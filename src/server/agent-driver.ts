@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   AgentRegistry,
   SessionManager,
@@ -39,6 +39,18 @@ export interface AgentDriver {
 /** Transcript file for a space: `<transcriptDir>/<space-id>.jsonl` (`:` is legal in POSIX filenames). */
 export function sessionFilePath(transcriptDir: string, spaceId: string): string {
   return join(transcriptDir, `${spaceId}.jsonl`);
+}
+
+/**
+ * Inverse of {@link sessionFilePath}: the space id from a session file
+ * path (the driver contract: `<transcriptDir>/<space-id>.jsonl`). Null or
+ * non-`.jsonl` files yield undefined. This is the canonical derivation —
+ * policy and tool extensions import it instead of re-deriving it.
+ */
+export function sessionIdFromFilePath(file: string | null | undefined): string | undefined {
+  if (!file) return undefined;
+  const base = basename(file);
+  return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : base;
 }
 
 /**

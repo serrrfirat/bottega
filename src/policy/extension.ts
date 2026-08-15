@@ -9,7 +9,6 @@
  * `policy.decision` audit row; ask-human additionally writes
  * `approval.requested` / `approval.resolved` rows.
  */
-import { basename } from "node:path";
 import type {
   ExtensionContext,
   ExtensionFactory,
@@ -17,6 +16,7 @@ import type {
   ToolCallEventResult,
 } from "@oh-my-pi/pi-coding-agent";
 import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
+import { sessionIdFromFilePath } from "../server/agent-driver";
 import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "./approval-router";
@@ -67,7 +67,7 @@ async function gateToolCall(
   ctx: ExtensionContext,
 ): Promise<ToolCallEventResult | void> {
   try {
-    const spaceId = spaceIdFromContext(ctx);
+    const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
     const policy = await policyFor(deps, spaceId);
     const tool = event.toolName;
     const tier = resolveTier(tool);
@@ -168,15 +168,9 @@ function requestWithTimeout(router: ApprovalRouter, request: ApprovalRequest, ti
 
 /**
  * Session file path is `<transcriptDir>/<spaceId>.jsonl` (driver contract),
- * so the space id is recoverable from the session manager at gate time.
+ * so the space id is recoverable from the session manager at gate time —
+ * derived by the shared {@link sessionIdFromFilePath}.
  */
-function spaceIdFromContext(ctx: ExtensionContext): string | undefined {
-  const file = ctx.sessionManager.getSessionFile();
-  if (!file) return undefined;
-  const base = basename(file);
-  return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : base;
-}
-
 function summarizeArgs(input: unknown): string {
   const text = JSON.stringify(input) ?? "";
   return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;

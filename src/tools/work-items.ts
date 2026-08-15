@@ -10,9 +10,9 @@
  * `pickup.auto: true` the agent MAY also self-trigger on actionable
  * messages — the tools themselves are identical either way.
  */
-import { basename } from "node:path";
-import type { AgentToolResult, ExtensionContext, ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
+import { sessionIdFromFilePath } from "../server/agent-driver";
 import type { Store } from "../store/db";
 
 export interface WorkItemsExtensionOpts {
@@ -40,7 +40,7 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts = 
       approval: "exec",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         if (!params.description.trim()) return toolError("description must not be empty");
-        const spaceId = spaceIdFromContext(ctx);
+        const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
         if (!spaceId) return toolError("work items require a space session");
         const item = await store.createWorkItem({
           space_id: spaceId,
@@ -65,7 +65,7 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts = 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const item = await store.getWorkItem(params.id);
         if (!item) return toolError(`work item not found: ${params.id}`);
-        const spaceId = spaceIdFromContext(ctx) ?? item.space_id;
+        const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile()) ?? item.space_id;
         const approvers = await approversFor(store, spaceId);
         if (actor !== item.requester && !approvers.has(actor)) {
           return toolError("cancel requires the requester or a space approver");
@@ -81,17 +81,6 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts = 
       },
     });
   };
-}
-
-/**
- * Session file path is `<transcriptDir>/<spaceId>.jsonl` (driver contract),
- * so the space id is recoverable from the session manager at tool time.
- */
-function spaceIdFromContext(ctx: ExtensionContext): string | undefined {
-  const file = ctx.sessionManager.getSessionFile();
-  if (!file) return undefined;
-  const base = basename(file);
-  return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : base;
 }
 
 /** The space overlay's `approvers` list (fail closed: none when absent or malformed). */
