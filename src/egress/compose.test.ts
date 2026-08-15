@@ -26,8 +26,14 @@ function serviceDns(name: string): string[] {
 }
 
 describe("docker-compose.yml (issue #8 egress topology)", () => {
-  test("parses and declares the three services", () => {
-    expect(Object.keys(services).sort()).toEqual(["executor", "iron-proxy", "server"]);
+  test("parses and declares the five services", () => {
+    expect(Object.keys(services).sort()).toEqual([
+      "auth-broker",
+      "auth-gateway",
+      "executor",
+      "iron-proxy",
+      "server",
+    ]);
   });
 
   test("iron-proxy is pinned to the latest stable image and is config-driven", () => {
@@ -64,10 +70,18 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     }
   });
 
-  test("NO_PROXY covers internal names (localhost, loopback, data)", () => {
+  test("NO_PROXY covers internal names (localhost, loopback, data, auth services)", () => {
+    // auth-broker/auth-gateway joined in issue #9: broker-mode traffic is
+    // internal and must bypass the proxy (the allowlist would 403 it).
     for (const name of ["server", "executor"]) {
       const noProxy = serviceEnv(name)["NO_PROXY"] as string;
-      expect(noProxy.split(",")).toEqual(["localhost", "127.0.0.1", "data"]);
+      expect(noProxy.split(",")).toEqual([
+        "localhost",
+        "127.0.0.1",
+        "data",
+        "auth-broker",
+        "auth-gateway",
+      ]);
     }
   });
 

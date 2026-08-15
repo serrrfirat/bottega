@@ -1,0 +1,11 @@
+# OMP agent settings for a bottega deployment (issue #9).
+# Loaded by the OMP SDK from the agent dir (data/omp-agent) at boot; this
+# file is the per-deployment template, mounted from config/omp/ by compose.
+secrets:
+  enabled: true
+# approvalMode is deliberately unset: the policy extension (issue #6) owns
+# tool-call gating (tier x space policy -> allow | deny | ask-human), so
+# OMP's own approval prompts stay off.
+# auth.broker.url / auth.broker.token are NOT set here: the server resolves
+# the broker from OMP_AUTH_BROKER_URL / OMP_AUTH_BROKER_TOKEN (compose .env),
+# keeping the broker token out of the committed templates.

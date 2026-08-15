@@ -190,3 +190,13 @@ export function parseYamlSubset(src: string): Record<string, YamlNode> {
   if (typeof node === "string" || Array.isArray(node)) throw new Error("top level must be a mapping");
   return node;
 }
+
+/** Parses a document whose root is a sequence (e.g. secrets.yml). */
+export function parseYamlSequence(src: string): YamlNode[] {
+  const lines = tokenize(src);
+  if (lines.length === 0) return [];
+  const [node, next] = parseBlock(lines, 0, lines[0].indent);
+  if (next !== lines.length) throw new Error(`line ${lines[next].lineNo}: unexpected content`);
+  if (!Array.isArray(node)) throw new Error("top level must be a sequence");
+  return node;
+}

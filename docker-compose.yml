@@ -5,8 +5,15 @@
 #   - HTTP_PROXY/HTTPS_PROXY route tools that honor proxy env (Bun fetch
 #     included — verified in src/egress/proxy-env.test.ts) through the
 #     proxy's tunnel listener.
-#   - NO_PROXY keeps loopback and the internal `data` hostname off the proxy.
+#   - NO_PROXY keeps loopback, the internal `data` hostname, and the auth
+#     services off the proxy (server -> broker/gateway traffic is internal).
 # No ports are published: everything lives on the internal `egress` network.
+#
+# Credential boundary (issue #9): auth-broker is the credential vault
+# (OMP), auth-gateway fronts it for OpenAI-compatible clients. Both are
+# internal-only and keep their state on the `data` volume. Provider keys
+# live in the vault; channel tokens live in the project .env only — the
+# executor env carries no keys, no tokens, no PAT.
 services:
   iron-proxy:
     # Pinned stable release; published to Docker Hub only (ghcr.io does not
@@ -29,6 +36,68 @@ services:
       egress:
         ipv4_address: 172.30.0.2
 
+  auth-broker:
+    # Credential vault (issue #9): OMP auth-broker, the only writer of
+    # provider credentials. Official OMP runtime image; `dev` is the
+    # published tag at implementation time — pin a release tag once one is
+    # published. Broker/gateway traffic to real providers (OAuth refresh,
+    # gateway dispatch) is NOT routed through iron-proxy: the #8 allowlist
+    # covers model endpoints only, so these services keep default egress.
+    image: oh-my-pi/pi:dev
+    # Bootstrap script generates the bearer token into the shared data
+    # volume (0600) on first boot, then execs omp auth-broker serve.
+    entrypoint:
+      - /entrypoints/broker.sh
+    command:
+      - auth-broker
+      - serve
+      - --bind=0.0.0.0:8765
+    environment:
+      # Config dir on the data volume: token + SQLite vault survive
+      # container recreation and are shared with the gateway.
+      PI_CONFIG_DIR: /data/.omp
+    volumes:
+      - ./config/entrypoints:/entrypoints:ro
+      - data:/data
+    healthcheck:
+      # /v1/healthz is the only unauthenticated broker endpoint; the token
+      # file exists before serve starts (entrypoint), so healthy implies
+      # the token is ready for dependents.
+      test:
+        - CMD
+        - curl
+        - -fsS
+        - http://127.0.0.1:8765/v1/healthz
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - egress
+
+  auth-gateway:
+    # Forward proxy over the broker (issue #9): OpenAI/Anthropic/pi-native
+    # wire formats resolved against vault credentials. Starts only after the
+    # broker is healthy so its token file is guaranteed on the shared volume.
+    image: oh-my-pi/pi:dev
+    depends_on:
+      auth-broker:
+        condition: service_healthy
+    command:
+      - auth-gateway
+      - serve
+      - --bind=0.0.0.0:4000
+    environment:
+      OMP_AUTH_BROKER_URL: http://auth-broker:8765
+      # The gateway is itself a broker client: with the same PI_CONFIG_DIR
+      # on the shared volume it resolves the broker token from
+      # /data/.omp/auth-broker.token automatically (no env token needed).
+      PI_CONFIG_DIR: /data/.omp
+    volumes:
+      - data:/data
+    networks:
+      - egress
+
   server:
     # App image build lands with the server packaging; bun runtime base keeps
     # this file valid today. Entrypoint: bun run src/server/index.ts.
@@ -40,9 +109,21 @@ services:
     environment:
       HTTP_PROXY: http://iron-proxy:8080
       HTTPS_PROXY: http://iron-proxy:8080
-      NO_PROXY: localhost,127.0.0.1,data
+      # auth-broker/auth-gateway are internal names: broker-mode traffic
+      # must bypass the proxy (the allowlist would 403 it).
+      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway
+      # Credential boundary (issue #9): model keys resolve through the
+      # broker, not from env. OMP_AUTH_BROKER_TOKEN is copied into .env
+      # from the broker's first-boot token on the data volume
+      # (/data/.omp/auth-broker.token, 0600). Broker mode is fail-closed:
+      # URL set with no token aborts at first credential resolution.
+      OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
+      OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
     volumes:
       - data:/data
+      # OMP agent config per deployment: templates from config/omp/ (issue
+      # #9), writable so the SDK can persist its placeholder key alongside.
+      - ./config/omp:/data/omp-agent
     networks:
       - egress
 
@@ -59,9 +140,15 @@ services:
     environment:
       HTTP_PROXY: http://iron-proxy:8080
       HTTPS_PROXY: http://iron-proxy:8080
-      NO_PROXY: localhost,127.0.0.1,data
+      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway
+      # Credential boundary (issue #9): the executor env carries NO provider
+      # keys, channel tokens, or PATs — credentials resolve through the
+      # broker at request time (git auth via the vault, #11 mechanism).
+      OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
+      OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
     volumes:
       - data:/data
+      - ./config/omp:/data/omp-agent
     networks:
       - egress
 

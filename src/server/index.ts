@@ -10,6 +10,16 @@ import { workItemsExtension } from "../tools/work-items";
 import { createOmpSdkDriver } from "./agent-driver";
 import { createSlackAdapter } from "./slack";
 import { SpaceService } from "./space-service";
+import { mkdirSync } from "node:fs";
+
+/**
+ * Project-local OMP agent dir (issue #9). Per-deployment agent config
+ * (config.yml / secrets.yml / models.yml) lives here instead of the default
+ * ~/.omp/agent: compose mounts config/omp templates at data/omp-agent, so a
+ * deployment's secrets-obfuscation and model catalog ship with the repo and
+ * no credential ever lands in a user's home agent dir.
+ */
+export const OMP_AGENT_DIR = "data/omp-agent";
 
 export interface BottegaServer {
   start(): Promise<void>;
@@ -26,9 +36,13 @@ export function main(): BottegaServer {
   const store = createStore();
   const audit = createAudit(store);
   const orgPolicy = loadOrgConfig();
+  // Created at boot so the SDK agent dir exists even outside compose (local
+  // dev); under compose the config/omp templates are mounted here.
+  mkdirSync(OMP_AGENT_DIR, { recursive: true });
   // DenyRouter until the Slack-backed approval router lands (later issue):
   // until then, exec-tier tool calls are blocked server-side, never run.
   const driver = createOmpSdkDriver({
+    agentDir: OMP_AGENT_DIR,
     extensions: [
       createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
       workItemsExtension(store),
