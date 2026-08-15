@@ -100,6 +100,27 @@ export function buildPostMessageArgs(
   return args;
 }
 
+/**
+ * Socket Mode delivers `message` events for all channel types the app is
+ * scoped for (channels, groups, ims). Unparseable events and bot-authored
+ * messages are dropped and logged, never thrown. Exported so the inbound
+ * wiring is testable hermetically through the real Bolt router
+ * (`App.processEvent`, issue #29); the adapter installs it on its app.
+ */
+export function registerMessageHandler(
+  app: Pick<App, "event">,
+  onMessage: (m: SlackMessage) => Promise<void>,
+): void {
+  app.event("message", async ({ event, logger }) => {
+    const message = normalizeMessage(event);
+    if (!message) {
+      logger.info("slack: dropping message event (unparseable or bot-authored)");
+      return;
+    }
+    await onMessage(message);
+  });
+}
+
 export function createSlackAdapter(opts: {
   appToken: string;
   botToken: string;
@@ -123,17 +144,7 @@ export function createSlackAdapter(opts: {
     ...(opts.clientOptions !== undefined ? { clientOptions: opts.clientOptions } : {}),
   });
 
-  // Socket Mode delivers `message` events for all channel types the app is
-  // scoped for (channels, groups, ims). Unparseable events and bot-authored
-  // messages are dropped and logged, never thrown.
-  app.event("message", async ({ event, logger }) => {
-    const message = normalizeMessage(event);
-    if (!message) {
-      logger.info("slack: dropping message event (unparseable or bot-authored)");
-      return;
-    }
-    await opts.onMessage(message);
-  });
+  registerMessageHandler(app, opts.onMessage);
 
   return {
     async postMessage(spaceId, text, postOpts) {

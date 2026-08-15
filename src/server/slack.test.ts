@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { App, type Logger } from "@slack/bolt";
 import {
   buildPostMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
   isBotMessage,
   normalizeMessage,
+  registerMessageHandler,
   spaceIdFromChannel,
+  type SlackMessage,
 } from "./slack";
 
 describe("space id derivation", () => {
@@ -110,5 +113,82 @@ describe("createSlackAdapter", () => {
     expect(typeof adapter.postMessage).toBe("function");
     expect(typeof adapter.start).toBe("function");
     expect(typeof adapter.stop).toBe("function");
+  });
+});
+
+describe("inbound Socket Mode routing through the real Bolt router (issue #29)", () => {
+  // Hermetic inbound: Bolt's App.processEvent routes an event_callback body
+  // to the registered "message" listener with no socket connection and no
+  // Slack API calls — the authorize hook is an injected local double (Bolt's
+  // default would run auth.test against the network). The wiring under test
+  // (registerMessageHandler) is the exact function createSlackAdapter
+  // installs on its app.
+  function bootApp(onMessage: (m: SlackMessage) => Promise<void>): {
+    logged: string[];
+    deliver: (event: Record<string, unknown>) => Promise<void>;
+  } {
+    const logged: string[] = [];
+    const app = new App({
+      appToken: "xapp-test-token",
+      // The default HTTP receiver requires a signing secret at construction;
+      // it is never started, so nothing listens or talks to Slack.
+      signingSecret: "test-signing-secret",
+      tokenVerificationEnabled: false,
+      authorize: async () => ({ botToken: "xoxb-test-token" }),
+      logger: {
+        info: (...args: unknown[]) => void logged.push(args.join(" ")),
+        debug: () => {},
+        warn: () => {},
+        error: () => {},
+        getLevel: () => 0,
+        setLevel: () => {},
+        setName: () => {},
+      } as unknown as Logger,
+    });
+    registerMessageHandler(app, onMessage);
+    return {
+      logged,
+      async deliver(event) {
+        await app.processEvent({ body: { type: "event_callback", event }, ack: async () => {} });
+      },
+    };
+  }
+
+  test("delivers a user message to onMessage, normalized to the space", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver } = bootApp(async (m) => { received.push(m); });
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "hello", ts: "1.1" });
+
+    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "hello", ts: "1.1" }]);
+  });
+
+  test("thread replies share the channel space in v1", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver } = bootApp(async (m) => { received.push(m); });
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "reply", ts: "1.2", thread_ts: "1.1" });
+
+    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "reply", ts: "1.2" }]);
+  });
+
+  test("drops bot-authored messages and logs the drop", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver, logged } = bootApp(async (m) => { received.push(m); });
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "hi", ts: "1.3", bot_id: "B1" });
+
+    expect(received).toHaveLength(0);
+    expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);
+  });
+
+  test("drops unparseable messages without throwing", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver, logged } = bootApp(async (m) => { received.push(m); });
+
+    await expect(deliver({ type: "message", channel: "C123" })).resolves.toBeUndefined();
+
+    expect(received).toHaveLength(0);
+    expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);
   });
 });

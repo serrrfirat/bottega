@@ -6,7 +6,11 @@
  */
 import { describe, expect, test, vi } from "bun:test";
 import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../store/audit-events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AuditRow, ListAuditOpts, Store } from "../store/db";
+import { createStore } from "../store/db";
 import type { SlackAdapter } from "./slack";
 import { DEFAULT_POLL_INTERVAL_MS, pollPendingDeliveries, startDeliveryPoller } from "./delivery-poller";
 
@@ -230,5 +234,50 @@ describe("startDeliveryPoller (issue #12)", () => {
 
   test("default interval is 5 seconds (documented contract)", () => {
     expect(DEFAULT_POLL_INTERVAL_MS).toBe(5000);
+  });
+});
+
+describe("pollPendingDeliveries against the real store (issue #29)", () => {
+  test("announces once on the real append-only audit trail and dedupes across a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-poller-"));
+    const dbPath = join(dir, "poller.db");
+    try {
+      const store = createStore(dbPath);
+      // The executor writes the marker through the real store API.
+      await store.appendAudit({
+        space_id: SPACE,
+        actor: "executor",
+        event_type: DELIVERY_PENDING_EVENT,
+        payload: JSON.stringify({ id: "wi_1", pr_url: PR_URL, summary: "implemented it" }),
+      });
+
+      const adapter = new FakeAdapter();
+      const posted = await pollPendingDeliveries(store, adapter);
+
+      expect(posted).toBe(1);
+      expect(adapter.posted).toEqual([
+        { spaceId: SPACE, text: `PR ready: ${PR_URL} — approve to finish` },
+      ]);
+      const requested = await store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+      expect(requested).toHaveLength(1);
+      expect(requested[0].actor).toBe("server");
+      expect(requested[0].space_id).toBe(SPACE);
+      expect(JSON.parse(requested[0].payload)).toEqual({
+        id: "wi_1",
+        pr_url: PR_URL,
+        summary: "implemented it",
+      });
+      store.close();
+
+      // Server restart: a fresh connection to the same file replays the same
+      // append-only audit rows — the announcement must not repeat.
+      const restarted = createStore(dbPath);
+      const second = await pollPendingDeliveries(restarted, adapter);
+      expect(second).toBe(0);
+      expect(adapter.posted).toHaveLength(1);
+      restarted.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
