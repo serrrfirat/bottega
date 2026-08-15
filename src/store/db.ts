@@ -44,6 +44,8 @@ export type TransitionOpts = {
   evidence?: string;
   /** JSON string stored verbatim in the result column */
   result?: string;
+  /** Actor recorded on the work_item.transition audit row; defaults to "system". */
+  by?: string;
 };
 
 export type AuditEntry = {
@@ -84,6 +86,49 @@ export interface Store {
 }
 
 const DEFAULT_DB_PATH = "data/bottega.db";
+
+/** Allowed state machine moves (issue #10). The atomic claim implements open -> claimed. */
+const ALLOWED_TRANSITIONS: Record<WorkItemState, readonly WorkItemState[]> = {
+  open: ["claimed", "aborted"],
+  claimed: ["working", "open", "aborted"],
+  working: ["review", "blocked", "aborted"],
+  review: ["done", "blocked", "aborted"],
+  done: [],
+  blocked: [],
+  aborted: [],
+};
+
+/**
+ * Enforces the state machine and its obligations (single choke point for all
+ * transitions): done requires result.pr_url, blocked requires non-empty
+ * evidence, review requires a recorded approval.
+ */
+function assertLegalTransition(from: WorkItemState, to: WorkItemState, opts?: TransitionOpts): void {
+  if (!ALLOWED_TRANSITIONS[from].includes(to)) {
+    throw new Error(`illegal work item transition ${from} -> ${to}`);
+  }
+  if (to === "done" && !prUrlFromResult(opts?.result)) {
+    throw new Error("work item cannot transition to done without result.pr_url");
+  }
+  if (to === "blocked" && !opts?.evidence?.trim()) {
+    throw new Error("work item cannot transition to blocked without evidence");
+  }
+  if (to === "review" && !opts?.approval) {
+    throw new Error("work item cannot transition to review without a recorded approval");
+  }
+}
+
+/** The pr_url from a result JSON string, or null when absent/invalid. */
+function prUrlFromResult(result: string | undefined): string | null {
+  if (!result) return null;
+  try {
+    const parsed: unknown = JSON.parse(result);
+    const url = (parsed as { pr_url?: unknown } | null)?.pr_url;
+    return typeof url === "string" && url.trim().length > 0 ? url : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Opens (creating if needed) the SQLite store at `dbPath` and runs the
@@ -139,7 +184,14 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       `INSERT INTO work_items (id, space_id, requester, description, state, approvals, evidence, result, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'open', '[]', '[]', NULL, ?, ?)`,
     ).run(id, input.space_id, input.requester, input.description, t, t);
-    return getWorkItemStmt.get(id) as WorkItem;
+    const item = getWorkItemStmt.get(id) as WorkItem;
+    appendAudit({
+      space_id: input.space_id,
+      actor: input.requester,
+      event_type: "work_item.created",
+      payload: JSON.stringify({ id, requester: input.requester }),
+    });
+    return item;
   }
 
   async function claimNextWorkItem(): Promise<WorkItem | null> {
@@ -160,6 +212,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     to: WorkItemState,
     opts?: TransitionOpts,
   ): Promise<WorkItem> {
+    assertLegalTransition(from, to, opts);
     const t = Date.now();
     const appendJson = (column: string): string => `json_set(${column}, '$[#]', json(?))`;
     const sets: string[] = ["state = ?", "updated_at = ?"];
@@ -181,6 +234,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .query(`UPDATE work_items SET ${sets.join(", ")} WHERE id = ? AND state = ? RETURNING *`)
       .get(...params) as WorkItem | null;
     if (!row) throw new Error(`work item not found or not in state ${from}: ${id}`);
+    const by = opts?.by ?? "system";
+    appendAudit({
+      space_id: row.space_id,
+      actor: by,
+      event_type: "work_item.transition",
+      payload: JSON.stringify({ from, to, by }),
+    });
     return row;
   }
 
@@ -190,15 +250,26 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
 
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
     const t = Date.now();
-    const res = db
-      .query(
-        `UPDATE work_items
-         SET state = 'blocked', updated_at = ?,
-             evidence = json_set(evidence, '$[#]', json(?))
-         WHERE state = ? AND updated_at < ?`,
-      )
-      .run(t, JSON.stringify({ kind: "stale", url: `stale after ${olderThanMs}ms`, at: t }), from, t - olderThanMs);
-    return res.changes;
+    const cutoff = t - olderThanMs;
+    const stale = db
+      .query("SELECT id, space_id FROM work_items WHERE state = ? AND updated_at < ?")
+      .all(from, cutoff) as { id: string; space_id: string }[];
+    if (stale.length === 0) return 0;
+    db.query(
+      `UPDATE work_items
+       SET state = 'blocked', updated_at = ?,
+           evidence = json_set(evidence, '$[#]', json(?))
+       WHERE state = ? AND updated_at < ?`,
+    ).run(t, JSON.stringify({ kind: "note", text: "interrupted by restart", at: t }), from, cutoff);
+    for (const row of stale) {
+      appendAudit({
+        space_id: row.space_id,
+        actor: "system",
+        event_type: "work_item.transition",
+        payload: JSON.stringify({ from, to: "blocked", by: "system" }),
+      });
+    }
+    return stale.length;
   }
 
   async function appendAudit(entry: AuditEntry): Promise<number> {
@@ -246,4 +317,17 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     listAudit,
     close: () => db.close(),
   };
+}
+
+/**
+ * Stale-run recovery (issue #10): marks `claimed` and `working` items idle
+ * for longer than `olderThanMs` as blocked with an interrupted-by-restart
+ * evidence note. The executor runs this once at boot.
+ */
+export function recoverStaleWorkItems(store: Store, olderThanMs: number): Promise<number> {
+  return (async () => {
+    const claimed = await store.markStaleWorkItems(olderThanMs, "claimed");
+    const working = await store.markStaleWorkItems(olderThanMs, "working");
+    return claimed + working;
+  })();
 }

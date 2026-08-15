@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, type Store } from "./db";
+import { createStore, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-store-"));
 const dbPath = join(dir, "test.db");
@@ -138,8 +138,9 @@ describe("work items", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C14" });
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "t2" });
+    await s.claimNextWorkItem();
 
-    const moved = await s.transitionWorkItem(item.id, "open", "working", {
+    const moved = await s.transitionWorkItem(item.id, "claimed", "working", {
       evidence: "picked up",
       result: JSON.stringify({ pr_url: "https://example.com/pr/1" }),
     });
@@ -173,7 +174,7 @@ describe("work items", () => {
       const stale = await s.getWorkItem(old.id);
       expect(stale?.state).toBe("blocked");
       expect(JSON.parse(stale!.evidence)).toEqual([
-        { kind: "stale", url: expect.stringContaining("stale"), at: expect.any(Number) },
+        { kind: "note", text: "interrupted by restart", at: expect.any(Number) },
       ]);
 
       const untouched = await s.getWorkItem(fresh.id);
@@ -181,6 +182,255 @@ describe("work items", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("all legal transitions succeed with obligations satisfied", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1A" });
+
+    // claimed -> open (executor crash before start)
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal" });
+    const claimed = await s.claimNextWorkItem();
+    expect(claimed?.id).toBe(item.id);
+    expect(claimed?.state).toBe("claimed");
+    const reset = await s.transitionWorkItem(item.id, "claimed", "open");
+    expect(reset.state).toBe("open");
+
+    // open -> aborted (cancel before pickup)
+    const cancelled = await s.transitionWorkItem(item.id, "open", "aborted");
+    expect(cancelled.state).toBe("aborted");
+
+    // claimed -> working -> blocked (evidence required)
+    const item2 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal2" });
+    await s.claimNextWorkItem();
+    const working = await s.transitionWorkItem(item2.id, "claimed", "working");
+    expect(working.state).toBe("working");
+    const blocked = await s.transitionWorkItem(item2.id, "working", "blocked", { evidence: "the build broke" });
+    expect(blocked.state).toBe("blocked");
+
+    // claimed -> working -> review -> blocked
+    const item3 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal3" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item3.id, "claimed", "working");
+    const review = await s.transitionWorkItem(item3.id, "working", "review", { approval: { approver: "U9" } });
+    expect(review.state).toBe("review");
+    expect(JSON.parse(review.approvals)).toEqual([{ approver: "U9", at: expect.any(Number) }]);
+    const rb = await s.transitionWorkItem(item3.id, "review", "blocked", { evidence: "abandoned" });
+    expect(rb.state).toBe("blocked");
+
+    // claimed -> working -> review -> done (result.pr_url required)
+    const item4 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal4" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item4.id, "claimed", "working");
+    await s.transitionWorkItem(item4.id, "working", "review", { approval: { approver: "U9" } });
+    const done = await s.transitionWorkItem(item4.id, "review", "done", {
+      result: JSON.stringify({ pr_url: "https://example.com/pr/42" }),
+    });
+    expect(done.state).toBe("done");
+    expect(JSON.parse(done.result!)).toEqual({ pr_url: "https://example.com/pr/42" });
+
+    // claimed -> working -> review -> aborted
+    const item5 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal5" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item5.id, "claimed", "working");
+    await s.transitionWorkItem(item5.id, "working", "review", { approval: { approver: "U9" } });
+    const aborted = await s.transitionWorkItem(item5.id, "review", "aborted");
+    expect(aborted.state).toBe("aborted");
+  });
+
+  test("illegal transitions are rejected from every state", async () => {
+    const LEGAL: Record<WorkItemState, WorkItemState[]> = {
+      open: ["claimed", "aborted"],
+      claimed: ["working", "open", "aborted"],
+      working: ["review", "blocked", "aborted"],
+      review: ["done", "blocked", "aborted"],
+      done: [],
+      blocked: [],
+      aborted: [],
+    };
+    const STATES: WorkItemState[] = ["open", "claimed", "working", "review", "done", "blocked", "aborted"];
+
+    async function itemInState(s: Store, spaceId: string, target: WorkItemState): Promise<string> {
+      const item = await s.createWorkItem({ space_id: spaceId, requester: "U1", description: `to ${target}` });
+      switch (target) {
+        case "open":
+          return item.id;
+        case "claimed":
+          await s.claimNextWorkItem();
+          return item.id;
+        case "working":
+          await s.claimNextWorkItem();
+          await s.transitionWorkItem(item.id, "claimed", "working");
+          return item.id;
+        case "review":
+          await s.claimNextWorkItem();
+          await s.transitionWorkItem(item.id, "claimed", "working");
+          await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+          return item.id;
+        case "done":
+          await s.claimNextWorkItem();
+          await s.transitionWorkItem(item.id, "claimed", "working");
+          await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+          await s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ pr_url: "x" }) });
+          return item.id;
+        case "blocked":
+          await s.claimNextWorkItem();
+          await s.transitionWorkItem(item.id, "claimed", "working");
+          await s.transitionWorkItem(item.id, "working", "blocked", { evidence: "e" });
+          return item.id;
+        case "aborted":
+          await s.transitionWorkItem(item.id, "open", "aborted");
+          return item.id;
+      }
+    }
+
+    for (const from of STATES) {
+      const s = freshStore();
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1B" });
+      const id = await itemInState(s, space.id, from);
+      for (const to of STATES) {
+        if (LEGAL[from].includes(to)) continue;
+        const obligationOpts =
+          to === "done"
+            ? { result: JSON.stringify({ pr_url: "x" }) }
+            : to === "blocked"
+              ? { evidence: "e" }
+              : to === "review"
+                ? { approval: { approver: "U9" } }
+                : undefined;
+        await expect(s.transitionWorkItem(id, from, to, obligationOpts), `${from} -> ${to}`).rejects.toThrow(
+          /illegal work item transition/,
+        );
+      }
+    }
+  });
+
+  test("done requires a result with a pr_url", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1C" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "done obligations" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item.id, "claimed", "working");
+    await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+
+    await expect(s.transitionWorkItem(item.id, "review", "done")).rejects.toThrow(/pr_url/);
+    await expect(s.transitionWorkItem(item.id, "review", "done", { result: "not json" })).rejects.toThrow(/pr_url/);
+    await expect(
+      s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ pr_url: "" }) }),
+    ).rejects.toThrow(/pr_url/);
+    await expect(
+      s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ url: "https://example.com" }) }),
+    ).rejects.toThrow(/pr_url/);
+
+    const done = await s.transitionWorkItem(item.id, "review", "done", {
+      result: JSON.stringify({ pr_url: "https://example.com/pr/1" }),
+    });
+    expect(done.state).toBe("done");
+  });
+
+  test("blocked requires non-empty evidence", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1D" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "blocked obligations" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item.id, "claimed", "working");
+
+    await expect(s.transitionWorkItem(item.id, "working", "blocked")).rejects.toThrow(/evidence/);
+    await expect(s.transitionWorkItem(item.id, "working", "blocked", { evidence: "   " })).rejects.toThrow(/evidence/);
+
+    const blocked = await s.transitionWorkItem(item.id, "working", "blocked", { evidence: "out of time" });
+    expect(blocked.state).toBe("blocked");
+  });
+
+  test("review requires a recorded approval", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1E" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "review obligations" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item.id, "claimed", "working");
+
+    await expect(s.transitionWorkItem(item.id, "working", "review")).rejects.toThrow(/approval/);
+    const review = await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+    expect(review.state).toBe("review");
+  });
+
+  test("recoverStaleWorkItems blocks stale claimed and working items with a restart note", async () => {
+    const s = freshStore();
+    vi.useFakeTimers();
+    try {
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1F" });
+      const staleClaimed = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "claimed stale" });
+      await s.claimNextWorkItem();
+      vi.advanceTimersByTime(1000);
+      const staleWorking = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "working stale" });
+      await s.claimNextWorkItem();
+      await s.transitionWorkItem(staleWorking.id, "claimed", "working");
+      vi.advanceTimersByTime(1000);
+      const fresh = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "fresh" });
+
+      const count = await recoverStaleWorkItems(s, 500);
+      expect(count).toBe(2);
+
+      const c = await s.getWorkItem(staleClaimed.id);
+      expect(c?.state).toBe("blocked");
+      expect(JSON.parse(c!.evidence)).toEqual([{ kind: "note", text: "interrupted by restart", at: expect.any(Number) }]);
+      const w = await s.getWorkItem(staleWorking.id);
+      expect(w?.state).toBe("blocked");
+      const f = await s.getWorkItem(fresh.id);
+      expect(f?.state).toBe("open");
+      expect(f?.evidence).toBe("[]");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("recoverStaleWorkItems audits each stale recovery transition", async () => {
+    const s = freshStore();
+    vi.useFakeTimers();
+    try {
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1G" });
+      await s.createWorkItem({ space_id: space.id, requester: "U1", description: "stale audited" });
+      await s.claimNextWorkItem();
+      vi.advanceTimersByTime(1000);
+      await recoverStaleWorkItems(s, 100);
+
+      const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
+      expect(rows).toHaveLength(1);
+      expect(JSON.parse(rows[0]!.payload)).toEqual({ from: "claimed", to: "blocked", by: "system" });
+      expect(rows[0]!.actor).toBe("system");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("every transition writes a work_item.transition audit row", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1H" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "audited" });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(item.id, "claimed", "working", { by: "executor:1" });
+    await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" }, by: "executor:1" });
+    await s.transitionWorkItem(item.id, "review", "done", {
+      result: JSON.stringify({ pr_url: "https://example.com/pr/9" }),
+      by: "executor:1",
+    });
+
+    const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
+    expect(rows).toHaveLength(3);
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ from: "claimed", to: "working", by: "executor:1" });
+    expect(JSON.parse(rows[1]!.payload)).toEqual({ from: "working", to: "review", by: "executor:1" });
+    expect(JSON.parse(rows[2]!.payload)).toEqual({ from: "review", to: "done", by: "executor:1" });
+  });
+
+  test("createWorkItem writes a work_item.created audit row", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1I" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U7", description: "audited create" });
+
+    const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.actor).toBe("U7");
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item.id, requester: "U7" });
   });
 });
 

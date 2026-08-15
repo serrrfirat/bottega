@@ -37,6 +37,8 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   edit: "write",
   bash: "exec",
   task: "exec",
+  create_work_item: "exec",
+  work_item_cancel: "exec",
 };
 
 export interface PolicyConfig {

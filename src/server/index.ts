@@ -6,6 +6,7 @@ import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { loadOrgConfig } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
+import { workItemsExtension } from "../tools/work-items";
 import { createOmpSdkDriver } from "./agent-driver";
 import { createSlackAdapter } from "./slack";
 import { SpaceService } from "./space-service";
@@ -28,7 +29,10 @@ export function main(): BottegaServer {
   // DenyRouter until the Slack-backed approval router lands (later issue):
   // until then, exec-tier tool calls are blocked server-side, never run.
   const driver = createOmpSdkDriver({
-    extensions: [createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store })],
+    extensions: [
+      createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
+      workItemsExtension(store),
+    ],
   });
   // The adapter routes inbound messages to the service; the service posts
   // replies back through the adapter. Late-bound: no message can arrive

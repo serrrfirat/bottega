@@ -40,10 +40,21 @@ export function sessionFilePath(transcriptDir: string, spaceId: string): string 
 /**
  * Space agent tool allowlist: conversation/read-only tools + `task` for
  * delegating to work executors. Deliberately no bash/write/edit — the space
- * agent is a participant, not an executor. `create_work_item` (Slice 3) is
- * added to this list once the tool exists.
+ * agent is a participant, not an executor. The work item queue tools
+ * (issue #10) are listed so the agent can create and cancel work items.
  */
-const SPACE_AGENT_TOOLS = ["read", "glob", "grep", "ast_grep", "web_search", "inspect_image", "lsp", "task"] as const;
+const SPACE_AGENT_TOOLS = [
+  "read",
+  "glob",
+  "grep",
+  "ast_grep",
+  "web_search",
+  "inspect_image",
+  "lsp",
+  "task",
+  "create_work_item",
+  "work_item_cancel",
+] as const;
 
 /**
  * Driver backed by the OMP SDK (`createAgentSession`). Sessions are
