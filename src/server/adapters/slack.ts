@@ -1,5 +1,6 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
 import type { ChatPostMessageArguments } from "@slack/web-api";
+import type { ResponseMode } from "../../policy/config";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
 // a call-time property read, so patching the exports object is effective).
@@ -95,6 +96,23 @@ export function isBotMessage(event: Record<string, unknown>): boolean {
 }
 
 /**
+ * Mention-mode inbound predicate (issue #55): true for DMs (a DM is always a
+ * direct request) and for channel messages whose text @mentions the bot.
+ * Slack renders a mention as `<@U0XXX>` or `<@U0XXX|display>` — the prefix
+ * match covers both forms. With no known bot id (pre-start) nothing can be
+ * judged, so everything passes rather than silently dropping messages.
+ */
+export function isMentionedMessage(
+  text: string,
+  channelId: string,
+  botUserId: string | undefined,
+): boolean {
+  if (isDmChannel(channelId)) return true;
+  if (!botUserId) return true;
+  return text.includes(`<@${botUserId}`);
+}
+
+/**
  * Normalizes a raw Slack message event into a {@link SlackMessage}.
  *
  * Returns `null` for anything unparseable (missing channel/user/text/ts,
@@ -175,6 +193,18 @@ export function buildUpdateMessageArgs(
   return { channel: channelFromSpaceId(spaceId), ts, text };
 }
 
+export interface MessageHandlerOptions {
+  /**
+   * Per-space response mode (issue #55); defaults to `always` (today's
+   * behavior). In `mention` spaces, channel messages that do not @mention
+   * the bot are dropped before they reach the agent (no turn, no audit
+   * noise); DMs always pass.
+   */
+  responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
+  /** Current bot user id; undefined until the adapter resolves it at start(). */
+  botUserId?: () => string | undefined;
+}
+
 /**
  * Socket Mode delivers `message` events for all channel types the app is
  * scoped for (channels, groups, ims). Unparseable events and bot-authored
@@ -185,11 +215,20 @@ export function buildUpdateMessageArgs(
 export function registerMessageHandler(
   app: Pick<App, "event">,
   onMessage: (m: SlackMessage) => Promise<void>,
+  opts: MessageHandlerOptions = {},
 ): void {
   app.event("message", async ({ event, logger }) => {
     const message = normalizeMessage(event);
     if (!message) {
       logger.info("slack: dropping message event (unparseable or bot-authored)");
+      return;
+    }
+    const mode = (await opts.responseModeFor?.(message.spaceId)) ?? "always";
+    if (
+      mode === "mention" &&
+      !isMentionedMessage(message.text, channelFromSpaceId(message.spaceId), opts.botUserId?.())
+    ) {
+      logger.info("slack: dropping unmentioned channel message (response_mode=mention)");
       return;
     }
     await onMessage(message);
@@ -231,6 +270,12 @@ export function createSlackAdapter(opts: {
    * callers omit it and Bolt talks to the real Slack API.
    */
   clientOptions?: AppOptions["clientOptions"];
+  /**
+   * Per-space response mode (issue #55); defaults to `always`. The mention
+   * filter applies per message, so the mode is resolved fresh for each
+   * inbound message (mode changes apply immediately for mention spaces).
+   */
+  responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
 }): SlackAdapter {
   // Bolt's default socket-mode wiring pings Slack from the client every
   // ~1.6s and disconnects after 4 unanswered pings (monitorPingToSlack).
@@ -254,7 +299,15 @@ export function createSlackAdapter(opts: {
     clientOptions: opts.clientOptions,
   });
 
-  registerMessageHandler(app, opts.onMessage);
+  // Resolved once at start via auth.test; the mention filter matches
+  // `<@U0XXX>` in channel text and no event can arrive before the socket
+  // connects.
+  let botUserId: string | undefined;
+
+  registerMessageHandler(app, opts.onMessage, {
+    responseModeFor: opts.responseModeFor,
+    botUserId: () => botUserId,
+  });
   if (opts.onAction !== undefined) {
     registerActionHandler(app, opts.onAction);
   }
@@ -271,6 +324,16 @@ export function createSlackAdapter(opts: {
       await app.client.chat.update(buildUpdateMessageArgs(spaceId, ts, text));
     },
     start: async () => {
+      // The bot's user id (issue #55): auth.test needs only the bot token
+      // and is always allowed. A failed lookup leaves the id unset — mention
+      // mode then passes everything rather than dropping messages it cannot
+      // judge.
+      try {
+        const auth = await app.client.auth.test();
+        if (auth.ok && typeof auth.user_id === "string") botUserId = auth.user_id;
+      } catch (err) {
+        console.error("[slack] failed to resolve bot user id (mention filtering disabled):", err);
+      }
       await app.start();
     },
     stop: async () => {

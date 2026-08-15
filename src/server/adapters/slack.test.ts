@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { App, type Logger } from "@slack/bolt";
+import type { ResponseMode } from "../../policy/config";
 import {
   APPROVE_ACTION_ID,
   DENY_ACTION_ID,
@@ -10,11 +11,13 @@ import {
   isBotMessage,
   isDmChannel,
   normalizeActionEvent,
+  isMentionedMessage,
   normalizeMessage,
   registerActionHandler,
   registerMessageHandler,
   spaceIdFromChannel,
   type SlackAction,
+  type MessageHandlerOptions,
   type SlackMessage,
 } from "./slack";
 
@@ -58,6 +61,26 @@ describe("isBotMessage (pure bot-message predicate)", () => {
 
   test("false for a plain user message", () => {
     expect(isBotMessage({ user: "U123", text: "hi" })).toBe(false);
+  });
+});
+
+describe("isMentionedMessage (issue #55 mention filter)", () => {
+  test("channel messages must @mention the bot", () => {
+    expect(isMentionedMessage("hello <@U0BOT> how are you", "C123ABC", "U0BOT")).toBe(true);
+    expect(isMentionedMessage("just chatter about the deploy", "C123ABC", "U0BOT")).toBe(false);
+  });
+
+  test("the <@U0XXX|display> mention form matches too", () => {
+    expect(isMentionedMessage("<@U0BOT|bottega> take this", "C123ABC", "U0BOT")).toBe(true);
+  });
+
+  test("DMs always pass, mention or not", () => {
+    expect(isMentionedMessage("plain dm text", "D123ABC", "U0BOT")).toBe(true);
+    expect(isMentionedMessage("", "D123ABC", "U0BOT")).toBe(true);
+  });
+
+  test("an unknown bot id passes everything (pre-start fallback)", () => {
+    expect(isMentionedMessage("unjudgeable chatter", "C123ABC", undefined)).toBe(true);
   });
 });
 
@@ -306,7 +329,10 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
   // default would run auth.test against the network). The wiring under test
   // (registerMessageHandler) is the exact function createSlackAdapter
   // installs on its app.
-  function bootApp(onMessage: (m: SlackMessage) => Promise<void>): {
+  function bootApp(
+    onMessage: (m: SlackMessage) => Promise<void>,
+    handlerOpts: MessageHandlerOptions = {},
+  ): {
     logged: string[];
     deliver: (event: Record<string, unknown>) => Promise<void>;
   } {
@@ -328,7 +354,7 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
         setName: () => {},
       } as unknown as Logger,
     });
-    registerMessageHandler(app, onMessage);
+    registerMessageHandler(app, onMessage, handlerOpts);
     return {
       logged,
       async deliver(event) {
@@ -373,5 +399,47 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
 
     expect(received).toHaveLength(0);
     expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);
+  });
+
+  const mentionOpts: MessageHandlerOptions = {
+    responseModeFor: async () => "mention" as ResponseMode,
+    botUserId: () => "U0BOT",
+  };
+
+  test("mention mode: a channel message mentioning the bot is delivered", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver } = bootApp(async (m) => { received.push(m); }, mentionOpts);
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "<@U0BOT> please fix", ts: "2.1" });
+
+    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "<@U0BOT> please fix", ts: "2.1" }]);
+  });
+
+  test("mention mode: unmentioned channel chatter is dropped and logged (no turn)", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver, logged } = bootApp(async (m) => { received.push(m); }, mentionOpts);
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "did anyone see the game?", ts: "2.2" });
+
+    expect(received).toHaveLength(0);
+    expect(logged.some((l) => l.includes("response_mode=mention"))).toBe(true);
+  });
+
+  test("mention mode: DMs pass without a mention", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver } = bootApp(async (m) => { received.push(m); }, mentionOpts);
+
+    await deliver({ type: "message", channel: "D123", user: "U1", text: "quick question", ts: "2.3" });
+
+    expect(received).toEqual([{ spaceId: "slack:D123", principal: "U1", text: "quick question", ts: "2.3" }]);
+  });
+
+  test("default mode (always) forwards unmentioned channel messages", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver } = bootApp(async (m) => { received.push(m); });
+
+    await deliver({ type: "message", channel: "C123", user: "U1", text: "plain chatter", ts: "2.4" });
+
+    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "plain chatter", ts: "2.4" }]);
   });
 });

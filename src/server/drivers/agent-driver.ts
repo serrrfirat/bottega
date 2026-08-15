@@ -55,6 +55,12 @@ export interface AgentDriver {
      * reach memory through the MCP tools (#25) and ignore it (documented).
      */
     getPrincipal?: () => string | undefined;
+    /**
+     * Extra system-prompt text appended at session creation (issue #55):
+     * the `request-only` directive. Evaluated per cold start, so a mode
+     * change applies once the space's live session is disposed.
+     */
+    appendSystemPrompt?: string;
   }): Promise<AgentSessionDriver>;
 }
 
@@ -146,7 +152,7 @@ export function createOmpSdkDriver(
   } = {},
 ): AgentDriver {
   return {
-    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal }) {
+    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt }) {
       mkdirSync(transcriptDir, { recursive: true });
       const sessionCwd = cwd ?? process.cwd();
       const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
@@ -174,6 +180,8 @@ export function createOmpSdkDriver(
         toolNames: allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS],
         // Extension seam: policy + audit extensions plug in here (#6/#7).
         extensions,
+        // request-only directive (issue #55), appended to the rendered prompt.
+        ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
       });
       return new OmpSessionDriver({ spaceId, session, onOutput });
     },

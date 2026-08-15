@@ -250,6 +250,20 @@ memory:
     expect(p.ok).toBe(false);
     expect(p.agentDriver).toBe("omp-sdk");
   });
+
+  test("response_mode parses at the org floor; default is always (issue #55)", () => {
+    expect(parseOrgConfigYaml("").responseMode).toBe("always");
+    expect(parseOrgConfigYaml("response_mode: mention\n").responseMode).toBe("mention");
+    expect(parseOrgConfigYaml("response_mode: request-only\n").responseMode).toBe("request-only");
+    expect(parseOrgConfigYaml("response_mode:  MENTION \n").responseMode).toBe("mention");
+  });
+
+  test("invalid response_mode warns and keeps the always default", () => {
+    const p = parseOrgConfigYaml("response_mode: whenever\n");
+    expect(p.ok).toBe(true);
+    expect(p.responseMode).toBe("always");
+    expect(p.warnings.some((w) => w.includes("response_mode"))).toBe(true);
+  });
 });
 
 describe("space overlay", () => {
@@ -309,6 +323,33 @@ describe("space overlay", () => {
     // Malformed always_approve is a structural error → deny everything for the space.
     expect(applySpaceOverlay(org, JSON.stringify({ always_approve: "bash" })).ok).toBe(false);
     expect(applySpaceOverlay(org, JSON.stringify({ always_approve: [1] })).ok).toBe(false);
+  });
+
+  test("overlay response_mode may change the mode but only tighten (issue #55)", () => {
+    const org = parseOrgConfigYaml("");
+    expect(org.responseMode).toBe("always");
+    expect(applySpaceOverlay(org, JSON.stringify({ response_mode: "mention" })).responseMode).toBe("mention");
+    expect(applySpaceOverlay(org, JSON.stringify({ response_mode: "request-only" })).responseMode).toBe(
+      "request-only",
+    );
+    // Loosening is clamped to the org floor (tighten rule).
+    const strictOrg = parseOrgConfigYaml("response_mode: request-only\n");
+    expect(applySpaceOverlay(strictOrg, JSON.stringify({ response_mode: "always" })).responseMode).toBe(
+      "request-only",
+    );
+    expect(applySpaceOverlay(strictOrg, JSON.stringify({ response_mode: "mention" })).responseMode).toBe(
+      "request-only",
+    );
+    // The org floor stands when the overlay does not mention response_mode.
+    expect(applySpaceOverlay(strictOrg, "").responseMode).toBe("request-only");
+  });
+
+  test("invalid overlay response_mode warns and keeps the org floor", () => {
+    const org = parseOrgConfigYaml("response_mode: mention\n");
+    const p = applySpaceOverlay(org, JSON.stringify({ response_mode: "nope" }));
+    expect(p.ok).toBe(true);
+    expect(p.responseMode).toBe("mention");
+    expect(p.warnings.some((w) => w.includes("response_mode"))).toBe(true);
   });
 });
 

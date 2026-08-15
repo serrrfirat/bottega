@@ -6,7 +6,7 @@ import { pruneDigestMemories } from "../memory/sqlite";
 import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
-import { loadOrgConfig, loadSpacePolicy } from "../policy/config";
+import { loadOrgConfig, loadSpacePolicy, type ResponseMode } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
@@ -74,6 +74,13 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // router, the router needs the adapter, and the adapter's callbacks need
   // the service/router — all late-bound closures, so no message or action
   // can arrive before main() returns.
+  // Per-space response mode (issue #55), read by both consumers: the adapter
+  // filters for `mention` spaces; the service appends the request-only
+  // directive at session creation.
+  const responseModeFor = async (spaceId: string): Promise<ResponseMode> => {
+    const policy = await loadSpacePolicy(orgPolicy, store, spaceId);
+    return policy.responseMode;
+  };
   let spaceService: SpaceService;
   let approvalRouter: ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
   const adapter = createSlackAdapter({
@@ -81,6 +88,7 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
     onAction: (a) => approvalRouter.handleAction(a),
+    responseModeFor,
   });
   // Space sessions resolve ask-human via Slack buttons (issue #44). The
   // executor keeps DenyRouter (src/executor.ts): its work-item pickup
@@ -143,6 +151,9 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
     store,
     adapter,
     driver,
+    // Per-space response mode (issue #55): the request-only directive is
+    // appended at session creation.
+    responseModeFor,
     // Digest-on-idle (#42): summarize idle spaces into org memory; the cap
     // prunes digest memories beyond the newest 20 per space on this file.
     memoryProvider,

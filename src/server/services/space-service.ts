@@ -2,6 +2,7 @@ import type { AgentDriver, AgentSessionDriver } from "../drivers/agent-driver";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
+import type { ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
@@ -31,10 +32,25 @@ export interface SpaceServiceDeps {
   digestPrune?: (spaceId: string, keep: number) => Promise<void> | void;
   /** Bound for the digest summary turn. Default 60s. */
   digestTimeoutMs?: number;
+  /**
+   * Per-space response mode (issue #55); defaults to `always`. Request-only
+   * spaces append {@link REQUEST_ONLY_DIRECTIVE} to the session prompt; the
+   * evaluation happens at session creation, so a mode change applies on the
+   * next cold start (sessions are disposed after the idle timeout).
+   */
+  responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_DIR = "data/sessions";
+
+/**
+ * System-prompt directive for `request-only` spaces (issue #55): the adapter
+ * forwards everything so context stays coherent, so the agent itself must
+ * decide when to act — explicit requests get work, chatter gets silence.
+ */
+export const REQUEST_ONLY_DIRECTIVE =
+  "Act only on explicit requests; stay silent on chatter — reply briefly or not at all.";
 
 /**
  * Rotating status phrases posted on turn_start and replaced in place by the
@@ -71,6 +87,7 @@ export class SpaceService {
   readonly #memoryProvider: MemoryProvider | undefined;
   readonly #digestPrune: ((spaceId: string, keep: number) => Promise<void> | void) | undefined;
   readonly #digestTimeoutMs: number;
+  readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
@@ -93,6 +110,7 @@ export class SpaceService {
     this.#memoryProvider = deps.memoryProvider;
     this.#digestPrune = deps.digestPrune;
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
+    this.#responseModeFor = deps.responseModeFor ?? (() => "always");
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
@@ -141,9 +159,12 @@ export class SpaceService {
   }
 
   async #createLive(spaceId: string): Promise<LiveSession> {
+    const mode = await this.#responseModeFor(spaceId);
+    const appendSystemPrompt = mode === "request-only" ? REQUEST_ONLY_DIRECTIVE : undefined;
     const session = await this.#driver.createSession({
       spaceId,
       transcriptDir: this.#transcriptDir,
+      appendSystemPrompt,
       // Output arrives on the session's event channel below. onOutput is the
       // same signal (both drivers emit both), so it must stay unconsumed or
       // every reply would be posted twice.

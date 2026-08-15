@@ -31,10 +31,42 @@ export type Decision = "allow" | "deny" | "ask-human";
 /** Space-agent driver selected by the org config (`agent.driver`, issue #26). */
 export type AgentDriverName = "acp" | "omp-sdk";
 export const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
+/**
+ * Per-space response mode (issue #55): when the agent acts at all.
+ * - `always`: every non-bot message is a turn (today's behavior).
+ * - `mention`: only messages that @mention the bot (or DMs) become turns.
+ * - `request-only`: everything is forwarded for context coherence, but the
+ *   agent is told to act only on explicit requests.
+ */
+export type ResponseMode = "always" | "mention" | "request-only";
+
+export const DEFAULT_RESPONSE_MODE: ResponseMode = "always";
 
 export const DEFAULT_TIMEOUT_MINUTES = 5;
 export const DEFAULT_REQUIRED_APPROVERS = 1;
 export const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
+
+/** Tightening order for response modes: always → mention → request-only. */
+const RESPONSE_MODE_STRICTNESS: Record<ResponseMode, number> = {
+  always: 0,
+  mention: 1,
+  "request-only": 2,
+};
+
+const RESPONSE_MODE_VALUES: readonly ResponseMode[] = ["always", "mention", "request-only"];
+
+function normalizeResponseMode(value: unknown): ResponseMode | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (RESPONSE_MODE_VALUES as readonly string[]).includes(normalized)
+    ? (normalized as ResponseMode)
+    : undefined;
+}
+
+/** The stricter of two response modes (mention/request-only tighten; always is the floor). */
+export function stricterResponseMode(a: ResponseMode, b: ResponseMode): ResponseMode {
+  return RESPONSE_MODE_STRICTNESS[b] > RESPONSE_MODE_STRICTNESS[a] ? b : a;
+}
 
 /** Capability tier per known OMP tool. Unknown/malformed names resolve to exec. */
 const TIER_BY_TOOL: Record<string, Tier> = {
@@ -90,6 +122,8 @@ export interface PolicyConfig {
 
   /** Space-agent driver (`agent.driver` in config.yml, issue #26). Default omp-sdk; acp is opt-in. */
   agentDriver: AgentDriverName;
+  /** Response mode (issue #55): when the space agent acts; org floor default is `always`. */
+  responseMode: ResponseMode;
   errors: string[];
   warnings: string[];
 }
@@ -110,6 +144,7 @@ export function defaultPolicy(): PolicyConfig {
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
 
     agentDriver: DEFAULT_AGENT_DRIVER,
+    responseMode: DEFAULT_RESPONSE_MODE,
     errors: [],
     warnings: [],
   };
@@ -225,7 +260,22 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
   }
 
   for (const [name, node] of Object.entries(doc)) {
-    // Every section must be a block mapping; a scalar or sequence section
+    // Scalar top-level section: the org floor response mode (issue #55).
+    // Invalid values warn and keep today's `always` default — a behavior
+    // toggle, not a permission, so nothing denies.
+    if (name === "response_mode") {
+      const mode = normalizeResponseMode(node);
+      if (mode) {
+        policy.responseMode = mode;
+      } else {
+        const shown = typeof node === "string" ? node : "<non-scalar>";
+        policy.warnings.push(
+          `response_mode: invalid value '${shown}' — using default '${DEFAULT_RESPONSE_MODE}'`,
+        );
+      }
+      continue;
+    }
+    // Every other section must be a block mapping; a scalar or sequence section
     // (e.g. `tools: nope`) is a structural error.
     if (typeof node !== "object" || node === null || Array.isArray(node)) {
       return structuralError(policy, `section '${name}' must be a block mapping`);
@@ -419,6 +469,21 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
     }
     const removed = new Set(alwaysApproveEntry as string[]);
     out.alwaysApprove = out.alwaysApprove.filter((tool) => !removed.has(tool));
+  }
+
+  // Response mode (issue #55): the overlay may change it, but the tighten
+  // rule still applies — a looser overlay value is clamped to the org floor
+  // (mirrors the tools rule above), and an invalid value cannot tighten, so
+  // the org floor stands with a warning.
+  const responseModeEntry = overlay["response_mode"];
+  if (responseModeEntry !== undefined) {
+    const mode = normalizeResponseMode(responseModeEntry);
+    if (!mode) {
+      const shown = typeof responseModeEntry === "string" ? responseModeEntry : "<non-scalar>";
+      out.warnings.push(`overlay response_mode: invalid value '${shown}' — keeping org floor '${out.responseMode}'`);
+    } else {
+      out.responseMode = stricterResponseMode(out.responseMode, mode);
+    }
   }
 
   return out;

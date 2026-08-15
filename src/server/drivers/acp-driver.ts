@@ -96,6 +96,8 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
   const sessionTimeoutMs = opts.sessionTimeoutMs ?? 30_000;
   return {
     async createSession({ spaceId, transcriptDir, onOutput }) {
+      // appendSystemPrompt (issue #55) has no ACP v1 transport field yet —
+      // the OMP driver is the shipped engine and carries the directive.
       mkdirSync(transcriptDir, { recursive: true });
       const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput, mcpServers: opts.mcpServers, policy: opts.policy });
       await session.start();
