@@ -155,17 +155,12 @@ export function buildPostMessageArgs(
   text: string,
   opts?: { threadTs?: string; blocks?: unknown[] },
 ): { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } {
-  const args: { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } = {
+  return {
     channel: channelFromSpaceId(spaceId),
     text,
+    ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : {}),
+    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : {}),
   };
-  if (opts?.threadTs !== undefined) {
-    args.thread_ts = opts.threadTs;
-  }
-  if (opts?.blocks !== undefined) {
-    args.blocks = opts.blocks;
-  }
-  return args;
 }
 
 /**
@@ -256,7 +251,7 @@ export function createSlackAdapter(opts: {
     // token is bad. Socket-mode connect still authenticates via the app
     // token; auth failures surface as Bolt error events.
     tokenVerificationEnabled: false,
-    ...(opts.clientOptions !== undefined ? { clientOptions: opts.clientOptions } : {}),
+    clientOptions: opts.clientOptions,
   });
 
   registerMessageHandler(app, opts.onMessage);

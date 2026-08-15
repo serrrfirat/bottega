@@ -9,8 +9,8 @@ import { DenyRouter, type ApprovalRouter } from "../../policy/approval-router";
 import { loadSpacePolicy, parseOrgConfigYaml } from "../../policy/config";
 import { createAcpDriver, type AcpMcpServerEntry, type AcpPolicyContext } from "./acp-driver";
 import type { AgentSessionDriver } from "./agent-driver";
-import { SpaceService, type InboundMessage } from "../services/space-service";
-import type { SlackAdapter } from "../adapters/slack";
+import { SpaceService } from "../services/space-service";
+import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 import type { Store } from "../../store/db";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-acp-server.ts");
@@ -287,7 +287,7 @@ describe("acp driver", () => {
       transcriptDir: join(dir, "sessions"),
     });
     try {
-      const msg: InboundMessage = { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" };
+      const msg: SlackMessage = { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" };
       await service.handleInboundMessage(msg);
       const deadline = Date.now() + 3_000;
       // The driver emits turn_start (phrase) then message (final reply);

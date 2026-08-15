@@ -1,15 +1,8 @@
-import { createOmpSdkDriver, type AgentDriver, type AgentSessionDriver } from "../drivers/agent-driver";
+import type { AgentDriver, AgentSessionDriver } from "../drivers/agent-driver";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
-import { channelFromSpaceId, isDmChannel, type SlackAdapter } from "../adapters/slack";
-
-export interface InboundMessage {
-  spaceId: string;
-  principal: string;
-  text: string;
-  ts: string;
-}
+import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -19,8 +12,8 @@ export const DEFAULT_DIGEST_TIMEOUT_MS = 60_000;
 export interface SpaceServiceDeps {
   store: Store;
   adapter: SlackAdapter;
-  /** Session factory seam; defaults to the OMP SDK driver. */
-  driver?: AgentDriver;
+  /** Session factory seam. */
+  driver: AgentDriver;
   /** Idle timeout before a space's live session is disposed. Default 30 min. */
   idleTimeoutMs?: number;
   /** Directory for file-backed space transcripts. Default data/sessions. */
@@ -94,7 +87,7 @@ export class SpaceService {
   constructor(deps: SpaceServiceDeps) {
     this.#store = deps.store;
     this.#adapter = deps.adapter;
-    this.#driver = deps.driver ?? createOmpSdkDriver();
+    this.#driver = deps.driver;
     this.#idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.#transcriptDir = deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR;
     this.#memoryProvider = deps.memoryProvider;
@@ -102,7 +95,7 @@ export class SpaceService {
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
   }
 
-  async handleInboundMessage(msg: InboundMessage): Promise<void> {
+  async handleInboundMessage(msg: SlackMessage): Promise<void> {
     try {
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) {
@@ -191,6 +184,11 @@ export class SpaceService {
     } catch (err) {
       console.error(`[space-service] dispose failed for ${spaceId}:`, err);
     } finally {
+      // Session-scoped inbound state: no event can fire after dispose
+      // resolves (both drivers unsubscribe/kill), and the next inbound
+      // re-sets both maps.
+      this.#lastInboundTs.delete(spaceId);
+      this.#lastPrincipal.delete(spaceId);
       this.#pendingThinkingTs.delete(spaceId);
       this.#sessions.delete(spaceId);
     }

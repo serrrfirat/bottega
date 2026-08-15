@@ -2,8 +2,8 @@ import { describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, type InboundMessage } from "./space-service";
-import type { SlackAdapter } from "../adapters/slack";
+import { SpaceService, DIGEST_CAP } from "./space-service";
+import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests
@@ -190,7 +190,7 @@ function fakeStore(): {
   return { store, audit };
 }
 
-function msg(overrides: Partial<InboundMessage> = {}): InboundMessage {
+function msg(overrides: Partial<SlackMessage> = {}): SlackMessage {
   return { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1", ...overrides };
 }
 
