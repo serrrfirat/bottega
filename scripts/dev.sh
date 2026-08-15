@@ -24,4 +24,4 @@ if [[ -z "${NEAR_API_KEY:-}" ]] && command -v security >/dev/null 2>&1; then
   fi
 fi
 
-exec bun run "${1:+--watch}" src/server/index.ts
+exec bun run ${1:+--watch} src/server/index.ts
