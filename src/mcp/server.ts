@@ -61,6 +61,7 @@ import {
   toolAction,
   type Decision,
   type PolicyConfig,
+  type Tier,
 } from "../policy/config";
 import { createStore } from "../store/db";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
@@ -74,8 +75,6 @@ export interface MemoryMcpServerOptions {
   audit: Pick<AuditModule, "appendAudit">;
   /** Session space; recorded on audit rows. */
   spaceId?: string | null;
-  /** Actor recorded on policy.decision rows; defaults to "agent". */
-  actor?: string;
   /** Principal used for user-scope saves when the call omits `principal`. */
   defaultPrincipal?: string;
 }
@@ -96,6 +95,8 @@ function zodIssues(error: { message: string; issues: Array<{ message: string }> 
 interface GateResult {
   decision: Decision;
   reason: string;
+  /** The tool's capability tier, audited alongside the decision. */
+  tier: Tier;
   /** Non-null when the call must not run: the MCP error to throw. */
   error: McpError | null;
 }
@@ -107,20 +108,22 @@ interface GateResult {
  * the audit.
  */
 function gateTool(policy: PolicyConfig, tool: string): GateResult {
+  const tier = resolveTier(tool);
   if (!policy.ok) {
     const reason = `policy invalid: ${policy.errors[0] ?? "parse error"}`;
-    return { decision: "deny", reason, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
+    return { decision: "deny", reason, tier, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
   }
   const { decision, reason } = decideToolCall({
-    tier: resolveTier(tool),
+    tier,
     action: toolAction(policy, tool),
     toolKnown: isKnownTool(tool),
   });
-  if (decision === "allow") return { decision, reason, error: null };
-  if (decision === "deny") return { decision, reason, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
+  if (decision === "allow") return { decision, reason, tier, error: null };
+  if (decision === "deny") return { decision, reason, tier, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
   return {
     decision,
     reason,
+    tier,
     error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason} (headless MCP context has no approval channel — denied)`),
   };
 }
@@ -151,7 +154,7 @@ const searchJsonSchema = {
 } as const;
 
 export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
-  const actor = opts.actor ?? "agent";
+  const actor = "agent";
 
   /** Every tool call audits its policy decision, like the in-session gate. */
   const auditDecision = (
@@ -177,7 +180,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     }
     const args = parsed.data;
     const gate = gateTool(opts.policy, tool);
-    await auditDecision(tool, resolveTier(tool), gate.decision, gate.reason, args);
+    await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
     if (gate.error) throw gate.error;
 
     const principal = args.principal ?? opts.defaultPrincipal;
@@ -216,7 +219,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     }
     const args = parsed.data;
     const gate = gateTool(opts.policy, tool);
-    await auditDecision(tool, resolveTier(tool), gate.decision, gate.reason, args);
+    await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
     if (gate.error) throw gate.error;
 
     const query: MemorySearchQuery = {

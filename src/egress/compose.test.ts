@@ -1,29 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { parseYamlSubset, type YamlNode } from "../yaml-subset";
-
-const compose = parseYamlSubset(
-  readFileSync(resolve(import.meta.dir, "../../docker-compose.yml"), "utf8"),
-);
-
-const services = compose["services"] as Record<string, YamlNode>;
-const networks = compose["networks"] as Record<string, YamlNode>;
-const volumes = compose["volumes"] as Record<string, YamlNode>;
+import { networks, service, serviceDns, serviceEnv, services, volumes } from "../compose-test-utils";
+import type { YamlNode } from "../yaml-subset";
 
 const IRON_PROXY_IP = "172.30.0.2";
-
-function service(name: string): Record<string, YamlNode> {
-  return services[name] as Record<string, YamlNode>;
-}
-
-function serviceEnv(name: string): Record<string, YamlNode> {
-  return service(name)["environment"] as Record<string, YamlNode>;
-}
-
-function serviceDns(name: string): string[] {
-  return service(name)["dns"] as string[];
-}
 
 describe("docker-compose.yml (issue #8 egress topology)", () => {
   test("parses and declares the six services", () => {

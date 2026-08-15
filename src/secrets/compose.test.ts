@@ -2,21 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { parseYamlSubset, type YamlNode } from "../yaml-subset";
-
-const compose = parseYamlSubset(
-  readFileSync(resolve(import.meta.dir, "../../docker-compose.yml"), "utf8"),
-);
-
-const services = compose["services"] as Record<string, YamlNode>;
-
-function service(name: string): Record<string, YamlNode> {
-  return services[name] as Record<string, YamlNode>;
-}
-
-function serviceEnv(name: string): Record<string, YamlNode> {
-  return service(name)["environment"] as Record<string, YamlNode>;
-}
+import { service, serviceEnv, services } from "../compose-test-utils";
+import type { YamlNode } from "../yaml-subset";
 
 describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("no service publishes public ports", () => {

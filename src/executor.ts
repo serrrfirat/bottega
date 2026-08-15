@@ -61,8 +61,6 @@ export interface ExecutorDeps {
   orgConfigDir?: string;
   /** Claim-loop poll interval. Default 2000 ms. */
   pollIntervalMs?: number;
-  /** Stale TTL for boot recovery. Default 30 min. */
-  staleAfterMs?: number;
   /** Transcript dir passed to the driver (one JSONL per work item). Default data/transcripts. */
   transcriptDir?: string;
   /**
@@ -71,7 +69,6 @@ export interface ExecutorDeps {
    * executor logs the pending request and waits indefinitely.
    */
   onDelivery?: (item: WorkItem, delivery: DeliveryInfo) => Promise<DeliveryApproval | null>;
-  log?: (line: string) => void;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -90,14 +87,12 @@ interface ExecutorConfig {
   transcriptDir: string;
   tokenFile: string;
   askpassScript: string;
-  log: (line: string) => void;
 }
 
 /** Boot: resolve config, recover stale runs (#10), install the askpass helper. */
 export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfig> {
-  const log = deps.log ?? ((line: string) => console.log(line));
-  const cfg = resolveConfig(deps, log);
-  await recoverStaleWorkItems(deps.store, deps.staleAfterMs ?? DEFAULT_STALE_AFTER_MS);
+  const cfg = resolveConfig(deps);
+  await recoverStaleWorkItems(deps.store, DEFAULT_STALE_AFTER_MS);
   writeAskpassScript(cfg);
   return cfg;
 }
@@ -105,13 +100,13 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
 export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Promise<void> {
   const cfg = await prepareExecutor(deps);
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  cfg.log(`executor ready: allowlist ${cfg.repoAllowlist.join(", ") || "(empty — no pushes until configured)"}, workspaces ${cfg.workspacesDir}`);
+  console.log(`executor ready: allowlist ${cfg.repoAllowlist.join(", ") || "(empty — no pushes until configured)"}, workspaces ${cfg.workspacesDir}`);
   while (!signal?.aborted) {
     let item: WorkItem | null = null;
     try {
       item = await deps.store.claimNextWorkItem();
     } catch (err) {
-      cfg.log(`claim failed: ${(err as Error).message}`);
+      console.log(`claim failed: ${(err as Error).message}`);
       await sleep(pollIntervalMs);
       continue;
     }
@@ -130,7 +125,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     await deps.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
   } catch (err) {
     // Someone else moved the item between claim and start (e.g. aborted).
-    cfg.log(`[${item.id}] start failed (item no longer claimed): ${(err as Error).message}`);
+    console.log(`[${item.id}] start failed (item no longer claimed): ${(err as Error).message}`);
     return;
   }
   try {
@@ -142,7 +137,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
         evidence: "repo not specified — ask the requester",
         by: "executor",
       });
-      cfg.log(`[${item.id}] blocked: repo not specified`);
+      console.log(`[${item.id}] blocked: repo not specified`);
       return;
     }
     if (!cfg.repoAllowlist.includes(repo)) {
@@ -150,10 +145,10 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
         evidence: `repo "${repo}" is not on the executor allowlist (config/org.yml repos or EXECUTOR_REPOS)`,
         by: "executor",
       });
-      cfg.log(`[${item.id}] blocked: repo ${repo} not on the allowlist`);
+      console.log(`[${item.id}] blocked: repo ${repo} not on the allowlist`);
       return;
     }
-    cfg.log(`[${item.id}] working (${repo}, workspace ${workspace})`);
+    console.log(`[${item.id}] working (${repo}, workspace ${workspace})`);
     await setupWorkspace(cfg, item, repo, workspace);
     const summary = await runAgentSession(deps, cfg, item, workspace);
     await deliver(deps, cfg, item, workspace, summary);
@@ -163,7 +158,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     // Failure: the workspace is kept for forensics; the item is blocked
     // with evidence — never silently dropped.
     const message = err instanceof Error ? err.message : String(err);
-    cfg.log(`[${item.id}] blocked: ${message}`);
+    console.log(`[${item.id}] blocked: ${message}`);
     try {
       await deps.store.transitionWorkItem(item.id, "working", "blocked", {
         evidence: `executor failed: ${message.slice(0, 2000)}`,
@@ -184,7 +179,11 @@ async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string,
   mkdirSync(cfg.workspacesDir, { recursive: true });
   // Fresh per item: a crashed run may have left a checkout behind.
   rmSync(workspace, { recursive: true, force: true });
-  await git(["clone", `${cfg.gitBaseUrl}/${repo}.git`, workspace]);
+  // The askpass contract covers every authenticated git operation: cloning
+  // a private org repo needs the PAT just like the push does.
+  await git(["clone", `${cfg.gitBaseUrl}/${repo}.git`, workspace], {
+    env: { GIT_ASKPASS: cfg.askpassScript, EXECUTOR_GIT_TOKEN_FILE: cfg.tokenFile },
+  });
   await git(["checkout", "-b", `bottega/${item.id}`], { cwd: workspace });
   // Commit identity for the agent session's commits.
   await git(["config", "user.name", "bottega executor"], { cwd: workspace });
@@ -202,7 +201,7 @@ async function runAgentSession(
     transcriptDir: cfg.transcriptDir,
     cwd: workspace,
     allowTools: EXECUTOR_TOOLS,
-    onOutput: (_spaceId, text) => cfg.log(`[${item.id}] agent: ${text}`),
+    onOutput: (_spaceId, text) => console.log(`[${item.id}] agent: ${text}`),
   });
   let summary = "";
   let sessionError: Error | null = null;
@@ -250,7 +249,7 @@ async function deliver(
     env: { GIT_ASKPASS: cfg.askpassScript, EXECUTOR_GIT_TOKEN_FILE: cfg.tokenFile },
   });
   const prUrl = await openPullRequest(cfg, item, branch, token, summary);
-  cfg.log(`[${item.id}] PR opened: ${prUrl}`);
+  console.log(`[${item.id}] PR opened: ${prUrl}`);
 
   // Pending-approval marker (audit) — the space reads this to render the request.
   await deps.store.appendAudit({
@@ -262,7 +261,7 @@ async function deliver(
   const requestApproval =
     deps.onDelivery ??
     ((_item, delivery) => {
-      cfg.log(
+      console.log(
         `[${_item.id}] delivery approval pending for ${delivery.prUrl} — ` +
           "server onDelivery hook not wired (follow-up; see src/server TODO)",
       );
@@ -287,7 +286,7 @@ async function deliver(
     by: "executor",
   });
   await deps.store.transitionWorkItem(item.id, "review", "done", { result, by: "executor" });
-  cfg.log(`[${item.id}] delivered: ${prUrl}`);
+  console.log(`[${item.id}] delivered: ${prUrl}`);
 }
 
 async function openPullRequest(
@@ -370,7 +369,7 @@ function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string }
   return { repos: repos.filter((r) => /^[^/]+\/[^/]+$/.test(r)), gitBaseUrl };
 }
 
-function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): ExecutorConfig {
+function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   const { repos, gitBaseUrl } = loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
   const workspacesDir = process.env.WORKSPACES_DIR ?? (existsSync("/workspaces") ? "/workspaces" : "data/workspaces");
   const tokenFile = process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
@@ -385,7 +384,7 @@ function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): Executo
           "set BOTTEGA_ALLOW_LOOSE_PAT=1 to override for local dev only",
       );
     }
-    log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — BOTTEGA_ALLOW_LOOSE_PAT set, continuing`);
+    console.log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — BOTTEGA_ALLOW_LOOSE_PAT set, continuing`);
   }
   return {
     repoAllowlist: repos,
@@ -395,7 +394,6 @@ function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): Executo
     transcriptDir: deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR,
     tokenFile,
     askpassScript: join(dirname(tokenFile), ASKPASS_SCRIPT_NAME),
-    log,
   };
 }
 

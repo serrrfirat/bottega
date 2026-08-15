@@ -7,19 +7,14 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseYamlSubset, type YamlNode } from "./yaml-subset";
+import { service, services } from "./compose-test-utils";
+import { parseYamlSubset } from "./yaml-subset";
+import type { YamlNode } from "./yaml-subset";
 
 const ROOT = resolve(import.meta.dir, "..");
 
 function readRoot(name: string): string {
   return readFileSync(resolve(ROOT, name), "utf8");
-}
-
-const compose = parseYamlSubset(readRoot("docker-compose.yml"));
-const services = compose["services"] as Record<string, YamlNode>;
-
-function service(name: string): Record<string, YamlNode> {
-  return services[name] as Record<string, YamlNode>;
 }
 
 describe("docker-compose.yml deploy wiring (issue #12)", () => {

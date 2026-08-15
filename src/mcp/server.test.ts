@@ -10,7 +10,7 @@
  * session. No ports, no global state; each test cleans up its process, DB,
  * and temp dir.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -103,15 +103,9 @@ interface ToolCallResult {
 /** Org floor allowing both memory tools; the common case for conformance tests. */
 const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n";
 
-const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
-
 describe("MCP server conformance (spawned entrypoint)", () => {
   test("initialize + tools/list returns memory.save and memory.search with schemas", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       const { tools } = await h.client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual(["memory.save", "memory.search"]);
@@ -138,7 +132,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("tools/call memory.save writes an audit row with content_hash, never the content", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       const res = (await h.client.callTool({
         name: "memory.save",
@@ -173,7 +166,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("user-scope save requires and audits the principal; search scopes by principal", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       const res = await h.client.callTool({
         name: "memory.save",
@@ -193,7 +185,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("user-scope save without principal fails as an MCP error and saves nothing", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.save", arguments: { scope: "user", content: "orphaned" } }),
@@ -206,7 +197,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("empty content fails as an MCP error and saves nothing", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "   " } }),
@@ -219,7 +209,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("out-of-range limit fails as an MCP error", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.search", arguments: { scope: "org", query: "x", limit: 100 } }),
@@ -231,7 +220,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("unknown tool fails as an MCP error", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       await expect(h.client.callTool({ name: "memory.nonexistent", arguments: {} })).rejects.toThrow();
     } finally {
@@ -241,7 +229,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("search scopes org vs user and filters by principal", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
-    dirs.push(h.dir);
     try {
       await h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "alpha org fact" } });
       await h.client.callTool({ name: "memory.save", arguments: { scope: "user", principal: "U1", content: "alpha user fact" } });
@@ -264,7 +251,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
   test("defaultPrincipal from env applies to user-scope saves that omit principal", async () => {
     const h = await launch({ configYaml: ALLOW_ALL, defaultPrincipal: "U9" });
-    dirs.push(h.dir);
     try {
       const res = await h.client.callTool({ name: "memory.save", arguments: { scope: "user", content: "likes llamas" } });
       expect(res.isError).not.toBe(true);
@@ -281,7 +267,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 describe("MCP server policy + audit enforcement", () => {
   test("policy-denied call fails as an MCP error with no execution", async () => {
     const h = await launch({ configYaml: "tools:\n  memory.save: deny\n  memory.search: allow\n" });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "blocked" } }),
@@ -299,7 +284,6 @@ describe("MCP server policy + audit enforcement", () => {
 
   test("ask-human policy fails closed in the headless MCP context", async () => {
     const h = await launch({ configYaml: "tools:\n  memory.save: prompt\n  memory.search: allow\n" });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "needs approval" } }),
@@ -319,7 +303,6 @@ describe("MCP server policy + audit enforcement", () => {
       configYaml: ALLOW_ALL,
       policyJson: JSON.stringify({ tools: { "memory.save": "deny" } }),
     });
-    dirs.push(h.dir);
     try {
       await expect(
         h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "tightened" } }),
