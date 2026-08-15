@@ -1,4 +1,18 @@
 import { App, type AppOptions } from "@slack/bolt";
+// Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
+// WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
+// a call-time property read, so patching the exports object is effective).
+// Without this, Socket Mode connections die with "Failed to send ping".
+import undici from "undici";
+
+if (typeof (undici as { ping?: unknown }).ping !== "function") {
+  (undici as unknown as { ping: (ws: WebSocket, data?: Uint8Array) => void }).ping = (
+    ws,
+    data,
+  ) => {
+    (ws as WebSocket & { ping?: (d?: Uint8Array) => void }).ping?.(data);
+  };
+}
 
 /**
  * Protocol-only Slack adapter (Socket Mode).

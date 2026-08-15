@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-coding-agent": "^17.3.4",
-    "@slack/bolt": "^5.0.0"
+    "@slack/bolt": "^5.0.0",
+    "undici": "^8.10.0"
   }
 }
