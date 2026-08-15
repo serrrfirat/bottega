@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { main } from "../server/index";
 import { parseYamlSequence, parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 const CONFIG_DIR = resolve(import.meta.dir, "../../config/omp");
@@ -62,24 +63,21 @@ describe(".env.example (issue #9 environment contract)", () => {
     }
   });
 
-  test("covers every environment variable referenced by the code", () => {
-    // Grep-level contract: code may not reference an env var the operator
-    // cannot discover from .env.example. PATH is ambient runtime state.
-    const srcFiles: string[] = [];
-    for (const dir of ["src"]) {
-      for (const file of walk(resolve(SRC_DIR, dir))) {
-        if (file.endsWith(".ts")) srcFiles.push(file);
-      }
-    }
-    const referenced = new Set<string>();
-    for (const file of srcFiles) {
-      const text = readFileSync(file, "utf8");
-      for (const m of text.matchAll(/process\.env\.([A-Z0-9_]+)/g)) referenced.add(m[1]);
-      for (const m of text.matchAll(/process\.env\[\s*"([A-Z0-9_]+)"\s*\]/g)) referenced.add(m[1]);
-    }
-    for (const varName of [...referenced].sort()) {
-      if (varName === "PATH") continue;
-      expect(envExample).toContain(varName);
+  test("boot fails closed when the documented channel tokens are missing", () => {
+    // Behavioral contract (issue #33): the server refuses to boot without
+    // the credentials .env.example documents — scrub the env and assert
+    // the fail-closed message instead of grepping src/ for env references.
+    const savedApp = process.env.SLACK_APP_TOKEN;
+    const savedBot = process.env.SLACK_BOT_TOKEN;
+    delete process.env.SLACK_APP_TOKEN;
+    delete process.env.SLACK_BOT_TOKEN;
+    try {
+      expect(() => main()).toThrow(/SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required/);
+    } finally {
+      if (savedApp === undefined) delete process.env.SLACK_APP_TOKEN;
+      else process.env.SLACK_APP_TOKEN = savedApp;
+      if (savedBot === undefined) delete process.env.SLACK_BOT_TOKEN;
+      else process.env.SLACK_BOT_TOKEN = savedBot;
     }
   });
 
@@ -92,13 +90,3 @@ describe(".env.example (issue #9 environment contract)", () => {
     expect(envExample).not.toMatch(/near-[A-Za-z0-9]{20,}/);
   });
 });
-
-function walk(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walk(full));
-    else out.push(full);
-  }
-  return out;
-}

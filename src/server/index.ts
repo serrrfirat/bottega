@@ -9,7 +9,7 @@ import { loadOrgConfig } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
-import { createOmpSdkDriver } from "./agent-driver";
+import { createOmpSdkDriver, type AgentDriver } from "./agent-driver";
 import { startDeliveryPoller } from "./delivery-poller";
 import { createSlackAdapter } from "./slack";
 import { SpaceService } from "./space-service";
@@ -29,7 +29,16 @@ export interface BottegaServer {
   stop(): Promise<void>;
 }
 
-export function main(): BottegaServer {
+export interface BottegaServerOpts {
+  /**
+   * Driver factory seam (issue #33): receives the resolved agent dir so
+   * tests can observe at runtime which directory the server hands the
+   * driver. Defaults to the OMP SDK driver with the project extensions.
+   */
+  createDriver?: (agentDir: string) => AgentDriver;
+}
+
+export function main(opts: BottegaServerOpts = {}): BottegaServer {
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {
@@ -44,16 +53,20 @@ export function main(): BottegaServer {
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
   // DenyRouter until the Slack-backed approval router lands (later issue):
   // until then, exec-tier tool calls are blocked server-side, never run.
-  const driver = createOmpSdkDriver({
-    agentDir: OMP_AGENT_DIR,
-    extensions: [
-      createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
-      workItemsExtension(store, { orgPolicy }),
-      // Memory tools (issue #22): the SQLite provider shares the store's
-      // database handle; every save is audited via the policy audit module.
-      memoryToolsExtension(createSqliteMemoryProvider(store.getDb()), { audit }),
-    ],
-  });
+  const createDriver =
+    opts.createDriver ??
+    ((agentDir: string) =>
+      createOmpSdkDriver({
+        agentDir,
+        extensions: [
+          createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
+          workItemsExtension(store, { orgPolicy }),
+          // Memory tools (issue #22): the SQLite provider shares the store's
+          // database handle; every save is audited via the policy audit module.
+          memoryToolsExtension(createSqliteMemoryProvider(store.getDb()), { audit }),
+        ],
+      }));
+  const driver = createDriver(OMP_AGENT_DIR);
   // The adapter routes inbound messages to the service; the service posts
   // replies back through the adapter. Late-bound: no message can arrive
   // before main() returns, so the closure read is always initialized.
