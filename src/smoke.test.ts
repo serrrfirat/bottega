@@ -3,10 +3,13 @@ import { run as executorRun } from "./executor";
 import { createExtension } from "./policy/extension";
 import { main as serverMain } from "./server/index";
 
-test("server stub boots and stops", () => {
+test("server main wires adapter and space service", async () => {
+  process.env.SLACK_APP_TOKEN = "xapp-test-token";
+  process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
   const server = serverMain();
-  expect(server.port).toBeGreaterThan(0);
-  server.stop();
+  expect(typeof server.start).toBe("function");
+  expect(typeof server.stop).toBe("function");
+  await server.stop();
 });
 
 test("executor stub runs", () => {

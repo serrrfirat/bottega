@@ -13,6 +13,7 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "^17.3.4",
     "@slack/bolt": "^5.0.0"
   }
 }
