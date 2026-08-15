@@ -2,7 +2,8 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { createStore } from "../store/db";
-import { createSqliteMemoryProvider, pruneDigestMemories } from "../memory/sqlite";
+import { pruneDigestMemories } from "../memory/sqlite";
+import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { loadOrgConfig } from "../policy/config";
@@ -48,9 +49,11 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   const store = createStore();
   const audit = createAudit(store);
   const orgPolicy = loadOrgConfig();
-  // One SQLite memory provider for the whole process: shared by the agent
+  // One memory provider for the whole process: shared by the agent
   // memory tools, the context-injection extension, and digest-on-idle (#42).
-  const memoryProvider = createSqliteMemoryProvider(store.getDb());
+  // Chosen from env (#43): MEM0_BASE_URL set → mem0 backend (compose ships
+  // it), else SQLite sharing the store's database handle.
+  const memoryProvider = resolveMemoryProvider(process.env, store.getDb());
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
@@ -64,8 +67,10 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         extensions: [
           createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
           workItemsExtension(store, { orgPolicy }),
-          // Memory tools (issue #22): the SQLite provider shares the store's
-          // database handle; every save is audited via the policy audit module.
+          // Memory tools (issue #22, #43): provider chosen from env —
+          // MEM0_BASE_URL set → mem0 backend (compose ships it), else SQLite
+          // sharing the store's database handle. Every save is audited via
+          // the policy audit module.
           memoryToolsExtension(memoryProvider, { audit }),
         ],
         // Turn-start memory injection (#42), gated by the org policy config.

@@ -102,6 +102,21 @@ services:
     networks:
       - egress
 
+  mem0:
+    # Memory backend (issue #43): self-hosted mem0 OSS REST server. Pinned to
+    # `latest` — Docker Hub publishes only that tag for mem0/mem0-api-server
+    # at implementation time; the mem0 client's docker leg uses the same tag
+    # (src/memory/mem0.test.ts). The OSS server's embedder/extractor needs an
+    # LLM key at boot (crashes with "api_key client option must be set"
+    # without one), so OPENAI_API_KEY is passed through from the project .env
+    # (fail-closed: without it the container won't boot).
+    image: mem0/mem0-api-server:latest
+    restart: on-failure
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    networks:
+      - egress
+
   server:
     # App image built from the repo root (Dockerfile): the server and the
     # executor share it and differ only in entrypoint. BOTTEGA_IMAGE_TAG
@@ -121,9 +136,10 @@ services:
     environment:
       HTTP_PROXY: http://iron-proxy:8080
       HTTPS_PROXY: http://iron-proxy:8080
-      # auth-broker/auth-gateway are internal names: broker-mode traffic
-      # must bypass the proxy (the allowlist would 403 it).
-      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway
+      # auth-broker/auth-gateway/mem0 are internal names: broker-mode traffic
+      # and memory-backend calls must bypass the proxy (the allowlist would
+      # 403 them).
+      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0
       # Credential boundary (issue #9): model keys resolve through the
       # broker, not from env. OMP_AUTH_BROKER_TOKEN is copied into .env
       # from the broker's first-boot token on the data volume
@@ -131,6 +147,12 @@ services:
       # URL set with no token aborts at first credential resolution.
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
+      # Memory backend (issue #43): MEM0_BASE_URL defaults to the internal
+      # mem0 service so a deployment starts memory on mem0 out of the box;
+      # unset it to fall back to SQLite. MEM0_API_KEY is optional (the OSS
+      # server only demands a key when its auth is enabled).
+      MEM0_BASE_URL: ${MEM0_BASE_URL:-http://mem0:8000}
+      MEM0_API_KEY: ${MEM0_API_KEY:-}
     volumes:
       # The app resolves its store/sessions/transcripts from the relative
       # path data/ (WORKDIR /app) — the shared volume mounts there.

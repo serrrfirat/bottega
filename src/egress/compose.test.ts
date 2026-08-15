@@ -26,12 +26,13 @@ function serviceDns(name: string): string[] {
 }
 
 describe("docker-compose.yml (issue #8 egress topology)", () => {
-  test("parses and declares the five services", () => {
+  test("parses and declares the six services", () => {
     expect(Object.keys(services).sort()).toEqual([
       "auth-broker",
       "auth-gateway",
       "executor",
       "iron-proxy",
+      "mem0",
       "server",
     ]);
   });
@@ -70,19 +71,29 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     }
   });
 
-  test("NO_PROXY covers internal names (localhost, loopback, data, auth services)", () => {
+  test("NO_PROXY covers internal names (localhost, loopback, data, auth services, mem0)", () => {
     // auth-broker/auth-gateway joined in issue #9: broker-mode traffic is
     // internal and must bypass the proxy (the allowlist would 403 it).
-    for (const name of ["server", "executor"]) {
-      const noProxy = serviceEnv(name)["NO_PROXY"] as string;
-      expect(noProxy.split(",")).toEqual([
-        "localhost",
-        "127.0.0.1",
-        "data",
-        "auth-broker",
-        "auth-gateway",
-      ]);
-    }
+    // mem0 joined in issue #43: the memory backend is internal too, so the
+    // server bypasses the proxy for it as well. The executor has no memory
+    // tools and keeps the original list.
+    const serverNoProxy = serviceEnv("server")["NO_PROXY"] as string;
+    expect(serverNoProxy.split(",")).toEqual([
+      "localhost",
+      "127.0.0.1",
+      "data",
+      "auth-broker",
+      "auth-gateway",
+      "mem0",
+    ]);
+    const executorNoProxy = serviceEnv("executor")["NO_PROXY"] as string;
+    expect(executorNoProxy.split(",")).toEqual([
+      "localhost",
+      "127.0.0.1",
+      "data",
+      "auth-broker",
+      "auth-gateway",
+    ]);
   });
 
   test("executor is declared but gated behind a profile until #11", () => {
@@ -108,5 +119,29 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       const vol = service(name)["volumes"] as string[];
       expect(vol).toContain("data:/app/data");
     }
+  });
+});
+
+describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
+  test("mem0 runs the pinned OSS server image on the internal network only", () => {
+    const mem0 = service("mem0");
+    expect(mem0["image"]).toBe("mem0/mem0-api-server:latest");
+    expect(mem0["ports"]).toBeUndefined();
+    // Internal service: on the egress network with no published ports.
+    expect((mem0["networks"] as string[]).includes("egress")).toBe(true);
+  });
+
+  test("mem0 passes OPENAI_API_KEY through from the project .env (fail-closed boot)", () => {
+    const env = serviceEnv("mem0");
+    // The OSS server's embedder/extractor requires an LLM key at boot
+    // ("api_key client option must be set" without one) — passthrough keeps
+    // the key out of the repo and fails closed when unset.
+    expect(env["OPENAI_API_KEY"]).toBe("${OPENAI_API_KEY:-}");
+  });
+
+  test("server defaults memory to the internal mem0 URL (SQLite fallback when unset)", () => {
+    const env = serviceEnv("server");
+    expect(env["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL:-http://mem0:8000}");
+    expect(env["MEM0_API_KEY"]).toBe("${MEM0_API_KEY:-}");
   });
 });
