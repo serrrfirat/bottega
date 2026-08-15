@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { createAcpDriver } from "./acp-driver";
+import { join, resolve } from "node:path";
+import { createAcpDriver, type AcpMcpServerEntry } from "./acp-driver";
 import type { AgentSessionDriver } from "./agent-driver";
 import { SpaceService, type InboundMessage } from "./space-service";
 import type { SlackAdapter } from "./slack";
@@ -24,13 +24,17 @@ interface Harness {
   waitForLog: (needle: string, timeoutMs?: number) => Promise<void>;
 }
 
-async function launch(scenario: string, opts: { sessionTimeoutMs?: number } = {}): Promise<Harness> {
+async function launch(
+  scenario: string,
+  opts: { sessionTimeoutMs?: number; mcpServers?: AcpMcpServerEntry[] } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "acp-driver-"));
   const logfile = join(dir, "server.log");
   const driver = createAcpDriver({
     command: "bun",
     args: ["run", FIXTURE, scenario, logfile],
     sessionTimeoutMs: opts.sessionTimeoutMs ?? 5_000,
+    mcpServers: opts.mcpServers,
   });
   const events = { message: [], turn_start: [], turn_end: [], error: [] } as Harness["events"];
   const outputs: string[] = [];
@@ -157,6 +161,54 @@ describe("acp driver", () => {
       // The fake server exits cleanly after session/close; give it a beat.
       await new Promise((r) => setTimeout(r, 100));
     } finally {
+      h.cleanup();
+    }
+  });
+
+  test("session/new sends mcpServers as an empty array when none are configured", async () => {
+    const h = await launch("happy");
+    try {
+      await h.waitForLog('"method":"session/new"');
+      // omp crashes on a missing mcpServers field (issue #18), so the driver
+      // must always send an explicit empty list.
+      expect(readFileSync(h.logfile, "utf8")).toContain('"mcpServers":[]');
+    } finally {
+      await h.session.dispose();
+      h.cleanup();
+    }
+  });
+
+  test("session/new carries configured mcpServers with per-session env", async () => {
+    const h = await launch("happy", {
+      mcpServers: [
+        {
+          name: "bottega",
+          command: "/usr/local/bin/bun",
+          args: ["run", "/repo/src/mcp/server.ts"],
+          env: { BOTTEGA_DB_PATH: "data/bottega.db", BOTTEGA_CONFIG_DIR: "config", CUSTOM: "x" },
+        },
+      ],
+    });
+    try {
+      await h.waitForLog('"method":"session/new"');
+      const log = readFileSync(h.logfile, "utf8");
+      // The ACP stdio MCP server shape: name + command + args + env pairs.
+      expect(log).toContain('"name":"bottega"');
+      expect(log).toContain('"type":"stdio"');
+      expect(log).toContain('"command":"/usr/local/bin/bun"');
+      expect(log).toContain('"args":["run","/repo/src/mcp/server.ts"]');
+      expect(log).toContain('"name":"CUSTOM","value":"x"');
+      // The session's space id is injected per-session so the MCP server can
+      // enforce the space's policy overlay and scope its audit rows.
+      expect(log).toContain('"name":"BOTTEGA_SPACE_ID","value":"slack:C1"');
+      // Path env vars are absolutized: the MCP server process is spawned by
+      // the agent with the session cwd, so a relative DB path would silently
+      // resolve against the wrong directory.
+      expect(log).toContain(resolve(process.cwd(), "data/bottega.db"));
+      expect(log).not.toContain('"value":"data/bottega.db"');
+      expect(log).toContain(resolve(process.cwd(), "config"));
+    } finally {
+      await h.session.dispose();
       h.cleanup();
     }
   });

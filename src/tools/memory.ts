@@ -108,7 +108,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
 }
 
 /** SHA-256 hex digest: the audit stores the hash of saved content, never the content. */
-function sha256Hex(text: string): string {
+export function sha256Hex(text: string): string {
   const hasher = new Bun.CryptoHasher("sha256");
   hasher.update(text);
   return hasher.digest("hex");

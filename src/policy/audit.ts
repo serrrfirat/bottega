@@ -12,10 +12,11 @@ export const TRUNCATION_MARKER = "\n...[truncated]";
  */
 export function redact(text: string): string {
   let out = text;
-  // Slack tokens: xoxb / xoxa / xoxp / xoxr / xoxs.
-  out = out.replace(/xox[baprs]-[0-9a-zA-Z-]+/g, "[REDACTED]");
+  // Slack tokens: xoxb / xoxa / xoxp / xoxr / xoxs (anchored so the "sk-"
+  // / "xox"-style shapes only redact real tokens, not words like "ask-human").
+  out = out.replace(/(?<![A-Za-z0-9])xox[baprs]-[0-9a-zA-Z-]+/g, "[REDACTED]");
   // OpenAI/Anthropic-style API keys (sk-... and sk-ant-...).
-  out = out.replace(/sk-[A-Za-z0-9-]+/g, "sk-[REDACTED]");
+  out = out.replace(/(?<![A-Za-z0-9])sk-[A-Za-z0-9-]+/g, "sk-[REDACTED]");
   // AWS access key ids.
   out = out.replace(/AKIA[0-9A-Z]{16}/g, "[REDACTED]");
   // GitHub fine-grained PATs.

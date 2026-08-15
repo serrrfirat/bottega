@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./agent-driver";
 
@@ -17,6 +18,16 @@ import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./agent-
  * terminal/*, elicitation/*) are answered with JSON-RPC method-not-found —
  * transport only; policy routing is issue #6.
  */
+export interface AcpMcpServerEntry {
+  /** Advertised to the agent; becomes the MCP tool prefix (e.g. `bottega`). */
+  name: string;
+  /** Stdio transport: the command the agent spawns (absolute path recommended). */
+  command: string;
+  args?: string[];
+  /** Extra env for the spawned MCP server process (BOTTEGA_DB_PATH, ...). */
+  env?: Record<string, string>;
+}
+
 export interface AcpDriverOptions {
   /** ACP server executable. Default "omp". */
   command?: string;
@@ -24,6 +35,15 @@ export interface AcpDriverOptions {
   args?: string[];
   /** Milliseconds to wait for the initialize + session/new handshake. Default 30s. */
   sessionTimeoutMs?: number;
+  /**
+   * MCP servers advertised in session/new's `mcpServers` field (issue #25).
+   * Each entry is sent with `type: "stdio"`; the driver injects the
+   * session's space id as `BOTTEGA_SPACE_ID` per session and absolutizes
+   * relative `BOTTEGA_DB_PATH` / `BOTTEGA_CONFIG_DIR` values, because the
+   * spawned MCP server process runs with the agent's session cwd.
+   * Default: [] — omp crashes on a missing field (issue #18).
+   */
+  mcpServers?: AcpMcpServerEntry[];
 }
 
 export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
@@ -33,7 +53,7 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
   return {
     async createSession({ spaceId, transcriptDir, onOutput }) {
       mkdirSync(transcriptDir, { recursive: true });
-      const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput });
+      const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput, mcpServers: opts.mcpServers });
       await session.start();
       return session;
     },
@@ -43,6 +63,22 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
 const PROTOCOL_VERSION = 1;
 const METHOD_NOT_FOUND = -32601;
 const DISPOSE_CLOSE_TIMEOUT_MS = 2_000;
+
+/**
+ * ACP's stdio MCP server shape takes env as name/value pairs, and the
+ * spawned MCP server process runs with the *agent session's* cwd — not
+ * bottega's. Path env vars the MCP server consumes are therefore
+ * absolutized here so a relative BOTTEGA_DB_PATH cannot silently resolve
+ * against the wrong directory.
+ */
+function toEnvPairs(env: Record<string, string>): Array<{ name: string; value: string }> {
+  const absolutize: Record<string, string> = {};
+  for (const key of ["BOTTEGA_DB_PATH", "BOTTEGA_CONFIG_DIR"]) {
+    const value = env[key];
+    if (value && !isAbsolute(value)) absolutize[key] = resolve(process.cwd(), value);
+  }
+  return Object.entries({ ...env, ...absolutize }).map(([name, value]) => ({ name, value }));
+}
 
 type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
 
@@ -59,6 +95,14 @@ class AcpSessionDriver implements AgentSessionDriver {
   readonly #sessionTimeoutMs: number;
   readonly #onOutput: (spaceId: string, text: string) => void;
   readonly #listeners = new Map<DriverEvent, Set<(data: unknown) => void>>();
+  /** ACP-shaped mcpServers entries (session/new payload), space id injected. */
+  readonly #mcpServers: Array<{
+    name: string;
+    type: "stdio";
+    command: string;
+    args?: string[];
+    env: Array<{ name: string; value: string }>;
+  }>;
 
   #child: ChildProcess | null = null;
   #sessionId: string | null = null;
@@ -79,12 +123,27 @@ class AcpSessionDriver implements AgentSessionDriver {
     args: string[];
     sessionTimeoutMs: number;
     onOutput: (spaceId: string, text: string) => void;
+    mcpServers?: AcpMcpServerEntry[];
   }) {
     this.#spaceId = deps.spaceId;
     this.#command = deps.command;
     this.#args = deps.args;
     this.#sessionTimeoutMs = deps.sessionTimeoutMs;
     this.#onOutput = deps.onOutput;
+    // The MCP server process is spawned by the agent with the session cwd,
+    // so the space id is injected per session and path env vars are
+    // absolutized here (see toEnvPairs).
+    this.#mcpServers = (deps.mcpServers ?? []).map((s) => {
+      const env = toEnvPairs({ ...s.env, BOTTEGA_SPACE_ID: deps.spaceId });
+      const entry: { name: string; type: "stdio"; command: string; args?: string[]; env: typeof env } = {
+        name: s.name,
+        type: "stdio",
+        command: s.command,
+        env,
+      };
+      if (s.args) entry.args = s.args;
+      return entry;
+    });
   }
 
   /** Spawn the agent child and complete the initialize + session/new handshake. */
@@ -114,7 +173,7 @@ class AcpSessionDriver implements AgentSessionDriver {
       // unconditionally: when the field is absent it crashes with
       // -32603 "undefined is not an object (evaluating 'n.length')" and may
       // never respond, so always send an explicit empty list (issue #17/#18).
-      const created = await this.#request("session/new", { cwd: process.cwd(), mcpServers: [] });
+      const created = await this.#request("session/new", { cwd: process.cwd(), mcpServers: this.#mcpServers });
       const sessionId = (created as { sessionId?: unknown } | null)?.sessionId;
       if (typeof sessionId !== "string" || !sessionId) {
         throw new Error("ACP agent returned no sessionId from session/new");
