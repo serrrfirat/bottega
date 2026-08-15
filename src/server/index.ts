@@ -58,6 +58,11 @@ export function main(): BottegaServer {
     onMessage: (m) => spaceService.handleInboundMessage(m),
   });
   spaceService = new SpaceService({ store, adapter, driver });
+  // TODO(issue #11 follow-up): wire the executor's delivery approval seam —
+  // runExecutor({ store, driver, onDelivery }) posts the PR + approval
+  // request to the space channel when a work item reaches delivery_pending;
+  // the human's decision resolves the seam (working → review → done). The
+  // executor container documents this contract in src/executor.ts.
 
   return {
     async start() {

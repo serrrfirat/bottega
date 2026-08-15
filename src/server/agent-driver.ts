@@ -29,6 +29,10 @@ export interface AgentDriver {
     spaceId: string;
     transcriptDir: string;
     onOutput: (spaceId: string, text: string) => void;
+    /** Working directory for the session (e.g. a work-item workspace). Defaults to process.cwd(). */
+    cwd?: string;
+    /** Tool allowlist override; defaults to the space-agent allowlist. */
+    allowTools?: readonly string[];
   }): Promise<AgentSessionDriver>;
 }
 
@@ -67,20 +71,20 @@ const SPACE_AGENT_TOOLS = [
  */
 export function createOmpSdkDriver(opts: { agentDir?: string; extensions?: ExtensionFactory[] } = {}): AgentDriver {
   return {
-    async createSession({ spaceId, transcriptDir, onOutput }) {
+    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools }) {
       mkdirSync(transcriptDir, { recursive: true });
-      const cwd = process.cwd();
-      const sessionManager = SessionManager.create(cwd, transcriptDir);
+      const sessionCwd = cwd ?? process.cwd();
+      const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
       // Missing/empty files start fresh; existing files resume the space's
       // transcript (server restarts keep history intact).
       await sessionManager.setSessionFile(sessionFilePath(transcriptDir, spaceId));
       const { session } = await createAgentSession({
-        cwd,
+        cwd: sessionCwd,
         agentDir: opts.agentDir,
         sessionManager,
         agentRegistry: new AgentRegistry(),
         restrictToolNames: true,
-        toolNames: [...SPACE_AGENT_TOOLS],
+        toolNames: allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS],
         // Extension seam: policy + audit extensions plug in here (#6/#7).
         extensions: opts.extensions ?? [],
       });

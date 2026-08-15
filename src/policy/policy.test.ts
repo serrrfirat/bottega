@@ -234,7 +234,12 @@ describe("policy extension wiring", () => {
     return { handlers, pi };
   }
 
-  function makeExtension(orgYaml: string, router: ApprovalRouter = DenyRouter, timeoutMs?: number): Map<string, ToolCallHandler> {
+  function makeExtension(
+    orgYaml: string,
+    router: ApprovalRouter = DenyRouter,
+    timeoutMs?: number,
+    preApproved = false,
+  ): Map<string, ToolCallHandler> {
     const { handlers, pi } = fakePi();
     createPolicyExtension({
       orgPolicy: parseOrgConfigYaml(orgYaml),
@@ -242,6 +247,7 @@ describe("policy extension wiring", () => {
       router,
       store,
       timeoutMs,
+      preApproved,
     })(pi);
     return handlers;
   }
@@ -330,6 +336,40 @@ describe("policy extension wiring", () => {
 
   test("exec-tier ask-human: DenyRouter blocks (headless)", async () => {
     const handlers = makeExtension("tools:\n  bash: allow\n");
+    const res = await call(handlers, "bash", { command: "ls" });
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
+  });
+
+  test("preApproved session: exec-tier allowlist tools run without a human prompt", async () => {
+    const approvalsBefore = (await audit.listAudit({ event_type: "approval.requested" })).length;
+    const handlers = makeExtension("tools:\n  bash: allow\n", DenyRouter, undefined, true);
+    const res = await call(handlers, "bash", { command: "ls" });
+    expect(res).toBeUndefined();
+    const decision = await lastAudit("policy.decision");
+    expect(decision).toMatchObject({ tool: "bash", tier: "exec", decision: "allow" });
+    expect(String(decision.reason)).toContain("pre-approved");
+    // No approval round-trip happened: the audit table did not grow.
+    expect(await audit.listAudit({ event_type: "approval.requested" })).toHaveLength(approvalsBefore);
+  });
+
+  test("preApproved session: unknown tools still deny", async () => {
+    const handlers = makeExtension("tools:\n  unknown: allow\n", DenyRouter, undefined, true);
+    const res = await call(handlers, "some_new_tool", {});
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    expect(await lastAudit("policy.decision")).toMatchObject({ tool: "some_new_tool", decision: "deny" });
+  });
+
+  test("preApproved session: an explicit policy prompt still asks a human", async () => {
+    const handlers = makeExtension("tools:\n  bash: prompt\n", DenyRouter, undefined, true);
     const res = await call(handlers, "bash", { command: "ls" });
     if (typeof res === "object" && res !== null) {
       expect(res.block).toBe(true);

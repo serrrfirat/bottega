@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { run as executorRun } from "./executor";
+import { EXECUTOR_TOOLS, prepareExecutor, runExecutor } from "./executor";
 import { DenyRouter } from "./policy/approval-router";
 import { defaultPolicy } from "./policy/config";
 import createPolicyExtension from "./policy/extension";
@@ -15,8 +15,10 @@ test("server main wires adapter and space service", async () => {
   await server.stop();
 });
 
-test("executor stub runs", () => {
-  expect(executorRun()).toBeUndefined();
+test("executor exposes the claim-loop runner and the work tool allowlist", () => {
+  expect(typeof runExecutor).toBe("function");
+  expect(typeof prepareExecutor).toBe("function");
+  expect(EXECUTOR_TOOLS).toEqual(["read", "write", "glob", "grep", "bash"]);
 });
 
 test("policy extension factory registers a tool_call gate", () => {

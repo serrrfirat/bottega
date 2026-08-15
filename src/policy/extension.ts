@@ -40,6 +40,13 @@ export interface PolicyExtensionDeps {
   timeoutMs?: number;
   /** Actor recorded on audit rows; defaults to "agent". */
   actor?: string;
+  /**
+   * Executor-session context (issue #11): the work item's pickup approval IS
+   * the authorization, so exec-tier tools the policy allows run without a
+   * further human prompt. Unknown tools still deny and every decision still
+   * audits; an explicit policy `prompt`/`deny` is never bypassed.
+   */
+  preApproved?: boolean;
 }
 
 /** Cap for the args summary embedded in policy.decision rows (appendAudit redacts + caps too). */
@@ -63,7 +70,7 @@ async function gateToolCall(
     const policy = await policyFor(deps, spaceId);
     const tool = event.toolName;
     const tier = resolveTier(tool);
-    const { decision, reason } = decide(policy, tool, tier);
+    const { decision, reason } = decide(policy, tool, tier, deps.preApproved ?? false);
 
     await deps.audit.appendAudit({
       space_id: spaceId ?? null,
@@ -89,9 +96,22 @@ async function gateToolCall(
   }
 }
 
-function decide(policy: PolicyConfig, tool: string, tier: Tier): { decision: Decision; reason: string } {
+function decide(
+  policy: PolicyConfig,
+  tool: string,
+  tier: Tier,
+  preApproved: boolean,
+): { decision: Decision; reason: string } {
   if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}` };
-  return decideToolCall({ tier, action: toolAction(policy, tool), toolKnown: isKnownTool(tool) });
+  const action = toolAction(policy, tool);
+  // Pre-approved executor session (issue #11): an exec-tier tool the policy
+  // allows needs no further human prompt — the work item's pickup approval
+  // already authorized it. Explicit prompt/deny and unknown tools are never
+  // bypassed.
+  if (preApproved && isKnownTool(tool) && tier === "exec" && action === "allow") {
+    return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)" };
+  }
+  return decideToolCall({ tier, action, toolKnown: isKnownTool(tool) });
 }
 
 async function policyFor(deps: PolicyExtensionDeps, spaceId: string | undefined): Promise<PolicyConfig> {

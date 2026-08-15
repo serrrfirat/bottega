@@ -128,11 +128,19 @@ services:
       - egress
 
   executor:
-    # Work-item runner. Declared now with its runtime image so the egress
-    # topology validates; real image + entrypoint arrive in #11.
+    # Work-item runner (issue #11): same image as the server, different
+    # entrypoint. Claims open work items, runs one agent session per item in
+    # a fresh workspace (data:/workspaces), pushes bottega/<id> branches and
+    # opens PRs through the GitHub API. The git PAT is read from a FILE on
+    # the data volume (/data/secrets/github-pat, mode 0600) — the executor
+    # env carries no keys, tokens, or PATs (credential boundary, issue #9).
     profiles:
       - executor
     image: oven/bun:1
+    entrypoint:
+      - "bun"
+      - "run"
+      - "src/executor.ts"
     depends_on:
       - iron-proxy
     dns:
@@ -143,11 +151,15 @@ services:
       NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway
       # Credential boundary (issue #9): the executor env carries NO provider
       # keys, channel tokens, or PATs — credentials resolve through the
-      # broker at request time (git auth via the vault, #11 mechanism).
+      # broker at request time (git auth via the PAT file, #11).
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
+      # Workspaces + git credentials live on the data volume.
+      WORKSPACES_DIR: /workspaces
+      EXECUTOR_GIT_TOKEN_FILE: /data/secrets/github-pat
     volumes:
       - data:/data
+      - data:/workspaces
       - ./config/omp:/data/omp-agent
     networks:
       - egress
