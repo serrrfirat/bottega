@@ -36,6 +36,33 @@ export interface AgentDriver {
   }): Promise<AgentSessionDriver>;
 }
 
+/** Events the session drivers emit; both drivers share this vocabulary. */
+export type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
+
+/**
+ * The listener plumbing behind {@link AgentSessionDriver.on} (issue #33).
+ * The OMP and ACP drivers share identical event semantics, so the emitter
+ * lives here once: typed by event name, idempotent `on` (a listener
+ * registers once), and unsubscribe-by-closure.
+ */
+export function createEmitter<Event extends string>() {
+  const listeners = new Map<Event, Set<(data: unknown) => void>>();
+  return {
+    on(event: Event, cb: (data: unknown) => void): () => void {
+      let set = listeners.get(event);
+      if (!set) {
+        set = new Set();
+        listeners.set(event, set);
+      }
+      set.add(cb);
+      return () => set.delete(cb);
+    },
+    emit(event: Event, data: unknown): void {
+      for (const cb of listeners.get(event) ?? []) cb(data);
+    },
+  };
+}
+
 /** Transcript file for a space: `<transcriptDir>/<space-id>.jsonl` (`:` is legal in POSIX filenames). */
 export function sessionFilePath(transcriptDir: string, spaceId: string): string {
   return join(transcriptDir, `${spaceId}.jsonl`);
@@ -108,13 +135,11 @@ export function createOmpSdkDriver(opts: { agentDir?: string; extensions?: Exten
   };
 }
 
-type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
-
 class OmpSessionDriver implements AgentSessionDriver {
   readonly #spaceId: string;
   readonly #session: AgentSession;
   readonly #onOutput: (spaceId: string, text: string) => void;
-  readonly #listeners = new Map<DriverEvent, Set<(data: unknown) => void>>();
+  readonly #emitter = createEmitter<DriverEvent>();
   #textByIndex = new Map<number, string>();
   #unsubscribe: () => void;
 
@@ -148,13 +173,13 @@ class OmpSessionDriver implements AgentSessionDriver {
           break;
         }
         case "turn_start":
-          this.#emit("turn_start", { spaceId: deps.spaceId });
+          this.#emitter.emit("turn_start", { spaceId: deps.spaceId });
           break;
         case "turn_end":
-          this.#emit("turn_end", { spaceId: deps.spaceId });
+          this.#emitter.emit("turn_end", { spaceId: deps.spaceId });
           break;
         case "notice":
-          if (event.level === "error") this.#emit("error", { spaceId: deps.spaceId, message: event.message });
+          if (event.level === "error") this.#emitter.emit("error", { spaceId: deps.spaceId, message: event.message });
           break;
         default:
           break;
@@ -184,13 +209,7 @@ class OmpSessionDriver implements AgentSessionDriver {
   }
 
   on(event: DriverEvent, cb: (data: unknown) => void): () => void {
-    let set = this.#listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this.#listeners.set(event, set);
-    }
-    set.add(cb);
-    return () => set.delete(cb);
+    return this.#emitter.on(event, cb);
   }
 
   async dispose(): Promise<void> {
@@ -202,10 +221,6 @@ class OmpSessionDriver implements AgentSessionDriver {
   #deliver(text: string): void {
     // onOutput and the "message" event are the same signal: consume one channel.
     this.#onOutput(this.#spaceId, text);
-    this.#emit("message", { spaceId: this.#spaceId, text });
-  }
-
-  #emit(event: DriverEvent, data: unknown): void {
-    for (const cb of this.#listeners.get(event) ?? []) cb(data);
+    this.#emitter.emit("message", { spaceId: this.#spaceId, text });
   }
 }

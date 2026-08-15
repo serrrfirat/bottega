@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./agent-driver";
+import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions, type DriverEvent } from "./agent-driver";
 
 /**
  * ACP (Agent Client Protocol) driver — the second AgentDriver implementation.
@@ -79,9 +79,6 @@ function toEnvPairs(env: Record<string, string>): Array<{ name: string; value: s
   }
   return Object.entries({ ...env, ...absolutize }).map(([name, value]) => ({ name, value }));
 }
-
-type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
-
 interface PendingRequest {
   method: string;
   resolve: (result: unknown) => void;
@@ -94,7 +91,7 @@ class AcpSessionDriver implements AgentSessionDriver {
   readonly #args: string[];
   readonly #sessionTimeoutMs: number;
   readonly #onOutput: (spaceId: string, text: string) => void;
-  readonly #listeners = new Map<DriverEvent, Set<(data: unknown) => void>>();
+  readonly #emitter = createEmitter<DriverEvent>();
   /** ACP-shaped mcpServers entries (session/new payload), space id injected. */
   readonly #mcpServers: Array<{
     name: string;
@@ -211,13 +208,7 @@ class AcpSessionDriver implements AgentSessionDriver {
   }
 
   on(event: DriverEvent, cb: (data: unknown) => void): () => void {
-    let set = this.#listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this.#listeners.set(event, set);
-    }
-    set.add(cb);
-    return () => set.delete(cb);
+    return this.#emitter.on(event, cb);
   }
 
   async dispose(): Promise<void> {
@@ -237,7 +228,7 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   #sendPrompt(text: string): Promise<void> {
     this.#streaming = true;
-    this.#emit("turn_start", { spaceId: this.#spaceId });
+    this.#emitter.emit("turn_start", { spaceId: this.#spaceId });
     return this.#request("session/prompt", {
       sessionId: this.#sessionId,
       prompt: [{ type: "text", text }],
@@ -246,7 +237,7 @@ class AcpSessionDriver implements AgentSessionDriver {
       .finally(() => {
         this.#streaming = false;
         this.#flushBufferedMessage();
-        this.#emit("turn_end", { spaceId: this.#spaceId });
+        this.#emitter.emit("turn_end", { spaceId: this.#spaceId });
       });
   }
 
@@ -265,7 +256,7 @@ class AcpSessionDriver implements AgentSessionDriver {
   /** Mark the child dead, surface an error event, and settle every in-flight request. */
   #failChild(err: Error): void {
     this.#dead = true;
-    this.#emit("error", { spaceId: this.#spaceId, message: err.message });
+    this.#emitter.emit("error", { spaceId: this.#spaceId, message: err.message });
     this.#failPending(err);
   }
 
@@ -409,10 +400,6 @@ class AcpSessionDriver implements AgentSessionDriver {
     const trimmed = text.trim();
     if (!trimmed) return;
     this.#onOutput(this.#spaceId, trimmed);
-    this.#emit("message", { spaceId: this.#spaceId, text: trimmed });
-  }
-
-  #emit(event: DriverEvent, data: unknown): void {
-    for (const cb of this.#listeners.get(event) ?? []) cb(data);
+    this.#emitter.emit("message", { spaceId: this.#spaceId, text: trimmed });
   }
 }
