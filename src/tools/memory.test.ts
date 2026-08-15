@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { memoryToolsExtension } from "./memory";
 
 /** The memory tools never read the extension context; only the arity needs it. */
@@ -233,5 +238,59 @@ describe("memory.search", () => {
       expect(resultText(res)).toMatch(/limit/);
     }
     expect(provider.searched).toHaveLength(0);
+  });
+});
+
+describe("memory tools against the real SQLite provider (issue #29)", () => {
+  test("save + search round-trip persists and scopes through the real provider", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-memtools-"));
+    try {
+      const db = new Database(join(dir, "memory.db"));
+      const provider = createSqliteMemoryProvider(db);
+      const { audit, rows } = fakeAudit();
+      const [saveTool, searchTool] = loadTools(provider, { audit });
+
+      const saved = await saveTool.execute(
+        "tc1",
+        { content: "the vault combination is 1234", scope: "org", metadata: { topic: "vault" } },
+        undefined,
+        undefined,
+        noopCtx,
+      );
+      expect(saved.isError).not.toBe(true);
+      const { id } = JSON.parse(resultText(saved));
+      expect(id).toMatch(/^mem_/);
+
+      const found = await searchTool.execute("tc1", { query: "vault combination", scope: "org" }, undefined, undefined, noopCtx);
+      expect(found.isError).not.toBe(true);
+      const entries = JSON.parse(resultText(found)) as Array<Record<string, unknown>>;
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        id,
+        scope: "org",
+        principal: null,
+        content: "the vault combination is 1234",
+        metadata: { topic: "vault" },
+      });
+
+      // Audit carries only the content hash — the raw content never lands in
+      // the trail, even though the real provider holds it in SQLite.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.event_type).toBe("memory.write");
+      expect(rows[0]!.payload.content_hash).toBe(sha256("the vault combination is 1234"));
+      expect(JSON.stringify(rows[0]!.payload)).not.toContain("vault combination");
+
+      // Principal isolation through the real provider: a user never sees
+      // another user's memory, and org rows stay org-scoped.
+      const userSave = await saveTool.execute("tc1", { content: "prefers dark mode", scope: "user", principal: "U123" }, undefined, undefined, noopCtx);
+      expect(userSave.isError).not.toBe(true);
+      const other = await searchTool.execute("tc1", { query: "dark mode", scope: "user", principal: "U456" }, undefined, undefined, noopCtx);
+      expect(JSON.parse(resultText(other))).toHaveLength(0);
+      const own = await searchTool.execute("tc1", { query: "dark mode", scope: "user", principal: "U123" }, undefined, undefined, noopCtx);
+      expect(JSON.parse(resultText(own))).toHaveLength(1);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
