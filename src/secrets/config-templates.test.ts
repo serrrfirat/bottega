@@ -40,7 +40,8 @@ describe("config/omp templates (issue #9 secrets & models)", () => {
     const providers = models["providers"] as Record<string, YamlNode>;
     const near = providers["near"] as Record<string, YamlNode>;
     expect(near["api"] as string).toBe("openai-completions");
-    expect(near["baseUrl"] as string).toBe("https://api.near.ai/v1");
+    // Live NEAR AI Cloud gateway (issue #36); api.near.ai was retired.
+    expect(near["baseUrl"] as string).toBe("https://cloud-api.near.ai/v1");
     // apiKey is an env-var reference, resolved by the SDK at runtime — the
     // key value itself never appears in the template.
     expect(near["apiKey"] as string).toBe("NEAR_API_KEY");
