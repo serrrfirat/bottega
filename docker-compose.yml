@@ -1,0 +1,76 @@
+# Bottega egress topology (issue #8): iron-proxy is the single egress gate.
+# All outbound traffic from `server` and `executor` crosses iron-proxy:
+#   - DNS resolves every name to the proxy (compose `dns:`) — default-deny
+#     routing; the allowlist transform 403s anything not configured.
+#   - HTTP_PROXY/HTTPS_PROXY route tools that honor proxy env (Bun fetch
+#     included — verified in src/egress/proxy-env.test.ts) through the
+#     proxy's tunnel listener.
+#   - NO_PROXY keeps loopback and the internal `data` hostname off the proxy.
+# No ports are published: everything lives on the internal `egress` network.
+services:
+  iron-proxy:
+    # Pinned stable release; published to Docker Hub only (ghcr.io does not
+    # exist — see .goreleaser.yml in ironsh/iron-proxy). v0.49.0 is the
+    # latest stable tag at implementation time.
+    image: ironsh/iron-proxy:0.49.0
+    command:
+      - "-config"
+      - "/etc/iron-proxy/egress.yml"
+    volumes:
+      - ./config/egress.yml:/etc/iron-proxy/egress.yml:ro
+      # MITM CA, generated once per deployment (gitignored):
+      #   docker run --rm -v $PWD/certs:/certs ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs
+      - ./certs:/etc/iron-proxy/certs:ro
+      # Audit: every request is logged as one JSON line to the proxy's
+      # stdout/stderr (docker compose logs iron-proxy). A log shipper can
+      # write data/egress/*.jsonl from there; v1 rotates nothing.
+      - data:/data
+    networks:
+      egress:
+        ipv4_address: 172.30.0.2
+
+  server:
+    # App image build lands with the server packaging; bun runtime base keeps
+    # this file valid today. Entrypoint: bun run src/server/index.ts.
+    image: oven/bun:1
+    depends_on:
+      - iron-proxy
+    dns:
+      - 172.30.0.2 # iron-proxy: DNS allowlist enforcement (anti-tunneling)
+    environment:
+      HTTP_PROXY: http://iron-proxy:8080
+      HTTPS_PROXY: http://iron-proxy:8080
+      NO_PROXY: localhost,127.0.0.1,data
+    volumes:
+      - data:/data
+    networks:
+      - egress
+
+  executor:
+    # Work-item runner. Declared now with its runtime image so the egress
+    # topology validates; real image + entrypoint arrive in #11.
+    profiles:
+      - executor
+    image: oven/bun:1
+    depends_on:
+      - iron-proxy
+    dns:
+      - 172.30.0.2 # iron-proxy: DNS allowlist enforcement (anti-tunneling)
+    environment:
+      HTTP_PROXY: http://iron-proxy:8080
+      HTTPS_PROXY: http://iron-proxy:8080
+      NO_PROXY: localhost,127.0.0.1,data
+    volumes:
+      - data:/data
+    networks:
+      - egress
+
+volumes:
+  data:
+
+networks:
+  egress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

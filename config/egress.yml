@@ -1,0 +1,78 @@
+# iron-proxy egress policy for bottega (issue #8).
+# Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
+#   iron-proxy -config /etc/iron-proxy/egress.yml
+# Reference: https://github.com/ironsh/iron-proxy#configuration
+#
+# Design: default-deny egress. Containers resolve DNS through this proxy
+# (compose `dns:`), so every name answers with `proxy_ip` — the proxy is the
+# only path out of the container network. The transform pipeline then gates:
+#   1. allowlist  — model endpoints pass without an LLM round-trip.
+#   2. judge      — everything that passed the allowlist is policy-judged by
+#                   an LLM ("deny unless clearly required by the task and
+#                   safe"). Fallback deny keeps egress closed when the judge
+#                   LLM is down or the circuit breaker is open.
+# iron-proxy's DNS always answers with proxy_ip (it does not refuse lookups);
+# enforcement is at the HTTP layer, so a non-allowlisted host gets a 403.
+dns:
+  listen: ":53"
+  proxy_ip: "172.30.0.2" # static IP of iron-proxy on the compose `egress` network
+  # passthrough: [] # names forwarded to the OS resolver (bypasses the proxy)
+  # records: []     # static A/CNAME records for internal names
+
+proxy:
+  http_listen: ":80"
+  https_listen: ":443"
+  tunnel_listen: ":8080" # explicit HTTP_PROXY/CONNECT/SOCKS5 listener
+  max_request_body_bytes: 1048576
+  max_response_body_bytes: 0
+  # upstream_deny_cidrs defaults to cloud-metadata + loopback (SSRF guard).
+
+tls:
+  # MITM CA, generated once per deployment and never committed:
+  #   docker run --rm -v $PWD/certs:/certs ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs
+  ca_cert: "/etc/iron-proxy/certs/ca.crt"
+  ca_key: "/etc/iron-proxy/certs/ca.key"
+
+transforms:
+  # 1. Static allowlist: NEAR.ai model endpoints (issue #8 scope).
+  - name: allowlist
+    config:
+      domains:
+        - "api.near.ai"
+        - "*.completions.near.ai"
+        # Add org-configured domains here (e.g. an opencode gateway host once
+        # one is deployed, or doc sites the agents legitimately read). Traffic
+        # to allowlisted hosts is then subject to the judge policy below.
+
+  # 2. Judge: LLM policy gate. Fires on every request that passed the
+  #    allowlist. Independent circuit breaker + timeout per instance.
+  - name: judge
+    config:
+      name: "egress-policy"
+      fallback: "deny" # fail closed on LLM error/timeout/breaker-open
+      timeout: "8s"
+      max_concurrent: 16
+      circuit_breaker:
+        consecutive_failures: 5
+        cooldown: "10s"
+      rules:
+        - host: "*"
+      provider:
+        type: "openai" # NEAR.ai OpenAI-compatible Chat Completions API
+        base_url: "https://qwen35-122b.completions.near.ai/v1"
+        model: "qwen35-122b"
+        # Judge key is separate from the agents' key (issue #8: "separate key
+        # if preferred"). Model id is org-chosen; this example is from
+        # https://docs.near.ai/cloud/models.
+        api_key_env: "NEARAI_JUDGE_API_KEY"
+        max_tokens: 256
+      prompt: |
+        Decide whether this outbound HTTP request is acceptable for a coding
+        agent. Policy: DENY unless the request is clearly required by the
+        current task and safe. Allow only requests that are necessary to
+        complete the work at hand, target a legitimate destination, and
+        carry no secrets or sensitive data. When in doubt, deny. Reply with
+        exactly one word: ALLOW or DENY.
+
+log:
+  level: "info"
