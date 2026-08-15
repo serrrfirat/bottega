@@ -142,6 +142,37 @@ describe("payload cap", () => {
     const [row] = await audit.listAudit({ event_type: "cap_test.small" });
     expect(row!.payload).toBe(JSON.stringify({ text: body }));
   });
+
+  test("a payload exactly at the cap boundary is stored whole, one byte over truncates", async () => {
+    // Exact boundary: byteLength === MAX_PAYLOAD_BYTES fits without a marker.
+    const exact = "a".repeat(MAX_PAYLOAD_BYTES);
+    await audit.appendAudit({ actor: "U4", event_type: "cap_test.exact", payload: exact });
+    const [exactRow] = await audit.listAudit({ event_type: "cap_test.exact" });
+    expect(exactRow!.payload).toBe(exact);
+    expect(exactRow!.payload).not.toContain(TRUNCATION_MARKER);
+
+    // One byte over: truncated to budget + marker, never exceeding the cap.
+    const over = "a".repeat(MAX_PAYLOAD_BYTES + 1);
+    await audit.appendAudit({ actor: "U4", event_type: "cap_test.over", payload: over });
+    const [overRow] = await audit.listAudit({ event_type: "cap_test.over" });
+    expect(overRow!.payload.endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(Buffer.byteLength(overRow!.payload, "utf8")).toBe(MAX_PAYLOAD_BYTES);
+    expect(overRow!.payload.startsWith("a".repeat(MAX_PAYLOAD_BYTES - TRUNCATION_MARKER.length))).toBe(true);
+  });
+
+  test("multi-byte payloads truncate on a character boundary without corrupting UTF-8", async () => {
+    // Each emoji is 4 UTF-8 bytes; the cap loop slices UTF-16 code units, so
+    // the cut must never land inside a surrogate pair (which would store a
+    // replacement character and shift the truncation point).
+    const body = "🔥".repeat(Math.ceil(MAX_PAYLOAD_BYTES / 4) + 10);
+    await audit.appendAudit({ actor: "U4", event_type: "cap_test.multibyte", payload: body });
+    const [row] = await audit.listAudit({ event_type: "cap_test.multibyte" });
+    expect(row!.payload.endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(Buffer.byteLength(row!.payload, "utf8")).toBeLessThanOrEqual(MAX_PAYLOAD_BYTES);
+    const text = row!.payload.slice(0, -TRUNCATION_MARKER.length);
+    expect(text.includes("\uFFFD")).toBe(false); // no lone surrogates survived
+    expect(text.length % 2).toBe(0); // complete surrogate pairs only
+  });
 });
 
 describe("immutability", () => {
