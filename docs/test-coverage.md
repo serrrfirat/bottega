@@ -85,3 +85,32 @@ Baseline verified on 2026-08-16 (`feat/28-audit`, before any changes):
   (`scripts/smoke.sh` steps 1–7); never reported as passing.
 - Exact branch-level coverage percentages were not computed (no coverage
   tooling configured); tiers are inferred from test files read in full.
+
+## Backfill status (issue #29)
+
+Every ranked gap above resolved or explicitly deferred, verified on
+2026-08-16 after the backfill commits (214 baseline → 236 tests, 0 failures
+across two consecutive full-suite runs):
+
+| # | Gap | Resolution | Evidence |
+|---|---|---|---|
+| 1 | `agent-driver.ts` untested | New `src/server/agent-driver.test.ts`: real-SDK session create → transcript file materialized at the exact session-file path → dispose; restart resumes the same file (no reset); `agentDir` honored (sessions materialize `agent.db` in the passed dir — the seam that keeps boots reading `config/omp` templates instead of `~/.omp/agent`); `allowTools` override accepted; `SPACE_AGENT_TOOLS` exported and asserted (read-only + task + queue/memory tools, never `write`/`bash`/`edit`). | 5 tests, hermetic (temp dirs, no network, no prompt, no credentials). |
+| 2 | iron-proxy never run | New `src/egress/iron-proxy.test.ts`: skip-gated Docker leg boots `ironsh/iron-proxy:0.49.0` with a config whose allowlist domains are read from `config/egress.yml` (judge transform omitted — needs `NEARAI_JUDGE_API_KEY`, documented manual checklist). Asserts allowlisted host reachable through the proxy (local `Bun.serve` target via `--add-host`), non-allowlisted host → 403, and DNS sinkhole answers every name with `proxy_ip` (queried from an `alpine:3.19` helper container — host-side UDP into containers is unreliable on Docker Desktop). Hard timeout (240s), skips with evidence when Docker/image unavailable. Ran and passed locally against the real image. | 1 test, 4 assertions; skip messages name the manual checklist. |
+| 3 | Slack inbound untested | Bolt's `App.processEvent` routes events without a socket; the message wiring is now the exported `registerMessageHandler` (production code, installed by `createSlackAdapter`). New tests drive the real Bolt router hermetically: user message delivered normalized, thread reply shares the channel space, bot-authored and unparseable events dropped and logged. Custom `authorize` stub avoids Bolt's network auth.test. | 4 tests in `src/server/slack.test.ts`. |
+| 4 | mem0 real-server leg | Kept as-is with its gate: it is the only wire-compatibility proof and by design needs an LLM/embedder key (observed skip with evidence in the audit baseline; `OPENAI_API_KEY` manual checklist documented in the skip message). | skip-gated leg in `src/memory/mem0.test.ts`. |
+| 5 | Fakes where real doubles exist | delivery-poller: new real-store leg (temp SQLite `createStore`, marker written via `store.appendAudit`, dedupe proven across a reopened connection — restart never double-posts against real append-only rows). tools/memory: new real-provider leg (`createSqliteMemoryProvider`): save+search round-trip persists, audit rows carry only the content hash, principal isolation holds through SQLite. | 1 new test each in `delivery-poller.test.ts`, `memory.test.ts`. |
+| 6 | Source-grep in `secrets/agent-dir.test.ts` | Removed `readFileSync`/`toContain` on `index.ts`. The contract is now behavioral across two seams: `main()` creates `data/omp-agent` at boot, and the driver test proves sessions honor the passed `agentDir`. | `agent-dir.test.ts` + `agent-driver.test.ts`. |
+| 7 | Audit payload-cap edges | New tests: payload exactly at `MAX_PAYLOAD_BYTES` stored whole; one byte over truncates to exactly cap with the marker; multi-byte (emoji) payloads truncate on a character boundary — no lone surrogates or replacement chars survive, final size ≤ cap. | 2 tests in `policy/audit.test.ts`. |
+| 8 | `scripts/dev.sh` untested | Deferred (documented, not blocked): dev-only Keychain loader, audit-marked optional/low-risk; no shell test infra exists in the repo. The Keychain path stays a manual dev workflow. | — |
+| 9 | No automated e2e | By design (AGENTS.md: real-credential legs stay a documented manual checklist). Compose-based smoke legs are tracked separately in issue #30. | — |
+
+Additional table items closed: `egress/yaml-subset.ts` now has direct
+rejection/acceptance tests (`src/egress/yaml-subset.test.ts`, 8 tests).
+
+Not backfilled (documented, by design or optional per the table): full
+`start()` await in `server/index.ts` (needs a Socket-Mode receiver stub; the
+inbound path it would exercise is now covered via `processEvent`, and boot
+wiring via `smoke.test.ts` + `agent-dir.test.ts`); real-`omp` ACP prompt
+round-trip (existing leg intentionally never prompts); direct
+`memory/types.ts` validator file (indirect coverage complete);
+SpaceService-via-real-store lifecycle (optional per the table).
