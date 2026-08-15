@@ -95,6 +95,11 @@ export function createSlackAdapter(opts: {
     token: opts.botToken,
     appToken: opts.appToken,
     socketMode: true,
+    // Bolt fires an unawaited auth.test at construction when this is on (the
+    // token-verification default), leaving an unhandled rejection if the
+    // token is bad. Socket-mode connect still authenticates via the app
+    // token; auth failures surface as Bolt error events.
+    tokenVerificationEnabled: false,
   });
 
   // Socket Mode delivers `message` events for all channel types the app is
