@@ -12,11 +12,12 @@
  * trail verifiable without leaking it. Policy decisions are already
  * audited by the policy extension, so search appends nothing.
  */
-import type { AgentToolResult, ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
+import { toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
 
 export interface MemoryToolsExtensionOpts {
@@ -113,8 +114,4 @@ export function sha256Hex(text: string): string {
   const hasher = new Bun.CryptoHasher("sha256");
   hasher.update(text);
   return hasher.digest("hex");
-}
-
-function toolError(text: string): AgentToolResult {
-  return { content: [{ type: "text", text }], isError: true };
 }

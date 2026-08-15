@@ -9,10 +9,11 @@
  * "@agent handle this"). The tools are identical in every space; cancel
  * authorization comes from the space policy's `approvers` list (issue #33).
  */
-import type { AgentToolResult, ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/agent-driver";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
+import { toolError } from "./helpers";
 import type { Store } from "../store/db";
 
 export interface WorkItemsExtensionOpts {
@@ -84,8 +85,4 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
       },
     });
   };
-}
-
-function toolError(text: string): AgentToolResult {
-  return { content: [{ type: "text", text }], isError: true };
 }
