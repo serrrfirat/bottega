@@ -6,21 +6,22 @@
  * marker (payload {id, pr_url, summary}) and then waits on the onDelivery
  * seam. The server side of that seam is this poller: it watches the audit
  * trail, posts the PR + approval request to the space channel via the
- * adapter, and records an `approval.requested` audit row so a restart never
+ * adapter, and records a `delivery.requested` audit row so a restart never
  * double-posts.
+ *
+ * `delivery.requested` is distinct from `approval.requested` (which is
+ * reserved for policy-tool approvals with payload {tool, reason}) — the
+ * two carry different payload schemas and never share an event name
+ * (issue #33).
  *
  * The button round-trip (the human's decision resolving the seam into
  * working -> review -> done) is a later adapter issue; this module only
  * announces. The executor keeps waiting, so the item stays `working` until
  * that path lands.
  */
+import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../store/audit-events";
 import type { Store } from "../store/db";
 import type { SlackAdapter } from "./slack";
-
-/** Audit event the executor writes once a PR is open and approval is pending. */
-export const DELIVERY_PENDING_EVENT = "work_item.delivery_pending";
-/** Audit event the server writes once it has announced the delivery. */
-export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -56,7 +57,7 @@ function parsePayload(raw: string): DeliveryPayload | null {
 
 /**
  * One poll pass: for every delivery_pending marker whose item has no
- * approval.requested row yet, post the PR + approval request to the space
+ * delivery.requested row yet, post the PR + approval request to the space
  * channel and record the request. Returns the number of announcements made.
  * Idempotent across restarts — the audit row is the dedupe key.
  */
@@ -66,7 +67,7 @@ export async function pollPendingDeliveries(
 ): Promise<number> {
   const [pending, requested] = await Promise.all([
     store.listAudit({ event_type: DELIVERY_PENDING_EVENT }),
-    store.listAudit({ event_type: APPROVAL_REQUESTED_EVENT }),
+    store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT }),
   ]);
   const announced = new Set<string>();
   for (const row of requested) {
@@ -84,7 +85,7 @@ export async function pollPendingDeliveries(
     await store.appendAudit({
       space_id: row.space_id,
       actor: "server",
-      event_type: APPROVAL_REQUESTED_EVENT,
+      event_type: DELIVERY_REQUESTED_EVENT,
       payload: JSON.stringify({
         id: payload.id,
         pr_url: payload.pr_url,

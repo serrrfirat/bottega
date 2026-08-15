@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -190,7 +191,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     appendAudit({
       space_id: input.space_id,
       actor: input.requester,
-      event_type: "work_item.created",
+      event_type: WORK_ITEM_CREATED_EVENT,
       payload: JSON.stringify({ id, requester: input.requester }),
     });
     return item;
@@ -240,7 +241,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     appendAudit({
       space_id: row.space_id,
       actor: by,
-      event_type: "work_item.transition",
+      event_type: WORK_ITEM_TRANSITION_EVENT,
       payload: JSON.stringify({ from, to, by }),
     });
     return row;
@@ -267,7 +268,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       appendAudit({
         space_id: row.space_id,
         actor: "system",
-        event_type: "work_item.transition",
+        event_type: WORK_ITEM_TRANSITION_EVENT,
         payload: JSON.stringify({ from, to: "blocked", by: "system" }),
       });
     }

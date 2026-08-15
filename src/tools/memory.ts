@@ -16,6 +16,7 @@ import type { AgentToolResult, ExtensionFactory } from "@oh-my-pi/pi-coding-agen
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
+import { MEMORY_WRITE_EVENT } from "../store/audit-events";
 import type { AuditModule } from "../policy/audit";
 
 export interface MemoryToolsExtensionOpts {
@@ -61,7 +62,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
           const entry = await provider.save(input);
           await opts.audit?.appendAudit({
             actor: principal ?? "agent",
-            event_type: "memory.write",
+            event_type: MEMORY_WRITE_EVENT,
             payload: {
               scope: entry.scope,
               principal: entry.principal,

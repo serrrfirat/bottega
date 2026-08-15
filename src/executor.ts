@@ -28,6 +28,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createStore, recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
+import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { loadOrgConfig } from "./policy/config";
@@ -152,7 +153,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
       await deps.store.appendAudit({
         space_id: item.space_id,
         actor: "executor",
-        event_type: "work_item.failed",
+        event_type: WORK_ITEM_FAILED_EVENT,
         payload: JSON.stringify({ id: item.id, error: message }),
       });
     }
@@ -235,7 +236,7 @@ async function deliver(
   await deps.store.appendAudit({
     space_id: item.space_id,
     actor: "executor",
-    event_type: "work_item.delivery_pending",
+    event_type: DELIVERY_PENDING_EVENT,
     payload: JSON.stringify({ id: item.id, pr_url: prUrl, summary }),
   });
   const requestApproval =

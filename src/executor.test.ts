@@ -17,6 +17,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, type Store, type WorkItem, type WorkItemState } from "./store/db";
+import { DELIVERY_PENDING_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./store/audit-events";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
@@ -273,7 +274,7 @@ describe("claim loop", () => {
       expect(evidence[0].url).toContain(result.pr_url);
 
       // Every transition was performed by the executor and audited.
-      const transitions = await fx.store.listAudit({ event_type: "work_item.transition" });
+      const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
       expect(transitions.map((t) => JSON.parse(t.payload))).toEqual(
         expect.arrayContaining([
           { from: "claimed", to: "working", by: "executor" },
@@ -285,7 +286,7 @@ describe("claim loop", () => {
       // The delivery seam saw the PR; a delivery_pending marker was audited.
       expect(fx.deliveries).toHaveLength(1);
       expect(fx.deliveries[0].delivery.prUrl).toBe(result.pr_url);
-      const pending = await fx.store.listAudit({ event_type: "work_item.delivery_pending" });
+      const pending = await fx.store.listAudit({ event_type: DELIVERY_PENDING_EVENT });
       expect(pending).toHaveLength(1);
       expect(JSON.parse(pending[0].payload)).toMatchObject({ id: item.id, pr_url: result.pr_url });
 

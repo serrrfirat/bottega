@@ -68,7 +68,7 @@ export function main(): BottegaServer {
   // in its own container and cannot post to Slack. When a work item's PR is
   // opened it writes a work_item.delivery_pending audit marker; this poller
   // watches that trail, posts the PR + approval request to the space
-  // channel, and records approval.requested (dedupe across restarts). The
+  // channel, and records delivery.requested (dedupe across restarts). The
   // button round-trip that resolves the seam (working -> review -> done) is
   // a later adapter issue.
   const deliveryPoller = startDeliveryPoller({

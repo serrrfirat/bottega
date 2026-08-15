@@ -5,15 +5,10 @@
  * audit trail so restarts never re-post.
  */
 import { describe, expect, test, vi } from "bun:test";
+import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../store/audit-events";
 import type { AuditRow, ListAuditOpts, Store } from "../store/db";
 import type { SlackAdapter } from "./slack";
-import {
-  APPROVAL_REQUESTED_EVENT,
-  DEFAULT_POLL_INTERVAL_MS,
-  DELIVERY_PENDING_EVENT,
-  pollPendingDeliveries,
-  startDeliveryPoller,
-} from "./delivery-poller";
+import { DEFAULT_POLL_INTERVAL_MS, pollPendingDeliveries, startDeliveryPoller } from "./delivery-poller";
 
 // --- Fakes ------------------------------------------------------------------
 
@@ -84,7 +79,7 @@ describe("pollPendingDeliveries (issue #12)", () => {
     expect(adapter.posted).toEqual([
       { spaceId: SPACE, text: `PR ready: ${PR_URL} — approve to finish` },
     ]);
-    const requested = store.rows.filter((r) => r.event_type === APPROVAL_REQUESTED_EVENT);
+    const requested = store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT);
     expect(requested).toHaveLength(1);
     expect(requested[0].actor).toBe("server");
     expect(requested[0].space_id).toBe(SPACE);
@@ -157,7 +152,7 @@ describe("pollPendingDeliveries (issue #12)", () => {
 
     expect(posted).toBe(0);
     expect(adapter.posted).toHaveLength(0);
-    expect(store.rows.filter((r) => r.event_type === APPROVAL_REQUESTED_EVENT)).toHaveLength(0);
+    expect(store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT)).toHaveLength(0);
   });
 
   test("a failed postMessage is not recorded and retries on the next pass", async () => {
@@ -167,7 +162,7 @@ describe("pollPendingDeliveries (issue #12)", () => {
     adapter.failNext = true;
 
     await expect(pollPendingDeliveries(store, adapter)).rejects.toThrow("postMessage failed");
-    expect(store.rows.filter((r) => r.event_type === APPROVAL_REQUESTED_EVENT)).toHaveLength(0);
+    expect(store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT)).toHaveLength(0);
 
     const posted = await pollPendingDeliveries(store, adapter);
     expect(posted).toBe(1);

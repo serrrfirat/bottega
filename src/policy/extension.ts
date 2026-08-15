@@ -16,6 +16,7 @@ import type {
   ToolCallEvent,
   ToolCallEventResult,
 } from "@oh-my-pi/pi-coding-agent";
+import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "./approval-router";
@@ -75,7 +76,7 @@ async function gateToolCall(
     await deps.audit.appendAudit({
       space_id: spaceId ?? null,
       actor,
-      event_type: "policy.decision",
+      event_type: POLICY_DECISION_EVENT,
       payload: {
         tool,
         tier,
@@ -138,7 +139,7 @@ async function requestApproval(
   await deps.audit.appendAudit({
     space_id: spaceId ?? null,
     actor,
-    event_type: "approval.requested",
+    event_type: APPROVAL_REQUESTED_EVENT,
     payload: { tool: request.tool, reason },
   });
 
@@ -148,7 +149,7 @@ async function requestApproval(
   await deps.audit.appendAudit({
     space_id: spaceId ?? null,
     actor,
-    event_type: "approval.resolved",
+    event_type: APPROVAL_RESOLVED_EVENT,
     payload: { tool: request.tool, approved: resolution.approved, approver: resolution.approver ?? null },
   });
 

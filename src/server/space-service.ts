@@ -1,4 +1,5 @@
 import { createOmpSdkDriver, type AgentDriver, type AgentSessionDriver } from "./agent-driver";
+import { MESSAGE_DROPPED_EVENT } from "../store/audit-events";
 import type { Store } from "../store/db";
 import type { SlackAdapter } from "./slack";
 
@@ -68,7 +69,7 @@ export class SpaceService {
         await this.#store.appendAudit({
           space_id: msg.spaceId,
           actor: msg.principal,
-          event_type: "message_dropped",
+          event_type: MESSAGE_DROPPED_EVENT,
           payload: JSON.stringify({ reason: "session_disposing", ts: msg.ts }),
         });
         return;

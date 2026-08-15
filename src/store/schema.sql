@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS audit (
   space_id   TEXT,
   actor      TEXT NOT NULL,              -- principal or "agent:work:wi_x"
   event_type TEXT NOT NULL,              -- message.in, tool_call, policy.decision,
-                                         -- approval.requested/resolved, work_item.transition, ...
+                                         -- approval.requested/resolved, delivery.requested, work_item.transition, ...
   payload    TEXT NOT NULL               -- JSON, secrets redacted before write
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
