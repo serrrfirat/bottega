@@ -4,6 +4,88 @@ Canonical rules for agents working in this repository. Read before changing
 anything; when in doubt, the README and the GitHub issues (epic #1, sub-issues)
 are the spec.
 
+## Global conventions (curated from OMP / pi / Ironclaw / Hermes AGENTS.md)
+
+Rules accepted across those codebases, adapted to bottega's scale. Where a
+rule below conflicts with a rule above, the user's explicit instructions win
+(pi's override rule: ask when they conflict).
+
+### Code quality
+- **No `any`** unless absolutely necessary. No inline/dynamic imports —
+  top-level imports only.
+- **No duplicate helpers.** Search `src/lib/` and adjacent modules before
+  writing a utility; two implementations of the same thing is a bug even when
+  both work. Extend the existing helper; don't fork it.
+- **No speculative infrastructure.** Hooks, callbacks, or abstractions need a
+  real consumer. Adding a hook is easy; removing one after code depends on it
+  is hard.
+- **Prompts live in files, not code** (static `.md`, `include_str!`-style)
+  when we ship model-visible copy beyond a single line.
+- **`.env` is for secrets only**; behavioral settings go in config files
+  (`config.yml`, `spaces.policy_json`), not new env vars.
+- **Never hardcode a configurable default** (keys, timeouts, thresholds) in
+  logic; put it in config with a documented default.
+- **Read files in full before wide-ranging changes**; never edit a file you
+  haven't inspected.
+- **Ask before removing functionality** that appears intentional.
+- Dependency and lockfile changes are reviewed code; pin exact versions.
+
+### Git & workflow
+- **Issue-first** (user-mandated): every change starts with a GitHub issue;
+  reference it in the commit (`#N`); close with a completion comment.
+- Commit style: `<type>(scope): <past-tense description>` — no emojis, no
+  fluff. `fixes #N` / `closes #N` in messages when a PR flow is ever used.
+- Stage explicit paths; never `git add -A` when other agents share the repo.
+- **Never force push or rewrite shared history.**
+- Rebase conflicts: resolve only in files you modified; abort and ask on
+  foreign conflicts.
+
+### Testing
+- **Test the contract, not internals.** Every test defends one externally
+  observable behavior; if you can't name the failure mode a consumer would
+  see, don't add the test.
+- No placeholder/tautology tests (`expect(true)`), no success-passthrough
+  asserts, no **source-grep tests** (asserting on file text — assert behavior).
+- Never `mock.module()` (leaks across files); use `spyOn` / injected fakes
+  (we already inject fake drivers/adapters).
+- Tests must be full-suite safe, not file-local safe.
+- **Behavior contracts over snapshots** — assert invariants and transitions,
+  not frozen literals (model lists, counts).
+- **E2E over mocks at boundaries** (Hermes/Ironclaw): exercise the real path
+  with real imports where resolution chains, security boundaries, or I/O are
+  involved — that's what the emulate.dev tests are for.
+- Test through the caller, not the helper: a policy gate is covered by driving
+  the extension wiring, not only the pure decision function.
+
+### Error handling & security
+- **No silent failures**: propagate with context (`throw new Error(...)` with
+  the cause in the message; never `catch` + swallow).
+- **Fail closed**: unknown tool → deny; policy parse error → deny; missing
+  config → deny; missing tokens → refuse to boot.
+- Never weaken auth, allowlists, approval gates, redaction, or audit
+  immutability to make something work.
+- **LLM/agent data is never deleted** — transcripts and audit rows are
+  retained; "cleanup" evicts caches, never rows.
+- Untrusted until a typed boundary establishes otherwise (that's the
+  adapters' job).
+- Side-effecting success requires durable evidence (obligations + audit).
+
+### Change discipline
+- Keep changes scoped; verify the premise before "fixing" something —
+  reproduce on current `main`, point at the exact line, fix the whole bug
+  class including sibling call paths.
+- When an interface changes, enumerate ALL implementations (AgentDriver has
+  two: OMP SDK + ACP) and test doubles.
+- After moves/renames, grep for old paths in code, docs, and config.
+- Update the README/contracts when behavior changes; PR/commit must describe
+  every layer touched and note rollback risk.
+
+### Agent-specific (Hermes, applies to our space agent)
+- Don't rebuild the space agent's system prompt or swap toolsets
+  mid-conversation — it invalidates prompt caching and multiplies cost.
+- Capability grows at the edges: prefer extending existing tools/config over
+  new core surface.
+
 ## Workflow (user-mandated)
 
 1. **Every piece of work starts with a GitHub issue.** Before implementing,
