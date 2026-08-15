@@ -1,4 +1,4 @@
-import { App } from "@slack/bolt";
+import { App, type AppOptions } from "@slack/bolt";
 
 /**
  * Protocol-only Slack adapter (Socket Mode).
@@ -90,6 +90,12 @@ export function createSlackAdapter(opts: {
   appToken: string;
   botToken: string;
   onMessage: (m: SlackMessage) => Promise<void>;
+  /**
+   * WebClient options passthrough. Tests point the Web API at an emulator
+   * (e.g. @emulators/slack) via `clientOptions.slackApiUrl`; production
+   * callers omit it and Bolt talks to the real Slack API.
+   */
+  clientOptions?: AppOptions["clientOptions"];
 }): SlackAdapter {
   const app = new App({
     token: opts.botToken,
@@ -100,6 +106,7 @@ export function createSlackAdapter(opts: {
     // token is bad. Socket-mode connect still authenticates via the app
     // token; auth failures surface as Bolt error events.
     tokenVerificationEnabled: false,
+    ...(opts.clientOptions !== undefined ? { clientOptions: opts.clientOptions } : {}),
   });
 
   // Socket Mode delivers `message` events for all channel types the app is

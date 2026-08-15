@@ -11,6 +11,7 @@
       "devDependencies": {
         "@emulators/core": "^0.9.0",
         "@emulators/github": "^0.9.0",
+        "@emulators/slack": "^0.9.0",
         "@types/bun": "latest",
         "typescript": "^5.5.0",
       },
@@ -32,6 +33,8 @@
     "@emulators/core": ["@emulators/core@0.9.0", "", { "dependencies": { "jose": "^6.2.2" } }, "sha512-Li/QxGzxzS0MRbRvfSximcH7ABaoX0k13eGRRdrCRhHHmuS2KVlotiatfGL7hFX+6DJMyhYG0uQV6zTEBbT/0A=="],
 
     "@emulators/github": ["@emulators/github@0.9.0", "", { "dependencies": { "@emulators/core": "0.9.0" } }, "sha512-3WhwXNQylweeu9KL52VvruP6GwjX81S2St5koc+Lu7IWO0wS8jJw+WrGp6usZvOfd0YX+NQdQPUago8XqlxBEA=="],
+
+    "@emulators/slack": ["@emulators/slack@0.9.0", "", { "dependencies": { "@emulators/core": "0.9.0" } }, "sha512-p8l1JS41UnpzPeO1Puxxx4xrVRAqAgc/7ao0P8+zLOv5kzPrQWfBFXz9jFmVnT9HKkPD4nvjT/JYxeZFcNtJSw=="],
 
     "@huggingface/jinja": ["@huggingface/jinja@0.5.9", "", {}, "sha512-uWTG+l3VJRsl7EXxYizuL3P+cCPoc3cRqbWWRcQN0FhejRfbdq0RNhCmbY/YDtnTcz9icdLYuLDjsnz4d8JMuw=="],
 
