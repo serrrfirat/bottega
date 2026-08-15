@@ -127,6 +127,17 @@ interface AgentDriver {
    writes `approval.requested` / `approval.resolved` (approver = the Slack
    user who clicked).
 
+**Response mode** (`response_mode: always | mention | request-only`, default
+`always`) controls when the space agent acts at all (issue #55). `always` is
+today's behavior: every non-bot message is a turn. `mention` spaces only
+forward messages that @mention the bot (DMs always pass), so unmentioned
+channel chatter never reaches the agent. `request-only` spaces forward
+everything (context stays coherent) but append a system-prompt directive
+telling the agent to act only on explicit requests. The org floor sets it in
+`config.yml`; the space overlay (`spaces.policy_json`) may change it but can
+only tighten (`always` → `mention` → `request-only`) — a looser overlay value
+is clamped to the org floor, mirroring the tools rule.
+
 Executor sessions run with `preApproved: true` policy scope: the work item's
 pickup approval (the human-approved `create_work_item` call in the channel)
 **is** the authorization. Allowlisted exec tools are then permitted inside

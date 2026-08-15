@@ -2,7 +2,8 @@ import { describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP } from "./space-service";
+import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE } from "./space-service";
+import type { ResponseMode } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,7 @@ interface CreateSessionOpts {
   transcriptDir: string;
   onOutput: (spaceId: string, text: string) => void;
   getPrincipal?: () => string | undefined;
+  appendSystemPrompt?: string;
 }
 
 class FakeDriver implements AgentDriver {
@@ -697,5 +699,57 @@ describe("SpaceService digest-on-idle", () => {
 
     expect(session.prompts).toHaveLength(1); // no digest turn
     expect(session.disposed).toBe(true);
+  });
+});
+
+describe("response mode → session prompt directive (issue #55)", () => {
+  test("request-only sessions append the request-only directive to the prompt", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      responseModeFor: async (): Promise<ResponseMode> => "request-only",
+    });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created).toHaveLength(1);
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(REQUEST_ONLY_DIRECTIVE);
+    await service.stop();
+  });
+
+  test("always and mention sessions get no directive", async () => {
+    for (const mode of ["always", "mention"] as const) {
+      const { adapter } = fakeAdapter();
+      const { store } = fakeStore();
+      const driver = new FakeDriver();
+      const service = new SpaceService({
+        store,
+        adapter,
+        driver,
+        responseModeFor: async (): Promise<ResponseMode> => mode,
+      });
+
+      await service.handleInboundMessage(msg({ spaceId: `slack:${mode}` }));
+
+      expect(driver.created).toHaveLength(1);
+      expect(driver.created[0].opts.appendSystemPrompt).toBeUndefined();
+      await service.stop();
+    }
+  });
+
+  test("without a resolver the default mode is always (no directive)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created[0].opts.appendSystemPrompt).toBeUndefined();
+    await service.stop();
   });
 });
