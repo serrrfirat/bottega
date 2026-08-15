@@ -451,4 +451,18 @@ describe("credential hygiene", () => {
       fx.cleanup();
     }
   });
+
+  test("a loose PAT file mode fails closed unless BOTTEGA_ALLOW_LOOSE_PAT=1", async () => {
+    const fx = makeFixture();
+    try {
+      chmodSync(fx.tokenFile, 0o644);
+      await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/must be mode 0600/);
+
+      process.env.BOTTEGA_ALLOW_LOOSE_PAT = "1";
+      await expect(prepareExecutor(makeDeps(fx))).resolves.toMatchObject({ tokenFile: fx.tokenFile });
+    } finally {
+      delete process.env.BOTTEGA_ALLOW_LOOSE_PAT;
+      fx.cleanup();
+    }
+  });
 });

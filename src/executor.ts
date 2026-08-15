@@ -12,8 +12,9 @@
  * data/secrets/github-pat, mode 0600, env-overridable via
  * EXECUTOR_GIT_TOKEN_FILE). It never enters the environment or the image:
  * git reads it through a generated GIT_ASKPASS helper, and the GitHub API
- * request reads the same file. The PAT value also never reaches tests via
- * env (asserted in executor.test.ts).
+ * request reads the same file. A mode other than 0600 fails boot closed
+ * (BOTTEGA_ALLOW_LOOSE_PAT=1 opts out, local dev only). The PAT value also
+ * never reaches tests via env (asserted in executor.test.ts).
  *
  * Delivery approval contract: after the PR is opened the executor writes a
  * `work_item.delivery_pending` audit marker, then calls the `onDelivery`
@@ -352,7 +353,15 @@ function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): Executo
     throw new Error(`git token file not found: ${tokenFile} (install the PAT there, mode 0600 — never env/image)`);
   }
   const tokenMode = statSync(tokenFile).mode & 0o777;
-  if (tokenMode !== 0o600) log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)}, expected 600`);
+  if (tokenMode !== 0o600) {
+    if (process.env.BOTTEGA_ALLOW_LOOSE_PAT !== "1") {
+      throw new Error(
+        `git token file ${tokenFile} must be mode 0600 (found ${tokenMode.toString(8)}); ` +
+          "set BOTTEGA_ALLOW_LOOSE_PAT=1 to override for local dev only",
+      );
+    }
+    log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — BOTTEGA_ALLOW_LOOSE_PAT set, continuing`);
+  }
   return {
     repo,
     gitBaseUrl: gitBaseUrl.replace(/\/+$/, ""),
