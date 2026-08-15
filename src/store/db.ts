@@ -39,6 +39,24 @@ export type AuditRow = {
   payload: string;
 };
 
+export type CredentialScope = "org" | "personal";
+
+/**
+ * Registry row for an extension credential (issue #51). Metadata only — the
+ * secret payload lives in the OMP auth broker; `broker_credential_id` is the
+ * broker snapshot entry id and `identity_key` the broker's identity key.
+ * Field names mirror the table columns (see Space / WorkItem).
+ */
+export type ExtensionCredential = {
+  id: string;
+  provider: string;
+  identity_key: string;
+  owner: string | null;
+  scope: CredentialScope;
+  broker_credential_id: number;
+  created_at: number;
+};
+
 export type TransitionOpts = {
   /** {approver, at} entry appended to the approvals JSON array */
   approval?: { approver: string; at?: number };
@@ -89,6 +107,20 @@ export interface Store {
   getWorkItem(id: string): Promise<WorkItem | null>;
   /** Moves items idle in `from` for longer than olderThanMs to blocked; returns count. */
   markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number>;
+  /**
+   * Registers or re-binds an extension credential (issue #51). One org row per
+   * provider, one personal row per (provider, owner): re-running connect with
+   * a refreshed broker credential updates identity_key + broker_credential_id.
+   */
+  upsertExtensionCredential(input: {
+    provider: string;
+    identityKey: string;
+    /** Required for scope='personal'; must be null for scope='org'. */
+    owner: string | null;
+    scope: CredentialScope;
+    brokerCredentialId: number;
+  }): Promise<ExtensionCredential>;
+  listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
   /** The underlying Database handle — memory providers share this file (#20). */
@@ -278,6 +310,46 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return (getWorkItemStmt.get(id) as WorkItem | null) ?? null;
   }
 
+  async function upsertExtensionCredential(input: {
+    provider: string;
+    identityKey: string;
+    owner: string | null;
+    scope: CredentialScope;
+    brokerCredentialId: number;
+  }): Promise<ExtensionCredential> {
+    const provider = input.provider.trim();
+    const identityKey = input.identityKey.trim();
+    const owner = input.owner?.trim() ?? "";
+    if (!provider || !identityKey) throw new Error("extension credential needs a provider and an identity key");
+    if (input.scope === "personal" && !owner) {
+      throw new Error("personal extension credentials need an owner");
+    }
+    if (input.scope === "org" && input.owner !== null) {
+      throw new Error("org extension credentials cannot have an owner");
+    }
+    const id = `ec_${randomUUID()}`;
+    const t = Date.now();
+    // Conflict targets match the partial unique indexes in schema.sql.
+    const conflictTarget = input.scope === "org" ? "(provider) WHERE scope = 'org'" : "(provider, owner) WHERE scope = 'personal'";
+    return db
+      .query(
+        `INSERT INTO extension_credentials (id, provider, identity_key, owner, scope, broker_credential_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT${conflictTarget}
+         DO UPDATE SET identity_key = excluded.identity_key,
+                       broker_credential_id = excluded.broker_credential_id,
+                       created_at = excluded.created_at
+         RETURNING *`,
+      )
+      .get(id, provider, identityKey, input.scope === "personal" ? owner : null, input.scope, input.brokerCredentialId, t) as ExtensionCredential;
+  }
+
+  async function listExtensionCredentials(provider: string): Promise<ExtensionCredential[]> {
+    return db
+      .query("SELECT * FROM extension_credentials WHERE provider = ? ORDER BY scope, created_at")
+      .all(provider) as ExtensionCredential[];
+  }
+
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
     const t = Date.now();
     const cutoff = t - olderThanMs;
@@ -343,6 +415,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     transitionWorkItem,
     getWorkItem,
     markStaleWorkItems,
+    upsertExtensionCredential,
+    listExtensionCredentials,
     appendAudit,
     listAudit,
     getDb: () => db,

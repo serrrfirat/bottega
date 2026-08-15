@@ -28,13 +28,31 @@ CREATE TABLE IF NOT EXISTS work_items (
 );
 CREATE INDEX IF NOT EXISTS idx_work_items_queue ON work_items(space_id, state);
 
+-- Extension credential registry (issue #51): METADATA + a reference to the
+-- credential row in the OMP auth broker. Secrets never leave the broker; the
+-- broker_credential_id is the broker snapshot entry id ({provider, identityKey}
+-- identify the row; the id is the opaque row key).
+CREATE TABLE IF NOT EXISTS extension_credentials (
+  id                   TEXT PRIMARY KEY, -- "ec_<uuid>"
+  provider             TEXT NOT NULL,    -- extension provider id, e.g. 'github'
+  identity_key         TEXT NOT NULL,    -- broker snapshot identityKey (email/accountId/projectId)
+  owner                TEXT,             -- principal for scope='personal'; NULL for scope='org'
+  scope                TEXT NOT NULL CHECK (scope IN ('org','personal')),
+  broker_credential_id INTEGER NOT NULL, -- auth-broker credential row id (SnapshotEntry.id)
+  created_at           INTEGER NOT NULL
+);
+-- One org-scoped credential per provider; one personal credential per (provider, owner).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
+
 CREATE TABLE IF NOT EXISTS audit (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,
   space_id   TEXT,
   actor      TEXT NOT NULL,              -- principal or "agent:work:wi_x"
   event_type TEXT NOT NULL,              -- message.in, tool_call, policy.decision,
-                                         -- approval.requested/resolved, delivery.requested, work_item.transition, ...
+                                         -- approval.requested/resolved, delivery.requested, work_item.transition,
+                                         -- extension.credential_resolved, ...
   payload    TEXT NOT NULL               -- JSON, secrets redacted before write
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);

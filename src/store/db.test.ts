@@ -493,6 +493,97 @@ describe("work items", () => {
   });
 });
 
+describe("extension credentials", () => {
+  test("upsert org credential round-trips and re-binds on re-connect", async () => {
+    const s = freshStore();
+    const first = await s.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:ada@example.com",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 7,
+    });
+    expect(first.owner).toBeNull();
+    expect(first.scope).toBe("org");
+
+    const rebound = await s.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:ada@example.com",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 42,
+    });
+    expect(rebound.id).toBe(first.id); // re-bind, not a duplicate row
+    expect(rebound.broker_credential_id).toBe(42);
+
+    const rows = await s.listExtensionCredentials("github");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(first.id);
+  });
+
+  test("personal credentials are unique per (provider, owner) and isolated across owners", async () => {
+    const s = freshStore();
+    const adas = await s.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:ada@example.com",
+      owner: "UADA",
+      scope: "personal",
+      brokerCredentialId: 1,
+    });
+    const bobs = await s.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:bob@example.com",
+      owner: "UBOB",
+      scope: "personal",
+      brokerCredentialId: 2,
+    });
+    expect(bobs.id).not.toBe(adas.id);
+
+    const rebound = await s.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:ada@new.example.com",
+      owner: "UADA",
+      scope: "personal",
+      brokerCredentialId: 3,
+    });
+    expect(rebound.id).toBe(adas.id);
+
+    const rows = await s.listExtensionCredentials("github");
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.owner).sort()).toEqual(["UADA", "UBOB"]);
+  });
+
+  test("upsert validates scope/owner pairing", async () => {
+    const s = freshStore();
+    await expect(
+      s.upsertExtensionCredential({ provider: "github", identityKey: "k", owner: "U1", scope: "org", brokerCredentialId: 1 }),
+    ).rejects.toThrow(/org extension credentials cannot have an owner/);
+    await expect(
+      s.upsertExtensionCredential({ provider: "github", identityKey: "k", owner: null, scope: "personal", brokerCredentialId: 1 }),
+    ).rejects.toThrow(/personal extension credentials need an owner/);
+    await expect(
+      s.upsertExtensionCredential({ provider: "", identityKey: "k", owner: null, scope: "org", brokerCredentialId: 1 }),
+    ).rejects.toThrow(/provider and an identity key/);
+  });
+
+  test("listExtensionCredentials filters by provider and orders org before personal", async () => {
+    const s = freshStore();
+    await s.upsertExtensionCredential({ provider: "linear", identityKey: "email:a@x.com", owner: "U1", scope: "personal", brokerCredentialId: 1 });
+    await s.upsertExtensionCredential({ provider: "github", identityKey: "org-key", owner: null, scope: "org", brokerCredentialId: 2 });
+    await s.upsertExtensionCredential({ provider: "github", identityKey: "email:a@x.com", owner: "U1", scope: "personal", brokerCredentialId: 3 });
+
+    const rows = await s.listExtensionCredentials("github");
+    expect(rows.map((r) => r.scope)).toEqual(["org", "personal"]);
+  });
+
+  test("schema CHECK rejects an unknown scope through the raw handle", () => {
+    const s = freshStore();
+    expect(() =>
+      s.getDb().query("INSERT INTO extension_credentials (id, provider, identity_key, owner, scope, broker_credential_id, created_at) VALUES (?, ?, ?, NULL, 'team', ?, ?)").run("ec_x", "github", "k", 1, 1),
+    ).toThrow(/CHECK/);
+  });
+});
+
 describe("audit", () => {
   test("appendAudit returns ids and listAudit filters", async () => {
     const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C20" });
@@ -543,5 +634,21 @@ describe("migration", () => {
     s2.close();
     const s3 = createStore(migratePath); // still fine after close/reopen
     s3.close();
+  });
+
+  test("extension_credentials survives schema re-runs and stays writable", async () => {
+    const migratePath = join(dir, "migrate-creds.db");
+    const s1 = createStore(migratePath);
+    const s2 = createStore(migratePath); // idempotent re-run
+    const row = await s2.upsertExtensionCredential({
+      provider: "github",
+      identityKey: "email:a@x.com",
+      owner: "U1",
+      scope: "personal",
+      brokerCredentialId: 9,
+    });
+    expect(row.scope).toBe("personal");
+    s1.close();
+    s2.close();
   });
 });
