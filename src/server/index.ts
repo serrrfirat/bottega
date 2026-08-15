@@ -11,6 +11,8 @@ import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
 import { createAcpDriver } from "./drivers/acp-driver";
+import { createExtensionRegistry } from "../extensions/registry";
+import { extensionToolDefinitions } from "../extensions/tools";
 import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
@@ -67,6 +69,10 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // Chosen from env (#43): MEM0_BASE_URL set → mem0 backend (compose ships
   // it), else SQLite sharing the store's database handle.
   const memoryProvider = resolveMemoryProvider(process.env, store.getDb());
+  // Extension registry (issue #50): loads pinned spec snapshots from
+  // config/extensions/ at boot. Per-org deployments resolve extensions from
+  // these local files — never from the integrations.sh catalog at runtime.
+  const extensionRegistry = createExtensionRegistry("config/extensions");
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
@@ -129,6 +135,10 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
       }
       return createOmpSdkDriver({
         agentDir,
+        // Registry tools (issue #50): typed extension tools ride the SDK
+        // custom-tools path so they surface in the restricted space-agent
+        // toolset alongside the project extensions below.
+        customTools: extensionToolDefinitions(extensionRegistry.list()),
         extensions: [
           createPolicyExtension({ orgPolicy, audit, router: approvalRouter, store }),
           workItemsExtension(store, { orgPolicy }),

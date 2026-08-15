@@ -144,6 +144,48 @@ pickup approval (the human-approved `create_work_item` call in the channel)
 the workspace, while unknown tools still deny and explicit deny/prompt
 policies are never bypassed.
 
+### Extension registry (typed integrations)
+
+`src/extensions/` implements the registry (issue #50): an extension is a
+typed, declarative integration — **manifest + pinned spec snapshot + vault
+binding + policy**:
+
+1. **Manifest** (`manifest.ts`) — `{ id, label, vendor, kind: "mcp" | "cli",
+   mcp?: {serverUrl | command, transport}, cli?: {command, args, env?},
+   credentialSchema: {type: oauth | api_key, scopes?}, tools: [{name, tier,
+   description, params}], domains: [egress allowlist entries] }`. `kind`
+   decides the integration: **mcp** = the provider's OFFICIAL MCP server
+   (bottega never implements provider API clients), **cli** = a preinstalled
+   CLI in the tools image that bottega shells out to. Validation fails
+   closed: duplicate ids, malformed schemas, unresolvable bindings, tool
+   names shadowing runtime built-ins — anything invalid is rejected, never
+   partially registered.
+2. **Pinned spec snapshot** (`registry.ts`) — registration resolves the
+   provider's spec from the integrations.sh catalog and snapshots it locally
+   PINNED: per-org deployments resolve from `config/extensions/<id>.json`
+   files, never from the catalog at runtime. Snapshot format:
+   `{ schema: "bottega.extension-snapshot.v1", extensionId, pinnedAt,
+   source: { catalog, specId, vendorOfficial, reviewed }, manifest }`.
+   Community entries (`vendorOfficial: false`) require explicit
+   `reviewed: true` before they register. The catalog fetch itself
+   (integrations.sh) is a later issue; it only writes these files.
+3. **Vault binding & policy** — `credentialSchema` declares what the vault
+   must hold (oauth scopes / api_key); the broker/vault wiring and the three
+   provider extensions are their own issues. Tool `tier` declarations feed
+   both the SDK approval tier and the policy gate.
+4. **Wiring** — registry tools become SDK definitions (`tools.ts`) that ride
+   the custom-tools path into the space agent's restricted toolset; mcp
+   tools call the provider's official MCP server (streamable-http or stdio),
+   cli tools spawn the preinstalled command with `--name value` flags.
+   Extension `domains` merge into the iron-proxy allowlist via
+   `src/egress/generate.ts` (run `bun run src/egress/generate.ts` after
+   adding snapshots; `config/egress.yml` is the generated artifact).
+
+The test-only fixture extension (`fixture.ts`) proves the shape end to end:
+registered → resolves → its tool appears in the space agent's toolset → its
+domain lands in the merged egress allowlist. No extension implementations
+ship in this issue — the three providers are their own issues.
+
 ### Data flow: "issue shared in Slack gets implemented"
 
 ```mermaid
@@ -222,16 +264,18 @@ src/
   server/drivers/   agent-driver.ts (AgentDriver + OMP SDK), acp-driver.ts
   server/services/  space-service.ts, delivery-poller.ts
   policy/           config.ts, extension.ts, approval-router.ts, audit.ts
+  extensions/       registry (manifest + pinned snapshots + tool bridge)
   store/            db.ts, schema.sql
   tools/            work-items.ts, memory.ts, helpers.ts
   memory/           sqlite.ts, mem0.ts, types.ts (providers behind one interface)
   mcp/              server.ts (bottega-hosted MCP memory surface, #25)
   executor.ts       containerized work-item runner (claim → PR)
   yaml-subset.ts    shared strict YAML-subset parser (configs + tests)
-  egress/           tests: compose topology, egress.yml, proxy-env, iron-proxy leg
-  secrets/          tests: credential boundary, omp templates, agent-dir
+  egress/           generate.ts (allowlist from extension domains) + tests: compose topology, egress.yml, iron-proxy leg
+  secrets/          broker/gateway wiring + tests: credential boundary, omp templates, agent-dir
 config/
-  egress.yml        iron-proxy allowlist + judge policy
+  extensions/       pinned extension snapshots (one JSON per extension)
+  egress.yml        generated iron-proxy allowlist + judge policy
   omp/              config.yml (secrets.enabled), secrets.yml, models.yml
   org.yml           executor repos + git base
   entrypoints/      broker.sh (auth-broker token bootstrap)

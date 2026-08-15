@@ -6,6 +6,7 @@ import {
   createAgentSession,
   type AgentSession,
   type ExtensionFactory,
+  type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider } from "../../memory/types";
 import { memoryContextExtension } from "../../tools/memory-context";
@@ -131,6 +132,21 @@ export const SPACE_AGENT_TOOLS = [
 ] as const;
 
 /**
+ * The session tool name list: the space-agent allowlist (or an explicit
+ * allowTools override) plus extension tool names. The SDK's restricted
+ * sessions only surface custom tools that are ALSO named here (see
+ * allowRestrictedCustomTools in createAgentSession), so extension tools must
+ * be merged into the list the driver passes.
+ */
+export function spaceAgentToolNames(extensionToolNames: readonly string[], allowTools?: readonly string[]): string[] {
+  const names = allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS];
+  for (const name of extensionToolNames) {
+    if (!names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/**
  * Driver backed by the OMP SDK (`createAgentSession`). Sessions are
  * file-backed (SessionManager under `transcriptDir`, one JSONL per space —
  * the durable space timeline), tool-restricted to the allowlist above, and
@@ -143,14 +159,20 @@ export const SPACE_AGENT_TOOLS = [
  * injection extension, built per session so it closes over the session's
  * `getPrincipal` — the smallest analogue of the MCP server's per-session
  * BOTTEGA_SPACE_ID pattern (the ACP driver documents this path instead).
+ *
+ * `customTools` (issue #50) carries the extension registry's tool
+ * definitions; restricted sessions skip extension factories entirely, so
+ * registry tools ride the SDK's custom-tools path instead.
  */
 export function createOmpSdkDriver(
   opts: {
     agentDir?: string;
     extensions?: ExtensionFactory[];
+    customTools?: ToolDefinition[];
     memoryContext?: MemoryContextDriverOpts;
   } = {},
 ): AgentDriver {
+  const customTools = opts.customTools ?? [];
   return {
     async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt }) {
       mkdirSync(transcriptDir, { recursive: true });
@@ -177,11 +199,15 @@ export function createOmpSdkDriver(
         sessionManager,
         agentRegistry: new AgentRegistry(),
         restrictToolNames: true,
-        toolNames: allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS],
+        toolNames: spaceAgentToolNames(customTools.map((tool) => tool.name), allowTools),
         // Extension seam: policy + audit extensions plug in here (#6/#7).
         extensions,
         // request-only directive (issue #55), appended to the rendered prompt.
         ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+        // Registry tools (issue #50) must surface in restricted sessions;
+        // discovered extensions, MCP, and ambient custom tools stay disabled.
+        customTools,
+        allowRestrictedCustomTools: true,
       });
       return new OmpSessionDriver({ spaceId, session, onOutput });
     },

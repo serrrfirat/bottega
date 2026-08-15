@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createOmpSdkDriver, SPACE_AGENT_TOOLS } from "./agent-driver";
+import { AgentRegistry, SessionManager, createAgentSession } from "@oh-my-pi/pi-coding-agent";
+import { createFixtureRegistry } from "../../extensions/fixture";
+import { extensionToolDefinitions } from "../../extensions/tools";
+import { createOmpSdkDriver, SPACE_AGENT_TOOLS, spaceAgentToolNames } from "./agent-driver";
 
 describe("omp sdk agent driver", () => {
   test("createSession materializes the space transcript file and disposes cleanly", async () => {
@@ -167,5 +170,65 @@ describe("omp sdk agent driver", () => {
     expect(SPACE_AGENT_TOOLS).not.toContain("write");
     expect(SPACE_AGENT_TOOLS).not.toContain("bash");
     expect(SPACE_AGENT_TOOLS).not.toContain("edit");
+  });
+
+  test("spaceAgentToolNames merges extension tools after the allowlist", () => {
+    expect(spaceAgentToolNames(["weather.current"])).toEqual([...SPACE_AGENT_TOOLS, "weather.current"]);
+    // allowTools override still wins; extension tools append to it.
+    expect(spaceAgentToolNames(["weather.current"], ["read", "grep"])).toEqual(["read", "grep", "weather.current"]);
+    expect(spaceAgentToolNames(["read"])).toEqual([...SPACE_AGENT_TOOLS]); // deduped
+  });
+
+  test("fixture extension tool appears in the space agent's toolset", async () => {
+    // The driver hides the session behind AgentSessionDriver, so the toolset
+    // contract is pinned here with the EXACT session options createOmpSdkDriver
+    // builds (restrictToolNames + spaceAgentToolNames + customTools +
+    // allowRestrictedCustomTools): a registered extension's tool must surface
+    // in the restricted space-agent toolset alongside the allowlist.
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const registry = createFixtureRegistry();
+      const customTools = extensionToolDefinitions(registry.list());
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      const sessionManager = SessionManager.create(process.cwd(), join(dir, "sessions"));
+      await sessionManager.setSessionFile(join(dir, "sessions", "slack:C1.jsonl"));
+      const { session } = await createAgentSession({
+        cwd: process.cwd(),
+        agentDir: join(dir, "agent"),
+        sessionManager,
+        agentRegistry: new AgentRegistry(),
+        restrictToolNames: true,
+        toolNames: spaceAgentToolNames(registry.toolNames()),
+        customTools,
+        allowRestrictedCustomTools: true,
+        extensions: [],
+      });
+      const active = session.getActiveToolNames();
+      expect(active).toContain("weather.current");
+      expect(active).toContain("read");
+      expect(active).toContain("grep");
+      expect(active).not.toContain("write"); // restricted: no executor tools
+      session.beginDispose();
+      await session.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("createOmpSdkDriver accepts registry customTools and creates sessions", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const customTools = extensionToolDefinitions(createFixtureRegistry().list());
+      const driver = createOmpSdkDriver({ agentDir: join(dir, "agent"), customTools });
+      const session = await driver.createSession({
+        spaceId: "slack:C1",
+        transcriptDir: join(dir, "sessions"),
+        onOutput: () => {},
+      });
+      expect(session.isStreaming()).toBe(false);
+      await session.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
