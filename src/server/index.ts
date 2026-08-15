@@ -2,11 +2,13 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { createStore } from "../store/db";
+import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { loadOrgConfig } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
+import { memoryToolsExtension } from "../tools/memory";
 import { createOmpSdkDriver } from "./agent-driver";
 import { startDeliveryPoller } from "./delivery-poller";
 import { createSlackAdapter } from "./slack";
@@ -47,6 +49,9 @@ export function main(): BottegaServer {
     extensions: [
       createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
       workItemsExtension(store),
+      // Memory tools (issue #22): the SQLite provider shares the store's
+      // database handle; every save is audited via the policy audit module.
+      memoryToolsExtension(createSqliteMemoryProvider(store.getDb()), { audit }),
     ],
   });
   // The adapter routes inbound messages to the service; the service posts

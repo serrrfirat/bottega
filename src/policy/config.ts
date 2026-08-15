@@ -39,6 +39,10 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   task: "exec",
   create_work_item: "exec",
   work_item_cancel: "exec",
+  // Memory tools (issue #22): save mutates durable state (write — prompts
+  // in non-yolo modes), search only queries (read).
+  "memory.save": "write",
+  "memory.search": "read",
 };
 
 export interface PolicyConfig {

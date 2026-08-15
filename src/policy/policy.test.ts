@@ -71,12 +71,12 @@ describe("decision table", () => {
 
 describe("tier resolution", () => {
   test("read-tier tools", () => {
-    for (const t of ["read", "glob", "grep", "ast_grep", "web_search", "inspect_image", "lsp"]) {
+    for (const t of ["read", "glob", "grep", "ast_grep", "web_search", "inspect_image", "lsp", "memory.search"]) {
       expect(resolveTier(t)).toBe("read");
     }
   });
   test("write-tier tools", () => {
-    for (const t of ["write", "edit"]) expect(resolveTier(t)).toBe("write");
+    for (const t of ["write", "edit", "memory.save"]) expect(resolveTier(t)).toBe("write");
   });
   test("exec-tier tools", () => {
     for (const t of ["bash", "task", "create_work_item", "work_item_cancel"]) expect(resolveTier(t)).toBe("exec");

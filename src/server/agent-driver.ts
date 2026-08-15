@@ -45,7 +45,8 @@ export function sessionFilePath(transcriptDir: string, spaceId: string): string 
  * Space agent tool allowlist: conversation/read-only tools + `task` for
  * delegating to work executors. Deliberately no bash/write/edit — the space
  * agent is a participant, not an executor. The work item queue tools
- * (issue #10) are listed so the agent can create and cancel work items.
+ * (issue #10) are listed so the agent can create and cancel work items, and
+ * the memory tools (issue #22) so it can save and search memory.
  */
 const SPACE_AGENT_TOOLS = [
   "read",
@@ -58,6 +59,8 @@ const SPACE_AGENT_TOOLS = [
   "task",
   "create_work_item",
   "work_item_cancel",
+  "memory.save",
+  "memory.search",
 ] as const;
 
 /**
