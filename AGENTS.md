@@ -112,6 +112,28 @@ docker compose --profile executor config -q   # compose validity (CI does this)
 - **TDD-first**: write the failing test before the implementation. Tests use
   `bun:test`; hermetic by default (real SQLite OK; no live LLM, Slack, or
   GitHub).
+
+### Test tiers (user-mandated): unit → hermetic → integration → e2e
+
+Every feature ships the highest tier reachable *hermetically*; the ladder is
+used whenever possible:
+
+1. **Unit** — pure functions, no I/O: policy decision table, normalization
+   helpers, validators, state-machine rules.
+2. **Hermetic** — real code paths against local doubles: real SQLite temp
+   DBs, `Bun.serve` stubs, scripted fake ACP servers, emulate.dev emulators.
+   NO external network, NO live services, NO real credentials. **This is the
+   default target for every feature.**
+3. **Integration** — real services in Docker (mem0 OSS server, iron-proxy):
+   skip-gated with evidence when the service can't run (missing key/image);
+   hard timeouts; never hang CI.
+4. **E2E** — full compose stack with real flows; real-credential legs (live
+   Slack/GitHub/LLM) stay a documented manual checklist, never fabricated as
+   passing.
+
+A test that passes alone but needs the network, a key, or a live service to
+pass is NOT hermetic — move it to integration with a skip gate, or make the
+double local.
 - **Integration tests** use the emulate.dev emulators (`@emulators/github`,
   `@emulators/slack` — see `src/executor.test.ts` for the pattern) — never
   real external services.
