@@ -1,12 +1,18 @@
-# Org repo config for the executor (issue #11).
+# Org repo config for the executor (issue #11, #47).
 #
-# The executor clones each work item's workspace from `git_base_url`,
-# pushes a bottega/<id> branch, and opens a PR (base: main) on the GitHub
-# API at EXECUTOR_GITHUB_API_URL (default https://api.github.com; point it
-# at a self-hosted GitHub instance or the emulate.dev emulator in tests).
+# `git_base_url` is where the executor clones each work item's workspace
+# from, pushes a bottega/<id> branch, and opens a PR (base: main) on the
+# GitHub API at EXECUTOR_GITHUB_API_URL (default https://api.github.com;
+# point it at a self-hosted GitHub instance or the emulate.dev emulator in
+# tests).
 #
-# `repos` lists the repositories work items run in — v1 uses the first
-# valid entry. EXECUTOR_REPOS (comma-separated "owner/repo") overrides.
+# `repos` is an ALLOWLIST, not a routing table (issue #47): the repo a work
+# item runs in comes from the CONVERSATION — the agent derives it from what
+# the requester said and org memory (e.g. an org-scope memory entry "our
+# repos are acme/sandbox, acme/tooling"), and passes it to create_work_item.
+# The executor refuses anything not listed here, whatever the conversation
+# said. EXECUTOR_REPOS (comma-separated "owner/repo") overrides. An empty
+# list means no pushes until a repo is configured.
 git_base_url: "https://github.com"
 repos:
   - "acme/sandbox"

@@ -82,8 +82,8 @@ const BASE_BRANCH = "main";
 const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
 
 interface ExecutorConfig {
-  /** "owner/repo" — v1 runs every item in the first configured repo. */
-  repo: string;
+  /** Authorization fence (issue #47): the only owner/repo pairs the executor may clone/push to. */
+  repoAllowlist: string[];
   gitBaseUrl: string;
   apiBaseUrl: string;
   workspacesDir: string;
@@ -105,7 +105,7 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
 export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Promise<void> {
   const cfg = await prepareExecutor(deps);
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  cfg.log(`executor ready: repo ${cfg.repo}, workspaces ${cfg.workspacesDir}`);
+  cfg.log(`executor ready: allowlist ${cfg.repoAllowlist.join(", ") || "(empty — no pushes until configured)"}, workspaces ${cfg.workspacesDir}`);
   while (!signal?.aborted) {
     let item: WorkItem | null = null;
     try {
@@ -134,8 +134,27 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     return;
   }
   try {
-    cfg.log(`[${item.id}] working (${cfg.repo}, workspace ${workspace})`);
-    await setupWorkspace(cfg, item, workspace);
+    // Repo gate (issue #47): the repo comes from the conversation, the
+    // allowlist is the authorization fence. Fail closed before any git work.
+    const repo = item.repo;
+    if (!repo) {
+      await deps.store.transitionWorkItem(item.id, "working", "blocked", {
+        evidence: "repo not specified — ask the requester",
+        by: "executor",
+      });
+      cfg.log(`[${item.id}] blocked: repo not specified`);
+      return;
+    }
+    if (!cfg.repoAllowlist.includes(repo)) {
+      await deps.store.transitionWorkItem(item.id, "working", "blocked", {
+        evidence: `repo "${repo}" is not on the executor allowlist (config/org.yml repos or EXECUTOR_REPOS)`,
+        by: "executor",
+      });
+      cfg.log(`[${item.id}] blocked: repo ${repo} not on the allowlist`);
+      return;
+    }
+    cfg.log(`[${item.id}] working (${repo}, workspace ${workspace})`);
+    await setupWorkspace(cfg, item, repo, workspace);
     const summary = await runAgentSession(deps, cfg, item, workspace);
     await deliver(deps, cfg, item, workspace, summary);
     // Delivered: drop the checkout (the transcript stays for the audit trail).
@@ -161,11 +180,11 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
   }
 }
 
-async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, workspace: string): Promise<void> {
+async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string, workspace: string): Promise<void> {
   mkdirSync(cfg.workspacesDir, { recursive: true });
   // Fresh per item: a crashed run may have left a checkout behind.
   rmSync(workspace, { recursive: true, force: true });
-  await git(["clone", `${cfg.gitBaseUrl}/${cfg.repo}.git`, workspace]);
+  await git(["clone", `${cfg.gitBaseUrl}/${repo}.git`, workspace]);
   await git(["checkout", "-b", `bottega/${item.id}`], { cwd: workspace });
   // Commit identity for the agent session's commits.
   await git(["config", "user.name", "bottega executor"], { cwd: workspace });
@@ -278,7 +297,7 @@ async function openPullRequest(
   token: string,
   summary: string,
 ): Promise<string> {
-  const res = await fetch(`${cfg.apiBaseUrl}/repos/${cfg.repo}/pulls`, {
+  const res = await fetch(`${cfg.apiBaseUrl}/repos/${item.repo}/pulls`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -303,16 +322,22 @@ async function openPullRequest(
 }
 
 /**
- * Org repo config: `repos` + `git_base_url` from config/org.yml
+ * Repo allowlist (issue #47): `repos` + `git_base_url` from config/org.yml
  * (EXECUTOR_REPOS overrides). Parsed by the shared YAML-subset parser and
  * validated — a malformed org.yml is a loud boot error, never a silent
  * mis-parse (trailing comments, inline sequences, and odd indentation
  * previously produced wrong repo/git-base values).
+ *
+ * This list is an AUTHORIZATION FENCE, not a routing table: work items name
+ * their own repo (derived from the conversation + org memory), and the
+ * executor refuses anything not listed here. An empty list is a legal boot
+ * state — no pushes happen until a repo is configured.
  */
-function loadOrgRepos(dir: string): { repos: string[]; gitBaseUrl: string } {
+function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string } {
   let gitBaseUrl = "https://github.com";
   let repos: string[] = [];
-  // Missing org.yml is a loud boot error: an executor with no repo is misconfigured.
+  // Missing org.yml is a loud boot error: an executor without config cannot
+  // authorize any push.
   const text = readFileSync(join(dir, "org.yml"), "utf8");
   let doc: Record<string, YamlNode>;
   try {
@@ -340,13 +365,13 @@ function loadOrgRepos(dir: string): { repos: string[]; gitBaseUrl: string } {
       .map((r) => r.trim())
       .filter(Boolean);
   }
-  return { repos, gitBaseUrl };
+  // Keep only well-formed owner/repo entries: anything else can never match
+  // an item's repo and would only muddy the fence.
+  return { repos: repos.filter((r) => /^[^/]+\/[^/]+$/.test(r)), gitBaseUrl };
 }
 
 function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): ExecutorConfig {
-  const { repos, gitBaseUrl } = loadOrgRepos(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
-  const repo = repos.find((r) => /^[^/]+\/[^/]+$/.test(r));
-  if (!repo) throw new Error(`no valid owner/repo configured (config/org.yml or EXECUTOR_REPOS)`);
+  const { repos, gitBaseUrl } = loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
   const workspacesDir = process.env.WORKSPACES_DIR ?? (existsSync("/workspaces") ? "/workspaces" : "data/workspaces");
   const tokenFile = process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
   if (!existsSync(tokenFile)) {
@@ -363,7 +388,7 @@ function resolveConfig(deps: ExecutorDeps, log: (line: string) => void): Executo
     log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — BOTTEGA_ALLOW_LOOSE_PAT set, continuing`);
   }
   return {
-    repo,
+    repoAllowlist: repos,
     gitBaseUrl: gitBaseUrl.replace(/\/+$/, ""),
     apiBaseUrl: (process.env.EXECUTOR_GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, ""),
     workspacesDir,

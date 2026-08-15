@@ -21,6 +21,7 @@ export type WorkItem = {
   space_id: string;
   requester: string;
   description: string;
+  repo: string | null;
   state: WorkItemState;
   approvals: string;
   evidence: string;
@@ -73,7 +74,7 @@ export interface Store {
   }): Promise<Space>;
   getSpace(id: string): Promise<Space | null>;
   updatePolicy(id: string, policyJson: string): Promise<Space>;
-  createWorkItem(input: { space_id: string; requester: string; description: string }): Promise<WorkItem>;
+  createWorkItem(input: { space_id: string; requester: string; description: string; repo?: string }): Promise<WorkItem>;
   /** Atomic open -> claimed: UPDATE ... WHERE id = (oldest open). Null when queue is empty. */
   claimNextWorkItem(): Promise<WorkItem | null>;
   /** Throws unless the row exists and is in `from`. */
@@ -145,6 +146,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(readFileSync(join(import.meta.dir, "schema.sql"), "utf8"));
+  // Idempotent migration (issue #47): databases created before the repo
+  // column existed keep their work_items table (CREATE TABLE IF NOT EXISTS
+  // is a no-op), so add the column explicitly when it is missing.
+  const workItemColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
+  if (!workItemColumns.includes("repo")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN repo TEXT");
+  }
 
   const getSpaceStmt = db.query("SELECT * FROM spaces WHERE id = ?");
   const getWorkItemStmt = db.query("SELECT * FROM work_items WHERE id = ?");
@@ -180,13 +188,14 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     space_id: string;
     requester: string;
     description: string;
+    repo?: string;
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, description, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'open', '[]', '[]', NULL, ?, ?)`,
-    ).run(id, input.space_id, input.requester, input.description, t, t);
+      `INSERT INTO work_items (id, space_id, requester, description, repo, state, approvals, evidence, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'open', '[]', '[]', NULL, ?, ?)`,
+    ).run(id, input.space_id, input.requester, input.description, input.repo ?? null, t, t);
     const item = getWorkItemStmt.get(id) as WorkItem;
     appendAudit({
       space_id: input.space_id,

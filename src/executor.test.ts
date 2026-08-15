@@ -96,8 +96,10 @@ interface Fixture {
   dir: string;
   store: Store;
   spaceId: string;
-  /** The executor's git remote: a local bare repo at bare/acme/sandbox.git. */
+  /** The executor's git remote for acme/sandbox (local bare repo). */
   bareRepo: string;
+  /** The executor's git remote for acme/tooling (local bare repo). */
+  toolingBareRepo: string;
   /** Base URL of the GitHub emulator (PR creation). */
   emulatorBase: string;
   /** The PAT that lives ONLY in the token file (0600). */
@@ -123,26 +125,34 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
   const dir = mkdtempSync(join(tmpdir(), "bottega-exec-"));
   const store = createStore(join(dir, "store.db"));
 
-  // Seeded local bare repo (the executor's remote), main with one commit.
-  const seedWork = join(dir, "seed-work");
-  mkdirSync(seedWork, { recursive: true });
-  runGit(["init", "-b", "main"], seedWork);
-  runGit(["config", "user.email", "seed@example.com"], seedWork);
-  runGit(["config", "user.name", "seed"], seedWork);
-  writeFileSync(join(seedWork, "README.md"), "# sandbox\n");
-  runGit(["add", "README.md"], seedWork);
-  runGit(["commit", "-m", "init"], seedWork);
-  const bareRepo = join(dir, "bare", "acme", "sandbox.git");
-  mkdirSync(join(dir, "bare", "acme"), { recursive: true });
-  runGit(["clone", "--bare", seedWork, bareRepo]);
-  rmSync(seedWork, { recursive: true, force: true });
+  // Seeded local bare repos (the executor's remotes), each main with one
+  // commit: acme/sandbox (the default in most tests) + acme/tooling (so the
+  // allowlist has more than one entry and item.repo routing is observable).
+  const seedBare = (name: string, content: string): string => {
+    const seedWork = join(dir, `seed-${name}`);
+    mkdirSync(seedWork, { recursive: true });
+    runGit(["init", "-b", "main"], seedWork);
+    runGit(["config", "user.email", "seed@example.com"], seedWork);
+    runGit(["config", "user.name", "seed"], seedWork);
+    writeFileSync(join(seedWork, "README.md"), content);
+    runGit(["add", "README.md"], seedWork);
+    runGit(["commit", "-m", "init"], seedWork);
+    const bare = join(dir, "bare", "acme", `${name}.git`);
+    mkdirSync(join(dir, "bare", "acme"), { recursive: true });
+    runGit(["clone", "--bare", seedWork, bare]);
+    rmSync(seedWork, { recursive: true, force: true });
+    return bare;
+  };
+  const bareRepo = seedBare("sandbox", "# sandbox\n");
+  const toolingBareRepo = seedBare("tooling", "# tooling\n");
 
-  // Org config: repos + git base (file:// so clone/push stay local).
+  // Org config: the repo ALLOWLIST (issue #47) + git base (file:// so
+  // clone/push stay local). Routing comes from item.repo, not this list.
   const orgConfigDir = join(dir, "config");
   mkdirSync(orgConfigDir, { recursive: true });
   writeFileSync(
     join(orgConfigDir, "org.yml"),
-    `git_base_url: "file://${join(dir, "bare")}"\nrepos:\n  - "acme/sandbox"\n`,
+    `git_base_url: "file://${join(dir, "bare")}"\nrepos:\n  - "acme/sandbox"\n  - "acme/tooling"\n`,
   );
 
   // The PAT file: mode 0600, like the deployment contract.
@@ -162,7 +172,10 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
   seedFromConfig(emu.store, emu.baseUrl, {
     users: [{ login: "bottega-bot" }],
     orgs: [{ login: "acme" }],
-    repos: [{ owner: "acme", name: "sandbox", default_branch: "main" }],
+    repos: [
+      { owner: "acme", name: "sandbox", default_branch: "main" },
+      { owner: "acme", name: "tooling", default_branch: "main" },
+    ],
   });
   const http = Bun.serve({ port, fetch: emu.app.fetch });
   const emulatorBase = `http://127.0.0.1:${port}`;
@@ -188,6 +201,7 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
     store,
     spaceId: "slack:C1",
     bareRepo,
+    toolingBareRepo,
     emulatorBase,
     pat: PAT,
     tokenFile,
@@ -260,6 +274,7 @@ describe("claim loop", () => {
         space_id: space.id,
         requester: "U1",
         description: "add a health check endpoint",
+        repo: "acme/sandbox",
       });
 
       const done = await runUntil(fx, item.id, "done", makeDeps(fx));
@@ -323,7 +338,12 @@ describe("claim loop", () => {
     try {
       fx.driver.failure = new Error("agent crashed: exit code 42");
       const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
-      const item = await fx.store.createWorkItem({ space_id: space.id, requester: "U1", description: "do the thing" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do the thing",
+        repo: "acme/sandbox",
+      });
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
@@ -347,7 +367,12 @@ describe("claim loop", () => {
     const fx = makeFixture(null);
     try {
       const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
-      const item = await fx.store.createWorkItem({ space_id: space.id, requester: "U1", description: "ship it" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "ship it",
+        repo: "acme/sandbox",
+      });
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
@@ -389,10 +414,114 @@ describe("claim loop", () => {
       fx.cleanup();
     }
   });
+
+  test("honors item.repo: the conversation-derived repo drives clone, branch, and PR", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "tune the tooling script",
+        repo: "acme/tooling",
+      });
+
+      const done = await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      // The PR went to the item's repo, not the first allowlisted one.
+      const result = JSON.parse(done.result!) as { pr_url: string };
+      expect(result.pr_url).toContain(`/acme/tooling/pull/1`);
+      // The branch landed on the tooling remote and nowhere near sandbox.
+      const toolingRefs = runGit(["--git-dir", fx.toolingBareRepo, "for-each-ref", "--format=%(refname:short)"]);
+      expect(toolingRefs).toContain(`bottega/${item.id}`);
+      const sandboxRefs = runGit(["--git-dir", fx.bareRepo, "for-each-ref", "--format=%(refname:short)"]);
+      expect(sandboxRefs).not.toContain(`bottega/${item.id}`);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an item without a repo blocks with 'repo not specified' evidence (fail closed)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "fix the flaky checkout",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0].url).toBe("repo not specified — ask the requester");
+      // The gate fires before any git work: no session, no workspace, no delivery.
+      expect(fx.driver.sessions).toHaveLength(0);
+      expect(existsSync(join(fx.workspacesDir, item.id))).toBe(false);
+      expect(fx.deliveries).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a repo outside the allowlist blocks with evidence naming the violation", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "ship it",
+        repo: "evil/corp",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      expect(evidence[0].url).toContain('"evil/corp"');
+      expect(evidence[0].url).toContain("allowlist");
+      expect(fx.driver.sessions).toHaveLength(0);
+      expect(fx.deliveries).toHaveLength(0);
+      // No PR was opened anywhere.
+      const pulls = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls`, {
+        headers: { Authorization: `Bearer ${fx.pat}` },
+      }).then((r) => r.json() as Promise<unknown[]>);
+      expect(pulls).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an empty allowlist boots fine and blocks every item until repos are configured", async () => {
+    const fx = makeFixture();
+    try {
+      // No repos key at all → allowlist []; EXECUTOR_REPOS is unset in the fixture.
+      writeFileSync(join(fx.orgConfigDir, "org.yml"), `git_base_url: "file://${join(fx.dir, "bare")}"\n`);
+      const cfg = await prepareExecutor(makeDeps(fx));
+      expect(cfg.repoAllowlist).toEqual([]);
+
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do the thing",
+        repo: "acme/sandbox",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      expect(evidence[0].url).toContain("allowlist");
+      expect(fx.driver.sessions).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
 });
 
 describe("org config parsing (issue #33)", () => {
-  test("trailing comments and quoted repo entries parse to the correct repo and git base", async () => {
+  test("trailing comments and quoted repo entries parse to the correct allowlist and git base", async () => {
     const fx = makeFixture();
     try {
       // Shapes the old line-scanner silently mis-parsed (the comment would
@@ -402,7 +531,7 @@ describe("org config parsing (issue #33)", () => {
         `# org repo config\ngit_base_url: "file://${join(fx.dir, "bare")}" # local bare repo\nrepos:\n  - "acme/sandbox" # v1 target\n`,
       );
       const cfg = await prepareExecutor(makeDeps(fx));
-      expect(cfg.repo).toBe("acme/sandbox");
+      expect(cfg.repoAllowlist).toEqual(["acme/sandbox"]);
       expect(cfg.gitBaseUrl).toBe(`file://${join(fx.dir, "bare")}`);
     } finally {
       fx.cleanup();

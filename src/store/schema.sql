@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   space_id     TEXT NOT NULL REFERENCES spaces(id),
   requester    TEXT NOT NULL,            -- principal (slack user id)
   description  TEXT NOT NULL,
+  repo         TEXT,                     -- owner/repo the agent derived from the conversation (issue #47);
+                                         -- null = not specified (executor blocks and asks the requester)
   state        TEXT NOT NULL DEFAULT 'open'
                CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
   approvals    TEXT NOT NULL DEFAULT '[]',-- JSON array of {approver, at}

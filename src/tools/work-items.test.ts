@@ -89,6 +89,53 @@ describe("create_work_item", () => {
     expect(item2?.requester).toBe("U7");
   });
 
+  test("accepts an optional repo and stores it on the item (issue #47)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T3" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "fix the flaky checkout", repo: "acme/bottega" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.repo).toBe("acme/bottega");
+  });
+
+  test("omits repo when not provided (nullable column stays null)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T4" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "no repo mentioned" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.repo).toBeNull();
+  });
+
+  test("rejects a whitespace-only repo", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T5" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "ambiguous repo", repo: "   " },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("non-empty");
+  });
+
   test("fails without a space session and on an empty description", async () => {
     const s = freshStore();
     const [createTool] = loadTools(s);

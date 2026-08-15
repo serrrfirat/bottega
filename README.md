@@ -267,14 +267,35 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 > only when the `executor` profile is enabled, as above. To run without the
 > executor, drop `--profile executor`.
 
+### Which repo does the executor work in?
+
+The repo is a property of the task, not of the deployment (issue #47): the
+agent derives it from the conversation — a mentioned repo, or org memory —
+and passes it to `create_work_item` ("fix the flaky checkout in bottega"
+→ `repo: "acme/bottega"`). Org memory is how the agent knows the repo
+names; seed an org-scope entry so it can answer "which repo?" without
+asking:
+
+```bash
+# via the memory.save tool in any space:
+memory.save {scope: "org", content: "our repos are acme/sandbox, acme/tooling"}
+```
+
+The executor treats `config/org.yml` `repos` (or `EXECUTOR_REPOS`) as an
+**allowlist**: it refuses any repo not listed, whatever the conversation
+said. A work item with no repo at all is blocked with
+"repo not specified — ask the requester" — there is no first-configured-repo
+fallback. An empty allowlist means no pushes until a repo is configured.
+
 ### First-run checklist
 
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.
 2. Invite the bot into a channel and @mention it — it should reply (the
    space agent answers in-channel).
-3. Create a test work item (the `create_work_item` tool) — the executor
-   claims it (`docker compose logs -f executor`), implements it in a
-   workspace, opens a PR, and the server posts
+3. Create a test work item (the `create_work_item` tool, passing a `repo`
+   that is on the allowlist — see "Which repo does the executor work in?"
+   below) — the executor claims it (`docker compose logs -f executor`),
+   implements it in a workspace, opens a PR, and the server posts
    `PR ready: <url> — approve to finish` in the channel.
 4. Restart persistence: `docker compose down && up` — spaces, work items,
    and the audit trail survive (they live on the `data` volume).
@@ -315,9 +336,11 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
   resolving `working → review → done`) is a follow-up: today the server
   posts the PR + approval request as text, and the item stays `working`
   until that path lands.
-- **Single repo per deployment** — the executor runs every item in the first
-  configured repo (`config/org.yml`), in one shared executor container (no
-  per-item container isolation yet).
+- **Allowlisted repos only** — the executor works in the repo the
+  conversation names (via `create_work_item`'s `repo` param) and refuses
+  anything outside the `config/org.yml`/`EXECUTOR_REPOS` allowlist; a work
+  item without a repo is blocked for the requester to specify. One shared
+  executor container (no per-item container isolation yet).
 - **Slack only** — Telegram, Teams, Meet, and the org observer are roadmap
   (issue #13 is the Telegram adapter).
 

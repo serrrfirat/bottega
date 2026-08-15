@@ -28,6 +28,7 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
   const createSchema = z.object({
     description: z.string(),
     requester: z.string().optional(),
+    repo: z.string().optional(),
   });
   const cancelSchema = z.object({ id: z.string() });
   return (pi) => {
@@ -37,17 +38,25 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
       description:
         "Creates a work item in the space's queue (state: open) that an executor agent can pick up and " +
         "work autonomously. Use it when asked to handle something (e.g. \"@agent handle this\"). " +
+        "The optional `repo` (\"owner/repo\") names the repository the task lives in — derive it from the " +
+        "conversation or org memory (e.g. \"fix the flaky checkout in bottega\" → repo \"acme/bottega\"); " +
+        "omit it when the conversation does not say, and the executor will block asking the requester. " +
+        "The executor only ever pushes to repos on the configured allowlist (config/org.yml or EXECUTOR_REPOS). " +
         "Requires human approval (exec-tier tool).",
       parameters: createSchema,
       approval: "exec",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         if (!params.description.trim()) return toolError("description must not be empty");
+        if (params.repo !== undefined && !params.repo.trim()) {
+          return toolError("repo must be a non-empty string when provided");
+        }
         const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
         if (!spaceId) return toolError("work items require a space session");
         const item = await store.createWorkItem({
           space_id: spaceId,
           requester: params.requester ?? actor,
           description: params.description,
+          repo: params.repo?.trim() || undefined,
         });
         return {
           content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],

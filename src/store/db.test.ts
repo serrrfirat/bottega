@@ -69,6 +69,7 @@ describe("work items", () => {
     expect(item.id).toMatch(/^wi_/);
     expect(item.space_id).toBe(space.id);
     expect(item.requester).toBe("U1");
+    expect(item.repo).toBeNull();
     expect(item.state).toBe("open");
     expect(item.approvals).toBe("[]");
     expect(item.evidence).toBe("[]");
@@ -77,6 +78,64 @@ describe("work items", () => {
 
     const got = await s.getWorkItem(item.id);
     expect(got).toEqual(item);
+  });
+
+  test("createWorkItem stores an optional repo (issue #47)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C10b" });
+    const item = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "fix the flaky checkout",
+      repo: "acme/bottega",
+    });
+    expect(item.repo).toBe("acme/bottega");
+
+    const got = await s.getWorkItem(item.id);
+    expect(got?.repo).toBe("acme/bottega");
+    // claim/transition round-trips carry the repo untouched.
+    const claimed = await s.claimNextWorkItem();
+    expect(claimed?.id).toBe(item.id);
+    expect(claimed?.repo).toBe("acme/bottega");
+  });
+
+  test("the repo column migration is idempotent on a pre-repo database", async () => {
+    const dbPath = join(dir, "store-legacy.db");
+    // A database created before issue #47: work_items has no repo column.
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE work_items (
+        id           TEXT PRIMARY KEY,
+        space_id     TEXT NOT NULL REFERENCES spaces(id),
+        requester    TEXT NOT NULL,
+        description  TEXT NOT NULL,
+        state        TEXT NOT NULL DEFAULT 'open'
+                     CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
+        approvals    TEXT NOT NULL DEFAULT '[]',
+        evidence     TEXT NOT NULL DEFAULT '[]',
+        result       TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+      );
+    `);
+    legacy.close();
+
+    // First open migrates; a second open must be a no-op (idempotent).
+    const s1 = createStore(dbPath);
+    const space = await s1.getOrCreateSpace({ platform: "slack", channel_id: "C10c" });
+    const item = await s1.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "migrated",
+      repo: "acme/sandbox",
+    });
+    expect(item.repo).toBe("acme/sandbox");
+    s1.close();
+
+    const s2 = createStore(dbPath);
+    const got = await s2.getWorkItem(item.id);
+    expect(got?.repo).toBe("acme/sandbox");
+    s2.close();
   });
 
   test("createWorkItem rejects an unknown space (foreign key)", async () => {
