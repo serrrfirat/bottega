@@ -2,6 +2,11 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { createStore } from "../store/db";
+import { createAudit } from "../policy/audit";
+import { DenyRouter } from "../policy/approval-router";
+import { loadOrgConfig } from "../policy/config";
+import createPolicyExtension from "../policy/extension";
+import { createOmpSdkDriver } from "./agent-driver";
 import { createSlackAdapter } from "./slack";
 import { SpaceService } from "./space-service";
 
@@ -18,6 +23,13 @@ export function main(): BottegaServer {
   }
 
   const store = createStore();
+  const audit = createAudit(store);
+  const orgPolicy = loadOrgConfig();
+  // DenyRouter until the Slack-backed approval router lands (later issue):
+  // until then, exec-tier tool calls are blocked server-side, never run.
+  const driver = createOmpSdkDriver({
+    extensions: [createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store })],
+  });
   // The adapter routes inbound messages to the service; the service posts
   // replies back through the adapter. Late-bound: no message can arrive
   // before main() returns, so the closure read is always initialized.
@@ -27,7 +39,7 @@ export function main(): BottegaServer {
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
   });
-  spaceService = new SpaceService({ store, adapter });
+  spaceService = new SpaceService({ store, adapter, driver });
 
   return {
     async start() {

@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { run as executorRun } from "./executor";
-import { createExtension } from "./policy/extension";
+import { DenyRouter } from "./policy/approval-router";
+import { defaultPolicy } from "./policy/config";
+import createPolicyExtension from "./policy/extension";
 import { main as serverMain } from "./server/index";
 
 test("server main wires adapter and space service", async () => {
@@ -16,6 +19,16 @@ test("executor stub runs", () => {
   expect(executorRun()).toBeUndefined();
 });
 
-test("extension factory returns the extension", () => {
-  expect(createExtension()).toEqual({ name: "bottega" });
+test("policy extension factory registers a tool_call gate", () => {
+  const events = new Set<string>();
+  // Test double: only the registration surface is exercised here.
+  const pi = { on: (event: string) => events.add(event) } as unknown as ExtensionAPI;
+  const factory = createPolicyExtension({
+    orgPolicy: defaultPolicy(),
+    audit: { appendAudit: async () => 1, listAudit: async () => [] },
+    router: DenyRouter,
+    store: { getSpace: async () => null },
+  });
+  factory(pi);
+  expect(events.has("tool_call")).toBe(true);
 });

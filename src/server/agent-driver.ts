@@ -5,6 +5,7 @@ import {
   SessionManager,
   createAgentSession,
   type AgentSession,
+  type ExtensionFactory,
 } from "@oh-my-pi/pi-coding-agent";
 
 /**
@@ -49,9 +50,11 @@ const SPACE_AGENT_TOOLS = ["read", "glob", "grep", "ast_grep", "web_search", "in
  * file-backed (SessionManager under `transcriptDir`, one JSONL per space —
  * the durable space timeline), tool-restricted to the allowlist above, and
  * registered in a private AgentRegistry (SDK requirement for concurrent
- * top-level sessions).
+ * top-level sessions). `extensions` is OMP-typed by design: the AgentDriver
+ * abstraction stays engine-free, and OMP-specific options live on this
+ * factory (policy + audit extensions plug in here, issues #6/#7).
  */
-export function createOmpSdkDriver(opts: { agentDir?: string } = {}): AgentDriver {
+export function createOmpSdkDriver(opts: { agentDir?: string; extensions?: ExtensionFactory[] } = {}): AgentDriver {
   return {
     async createSession({ spaceId, transcriptDir, onOutput }) {
       mkdirSync(transcriptDir, { recursive: true });
@@ -68,7 +71,7 @@ export function createOmpSdkDriver(opts: { agentDir?: string } = {}): AgentDrive
         restrictToolNames: true,
         toolNames: [...SPACE_AGENT_TOOLS],
         // Extension seam: policy + audit extensions plug in here (#6/#7).
-        extensions: [],
+        extensions: opts.extensions ?? [],
       });
       return new OmpSessionDriver({ spaceId, session, onOutput });
     },
