@@ -11,8 +11,7 @@
  * The ladder never guesses: when `auto` cannot resolve a credential it
  * returns an ask signal instead of picking a scope silently.
  */
-import type { ExtensionCredential } from "../store/db";
-import type { Store } from "../store/db";
+import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CREDENTIAL_RESOLVED_EVENT } from "../store/audit-events";
 
 export type CallScope = "org" | "me" | "auto";
@@ -94,6 +93,8 @@ export async function recordCredentialResolution(
     space_id: input.spaceId ?? null,
     actor: input.actor,
     event_type: EXTENSION_CREDENTIAL_RESOLVED_EVENT,
+    // Store.appendAudit takes a string payload (the policy audit wrapper is
+    // the one that accepts objects).
     payload: JSON.stringify({
       provider: input.credential.provider,
       scope: input.credential.scope,
