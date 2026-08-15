@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { run as executorRun } from "./executor";
 import { createExtension } from "./policy/extension";
-import { main as serverMain } from "./server";
+import { main as serverMain } from "./server/index";
 
 test("server stub boots and stops", () => {
   const server = serverMain();

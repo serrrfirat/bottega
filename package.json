@@ -4,12 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run --watch src/server.ts",
+    "dev": "bun run --watch src/server/index.ts",
     "check": "tsc --noEmit",
     "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@slack/bolt": "^5.0.0"
   }
 }
