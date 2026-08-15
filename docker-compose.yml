@@ -5,8 +5,9 @@
 #   - HTTP_PROXY/HTTPS_PROXY route tools that honor proxy env (Bun fetch
 #     included — verified in src/egress/proxy-env.test.ts) through the
 #     proxy's tunnel listener.
-#   - NO_PROXY keeps loopback, the internal `data` hostname, and the auth
-#     services off the proxy (server -> broker/gateway traffic is internal).
+#   - NO_PROXY keeps loopback and the auth services off the proxy (server
+#     -> broker/gateway traffic is internal; "data" is kept for legacy
+#     local setups that resolve it as a hostname).
 # No ports are published: everything lives on the internal `egress` network.
 #
 # Credential boundary (issue #9): auth-broker is the credential vault
@@ -20,6 +21,7 @@ services:
     # exist — see .goreleaser.yml in ironsh/iron-proxy). v0.49.0 is the
     # latest stable tag at implementation time.
     image: ironsh/iron-proxy:0.49.0
+    restart: on-failure
     command:
       - "-config"
       - "/etc/iron-proxy/egress.yml"
@@ -44,6 +46,7 @@ services:
     # gateway dispatch) is NOT routed through iron-proxy: the #8 allowlist
     # covers model endpoints only, so these services keep default egress.
     image: oh-my-pi/pi:dev
+    restart: on-failure
     # Bootstrap script generates the bearer token into the shared data
     # volume (0600) on first boot, then execs omp auth-broker serve.
     entrypoint:
@@ -80,6 +83,7 @@ services:
     # wire formats resolved against vault credentials. Starts only after the
     # broker is healthy so its token file is guaranteed on the shared volume.
     image: oh-my-pi/pi:dev
+    restart: on-failure
     depends_on:
       auth-broker:
         condition: service_healthy
@@ -99,9 +103,17 @@ services:
       - egress
 
   server:
-    # App image build lands with the server packaging; bun runtime base keeps
-    # this file valid today. Entrypoint: bun run src/server/index.ts.
-    image: oven/bun:1
+    # App image built from the repo root (Dockerfile): the server and the
+    # executor share it and differ only in entrypoint. BOTTEGA_IMAGE_TAG
+    # pins a known-good build (rollback: set it to the previous tag).
+    build:
+      context: .
+    image: bottega:${BOTTEGA_IMAGE_TAG:-local}
+    entrypoint:
+      - "bun"
+      - "run"
+      - "src/server/index.ts"
+    restart: on-failure
     depends_on:
       - iron-proxy
     dns:
@@ -120,10 +132,12 @@ services:
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
     volumes:
-      - data:/data
+      # The app resolves its store/sessions/transcripts from the relative
+      # path data/ (WORKDIR /app) — the shared volume mounts there.
+      - data:/app/data
       # OMP agent config per deployment: templates from config/omp/ (issue
       # #9), writable so the SDK can persist its placeholder key alongside.
-      - ./config/omp:/data/omp-agent
+      - ./config/omp:/app/data/omp-agent
     networks:
       - egress
 
@@ -132,15 +146,18 @@ services:
     # entrypoint. Claims open work items, runs one agent session per item in
     # a fresh workspace (data:/workspaces), pushes bottega/<id> branches and
     # opens PRs through the GitHub API. The git PAT is read from a FILE on
-    # the data volume (/data/secrets/github-pat, mode 0600) — the executor
+    # the data volume (/app/data/secrets/github-pat, mode 0600) — the executor
     # env carries no keys, tokens, or PATs (credential boundary, issue #9).
     profiles:
       - executor
-    image: oven/bun:1
+    build:
+      context: .
+    image: bottega:${BOTTEGA_IMAGE_TAG:-local}
     entrypoint:
       - "bun"
       - "run"
       - "src/executor.ts"
+    restart: on-failure
     depends_on:
       - iron-proxy
     dns:
@@ -156,11 +173,11 @@ services:
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
       # Workspaces + git credentials live on the data volume.
       WORKSPACES_DIR: /workspaces
-      EXECUTOR_GIT_TOKEN_FILE: /data/secrets/github-pat
+      EXECUTOR_GIT_TOKEN_FILE: /app/data/secrets/github-pat
     volumes:
-      - data:/data
+      - data:/app/data
       - data:/workspaces
-      - ./config/omp:/data/omp-agent
+      - ./config/omp:/app/data/omp-agent
     networks:
       - egress
 

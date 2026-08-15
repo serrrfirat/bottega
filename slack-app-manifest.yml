@@ -1,0 +1,38 @@
+# Bottega Slack app manifest (issue #12).
+#
+# Create the app from this file: api.slack.com/apps -> Create New App ->
+# From an app manifest -> paste this file -> Create. Then:
+#   - Install to your workspace (Settings -> Basic Information -> Install
+#     App), copy the Bot User OAuth Token (xoxb-...) into .env as
+#     SLACK_BOT_TOKEN.
+#   - Create an app-level token (Settings -> Basic Information -> App-Level
+#     Tokens -> Generate Token) with the `connections:write` scope and copy
+#     it into .env as SLACK_APP_TOKEN. Socket Mode (below) uses it.
+# No request URL is needed: Socket Mode delivers events over a websocket.
+display_information:
+  name: Bottega
+  description: "Team agents that live in your chat: pick up work items, implement them, open PRs."
+  background_color: "#1a1d21"
+features:
+  bot_user:
+    display_name: Bottega
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # Posting agent replies and delivery announcements to channels.
+      - chat:write
+      # Receiving @mentions of the bot.
+      - app_mentions:read
+      # Receiving messages in public channels, private channels, and DMs.
+      - channels:history
+      - groups:history
+      - im:history
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - app_mention
+  socket_mode_enabled: true
+  token_rotation_enabled: false

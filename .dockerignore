@@ -1,0 +1,11 @@
+node_modules/
+data/
+certs/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.git/
+.worktrees/
+.DS_Store

@@ -100,7 +100,13 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
 
   test("shared data volume exists for the store and egress audit", () => {
     expect(volumes["data"]).toBeDefined();
-    const vol = service("server")["volumes"] as string[];
-    expect(vol).toContain("data:/data");
+    // iron-proxy audits to /data; the app mounts the same volume at /app/data
+    // (its relative data/ paths resolve there under WORKDIR /app, issue #12).
+    const proxyVol = service("iron-proxy")["volumes"] as string[];
+    expect(proxyVol).toContain("data:/data");
+    for (const name of ["server", "executor"]) {
+      const vol = service(name)["volumes"] as string[];
+      expect(vol).toContain("data:/app/data");
+    }
   });
 });

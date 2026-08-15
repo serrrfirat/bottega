@@ -8,6 +8,7 @@ import { loadOrgConfig } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { createOmpSdkDriver } from "./agent-driver";
+import { startDeliveryPoller } from "./delivery-poller";
 import { createSlackAdapter } from "./slack";
 import { SpaceService } from "./space-service";
 import { mkdirSync } from "node:fs";
@@ -58,18 +59,27 @@ export function main(): BottegaServer {
     onMessage: (m) => spaceService.handleInboundMessage(m),
   });
   spaceService = new SpaceService({ store, adapter, driver });
-  // TODO(issue #11 follow-up): wire the executor's delivery approval seam —
-  // runExecutor({ store, driver, onDelivery }) posts the PR + approval
-  // request to the space channel when a work item reaches delivery_pending;
-  // the human's decision resolves the seam (working → review → done). The
-  // executor container documents this contract in src/executor.ts.
+  // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
+  // in its own container and cannot post to Slack. When a work item's PR is
+  // opened it writes a work_item.delivery_pending audit marker; this poller
+  // watches that trail, posts the PR + approval request to the space
+  // channel, and records approval.requested (dedupe across restarts). The
+  // button round-trip that resolves the seam (working -> review -> done) is
+  // a later adapter issue.
+  const deliveryPoller = startDeliveryPoller({
+    store,
+    adapter,
+    log: (line) => console.log(line),
+  });
 
   return {
     async start() {
       await adapter.start();
       await spaceService.start();
+      deliveryPoller.start();
     },
     async stop() {
+      deliveryPoller.stop();
       await spaceService.stop();
       await adapter.stop();
       store.close();

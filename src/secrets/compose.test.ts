@@ -89,9 +89,11 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
   });
 
   test("OMP agent config templates mount at the SDK agent dir", () => {
+    // /app/data/omp-agent is the container path of the app's relative
+    // data/omp-agent (WORKDIR /app, issue #12).
     for (const name of ["server", "executor"]) {
       const volumes = service(name)["volumes"] as string[];
-      expect(volumes).toContain("./config/omp:/data/omp-agent");
+      expect(volumes).toContain("./config/omp:/app/data/omp-agent");
     }
   });
 
