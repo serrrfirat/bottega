@@ -1,21 +1,25 @@
-# Model catalog for a bottega deployment (issue #9).
+# Model catalog for a bottega deployment (issue #9, fixed #36).
 # Loaded by the OMP SDK from the agent dir (data/omp-agent); this file is
 # the per-deployment template, mounted from config/omp/ by compose.
 #
-# The NEAR.ai provider is wired per https://docs.near.ai/cloud/models using
-# the OpenAI-compatible Chat Completions API. The key is referenced by env
-# var name: the SDK resolves NEAR_API_KEY from the server process env (set
-# in the compose project .env). The key value never appears in this file,
-# agent config, or transcripts.
+# NEAR AI Cloud (OpenAI-compatible gateway):
+#   https://docs.near.ai/cloud/guides/openai-compatibility/
+# NOTE: api.near.ai (Developer Hub / Completions) was retired 2025-10-31;
+# the live gateway is cloud-api.near.ai/v1. The key is referenced by env
+# var name: the SDK resolves NEAR_API_KEY from the server process env
+# (set in .env or via the Keychain dev loader). The key value never appears
+# in this file, agent config, or transcripts.
 providers:
   near:
     api: openai-completions
-    baseUrl: "https://api.near.ai/v1"
+    baseUrl: "https://cloud-api.near.ai/v1"
     apiKey: NEAR_API_KEY
     models:
-      # Placeholder — list the org's model ids here (docs.near.ai/cloud/models),
-      # e.g.:
-      #   qwen35-122b: {}
+      - id: zai-org/GLM-5.1-FP8
+        name: GLM 5.1 FP8 via NEAR AI Cloud
+        contextWindow: 128000
+        maxTokens: 8192
+# Add more model ids here as the org needs them (docs.near.ai/cloud/models).
 # Alternative agent cores are supported by the driver seam (issue #17): the
 # opencode-go runtime is the second engine option; the same models.yml shape
 # applies to it.
