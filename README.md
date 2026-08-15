@@ -60,7 +60,7 @@ the [OMP](https://oh-my-pi.dev) agent core; the egress firewall is
 
 The agent is **not** hardwired to OMP. Everything that talks to an agent —
 the space service, the executor — depends only on the `AgentDriver` /
-`AgentSessionDriver` interfaces in `src/server/agent-driver.ts`:
+`AgentSessionDriver` interfaces in `src/server/drivers/agent-driver.ts`:
 
 ```ts
 interface AgentSessionDriver {
@@ -185,8 +185,10 @@ The space timeline itself is the OMP session file (`.jsonl` under
 
 ```
 src/
-  server/           slack.ts, space-service.ts, agent-driver.ts,
-                    acp-driver.ts, delivery-poller.ts, index.ts
+  server/           index.ts (composition root)
+  server/adapters/  slack.ts
+  server/drivers/   agent-driver.ts, acp-driver.ts
+  server/services/  space-service.ts, delivery-poller.ts
   policy/           config.ts, extension.ts, approval-router.ts, audit.ts
   store/            db.ts, schema.sql
   tools/            work-items.ts (create_work_item, work_item_cancel)

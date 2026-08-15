@@ -19,9 +19,9 @@
  * announces. The executor keeps waiting, so the item stays `working` until
  * that path lands.
  */
-import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../store/audit-events";
-import type { Store } from "../store/db";
-import type { SlackAdapter } from "./slack";
+import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/audit-events";
+import type { Store } from "../../store/db";
+import type { SlackAdapter } from "../adapters/slack";
 
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
 

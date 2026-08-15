@@ -9,10 +9,10 @@ import { loadOrgConfig } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
-import { createOmpSdkDriver, type AgentDriver } from "./agent-driver";
-import { startDeliveryPoller } from "./delivery-poller";
-import { createSlackAdapter } from "./slack";
-import { SpaceService } from "./space-service";
+import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
+import { startDeliveryPoller } from "./services/delivery-poller";
+import { createSlackAdapter } from "./adapters/slack";
+import { SpaceService } from "./services/space-service";
 import { mkdirSync } from "node:fs";
 
 /**

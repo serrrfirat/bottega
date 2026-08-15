@@ -11,7 +11,7 @@
  */
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
-import { sessionIdFromFilePath } from "../server/agent-driver";
+import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
 import { toolError } from "./helpers";
 import type { Store } from "../store/db";

@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createAcpDriver, type AcpMcpServerEntry } from "./acp-driver";
 import type { AgentSessionDriver } from "./agent-driver";
-import { SpaceService, type InboundMessage } from "./space-service";
-import type { SlackAdapter } from "./slack";
-import type { Store } from "../store/db";
+import { SpaceService, type InboundMessage } from "../services/space-service";
+import type { SlackAdapter } from "../adapters/slack";
+import type { Store } from "../../store/db";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-acp-server.ts");
 

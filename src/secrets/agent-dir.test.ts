@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import { createOmpSdkDriver } from "../server/agent-driver";
+import { createOmpSdkDriver } from "../server/drivers/agent-driver";
 import { OMP_AGENT_DIR, main } from "../server/index";
 
 describe("agent dir wiring (issue #9)", () => {

@@ -1,7 +1,7 @@
-import { createOmpSdkDriver, type AgentDriver, type AgentSessionDriver } from "./agent-driver";
-import { MESSAGE_DROPPED_EVENT } from "../store/audit-events";
-import type { Store } from "../store/db";
-import type { SlackAdapter } from "./slack";
+import { createOmpSdkDriver, type AgentDriver, type AgentSessionDriver } from "../drivers/agent-driver";
+import { MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
+import type { Store } from "../../store/db";
+import type { SlackAdapter } from "../adapters/slack";
 
 export interface InboundMessage {
   spaceId: string;

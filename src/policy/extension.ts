@@ -16,7 +16,7 @@ import type {
   ToolCallEventResult,
 } from "@oh-my-pi/pi-coding-agent";
 import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
-import { sessionIdFromFilePath } from "../server/agent-driver";
+import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "./approval-router";

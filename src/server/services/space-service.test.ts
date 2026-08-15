@@ -1,8 +1,8 @@
 import { describe, expect, test, vi } from "bun:test";
-import type { Store } from "../store/db";
-import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "./agent-driver";
+import type { Store } from "../../store/db";
+import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type InboundMessage } from "./space-service";
-import type { SlackAdapter } from "./slack";
+import type { SlackAdapter } from "../adapters/slack";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests

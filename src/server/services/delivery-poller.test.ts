@@ -5,13 +5,13 @@
  * audit trail so restarts never re-post.
  */
 import { describe, expect, test, vi } from "bun:test";
-import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../store/audit-events";
+import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/audit-events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AuditRow, ListAuditOpts, Store } from "../store/db";
-import { createStore } from "../store/db";
-import type { SlackAdapter } from "./slack";
+import type { AuditRow, ListAuditOpts, Store } from "../../store/db";
+import { createStore } from "../../store/db";
+import type { SlackAdapter } from "../adapters/slack";
 import { DEFAULT_POLL_INTERVAL_MS, pollPendingDeliveries, startDeliveryPoller } from "./delivery-poller";
 
 // --- Fakes ------------------------------------------------------------------

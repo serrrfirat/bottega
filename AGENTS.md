@@ -153,7 +153,7 @@ double local.
 - **Commit style**: `<type>(scope): <past-tense description>` (e.g.
   `feat(store): added atomic claim`), with the issue number when one exists.
 - The agent is pluggable: SpaceService and the executor depend only on
-  `AgentDriver` (`src/server/agent-driver.ts`). Never hardwire agent logic to
+  `AgentDriver` (`src/server/drivers/agent-driver.ts`). Never hardwire agent logic to
   OMP; add drivers, don't branch on them.
 
 ## Security invariants (never weaken)

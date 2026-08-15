@@ -34,7 +34,7 @@ import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { loadOrgConfig } from "./policy/config";
 import createPolicyExtension from "./policy/extension";
-import { createOmpSdkDriver, type AgentDriver } from "./server/agent-driver";
+import { createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 /**

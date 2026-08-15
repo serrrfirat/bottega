@@ -26,7 +26,7 @@ import {
   type DeliveryInfo,
   type ExecutorDeps,
 } from "./executor";
-import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./server/agent-driver";
+import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./server/drivers/agent-driver";
 
 // --- Fakes ------------------------------------------------------------------
 
