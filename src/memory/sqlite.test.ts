@@ -10,7 +10,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { createSqliteMemoryProvider } from "./sqlite";
+import { createSqliteMemoryProvider, pruneDigestMemories } from "./sqlite";
 import { runMemoryConformanceTests } from "./conformance.test";
 import { createStore } from "../store/db";
 
@@ -128,5 +128,43 @@ describe("sqlite memory backend specifics", () => {
     } finally {
       store.close();
     }
+  });
+
+  test("an empty query is allowed when metadata filters are given (newest digest marker)", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
+    await p.save({ scope: "org", content: "older digest", metadata: { kind: "digest", space: "slack:C1", until: "1.1" } });
+    await p.save({ scope: "org", content: "newer digest", metadata: { kind: "digest", space: "slack:C1", until: "2.2" } });
+    await p.save({ scope: "org", content: "other space digest", metadata: { kind: "digest", space: "slack:C2", until: "9.9" } });
+    await p.save({ scope: "org", content: "plain memory" });
+
+    const [newest] = await p.search({ scope: "org", query: "", metadata: { kind: "digest", space: "slack:C1" }, limit: 1 });
+    expect(newest.content).toBe("newer digest");
+    // Still rejected without metadata filters (contract unchanged).
+    expect(() => p.search({ scope: "org", query: "" })).toThrow(/non-empty/);
+  });
+
+  test("pruneDigestMemories keeps only the newest `keep` digests per space", async () => {
+    const db = freshDb();
+    const p = createSqliteMemoryProvider(db);
+    for (let i = 1; i <= 25; i++) {
+      await p.save({ scope: "org", content: `digest ${i}`, metadata: { kind: "digest", space: "slack:C1", until: `${i}.0` } });
+    }
+    await p.save({ scope: "org", content: "other space", metadata: { kind: "digest", space: "slack:C2", until: "1.0" } });
+    await p.save({ scope: "org", content: "plain memory" });
+
+    const deleted = pruneDigestMemories(db, "slack:C1", 20);
+    expect(deleted).toBe(5);
+
+    const [newest] = await p.search({ scope: "org", query: "", metadata: { kind: "digest", space: "slack:C1" }, limit: 1 });
+    expect(newest.content).toBe("digest 25"); // newest survives
+    const remaining = await p.search({ scope: "org", query: "", metadata: { kind: "digest", space: "slack:C1" }, limit: 20 });
+    expect(remaining).toHaveLength(20);
+    expect(remaining.at(-1)!.content).toBe("digest 6"); // oldest survivor
+
+    // Other spaces and plain memories are untouched.
+    const other = await p.search({ scope: "org", query: "", metadata: { kind: "digest", space: "slack:C2" }, limit: 1 });
+    expect(other).toHaveLength(1);
+    const plain = await p.search({ scope: "org", query: "plain" });
+    expect(plain).toHaveLength(1);
   });
 });

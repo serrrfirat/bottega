@@ -28,7 +28,7 @@ export interface MemorySaveInput {
 }
 
 export interface MemorySearchQuery {
-  /** Non-empty. */
+  /** Non-empty unless `metadata` filters are given (metadata-only listing). */
   query: string;
   scope: MemoryScope;
   /** Filters when provided; ignored for org scope. */
@@ -63,8 +63,11 @@ export function validateSearchQuery(query: MemorySearchQuery): void {
   if (query.scope !== "org" && query.scope !== "user") {
     throw new Error(`memory.search: invalid scope ${String(query.scope)}`);
   }
-  if (!query.query || !query.query.trim()) {
-    throw new Error("memory.search: query must be non-empty");
+  // An empty query is a metadata-only listing (e.g. the newest digest for a
+  // space, issue #42); without metadata filters it is a plain validation miss.
+  const hasMetadataFilters = query.metadata !== undefined && Object.keys(query.metadata).length > 0;
+  if ((!query.query || !query.query.trim()) && !hasMetadataFilters) {
+    throw new Error("memory.search: query must be non-empty (or provide metadata filters)");
   }
   if (query.limit !== undefined && (query.limit < 1 || query.limit > MEMORY_LIMIT_MAX)) {
     throw new Error(`memory.search: limit must be 1..${MEMORY_LIMIT_MAX}`);

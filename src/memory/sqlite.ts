@@ -56,6 +56,30 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
+/**
+ * Digest cap (issue #42): deletes digest memories for `spaceId` beyond the
+ * newest `keep`, so digests cannot pile up (the space transcript retains the
+ * full history, so pruning loses nothing). Returns the number of deleted
+ * rows. This is deliberately not part of the MemoryProvider contract —
+ * memory is never deleted through the provider (issue #19); the cap is a
+ * bottega-owned storage-management rule on the shared SQLite file.
+ */
+export function pruneDigestMemories(db: Database, spaceId: string, keep: number): number {
+  const result = db
+    .query(
+      `DELETE FROM memories
+       WHERE id IN (
+         SELECT id FROM memories
+         WHERE metadata_json LIKE '%"kind":"digest"%' ESCAPE '\\'
+           AND metadata_json LIKE ? ESCAPE '\\'
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT -1 OFFSET ?
+       )`,
+    )
+    .run(`%"space":"${escapeLike(spaceId)}"%`, keep);
+  return result.changes;
+}
+
 export function createSqliteMemoryProvider(db: Database): MemoryProvider {
   db.exec(MIGRATION);
 
@@ -104,7 +128,7 @@ export function createSqliteMemoryProvider(db: Database): MemoryProvider {
         `SELECT id, scope, principal, content, metadata_json, created_at
          FROM memories
          WHERE ${clauses.join(" AND ")}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC, rowid DESC`,
       )
       .all(...params) as MemoryRow[];
 

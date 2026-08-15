@@ -1,7 +1,8 @@
 import { describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
+import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, type InboundMessage } from "./space-service";
+import { SpaceService, DIGEST_CAP, type InboundMessage } from "./space-service";
 import type { SlackAdapter } from "../adapters/slack";
 
 // ---------------------------------------------------------------------------
@@ -10,20 +11,43 @@ import type { SlackAdapter } from "../adapters/slack";
 // ---------------------------------------------------------------------------
 
 class FakeSession implements AgentSessionDriver {
+  readonly spaceId: string;
   readonly prompts: Array<{ text: string; opts?: AgentTurnOptions }> = [];
   disposed = false;
   streaming = false;
-  /** When true, dispose() parks until finishDispose() — exposes the mid-dispose window. */
+  /** When true, prompt() parks until finishDispose() — exposes the mid-dispose window. */
   deferDispose = false;
+  /** When true, prompt() parks until finishPrompt() — exposes the digest bound. */
+  deferPrompt = false;
   /** When true, prompt() throws — exercises the handler's failure path. */
   failPrompt = false;
+  /** When set, prompt() emits a message event with this text (the model's reply). */
+  autoReply?: string;
 
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
+  private promptGate?: { promise: Promise<void>; resolve: () => void };
+
+  constructor(spaceId = "slack:C1") {
+    this.spaceId = spaceId;
+  }
 
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     if (this.failPrompt) throw new Error("fake prompt failure");
     this.prompts.push({ text, opts });
+    if (this.deferPrompt) {
+      const gate = Promise.withResolvers<void>();
+      this.promptGate = gate;
+      await gate.promise;
+    }
+    if (this.autoReply !== undefined) {
+      this.emit("message", { spaceId: this.spaceId, text: this.autoReply });
+    }
+  }
+
+  finishPrompt(): void {
+    this.promptGate?.resolve();
+    this.promptGate = undefined;
   }
 
   async abort(): Promise<void> {}
@@ -65,19 +89,69 @@ interface CreateSessionOpts {
   spaceId: string;
   transcriptDir: string;
   onOutput: (spaceId: string, text: string) => void;
+  getPrincipal?: () => string | undefined;
 }
 
 class FakeDriver implements AgentDriver {
   readonly created: Array<{ opts: CreateSessionOpts; session: FakeSession }> = [];
 
   async createSession(opts: CreateSessionOpts): Promise<AgentSessionDriver> {
-    const session = new FakeSession();
+    const session = new FakeSession(opts.spaceId);
     this.created.push({ opts, session });
     return session;
   }
 
   last(): FakeSession {
     return this.created[this.created.length - 1].session;
+  }
+}
+
+/**
+ * Stateful memory fake: digest saves feed back into marker lookups, so the
+ * "marker advanced" behavior is observable across dispose cycles.
+ */
+class FakeMemoryProvider implements MemoryProvider {
+  saved: MemorySaveInput[] = [];
+  /** Digest entries (newest last): {space, since, until}. */
+  digests: Array<{ space: string; since: string; until: string }> = [];
+
+  async save(input: MemorySaveInput) {
+    this.saved.push(input);
+    if (input.metadata?.kind === "digest") {
+      this.digests.push({
+        space: input.metadata.space ?? "",
+        since: input.metadata.since ?? "",
+        until: input.metadata.until ?? "",
+      });
+    }
+    return {
+      id: `mem_${this.saved.length}`,
+      scope: input.scope,
+      principal: input.principal ?? null,
+      content: input.content,
+      metadata: input.metadata ?? {},
+      createdAt: 1000,
+    };
+  }
+
+  async search(query: MemorySearchQuery) {
+    if (query.metadata?.kind === "digest") {
+      const matches = this.digests.filter((d) => d.space === query.metadata!.space);
+      const newest = matches[matches.length - 1];
+      return newest
+        ? [
+            {
+              id: "mem_digest",
+              scope: "org" as const,
+              principal: null,
+              content: "digest",
+              metadata: { kind: "digest", space: newest.space, since: newest.since, until: newest.until },
+              createdAt: 1000,
+            },
+          ]
+        : [];
+    }
+    return [];
   }
 }
 
@@ -267,6 +341,20 @@ describe("SpaceService session lifecycle", () => {
     await expect(service.handleInboundMessage(msg({ text: "boom" }))).resolves.toBeUndefined();
     expect(driver.last().prompts).toHaveLength(1);
   });
+
+  test("sessions get a getPrincipal getter that tracks the space's last inbound principal", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ principal: "U1", ts: "1.1" }));
+    await service.handleInboundMessage(msg({ principal: "U2", ts: "2.2" }));
+
+    expect(driver.created).toHaveLength(1); // same session, getter stays fresh
+    const getPrincipal = driver.created[0].opts.getPrincipal!;
+    expect(getPrincipal()).toBe("U2");
+  });
 });
 
 describe("SpaceService output routing", () => {
@@ -412,5 +500,202 @@ describe("SpaceService output routing", () => {
     session.emit("message", { spaceId: "slack:C1", text: "after unsubscribe" });
 
     expect(received).toEqual([{ spaceId: "slack:C1", text: "event output" }]);
+  });
+});
+
+describe("SpaceService digest-on-idle", () => {
+  test("dispose digests new messages into org memory, advances the marker, and disposes", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ text: "hello", ts: "1.1" }));
+    const first = driver.last();
+    first.autoReply = "- first digest";
+    await service.stop();
+
+    // Digest turn: one silent summary prompt whose output was captured.
+    expect(first.prompts).toHaveLength(2);
+    expect(first.prompts[1].text).toContain("Summarize this conversation so far");
+    expect(first.prompts[1].opts).toEqual({ silent: true });
+    expect(provider.saved).toEqual([
+      {
+        scope: "org",
+        content: "- first digest",
+        metadata: { kind: "digest", space: "slack:C1", since: "", until: "1.1" },
+      },
+    ]);
+    expect(first.disposed).toBe(true);
+    expect(audit).toHaveLength(0); // no failure audited
+
+    // Marker advanced: the next digest reads `until` from the newest digest.
+    await service.handleInboundMessage(msg({ text: "more", ts: "2.2" }));
+    const second = driver.last();
+    second.autoReply = "- second digest";
+    await service.stop();
+
+    expect(second.prompts[1].text).toContain("since 1.1");
+    expect(provider.saved).toHaveLength(2);
+    expect(provider.saved[1].metadata).toEqual({ kind: "digest", space: "slack:C1", since: "1.1", until: "2.2" });
+    expect(second.disposed).toBe(true);
+  });
+
+  test("prunes to the digest cap after a successful save", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const prunes: Array<{ spaceId: string; keep: number }> = [];
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      memoryProvider: provider,
+      digestPrune: async (spaceId, keep) => void prunes.push({ spaceId, keep }),
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    driver.last().autoReply = "- digest";
+    await service.stop();
+
+    expect(prunes).toEqual([{ spaceId: "slack:C1", keep: DIGEST_CAP }]);
+  });
+
+  test("no messages newer than the marker means no digest", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    provider.digests.push({ space: "slack:C1", since: "0.1", until: "1.1" });
+    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" })); // same ts as the marker
+    await service.stop();
+
+    expect(driver.last().prompts).toHaveLength(1); // the message only, no digest turn
+    expect(provider.saved).toHaveLength(0);
+    expect(driver.last().disposed).toBe(true);
+  });
+
+  test("a failing summary turn audits digest.failed and still disposes", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.failPrompt = true;
+    await service.stop();
+
+    expect(provider.saved).toHaveLength(0);
+    expect(audit).toEqual([
+      {
+        space_id: "slack:C1",
+        actor: "system",
+        event_type: "digest.failed",
+        payload: JSON.stringify({ reason: "fake prompt failure" }),
+      },
+    ]);
+    expect(session.disposed).toBe(true);
+  });
+
+  test("an empty summary is a digest failure, audited, and dispose proceeds", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.autoReply = ""; // turn completes with no text
+    await service.stop();
+
+    expect(provider.saved).toHaveLength(0);
+    expect(audit).toEqual([
+      {
+        space_id: "slack:C1",
+        actor: "system",
+        event_type: "digest.failed",
+        payload: JSON.stringify({ reason: "empty summary" }),
+      },
+    ]);
+    expect(session.disposed).toBe(true);
+  });
+
+  test("a digest turn that never settles times out, audits, and disposes", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      memoryProvider: provider,
+      digestTimeoutMs: 10,
+    });
+    vi.useFakeTimers();
+    try {
+      await service.handleInboundMessage(msg({ ts: "1.1" }));
+      const session = driver.last();
+      session.deferPrompt = true; // prompt never resolves on its own
+      const stopPromise = service.stop();
+      for (let i = 0; i < 10; i++) await Promise.resolve(); // let the digest reach withTimeout
+      vi.advanceTimersByTime(10); // the digest bound fires
+      for (let i = 0; i < 10; i++) await Promise.resolve(); // flush the timeout chain
+
+      expect(provider.saved).toHaveLength(0);
+      expect(audit).toEqual([
+        {
+          space_id: "slack:C1",
+          actor: "system",
+          event_type: "digest.failed",
+          payload: expect.stringContaining("timed out"),
+        },
+      ]);
+      session.finishPrompt(); // let the parked turn settle so dispose proceeds
+      await stopPromise;
+      expect(session.disposed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a streaming session is not idle: dispose skips the digest and does not hijack the turn", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider();
+    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+    session.autoReply = "- digest";
+    await service.stop();
+
+    expect(session.prompts).toHaveLength(1); // no digest turn steered into the stream
+    expect(provider.saved).toHaveLength(0);
+    expect(session.disposed).toBe(true);
+  });
+
+  test("without a memory provider dispose never digests", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.autoReply = "- digest";
+    await service.stop();
+
+    expect(session.prompts).toHaveLength(1); // no digest turn
+    expect(session.disposed).toBe(true);
   });
 });

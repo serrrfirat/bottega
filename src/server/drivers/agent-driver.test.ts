@@ -76,6 +76,35 @@ describe("omp sdk agent driver", () => {
     }
   });
 
+  test("memoryContext wiring creates sessions with the injection extension (issue #42)", async () => {
+    // The driver builds the memory-context extension per session around the
+    // session's getPrincipal; a real SDK session must accept it at creation
+    // and dispose cleanly (the extension only acts on LLM calls, so no prompt).
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const provider = {
+        save: async () => {
+          throw new Error("unused");
+        },
+        search: async () => [],
+      };
+      const driver = createOmpSdkDriver({
+        agentDir: join(dir, "agent"),
+        memoryContext: { provider, maxEntries: 2, enabled: true },
+      });
+      const session = await driver.createSession({
+        spaceId: "slack:C1",
+        transcriptDir: join(dir, "sessions"),
+        onOutput: () => {},
+        getPrincipal: () => "U1",
+      });
+      expect(session.isStreaming()).toBe(false);
+      await session.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("sessions materialize the SDK agent state in the passed agentDir", async () => {
     // Behavioral proof the agentDir option is honored: the OMP SDK keeps its
     // agent store (agent.db) in the directory the driver was given, not the

@@ -2,7 +2,7 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { createStore } from "../store/db";
-import { createSqliteMemoryProvider } from "../memory/sqlite";
+import { createSqliteMemoryProvider, pruneDigestMemories } from "../memory/sqlite";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { loadOrgConfig } from "../policy/config";
@@ -48,6 +48,9 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   const store = createStore();
   const audit = createAudit(store);
   const orgPolicy = loadOrgConfig();
+  // One SQLite memory provider for the whole process: shared by the agent
+  // memory tools, the context-injection extension, and digest-on-idle (#42).
+  const memoryProvider = createSqliteMemoryProvider(store.getDb());
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
@@ -63,8 +66,14 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
           workItemsExtension(store, { orgPolicy }),
           // Memory tools (issue #22): the SQLite provider shares the store's
           // database handle; every save is audited via the policy audit module.
-          memoryToolsExtension(createSqliteMemoryProvider(store.getDb()), { audit }),
+          memoryToolsExtension(memoryProvider, { audit }),
         ],
+        // Turn-start memory injection (#42), gated by the org policy config.
+        memoryContext: {
+          provider: memoryProvider,
+          enabled: orgPolicy.memory.injection.enabled,
+          maxEntries: orgPolicy.memory.injection.maxEntries,
+        },
       }));
   const driver = createDriver(OMP_AGENT_DIR);
   // The adapter routes inbound messages to the service; the service posts
@@ -76,7 +85,17 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
   });
-  spaceService = new SpaceService({ store, adapter, driver });
+  spaceService = new SpaceService({
+    store,
+    adapter,
+    driver,
+    // Digest-on-idle (#42): summarize idle spaces into org memory; the cap
+    // prunes digest memories beyond the newest 20 per space on this file.
+    memoryProvider,
+    digestPrune: (spaceId, keep) => {
+      pruneDigestMemories(store.getDb(), spaceId, keep);
+    },
+  });
   // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
   // in its own container and cannot post to Slack. When a work item's PR is
   // opened it writes a work_item.delivery_pending audit marker; this poller

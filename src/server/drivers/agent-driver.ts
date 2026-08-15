@@ -7,6 +7,17 @@ import {
   type AgentSession,
   type ExtensionFactory,
 } from "@oh-my-pi/pi-coding-agent";
+import type { MemoryProvider } from "../../memory/types";
+import { memoryContextExtension } from "../../tools/memory-context";
+
+/** Driver-level memory-context wiring (issue #42): mirrors the extension opts. */
+export interface MemoryContextDriverOpts {
+  provider: MemoryProvider;
+  defaultPrincipal?: string;
+  maxEntries?: number;
+  maxBytes?: number;
+  enabled?: boolean;
+}
 
 /**
  * Minimal agent-session abstraction. SpaceService depends only on this — the
@@ -14,6 +25,11 @@ import {
  */
 export interface AgentTurnOptions {
   streamingBehavior?: "steer" | "followUp";
+  /**
+   * Suppress onOutput delivery for this turn (digest turns, issue #42). The
+   * "message" event still fires, so callers can capture the turn's text.
+   */
+  silent?: boolean;
 }
 
 export interface AgentSessionDriver {
@@ -33,6 +49,12 @@ export interface AgentDriver {
     cwd?: string;
     /** Tool allowlist override; defaults to the space-agent allowlist. */
     allowTools?: readonly string[];
+    /**
+     * The space's current principal, re-read on every LLM call (issue #42).
+     * Consumed by the OMP driver's memory-context injection; ACP sessions
+     * reach memory through the MCP tools (#25) and ignore it (documented).
+     */
+    getPrincipal?: () => string | undefined;
   }): Promise<AgentSessionDriver>;
 }
 
@@ -110,16 +132,39 @@ export const SPACE_AGENT_TOOLS = [
  * top-level sessions). `extensions` is OMP-typed by design: the AgentDriver
  * abstraction stays engine-free, and OMP-specific options live on this
  * factory (policy + audit extensions plug in here, issues #6/#7).
+ *
+ * `memoryContext` (issue #42) wraps every session with the memory-context
+ * injection extension, built per session so it closes over the session's
+ * `getPrincipal` — the smallest analogue of the MCP server's per-session
+ * BOTTEGA_SPACE_ID pattern (the ACP driver documents this path instead).
  */
-export function createOmpSdkDriver(opts: { agentDir?: string; extensions?: ExtensionFactory[] } = {}): AgentDriver {
+export function createOmpSdkDriver(
+  opts: {
+    agentDir?: string;
+    extensions?: ExtensionFactory[];
+    memoryContext?: MemoryContextDriverOpts;
+  } = {},
+): AgentDriver {
   return {
-    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools }) {
+    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal }) {
       mkdirSync(transcriptDir, { recursive: true });
       const sessionCwd = cwd ?? process.cwd();
       const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
       // Missing/empty files start fresh; existing files resume the space's
       // transcript (server restarts keep history intact).
       await sessionManager.setSessionFile(sessionFilePath(transcriptDir, spaceId));
+      const extensions = [...(opts.extensions ?? [])];
+      if (opts.memoryContext) {
+        extensions.push(
+          memoryContextExtension(opts.memoryContext.provider, {
+            defaultPrincipal: opts.memoryContext.defaultPrincipal,
+            maxEntries: opts.memoryContext.maxEntries,
+            maxBytes: opts.memoryContext.maxBytes,
+            enabled: opts.memoryContext.enabled,
+            getPrincipal,
+          }),
+        );
+      }
       const { session } = await createAgentSession({
         cwd: sessionCwd,
         agentDir: opts.agentDir,
@@ -128,7 +173,7 @@ export function createOmpSdkDriver(opts: { agentDir?: string; extensions?: Exten
         restrictToolNames: true,
         toolNames: allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS],
         // Extension seam: policy + audit extensions plug in here (#6/#7).
-        extensions: opts.extensions ?? [],
+        extensions,
       });
       return new OmpSessionDriver({ spaceId, session, onOutput });
     },
@@ -142,6 +187,8 @@ class OmpSessionDriver implements AgentSessionDriver {
   readonly #emitter = createEmitter<DriverEvent>();
   #textByIndex = new Map<number, string>();
   #unsubscribe: () => void;
+  /** When a prompt runs with silent: true, output is captured but not delivered. */
+  #silentTurn = false;
 
   constructor(deps: {
     spaceId: string;
@@ -189,14 +236,19 @@ class OmpSessionDriver implements AgentSessionDriver {
 
   /** Steers into the running turn, queues a follow-up, or starts a fresh turn. */
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
-    if (this.#session.isStreaming) {
-      if (opts?.streamingBehavior === "followUp") {
-        await this.#session.followUp(text);
+    this.#silentTurn = opts?.silent ?? false;
+    try {
+      if (this.#session.isStreaming) {
+        if (opts?.streamingBehavior === "followUp") {
+          await this.#session.followUp(text);
+        } else {
+          await this.#session.steer(text);
+        }
       } else {
-        await this.#session.steer(text);
+        await this.#session.prompt(text);
       }
-    } else {
-      await this.#session.prompt(text);
+    } finally {
+      this.#silentTurn = false;
     }
   }
 
@@ -220,7 +272,9 @@ class OmpSessionDriver implements AgentSessionDriver {
 
   #deliver(text: string): void {
     // onOutput and the "message" event are the same signal: consume one channel.
-    this.#onOutput(this.#spaceId, text);
+    // Silent turns (digest, #42) skip the output callback but still emit, so
+    // the caller can capture the text without posting it to the space.
+    if (!this.#silentTurn) this.#onOutput(this.#spaceId, text);
     this.#emitter.emit("message", { spaceId: this.#spaceId, text });
   }
 }

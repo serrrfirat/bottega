@@ -28,3 +28,5 @@ export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 export const MEMORY_WRITE_EVENT = "memory.write";
 /** Inbound message dropped (payload {reason, ts}). */
 export const MESSAGE_DROPPED_EVENT = "message_dropped";
+/** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */
+export const DIGEST_FAILED_EVENT = "digest.failed";

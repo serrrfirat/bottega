@@ -147,6 +147,45 @@ approvals:
     expect(p.unknownAction).toBe("deny");
     expect(p.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
     expect(p.requiredApprovers).toBe(1);
+    // Memory-context injection defaults (issue #42): enabled, 5 entries.
+    expect(p.memory.injection).toEqual({ enabled: true, maxEntries: 5 });
+  });
+
+  test("memory.injection parses and invalid values warn, not fail", () => {
+    const p = parseOrgConfigYaml(`
+memory:
+  injection:
+    enabled: false
+    max_entries: 3
+`);
+    expect(p.ok).toBe(true);
+    expect(p.memory.injection).toEqual({ enabled: false, maxEntries: 3 });
+    expect(p.errors).toEqual([]);
+    expect(p.warnings).toEqual([]);
+
+    const bad = parseOrgConfigYaml("memory:\n  injection:\n    enabled: sometimes\n    max_entries: 0\n");
+    expect(bad.ok).toBe(true);
+    expect(bad.memory.injection).toEqual({ enabled: true, maxEntries: 5 }); // defaults kept
+    expect(bad.warnings).toHaveLength(2);
+  });
+
+  test("memory.injection.max_entries over 20 is capped with a warning", () => {
+    const p = parseOrgConfigYaml("memory:\n  injection:\n    max_entries: 50\n");
+    expect(p.ok).toBe(true);
+    expect(p.memory.injection.maxEntries).toBe(20);
+    expect(p.warnings).toHaveLength(1);
+  });
+
+  test("a non-mapping memory.injection is a structural error (fail closed)", () => {
+    expect(parseOrgConfigYaml("memory:\n  injection: nope\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("memory: nope\n").ok).toBe(false);
+  });
+
+  test("the space overlay cannot change memory.injection (org floor only)", () => {
+    const org = parseOrgConfigYaml("memory:\n  injection:\n    enabled: false\n    max_entries: 2\n");
+    const p = applySpaceOverlay(org, JSON.stringify({ memory: { injection: { enabled: true, max_entries: 9 } } }));
+    expect(p.ok).toBe(true);
+    expect(p.memory.injection).toEqual({ enabled: false, maxEntries: 2 });
   });
 
   test("toolAction falls back to the unknown default", () => {

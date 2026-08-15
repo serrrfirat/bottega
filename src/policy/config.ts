@@ -47,6 +47,13 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   "memory.search": "read",
 };
 
+export interface MemoryInjectionConfig {
+  /** Master switch for turn-start memory injection (issue #42). Default true. */
+  enabled: boolean;
+  /** Max memory entries per injected message. Default 5, capped at 20. */
+  maxEntries: number;
+}
+
 export interface PolicyConfig {
   /** Structural validity. False → every decision denies (fail closed). */
   ok: boolean;
@@ -60,9 +67,15 @@ export interface PolicyConfig {
   requiredApprovers: number;
   /** Space approvers (issue #33): the overlay's `approvers` list; org floor default is none. */
   approvers: string[];
+  /** Memory-context injection settings (issue #42); org floor only — the overlay cannot change them. */
+  memory: { injection: MemoryInjectionConfig };
   errors: string[];
   warnings: string[];
 }
+
+/** `memory.injection.max_entries` default and ceiling (search caps at 20). */
+export const DEFAULT_MEMORY_INJECTION_MAX_ENTRIES = 5;
+export const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
 
 export function defaultPolicy(): PolicyConfig {
   return {
@@ -72,6 +85,7 @@ export function defaultPolicy(): PolicyConfig {
     timeoutMinutes: DEFAULT_TIMEOUT_MINUTES,
     requiredApprovers: DEFAULT_REQUIRED_APPROVERS,
     approvers: [],
+    memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
     errors: [],
     warnings: [],
   };
@@ -132,6 +146,15 @@ function parsePositiveInt(value: string | undefined): number | undefined {
   return n >= 1 ? n : undefined;
 }
 
+/** YAML-subset scalars are strings; "true"/"false" map to booleans, anything else is invalid. */
+function parseBoolean(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  return undefined;
+}
+
 /** Parses and validates the org `config.yml` text. Structural problems fail the whole policy. */
 export function parseOrgConfigYaml(text: string): PolicyConfig {
   const policy = defaultPolicy();
@@ -181,6 +204,30 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       } else if (entries.required_for_org_change !== undefined) {
         policy.warnings.push("approvals.required_for_org_change: invalid — using default");
       }
+    } else if (name === "memory") {
+      const injection = entries.injection;
+      if (injection !== undefined) {
+        // `memory:` with a nested `injection:` mapping; anything else is structural.
+        if (typeof injection !== "object" || injection === null || Array.isArray(injection)) {
+          return structuralError(policy, "memory.injection must be a block mapping");
+        }
+        const inj = injection as Record<string, YamlNode>;
+        const enabled = parseBoolean(scalarOrUndefined(inj.enabled));
+        if (enabled !== undefined) {
+          policy.memory.injection.enabled = enabled;
+        } else if (inj.enabled !== undefined) {
+          policy.warnings.push("memory.injection.enabled: invalid (true|false) — using default");
+        }
+        const maxEntries = parsePositiveInt(scalarOrUndefined(inj.max_entries));
+        if (maxEntries !== undefined) {
+          if (maxEntries > MEMORY_INJECTION_MAX_ENTRIES_CAP) {
+            policy.warnings.push(`memory.injection.max_entries: ${maxEntries} capped at ${MEMORY_INJECTION_MAX_ENTRIES_CAP}`);
+          }
+          policy.memory.injection.maxEntries = Math.min(maxEntries, MEMORY_INJECTION_MAX_ENTRIES_CAP);
+        } else if (inj.max_entries !== undefined) {
+          policy.warnings.push("memory.injection.max_entries: invalid — using default");
+        }
+      }
     } else {
       policy.warnings.push(`unknown section '${name}' ignored`);
     }
@@ -217,7 +264,13 @@ function stricter(a: PolicyAction, b: PolicyAction): PolicyAction {
 }
 
 function clonePolicy(p: PolicyConfig): PolicyConfig {
-  return { ...p, tools: { ...p.tools }, errors: [...p.errors], warnings: [...p.warnings] };
+  return {
+    ...p,
+    tools: { ...p.tools },
+    memory: { injection: { ...p.memory.injection } },
+    errors: [...p.errors],
+    warnings: [...p.warnings],
+  };
 }
 
 /**
