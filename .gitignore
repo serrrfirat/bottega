@@ -8,3 +8,6 @@ certs/
 *.log
 .DS_Store
 .worktrees/
+
+# Deployment-local policy floor (fail-closed default when absent).
+config.yml
