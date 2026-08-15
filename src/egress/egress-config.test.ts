@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseYamlSubset, type YamlNode } from "./yaml-subset";
+import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 const cfg = parseYamlSubset(
   readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"),

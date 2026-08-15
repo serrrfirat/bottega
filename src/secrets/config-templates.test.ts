@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { parseYamlSequence, parseYamlSubset, type YamlNode } from "../egress/yaml-subset";
+import { parseYamlSequence, parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 const CONFIG_DIR = resolve(import.meta.dir, "../../config/omp");
 const SRC_DIR = resolve(import.meta.dir, "../..");

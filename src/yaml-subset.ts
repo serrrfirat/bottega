@@ -1,8 +1,9 @@
 /**
- * Minimal YAML-subset parser used ONLY by tests to structurally validate the
- * hand-authored compose/egress fixtures (issue #8). This is not a general
- * YAML parser: it supports exactly the constructs used in
- * docker-compose.yml and config/egress.yml:
+ * Shared dependency-free YAML-subset parser (issue #33). Promoted from a
+ * test-only fixture validator (issue #8) to the production parser for the
+ * hand-authored configs bottega ships: docker-compose.yml, config/egress.yml,
+ * the org policy config.yml, and the executor's config/org.yml. This is not
+ * a general YAML parser — it supports exactly the constructs those files use:
  *
  *   - comments (# full-line and trailing, not inside quotes)
  *   - block mappings (key: value, nested blocks by indentation)
@@ -11,6 +12,8 @@
  *   - `|` literal block scalars (multi-line prompts)
  *
  * Flow collections, anchors/aliases, and single-quoted scalars are rejected.
+ * Callers are fail-closed adapters: a parse error is a configuration error
+ * (policy denies, executor refuses to boot) — never a silent default.
  */
 
 export type YamlNode = string | YamlNode[] | { [key: string]: YamlNode };

@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseYamlSubset, type YamlNode } from "./egress/yaml-subset";
+import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 const ROOT = resolve(import.meta.dir, "..");
 

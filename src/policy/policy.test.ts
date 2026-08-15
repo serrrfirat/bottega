@@ -111,6 +111,14 @@ approvals:
     expect(p.errors).toEqual([]);
   });
 
+  test("trailing comments and quoted actions parse (shared YAML parser)", () => {
+    const p = parseOrgConfigYaml('tools:\n  bash: deny # block shells\n  write: "allow"\napprovals:\n  timeout_minutes: 7 # minutes\n');
+    expect(p.ok).toBe(true);
+    expect(toolAction(p, "bash")).toBe("deny");
+    expect(toolAction(p, "write")).toBe("allow");
+    expect(p.timeoutMinutes).toBe(7);
+  });
+
   test("malformed tool entry denies that tool only", () => {
     const p = parseOrgConfigYaml("tools:\n  bash: maybe\n  write: allow\n");
     expect(p.ok).toBe(true);

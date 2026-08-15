@@ -390,6 +390,48 @@ describe("claim loop", () => {
   });
 });
 
+describe("org config parsing (issue #33)", () => {
+  test("trailing comments and quoted repo entries parse to the correct repo and git base", async () => {
+    const fx = makeFixture();
+    try {
+      // Shapes the old line-scanner silently mis-parsed (the comment would
+      // have been glued to the repo string, breaking the owner/repo match).
+      writeFileSync(
+        join(fx.orgConfigDir, "org.yml"),
+        `# org repo config\ngit_base_url: "file://${join(fx.dir, "bare")}" # local bare repo\nrepos:\n  - "acme/sandbox" # v1 target\n`,
+      );
+      const cfg = await prepareExecutor(makeDeps(fx));
+      expect(cfg.repo).toBe("acme/sandbox");
+      expect(cfg.gitBaseUrl).toBe(`file://${join(fx.dir, "bare")}`);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an inline-sequence repos entry fails closed with a clear boot error", async () => {
+    const fx = makeFixture();
+    try {
+      writeFileSync(join(fx.orgConfigDir, "org.yml"), `git_base_url: "file://${join(fx.dir, "bare")}"\nrepos: ["acme/sandbox"]\n`);
+      await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/config\/org\.yml: .*flow collections/);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a malformed repos entry (non-string) fails closed", async () => {
+    const fx = makeFixture();
+    try {
+      writeFileSync(
+        join(fx.orgConfigDir, "org.yml"),
+        `git_base_url: "file://${join(fx.dir, "bare")}"\nrepos:\n  - acme/sandbox\n  - broken: entry\n`,
+      );
+      await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/config\/org\.yml: .*owner\/repo strings/);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
 describe("credential hygiene", () => {
   test("the PAT lives only in a 0600 file; the askpass script reads it; env carries no key", async () => {
     const fx = makeFixture();

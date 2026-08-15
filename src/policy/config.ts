@@ -7,14 +7,15 @@
  * allows. A missing config.yml is a fail-closed default policy (everything
  * denies unless explicitly allowed).
  *
- * YAML: deliberately dependency-free. Only the subset config.yml needs is
- * parsed (`section:` blocks of `key: value` scalars, 2-space indentation,
- * `#` comments); anything outside that subset is a structural error that
- * fails the whole policy closed. A subset parser is safe here because
- * denial is the default for everything it cannot understand.
+ * YAML: deliberately dependency-free — parsed by the shared YAML-subset
+ * parser (src/yaml-subset.ts). Anything outside that subset is a
+ * structural error that fails the whole policy closed. A subset parser is
+ * safe here because denial is the default for everything it cannot
+ * understand.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 export type Tier = "read" | "write" | "exec";
 export type PolicyAction = "allow" | "deny" | "prompt";
@@ -130,48 +131,33 @@ function parsePositiveInt(value: string | undefined): number | undefined {
   return n >= 1 ? n : undefined;
 }
 
-const SECTION_LINE = /^([A-Za-z0-9_.-]+):(.*)$/;
-
 /** Parses and validates the org `config.yml` text. Structural problems fail the whole policy. */
 export function parseOrgConfigYaml(text: string): PolicyConfig {
   const policy = defaultPolicy();
-  // Raw sections before validation: section name -> (key -> raw value).
-  const sections: Record<string, Record<string, string>> = {};
-  let current: string | null = null;
+  // Tabs are outside the supported YAML subset (they silently change
+  // indentation semantics); reject them like any other structural error.
+  if (text.includes("\t")) return structuralError(policy, "tabs are not supported");
 
-  const lines = text.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const trimmed = raw.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    if (raw.includes("\t")) return structuralError(policy, `line ${i + 1}: tabs are not supported`);
-    const indent = raw.length - raw.trimStart().length;
-    if (indent !== 0 && indent !== 2) return structuralError(policy, `line ${i + 1}: unsupported indentation`);
-    const commentAt = trimmed.indexOf("#");
-    const content = (commentAt >= 0 ? trimmed.slice(0, commentAt) : trimmed).trimEnd();
-    if (!content) continue;
-    const m = SECTION_LINE.exec(content);
-    if (!m) return structuralError(policy, `line ${i + 1}: expected 'key: value'`);
-    const key = m[1];
-    const value = m[2].trim();
-    if (indent === 0) {
-      if (value !== "") return structuralError(policy, `line ${i + 1}: section '${key}' must not have an inline value`);
-      if (key in sections) return structuralError(policy, `line ${i + 1}: duplicate section '${key}'`);
-      sections[key] = {};
-      current = key;
-    } else {
-      if (current === null) return structuralError(policy, `line ${i + 1}: nested key '${key}' without a section`);
-      if (key in sections[current]) return structuralError(policy, `line ${i + 1}: duplicate key '${key}'`);
-      sections[current][key] = value;
-    }
+  let doc: Record<string, YamlNode>;
+  try {
+    doc = parseYamlSubset(text);
+  } catch (err) {
+    return structuralError(policy, `config.yml: ${(err as Error).message}`);
   }
 
-  for (const [name, entries] of Object.entries(sections)) {
+  for (const [name, node] of Object.entries(doc)) {
+    // Every section must be a block mapping; a scalar or sequence section
+    // (e.g. `tools: nope`) is a structural error.
+    if (typeof node !== "object" || node === null || Array.isArray(node)) {
+      return structuralError(policy, `section '${name}' must be a block mapping`);
+    }
+    const entries = node as Record<string, YamlNode>;
     if (name === "tools") {
       for (const [tool, rawValue] of Object.entries(entries)) {
         const action = normalizeAction(rawValue);
         if (!action) {
-          policy.errors.push(`tools.${tool}: invalid action '${rawValue}' (allow|deny|prompt) — denying`);
+          const shown = typeof rawValue === "string" ? rawValue : "<non-scalar>";
+          policy.errors.push(`tools.${tool}: invalid action '${shown}' (allow|deny|prompt) — denying`);
           policy.tools[tool] = "deny";
           continue;
         }
@@ -182,13 +168,13 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         policy.tools[tool] = action;
       }
     } else if (name === "approvals") {
-      const timeout = parsePositiveInt(entries.timeout_minutes);
+      const timeout = parsePositiveInt(scalarOrUndefined(entries.timeout_minutes));
       if (timeout !== undefined) {
         policy.timeoutMinutes = timeout;
       } else if (entries.timeout_minutes !== undefined) {
         policy.warnings.push("approvals.timeout_minutes: invalid — using default");
       }
-      const required = parsePositiveInt(entries.required_for_org_change);
+      const required = parsePositiveInt(scalarOrUndefined(entries.required_for_org_change));
       if (required !== undefined) {
         policy.requiredApprovers = required;
       } else if (entries.required_for_org_change !== undefined) {
@@ -199,6 +185,11 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
     }
   }
   return policy;
+}
+
+/** A scalar node's string value; non-scalar nodes (mappings/sequences) are undefined. */
+function scalarOrUndefined(value: YamlNode | undefined): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 /** Loads the org floor: `config.yml` in `dir`, `BOTTEGA_CONFIG_DIR`, or the repo root. */

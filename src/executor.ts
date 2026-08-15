@@ -33,6 +33,7 @@ import { DenyRouter } from "./policy/approval-router";
 import { loadOrgConfig } from "./policy/config";
 import createPolicyExtension from "./policy/extension";
 import { createOmpSdkDriver, type AgentDriver } from "./server/agent-driver";
+import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 /**
  * Work-item session tool allowlist: file/code tools + bash. Git runs through
@@ -299,30 +300,36 @@ async function openPullRequest(
   return parsed.html_url;
 }
 
-/** Org repo config: `repos` + `git_base_url` from config/org.yml (EXECUTOR_REPOS overrides). */
+/**
+ * Org repo config: `repos` + `git_base_url` from config/org.yml
+ * (EXECUTOR_REPOS overrides). Parsed by the shared YAML-subset parser and
+ * validated — a malformed org.yml is a loud boot error, never a silent
+ * mis-parse (trailing comments, inline sequences, and odd indentation
+ * previously produced wrong repo/git-base values).
+ */
 function loadOrgRepos(dir: string): { repos: string[]; gitBaseUrl: string } {
   let gitBaseUrl = "https://github.com";
   let repos: string[] = [];
   // Missing org.yml is a loud boot error: an executor with no repo is misconfigured.
   const text = readFileSync(join(dir, "org.yml"), "utf8");
-  let inRepos = false;
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    if (line === "repos:") {
-      inRepos = true;
-      continue;
-    }
-    if (line.startsWith("git_base_url:")) {
-      inRepos = false;
-      gitBaseUrl = line.slice("git_base_url:".length).trim().replace(/^["']|["']$/g, "");
-      continue;
-    }
-    if (inRepos && line.startsWith("- ")) {
-      repos.push(line.slice(2).trim().replace(/^["']|["']$/g, ""));
-      continue;
-    }
-    inRepos = false;
+  let doc: Record<string, YamlNode>;
+  try {
+    doc = parseYamlSubset(text);
+  } catch (err) {
+    throw new Error(`config/org.yml: ${(err as Error).message}`);
+  }
+  const base = doc["git_base_url"];
+  if (base !== undefined) {
+    if (typeof base !== "string") throw new Error("config/org.yml: git_base_url must be a string");
+    gitBaseUrl = base;
+  }
+  const reposNode = doc["repos"];
+  if (reposNode !== undefined) {
+    if (!Array.isArray(reposNode)) throw new Error("config/org.yml: repos must be a list of owner/repo strings");
+    repos = reposNode.map((r) => {
+      if (typeof r !== "string") throw new Error("config/org.yml: repos must be a list of owner/repo strings");
+      return r;
+    });
   }
   const envRepos = process.env.EXECUTOR_REPOS;
   if (envRepos) {
