@@ -283,6 +283,7 @@ Dockerfile          single image (server + executor entrypoints), bun user
 docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy
 slack-app-manifest.yml
 scripts/smoke.sh    local checks + manual checklist
+scripts/e2e-smoke.sh  compose e2e smoke leg: fail-closed boots + wiring (skip-gated)
 ```
 
 ## Deployment
@@ -445,6 +446,7 @@ bun install
 bun check    # typecheck
 bun test     # 270+ tests: store, policy, adapter, executor, deploy packaging
 scripts/smoke.sh  # local checks + compose validation + manual checklist
+scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
 bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
 ```
 

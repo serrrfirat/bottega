@@ -25,6 +25,10 @@ else
 fi
 
 echo
+echo "Automated e2e leg (no real credentials, needs Docker): scripts/e2e-smoke.sh"
+echo "  boots the compose stack with placeholder env, asserts fail-closed"
+echo "  guards + broker token + SQLite schema, then tears down."
+echo
 echo "Manual checklist (needs real infra):"
 echo "  1. Create the Slack app from slack-app-manifest.yml and install it"
 echo "     to your workspace; generate an app-level token (connections:write)."
