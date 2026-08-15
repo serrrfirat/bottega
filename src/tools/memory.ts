@@ -17,7 +17,7 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
-import { toolError } from "./helpers";
+import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
 
 export interface MemoryToolsExtensionOpts {
@@ -27,19 +27,21 @@ export interface MemoryToolsExtensionOpts {
   audit?: Pick<AuditModule, "appendAudit">;
 }
 
+/** Argument shapes of the memory tools; shared with the MCP surface (src/mcp/server.ts). */
+export const memorySaveArgsSchema = z.object({
+  content: z.string(),
+  scope: z.enum(["org", "user"]),
+  principal: z.string().optional(),
+  metadata: z.record(z.string(), z.string()).optional(),
+});
+export const memorySearchArgsSchema = z.object({
+  query: z.string(),
+  scope: z.enum(["org", "user"]),
+  principal: z.string().optional(),
+  limit: z.number().int().optional(),
+});
+
 export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryToolsExtensionOpts = {}): ExtensionFactory {
-  const saveSchema = z.object({
-    content: z.string(),
-    scope: z.enum(["org", "user"]),
-    principal: z.string().optional(),
-    metadata: z.record(z.string(), z.string()).optional(),
-  });
-  const searchSchema = z.object({
-    query: z.string(),
-    scope: z.enum(["org", "user"]),
-    principal: z.string().optional(),
-    limit: z.number().int().optional(),
-  });
   return (pi) => {
     pi.registerTool({
       name: "memory.save",
@@ -48,7 +50,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
         "Saves a memory entry to org-shared memory (scope: org) or a user's personal memory (scope: user; " +
         "principal required, or resolved from the session default). Content is stored by the memory " +
         "backend and audited by hash only. Write-tier: prompts for approval in non-yolo modes.",
-      parameters: saveSchema,
+      parameters: memorySaveArgsSchema,
       approval: "write",
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const principal = params.principal ?? opts.defaultPrincipal;
@@ -57,7 +59,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
         try {
           validateSaveInput(input);
         } catch (err) {
-          return toolError((err as Error).message);
+          return toolError(errorMessage(err));
         }
         try {
           const entry = await provider.save(input);
@@ -73,7 +75,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
           });
           return { content: [{ type: "text", text: JSON.stringify({ id: entry.id }) }] };
         } catch (err) {
-          return toolError((err as Error).message);
+          return toolError(errorMessage(err));
         }
       },
     });
@@ -84,7 +86,7 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
       description:
         "Searches saved memory entries in org or user scope (principal filters user scope). Returns " +
         "matching entries with content, metadata, and creation time. Read-only.",
-      parameters: searchSchema,
+      parameters: memorySearchArgsSchema,
       approval: "read",
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         const query: MemorySearchQuery = {
@@ -96,13 +98,13 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
         try {
           validateSearchQuery(query);
         } catch (err) {
-          return toolError((err as Error).message);
+          return toolError(errorMessage(err));
         }
         try {
           const entries = await provider.search(query);
           return { content: [{ type: "text", text: JSON.stringify(entries) }] };
         } catch (err) {
-          return toolError((err as Error).message);
+          return toolError(errorMessage(err));
         }
       },
     });

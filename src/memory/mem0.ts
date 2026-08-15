@@ -100,7 +100,8 @@ export function asRecord(value: unknown): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value));
 }
 
-function stringifyMetadata(meta: Record<string, unknown>): Record<string, string> {
+/** Metadata values are coerced to strings (our contract is Record<string, string>). */
+export function stringifyMetadata(meta: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(meta)) {
     out[key] = typeof value === "string" ? value : String(value);
@@ -150,11 +151,11 @@ function stripIdentityKeys(metadata: Record<string, string>): Record<string, str
 async function requestJson(
   baseUrl: string,
   path: string,
-  method: "POST",
   body: unknown,
   apiKey: string | undefined,
   timeoutMs: number,
 ): Promise<unknown> {
+  const method = "POST";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -224,7 +225,6 @@ async function saveToMem0(
   const data = await requestJson(
     baseUrl,
     "/memories",
-    "POST",
     {
       messages: [{ role: "user", content: input.content }],
       ...identity,
@@ -271,7 +271,6 @@ async function searchMem0(
   const data = await requestJson(
     baseUrl,
     "/search",
-    "POST",
     {
       query: query.query,
       filters,

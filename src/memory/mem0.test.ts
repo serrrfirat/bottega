@@ -10,9 +10,10 @@
  * WITHOUT an LLM key; it skips with a message whenever the server can't run
  * without one (no keys are ever created here).
  */
-import type { Server } from "bun";import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import type { Server } from "bun";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { MemoryProvider } from "./types";
-import { createMem0MemoryProvider, MEM0_ORG_AGENT_ID } from "./mem0";
+import { asRecord, createMem0MemoryProvider, MEM0_ORG_AGENT_ID, stringifyMetadata } from "./mem0";
 import { runMemoryConformanceTests } from "./conformance.test";
 
 /** In-memory row emulating a stored mem0 memory (payload shape of the OSS server). */
@@ -98,11 +99,11 @@ function createStub(options: StubOptions = {}): StubHarness {
           : new Date(1_700_000_000_000 + seq * 1000).toISOString();
         const mem: StubMemory = {
           id,
-          memory: String(toRecord(messages[0]).content ?? ""),
+          memory: String(asRecord(messages[0]).content ?? ""),
           event: "ADD",
           user_id: typeof body.user_id === "string" ? body.user_id : null,
           agent_id: typeof body.agent_id === "string" ? body.agent_id : null,
-          metadata: toStrRecord(body.metadata),
+          metadata: stringifyMetadata(asRecord(body.metadata)),
           created_at,
         };
         memories.push(mem);
@@ -124,7 +125,7 @@ function createStub(options: StubOptions = {}): StubHarness {
         const body = (await req.json()) as Record<string, unknown>;
         searchBodies.push(body);
         if (options.failSearch) return Response.json({ detail: "upstream search failed" }, { status: 500 });
-        const filters = toRecord(body.filters);
+        const filters = asRecord(body.filters);
         if (!filters.user_id && !filters.agent_id && !filters.run_id) {
           return Response.json(
             { detail: "filters must contain at least one of: user_id, agent_id, run_id" },
@@ -170,20 +171,6 @@ function createStub(options: StubOptions = {}): StubHarness {
       await server.stop(true);
     },
   };
-}
-
-/** Runtime-narrowed copy of an arbitrary JSON object into string values. */
-function toStrRecord(value: unknown): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return out;
-  for (const [key, val] of Object.entries(value)) out[key] = String(val);
-  return out;
-}
-
-/** Runtime-narrowed copy of an arbitrary JSON object into unknown values. */
-function toRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value));
 }
 
 describe("mem0 provider (stub-backed)", () => {

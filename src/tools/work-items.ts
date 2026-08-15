@@ -13,7 +13,7 @@ import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
-import { toolError } from "./helpers";
+import { errorMessage, toolError } from "./helpers";
 import type { Store } from "../store/db";
 
 export interface WorkItemsExtensionOpts {
@@ -123,7 +123,7 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
             content: [{ type: "text", text: JSON.stringify({ id: aborted.id, state: aborted.state }) }],
           };
         } catch (err) {
-          return toolError((err as Error).message);
+          return toolError(errorMessage(err));
         }
       },
     });

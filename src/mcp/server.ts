@@ -47,7 +47,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
@@ -64,7 +63,9 @@ import {
   type PolicyConfig,
 } from "../policy/config";
 import { createStore } from "../store/db";
-import { sha256Hex } from "../tools/memory";
+import { MEMORY_WRITE_EVENT } from "../store/audit-events";
+import { errorMessage } from "../tools/helpers";
+import { memorySaveArgsSchema, memorySearchArgsSchema, sha256Hex } from "../tools/memory";
 
 export interface MemoryMcpServerOptions {
   provider: MemoryProvider;
@@ -87,8 +88,8 @@ function summarizeArgs(input: unknown): string {
   return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;
 }
 
-/** Flattens a zod parse failure into a single-line message for the client. */
-function zodIssues(error: z.ZodError): string {
+/** Flattens a parse failure into a single-line message for the client. */
+function zodIssues(error: { message: string; issues: Array<{ message: string }> }): string {
   return error.issues.map((issue) => issue.message).join("; ");
 }
 
@@ -123,21 +124,6 @@ function gateTool(policy: PolicyConfig, tool: string): GateResult {
     error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason} (headless MCP context has no approval channel — denied)`),
   };
 }
-
-/** Argument schemas mirror the in-session tools' parameter schemas exactly. */
-const saveArgsSchema = z.object({
-  content: z.string(),
-  scope: z.enum(["org", "user"]),
-  principal: z.string().optional(),
-  metadata: z.record(z.string(), z.string()).optional(),
-});
-
-const searchArgsSchema = z.object({
-  query: z.string(),
-  scope: z.enum(["org", "user"]),
-  principal: z.string().optional(),
-  limit: z.number().int().optional(),
-});
 
 /** JSON Schema advertised via tools/list (hand-written, mirrors the zod shapes). */
 const saveJsonSchema = {
@@ -185,7 +171,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   /** Gate + audit first, then validate, then execute. Returns the MCP result. */
   const callSave = async (callArgs: unknown) => {
     const tool = "memory.save";
-    const parsed = saveArgsSchema.safeParse(callArgs);
+    const parsed = memorySaveArgsSchema.safeParse(callArgs);
     if (!parsed.success) {
       throw new McpError(ErrorCode.InvalidParams, `${tool}: invalid arguments: ${zodIssues(parsed.error)}`);
     }
@@ -200,14 +186,14 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     try {
       validateSaveInput(input);
     } catch (err) {
-      throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      throw new McpError(ErrorCode.InvalidParams, errorMessage(err));
     }
     try {
       const entry = await opts.provider.save(input);
       await opts.audit.appendAudit({
         space_id: opts.spaceId ?? null,
         actor: principal ?? actor,
-        event_type: "memory.write",
+        event_type: MEMORY_WRITE_EVENT,
         payload: {
           scope: entry.scope,
           principal: entry.principal,
@@ -218,13 +204,13 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       return { content: [{ type: "text", text: JSON.stringify({ id: entry.id }) }] };
     } catch (err) {
       // Provider failures surface as tool errors, not protocol errors.
-      return { content: [{ type: "text", text: (err as Error).message, isError: true }] };
+      return { content: [{ type: "text", text: errorMessage(err), isError: true }] };
     }
   };
 
   const callSearch = async (callArgs: unknown) => {
     const tool = "memory.search";
-    const parsed = searchArgsSchema.safeParse(callArgs);
+    const parsed = memorySearchArgsSchema.safeParse(callArgs);
     if (!parsed.success) {
       throw new McpError(ErrorCode.InvalidParams, `${tool}: invalid arguments: ${zodIssues(parsed.error)}`);
     }
@@ -242,13 +228,13 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     try {
       validateSearchQuery(query);
     } catch (err) {
-      throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      throw new McpError(ErrorCode.InvalidParams, errorMessage(err));
     }
     try {
       const entries = await opts.provider.search(query);
       return { content: [{ type: "text", text: JSON.stringify(entries) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: (err as Error).message, isError: true }] };
+      return { content: [{ type: "text", text: errorMessage(err), isError: true }] };
     }
   };
 

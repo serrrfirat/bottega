@@ -7,17 +7,10 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/p
 import type { AuditModule } from "../policy/audit";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
-import { memoryToolsExtension } from "./memory";
+import { memoryToolsExtension, sha256Hex } from "./memory";
 
 /** The memory tools never read the extension context; only the arity needs it. */
 const noopCtx = {} as unknown as ExtensionContext;
-
-/** Expected value for the audit's content hash — same algorithm the tool uses. */
-function sha256(text: string): string {
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(text);
-  return hasher.digest("hex");
-}
 
 class FakeProvider implements MemoryProvider {
   saved: MemorySaveInput[] = [];
@@ -128,7 +121,7 @@ describe("memory.save", () => {
     expect(payload.principal).toBeNull();
     expect(payload.id).toBe("mem_1");
     // Hash only — the raw content must never land in the audit row.
-    expect(payload.content_hash).toBe(sha256("the vault combination is 1234"));
+    expect(payload.content_hash).toBe(sha256Hex("the vault combination is 1234"));
     const auditText = JSON.stringify(rows[0]!.payload);
     expect(auditText).not.toContain("vault combination");
     expect(auditText).not.toContain("1234");
@@ -277,7 +270,7 @@ describe("memory tools against the real SQLite provider (issue #29)", () => {
       // the trail, even though the real provider holds it in SQLite.
       expect(rows).toHaveLength(1);
       expect(rows[0]!.event_type).toBe("memory.write");
-      expect(rows[0]!.payload.content_hash).toBe(sha256("the vault combination is 1234"));
+      expect(rows[0]!.payload.content_hash).toBe(sha256Hex("the vault combination is 1234"));
       expect(JSON.stringify(rows[0]!.payload)).not.toContain("vault combination");
 
       // Principal isolation through the real provider: a user never sees

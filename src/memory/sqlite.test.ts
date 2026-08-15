@@ -87,7 +87,7 @@ describe("sqlite memory backend specifics", () => {
     expect(hits.map((e) => e.id)).toEqual(["mem_new", "mem_mid", "mem_old"]);
   });
 
-  test("two providers on one file share the same table", async () => {
+  test("memories survive reopen: second provider on the same file reruns the idempotent migration", async () => {
     const path = join(dir, "shared.db");
     const db1 = new Database(path);
     const p1 = createSqliteMemoryProvider(db1);
@@ -100,21 +100,6 @@ describe("sqlite memory backend specifics", () => {
     const hits = await p2.search({ scope: "org", query: "persisted" });
     expect(hits.length).toBe(1);
     expect(hits[0].content).toBe("persisted across connections");
-  });
-
-  test("migration is idempotent across reopenings", async () => {
-    const path = join(dir, "reopen.db");
-    const db1 = new Database(path);
-    const p1 = createSqliteMemoryProvider(db1);
-    await p1.save({ scope: "org", content: "survives reopen" });
-    db1.close();
-
-    const db2 = new Database(path);
-    dbs.push(db2);
-    const p2 = createSqliteMemoryProvider(db2);
-    const hits = await p2.search({ scope: "org", query: "survives" });
-    expect(hits.length).toBe(1);
-    expect(hits[0].content).toBe("survives reopen");
   });
 
   test("works with the store's database handle (getDb)", async () => {

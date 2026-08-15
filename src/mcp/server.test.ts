@@ -17,15 +17,9 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createStore, type AuditRow, type Store } from "../store/db";
+import { sha256Hex } from "../tools/memory";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
-
-/** Expected content hash — same SHA-256 the tools and the server compute. */
-function sha256(text: string): string {
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(text);
-  return hasher.digest("hex");
-}
 
 interface LaunchOpts {
   configYaml: string;
@@ -163,7 +157,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(p.scope).toBe("org");
       expect(p.principal).toBeNull();
       expect(p.id).toBe(id);
-      expect(p.content_hash).toBe(sha256("the vault combination is 1234"));
+      expect(p.content_hash).toBe(sha256Hex("the vault combination is 1234"));
       const auditText = rows[0]!.payload;
       expect(auditText).not.toContain("vault combination");
       expect(auditText).not.toContain("1234");
