@@ -14,6 +14,9 @@ display_information:
   description: "Team agents that live in your chat: pick up work items, implement them, open PRs."
   background_color: "#1a1d21"
 features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
   bot_user:
     display_name: Bottega
     always_online: true
