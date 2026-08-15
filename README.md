@@ -335,7 +335,7 @@ bun install
 bun check    # typecheck
 bun test     # 165+ tests: store, policy, adapter, executor, deploy packaging
 scripts/smoke.sh  # local checks + compose validation + manual checklist
-bun run dev  # local server (needs .env)
+bun run dev  # local server (needs .env, or the key in Keychain: security add-generic-password -s bottega-near -a $(whoami) -w '<key>')
 ```
 
 Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
