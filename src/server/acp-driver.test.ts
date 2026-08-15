@@ -267,7 +267,6 @@ describe("acp driver", () => {
       transcriptDir: join(dir, "sessions"),
     });
     try {
-      await service.start();
       const msg: InboundMessage = { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" };
       await service.handleInboundMessage(msg);
       const deadline = Date.now() + 3_000;

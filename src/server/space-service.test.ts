@@ -11,7 +11,6 @@ import type { SlackAdapter } from "./slack";
 
 class FakeSession implements AgentSessionDriver {
   readonly prompts: Array<{ text: string; opts?: AgentTurnOptions }> = [];
-  aborts = 0;
   disposed = false;
   streaming = false;
   /** When true, dispose() parks until finishDispose() — exposes the mid-dispose window. */
@@ -27,9 +26,7 @@ class FakeSession implements AgentSessionDriver {
     this.prompts.push({ text, opts });
   }
 
-  async abort(): Promise<void> {
-    this.aborts++;
-  }
+  async abort(): Promise<void> {}
 
   isStreaming(): boolean {
     return this.streaming;
@@ -118,14 +115,13 @@ function msg(overrides: Partial<InboundMessage> = {}): InboundMessage {
 }
 
 describe("SpaceService session lifecycle", () => {
-  test("start is lazy and the first message cold-starts a session that gets the prompt", async () => {
+  test("sessions are lazy: the first message cold-starts a session that gets the prompt", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = new SpaceService({ store, adapter, driver });
 
-    await service.start();
-    expect(driver.created).toHaveLength(0);
+    expect(driver.created).toHaveLength(0); // no session until a message arrives
 
     await service.handleInboundMessage(msg({ text: "hello", ts: "1.1" }));
 
@@ -267,7 +263,7 @@ describe("SpaceService session lifecycle", () => {
   });
 });
 
-describe("SpaceService output and interrupt routing", () => {
+describe("SpaceService output routing", () => {
   test("agent output is posted to the adapter threaded under the latest inbound message", async () => {
     const { adapter, posts } = fakeAdapter();
     const { store } = fakeStore();
@@ -278,20 +274,6 @@ describe("SpaceService output and interrupt routing", () => {
     driver.created[0].opts.onOutput("slack:C1", "agent reply");
 
     expect(posts).toEqual([{ spaceId: "slack:C1", text: "agent reply", opts: { threadTs: "1.1" } }]);
-  });
-
-  test("interrupt aborts the live session; unknown spaces are a no-op", async () => {
-    const { adapter } = fakeAdapter();
-    const { store } = fakeStore();
-    const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
-
-    await service.handleInboundMessage(msg());
-    await service.abortTurn("slack:C1");
-    expect(driver.last().aborts).toBe(1);
-
-    await service.abortTurn("slack:C9"); // no live session — must not throw
-    expect(driver.last().aborts).toBe(1);
   });
 
   test("the session driver emits message events to subscribers (contract surface)", async () => {

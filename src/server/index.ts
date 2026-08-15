@@ -80,7 +80,6 @@ export function main(): BottegaServer {
   return {
     async start() {
       await adapter.start();
-      await spaceService.start();
       deliveryPoller.start();
     },
     async stop() {

@@ -19,8 +19,6 @@ export interface SpaceServiceDeps {
   idleTimeoutMs?: number;
   /** Directory for file-backed space transcripts. Default data/sessions. */
   transcriptDir?: string;
-  /** Reserved for model selection (Slice 3); accepted for contract compatibility, not yet used. */
-  modelConfig?: unknown;
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -58,9 +56,6 @@ export class SpaceService {
     this.#transcriptDir = deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR;
   }
 
-  /** Lazy: no sessions exist until the first inbound message. */
-  async start(): Promise<void> {}
-
   async handleInboundMessage(msg: InboundMessage): Promise<void> {
     try {
       const live = await this.#sessionFor(msg.spaceId);
@@ -83,12 +78,6 @@ export class SpaceService {
     } catch (err) {
       console.error(`[space-service] failed to handle message in ${msg.spaceId}:`, err);
     }
-  }
-
-  /** Interrupt seam: adapter interrupt events map here (v1: Slack has none). */
-  async abortTurn(spaceId: string): Promise<void> {
-    const live = this.#sessions.get(spaceId);
-    if (live && !live.disposing) await live.session.abort();
   }
 
   async stop(): Promise<void> {
