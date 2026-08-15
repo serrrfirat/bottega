@@ -87,7 +87,7 @@ export function sessionIdFromFilePath(file: string | null | undefined): string |
  * (issue #10) are listed so the agent can create and cancel work items, and
  * the memory tools (issue #22) so it can save and search memory.
  */
-const SPACE_AGENT_TOOLS = [
+export const SPACE_AGENT_TOOLS = [
   "read",
   "glob",
   "grep",
