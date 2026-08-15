@@ -251,9 +251,14 @@ describe("acp driver", () => {
       sessionTimeoutMs: 5_000,
     });
     const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
+    const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
     const adapter: SlackAdapter = {
       async postMessage(spaceId, text, opts) {
         posts.push({ spaceId, text, opts });
+        return `ts-${posts.length}`;
+      },
+      async updateMessage(spaceId, ts, text) {
+        updates.push({ spaceId, ts, text });
       },
       async start() {},
       async stop() {},
@@ -270,10 +275,13 @@ describe("acp driver", () => {
       const msg: InboundMessage = { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" };
       await service.handleInboundMessage(msg);
       const deadline = Date.now() + 3_000;
-      while (posts.length === 0 && Date.now() < deadline) {
+      // The driver emits turn_start (phrase) then message (final reply);
+      // the reply must replace the phrase in place, never post a second message.
+      while (updates.length === 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 20));
       }
-      expect(posts).toEqual([{ spaceId: "slack:C1", text: "Hello, world!", opts: { threadTs: "1.1" } }]);
+      expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+      expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "Hello, world!" }]);
     } finally {
       await service.stop();
       rmSync(dir, { recursive: true, force: true });

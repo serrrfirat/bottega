@@ -22,7 +22,9 @@ if (typeof (undici as { ping?: unknown }).ping !== "function") {
  * messages go to the `onMessage` callback, outbound goes through
  * `postMessage`. Replies in threads are supported via `opts.threadTs`
  * passthrough to `chat.postMessage` (v1: threads share the channel space,
- * so no per-thread space ids).
+ * so no per-thread space ids). `updateMessage` rewrites an already-posted
+ * message in place (`chat.update`), so a thinking phrase can become the
+ * final reply without a second message.
  */
 
 export interface SlackMessage {
@@ -33,7 +35,10 @@ export interface SlackMessage {
 }
 
 export interface SlackAdapter {
-  postMessage(spaceId: string, text: string, opts?: { threadTs?: string }): Promise<void>;
+  /** Posts a message; resolves with the created message ts (undefined when the API omits it). */
+  postMessage(spaceId: string, text: string, opts?: { threadTs?: string }): Promise<string | undefined>;
+  /** Replaces the text of an already-posted message (chat.update). */
+  updateMessage(spaceId: string, ts: string, text: string): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -48,6 +53,15 @@ export function spaceIdFromChannel(channelId: string): string {
 /** Inverse of {@link spaceIdFromChannel}; unprefixed ids pass through unchanged. */
 export function channelFromSpaceId(spaceId: string): string {
   return spaceId.startsWith(SPACE_PREFIX) ? spaceId.slice(SPACE_PREFIX.length) : spaceId;
+}
+
+/**
+ * Direct-message channels use `D`-prefixed ids; public channels are `C`,
+ * private groups `G`. DMs read naturally as a plain message, so replies
+ * there skip threading (issue #40).
+ */
+export function isDmChannel(channelId: string): boolean {
+  return channelId.startsWith("D");
 }
 
 /**
@@ -98,6 +112,18 @@ export function buildPostMessageArgs(
     args.thread_ts = opts.threadTs;
   }
   return args;
+}
+
+/**
+ * Maps adapter arguments onto `chat.update` arguments. Pure so the
+ * in-place edit rendering is testable without a live Slack connection.
+ */
+export function buildUpdateMessageArgs(
+  spaceId: string,
+  ts: string,
+  text: string,
+): { channel: string; ts: string; text: string } {
+  return { channel: channelFromSpaceId(spaceId), ts, text };
 }
 
 /**
@@ -158,7 +184,11 @@ export function createSlackAdapter(opts: {
 
   return {
     async postMessage(spaceId, text, postOpts) {
-      await app.client.chat.postMessage(buildPostMessageArgs(spaceId, text, postOpts));
+      const res = await app.client.chat.postMessage(buildPostMessageArgs(spaceId, text, postOpts));
+      return res.ts;
+    },
+    async updateMessage(spaceId, ts, text) {
+      await app.client.chat.update(buildUpdateMessageArgs(spaceId, ts, text));
     },
     start: async () => {
       await app.start();

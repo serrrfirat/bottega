@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { App, type Logger } from "@slack/bolt";
 import {
   buildPostMessageArgs,
+  buildUpdateMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
   isBotMessage,
+  isDmChannel,
   normalizeMessage,
   registerMessageHandler,
   spaceIdFromChannel,
@@ -22,6 +24,21 @@ describe("space id derivation", () => {
 
   test("unprefixed ids pass through unchanged", () => {
     expect(channelFromSpaceId("C123ABC")).toBe("C123ABC");
+  });
+});
+
+describe("isDmChannel", () => {
+  test("true for D-prefixed direct-message channel ids", () => {
+    expect(isDmChannel("D123ABC")).toBe(true);
+  });
+
+  test("false for public channels (C) and private groups (G)", () => {
+    expect(isDmChannel("C123ABC")).toBe(false);
+    expect(isDmChannel("G123ABC")).toBe(false);
+  });
+
+  test("false for unprefixed ids", () => {
+    expect(isDmChannel("123ABC")).toBe(false);
   });
 });
 
@@ -103,14 +120,33 @@ describe("buildPostMessageArgs", () => {
   });
 });
 
+describe("buildUpdateMessageArgs", () => {
+  test("maps space id, ts and text to chat.update args", () => {
+    expect(buildUpdateMessageArgs("slack:C123ABC", "1723700000.000100", "updated")).toEqual({
+      channel: "C123ABC",
+      ts: "1723700000.000100",
+      text: "updated",
+    });
+  });
+
+  test("unprefixed space ids pass through unchanged", () => {
+    expect(buildUpdateMessageArgs("D123ABC", "1.1", "updated")).toEqual({
+      channel: "D123ABC",
+      ts: "1.1",
+      text: "updated",
+    });
+  });
+});
+
 describe("createSlackAdapter", () => {
-  test("returns an adapter exposing postMessage, start and stop", () => {
+  test("returns an adapter exposing postMessage, updateMessage, start and stop", () => {
     const adapter = createSlackAdapter({
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
       onMessage: async () => {},
     });
     expect(typeof adapter.postMessage).toBe("function");
+    expect(typeof adapter.updateMessage).toBe("function");
     expect(typeof adapter.start).toBe("function");
     expect(typeof adapter.stop).toBe("function");
   });

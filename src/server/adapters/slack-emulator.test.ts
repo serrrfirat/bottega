@@ -7,7 +7,7 @@
  *
  * Emulator coverage (issue #18):
  * - Emulated: Web API — chat.postMessage (text + thread_ts passthrough),
- *   auth.test, token auth via Bearer header.
+ *   chat.update (issue #40), auth.test, token auth via Bearer header.
  * - NOT emulated: Socket Mode and inbound event delivery (README "Current
  *   Limits"). The socket connection cannot be pointed at the emulator, so
  *   inbound handling stays covered by the pure-function tests for
@@ -75,6 +75,14 @@ describe("slack adapter against @emulators/slack", () => {
     expect(messages[0].user).toBe(slack.users.findOneBy("name", "developer")!.user_id);
   });
 
+  test("postMessage resolves with the created message ts", async () => {
+    const ts = await adapter.postMessage(spaceIdFromChannel(opsChannel), "ts check");
+
+    expect(ts).toBeDefined();
+    const msg = slack.messages.all().find((m) => m.channel_id === opsChannel && m.ts === ts)!;
+    expect(msg.text).toBe("ts check");
+  });
+
   test("thread replies pass thread_ts through to the emulator", async () => {
     await adapter.postMessage(spaceIdFromChannel(opsChannel), "parent message");
     const parent = slack.messages
@@ -97,6 +105,24 @@ describe("slack adapter against @emulators/slack", () => {
       .find((m) => m.channel_id === opsChannel && m.ts === parent.ts)!;
     expect(updated.reply_count).toBe(1);
     expect(updated.reply_users).toContain(reply!.user);
+  });
+
+  test("updateMessage edits an existing message in place (chat.update)", async () => {
+    await adapter.postMessage(spaceIdFromChannel(opsChannel), "before update");
+    const original = slack.messages
+      .all()
+      .find((m) => m.channel_id === opsChannel && m.text === "before update")!;
+    expect(original.ts).toBeDefined();
+    const before = slack.messages.all().filter((m) => m.channel_id === opsChannel).length;
+
+    await adapter.updateMessage(spaceIdFromChannel(opsChannel), original.ts, "after update");
+
+    const updated = slack.messages
+      .all()
+      .find((m) => m.channel_id === opsChannel && m.ts === original.ts)!;
+    expect(updated.text).toBe("after update");
+    // Same message row — the edit replaced the text, it did not add a message.
+    expect(slack.messages.all().filter((m) => m.channel_id === opsChannel)).toHaveLength(before);
   });
 
   test("auth.test resolves the seeded bot token against the emulator", async () => {

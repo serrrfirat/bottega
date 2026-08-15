@@ -1,7 +1,7 @@
 import { createOmpSdkDriver, type AgentDriver, type AgentSessionDriver } from "../drivers/agent-driver";
 import { MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
-import type { SlackAdapter } from "../adapters/slack";
+import { channelFromSpaceId, isDmChannel, type SlackAdapter } from "../adapters/slack";
 
 export interface InboundMessage {
   spaceId: string;
@@ -23,6 +23,19 @@ export interface SpaceServiceDeps {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_DIR = "data/sessions";
+
+/**
+ * Rotating status phrases posted on turn_start and replaced in place by the
+ * real reply (or error text) when the turn completes (issue #40). A turn
+ * that ends with neither message nor error leaves the phrase as-is.
+ */
+const THINKING_PHRASES = [
+  "Thinking…",
+  "On it — thinking…",
+  "Give me a second…",
+  "Working on it…",
+  "Let me think…",
+];
 
 interface LiveSession {
   spaceId: string;
@@ -47,6 +60,10 @@ export class SpaceService {
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
   readonly #lastInboundTs = new Map<string, string>();
+  /** ts of the in-place thinking phrase per space; consumed when the reply lands. */
+  readonly #pendingThinkingTs = new Map<string, string>();
+  /** Rotates THINKING_PHRASES one step per turn. */
+  #phraseIndex = 0;
 
   constructor(deps: SpaceServiceDeps) {
     this.#store = deps.store;
@@ -104,9 +121,14 @@ export class SpaceService {
     const session = await this.#driver.createSession({
       spaceId,
       transcriptDir: this.#transcriptDir,
-      onOutput: (sid, text) => this.#postOutput(sid, text),
+      // Output arrives on the session's event channel below. onOutput is the
+      // same signal (both drivers emit both), so it must stay unconsumed or
+      // every reply would be posted twice.
+      onOutput: () => {},
     });
-    session.on("error", (data) => console.error(`[space-service] session error (${spaceId}):`, data));
+    session.on("turn_start", (data) => this.#onTurnStart(spaceId, data));
+    session.on("message", (data) => this.#onSessionMessage(spaceId, data));
+    session.on("error", (data) => this.#onSessionError(spaceId, data));
     const live: LiveSession = {
       spaceId,
       session,
@@ -129,13 +151,69 @@ export class SpaceService {
     } catch (err) {
       console.error(`[space-service] dispose failed for ${spaceId}:`, err);
     } finally {
+      this.#pendingThinkingTs.delete(spaceId);
       this.#sessions.delete(spaceId);
     }
   }
 
-  #postOutput(spaceId: string, text: string): void {
-    this.#adapter.postMessage(spaceId, text, { threadTs: this.#lastInboundTs.get(spaceId) }).catch((err) => {
+  /**
+   * Turn started: post a rotating thinking phrase immediately so the space
+   * shows activity, and remember its ts to replace in place when the reply
+   * (or an error) lands. A turn that ends with neither leaves the phrase.
+   */
+  #onTurnStart(spaceId: string, _data: unknown): void {
+    const phrase = THINKING_PHRASES[this.#phraseIndex % THINKING_PHRASES.length];
+    this.#phraseIndex += 1;
+    void this.#adapter
+      .postMessage(spaceId, phrase, this.#replyOpts(spaceId))
+      .then((ts) => {
+        if (ts !== undefined) this.#pendingThinkingTs.set(spaceId, ts);
+      })
+      .catch((err) => {
+        console.error(`[space-service] failed to post thinking phrase to ${spaceId}:`, err);
+      });
+  }
+
+  /** Complete reply text: replace the thinking phrase in place (or post fresh). */
+  #onSessionMessage(spaceId: string, data: unknown): void {
+    const text = (data as { text?: unknown }).text;
+    if (typeof text !== "string") return;
+    this.#replaceOrPost(spaceId, text);
+  }
+
+  /** Session error: surface it by replacing the thinking phrase in place. */
+  #onSessionError(spaceId: string, data: unknown): void {
+    console.error(`[space-service] session error (${spaceId}):`, data);
+    const message = (data as { message?: unknown }).message;
+    this.#replaceOrPost(spaceId, typeof message === "string" ? message : "Something went wrong while thinking.");
+  }
+
+  /**
+   * Replaces the pending thinking phrase in place when one exists; otherwise
+   * posts fresh (edge: the reply landed before the phrase ts was captured).
+   * The pending ts is cleared either way so a reply updates exactly once.
+   */
+  #replaceOrPost(spaceId: string, text: string): void {
+    const pendingTs = this.#pendingThinkingTs.get(spaceId);
+    if (pendingTs !== undefined) {
+      this.#pendingThinkingTs.delete(spaceId);
+      void this.#adapter.updateMessage(spaceId, pendingTs, text).catch((err) => {
+        console.error(`[space-service] failed to update reply in ${spaceId}:`, err);
+      });
+      return;
+    }
+    void this.#adapter.postMessage(spaceId, text, this.#replyOpts(spaceId)).catch((err) => {
       console.error(`[space-service] failed to post reply to ${spaceId}:`, err);
     });
+  }
+
+  /**
+   * DMs read naturally as a plain message — no thread. Team channels (C/G)
+   * keep replies threaded under the latest inbound message.
+   */
+  #replyOpts(spaceId: string): { threadTs?: string } | undefined {
+    if (isDmChannel(channelFromSpaceId(spaceId))) return undefined;
+    const threadTs = this.#lastInboundTs.get(spaceId);
+    return threadTs === undefined ? undefined : { threadTs };
   }
 }

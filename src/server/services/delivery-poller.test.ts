@@ -57,12 +57,13 @@ class FakeAdapter implements Pick<SlackAdapter, "postMessage"> {
   posted: Array<{ spaceId: string; text: string }> = [];
   failNext = false;
 
-  async postMessage(spaceId: string, text: string): Promise<void> {
+  async postMessage(spaceId: string, text: string): Promise<string | undefined> {
     if (this.failNext) {
       this.failNext = false;
       throw new Error("postMessage failed (fake)");
     }
     this.posted.push({ spaceId, text });
+    return undefined;
   }
 }
 
