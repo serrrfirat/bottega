@@ -13,3 +13,35 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun check
       - run: bun test
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file is valid
+        run: docker compose --profile executor config -q
+
+      - name: Build app image
+        run: docker build -t bottega:ci .
+
+      - name: Server fails closed without Slack tokens
+        run: |
+          set +e
+          output="$(docker run --rm bottega:ci bun run src/server/index.ts 2>&1)"
+          status=$?
+          echo "$output"
+          [ "$status" -ne 0 ] || { echo "expected non-zero exit, got $status"; exit 1; }
+          grep -q "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required" <<<"$output" \
+            || { echo "expected fail-closed message, got: $output"; exit 1; }
+
+      - name: Executor fails closed without PAT file
+        run: |
+          set +e
+          output="$(docker run --rm bottega:ci bun run src/executor.ts 2>&1)"
+          status=$?
+          echo "$output"
+          [ "$status" -ne 0 ] || { echo "expected non-zero exit, got $status"; exit 1; }
+          grep -q "git token file not found: data/secrets/github-pat" <<<"$output" \
+            || { echo "expected fail-closed message, got: $output"; exit 1; }
