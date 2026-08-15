@@ -33,6 +33,7 @@ settings:
     bot_events:
       - message.channels
       - message.groups
+      - message.im
       - app_mention
   socket_mode_enabled: true
   token_rotation_enabled: false
