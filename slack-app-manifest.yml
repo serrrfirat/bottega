@@ -32,6 +32,11 @@ oauth_config:
       - groups:history
       - im:history
 settings:
+  # Interactive components (approval buttons, issue #44): block_actions need
+  # interactivity enabled. Socket Mode delivers the payloads over the same
+  # websocket — no request URL is needed.
+  interactivity:
+    is_enabled: true
   event_subscriptions:
     bot_events:
       - message.channels

@@ -1,15 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import { App, type Logger } from "@slack/bolt";
 import {
+  APPROVE_ACTION_ID,
+  DENY_ACTION_ID,
   buildPostMessageArgs,
   buildUpdateMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
   isBotMessage,
   isDmChannel,
+  normalizeActionEvent,
   normalizeMessage,
+  registerActionHandler,
   registerMessageHandler,
   spaceIdFromChannel,
+  type SlackAction,
   type SlackMessage,
 } from "./slack";
 
@@ -101,6 +106,139 @@ describe("normalizeMessage", () => {
   });
 });
 
+describe("normalizeActionEvent", () => {
+  const action = { type: "button", action_id: APPROVE_ACTION_ID, value: "req-1" };
+  const body = {
+    type: "block_actions",
+    channel: { id: "C123ABC" },
+    user: { id: "U456" },
+    message: { ts: "1723700000.000100" },
+  };
+
+  test("maps a block-action click to a SlackAction", () => {
+    expect(normalizeActionEvent(action, body)).toEqual({
+      actionId: APPROVE_ACTION_ID,
+      value: "req-1",
+      spaceId: "slack:C123ABC",
+      principal: "U456",
+      messageTs: "1723700000.000100",
+    });
+  });
+
+  test("deny buttons normalize the same way", () => {
+    expect(
+      normalizeActionEvent({ ...action, action_id: DENY_ACTION_ID }, body)?.actionId,
+    ).toBe(DENY_ACTION_ID);
+  });
+
+  test("drops payloads missing the action id or value", () => {
+    expect(normalizeActionEvent({ type: "button" }, body)).toBeNull();
+    expect(normalizeActionEvent({ type: "button", action_id: APPROVE_ACTION_ID }, body)).toBeNull();
+    expect(normalizeActionEvent(null, body)).toBeNull();
+  });
+
+  test("drops payloads missing channel/user/message context", () => {
+    expect(normalizeActionEvent(action, { type: "block_actions" })).toBeNull();
+    const { channel: _channel, ...noChannel } = body;
+    expect(normalizeActionEvent(action, noChannel)).toBeNull();
+    expect(normalizeActionEvent(action, { ...body, user: {} })).toBeNull();
+    expect(normalizeActionEvent(action, { ...body, message: {} })).toBeNull();
+    expect(normalizeActionEvent(action, null)).toBeNull();
+  });
+});
+
+describe("inbound block-action routing through the real Bolt router (issue #44)", () => {
+  // Hermetic inbound, same shape as the message tests: Bolt's
+  // App.processEvent routes a block_actions body to the registered "action"
+  // listener with no socket connection and no Slack API calls (the
+  // authorize hook is an injected local double).
+  function bootApp(onAction: (a: SlackAction) => Promise<void>): {
+    logged: string[];
+    deliver: (body: Record<string, unknown>) => Promise<void>;
+  } {
+    const logged: string[] = [];
+    const app = new App({
+      appToken: "xapp-test-token",
+      signingSecret: "test-signing-secret",
+      tokenVerificationEnabled: false,
+      authorize: async () => ({ botToken: "xoxb-test-token" }),
+      logger: {
+        info: (...args: unknown[]) => void logged.push(args.join(" ")),
+        debug: () => {},
+        warn: () => {},
+        error: () => {},
+        getLevel: () => 0,
+        setLevel: () => {},
+        setName: () => {},
+      } as unknown as Logger,
+    });
+    registerActionHandler(app, onAction);
+    return {
+      logged,
+      async deliver(body) {
+        await app.processEvent({ body, ack: async () => {} });
+      },
+    };
+  }
+
+  const approveBody = {
+    type: "block_actions",
+    team: { id: "T1" },
+    channel: { id: "C123" },
+    user: { id: "U1" },
+    message: { ts: "1723700000.000100" },
+    actions: [{ type: "button", action_id: APPROVE_ACTION_ID, value: "req-1" }],
+  };
+
+  test("delivers an approve click to onAction, normalized to the space", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (a) => { received.push(a); });
+
+    await deliver(approveBody);
+
+    expect(received).toEqual([
+      {
+        actionId: APPROVE_ACTION_ID,
+        value: "req-1",
+        spaceId: "slack:C123",
+        principal: "U1",
+        messageTs: "1723700000.000100",
+      },
+    ]);
+  });
+
+  test("delivers a deny click to onAction", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (a) => { received.push(a); });
+
+    await deliver({ ...approveBody, actions: [{ type: "button", action_id: DENY_ACTION_ID, value: "req-2" }] });
+
+    expect(received.map((a) => a.actionId)).toEqual([DENY_ACTION_ID]);
+    expect(received[0].value).toBe("req-2");
+  });
+
+  test("unrelated action ids do not reach onAction", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (a) => { received.push(a); });
+
+    await deliver({ ...approveBody, actions: [{ type: "button", action_id: "some_other_button", value: "x" }] });
+
+    expect(received).toHaveLength(0);
+  });
+
+  test("unparseable action payloads are dropped and logged, not thrown", async () => {
+    const received: SlackAction[] = [];
+    const { deliver, logged } = bootApp(async (a) => { received.push(a); });
+
+    await expect(
+      deliver({ ...approveBody, actions: [{ type: "button", action_id: APPROVE_ACTION_ID }] }),
+    ).resolves.toBeUndefined();
+
+    expect(received).toHaveLength(0);
+    expect(logged.some((l) => l.includes("dropping action event"))).toBe(true);
+  });
+});
+
 describe("buildPostMessageArgs", () => {
   test("maps space id and text to chat.postMessage args", () => {
     expect(buildPostMessageArgs("slack:C123ABC", "hello")).toEqual({
@@ -116,6 +254,15 @@ describe("buildPostMessageArgs", () => {
       channel: "C123ABC",
       text: "hello",
       thread_ts: "1723700000.000100",
+    });
+  });
+
+  test("passes interactive blocks through when provided (issue #44)", () => {
+    const blocks = [{ type: "actions", elements: [] }];
+    expect(buildPostMessageArgs("slack:C123ABC", "hello", { blocks })).toEqual({
+      channel: "C123ABC",
+      text: "hello",
+      blocks,
     });
   });
 });

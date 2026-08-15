@@ -7,6 +7,12 @@
  * allows. A missing config.yml is a fail-closed default policy (everything
  * denies unless explicitly allowed).
  *
+ * `approvals` keys: `timeout_minutes` (ask-human timeout, default 5),
+ * `required_for_org_change` (reserved), and `always_approve` (issue #45) —
+ * an allowlist of exec-tier tools that skip the ask-human prompt when their
+ * policy action is `allow`; known tool names only, unknown names fail the
+ * policy closed. The space overlay can only remove entries from that list.
+ *
  * YAML: deliberately dependency-free — parsed by the shared YAML-subset
  * parser (src/yaml-subset.ts). Anything outside that subset is a
  * structural error that fails the whole policy closed. A subset parser is
@@ -71,6 +77,14 @@ export interface PolicyConfig {
   requiredApprovers: number;
   /** Space approvers (issue #33): the overlay's `approvers` list; org floor default is none. */
   approvers: string[];
+  /**
+   * Always-approve opt-in (issue #45): exec-tier tools listed here skip the
+   * ask-human prompt when their policy action is `allow` (explicit deny/
+   * prompt and unknown tools still win). Org floor only — the space overlay
+   * can only remove entries. Auto-approvals audit `approval.resolved` with
+   * `approver: "policy"`.
+   */
+  alwaysApprove: string[];
   /** Memory-context injection settings (issue #42); org floor only — the overlay cannot change them. */
   memory: { injection: MemoryInjectionConfig };
 
@@ -92,6 +106,7 @@ export function defaultPolicy(): PolicyConfig {
     timeoutMinutes: DEFAULT_TIMEOUT_MINUTES,
     requiredApprovers: DEFAULT_REQUIRED_APPROVERS,
     approvers: [],
+    alwaysApprove: [],
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
 
     agentDriver: DEFAULT_AGENT_DRIVER,
@@ -127,19 +142,29 @@ export function decideToolCall(input: {
  * policy denies everything, then the tier × action table applies. The
  * executor's preApproved scope (issue #11) lets an allowlisted exec-tier
  * tool run on the work item's pickup approval; explicit prompt/deny and
- * unknown tools are never bypassed.
+ * unknown tools are never bypassed. `autoApproved` marks an
+ * always_approve decision (issue #45) so the caller can audit it as
+ * resolved-by-policy.
  */
 export function decidePolicyCall(
   policy: PolicyConfig,
   toolName: string,
   preApproved = false,
-): { decision: Decision; reason: string } {
-  if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}` };
+): { decision: Decision; reason: string; autoApproved: boolean } {
+  if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}`, autoApproved: false };
   const action = toolAction(policy, toolName);
   if (preApproved && isKnownTool(toolName) && resolveTier(toolName) === "exec" && action === "allow") {
-    return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)" };
+    return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)", autoApproved: false };
   }
-  return decideToolCall({ tier: resolveTier(toolName), action, toolKnown: isKnownTool(toolName) });
+  // Always-approve opt-in (issue #45): a listed known tool with an allow
+  // action skips the ask-human prompt. Explicit deny/prompt still win (only
+  // `allow` reaches this branch) and unknown tools can never be listed
+  // (config validation fails closed), so decideToolCall's deny stays intact.
+  if (action === "allow" && policy.alwaysApprove.includes(toolName)) {
+    return { decision: "allow", reason: "auto-approved by policy (approvals.always_approve)", autoApproved: true };
+  }
+  const { decision, reason } = decideToolCall({ tier: resolveTier(toolName), action, toolKnown: isKnownTool(toolName) });
+  return { decision, reason, autoApproved: false };
 }
 
 export function resolveTier(toolName: string): Tier {
@@ -233,6 +258,24 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         policy.requiredApprovers = required;
       } else if (entries.required_for_org_change !== undefined) {
         policy.warnings.push("approvals.required_for_org_change: invalid — using default");
+      }
+      // always_approve (issue #45): an opt-in allowlist of exec-tier tools
+      // that skip the ask-human prompt. Known tool names only — an unknown
+      // name is a structural error (fail closed), because a typo here would
+      // otherwise silently enable nothing while looking intentional.
+      if (entries.always_approve !== undefined) {
+        const list = entries.always_approve;
+        if (!Array.isArray(list)) {
+          return structuralError(policy, "approvals.always_approve must be a list of tool names");
+        }
+        const names: string[] = [];
+        for (const raw of list) {
+          if (typeof raw !== "string" || !isKnownTool(raw)) {
+            return structuralError(policy, `approvals.always_approve: unknown tool '${String(raw)}'`);
+          }
+          names.push(raw);
+        }
+        policy.alwaysApprove = names;
       }
     } else if (name === "memory") {
       const injection = entries.injection;
@@ -363,6 +406,19 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
       return structuralError(defaultPolicy(), "spaces.policy_json: approvers must be an array of strings");
     }
     out.approvers = [...approversEntry];
+  }
+
+  // always_approve (issue #45): the overlay lists tools to REMOVE from the
+  // org floor list — the overlay can only tighten, never add entries. A
+  // name the org floor does not list is a no-op (removal can only fail in
+  // the safe direction); malformed values are a structural error.
+  const alwaysApproveEntry = overlay["always_approve"];
+  if (alwaysApproveEntry !== undefined) {
+    if (!Array.isArray(alwaysApproveEntry) || alwaysApproveEntry.some((t) => typeof t !== "string")) {
+      return structuralError(defaultPolicy(), "spaces.policy_json: always_approve must be an array of strings");
+    }
+    const removed = new Set(alwaysApproveEntry as string[]);
+    out.alwaysApprove = out.alwaysApprove.filter((tool) => !removed.has(tool));
   }
 
   return out;

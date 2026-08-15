@@ -109,7 +109,30 @@ approvals:
     expect(p.timeoutMinutes).toBe(7);
     expect(p.requiredApprovers).toBe(2);
     expect(p.approvers).toEqual([]);
+    expect(p.alwaysApprove).toEqual([]);
     expect(p.errors).toEqual([]);
+  });
+
+  test("approvals.always_approve parses a known-tool allowlist (issue #45)", () => {
+    const p = parseOrgConfigYaml(`
+approvals:
+  always_approve:
+    - create_work_item
+    - bash
+`);
+    expect(p.ok).toBe(true);
+    expect(p.alwaysApprove).toEqual(["create_work_item", "bash"]);
+  });
+
+  test("always_approve with an unknown tool fails the policy closed (issue #45)", () => {
+    const p = parseOrgConfigYaml("approvals:\n  always_approve:\n    - some_new_tool\n");
+    expect(p.ok).toBe(false);
+    expect(p.errors[0]).toContain("some_new_tool");
+  });
+
+  test("always_approve must be a list of tool names (issue #45)", () => {
+    expect(parseOrgConfigYaml("approvals:\n  always_approve: nope\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("approvals:\n  always_approve:\n    - 42\n").ok).toBe(false);
   });
 
   test("trailing comments and quoted actions parse (shared YAML parser)", () => {
@@ -278,6 +301,24 @@ describe("space overlay", () => {
     // Malformed approvers is a structural error → deny everything for the space.
     expect(applySpaceOverlay(org, JSON.stringify({ approvers: "U1" })).ok).toBe(false);
     expect(applySpaceOverlay(org, JSON.stringify({ approvers: [1] })).ok).toBe(false);
+  });
+
+  test("overlay always_approve can only remove org-floor entries (issue #45)", () => {
+    const org = parseOrgConfigYaml("approvals:\n  always_approve:\n    - bash\n    - create_work_item\n");
+    const p = applySpaceOverlay(org, JSON.stringify({ always_approve: ["bash"] }));
+    expect(p.ok).toBe(true);
+    expect(p.alwaysApprove).toEqual(["create_work_item"]);
+    // An entry the org floor does not list is a no-op (removal only tightens).
+    const noop = applySpaceOverlay(org, JSON.stringify({ always_approve: ["task", "nope"] }));
+    expect(noop.ok).toBe(true);
+    expect(noop.alwaysApprove).toEqual(["bash", "create_work_item"]);
+    // The overlay can never widen: entries absent from the org list stay absent.
+    const empty = applySpaceOverlay(parseOrgConfigYaml(""), JSON.stringify({ always_approve: ["bash"] }));
+    expect(empty.ok).toBe(true);
+    expect(empty.alwaysApprove).toEqual([]);
+    // Malformed always_approve is a structural error → deny everything for the space.
+    expect(applySpaceOverlay(org, JSON.stringify({ always_approve: "bash" })).ok).toBe(false);
+    expect(applySpaceOverlay(org, JSON.stringify({ always_approve: [1] })).ok).toBe(false);
   });
 });
 
@@ -454,6 +495,73 @@ describe("policy extension wiring", () => {
       expect.unreachable("expected a block result");
     }
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
+  });
+
+  test("always_approve lets a listed exec tool run without a prompt (issue #45)", async () => {
+    const requestedBefore = (await audit.listAudit({ event_type: "approval.requested" })).length;
+    const handlers = makeExtension("tools:\n  bash: allow\napprovals:\n  always_approve:\n    - bash\n");
+    const res = await call(handlers, "bash", { command: "ls" });
+    expect(res).toBeUndefined();
+    const decision = await lastAudit("policy.decision");
+    expect(decision).toMatchObject({ tool: "bash", tier: "exec", decision: "allow" });
+    expect(String(decision.reason)).toContain("always_approve");
+    // No prompt was posted; the resolved row records approver "policy".
+    expect(await audit.listAudit({ event_type: "approval.requested" })).toHaveLength(requestedBefore);
+    expect(await lastAudit("approval.resolved")).toMatchObject({ tool: "bash", approved: true, approver: "policy" });
+  });
+
+  test("explicit deny beats always_approve (issue #45)", async () => {
+    const resolvedBefore = (await audit.listAudit({ event_type: "approval.resolved" })).length;
+    const handlers = makeExtension("tools:\n  bash: deny\napprovals:\n  always_approve:\n    - bash\n");
+    const res = await call(handlers, "bash", { command: "ls" });
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    expect(await lastAudit("policy.decision")).toMatchObject({ tool: "bash", decision: "deny" });
+    expect(await audit.listAudit({ event_type: "approval.resolved" })).toHaveLength(resolvedBefore);
+  });
+
+  test("explicit prompt beats always_approve (issue #45)", async () => {
+    const handlers = makeExtension("tools:\n  bash: prompt\napprovals:\n  always_approve:\n    - bash\n");
+    const res = await call(handlers, "bash", { command: "ls" });
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    // The ask-human path ran (DenyRouter), not the auto-approval.
+    expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
+  });
+
+  test("an unknown tool in always_approve fails the policy closed (issue #45)", async () => {
+    const handlers = makeExtension("approvals:\n  always_approve:\n    - some_new_tool\n");
+    const res = await call(handlers, "read", { path: "x" });
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    expect(await lastAudit("policy.decision")).toMatchObject({ tool: "read", decision: "deny" });
+  });
+
+  test("space overlay removal of always_approve restores ask-human (issue #45)", async () => {
+    await store.updatePolicy(space.id, JSON.stringify({ always_approve: ["bash"] }));
+    const handlers = makeExtension(
+      "tools:\n  bash: allow\napprovals:\n  always_approve:\n    - bash\n",
+      DenyRouter,
+    );
+    // Space with the removal overlay: the exec tool goes back to ask-human → denied.
+    const blocked = await call(handlers, "bash", { command: "ls" }, space.id);
+    if (typeof blocked === "object" && blocked !== null) {
+      expect(blocked.block).toBe(true);
+    } else {
+      expect.unreachable("expected a block result");
+    }
+    // Space without the overlay (org floor list intact): auto-approved.
+    expect(await call(handlers, "bash", { command: "ls" }, space2.id)).toBeUndefined();
+    expect(await lastAudit("approval.resolved")).toMatchObject({ approved: true, approver: "policy" });
   });
 
   test("approval timeout denies", async () => {

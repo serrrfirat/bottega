@@ -5,7 +5,7 @@ import { createStore } from "../store/db";
 import { pruneDigestMemories } from "../memory/sqlite";
 import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
-import { DenyRouter } from "../policy/approval-router";
+import type { ApprovalRouter } from "../policy/approval-router";
 import { loadOrgConfig, loadSpacePolicy } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
@@ -13,7 +13,8 @@ import { memoryToolsExtension } from "../tools/memory";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
-import { createSlackAdapter } from "./adapters/slack";
+import { SlackApprovalRouter } from "./adapters/approval-router";
+import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -39,6 +40,16 @@ export interface BottegaServerOpts {
    * driver. Defaults to the OMP SDK driver with the project extensions.
    */
   createDriver?: (agentDir: string) => AgentDriver;
+  /**
+   * Approval router factory seam (issue #44): receives the adapter and the
+   * policy timeout so tests can observe the wiring. Defaults to the
+   * Slack-backed button router used for space sessions; headless contexts
+   * (the executor) keep DenyRouter in their own entrypoint.
+   */
+  createApprovalRouter?: (deps: {
+    adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
+    timeoutMs: number;
+  }) => ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
 }
 
 export function main(opts: BottegaServerOpts = {}): BottegaServer {
@@ -59,8 +70,26 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
-  // DenyRouter until the Slack-backed approval router lands (later issue):
-  // until then, exec-tier tool calls are blocked server-side, never run.
+  // Wiring order matters: the policy gate (both drivers) needs the approval
+  // router, the router needs the adapter, and the adapter's callbacks need
+  // the service/router — all late-bound closures, so no message or action
+  // can arrive before main() returns.
+  let spaceService: SpaceService;
+  let approvalRouter: ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
+  const adapter = createSlackAdapter({
+    appToken,
+    botToken,
+    onMessage: (m) => spaceService.handleInboundMessage(m),
+    onAction: (a) => approvalRouter.handleAction(a),
+  });
+  // Space sessions resolve ask-human via Slack buttons (issue #44). The
+  // executor keeps DenyRouter (src/executor.ts): its work-item pickup
+  // approval is the authorization, and nothing headless may run exec tools
+  // without one.
+  approvalRouter = (opts.createApprovalRouter ?? ((deps) => new SlackApprovalRouter(deps)))({
+    adapter,
+    timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+  });
   const createDriver =
     opts.createDriver ??
     ((agentDir: string) => {
@@ -86,14 +115,14 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
             orgPolicy,
             loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
             audit,
-            router: DenyRouter,
+            router: approvalRouter,
           },
         });
       }
       return createOmpSdkDriver({
         agentDir,
         extensions: [
-          createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
+          createPolicyExtension({ orgPolicy, audit, router: approvalRouter, store }),
           workItemsExtension(store, { orgPolicy }),
           // Memory tools (issue #22, #43): provider chosen from env —
           // MEM0_BASE_URL set → mem0 backend (compose ships it), else SQLite
@@ -110,15 +139,6 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
       });
     });
   const driver = createDriver(OMP_AGENT_DIR);
-  // The adapter routes inbound messages to the service; the service posts
-  // replies back through the adapter. Late-bound: no message can arrive
-  // before main() returns, so the closure read is always initialized.
-  let spaceService: SpaceService;
-  const adapter = createSlackAdapter({
-    appToken,
-    botToken,
-    onMessage: (m) => spaceService.handleInboundMessage(m),
-  });
   spaceService = new SpaceService({
     store,
     adapter,

@@ -1,4 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
+import type { ChatPostMessageArguments } from "@slack/web-api";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
 // a call-time property read, so patching the exports object is effective).
@@ -34,9 +35,30 @@ export interface SlackMessage {
   ts: string;
 }
 
+/** Approval button action ids (issue #44); the buttons and the router's action handler share these. */
+export const APPROVE_ACTION_ID = "bottega_approve";
+export const DENY_ACTION_ID = "bottega_deny";
+
+/**
+ * A normalized interactive-component event (issue #44): a block-action
+ * button click carries the button's `action_id` and `value` (the approval
+ * request id), plus the channel/user/message the click happened on.
+ */
+export interface SlackAction {
+  actionId: string;
+  value: string;
+  spaceId: string;
+  principal: string;
+  messageTs: string;
+}
+
 export interface SlackAdapter {
   /** Posts a message; resolves with the created message ts (undefined when the API omits it). */
-  postMessage(spaceId: string, text: string, opts?: { threadTs?: string }): Promise<string | undefined>;
+  postMessage(
+    spaceId: string,
+    text: string,
+    opts?: { threadTs?: string; blocks?: unknown[] },
+  ): Promise<string | undefined>;
   /** Replaces the text of an already-posted message (chat.update). */
   updateMessage(spaceId: string, ts: string, text: string): Promise<void>;
   start(): Promise<void>;
@@ -96,20 +118,52 @@ export function normalizeMessage(event: unknown): SlackMessage | null {
 }
 
 /**
+ * Normalizes a Bolt block-action payload into a {@link SlackAction}.
+ *
+ * `action` is the clicked element (carries `action_id` + `value`); `body` is
+ * the full interactive payload (carries channel/user/message context).
+ * Returns `null` for anything unparseable instead of throwing — the caller
+ * drops and logs those.
+ */
+export function normalizeActionEvent(action: unknown, body: unknown): SlackAction | null {
+  if (typeof action !== "object" || action === null) return null;
+  if (typeof body !== "object" || body === null) return null;
+  const a = action as Record<string, unknown>;
+  const b = body as Record<string, unknown>;
+  const channel = b.channel as Record<string, unknown> | undefined;
+  const user = b.user as Record<string, unknown> | undefined;
+  const message = b.message as Record<string, unknown> | undefined;
+  if (typeof a.action_id !== "string" || typeof a.value !== "string") return null;
+  if (typeof channel?.id !== "string" || typeof user?.id !== "string" || typeof message?.ts !== "string") {
+    return null;
+  }
+  return {
+    actionId: a.action_id,
+    value: a.value,
+    spaceId: spaceIdFromChannel(channel.id),
+    principal: user.id,
+    messageTs: message.ts,
+  };
+}
+
+/**
  * Maps adapter arguments onto `chat.postMessage` arguments. Pure so the
  * outbound rendering is testable without a live Slack connection.
  */
 export function buildPostMessageArgs(
   spaceId: string,
   text: string,
-  opts?: { threadTs?: string },
-): { channel: string; text: string; thread_ts?: string } {
-  const args: { channel: string; text: string; thread_ts?: string } = {
+  opts?: { threadTs?: string; blocks?: unknown[] },
+): { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } {
+  const args: { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } = {
     channel: channelFromSpaceId(spaceId),
     text,
   };
   if (opts?.threadTs !== undefined) {
     args.thread_ts = opts.threadTs;
+  }
+  if (opts?.blocks !== undefined) {
+    args.blocks = opts.blocks;
   }
   return args;
 }
@@ -147,10 +201,35 @@ export function registerMessageHandler(
   });
 }
 
+/**
+ * Routes block-action clicks (`bottega_approve` / `bottega_deny`, issue
+ * #44) to `onAction`. Unparseable payloads are dropped and logged, never
+ * thrown. Exported so the inbound wiring is testable hermetically through
+ * the real Bolt router (`App.processEvent`, issue #29); the adapter
+ * installs it on its app when `onAction` is provided.
+ */
+export function registerActionHandler(
+  app: Pick<App, "action">,
+  onAction: (a: SlackAction) => Promise<void>,
+): void {
+  app.action(/^bottega_(approve|deny)$/, async ({ action, body, ack, logger }) => {
+    // Ack first: Slack retries unacked interactive payloads.
+    await ack();
+    const normalized = normalizeActionEvent(action, body);
+    if (!normalized) {
+      logger.info("slack: dropping action event (unparseable)");
+      return;
+    }
+    await onAction(normalized);
+  });
+}
+
 export function createSlackAdapter(opts: {
   appToken: string;
   botToken: string;
   onMessage: (m: SlackMessage) => Promise<void>;
+  /** Interactive-component handler (approval buttons, issue #44); optional so headless callers omit it. */
+  onAction?: (a: SlackAction) => Promise<void>;
   /**
    * WebClient options passthrough. Tests point the Web API at an emulator
    * (e.g. @emulators/slack) via `clientOptions.slackApiUrl`; production
@@ -181,10 +260,16 @@ export function createSlackAdapter(opts: {
   });
 
   registerMessageHandler(app, opts.onMessage);
+  if (opts.onAction !== undefined) {
+    registerActionHandler(app, opts.onAction);
+  }
 
   return {
     async postMessage(spaceId, text, postOpts) {
-      const res = await app.client.chat.postMessage(buildPostMessageArgs(spaceId, text, postOpts));
+      // blocks are built by the approval router as plain JSON; chat.postMessage
+      // wants Slack's Block[] union — the shape is checked by the builder.
+      const args = buildPostMessageArgs(spaceId, text, postOpts) as ChatPostMessageArguments;
+      const res = await app.client.chat.postMessage(args);
       return res.ts;
     },
     async updateMessage(spaceId, ts, text) {

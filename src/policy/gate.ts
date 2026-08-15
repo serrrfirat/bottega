@@ -7,9 +7,13 @@
  *
  * Sequence per call:
  *   1. load the space's effective policy (org floor + space overlay);
- *   2. decide (tier × action, unknown tools deny, invalid policy denies);
+ *   2. decide (tier × action, unknown tools deny, invalid policy denies;
+ *      `approvals.always_approve` auto-approves listed exec tools, audited
+ *      below as resolved-by-policy — issue #45);
  *   3. audit every decision as `policy.decision` {tool, tier, decision,
- *      reason, args} (args redacted + capped by appendAudit);
+ *      reason, args} (args redacted + capped by appendAudit); auto-approvals
+ *      additionally write `approval.resolved` {tool, approved: true,
+ *      approver: "policy"};
  *   4. ask-human routes through the configured ApprovalRouter, auditing
  *      `approval.requested` / `approval.resolved`; router failure and
  *      timeout deny.
@@ -60,7 +64,7 @@ export function summarizeArgs(input: unknown): string {
 
 export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateCall): Promise<PolicyGateOutcome> {
   const policy = await deps.loadPolicy(call.spaceId);
-  const { decision, reason } = decidePolicyCall(policy, call.tool, deps.preApproved ?? false);
+  const { decision, reason, autoApproved } = decidePolicyCall(policy, call.tool, deps.preApproved ?? false);
 
   await deps.audit.appendAudit({
     space_id: call.spaceId ?? null,
@@ -75,6 +79,18 @@ export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateC
       args: summarizeArgs(call.args),
     },
   });
+
+  // Always-approve (issue #45): no prompt was posted, but the resolved row
+  // with approver "policy" keeps the trail complete and distinguishable
+  // from a human approval.
+  if (autoApproved) {
+    await deps.audit.appendAudit({
+      space_id: call.spaceId ?? null,
+      actor: call.actor,
+      event_type: APPROVAL_RESOLVED_EVENT,
+      payload: { tool: call.tool, approved: true, approver: "policy" },
+    });
+  }
 
   if (decision === "allow") return { decision, reason, allowed: true, blockReason: "" };
   if (decision === "deny") return { decision, reason, allowed: false, blockReason: `policy: ${reason}` };

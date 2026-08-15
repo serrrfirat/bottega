@@ -91,8 +91,9 @@ interface AgentDriver {
   inbound permission request runs through the same policy table the OMP
   extensions use (tier × org config + space overlay → allow | deny |
   ask-human), with audit on every decision. Unknown tools deny (fail
-  closed); ask-human routes through the configured `ApprovalRouter`
-  (`DenyRouter` until the Slack button router lands). With `agent.driver:
+  closed); ask-human routes through the same Slack button `ApprovalRouter`
+  as the OMP driver (issue #44), or `DenyRouter` in headless contexts.
+  With `agent.driver:
   acp`, the bottega MCP server (memory.save/search, issue #25) attaches to
   each session so bottega's own tools stay reachable. The tradeoff vs the
   OMP driver is interception depth: ACP gives allow/deny only, no arg
@@ -107,13 +108,24 @@ interface AgentDriver {
 2. **Policy** = org floor (`config.yml`, fail-closed when absent: everything
    denies) + space overlay (`spaces.policy_json`, can only tighten). Strict
    YAML-subset parsing; any structural error fails the policy closed.
-3. **Decision**: deny wins; `prompt` and `exec` tier → `ask-human`;
-   read/write + allow → allow. Exec never fails open.
-4. **ask-human** routes through an `ApprovalRouter` — the interface ships
-   with a `DenyRouter` (headless contexts); the Slack button router is a
-   follow-up. Timeout (default 5 min) → deny.
-5. **Every decision** is audited (`policy.decision` with tool/tier/decision/
-   reason; args redacted).
+3. **Decision precedence** (issue #45): explicit tool `deny`/`prompt` wins →
+   `approvals.always_approve` contains the tool → allow → tier logic
+   (`prompt` and `exec` tier → `ask-human`; read/write + allow → allow).
+   Exec never fails open.
+4. **ask-human** posts an interactive Approve/Deny prompt to the space
+   channel (Slack block actions `bottega_approve` / `bottega_deny`, issue
+   #44) and resolves when a human clicks; the message is rewritten with the
+   outcome. Headless contexts (the executor) use `DenyRouter` — every
+   ask-human request there denies. Timeout (`approvals.timeout_minutes`,
+   default 5 min) → deny, prompt rewritten to expired.
+5. **`approvals.always_approve`** (org floor only; default off) lists
+   exec-tier tools that skip the ask-human prompt when their policy action
+   is `allow` — the space overlay can only *remove* entries, never add.
+   Auto-approvals audit `approval.resolved` with `approver: "policy"`.
+6. **Every decision** is audited (`policy.decision` with tool/tier/decision/
+   reason; args redacted), and every ask-human round-trip additionally
+   writes `approval.requested` / `approval.resolved` (approver = the Slack
+   user who clicked).
 
 Executor sessions run with `preApproved: true` policy scope: the work item's
 pickup approval (the human-approved `create_work_item` call in the channel)
@@ -341,10 +353,11 @@ fallback. An empty allowlist means no pushes until a repo is configured.
 - **No auto-pickup** — the space agent creates work items only on an
   explicit tool call; there is no auto-pickup policy flag.
 - **Approvals** — anyone in the channel can approve; there is no role model
-  yet. The delivery approval button round-trip (the human's decision
-  resolving `working → review → done`) is a follow-up: today the server
-  posts the PR + approval request as text, and the item stays `working`
-  until that path lands.
+  yet. In-session exec approvals (e.g. `create_work_item`) resolve via the
+  Approve/Deny buttons (issue #44). The *delivery* approval button
+  round-trip (the human's decision resolving `working → review → done`) is
+  still a follow-up: today the server posts the PR + approval request as
+  text, and the item stays `working` until that path lands.
 - **Allowlisted repos only** — the executor works in the repo the
   conversation names (via `create_work_item`'s `repo` param) and refuses
   anything outside the `config/org.yml`/`EXECUTOR_REPOS` allowlist; a work
@@ -355,8 +368,9 @@ fallback. An empty allowlist means no pushes until a repo is configured.
 
 ## Roadmap
 
-- Slack approval buttons (router + delivery resolution) — completes the
-  `working → review → done` loop in-channel.
+- Delivery approval buttons (resolving `working → review → done`
+  in-channel) — completes the delivery loop; in-session approvals already
+  resolve via buttons (issue #44).
 - Telegram adapter (grammY, long polling) — #13.
 - Per-work-item container isolation (deployment-only change).
 - Roles (explicit approvers) and SSO.
