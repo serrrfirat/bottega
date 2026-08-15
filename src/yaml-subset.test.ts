@@ -70,4 +70,22 @@ describe("yaml-subset sequence parsing", () => {
       "plain-item",
     ]);
   });
+
+  test("parses literal block scalars verbatim (multi-line prompts)", () => {
+    const cfg = parseYamlSubset(
+      ["prompt: |", "  Decide whether this outbound", "  request is acceptable.", "after: value"].join("\n"),
+    );
+    expect(cfg["prompt"]).toBe("Decide whether this outbound\nrequest is acceptable.");
+    expect(cfg["after"]).toBe("value");
+  });
+
+  test("rejects unterminated quotes and quotes inside quoted scalars", () => {
+    expect(() => parseYamlSubset('key: "unterminated')).toThrow(/unterminated/);
+    expect(() => parseYamlSubset('key: "a"b"')).toThrow(/quotes inside/);
+  });
+
+  test("rejects empty sequence items and block scalars inside sequence items", () => {
+    expect(() => parseYamlSubset("-\n- x")).toThrow(/empty sequence item/);
+    expect(() => parseYamlSequence("- prompt: |\n    body")).toThrow(/block scalar inside sequence item/);
+  });
 });

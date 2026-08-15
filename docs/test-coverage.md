@@ -89,8 +89,9 @@ Baseline verified on 2026-08-16 (`feat/28-audit`, before any changes):
 ## Backfill status (issue #29)
 
 Every ranked gap above resolved or explicitly deferred, verified on
-2026-08-16 after the backfill commits (214 baseline → 236 tests, 0 failures
-across two consecutive full-suite runs):
+2026-08-16 after the backfill commits (214 baseline → 257 tests, 0 failures
+across two consecutive full-suite runs; the count includes the sibling MCP
+surface work that landed on main during backfill):
 
 | # | Gap | Resolution | Evidence |
 |---|---|---|---|
@@ -104,8 +105,10 @@ across two consecutive full-suite runs):
 | 8 | `scripts/dev.sh` untested | Deferred (documented, not blocked): dev-only Keychain loader, audit-marked optional/low-risk; no shell test infra exists in the repo. The Keychain path stays a manual dev workflow. | — |
 | 9 | No automated e2e | By design (AGENTS.md: real-credential legs stay a documented manual checklist). Compose-based smoke legs are tracked separately in issue #30. | — |
 
-Additional table items closed: `egress/yaml-subset.ts` now has direct
-rejection/acceptance tests (`src/egress/yaml-subset.test.ts`, 8 tests).
+Additional table items closed: `yaml-subset` now has direct
+rejection/acceptance tests in the shared `src/yaml-subset.test.ts` (extended
+to 11 tests during backfill; the parser itself was promoted out of
+`src/egress/` by the #33 consolidation that landed mid-flight).
 
 Not backfilled (documented, by design or optional per the table): full
 `start()` await in `server/index.ts` (needs a Socket-Mode receiver stub; the

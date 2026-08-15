@@ -20,7 +20,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { parseYamlSubset, type YamlNode } from "./yaml-subset";
+import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 const PROXY_IMAGE = "ironsh/iron-proxy:0.49.0";
 /** Pinned tiny image with nslookup, used to query the proxy's DNS. */
