@@ -38,8 +38,11 @@ transforms:
   - name: allowlist
     config:
       domains:
-        - "api.near.ai"
-        - "*.completions.near.ai"
+        # Live model gateway (issue #36): config/omp/models.yml points the
+        # `near` provider at cloud-api.near.ai/v1; api.near.ai was retired
+        # 2025-10-31.
+        - "cloud-api.near.ai"
+        - "*.completions.near.ai" # judge LLM endpoint (see provider below)
         # Add org-configured domains here (e.g. an opencode gateway host once
         # one is deployed, or doc sites the agents legitimately read). Traffic
         # to allowlisted hosts is then subject to the judge policy below.

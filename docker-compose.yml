@@ -25,6 +25,12 @@ services:
     command:
       - "-config"
       - "/etc/iron-proxy/egress.yml"
+    environment:
+      # LLM judge key (config/egress.yml -> judge.provider.api_key_env):
+      # the judge gates allowlisted traffic, so without a key every
+      # allowlisted request fails the judge and is denied (fail closed).
+      # Set it in .env; the proxy reads it from its own environment.
+      NEARAI_JUDGE_API_KEY: ${NEARAI_JUDGE_API_KEY:-}
     volumes:
       - ./config/egress.yml:/etc/iron-proxy/egress.yml:ro
       # MITM CA, generated once per deployment (gitignored):

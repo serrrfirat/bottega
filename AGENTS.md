@@ -13,7 +13,7 @@ rule below conflicts with a rule above, the user's explicit instructions win
 ### Code quality
 - **No `any`** unless absolutely necessary. No inline/dynamic imports —
   top-level imports only.
-- **No duplicate helpers.** Search `src/lib/` and adjacent modules before
+- **No duplicate helpers.** Search existing modules and adjacent code before
   writing a utility; two implementations of the same thing is a bug even when
   both work. Extend the existing helper; don't fork it.
 - **No speculative infrastructure.** Hooks, callbacks, or abstractions need a
@@ -96,19 +96,19 @@ rule below conflicts with a rule above, the user's explicit instructions win
    problem surfaces in conversation (not from a plan), create the issue AND
    start a task subagent in its own worktree to fix it right away — the main
    agent does not fix chat-discovered issues itself.
-2. **Ship to `main` directly** — no PRs (tried, user changed the workflow).
+3. **Ship to `main` directly** — no PRs (tried, user changed the workflow).
    Push with `git push origin <branch>:main` after `git pull --rebase origin
    main` (retry rebase up to 3x on rejection).
-3. **Isolated worktrees** when multiple agents run: work ONLY in your assigned
+4. **Isolated worktrees** when multiple agents run: work ONLY in your assigned
    `.worktrees/<topic>`; never touch the main checkout or sibling worktrees.
-4. Never rewrite shared history.
+5. Never rewrite shared history.
 
 ## Build, test, verify
 
 ```bash
 bun install          # Bun 1.3+; lockfile frozen in CI
 bun check            # tsc --noEmit — must exit 0
-bun test             # 165+ tests — must exit 0
+bun test             # 270+ tests — must exit 0
 scripts/smoke.sh     # local checks + compose validation + manual checklist
 docker compose --profile executor config -q   # compose validity (CI does this)
 ```

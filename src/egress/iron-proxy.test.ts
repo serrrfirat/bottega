@@ -28,7 +28,7 @@ const DNS_CLIENT_IMAGE = "alpine:3.19";
 /** Arbitrary sinkhole IP for the leg config; must never be a real host. */
 const SINKHOLE_IP = "10.42.0.2";
 /** Exact entry in config/egress.yml — the allowlisted target host. */
-const ALLOWED_HOST = "api.near.ai";
+const ALLOWED_HOST = "cloud-api.near.ai";
 /** Anything not on the allowlist must be blocked. */
 const DENIED_HOST = "bottega-blocked.test";
 

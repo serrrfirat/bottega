@@ -96,9 +96,10 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     ]);
   });
 
-  test("executor is declared but gated behind a profile until #11", () => {
+  test("executor is opt-in via profile (not started by default)", () => {
+    // The executor shares the app image with the server (pinned tag asserted
+    // in deploy.test.ts); the profile is what keeps it out of `up -d`.
     expect(service("executor")["profiles"] as string[]).toContain("executor");
-    expect(service("executor")["image"]).toBeTruthy();
   });
 
   test("internal network has the fixed subnet that matches dns.proxy_ip", () => {

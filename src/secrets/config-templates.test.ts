@@ -55,10 +55,14 @@ describe(".env.example (issue #9 environment contract)", () => {
     for (const varName of [
       "SLACK_APP_TOKEN",
       "SLACK_BOT_TOKEN",
+      "OPENCODE_API_KEY",
       "NEAR_API_KEY",
       "OMP_AUTH_BROKER_URL",
       "OMP_AUTH_BROKER_TOKEN",
+      "NEARAI_JUDGE_API_KEY",
       "GITHUB_PAT",
+      "MEM0_BASE_URL",
+      "OPENAI_API_KEY",
     ]) {
       expect(envExample).toContain(varName);
     }

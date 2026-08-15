@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 const compose = parseYamlSubset(
@@ -97,13 +98,56 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     }
   });
 
-  test("broker bootstrap script exists, is executable, and execs omp", () => {
+  test("broker bootstrap generates the 0600 token once and execs omp with forwarded args", async () => {
     const script = resolve(import.meta.dir, "../../config/entrypoints/broker.sh");
-    const mode = statSync(script).mode;
-    expect(mode & 0o111).not.toBe(0);
-    const body = readFileSync(script, "utf8");
-    expect(body).toContain("exec omp \"$@\"");
-    // Token must be written 0600 into the shared data volume.
-    expect(body).toContain("chmod 600");
+    expect(statSync(script).mode & 0o111).not.toBe(0);
+    const dir = mkdtempSync(join(tmpdir(), "bottega-broker-"));
+    try {
+      // Fake omp on PATH: records its args, its PID, and the exported
+      // OMP_AUTH_BROKER_TOKEN. PID equality with the spawned process proves
+      // `exec` semantics (no intermediate shell survives).
+      const bin = join(dir, "bin");
+      const argsFile = join(dir, "omp.args");
+      const pidFile = join(dir, "omp.pid");
+      const tokenSeenFile = join(dir, "omp.token-seen");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(
+        join(bin, "omp"),
+        [
+          "#!/bin/sh",
+          `printf '%s\\n' "$@" > "${argsFile}"`,
+          `printf '%s' "$$" > "${pidFile}"`,
+          `printf '%s' "$OMP_AUTH_BROKER_TOKEN" > "${tokenSeenFile}"`,
+          "exit 0",
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+      chmodSync(join(bin, "omp"), 0o700);
+      const configDir = join(dir, ".omp");
+      const env = { PATH: `${bin}:${process.env.PATH ?? ""}`, PI_CONFIG_DIR: configDir };
+      const tokenFile = join(configDir, "auth-broker.token");
+
+      const vaultArgs = ["auth-broker", "serve", "--bind=0.0.0.0:8765"];
+      const first = Bun.spawnSync(["sh", script, ...vaultArgs], { env });
+      expect(first.success).toBe(true);
+      expect(existsSync(tokenFile)).toBe(true);
+      expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+      const token = readFileSync(tokenFile, "utf8").trim();
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+
+      // omp was exec'd with the vault serve command and saw the token.
+      expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(vaultArgs);
+      expect(readFileSync(pidFile, "utf8")).toBe(String(first.pid));
+      expect(readFileSync(tokenSeenFile, "utf8")).toBe(token);
+
+      // Later boots reuse the token: no regeneration, same vault identity.
+      const second = Bun.spawnSync(["sh", script, ...vaultArgs], { env });
+      expect(second.success).toBe(true);
+      expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
+      expect(readFileSync(pidFile, "utf8")).toBe(String(second.pid));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

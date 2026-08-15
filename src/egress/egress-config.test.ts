@@ -40,8 +40,11 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   test("allowlist contains the NEAR.ai model endpoints", () => {
     expect(allowlist).toBeDefined();
     const domains = allowlistCfg["domains"] as string[];
-    expect(domains).toContain("api.near.ai");
+    // Live gateway used by config/omp/models.yml (issue #36); api.near.ai
+    // was retired 2025-10-31 and must not be allowed.
+    expect(domains).toContain("cloud-api.near.ai");
     expect(domains).toContain("*.completions.near.ai");
+    expect(domains).not.toContain("api.near.ai");
   });
 
   test("judge policy gate is configured after the allowlist", () => {

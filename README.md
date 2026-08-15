@@ -165,7 +165,7 @@ sequenceDiagram
 | Untrusted ingress | Adapters validate every event; only adapters mint messages |
 | Credential exposure | Provider keys in auth-broker vault; Slack tokens only in server `.env`; git PAT only in a mode-0600 file on the data volume; OMP secret obfuscation (`secrets.enabled`) |
 | Malicious repo content | Work items run in the executor container in disposable workspaces; server never mounts repo paths |
-| Exfiltration / rogue egress | All outbound traffic through iron-proxy: default-deny allowlist (NEAR.ai model endpoints), LLM-judge for unmatched, DNS sinkhole (containers resolve only through the proxy) |
+| Exfiltration / rogue egress | All outbound traffic through iron-proxy: default-deny allowlist (model endpoints: cloud-api.near.ai, *.completions.near.ai), LLM-judge on allowlisted traffic, DNS sinkhole (containers resolve only through the proxy) |
 | Unauthorized side effects | Policy gate on every tool call; exec prompts to humans; unknown → deny |
 | Data loss / tampering | Append-only audit (SQLite triggers reject UPDATE/DELETE), transcripts retained, never deleted |
 | Failure | Fail closed: parse errors, policy errors, model outages, missing tokens → deny or block with evidence |
@@ -208,17 +208,22 @@ The space timeline itself is the OMP session file (`.jsonl` under
 src/
   server/           index.ts (composition root)
   server/adapters/  slack.ts
-  server/drivers/   agent-driver.ts, acp-driver.ts
+  server/drivers/   agent-driver.ts (AgentDriver + OMP SDK), acp-driver.ts
   server/services/  space-service.ts, delivery-poller.ts
   policy/           config.ts, extension.ts, approval-router.ts, audit.ts
   store/            db.ts, schema.sql
-  tools/            work-items.ts (create_work_item, work_item_cancel)
+  tools/            work-items.ts, memory.ts, helpers.ts
+  memory/           sqlite.ts, mem0.ts, types.ts (providers behind one interface)
+  mcp/              server.ts (bottega-hosted MCP memory surface, #25)
   executor.ts       containerized work-item runner (claim → PR)
-  egress/           iron-proxy config + compose wiring
-  secrets/          broker/gateway wiring
+  yaml-subset.ts    shared strict YAML-subset parser (configs + tests)
+  egress/           tests: compose topology, egress.yml, proxy-env, iron-proxy leg
+  secrets/          tests: credential boundary, omp templates, agent-dir
 config/
   egress.yml        iron-proxy allowlist + judge policy
   omp/              config.yml (secrets.enabled), secrets.yml, models.yml
+  org.yml           executor repos + git base
+  entrypoints/      broker.sh (auth-broker token bootstrap)
 Dockerfile          single image (server + executor entrypoints), bun user
 docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy
 slack-app-manifest.yml
@@ -255,9 +260,11 @@ Copy `.env.example` to `.env` and fill in:
 | --- | --- | --- |
 | `SLACK_APP_TOKEN` | App-level token | Slack app dashboard (step 1.3) |
 | `SLACK_BOT_TOKEN` | Bot user OAuth token | Slack app dashboard (step 1.2) |
-| `NEAR_API_KEY` | Model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
+| `OPENCODE_API_KEY` | Primary model key (#37) | Referenced by `config/omp/models.yml` (`providers.opencode-go.apiKey`); resolved by the SDK inside the server, never in agent env. Local dev: Keychain service `bottega-opencode` |
+| `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3) |
+| `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key | Referenced by `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied |
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |
 
@@ -381,9 +388,9 @@ fallback. An empty allowlist means no pushes until a repo is configured.
 ```bash
 bun install
 bun check    # typecheck
-bun test     # 165+ tests: store, policy, adapter, executor, deploy packaging
+bun test     # 270+ tests: store, policy, adapter, executor, deploy packaging
 scripts/smoke.sh  # local checks + compose validation + manual checklist
-bun run dev  # local server (needs .env, or the key in Keychain: security add-generic-password -s bottega-near -a $(whoami) -w '<key>')
+bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
 ```
 
 Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
