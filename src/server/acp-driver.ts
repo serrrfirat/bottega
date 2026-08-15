@@ -109,7 +109,12 @@ class AcpSessionDriver implements AgentSessionDriver {
       if (init?.protocolVersion !== PROTOCOL_VERSION) {
         throw new Error(`unsupported ACP protocol version: ${String(init?.protocolVersion)}`);
       }
-      const created = await this.#request("session/new", { cwd: process.cwd() });
+      // ACP v1 session/new takes { cwd, mcpServers } — a list of MCP servers
+      // for the agent to connect. omp's handler iterates mcpServers
+      // unconditionally: when the field is absent it crashes with
+      // -32603 "undefined is not an object (evaluating 'n.length')" and may
+      // never respond, so always send an explicit empty list (issue #17/#18).
+      const created = await this.#request("session/new", { cwd: process.cwd(), mcpServers: [] });
       const sessionId = (created as { sessionId?: unknown } | null)?.sessionId;
       if (typeof sessionId !== "string" || !sessionId) {
         throw new Error("ACP agent returned no sessionId from session/new");

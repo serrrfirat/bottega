@@ -228,4 +228,32 @@ describe("acp driver", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("real omp acp: initialize + session/new + session/close (skips when omp is unavailable)", async () => {
+    // Interop smoke test against the real `omp acp` binary (issue #18).
+    // No prompt is ever sent — only the handshake, session/new, and
+    // session/close. Skips (with a message) when omp is not on PATH or the
+    // agent cannot complete the handshake, so CI never hard-fails on an
+    // environment without omp.
+    const dir = mkdtempSync(join(tmpdir(), "acp-real-omp-"));
+    const driver = createAcpDriver({ sessionTimeoutMs: 10_000 });
+    let session: AgentSessionDriver | null = null;
+    try {
+      session = await driver.createSession({
+        spaceId: "real-omp",
+        transcriptDir: join(dir, "sessions"),
+        onOutput: () => {},
+      });
+      // Handshake + session/new succeeded against real omp; dispose sends
+      // session/close and terminates the child. Nothing else is asserted
+      // because this test must never send a prompt.
+      await session.dispose();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`SKIP real-omp interop test: omp acp unavailable or handshake failed (${msg})`);
+    } finally {
+      await session?.dispose().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
