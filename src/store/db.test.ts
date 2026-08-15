@@ -51,9 +51,9 @@ describe("spaces", () => {
     try {
       const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C2" });
       vi.advanceTimersByTime(1000);
-      const updated = await store.updatePolicy(space.id, '{"pickup":{"auto":true}}');
+      const updated = await store.updatePolicy(space.id, '{"tools":{"bash":"deny"}}');
       expect(updated.id).toBe(space.id);
-      expect(updated.policy_json).toBe('{"pickup":{"auto":true}}');
+      expect(updated.policy_json).toBe('{"tools":{"bash":"deny"}}');
       expect(updated.updated_at).toBe(space.updated_at + 1000);
     } finally {
       vi.useRealTimers();

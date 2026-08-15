@@ -185,7 +185,7 @@ const ACTION_VALUES: readonly PolicyAction[] = ["allow", "deny", "prompt"];
 function normalizeAction(value: unknown): PolicyAction | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
-  return (ACTION_VALUES as readonly string[]).includes(normalized) ? (normalized as PolicyAction) : undefined;
+  return ACTION_VALUES.find((action) => action === normalized);
 }
 
 function structuralError(policy: PolicyConfig, message: string): PolicyConfig {
@@ -363,7 +363,7 @@ function clonePolicy(p: PolicyConfig): PolicyConfig {
  * The overlay can only tighten; an unparseable overlay fails the space closed.
  */
 export function applySpaceOverlay(org: PolicyConfig, policyJson: string): PolicyConfig {
-  const trimmed = policyJson?.trim() ?? "";
+  const trimmed = policyJson.trim();
   if (!trimmed || !org.ok) return org;
 
   let parsed: unknown;

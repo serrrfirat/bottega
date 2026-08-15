@@ -2,7 +2,7 @@
 -- so re-running this file (e.g. on every boot, server and executor) is a no-op.
 
 CREATE TABLE IF NOT EXISTS spaces (
-  id          TEXT PRIMARY KEY,          -- "slack:C0123/thread" or "slack:C0123"
+  id          TEXT PRIMARY KEY,          -- "slack:C0123" (DMs, no threads)
   platform    TEXT NOT NULL,             -- 'slack' | 'telegram'
   channel_id  TEXT NOT NULL,
   name        TEXT,
@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS spaces (
 );
 
 CREATE TABLE IF NOT EXISTS work_items (
-  id           TEXT PRIMARY KEY,         -- "wi_<nanoid>"
+  id           TEXT PRIMARY KEY,         -- "wi_<uuid>"
   space_id     TEXT NOT NULL REFERENCES spaces(id),
   requester    TEXT NOT NULL,            -- principal (slack user id)
   description  TEXT NOT NULL,

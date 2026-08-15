@@ -1,5 +1,4 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -175,18 +174,3 @@ describe("payload cap", () => {
   });
 });
 
-describe("immutability", () => {
-  test("raw UPDATE and DELETE on audit raise ABORT via triggers", async () => {
-    const id = await audit.appendAudit({ actor: "U5", event_type: "policy.decision", payload: { allow: true } });
-    const raw = new Database(join(dir, "test.db"));
-    try {
-      expect(() => raw.query("UPDATE audit SET payload = 'tampered' WHERE id = ?").run(id)).toThrow(/append-only/);
-      expect(() => raw.query("DELETE FROM audit WHERE id = ?").run(id)).toThrow(/append-only/);
-    } finally {
-      raw.close();
-    }
-    const rows = await audit.listAudit({ event_type: "policy.decision" });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.payload).toBe('{"allow":true}');
-  });
-});

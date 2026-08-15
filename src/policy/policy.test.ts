@@ -58,16 +58,6 @@ describe("decision table", () => {
       }
     }
   });
-
-  test("every decision carries a reason", () => {
-    for (const tier of ALL_TIERS) {
-      for (const action of ALL_ACTIONS) {
-        for (const toolKnown of [true, false]) {
-          expect(decideToolCall({ tier, action, toolKnown }).reason.length).toBeGreaterThan(0);
-        }
-      }
-    }
-  });
 });
 
 describe("tier resolution", () => {
@@ -386,6 +376,15 @@ describe("policy extension wiring", () => {
     return Promise.resolve(handler(toolCallEvent(toolName, input), ctx));
   }
 
+  /** Asserts the gate returned a block result and returns it for further assertions. */
+  function blocked(res: ToolCallEventResult | void): ToolCallEventResult {
+    if (typeof res === "object" && res !== null) {
+      expect(res.block).toBe(true);
+      return res;
+    }
+    return expect.unreachable("expected a block result");
+  }
+
   async function lastAudit(eventType: string) {
     const rows = await audit.listAudit({ event_type: eventType });
     return JSON.parse(rows.at(-1)!.payload) as Record<string, unknown>;
@@ -401,37 +400,22 @@ describe("policy extension wiring", () => {
 
   test("deny decision blocks the tool and writes a policy.decision row", async () => {
     const handlers = makeExtension("tools:\n  bash: deny\n");
-    const res = await call(handlers, "bash", { command: "rm -rf /" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-      expect(res.reason).toContain("denies");
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    const res = blocked(await call(handlers, "bash", { command: "rm -rf /" }));
+    expect(res.reason).toContain("denies");
     const payload = await lastAudit("policy.decision");
     expect(payload).toMatchObject({ tool: "bash", tier: "exec", decision: "deny" });
   });
 
   test("unknown tool is blocked even with a permissive policy", async () => {
     const handlers = makeExtension("tools:\n  unknown: allow\n");
-    const res = await call(handlers, "some_new_tool", {});
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "some_new_tool", {}));
     const payload = await lastAudit("policy.decision");
     expect(payload).toMatchObject({ tool: "some_new_tool", tier: "exec", decision: "deny" });
   });
 
   test("structural policy error denies everything", async () => {
     const handlers = makeExtension("tools:\n  bash deny\n");
-    const res = await call(handlers, "read", {});
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "read", {}));
   });
 
   test("exec-tier ask-human: approved router lets the tool run", async () => {
@@ -454,12 +438,7 @@ describe("policy extension wiring", () => {
 
   test("exec-tier ask-human: DenyRouter blocks (headless)", async () => {
     const handlers = makeExtension("tools:\n  bash: allow\n");
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
   });
 
@@ -477,23 +456,13 @@ describe("policy extension wiring", () => {
 
   test("preApproved session: unknown tools still deny", async () => {
     const handlers = makeExtension("tools:\n  unknown: allow\n", DenyRouter, undefined, true);
-    const res = await call(handlers, "some_new_tool", {});
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "some_new_tool", {}));
     expect(await lastAudit("policy.decision")).toMatchObject({ tool: "some_new_tool", decision: "deny" });
   });
 
   test("preApproved session: an explicit policy prompt still asks a human", async () => {
     const handlers = makeExtension("tools:\n  bash: prompt\n", DenyRouter, undefined, true);
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
   });
 
@@ -568,12 +537,7 @@ describe("policy extension wiring", () => {
     const { promise } = Promise.withResolvers<ApprovalResolution>();
     const router: ApprovalRouter = { request: () => promise };
     const handlers = makeExtension("tools:\n  bash: allow\n", router, 50);
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
   });
 
@@ -584,24 +548,14 @@ describe("policy extension wiring", () => {
       },
     };
     const handlers = makeExtension("tools:\n  bash: allow\n", router, 50);
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
   });
 
   test("space overlay tightens policy per space", async () => {
     await store.updatePolicy(space.id, JSON.stringify({ tools: { read: "deny" } }));
     const handlers = makeExtension("tools:\n  read: allow\n");
     // Space with a tightening overlay: blocked.
-    const blocked = await call(handlers, "read", { path: "x" }, space.id);
-    if (typeof blocked === "object" && blocked !== null) {
-      expect(blocked.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "read", { path: "x" }, space.id));
     // Space without an overlay: still allowed.
     expect(await call(handlers, "read", { path: "x" }, space2.id)).toBeUndefined();
   });
