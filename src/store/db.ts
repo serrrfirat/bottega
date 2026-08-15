@@ -74,7 +74,14 @@ export interface Store {
   }): Promise<Space>;
   getSpace(id: string): Promise<Space | null>;
   updatePolicy(id: string, policyJson: string): Promise<Space>;
-  createWorkItem(input: { space_id: string; requester: string; description: string; repo?: string }): Promise<WorkItem>;
+  createWorkItem(input: {
+    space_id: string;
+    requester: string;
+    description: string;
+    repo?: string;
+    /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
+    evidence?: Array<{ kind: string; url: string }>;
+  }): Promise<WorkItem>;
   /** Atomic open -> claimed: UPDATE ... WHERE id = (oldest open). Null when queue is empty. */
   claimNextWorkItem(): Promise<WorkItem | null>;
   /** Throws unless the row exists and is in `from`. */
@@ -189,13 +196,24 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     requester: string;
     description: string;
     repo?: string;
+    /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
+    evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     db.query(
       `INSERT INTO work_items (id, space_id, requester, description, repo, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'open', '[]', '[]', NULL, ?, ?)`,
-    ).run(id, input.space_id, input.requester, input.description, input.repo ?? null, t, t);
+       VALUES (?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
+    ).run(
+      id,
+      input.space_id,
+      input.requester,
+      input.description,
+      input.repo ?? null,
+      JSON.stringify((input.evidence ?? []).map((e) => ({ ...e, at: t }))),
+      t,
+      t,
+    );
     const item = getWorkItemStmt.get(id) as WorkItem;
     appendAudit({
       space_id: input.space_id,

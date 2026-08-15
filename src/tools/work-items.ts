@@ -23,6 +23,22 @@ export interface WorkItemsExtensionOpts {
   orgPolicy: PolicyConfig;
 }
 
+/**
+ * Extracts a GitHub issue reference from free text (issue #48): the repo and
+ * issue number come straight from the URL, so pickup is deterministic instead
+ * of left to whatever the model happens to notice. Accepts http(s) or bare
+ * github.com/... forms, a trailing slash, and query params, embedded anywhere
+ * in the text. PR links are NOT issue links and return null (v1: they stay in
+ * the description as context).
+ */
+export function parseGithubIssueUrl(text: string): { owner: string; repo: string; issueNumber: number } | null {
+  const match = text.match(
+    /(?:^|[^A-Za-z0-9_-])github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/issues\/(\d+)/,
+  );
+  if (!match) return null;
+  return { owner: match[1]!, repo: match[2]!, issueNumber: Number(match[3]!) };
+}
+
 export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): ExtensionFactory {
   const actor = opts.actor ?? "agent";
   const createSchema = z.object({
@@ -38,9 +54,11 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
       description:
         "Creates a work item in the space's queue (state: open) that an executor agent can pick up and " +
         "work autonomously. Use it when asked to handle something (e.g. \"@agent handle this\"). " +
+        "GitHub issue-URL pickup: when the user shares a GitHub issue URL, derive the repo and issue " +
+        "number from the URL and include them; the link is recorded as evidence. " +
         "The optional `repo` (\"owner/repo\") names the repository the task lives in — derive it from the " +
-        "conversation or org memory (e.g. \"fix the flaky checkout in bottega\" → repo \"acme/bottega\"); " +
-        "omit it when the conversation does not say, and the executor will block asking the requester. " +
+        "URL or the conversation (e.g. \"fix the flaky checkout in bottega\" → repo \"acme/bottega\"); " +
+        "omit it when neither says, and the executor will block asking the requester. " +
         "The executor only ever pushes to repos on the configured allowlist (config/org.yml or EXECUTOR_REPOS). " +
         "Requires human approval (exec-tier tool).",
       parameters: createSchema,
@@ -52,11 +70,27 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
         }
         const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
         if (!spaceId) return toolError("work items require a space session");
+
+        // Issue-URL pickup (#48): a parseable GitHub issue URL in the
+        // description is the source of truth for the repo + issue number.
+        // The canonical URL is guaranteed present in the description, the
+        // link is recorded as evidence, and the repo is derived into the
+        // repo column unless the caller provided one explicitly.
+        let description = params.description;
+        let evidence: Array<{ kind: string; url: string }> | undefined;
+        const parsed = parseGithubIssueUrl(description);
+        if (parsed) {
+          const canonical = `https://github.com/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`;
+          if (!description.includes(canonical)) description = `${description.trimEnd()}\n${canonical}`;
+          evidence = [{ kind: "issue_url", url: canonical }];
+        }
+
         const item = await store.createWorkItem({
           space_id: spaceId,
           requester: params.requester ?? actor,
-          description: params.description,
-          repo: params.repo?.trim() || undefined,
+          description,
+          evidence,
+          repo: params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined),
         });
         return {
           content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],

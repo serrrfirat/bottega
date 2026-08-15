@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
 import { defaultPolicy } from "../policy/config";
-import { workItemsExtension } from "./work-items";
+import { parseGithubIssueUrl, workItemsExtension } from "./work-items";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-tools-"));
 const stores: Store[] = [];
@@ -47,6 +47,55 @@ describe("workItemsExtension registration", () => {
       expect(t.parameters).toBeDefined();
       expect(t.approval).toBe("exec");
     }
+  });
+});
+
+describe("parseGithubIssueUrl", () => {
+  test("extracts owner, repo, and issue number from a plain URL", () => {
+    expect(parseGithubIssueUrl("https://github.com/acme/bottega/issues/42")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 42,
+    });
+  });
+
+  test("tolerates a trailing slash, query params, http, and a bare host", () => {
+    expect(parseGithubIssueUrl("https://github.com/acme/bottega/issues/42/")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 42,
+    });
+    expect(parseGithubIssueUrl("https://github.com/acme/bottega/issues/42?ref=123&x=1")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 42,
+    });
+    expect(parseGithubIssueUrl("http://github.com/acme/bottega/issues/7")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 7,
+    });
+    expect(parseGithubIssueUrl("github.com/acme/bottega/issues/1")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 1,
+    });
+  });
+
+  test("finds a URL embedded in surrounding text", () => {
+    expect(parseGithubIssueUrl("Fix the flaky checkout https://github.com/acme/bottega/issues/42 please")).toEqual({
+      owner: "acme",
+      repo: "bottega",
+      issueNumber: 42,
+    });
+  });
+
+  test("rejects non-GitHub hosts, PR links, and URL-free text", () => {
+    expect(parseGithubIssueUrl("https://example.com/acme/bottega/issues/42")).toBeNull();
+    expect(parseGithubIssueUrl("https://github.com/acme/bottega/pull/42")).toBeNull();
+    expect(parseGithubIssueUrl("https://notgithub.com/acme/bottega/issues/42")).toBeNull();
+    expect(parseGithubIssueUrl("just some words")).toBeNull();
+    expect(parseGithubIssueUrl("")).toBeNull();
   });
 });
 
@@ -134,6 +183,87 @@ describe("create_work_item", () => {
     );
     expect(res.isError).toBe(true);
     expect(resultText(res)).toContain("non-empty");
+  });
+
+  test("derives repo, canonical URL, and evidence from a shared issue URL (issue #48)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T2B" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "Fix the flaky checkout http://github.com/acme/bottega/issues/42" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.repo).toBe("acme/bottega");
+    expect(item?.description).toBe(
+      "Fix the flaky checkout http://github.com/acme/bottega/issues/42\nhttps://github.com/acme/bottega/issues/42",
+    );
+    expect(JSON.parse(item!.evidence)).toEqual([
+      { kind: "issue_url", url: "https://github.com/acme/bottega/issues/42", at: expect.any(Number) },
+    ]);
+  });
+
+  test("explicit repo wins over the repo derived from an issue URL", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T2E" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      {
+        description: "Fix the flaky checkout https://github.com/acme/bottega/issues/42",
+        repo: "other/org",
+      },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.repo).toBe("other/org");
+    expect(item?.description).toContain("https://github.com/acme/bottega/issues/42");
+    expect(JSON.parse(item!.evidence)).toEqual([
+      { kind: "issue_url", url: "https://github.com/acme/bottega/issues/42", at: expect.any(Number) },
+    ]);
+  });
+
+  test("keeps the description untouched when it already carries the canonical URL (incl. variants)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T2C" });
+    const [createTool] = loadTools(s);
+    for (const description of [
+      "fix https://github.com/acme/bottega/issues/42",
+      "fix https://github.com/acme/bottega/issues/42?ref=sharing",
+      "fix https://github.com/acme/bottega/issues/42/",
+    ]) {
+      const res = await createTool.execute("tc1", { description }, undefined, undefined, ctxFor(space.id));
+      expect(res.isError).not.toBe(true);
+      const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+      expect(item?.description).toBe(description);
+      expect(JSON.parse(item!.evidence)).toEqual([
+        { kind: "issue_url", url: "https://github.com/acme/bottega/issues/42", at: expect.any(Number) },
+      ]);
+    }
+  });
+
+  test("leaves the item unchanged when the description has no GitHub issue URL", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T2D" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "ship the queue, see https://example.com/tickets/1" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.description).toBe("ship the queue, see https://example.com/tickets/1");
+    expect(item?.evidence).toBe("[]");
   });
 
   test("fails without a space session and on an empty description", async () => {
