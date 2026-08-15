@@ -82,6 +82,8 @@ export interface Store {
   markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
+  /** The underlying Database handle — memory providers share this file (#20). */
+  getDb(): Database;
   close(): void;
 }
 
@@ -315,6 +317,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     markStaleWorkItems,
     appendAudit,
     listAudit,
+    getDb: () => db,
     close: () => db.close(),
   };
 }
