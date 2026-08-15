@@ -10,6 +10,12 @@
 # (set in .env or via the Keychain dev loader). The key value never appears
 # in this file, agent config, or transcripts.
 providers:
+  # Primary model (issue #37): deepseek-v4-flash via the built-in opencode-go
+  # provider. Key from env/Keychain (service: bottega-opencode).
+  opencode-go:
+    apiKey: OPENCODE_API_KEY
+  # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key
+  # is configured.
   near:
     api: openai-completions
     baseUrl: "https://cloud-api.near.ai/v1"

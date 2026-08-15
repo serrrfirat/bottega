@@ -24,4 +24,11 @@ if [[ -z "${NEAR_API_KEY:-}" ]] && command -v security >/dev/null 2>&1; then
   fi
 fi
 
+if [[ -z "${OPENCODE_API_KEY:-}" ]] && command -v security >/dev/null 2>&1; then
+  if KEY="$(security find-generic-password -s bottega-opencode -w 2>/dev/null)"; then
+    export OPENCODE_API_KEY="$KEY"
+    echo "OPENCODE_API_KEY loaded from Keychain (service: bottega-opencode)"
+  fi
+fi
+
 exec bun run ${1:+--watch} src/server/index.ts
