@@ -429,6 +429,13 @@ describe("mem0 docker leg (skip-gated)", () => {
         console.log(`[mem0 docker leg] SKIP: ${reason}`);
       };
 
+      // 0. Integration legs are opt-in (issue #41): the default CI run stays
+      //    hermetic + unit only; set BOTTEGA_RUN_INTEGRATION=1 to enable.
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run");
+        return;
+      }
+
       // 1. Docker daemon present?
       const docker = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], {
         timeout: 10_000,

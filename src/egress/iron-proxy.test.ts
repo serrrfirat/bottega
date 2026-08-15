@@ -40,6 +40,13 @@ describe("iron-proxy integration leg (skip-gated)", () => {
         console.log(`[iron-proxy leg] SKIP: ${reason}`);
       };
 
+      // 0. Integration legs are opt-in (issue #41): the default CI run stays
+      //    hermetic + unit only; set BOTTEGA_RUN_INTEGRATION=1 to enable.
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run");
+        return;
+      }
+
       // 1. Allowlist domains straight from the deployment contract
       //    (config/egress.yml) so the leg tracks the real policy.
       const egressCfg = parseYamlSubset(readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"));
