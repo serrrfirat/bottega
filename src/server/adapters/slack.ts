@@ -1,4 +1,4 @@
-import { App, type AppOptions } from "@slack/bolt";
+import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
 // a call-time property read, so patching the exports object is effective).
@@ -132,10 +132,20 @@ export function createSlackAdapter(opts: {
    */
   clientOptions?: AppOptions["clientOptions"];
 }): SlackAdapter {
+  // Bolt's default socket-mode wiring pings Slack from the client every
+  // ~1.6s and disconnects after 4 unanswered pings (monitorPingToSlack).
+  // Under Bun, Slack's Socket Mode server never pongs our client pings, so
+  // that monitor always kills the connection ~7s after (re)connect. Use an
+  // explicit receiver with a 24h clientPingTimeout — the client-ping monitor
+  // effectively never fires. Health checking continues via Bolt's
+  // server-ping monitor (Slack pings us; Bun auto-pongs).
+  const receiver = new SocketModeReceiver({
+    appToken: opts.appToken,
+    clientPingTimeout: 24 * 60 * 60 * 1000,
+  });
   const app = new App({
     token: opts.botToken,
-    appToken: opts.appToken,
-    socketMode: true,
+    receiver,
     // Bolt fires an unawaited auth.test at construction when this is on (the
     // token-verification default), leaving an unhandled rejection if the
     // token is bad. Socket-mode connect still authenticates via the app
