@@ -92,6 +92,10 @@ rule below conflicts with a rule above, the user's explicit instructions win
    create or update an issue on `serrrfirat/bottega` so humans can follow
    along. Reference the issue in the commit message (`#N`) and close it with a
    completion comment when the work ships.
+2. **Issues found during chat are dispatched immediately.** When a bug or
+   problem surfaces in conversation (not from a plan), create the issue AND
+   start a task subagent in its own worktree to fix it right away — the main
+   agent does not fix chat-discovered issues itself.
 2. **Ship to `main` directly** — no PRs (tried, user changed the workflow).
    Push with `git push origin <branch>:main` after `git pull --rebase origin
    main` (retry rebase up to 3x on rejection).
