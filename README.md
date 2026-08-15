@@ -125,7 +125,7 @@ sequenceDiagram
     A->>S: validated {space, principal, text}
     S->>S: agent session (driver): steer or prompt
     S->>A: reply streams to the channel
-    H->>A: "@agent take this" (or agent decides, pickup.auto)
+    H->>A: "@agent take this" (pickup is explicit)
     A->>S: create_work_item (exec tier)
     S->>P: ask-human → H approves (v1: anyone in channel)
     P->>S: approved → work item open
@@ -306,8 +306,8 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 
 ## Known limitations (v1)
 
-- **No auto-pickup by default** — the space agent picks up work items only
-  on an explicit tool call (`pickup.auto` policy flag is off by default).
+- **No auto-pickup** — the space agent creates work items only on an
+  explicit tool call; there is no auto-pickup policy flag.
 - **Approvals** — anyone in the channel can approve; there is no role model
   yet. The delivery approval button round-trip (the human's decision
   resolving `working → review → done`) is a follow-up: today the server
