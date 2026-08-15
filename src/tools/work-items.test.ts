@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
+import { defaultPolicy } from "../policy/config";
 import { workItemsExtension } from "./work-items";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-tools-"));
@@ -22,7 +23,7 @@ afterAll(() => {
 function loadTools(store: Store, opts?: { actor?: string }): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
-  workItemsExtension(store, opts)(pi);
+  workItemsExtension(store, { orgPolicy: defaultPolicy(), ...opts })(pi);
   return tools;
 }
 

@@ -107,7 +107,7 @@ approvals:
     expect(p.unknownAction).toBe("deny");
     expect(p.timeoutMinutes).toBe(7);
     expect(p.requiredApprovers).toBe(2);
-    expect(p.pickupAuto).toBe(false);
+    expect(p.approvers).toEqual([]);
     expect(p.errors).toEqual([]);
   });
 
@@ -203,12 +203,15 @@ describe("space overlay", () => {
     expect(applySpaceOverlay(org, "   ")).toBe(org);
   });
 
-  test("overlay pickup.auto is parsed", () => {
+  test("overlay approvers is parsed and replaces the org floor default", () => {
     const org = parseOrgConfigYaml("");
-    expect(org.pickupAuto).toBe(false);
-    expect(applySpaceOverlay(org, JSON.stringify({ pickup: { auto: true } })).pickupAuto).toBe(true);
-    // Non-boolean pickup.auto is a structural error → deny everything.
-    expect(applySpaceOverlay(org, JSON.stringify({ pickup: { auto: "yes" } })).ok).toBe(false);
+    expect(org.approvers).toEqual([]);
+    const p = applySpaceOverlay(org, JSON.stringify({ approvers: ["U1", "U2"] }));
+    expect(p.ok).toBe(true);
+    expect(p.approvers).toEqual(["U1", "U2"]);
+    // Malformed approvers is a structural error → deny everything for the space.
+    expect(applySpaceOverlay(org, JSON.stringify({ approvers: "U1" })).ok).toBe(false);
+    expect(applySpaceOverlay(org, JSON.stringify({ approvers: [1] })).ok).toBe(false);
   });
 });
 

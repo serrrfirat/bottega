@@ -21,9 +21,9 @@ import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "./approval-router";
 import {
-  applySpaceOverlay,
   decideToolCall,
   isKnownTool,
+  loadSpacePolicy,
   resolveTier,
   toolAction,
   type Decision,
@@ -68,7 +68,7 @@ async function gateToolCall(
 ): Promise<ToolCallEventResult | void> {
   try {
     const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-    const policy = await policyFor(deps, spaceId);
+    const policy = await loadSpacePolicy(deps.orgPolicy, deps.store, spaceId);
     const tool = event.toolName;
     const tier = resolveTier(tool);
     const { decision, reason } = decide(policy, tool, tier, deps.preApproved ?? false);
@@ -113,12 +113,6 @@ function decide(
     return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)" };
   }
   return decideToolCall({ tier, action, toolKnown: isKnownTool(tool) });
-}
-
-async function policyFor(deps: PolicyExtensionDeps, spaceId: string | undefined): Promise<PolicyConfig> {
-  if (!spaceId) return deps.orgPolicy;
-  const space = await deps.store.getSpace(spaceId);
-  return applySpaceOverlay(deps.orgPolicy, space?.policy_json ?? "");
 }
 
 async function requestApproval(

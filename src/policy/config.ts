@@ -15,6 +15,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Store } from "../store/db";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 export type Tier = "read" | "write" | "exec";
@@ -57,8 +58,8 @@ export interface PolicyConfig {
   timeoutMinutes: number;
   /** Approvers required for org-level changes (consumed by the Slack router, later issue). */
   requiredApprovers: number;
-  /** `pickup.auto` flag (work-item pickup, later issue). */
-  pickupAuto: boolean;
+  /** Space approvers (issue #33): the overlay's `approvers` list; org floor default is none. */
+  approvers: string[];
   errors: string[];
   warnings: string[];
 }
@@ -70,7 +71,7 @@ export function defaultPolicy(): PolicyConfig {
     unknownAction: DEFAULT_UNKNOWN_ACTION,
     timeoutMinutes: DEFAULT_TIMEOUT_MINUTES,
     requiredApprovers: DEFAULT_REQUIRED_APPROVERS,
-    pickupAuto: false,
+    approvers: [],
     errors: [],
     warnings: [],
   };
@@ -261,19 +262,28 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
     }
   }
 
-  const pickupEntry = overlay["pickup"];
-  if (pickupEntry !== undefined) {
-    if (
-      typeof pickupEntry !== "object" ||
-      pickupEntry === null ||
-      Array.isArray(pickupEntry) ||
-      !("auto" in pickupEntry) ||
-      typeof pickupEntry.auto !== "boolean"
-    ) {
-      return structuralError(defaultPolicy(), "spaces.policy_json: pickup.auto must be a boolean");
+  const approversEntry = overlay["approvers"];
+  if (approversEntry !== undefined) {
+    if (!Array.isArray(approversEntry) || approversEntry.some((a) => typeof a !== "string")) {
+      return structuralError(defaultPolicy(), "spaces.policy_json: approvers must be an array of strings");
     }
-    out.pickupAuto = pickupEntry.auto;
+    out.approvers = [...approversEntry];
   }
 
   return out;
+}
+
+/**
+ * The effective policy for a space session: the org floor with the space's
+ * `spaces.policy_json` overlay applied. Shared by the policy gate and the
+ * work-item tools so both read the same per-space policy (issue #33).
+ */
+export async function loadSpacePolicy(
+  org: PolicyConfig,
+  store: Pick<Store, "getSpace">,
+  spaceId: string | undefined,
+): Promise<PolicyConfig> {
+  if (!spaceId) return org;
+  const space = await store.getSpace(spaceId);
+  return applySpaceOverlay(org, space?.policy_json ?? "");
 }

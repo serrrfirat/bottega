@@ -48,7 +48,7 @@ export function main(): BottegaServer {
     agentDir: OMP_AGENT_DIR,
     extensions: [
       createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
-      workItemsExtension(store),
+      workItemsExtension(store, { orgPolicy }),
       // Memory tools (issue #22): the SQLite provider shares the store's
       // database handle; every save is audited via the policy audit module.
       memoryToolsExtension(createSqliteMemoryProvider(store.getDb()), { audit }),
