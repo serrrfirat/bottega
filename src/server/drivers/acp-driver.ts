@@ -2,6 +2,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import type { AuditModule } from "../../policy/audit";
+import type { ApprovalRouter } from "../../policy/approval-router";
+import { evaluatePolicyGate } from "../../policy/gate";
+import type { PolicyConfig } from "../../policy/config";
 import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions, type DriverEvent } from "./agent-driver";
 
 /**
@@ -14,9 +18,17 @@ import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTur
  * then session/prompt turns streamed as session/update notifications, with
  * session/cancel for aborts and session/close on dispose.
  *
- * Permission requests and other client-gated inbound methods (fs/*,
- * terminal/*, elicitation/*) are answered with JSON-RPC method-not-found —
- * transport only; policy routing is issue #6.
+ * Inbound `session/request_permission` requests are the ACP policy seam
+ * (issue #26): with a {@link AcpPolicyContext} configured, each request is
+ * evaluated against the same policy table the in-process OMP extension uses
+ * (tier × org config + space overlay → allow | deny | ask-human; ask-human
+ * routes through the configured ApprovalRouter) and answered with ACP's
+ * permission response shape (`outcome: selected` with an allow/reject
+ * option id). Every decision is audited (`policy.decision`; ask-human also
+ * `approval.requested`/`approval.resolved`). Unknown tools deny — fail
+ * closed. Without a policy context the driver stays transport-only and
+ * answers method-not-found (nothing can run), as does every other
+ * client-gated inbound method (fs/*, terminal/*, elicitation/*).
  */
 export interface AcpMcpServerEntry {
   /** Advertised to the agent; becomes the MCP tool prefix (e.g. `bottega`). */
@@ -26,6 +38,31 @@ export interface AcpMcpServerEntry {
   args?: string[];
   /** Extra env for the spawned MCP server process (BOTTEGA_DB_PATH, ...). */
   env?: Record<string, string>;
+}
+
+/**
+ * Policy context for ACP sessions (issue #26): wires the driver's
+ * `session/request_permission` handler to the same policy engine the
+ * in-process OMP extension uses. Without it, permission requests answer
+ * method-not-found (transport only — no tool can run).
+ */
+export interface AcpPolicyContext {
+  /** Org floor; the fallback policy when no per-space resolver is given. */
+  orgPolicy: PolicyConfig;
+  /**
+   * Resolves the effective policy for a space (org floor + the space's
+   * `spaces.policy_json` overlay). Defaults to the org floor for every
+   * space.
+   */
+  loadPolicy?: (spaceId: string | undefined) => Promise<PolicyConfig>;
+  /** Audit trail; every decision writes `policy.decision` rows. */
+  audit: AuditModule;
+  /** ask-human routing (DenyRouter in headless contexts). */
+  router: ApprovalRouter;
+  /** Actor recorded on audit rows; defaults to "agent". */
+  actor?: string;
+  /** Ask-human timeout in ms; defaults to the policy's `approvals.timeout_minutes`. */
+  timeoutMs?: number;
 }
 
 export interface AcpDriverOptions {
@@ -44,6 +81,13 @@ export interface AcpDriverOptions {
    * Default: [] — omp crashes on a missing field (issue #18).
    */
   mcpServers?: AcpMcpServerEntry[];
+  /**
+   * Policy context for the `session/request_permission` seam (issue #26).
+   * When set, inbound permission requests are evaluated against the shared
+   * policy table with audit; when unset they answer method-not-found
+   * (transport only — nothing can run).
+   */
+  policy?: AcpPolicyContext;
 }
 
 export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
@@ -53,7 +97,7 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
   return {
     async createSession({ spaceId, transcriptDir, onOutput }) {
       mkdirSync(transcriptDir, { recursive: true });
-      const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput, mcpServers: opts.mcpServers });
+      const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput, mcpServers: opts.mcpServers, policy: opts.policy });
       await session.start();
       return session;
     },
@@ -79,6 +123,86 @@ function toEnvPairs(env: Record<string, string>): Array<{ name: string; value: s
   }
   return Object.entries({ ...env, ...absolutize }).map(([name, value]) => ({ name, value }));
 }
+
+/** The ACP v1 toolCall carried by session/request_permission (issue #26). */
+interface AcpToolCall {
+  kind?: unknown;
+  rawInput?: unknown;
+}
+
+/**
+ * Maps an ACP toolCall to the policy table's tool names. MCP tools surface
+ * as xdev paths (`xd://mcp__<server>_<tool>` with dots underscore-encoded,
+ * e.g. `xd://mcp__bottega_memory_save` → `memory.save`); built-in calls
+ * carry only a ToolKind (read/search/fetch/edit/execute/...), so each kind
+ * maps to the bottega tool that best matches its capability tier — a
+ * documented approximation of the OMP path's exact tool names, because ACP
+ * gives allow/deny only (issue #26). Unmappable kinds return null and the
+ * caller's raw kind name reaches the table, which denies it (fail closed).
+ */
+function toolNameFromAcpToolCall(toolCall: AcpToolCall | null | undefined): string | null {
+  const rawInput = toolCall?.rawInput;
+  const path = typeof rawInput === "object" && rawInput !== null ? (rawInput as Record<string, unknown>).path : undefined;
+  if (typeof path === "string" && path.startsWith("xd://mcp__")) {
+    const rest = path.slice("xd://mcp__".length);
+    const sep = rest.indexOf("_");
+    return sep > 0 ? rest.slice(sep + 1).replaceAll("_", ".") : null;
+  }
+  switch (toolCall?.kind) {
+    case "read":
+      return "read";
+    case "search":
+      return "grep"; // read-tier search representative (grep/glob/ast_grep)
+    case "fetch":
+      return "web_search";
+    case "edit":
+    case "delete":
+    case "move": // write-tier file mutations share the edit policy name
+      return "edit";
+    case "execute":
+      return "bash";
+    default:
+      return null; // think/other/unknown → deny
+  }
+}
+
+/** Args for the audit row: the rawInput, or the parsed MCP `content` JSON. */
+function acpToolCallArgs(toolCall: AcpToolCall | null | undefined): unknown {
+  const rawInput = toolCall?.rawInput;
+  if (typeof rawInput === "object" && rawInput !== null) {
+    const content = (rawInput as Record<string, unknown>).content;
+    if (typeof content === "string") {
+      try {
+        return JSON.parse(content);
+      } catch {
+        // Not JSON; fall through to the raw shape.
+      }
+    }
+  }
+  return rawInput;
+}
+
+/**
+ * The optionId to answer with: prefer the agent-offered allow_once /
+ * reject_once, else the first allow-kind/reject-kind option, else the
+ * literal id (a conforming client should pick an offered option; the
+ * fallback keeps the response valid for peers that send none).
+ */
+function pickPermissionOptionId(options: unknown, allow: boolean): string {
+  const wanted = allow ? "allow_once" : "reject_once";
+  const kindPrefix = allow ? "allow" : "reject";
+  if (Array.isArray(options)) {
+    for (const option of options) {
+      const id = (option as { optionId?: unknown } | null)?.optionId;
+      if (id === wanted) return String(id);
+    }
+    for (const option of options) {
+      const id = (option as { optionId?: unknown } | null)?.optionId;
+      if (typeof id === "string" && id.startsWith(kindPrefix)) return id;
+    }
+  }
+  return wanted;
+}
 interface PendingRequest {
   method: string;
   resolve: (result: unknown) => void;
@@ -92,6 +216,8 @@ class AcpSessionDriver implements AgentSessionDriver {
   readonly #sessionTimeoutMs: number;
   readonly #onOutput: (spaceId: string, text: string) => void;
   readonly #emitter = createEmitter<DriverEvent>();
+  /** Policy context for session/request_permission; null = transport-only. */
+  readonly #policy: AcpPolicyContext | null;
   /** ACP-shaped mcpServers entries (session/new payload), space id injected. */
   readonly #mcpServers: Array<{
     name: string;
@@ -121,12 +247,14 @@ class AcpSessionDriver implements AgentSessionDriver {
     sessionTimeoutMs: number;
     onOutput: (spaceId: string, text: string) => void;
     mcpServers?: AcpMcpServerEntry[];
+    policy?: AcpPolicyContext;
   }) {
     this.#spaceId = deps.spaceId;
     this.#command = deps.command;
     this.#args = deps.args;
     this.#sessionTimeoutMs = deps.sessionTimeoutMs;
     this.#onOutput = deps.onOutput;
+    this.#policy = deps.policy ?? null;
     // The MCP server process is spawned by the agent with the session cwd,
     // so the space id is injected per session and path env vars are
     // absolutized here (see toEnvPairs).
@@ -336,9 +464,60 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   /** Requests the agent sends to us (permission, fs, terminal, elicitation, ...). */
   #onInboundRequest(msg: { id: unknown; method: string; params?: unknown }): void {
+    if (msg.method === "session/request_permission") {
+      if (this.#policy) {
+        // Fire and forget: the resolution writes the JSON-RPC response.
+        void this.#resolvePermissionRequest(msg.id, msg.params).catch((err) => {
+          // Fail closed: an internal gate error denies the call.
+          console.error(`[acp-driver] permission gate error (${this.#spaceId}), denying:`, err);
+          this.#answerPermission(msg.id, false, msg.params);
+        });
+        return;
+      }
+      // No policy context: transport-only, nothing can run.
+      console.error(`[acp-driver] unsupported method from agent (${this.#spaceId}): ${msg.method}`);
+      this.#write({ jsonrpc: "2.0", id: msg.id, error: { code: METHOD_NOT_FOUND, message: `method not found: ${msg.method}` } });
+      return;
+    }
     // Transport only: v1 answers method-not-found until policy routing (#6) wires these.
     console.error(`[acp-driver] unsupported method from agent (${this.#spaceId}): ${msg.method}`);
     this.#write({ jsonrpc: "2.0", id: msg.id, error: { code: METHOD_NOT_FOUND, message: `method not found: ${msg.method}` } });
+  }
+
+  // --- session/request_permission (issue #26) ------------------------------
+
+  /** Evaluate one permission request against the shared policy gate and answer. */
+  async #resolvePermissionRequest(id: unknown, params: unknown): Promise<void> {
+    const policy = this.#policy!;
+    const toolCall = (params as { toolCall?: unknown } | null)?.toolCall as AcpToolCall | null | undefined;
+    const tool = toolNameFromAcpToolCall(toolCall);
+    const outcome = await evaluatePolicyGate(
+      {
+        loadPolicy: policy.loadPolicy ?? (async () => policy.orgPolicy),
+        audit: policy.audit,
+        router: policy.router,
+        timeoutMs: policy.timeoutMs,
+      },
+      {
+        tool: tool ?? String((toolCall as { kind?: unknown } | null)?.kind ?? "unknown"),
+        args: acpToolCallArgs(toolCall),
+        spaceId: this.#spaceId,
+        actor: policy.actor ?? "agent",
+      },
+    );
+    this.#answerPermission(id, outcome.allowed, params);
+  }
+
+  /**
+   * ACP's permission response: `outcome: { outcome: "selected", optionId }`
+   * (agentclientprotocol.com/protocol/v1 tool-calls, "Requesting Permission").
+   * The optionId is one the agent offered (allow_once/reject_once preferred,
+   * else the first allow-kind/reject-kind option), falling back to the
+   * literal ids so a peer that omits options still gets a valid response.
+   */
+  #answerPermission(id: unknown, allow: boolean, params: unknown): void {
+    const optionId = pickPermissionOptionId((params as { options?: unknown } | null)?.options, allow);
+    this.#write({ jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId } } });
   }
 
   #onInboundNotification(msg: { method: string; params?: unknown }): void {

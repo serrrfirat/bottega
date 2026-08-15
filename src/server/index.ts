@@ -6,15 +6,17 @@ import { pruneDigestMemories } from "../memory/sqlite";
 import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
-import { loadOrgConfig } from "../policy/config";
+import { loadOrgConfig, loadSpacePolicy } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
+import { createAcpDriver } from "./drivers/acp-driver";
 import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { createSlackAdapter } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import { mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /**
  * Project-local OMP agent dir (issue #9). Per-deployment agent config
@@ -61,8 +63,34 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // until then, exec-tier tool calls are blocked server-side, never run.
   const createDriver =
     opts.createDriver ??
-    ((agentDir: string) =>
-      createOmpSdkDriver({
+    ((agentDir: string) => {
+      // Org config selects the space-agent driver (issue #26): `acp` flips
+      // the space agent to the ACP driver — policy enforced over
+      // session/request_permission with audit, memory tools attached as an
+      // MCP server. Default `omp-sdk` keeps the in-process extensions
+      // (deep interception); the flip is opt-in via config until proven.
+      if (orgPolicy.agentDriver === "acp") {
+        return createAcpDriver({
+          mcpServers: [
+            {
+              name: "bottega",
+              command: process.execPath,
+              args: ["run", fileURLToPath(new URL("../mcp/server.ts", import.meta.url))],
+              env: {
+                BOTTEGA_DB_PATH: process.env.BOTTEGA_DB_PATH ?? "data/bottega.db",
+                BOTTEGA_CONFIG_DIR: process.env.BOTTEGA_CONFIG_DIR ?? process.cwd(),
+              },
+            },
+          ],
+          policy: {
+            orgPolicy,
+            loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+            audit,
+            router: DenyRouter,
+          },
+        });
+      }
+      return createOmpSdkDriver({
         agentDir,
         extensions: [
           createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store }),
@@ -79,7 +107,8 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
           enabled: orgPolicy.memory.injection.enabled,
           maxEntries: orgPolicy.memory.injection.maxEntries,
         },
-      }));
+      });
+    });
   const driver = createDriver(OMP_AGENT_DIR);
   // The adapter routes inbound messages to the service; the service posts
   // replies back through the adapter. Late-bound: no message can arrive

@@ -26,6 +26,10 @@ const logfile = process.argv[3] ?? "";
 //  - noisy:  on session/new, sends an unknown notification and an unknown
 //            inbound request (which a conforming client must answer with
 //            JSON-RPC method-not-found), then behaves like "happy".
+//  - permission: on session/new, sends a session/request_permission in the
+//            real omp acp shape (toolCall + options, issue #26), then
+//            behaves like "happy". argv[4], when given, is JSON overriding
+//            {toolCall, options} so tests exercise the whole tool mapping.
 //  - silent: never responds to anything (exercises client-side timeouts).
 
 function sleep(ms: number): Promise<void> {
@@ -86,6 +90,29 @@ async function handle(msg: { id?: number; method?: string; params?: unknown }): 
           id: 99,
           method: "session/request_permission",
           params: { permissionRequest: { id: "p1", title: "Run command" } },
+        });
+      }
+      if (scenario === "permission") {
+        // Issue #26: the real omp acp request shape (toolCall + options).
+        const override = process.argv[4] ? JSON.parse(process.argv[4]) : {};
+        const toolCall = override.toolCall ?? {
+          toolCallId: "call_01",
+          title: "Run command",
+          kind: "execute",
+          status: "pending",
+          rawInput: { command: "echo hi" },
+        };
+        const options = override.options ?? [
+          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+          { optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+          { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+          { optionId: "reject_always", name: "Always reject", kind: "reject_always" },
+        ];
+        send({
+          jsonrpc: "2.0",
+          id: 99,
+          method: "session/request_permission",
+          params: { sessionId, toolCall, options },
         });
       }
       send({ jsonrpc: "2.0", id, result: { sessionId } });

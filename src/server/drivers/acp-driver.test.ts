@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createAcpDriver, type AcpMcpServerEntry } from "./acp-driver";
+import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-events";
+import { createStore } from "../../store/db";
+import { createAudit, type AuditModule } from "../../policy/audit";
+import { DenyRouter, type ApprovalRouter } from "../../policy/approval-router";
+import { loadSpacePolicy, parseOrgConfigYaml } from "../../policy/config";
+import { createAcpDriver, type AcpMcpServerEntry, type AcpPolicyContext } from "./acp-driver";
 import type { AgentSessionDriver } from "./agent-driver";
 import { SpaceService, type InboundMessage } from "../services/space-service";
 import type { SlackAdapter } from "../adapters/slack";
@@ -26,15 +31,25 @@ interface Harness {
 
 async function launch(
   scenario: string,
-  opts: { sessionTimeoutMs?: number; mcpServers?: AcpMcpServerEntry[] } = {},
+  opts: {
+    sessionTimeoutMs?: number;
+    mcpServers?: AcpMcpServerEntry[];
+    /** Policy context for the session/request_permission handler (issue #26). */
+    policy?: AcpPolicyContext;
+    /** JSON override passed to the fake server's permission scenario. */
+    permissionOverride?: Record<string, unknown>;
+  } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "acp-driver-"));
   const logfile = join(dir, "server.log");
+  const args = [FIXTURE, scenario, logfile];
+  if (opts.permissionOverride) args.push(JSON.stringify(opts.permissionOverride));
   const driver = createAcpDriver({
     command: "bun",
-    args: ["run", FIXTURE, scenario, logfile],
+    args: ["run", ...args],
     sessionTimeoutMs: opts.sessionTimeoutMs ?? 5_000,
     mcpServers: opts.mcpServers,
+    policy: opts.policy,
   });
   const events = { message: [], turn_start: [], turn_end: [], error: [] } as Harness["events"];
   const outputs: string[] = [];
@@ -288,6 +303,198 @@ describe("acp driver", () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // session/request_permission policy seam (issue #26)
+  // -------------------------------------------------------------------------
+
+  interface PolicyHarness {
+    policy: AcpPolicyContext;
+    store: Store;
+    audit: AuditModule;
+    cleanup: () => void;
+    lastAudit: (eventType: string) => Promise<Record<string, unknown>>;
+  }
+
+  function makePolicyHarness(orgYaml: string, opts: { router?: ApprovalRouter } = {}): PolicyHarness {
+    const dir = mkdtempSync(join(tmpdir(), "acp-policy-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const orgPolicy = parseOrgConfigYaml(orgYaml);
+    const policy: AcpPolicyContext = {
+      orgPolicy,
+      loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+      audit,
+      router: opts.router ?? DenyRouter,
+    };
+    const cleanup = () => {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    };
+    const lastAudit = async (eventType: string) => {
+      const rows = await audit.listAudit({ event_type: eventType });
+      return JSON.parse(rows.at(-1)!.payload) as Record<string, unknown>;
+    };
+    return { policy, store, audit, cleanup, lastAudit };
+  }
+
+  describe("acp permission handler", () => {
+    test("allowed tool responds allow_once and audits policy.decision", async () => {
+      const h = makePolicyHarness("tools:\n  read: allow\n");
+      const l = await launch("permission", {
+        policy: h.policy,
+        permissionOverride: { toolCall: { toolCallId: "c1", title: "Read file", kind: "read", rawInput: { path: "/x" } } },
+      });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"allow_once"');
+        const log = readFileSync(l.logfile, "utf8");
+        expect(log).toContain('"outcome":{"outcome":"selected","optionId":"allow_once"');
+        const payload = await h.lastAudit(POLICY_DECISION_EVENT);
+        expect(payload).toMatchObject({ tool: "read", tier: "read", decision: "allow" });
+        expect(payload.args).toContain('"/x"');
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("policy deny responds reject_once and audits the decision", async () => {
+      const h = makePolicyHarness("tools:\n  bash: deny\n");
+      const l = await launch("permission", { policy: h.policy });
+      try {
+        // Default fake request: kind execute → bash.
+        await l.waitForLog('"outcome":"selected","optionId":"reject_once"');
+        const log = readFileSync(l.logfile, "utf8");
+        expect(log).toContain('"outcome":{"outcome":"selected","optionId":"reject_once"');
+        expect(await h.lastAudit(POLICY_DECISION_EVENT)).toMatchObject({ tool: "bash", tier: "exec", decision: "deny" });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("unmappable tool kinds respond reject_once (fail closed)", async () => {
+      const h = makePolicyHarness("tools:\n  unknown: allow\n");
+      const l = await launch("permission", {
+        policy: h.policy,
+        permissionOverride: { toolCall: { toolCallId: "c1", title: "Think", kind: "think", rawInput: {} } },
+      });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"reject_once"');
+        expect(await h.lastAudit(POLICY_DECISION_EVENT)).toMatchObject({ tool: "think", decision: "deny" });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("MCP xdev paths map to the policy tool name (memory.save)", async () => {
+      const h = makePolicyHarness("tools:\n  memory.save: allow\n  unknown: deny\n");
+      const l = await launch("permission", {
+        policy: h.policy,
+        permissionOverride: {
+          toolCall: {
+            toolCallId: "c1",
+            title: "Save memory",
+            kind: "execute",
+            rawInput: { path: "xd://mcp__bottega_memory_save", content: JSON.stringify({ content: "hi", scope: "org" }) },
+          },
+        },
+      });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"allow_once"');
+        const payload = await h.lastAudit(POLICY_DECISION_EVENT);
+        expect(payload).toMatchObject({ tool: "memory.save", tier: "write", decision: "allow" });
+        // The MCP args JSON is parsed so the audit payload matches the OMP path.
+        expect(payload.args).toEqual(JSON.stringify({ content: "hi", scope: "org" }));
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("MCP xdev path for a denied tool responds reject_once", async () => {
+      const h = makePolicyHarness("tools:\n  memory.save: deny\n");
+      const l = await launch("permission", {
+        policy: h.policy,
+        permissionOverride: {
+          toolCall: { toolCallId: "c1", title: "Save", kind: "execute", rawInput: { path: "xd://mcp__bottega_memory_save", content: "{}" } },
+        },
+      });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"reject_once"');
+        expect(await h.lastAudit(POLICY_DECISION_EVENT)).toMatchObject({ tool: "memory.save", decision: "deny" });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("ask-human routes through the router: DenyRouter rejects", async () => {
+      const h = makePolicyHarness("tools:\n  bash: allow\n"); // exec tier → ask-human
+      const l = await launch("permission", { policy: h.policy });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"reject_once"');
+        expect(await h.lastAudit(APPROVAL_REQUESTED_EVENT)).toMatchObject({ tool: "bash" });
+        expect(await h.lastAudit(APPROVAL_RESOLVED_EVENT)).toMatchObject({ approved: false });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("ask-human routes through the router: an approving router allows", async () => {
+      const router: ApprovalRouter = { request: async () => ({ approved: true, approver: "U1" }) };
+      const h = makePolicyHarness("tools:\n  bash: allow\n", { router });
+      const l = await launch("permission", { policy: h.policy });
+      try {
+        await l.waitForLog('"outcome":"selected","optionId":"allow_once"');
+        expect(await h.lastAudit(APPROVAL_RESOLVED_EVENT)).toMatchObject({ approved: true, approver: "U1" });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("space overlay tightens the ACP permission path per space", async () => {
+      const h = makePolicyHarness("tools:\n  read: allow\n");
+      const space = await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      await h.store.updatePolicy(space.id, JSON.stringify({ tools: { read: "deny" } }));
+      const l = await launch("permission", {
+        policy: h.policy,
+        permissionOverride: { toolCall: { toolCallId: "c1", title: "Read", kind: "read", rawInput: { path: "/x" } } },
+      });
+      try {
+        // The harness session runs in space slack:C1, which now denies read.
+        await l.waitForLog('"outcome":"selected","optionId":"reject_once"');
+        expect(await h.lastAudit(POLICY_DECISION_EVENT)).toMatchObject({ tool: "read", decision: "deny" });
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+        h.cleanup();
+      }
+    });
+
+    test("request_permission without a policy context answers method-not-found", async () => {
+      const l = await launch("permission");
+      try {
+        await l.waitForLog('"code":-32601');
+        const log = readFileSync(l.logfile, "utf8");
+        expect(log).toContain('"method":"session/request_permission"');
+        expect(log).toContain('"error":{"code":-32601');
+      } finally {
+        await l.session.dispose();
+        l.cleanup();
+      }
+    });
+  });
+
   test("real omp acp: initialize + session/new + session/close (skips when omp is unavailable)", async () => {
     // Interop smoke test against the real `omp acp` binary (issue #18).
     // No prompt is ever sent — only the handshake, session/new, and
@@ -315,4 +522,63 @@ describe("acp driver", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("real omp acp: permission round-trip enforces policy (skips when omp is unavailable)", async () => {
+    // A real model turn with a tool call takes far longer than the default
+    // 5s bun:test budget; the driver's own request timeout (120s) bounds it.
+    // Interop test (issue #26): with a policy context wired, a real `omp acp`
+    // session must enforce policy over session/request_permission. The agent
+    // is prompted to run one bash command; omp asks permission; the driver
+    // evaluates the policy (bash: allow → ask-human → DenyRouter) and answers
+    // the ACP permission response; the turn completes. The audit trail is the
+    // wire proof. When omp auto-approves instead — no permission request ever
+    // arrives — there is nothing to enforce (the documented failure path:
+    // the engine's own permission config short-circuits the policy seam) and
+    // the leg skips with a message, like the handshake test above.
+    const dir = mkdtempSync(join(tmpdir(), "acp-real-perm-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const orgPolicy = parseOrgConfigYaml("tools:\n  bash: allow\n  unknown: deny\n");
+    const driver = createAcpDriver({
+      sessionTimeoutMs: 120_000,
+      policy: {
+        orgPolicy,
+        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+        audit,
+        router: DenyRouter,
+      },
+    });
+    let session: AgentSessionDriver | null = null;
+    let turnFailed = false;
+    try {
+      session = await driver.createSession({
+        spaceId: "real-omp-perm",
+        transcriptDir: join(dir, "sessions"),
+        onOutput: () => {},
+      });
+      await session.prompt("Run the bash command: echo acp-permission-roundtrip. Use the bash tool.");
+    } catch (err) {
+      turnFailed = true;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`SKIP real-omp permission test: omp acp unavailable or turn failed (${msg})`);
+    } finally {
+      await session?.dispose().catch(() => {});
+    }
+    // The assertions below are real expectations, not skip conditions: a
+    // completed turn with no permission request is the documented failure
+    // path (omp's own permission config auto-approved — nothing to enforce).
+    if (!turnFailed) {
+      const decisions = await audit.listAudit({ event_type: POLICY_DECISION_EVENT });
+      if (decisions.length === 0) {
+        console.log("SKIP real-omp permission leg: no session/request_permission arrived (omp auto-approved) — nothing to enforce");
+      } else {
+        // bash: allow → exec tier → ask-human; DenyRouter resolves it.
+        expect(JSON.parse(decisions.at(-1)!.payload)).toMatchObject({ tool: "bash", tier: "exec", decision: "ask-human" });
+        const resolved = await audit.listAudit({ event_type: APPROVAL_RESOLVED_EVENT });
+        expect(JSON.parse(resolved.at(-1)!.payload)).toMatchObject({ tool: "bash", approved: false });
+      }
+    }
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }, 180_000);
 });

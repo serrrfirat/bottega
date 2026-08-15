@@ -22,6 +22,10 @@ export type Tier = "read" | "write" | "exec";
 export type PolicyAction = "allow" | "deny" | "prompt";
 export type Decision = "allow" | "deny" | "ask-human";
 
+/** Space-agent driver selected by the org config (`agent.driver`, issue #26). */
+export type AgentDriverName = "acp" | "omp-sdk";
+export const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
+
 export const DEFAULT_TIMEOUT_MINUTES = 5;
 export const DEFAULT_REQUIRED_APPROVERS = 1;
 export const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
@@ -69,6 +73,9 @@ export interface PolicyConfig {
   approvers: string[];
   /** Memory-context injection settings (issue #42); org floor only — the overlay cannot change them. */
   memory: { injection: MemoryInjectionConfig };
+
+  /** Space-agent driver (`agent.driver` in config.yml, issue #26). Default omp-sdk; acp is opt-in. */
+  agentDriver: AgentDriverName;
   errors: string[];
   warnings: string[];
 }
@@ -86,6 +93,8 @@ export function defaultPolicy(): PolicyConfig {
     requiredApprovers: DEFAULT_REQUIRED_APPROVERS,
     approvers: [],
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
+
+    agentDriver: DEFAULT_AGENT_DRIVER,
     errors: [],
     warnings: [],
   };
@@ -110,6 +119,27 @@ export function decideToolCall(input: {
   if (input.action === "prompt") return { decision: "ask-human", reason: "policy requires a human prompt" };
   if (input.tier === "exec") return { decision: "ask-human", reason: "exec-tier tool requires human approval" };
   return { decision: "allow", reason: "allowed by policy" };
+}
+
+/**
+ * The gate decision for one tool call, shared by every policy surface
+ * (in-process extension, ACP permission handler — issue #26): an invalid
+ * policy denies everything, then the tier × action table applies. The
+ * executor's preApproved scope (issue #11) lets an allowlisted exec-tier
+ * tool run on the work item's pickup approval; explicit prompt/deny and
+ * unknown tools are never bypassed.
+ */
+export function decidePolicyCall(
+  policy: PolicyConfig,
+  toolName: string,
+  preApproved = false,
+): { decision: Decision; reason: string } {
+  if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}` };
+  const action = toolAction(policy, toolName);
+  if (preApproved && isKnownTool(toolName) && resolveTier(toolName) === "exec" && action === "allow") {
+    return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)" };
+  }
+  return decideToolCall({ tier: resolveTier(toolName), action, toolKnown: isKnownTool(toolName) });
 }
 
 export function resolveTier(toolName: string): Tier {
@@ -227,6 +257,18 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         } else if (inj.max_entries !== undefined) {
           policy.warnings.push("memory.injection.max_entries: invalid — using default");
         }
+      }
+    } else if (name === "agent") {
+      // Space-agent driver selection (issue #26). The flip is opt-in:
+      // anything unrecognized keeps the safe omp-sdk default with a warning.
+      const driver = scalarOrUndefined(entries.driver);
+      if (driver === "acp" || driver === "omp-sdk") {
+        policy.agentDriver = driver;
+      } else if (entries.driver !== undefined) {
+        policy.warnings.push(`agent.driver: invalid '${driver ?? "<non-scalar>"}' (acp|omp-sdk) — using default omp-sdk`);
+      }
+      for (const key of Object.keys(entries)) {
+        if (key !== "driver") policy.warnings.push(`agent.${key}: unknown key ignored`);
       }
     } else {
       policy.warnings.push(`unknown section '${name}' ignored`);

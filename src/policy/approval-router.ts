@@ -32,3 +32,21 @@ export const DenyRouter: ApprovalRouter = {
     return { approved: false };
   },
 };
+
+/**
+ * Resolves on the first of: router resolution, router failure (deny),
+ * timeout (deny). Shared by every policy surface (in-process extension and
+ * the ACP permission handler, issue #26) so ask-human can never hang a
+ * tool call.
+ */
+export function requestWithTimeout(
+  router: ApprovalRouter,
+  request: ApprovalRequest,
+  timeoutMs: number,
+): Promise<ApprovalResolution> {
+  const { promise, resolve } = Promise.withResolvers<ApprovalResolution>();
+  const timer = setTimeout(() => resolve({ approved: false }), timeoutMs);
+  timer.unref?.();
+  void router.request(request).then(resolve, () => resolve({ approved: false }));
+  return promise;
+}

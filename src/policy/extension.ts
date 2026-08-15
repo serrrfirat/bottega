@@ -8,6 +8,10 @@
  * → deny, router failure → deny, gate error → deny. Every decision writes a
  * `policy.decision` audit row; ask-human additionally writes
  * `approval.requested` / `approval.resolved` rows.
+ *
+ * The decision + audit + approval sequence itself lives in the shared
+ * policy gate (src/policy/gate.ts, issue #26) so the ACP permission handler
+ * makes exactly the same decisions this extension makes.
  */
 import type {
   ExtensionContext,
@@ -15,21 +19,12 @@ import type {
   ToolCallEvent,
   ToolCallEventResult,
 } from "@oh-my-pi/pi-coding-agent";
-import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
-import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "./approval-router";
-import {
-  decideToolCall,
-  isKnownTool,
-  loadSpacePolicy,
-  resolveTier,
-  toolAction,
-  type Decision,
-  type PolicyConfig,
-  type Tier,
-} from "./config";
+import type { ApprovalRouter } from "./approval-router";
+import { loadSpacePolicy, type PolicyConfig } from "./config";
+import { evaluatePolicyGate } from "./gate";
 
 export interface PolicyExtensionDeps {
   orgPolicy: PolicyConfig;
@@ -50,9 +45,6 @@ export interface PolicyExtensionDeps {
   preApproved?: boolean;
 }
 
-/** Cap for the args summary embedded in policy.decision rows (appendAudit redacts + caps too). */
-const ARGS_SUMMARY_MAX = 1000;
-
 export default function createPolicyExtension(deps: PolicyExtensionDeps): ExtensionFactory {
   const actor = deps.actor ?? "agent";
   return (pi) => {
@@ -68,104 +60,21 @@ async function gateToolCall(
 ): Promise<ToolCallEventResult | void> {
   try {
     const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-    const policy = await loadSpacePolicy(deps.orgPolicy, deps.store, spaceId);
-    const tool = event.toolName;
-    const tier = resolveTier(tool);
-    const { decision, reason } = decide(policy, tool, tier, deps.preApproved ?? false);
-
-    await deps.audit.appendAudit({
-      space_id: spaceId ?? null,
-      actor,
-      event_type: POLICY_DECISION_EVENT,
-      payload: {
-        tool,
-        tier,
-        decision,
-        reason,
-        // Args are redacted and capped by appendAudit before the row is written.
-        args: summarizeArgs(event.input),
+    const outcome = await evaluatePolicyGate(
+      {
+        loadPolicy: (sid) => loadSpacePolicy(deps.orgPolicy, deps.store, sid),
+        audit: deps.audit,
+        router: deps.router,
+        timeoutMs: deps.timeoutMs,
+        preApproved: deps.preApproved,
       },
-    });
-
-    if (decision === "allow") return;
-    if (decision === "deny") return { block: true, reason: `policy: ${reason}` };
-    return await requestApproval(deps, actor, event, policy, reason, spaceId);
+      { tool: event.toolName, args: event.input, spaceId, actor },
+    );
+    if (outcome.allowed) return;
+    return { block: true, reason: outcome.blockReason };
   } catch (err) {
     // Fail closed: an internal gate error must never let the tool run.
     console.error("[policy] gate error (denying tool call):", err);
     return { block: true, reason: "policy: gate error — denied" };
   }
-}
-
-function decide(
-  policy: PolicyConfig,
-  tool: string,
-  tier: Tier,
-  preApproved: boolean,
-): { decision: Decision; reason: string } {
-  if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}` };
-  const action = toolAction(policy, tool);
-  // Pre-approved executor session (issue #11): an exec-tier tool the policy
-  // allows needs no further human prompt — the work item's pickup approval
-  // already authorized it. Explicit prompt/deny and unknown tools are never
-  // bypassed.
-  if (preApproved && isKnownTool(tool) && tier === "exec" && action === "allow") {
-    return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)" };
-  }
-  return decideToolCall({ tier, action, toolKnown: isKnownTool(tool) });
-}
-
-async function requestApproval(
-  deps: PolicyExtensionDeps,
-  actor: string,
-  event: ToolCallEvent,
-  policy: PolicyConfig,
-  reason: string,
-  spaceId: string | undefined,
-): Promise<ToolCallEventResult | void> {
-  const request: ApprovalRequest = {
-    tool: event.toolName,
-    args: event.input,
-    reason,
-    spaceId: spaceId ?? "",
-    actor,
-  };
-  await deps.audit.appendAudit({
-    space_id: spaceId ?? null,
-    actor,
-    event_type: APPROVAL_REQUESTED_EVENT,
-    payload: { tool: request.tool, reason },
-  });
-
-  const timeoutMs = deps.timeoutMs ?? policy.timeoutMinutes * 60_000;
-  const resolution = await requestWithTimeout(deps.router, request, timeoutMs);
-
-  await deps.audit.appendAudit({
-    space_id: spaceId ?? null,
-    actor,
-    event_type: APPROVAL_RESOLVED_EVENT,
-    payload: { tool: request.tool, approved: resolution.approved, approver: resolution.approver ?? null },
-  });
-
-  if (resolution.approved) return;
-  return { block: true, reason: "policy: approval denied" };
-}
-
-/** Resolves on the first of: router resolution, router failure (deny), timeout (deny). */
-function requestWithTimeout(router: ApprovalRouter, request: ApprovalRequest, timeoutMs: number): Promise<ApprovalResolution> {
-  const { promise, resolve } = Promise.withResolvers<ApprovalResolution>();
-  const timer = setTimeout(() => resolve({ approved: false }), timeoutMs);
-  timer.unref?.();
-  void router.request(request).then(resolve, () => resolve({ approved: false }));
-  return promise;
-}
-
-/**
- * Session file path is `<transcriptDir>/<spaceId>.jsonl` (driver contract),
- * so the space id is recoverable from the session manager at gate time —
- * derived by the shared {@link sessionIdFromFilePath}.
- */
-function summarizeArgs(input: unknown): string {
-  const text = JSON.stringify(input) ?? "";
-  return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;
 }

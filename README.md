@@ -84,10 +84,19 @@ interface AgentDriver {
 - **`createAcpDriver`** spawns any ACP-speaking agent (default `omp acp`)
   over stdio JSON-RPC 2.0 (newline-delimited, per the ACP v1 spec). This is
   how a non-OMP agent plugs in later without touching bottega code. OMP is
-  the first engine, not a dependency.
-- ACP permission requests are the future policy surface for non-OMP agents
-  (see roadmap); today the OMP driver enforces policy in-process via
-  extensions.
+  the first engine, not a dependency. The org config selects the space-agent
+  driver with `agent.driver: acp | omp-sdk` (default `omp-sdk`; the ACP flip
+  is opt-in via config until proven — issue #26).
+- ACP sessions enforce policy over `session/request_permission`: every
+  inbound permission request runs through the same policy table the OMP
+  extensions use (tier × org config + space overlay → allow | deny |
+  ask-human), with audit on every decision. Unknown tools deny (fail
+  closed); ask-human routes through the configured `ApprovalRouter`
+  (`DenyRouter` until the Slack button router lands). With `agent.driver:
+  acp`, the bottega MCP server (memory.save/search, issue #25) attaches to
+  each session so bottega's own tools stay reachable. The tradeoff vs the
+  OMP driver is interception depth: ACP gives allow/deny only, no arg
+  rewriting or output redaction.
 
 ### Policy & approvals
 
