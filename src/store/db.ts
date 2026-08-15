@@ -328,10 +328,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
  * for longer than `olderThanMs` as blocked with an interrupted-by-restart
  * evidence note. The executor runs this once at boot.
  */
-export function recoverStaleWorkItems(store: Store, olderThanMs: number): Promise<number> {
-  return (async () => {
-    const claimed = await store.markStaleWorkItems(olderThanMs, "claimed");
-    const working = await store.markStaleWorkItems(olderThanMs, "working");
-    return claimed + working;
-  })();
+export async function recoverStaleWorkItems(store: Store, olderThanMs: number): Promise<number> {
+  const claimed = await store.markStaleWorkItems(olderThanMs, "claimed");
+  const working = await store.markStaleWorkItems(olderThanMs, "working");
+  return claimed + working;
 }
