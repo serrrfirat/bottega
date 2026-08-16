@@ -102,6 +102,18 @@ rule below conflicts with a rule above, the user's explicit instructions win
 4. **Isolated worktrees** when multiple agents run: work ONLY in your assigned
    `.worktrees/<topic>`; never touch the main checkout or sibling worktrees.
 5. Never rewrite shared history.
+6. **Dev server stays up while work is in progress.** Start `bun run dev`
+   through the harness process manager with a readiness check (`bottega boot:
+   model registry ready`) before implementing, and keep it running across the
+   session (restart on crash). If it refuses to boot (fail-closed guards:
+   Slack tokens missing from server `.env` — boot throws; provider keys
+   missing from the macOS Keychain), state the blocker explicitly and finish
+   all work that does not need it live.
+7. **Implementation is delegated to task agents.** Any code change ships via
+   a task subagent given complete, self-contained instructions (targets,
+   change steps, acceptance); the main agent handles tracking (issues, todos)
+   and reviews the agent's output before it lands. The main agent does not
+   implement directly.
 
 ## Build, test, verify
 
