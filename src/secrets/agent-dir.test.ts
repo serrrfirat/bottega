@@ -12,7 +12,7 @@ describe("agent dir wiring (issue #9)", () => {
     process.env.SLACK_APP_TOKEN = "xapp-test-token";
     process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
     let receivedAgentDir: string | undefined;
-    const server = main({
+    const server = await main({
       createDriver: (agentDir) => {
         receivedAgentDir = agentDir;
         return createOmpSdkDriver({ agentDir, extensions: [] });

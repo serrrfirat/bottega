@@ -83,7 +83,7 @@ describe(".env.example (issue #9 environment contract)", () => {
     }
   });
 
-  test("boot fails closed when the documented channel tokens are missing", () => {
+  test("boot fails closed when the documented channel tokens are missing", async () => {
     // Behavioral contract (issue #33): the server refuses to boot without
     // the credentials .env.example documents — scrub the env and assert
     // the fail-closed message instead of grepping src/ for env references.
@@ -92,7 +92,7 @@ describe(".env.example (issue #9 environment contract)", () => {
     delete process.env.SLACK_APP_TOKEN;
     delete process.env.SLACK_BOT_TOKEN;
     try {
-      expect(() => main()).toThrow(/SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required/);
+      await expect(main()).rejects.toThrow(/SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required/);
     } finally {
       if (savedApp === undefined) delete process.env.SLACK_APP_TOKEN;
       else process.env.SLACK_APP_TOKEN = savedApp;

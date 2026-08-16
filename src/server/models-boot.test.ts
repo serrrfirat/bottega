@@ -9,7 +9,7 @@
  * whole boot path is exercised, not just the renderer.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore } from "../store/db";
@@ -51,14 +51,19 @@ describe("boot-time models.yml generation (issue #67)", () => {
       store.setOrgSettings({ models: { default: "zai-org/GLM-5.1-FP8", fast: "acme/chat" } });
       store.close();
 
+      // The generated catalog references NEAR_API_KEY by env name; the boot
+      // guard (issue #80) requires ≥1 available model from OUR providers, so
+      // the key must resolve for the boot to succeed.
+      process.env.NEAR_API_KEY = "bottega-boot-test-key";
       const agentDir = join(env.dir, "agent");
-      const server = main({ agentDir });
+      const server = await main({ agentDir });
       await server.stop();
 
       const generated = readFileSync(join(agentDir, "models.yml"), "utf8");
       expect(generated).toContain('id: "zai-org/GLM-5.1-FP8"');
       expect(generated).toContain('id: "acme/chat"');
     } finally {
+      delete process.env.NEAR_API_KEY;
       env.cleanup();
     }
   });
@@ -71,10 +76,41 @@ describe("boot-time models.yml generation (issue #67)", () => {
       store.close();
 
       const agentDir = join(env.dir, "agent");
-      const server = main({ agentDir });
+      const server = await main({ agentDir });
       await server.stop();
 
       expect(existsSync(join(agentDir, "models.yml"))).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("boot guard: catalog with no available model fails the boot with a clear message (issue #80)", async () => {
+    const env = tempEnv();
+    try {
+      // No model ids in settings → main() leaves our fixture models.yml in
+      // place. The catalog declares one baseUrl-only provider (valid, but
+      // with no auth) — the guard must refuse the boot, naming the agent
+      // dir + config, instead of "No model selected" at the first prompt.
+      const store = createStore("data/bottega.db");
+      store.setOrgSettings({ response_mode: "mention" });
+      store.close();
+
+      const agentDir = join(env.dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "models.yml"),
+        [
+          "providers:",
+          "  guard-test:",
+          "    api: openai-completions",
+          '    baseUrl: "http://127.0.0.1:4891/v1"',
+          "",
+        ].join("\n"),
+      );
+      await expect(main({ agentDir })).rejects.toThrow(
+        /bottega boot guard: no model is available from the agent dir .*models\.yml.*config\.yml/,
+      );
     } finally {
       env.cleanup();
     }

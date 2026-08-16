@@ -11,7 +11,7 @@ import { main as serverMain } from "./server/index";
 test("server main wires adapter and space service", async () => {
   process.env.SLACK_APP_TOKEN = "xapp-test-token";
   process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
-  const server = serverMain();
+  const server = await serverMain();
   expect(typeof server.start).toBe("function");
   expect(typeof server.stop).toBe("function");
   await server.stop();
@@ -24,7 +24,7 @@ test("server main wires the Slack approval router for space sessions (issue #44)
     adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
     timeoutMs: number;
   }> = [];
-  const server = serverMain({
+  const server = await serverMain({
     createApprovalRouter: (deps) => {
       created.push(deps);
       // Test double with the same surface the default Slack router exposes.

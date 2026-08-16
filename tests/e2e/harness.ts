@@ -64,7 +64,6 @@ import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./sla
 import type { McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import { setAgentDir } from "@oh-my-pi/pi-utils";
 import type { AgentDriver } from "../../src/server/drivers/agent-driver";
 import { createOmpSdkDriver } from "../../src/server/drivers/agent-driver";
 import {
@@ -597,10 +596,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   mkdirSync(configDir, { recursive: true });
   mkdirSync(agentDir, { recursive: true });
   // The SDK's model registry reads models.yml from the PROCESS-global agent
-  // dir (`getAgentDir()`), not from the session's agentDir option — so the
-  // per-harness temp dir is installed globally (the #9 seam). Session
-  // settings (config.yml) still come from the explicit agentDir option.
-  setAgentDir(agentDir);
+  // dir (`getAgentDir()`), not from the session's agentDir option — that
+  // seam is now the driver's (issue #80): createOmpSdkDriver installs the
+  // per-harness temp dir globally at construction, below. Session settings
+  // (config.yml) come from the explicit agentDir option as before.
 
   // --- model stub + temp agent dir (models.yml baseUrl override) -----------
   const modelStub = createModelStub();

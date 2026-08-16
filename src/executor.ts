@@ -37,7 +37,7 @@ import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-ev
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { loadOrgPolicy } from "./policy/config";
-import { createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
+import { assertAgentDirModelAvailable, createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 /**
@@ -66,6 +66,13 @@ export interface ExecutorDeps {
   pollIntervalMs?: number;
   /** Transcript dir passed to the driver (one JSONL per work item). Default data/transcripts. */
   transcriptDir?: string;
+  /**
+   * Agent dir the driver was constructed with (issue #80 boot guard). The
+   * driver installs it as the process-global dir; the guard verifies the
+   * registry resolves an available model from its catalog. Default
+   * "data/omp-agent" (the executor's deployment agent dir).
+   */
+  agentDir?: string;
   /**
    * Delivery approval seam: called with the opened PR, resolves the human
    * decision. `null` → delivery denied (item blocked). Absent → the
@@ -102,6 +109,13 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
 
 export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Promise<void> {
   const cfg = await prepareExecutor(deps);
+  // Boot-time guard (issue #80), same fail-fast as the server: the driver
+  // installed the agent dir as the process-global dir at construction, so
+  // verify the registry resolves an available model from ITS catalog before
+  // the claim loop starts — a clear boot error, never "No model selected"
+  // mid-implementation. Runs after prepareExecutor so the PAT guard (the
+  // credential boundary, issue #9) stays the first fail-closed check.
+  await assertAgentDirModelAvailable(deps.agentDir ?? "data/omp-agent");
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   console.log(`executor ready: allowlist ${cfg.repoAllowlist.join(", ") || "(empty — no pushes until configured)"}, workspaces ${cfg.workspacesDir}`);
   while (!signal?.aborted) {

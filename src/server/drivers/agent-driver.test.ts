@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { AgentRegistry, SessionManager, createAgentSession, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
+import { join, resolve } from "node:path";
+import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { extensionToolDefinitions } from "../../extensions/tools";
@@ -12,6 +13,7 @@ import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
 import { createStore, type SpaceModelSettings } from "../../store/db";
 import {
+  assertAgentDirModelAvailable,
   createOmpSdkDriver,
   OmpSessionDriver,
   resolveRoleTarget,
@@ -493,5 +495,111 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
     });
     expect(stub.calls).toEqual([]);
     expect(stub.thinkingCalls).toEqual([]);
+  });
+});
+
+describe("process-global agent dir + boot guard (issue #80)", () => {
+  const PROVIDER = "agentdir-test";
+  const MODEL_ID = "model-1";
+  const STUB_BASE_URL = "http://127.0.0.1:4891/v1";
+
+  /** A temp agent dir whose models.yml declares ONE provider with an inline key. */
+  function agentDirWithCatalog(): { agentDir: string; cleanup(): void } {
+    const dir = mkdtempSync(join(tmpdir(), "agentdir-issue80-"));
+    const agentDir = join(dir, "omp-agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "models.yml"),
+      [
+        "providers:",
+        `  ${PROVIDER}:`,
+        "    api: openai-completions",
+        `    baseUrl: "${STUB_BASE_URL}"`,
+        '    apiKey: "issue80-inline-key"',
+        "    models:",
+        `      - id: ${MODEL_ID}`,
+        '        name: "Issue 80 Test Model"',
+        "        contextWindow: 128000",
+        "        maxTokens: 4096",
+        "",
+      ].join("\n"),
+    );
+    return { agentDir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  test("driver construction installs the agent dir as the process-global dir (the #9 seam moves into the driver)", async () => {
+    const { agentDir, cleanup } = agentDirWithCatalog();
+    try {
+      createOmpSdkDriver({ agentDir });
+      // The registry the SDK sessions build reads models.yml from
+      // getAgentDir() — it must now be OUR dir, with PI_CODING_AGENT_DIR
+      // pinned for subprocesses (the old workaround env, set by the driver).
+      expect(getAgentDir()).toBe(resolve(agentDir));
+      expect(process.env.PI_CODING_AGENT_DIR).toBe(agentDir);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("the real SDK registry resolves the models.yml model after driver construction — no env hacks", async () => {
+    const { agentDir, cleanup } = agentDirWithCatalog();
+    try {
+      createOmpSdkDriver({ agentDir });
+      // The session path: discoverAuthStorage(agentDir) + new ModelRegistry
+      // (models.yml from the process-global dir) — exactly what
+      // createAgentSession does.
+      const registry = new ModelRegistry(await discoverAuthStorage(agentDir));
+      expect(registry.getError()).toBeUndefined();
+      const model = registry.find(PROVIDER, MODEL_ID);
+      expect(model?.baseUrl).toBe(STUB_BASE_URL); // OUR models.yml, not ~/.omp/agent
+      const available = registry.getAvailable();
+      expect(available.some((m) => m.provider === PROVIDER)).toBe(true);
+      // The boot guard agrees: ≥1 available model from OUR declared providers.
+      await expect(assertAgentDirModelAvailable(agentDir)).resolves.toBeGreaterThanOrEqual(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("boot guard fails with a clear message when OUR catalog has no available model", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentdir-issue80-"));
+    const agentDir = join(dir, "omp-agent");
+    mkdirSync(agentDir, { recursive: true });
+    // A provider declared with ONLY a baseUrl (no apiKey, no models, no
+    // `auth: none`) is a valid override-only entry — and it has no auth, so
+    // the registry reports it unavailable: the exact state that used to
+    // surface as "No model selected" at the first prompt.
+    writeFileSync(
+      join(agentDir, "models.yml"),
+      [
+        "providers:",
+        `  ${PROVIDER}:`,
+        "    api: openai-completions",
+        `    baseUrl: "${STUB_BASE_URL}"`,
+        "",
+      ].join("\n"),
+    );
+    try {
+      createOmpSdkDriver({ agentDir });
+      await expect(assertAgentDirModelAvailable(agentDir)).rejects.toThrow(
+        /bottega boot guard: no model is available from the agent dir .*models\.yml.*config\.yml/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("boot guard skips the assertion when models.yml is missing (no catalog → bundled/env view, no fail-fast)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentdir-issue80-"));
+    const agentDir = join(dir, "omp-agent");
+    mkdirSync(agentDir, { recursive: true });
+    try {
+      createOmpSdkDriver({ agentDir });
+      // No models.yml → lenient leg: the guard resolves (returns the
+      // available count, 0 in this hermetic env) instead of failing the boot.
+      await expect(assertAgentDirModelAvailable(agentDir)).resolves.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

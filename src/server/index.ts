@@ -18,7 +18,12 @@ import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { extensionToolDefinitions } from "../extensions/tools";
-import { createOmpSdkDriver, SessionModelRoleRegistry, type AgentDriver } from "./drivers/agent-driver";
+import {
+  assertAgentDirModelAvailable,
+  createOmpSdkDriver,
+  SessionModelRoleRegistry,
+  type AgentDriver,
+} from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
@@ -67,7 +72,7 @@ export interface BottegaServerOpts {
   agentDir?: string;
 }
 
-export function main(opts: BottegaServerOpts = {}): BottegaServer {
+export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {
@@ -256,6 +261,15 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
       });
     });
   const driver = createDriver(agentDir);
+  // Boot-time guard (issue #80): createOmpSdkDriver installs the agent dir
+  // as the process-global dir at construction; fail the boot here — not the
+  // first prompt — when the SDK's model registry then resolves no available
+  // model from OUR models.yml. The ACP driver resolves models in its own
+  // MCP server, not through the OMP registry, so the guard is OMP-only.
+  if (orgPolicy.agentDriver !== "acp") {
+    const available = await assertAgentDirModelAvailable(agentDir);
+    console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
+  }
   spaceService = new SpaceService({
     store,
     adapter,
@@ -315,7 +329,7 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
 }
 
 if (import.meta.main) {
-  const server = main();
+  const server = await main();
   let stopping = false;
   process.on("SIGINT", () => {
     if (stopping) return;

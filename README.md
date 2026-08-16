@@ -557,6 +557,20 @@ settings carry none, the committed `config/omp/models.yml` template stays
 the default. The DB is the single source of truth — no agent-editable
 model YAML.
 
+The OMP SDK's model registry reads `models.yml` from the **process-global**
+agent dir (`getAgentDir()`), not from the session's `agentDir` option. The
+driver owns that seam (issue #80): `createOmpSdkDriver` installs the
+bottega agent dir (`data/omp-agent`) as the process-global dir at
+construction, so registry and session settings always read the deployment
+catalog — no `PI_CODING_AGENT_DIR` env is needed in dev, compose, or the
+executor. A boot-time guard then asserts the registry resolves ≥1
+**available** model from that catalog (env key, `models.yml` `apiKey`, or
+the auth-broker credential) and fails the boot with a message naming the
+agent dir + config instead of surfacing "No model selected" at the first
+space prompt. Local first runs get the catalog automatically: `scripts/dev.sh`
+copies the `config/omp/` templates into `data/omp-agent` when it is empty
+(compose mounts them).
+
 ### First-run checklist
 
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.

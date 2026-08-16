@@ -1,9 +1,11 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
   AgentRegistry,
+  ModelRegistry,
   SessionManager,
   createAgentSession,
+  discoverAuthStorage,
   z,
   type AgentSession,
   type CreateAgentSessionOptions,
@@ -11,6 +13,8 @@ import {
   type ExtensionFactory,
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
+import { setAgentDir } from "@oh-my-pi/pi-utils";
+import { parseYamlSubset } from "../../yaml-subset";
 import type { MemoryProvider } from "../../memory/types";
 import { MEMORY_LIMIT_MAX } from "../../memory/types";
 import type { SpaceModelSettings } from "../../store/db";
@@ -493,6 +497,76 @@ function gatedBuiltinDefinitions(names: readonly string[]): ToolDefinition[] {
 export type DriverThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
+ * Boot-time guard (issue #80): assert the OMP SDK's model registry resolves
+ * ≥1 AVAILABLE model from the agent dir's own catalog, and throw a clear
+ * boot error naming the agent dir + config when it does not — never let the
+ * first space prompt fail with "No model selected".
+ *
+ * The registry is built with the SDK's own discovery
+ * (`new ModelRegistry(discoverAuthStorage(agentDir))`, models.yml pointed
+ * at OUR file explicitly), so the guard checks the catalog the sessions
+ * will use — the driver's {@link createOmpSdkDriver} installs that same
+ * dir as the process-global agent dir at construction, so in the boot
+ * paths (server + executor) the two views coincide.
+ *
+ * - models.yml declares providers → require ≥1 available model from THOSE
+ *   providers (env key, models.yml apiKey, or broker credential). A
+ *   declared-but-unavailable catalog is the #80 symptom: it used to
+ *   surface as "No model selected" at the first prompt (or as silent drift
+ *   to whatever catalog the machine's own agent dir offered).
+ * - models.yml missing / declares no providers → lenient leg, no assertion
+ *   (deployments without a catalog fall back to the SDK's bundled models
+ *   and env keys, exactly the view the session gets).
+ * - a malformed models.yml surfaces the SDK's own config error.
+ *
+ * Returns the number of available models from the declared providers, or
+ * the overall available count on the lenient leg (informational).
+ */
+export async function assertAgentDirModelAvailable(agentDir: string): Promise<number> {
+  const configPath = join(agentDir, "config.yml");
+  const modelsPath = join(agentDir, "models.yml");
+  // The providers OUR models.yml declares. null = file missing/unreadable/
+  // unparseable → the lenient leg below (the SDK itself would also see no
+  // custom config; a parse failure that the SDK DOES flag is caught via
+  // registry.getError()).
+  let declared: string[] | null = null;
+  try {
+    const parsed = parseYamlSubset(readFileSync(modelsPath, "utf8"));
+    const providers = parsed.providers;
+    if (providers !== undefined && typeof providers === "object" && !Array.isArray(providers)) {
+      declared = Object.keys(providers);
+    } else {
+      declared = [];
+    }
+  } catch {
+    declared = null;
+  }
+  const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);
+  const configError = registry.getError();
+  if (configError !== undefined) {
+    throw new Error(
+      `bottega boot guard: ${modelsPath} failed to load: ${configError.message} ` +
+        `(agent dir ${agentDir}, config: ${configPath})`,
+    );
+  }
+  const available = registry.getAvailable();
+  if (declared !== null && declared.length > 0) {
+    const fromDeclared = available.filter((model) => declared.includes(model.provider));
+    if (fromDeclared.length === 0) {
+      throw new Error(
+        `bottega boot guard: no model is available from the agent dir ${agentDir}: ` +
+          `${modelsPath} declares providers [${declared.join(", ")}] but none of their models ` +
+          `has configured auth (env key, models.yml apiKey, or auth-broker credential; ` +
+          `config: ${configPath}). The first space prompt would fail with "No model selected" — ` +
+          `refusing to boot. Configure a provider key and restart.`,
+      );
+    }
+    return fromDeclared.length;
+  }
+  return available.length;
+}
+
+/**
  * Driver backed by the OMP SDK (`createAgentSession`). Sessions are
  * file-backed (SessionManager under `transcriptDir`, one JSONL per space —
  * the durable space timeline), tool-restricted to the allowlist above, and
@@ -546,6 +620,19 @@ export function createOmpSdkDriver(
     createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
   } = {},
 ): AgentDriver {
+  // Issue #80: the SDK's model registry reads models.yml from the
+  // PROCESS-GLOBAL agent dir (`getAgentDir()`), NOT from the session's
+  // `agentDir` option — the root cause of today's model drift + "No model
+  // selected" in production (the registry was reading ~/.omp/agent, so the
+  // deployment's data/omp-agent catalog was never seen). Install the
+  // bottega agent dir globally at construction, before any session can be
+  // created, so registry AND session settings read OUR config. The dir is
+  // created here so the driver is self-sufficient (agent.db etc. land
+  // inside it); setAgentDir also pins PI_CODING_AGENT_DIR for subprocesses.
+  if (opts.agentDir !== undefined) {
+    mkdirSync(opts.agentDir, { recursive: true });
+    setAgentDir(opts.agentDir);
+  }
   const customTools = opts.customTools ?? [];
   const createSession = opts.createSession ?? createAgentSession;
   const thinkingLevel: DriverThinkingLevel = opts.thinkingLevel ?? "low";
