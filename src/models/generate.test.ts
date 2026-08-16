@@ -57,7 +57,8 @@ describe("regenerateModelsConfig (issue #67)", () => {
         outPath,
       );
       expect(rendered).not.toBeNull();
-      expect(readFileSync(outPath, "utf8")).toBe(rendered);
+      expect(rendered).not.toBeUndefined();
+      expect(readFileSync(outPath, "utf8")).toBe(rendered as string);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -10,7 +10,6 @@ import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/con
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
-import { memoryToolsExtension } from "../tools/memory";
 import { modelToolsExtension } from "../tools/model-settings";
 import { settingsToolsExtension } from "../tools/settings";
 import { regenerateModelsConfig } from "../models/generate";

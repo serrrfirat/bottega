@@ -30,7 +30,7 @@
  * policy for the scope (file floor + DB + overlay), so the agent sees what
  * actually governs, not just what is stored.
  */
-import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory, AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { Store } from "../store/db";
 import { type OrgSettings, type OrgSettingsInput } from "../store/org-settings";
@@ -227,7 +227,7 @@ export function settingsToolsExtension(store: Store, opts: SettingsToolsExtensio
         "model_settings tool.",
       parameters: settingsArgsSchema,
       approval: "write",
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
         try {
           if (params.scope === "space") {
             return await handleSpace(store, opts, actor, params);
@@ -246,7 +246,7 @@ async function handleOrg(
   opts: SettingsToolsExtensionOpts,
   actor: string,
   params: z.infer<typeof settingsArgsSchema>,
-): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+): Promise<AgentToolResult> {
   const current = store.getOrgSettings();
   const orgPolicy = loadOrgPolicy(store);
   if (params.set === undefined) {
@@ -286,7 +286,7 @@ async function handleSpace(
   opts: SettingsToolsExtensionOpts,
   actor: string,
   params: z.infer<typeof settingsArgsSchema>,
-): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+): Promise<AgentToolResult> {
   const spaceId = params.space;
   if (!spaceId) return toolError("space scope requires `space` (e.g. \"slack:C123\")");
   const space = await store.getSpace(spaceId);
