@@ -183,6 +183,23 @@ describe("acp driver", () => {
     }
   });
 
+  test("setModelRole is documented not-supported (issue #64)", async () => {
+    const h = await launch("happy");
+    try {
+      const result = await h.session.setModelRole!("fast");
+      expect(result.applied).toBe(false);
+      expect(result.role).toBe("fast");
+      expect(result.model).toBeNull();
+      expect(result.thinking_level).toBeNull();
+      expect(result.reason).toMatch(/ACP sessions cannot switch models mid-session/);
+      // No protocol traffic: the switch is a no-op, not a wire round-trip.
+      expect(readFileSync(h.logfile, "utf8")).not.toContain('"method":"session/prompt"');
+    } finally {
+      await h.session.dispose();
+      h.cleanup();
+    }
+  });
+
   test("session/new sends mcpServers as an empty array when none are configured", async () => {
     const h = await launch("happy");
     try {

@@ -69,6 +69,7 @@ interface AgentSessionDriver {
   isStreaming(): boolean;
   on(event: "message" | "turn_start" | "turn_end" | "error", cb): () => void;
   dispose(): Promise<void>;
+  setModelRole?(role: "default" | "fast" | "reasoning"): Promise<...>; // optional (issue #64)
 }
 interface AgentDriver {
   createSession({ spaceId, transcriptDir, onOutput, cwd?, allowTools? }): Promise<AgentSessionDriver>;
@@ -102,7 +103,10 @@ interface AgentDriver {
   egress boundary → audit spine as in-session OMP tool calls, so any agent
   (OMP, ACP, or future) gets identical enforcement. The tradeoff vs the OMP
   driver is interception depth: ACP gives allow/deny only, no arg rewriting
-  or output redaction.
+  or output redaction. It also cannot switch models mid-session:
+  `setModelRole` (issue #64) is an optional `AgentSessionDriver` hook that
+  the OMP driver implements (SDK `setModel`/`setThinkingLevel`) and the ACP
+  driver reports as not-supported — `use_model` surfaces that as an error.
 
 ### Policy & approvals
 
@@ -471,6 +475,36 @@ said. A work item with no repo at all is blocked with
 "repo not specified — ask the requester" — there is no first-configured-repo
 fallback. An empty allowlist means no pushes until a repo is configured.
 
+### Model settings & model roles
+
+The space agent's model is configurable from chat (issue #64) — no config
+files, no restarts:
+
+- **`model_settings`** reads/writes the space's model settings, persisted
+  per space in the `spaces.settings` column (SQLite) and audited
+  (`model.settings_changed`). Slots: `model` (the space's default),
+  `reasoning_effort` (`off|low|medium|high`), `fast_model`,
+  `reasoning_model`. All slots are optional; unset slots fall back to
+  `model` at role-resolution time.
+- **`use_model`** switches the agent's model **role for the next turn**:
+  `default` (the space `model` at the space's default effort), `fast` (the
+  `fast_model` — or `model` — at low effort; simple tasks), `reasoning`
+  (the `reasoning_model` — or `model` — at `reasoning_effort`, default
+  high; hard tasks). Natural language like "use the fast model for this"
+  maps to `use_model {role: "fast"}`. Every switch is audited
+  (`model.switched`).
+
+Both are write-tier, so they prompt for approval in non-yolo policy modes,
+and they sit on the space-agent allowlist like the memory tools. The OMP
+driver implements the switch through the SDK's per-session model hooks
+(`setModel` + `setThinkingLevel`, session-only — the space's settings
+column is the persistence home, never the agent dir). The ACP driver does
+not support mid-session switches: ACP v1 has no model-switch message and
+the spawned agent's own config governs there — `use_model` reports this
+back as a clear error instead of pretending. Auto-routing by task
+complexity is explicitly v2: v1 is the agent *deciding* per task via
+`use_model`.
+
 ### First-run checklist
 
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.
@@ -528,6 +562,11 @@ fallback. An empty allowlist means no pushes until a repo is configured.
   executor container (no per-item container isolation yet).
 - **Slack only** — Telegram, Teams, Meet, and the org observer are roadmap
   (issue #13 is the Telegram adapter).
+- **No mid-session model switches on ACP** — `use_model` (issue #64) works
+  on the OMP driver; ACP sessions cannot switch models mid-session (the
+  agent's own config governs) and the tool reports it as an error.
+- **No auto model routing** — the agent picks the model role per task via
+  `use_model`; complexity-based auto-routing is v2.
 
 ## Roadmap
 

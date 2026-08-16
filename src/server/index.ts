@@ -10,12 +10,13 @@ import { loadOrgConfig, loadSpacePolicy, type ResponseMode } from "../policy/con
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
+import { modelToolsExtension } from "../tools/model-settings";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { extensionToolDefinitions } from "../extensions/tools";
-import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
+import { createOmpSdkDriver, SessionModelRoleRegistry, type AgentDriver } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
@@ -123,6 +124,10 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
     orgPolicy,
     router: approvalRouter,
   });
+  // Live-session registry (issue #64): SpaceService registers each live
+  // session; the model tools extension resolves use_model switches through
+  // it. Created here (before both) because the two share it.
+  const modelRoles = new SessionModelRoleRegistry();
   const createDriver =
     opts.createDriver ??
     ((agentDir: string) => {
@@ -175,6 +180,9 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
           loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
           router: approvalRouter,
         },
+        // Per-space model settings (issue #64): the OMP session resolves
+        // use_model roles against the space's settings column.
+        getModelSettings: (spaceId) => store.getSpaceSettings(spaceId),
         extensions: [
           createPolicyExtension({
             orgPolicy,
@@ -195,6 +203,10 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
           // sharing the store's database handle. Every save is audited via
           // the policy audit module.
           memoryToolsExtension(memoryProvider, { audit }),
+          // Model tools (issue #64): chat-driven per-space model settings
+          // (persisted in spaces.settings, audited) + next-turn model role
+          // switching through the live-session registry.
+          modelToolsExtension(store, { audit, modelRoles }),
         ],
         // Turn-start memory injection (#42), gated by the org policy config.
         memoryContext: {
@@ -233,6 +245,8 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         timeoutMs: orgPolicy.timeoutMinutes * 60_000,
       },
     },
+    // Live sessions register here (issue #64) so use_model can reach them.
+    modelRoles,
   });
   // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
   // in its own container and cannot post to Slack. When a work item's PR is

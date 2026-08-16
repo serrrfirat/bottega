@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS spaces (
   channel_id  TEXT NOT NULL,
   name        TEXT,
   policy_json TEXT NOT NULL DEFAULT '{}',-- space policy overlay (org config is the floor)
+  settings    TEXT NOT NULL DEFAULT '{}',-- per-space model settings JSON (issue #64), see db.ts
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );

@@ -9,6 +9,7 @@ import {
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider } from "../../memory/types";
+import type { SpaceModelSettings } from "../../store/db";
 import { memoryContextExtension } from "../../tools/memory-context";
 import {
   connectExtensionToolDefinition,
@@ -61,12 +62,44 @@ export interface AgentTurnOptions {
   silent?: boolean;
 }
 
+/**
+ * Model roles the `use_model` tool switches between (issue #64):
+ * - `default` — the space's configured model (the `model` setting);
+ * - `fast` — the `fast_model` setting (falls back to `model`) at low effort;
+ * - `reasoning` — the `reasoning_model` setting (falls back to `model`) at
+ *   the space's `reasoning_effort` (default high).
+ */
+export type ModelRole = "default" | "fast" | "reasoning";
+
+/**
+ * What a role switch actually applied (issue #64). `applied: false` means
+ * nothing changed and `reason` explains why (e.g. no settings configured).
+ * `model`/`thinking_level` are null when that half of the switch was a
+ * no-op; `model` is a bare model id as the session lists it.
+ */
+export interface ModelRoleSwitchResult {
+  applied: boolean;
+  role: ModelRole;
+  model: string | null;
+  thinking_level: string | null;
+  reason?: string;
+}
+
 export interface AgentSessionDriver {
   prompt(text: string, opts?: AgentTurnOptions): Promise<void>;
   abort(): Promise<void>;
   isStreaming(): boolean;
   on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: unknown) => void): () => void;
   dispose(): Promise<void>;
+  /**
+   * Optional per-session model-role switch (issue #64): applies the role for
+   * the NEXT turn. Optional on purpose — the interface stays
+   * backward-compatible, and drivers that cannot switch mid-session (ACP:
+   * the agent's own config governs) simply omit it or return a
+   * not-supported result. The `use_model` tool reaches this through the
+   * live-session registry (SessionModelRoleRegistry).
+   */
+  setModelRole?(role: ModelRole): Promise<ModelRoleSwitchResult>;
 }
 
 export interface AgentDriver {
@@ -90,8 +123,84 @@ export interface AgentDriver {
      * change applies once the space's live session is disposed.
      */
     appendSystemPrompt?: string;
+    /**
+     * Per-space model settings (issue #64): the OMP driver resolves
+     * `use_model` roles against these. Absent → sessions have no settings
+     * to switch to (role switches report applied: false).
+     */
+    getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
   }): Promise<AgentSessionDriver>;
 }
+
+/**
+ * Live-session registry for the `use_model` tool (issue #64). The space
+ * service registers each live session under its space id and removes it on
+ * dispose; the tool resolves the caller's space to its live session and
+ * delegates the role switch to the session's optional `setModelRole` hook.
+ * A session whose driver cannot switch (or no live session at all) yields a
+ * clear error instead of a silent no-op.
+ */
+export class SessionModelRoleRegistry {
+  readonly #sessions = new Map<string, AgentSessionDriver>();
+
+  set(spaceId: string, session: AgentSessionDriver): void {
+    this.#sessions.set(spaceId, session);
+  }
+
+  delete(spaceId: string): void {
+    this.#sessions.delete(spaceId);
+  }
+
+  has(spaceId: string): boolean {
+    return this.#sessions.has(spaceId);
+  }
+
+  async switchRole(
+    spaceId: string,
+    role: ModelRole,
+  ): Promise<{ ok: true; result: ModelRoleSwitchResult } | { ok: false; error: string }> {
+    const session = this.#sessions.get(spaceId);
+    if (!session) return { ok: false, error: `no live agent session for space ${spaceId}` };
+    if (!session.setModelRole) {
+      return {
+        ok: false,
+        error: "this agent driver does not support mid-session model switches (ACP sessions use the agent's own config)",
+      };
+    }
+    return { ok: true, result: await session.setModelRole(role) };
+  }
+}
+
+/**
+ * Maps a model role to concrete per-space settings (issue #64). Each slot
+ * falls back to the space `model` when its own slot is unset, so an agent
+ * that only ever runs one model still gets effort switching:
+ * - default → space model at the space's `reasoning_effort` (the space's
+ *   default effort; unset → leave the session's model/effort untouched);
+ * - fast → fast_model ?? model at fixed low effort;
+ * - reasoning → reasoning_model ?? model at reasoning_effort ?? high.
+ */
+export function resolveRoleTarget(
+  role: ModelRole,
+  settings: SpaceModelSettings,
+): { modelId?: string; thinkingLevel?: "off" | "low" | "medium" | "high" } {
+  switch (role) {
+    case "fast":
+      return { modelId: settings.fast_model ?? settings.model, thinkingLevel: "low" };
+    case "reasoning":
+      return { modelId: settings.reasoning_model ?? settings.model, thinkingLevel: settings.reasoning_effort ?? "high" };
+    case "default":
+      return { modelId: settings.model, thinkingLevel: settings.reasoning_effort };
+  }
+}
+
+/**
+ * The SDK's thinking-level union is const-enum backed (`Effort`), which
+ * loses string-literal assignability across the package boundary under
+ * isolatedModules. The settings values ARE those runtime strings
+ * (`Effort.Low === "low"`), so the boundary cast is value-identical.
+ */
+type SdkThinkingLevel = NonNullable<Parameters<AgentSession["setModel"]>[2]>["thinkingLevel"];
 
 /** Events the session drivers emit; both drivers share this vocabulary. */
 export type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
@@ -142,10 +251,12 @@ export function sessionIdFromFilePath(file: string | null | undefined): string |
  * delegating to work executors. Deliberately no bash/write/edit — the space
  * agent is a participant, not an executor. The work item queue tools
  * (issue #10) are listed so the agent can create and cancel work items, and
- * the memory tools (issue #22) so it can save and search memory. The
- * connect capability (issue #52) rides the custom-tools path
+ * (issue #22) so it can save and search memory. The connect capability
+ * (issue #52) rides the custom-tools path
  * (createOmpSdkDriver builds its definition per session) and is listed here
  * so the allowlist documents it — keep in sync with PROJECT_TOOL_NAMES.
+ * The model tools (issue #64) are listed so the agent can read/change
+ * per-space model settings and switch its own next-turn model role.
  */
 export const SPACE_AGENT_TOOLS = [
   "read",
@@ -161,6 +272,8 @@ export const SPACE_AGENT_TOOLS = [
   "connect_extension",
   "memory.save",
   "memory.search",
+  "model_settings",
+  "use_model",
 ] as const;
 
 /**
@@ -204,11 +317,13 @@ export function createOmpSdkDriver(
     memoryContext?: MemoryContextDriverOpts;
     /** Connect capability (issue #52); omitted → the connect tool is absent (e.g. executor sessions). */
     connectExtension?: ConnectExtensionDriverOpts;
+    /** Per-space model settings (issue #64); see createSession's getModelSettings. */
+    getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
   } = {},
 ): AgentDriver {
   const customTools = opts.customTools ?? [];
   return {
-    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt }) {
+    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt, getModelSettings }) {
       mkdirSync(transcriptDir, { recursive: true });
       const sessionCwd = cwd ?? process.cwd();
       const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
@@ -265,15 +380,26 @@ export function createOmpSdkDriver(
         customTools: sessionCustomTools,
         allowRestrictedCustomTools: true,
       });
-      return new OmpSessionDriver({ spaceId, session, onOutput });
+      return new OmpSessionDriver({
+        spaceId,
+        session,
+        onOutput,
+        getModelSettings: opts.getModelSettings ?? getModelSettings ?? (async () => ({})),
+      });
     },
   };
 }
 
-class OmpSessionDriver implements AgentSessionDriver {
+/**
+ * The OMP driver's session implementation. Exported so driver-level tests
+ * can pin setModelRole against a stubbed SDK session (the factory path
+ * exercises it with a real SDK session elsewhere).
+ */
+export class OmpSessionDriver implements AgentSessionDriver {
   readonly #spaceId: string;
   readonly #session: AgentSession;
   readonly #onOutput: (spaceId: string, text: string) => void;
+  readonly #getModelSettings: (spaceId: string) => Promise<SpaceModelSettings>;
   readonly #emitter = createEmitter<DriverEvent>();
   #textByIndex = new Map<number, string>();
   #unsubscribe: () => void;
@@ -284,10 +410,13 @@ class OmpSessionDriver implements AgentSessionDriver {
     spaceId: string;
     session: AgentSession;
     onOutput: (spaceId: string, text: string) => void;
+    /** Per-space model settings (issue #64); default: no settings (role switches report applied: false). */
+    getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
   }) {
     this.#spaceId = deps.spaceId;
     this.#session = deps.session;
     this.#onOutput = deps.onOutput;
+    this.#getModelSettings = deps.getModelSettings ?? (async () => ({}));
     this.#unsubscribe = deps.session.subscribe((event) => {
       switch (event.type) {
         case "message_update": {
@@ -352,6 +481,57 @@ class OmpSessionDriver implements AgentSessionDriver {
 
   on(event: DriverEvent, cb: (data: unknown) => void): () => void {
     return this.#emitter.on(event, cb);
+  }
+
+  /**
+   * Applies a model role for the NEXT turn (issue #64): resolves the role
+   * against the space's model settings, finds the model in the session's
+   * available set, and switches via the SDK's per-session model hooks
+   * (AgentSession.setModel with an explicit thinking level, non-persisting —
+   * per-space persistence lives in `spaces.settings`, not the agent dir).
+   * A role whose slots are all unset reports applied: false without
+   * touching the session.
+   */
+  async setModelRole(role: ModelRole): Promise<ModelRoleSwitchResult> {
+    const settings = await this.#getModelSettings(this.#spaceId);
+    const target = resolveRoleTarget(role, settings);
+    if (!target.modelId && !target.thinkingLevel) {
+      return {
+        applied: false,
+        role,
+        model: null,
+        thinking_level: null,
+        reason: "no model settings configured for this space",
+      };
+    }
+    const thinkingLevel = target.thinkingLevel as SdkThinkingLevel | undefined;
+    if (target.modelId) {
+      const model = this.#findModel(target.modelId);
+      if (!model) {
+        throw new Error(`model '${target.modelId}' is not available to this session`);
+      }
+      await this.#session.setModel(model, undefined, {
+        thinkingLevel,
+        // Session-only: never write the OMP agent's settings file — the
+        // space's `settings` column is the persistence home (#64).
+        persist: false,
+      });
+    } else if (thinkingLevel !== undefined) {
+      this.#session.setThinkingLevel(thinkingLevel);
+    }
+    return {
+      applied: true,
+      role,
+      model: target.modelId ?? null,
+      thinking_level: target.thinkingLevel ?? null,
+    };
+  }
+
+  /** The session's available model matching a bare id (or "provider/id"). */
+  #findModel(modelId: string): ReturnType<AgentSession["getAvailableModels"]>[number] | undefined {
+    return this.#session
+      .getAvailableModels()
+      .find((m) => m.id === modelId || `${m.provider}/${m.id}` === modelId);
   }
 
   async dispose(): Promise<void> {

@@ -1,4 +1,4 @@
-import type { AgentDriver, AgentSessionDriver } from "../drivers/agent-driver";
+import type { AgentDriver, AgentSessionDriver, SessionModelRoleRegistry } from "../drivers/agent-driver";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
@@ -48,6 +48,12 @@ export interface SpaceServiceDeps {
    * on the agent having the tool. Everything else stays agent territory.
    */
   connect?: ConnectExtensionDeps;
+  /**
+   * Live-session registry (issue #64): each created session is registered
+   * under its space id and removed on dispose, so the `use_model` tool can
+   * reach the session's setModelRole hook. Absent → no registration.
+   */
+  modelRoles?: SessionModelRoleRegistry;
 }
 
 /** A connect-intent message parsed by {@link parseConnectIntent}. */
@@ -142,6 +148,7 @@ export class SpaceService {
   readonly #digestTimeoutMs: number;
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   readonly #connect: ConnectExtensionDeps | undefined;
+  readonly #modelRoles: SessionModelRoleRegistry | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
@@ -186,6 +193,7 @@ export class SpaceService {
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
     this.#connect = deps.connect;
+    this.#modelRoles = deps.modelRoles;
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
@@ -290,6 +298,9 @@ export class SpaceService {
     // Unref so a long-lived idle timer never keeps the process (or test run) alive.
     live.idleTimer.unref?.();
     this.#sessions.set(spaceId, live);
+    // use_model reachability (issue #64): the live session is the switch
+    // target until dispose removes it.
+    this.#modelRoles?.set(spaceId, session);
     return live;
   }
 
@@ -318,6 +329,7 @@ export class SpaceService {
       this.#churnActive.delete(spaceId);
       this.#turnDelivered.delete(spaceId);
       this.#sessions.delete(spaceId);
+      this.#modelRoles?.delete(spaceId);
     }
   }
 

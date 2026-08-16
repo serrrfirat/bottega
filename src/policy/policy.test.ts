@@ -69,7 +69,9 @@ describe("tier resolution", () => {
     }
   });
   test("write-tier tools", () => {
-    for (const t of ["write", "edit", "memory.save"]) expect(resolveTier(t)).toBe("write");
+    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model"]) expect(resolveTier(t)).toBe("write");
+    expect(isKnownTool("model_settings")).toBe(true);
+    expect(isKnownTool("use_model")).toBe(true);
   });
   test("exec-tier tools", () => {
     for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension"]) {

@@ -10,8 +10,34 @@ export type Space = {
   channel_id: string;
   name: string | null;
   policy_json: string;
+  /** Per-space model settings JSON (issue #64): the `model_settings` tool's persistence home. */
+  settings: string;
   created_at: number;
   updated_at: number;
+};
+
+/**
+ * Thinking-effort values the space can pin for the reasoning role (issue
+ * #64). A subset of the OMP effort scale — enough granularity for the
+ * fast/reasoning split without exposing the full ladder.
+ */
+export type ModelThinkingLevel = "off" | "low" | "medium" | "high";
+
+/**
+ * Per-space model settings (issue #64), stored as the `spaces.settings`
+ * JSON column. Model ids are bare ids as the session lists them (e.g.
+ * "deepseek-v4-flash"); each slot falls back to `model` when unset at role
+ * resolution (see resolveRoleTarget in agent-driver.ts).
+ */
+export type SpaceModelSettings = {
+  /** The space's default model (the `default` role). */
+  model?: string;
+  /** Thinking effort for the reasoning role; also the space default effort. */
+  reasoning_effort?: ModelThinkingLevel;
+  /** Model for the `fast` role (falls back to `model` when unset). */
+  fast_model?: string;
+  /** Model for the `reasoning` role (falls back to `model` when unset). */
+  reasoning_model?: string;
 };
 
 export type WorkItemState = "open" | "claimed" | "working" | "review" | "done" | "blocked" | "aborted";
@@ -92,6 +118,10 @@ export interface Store {
   }): Promise<Space>;
   getSpace(id: string): Promise<Space | null>;
   updatePolicy(id: string, policyJson: string): Promise<Space>;
+  /** Per-space model settings (issue #64): the parsed `spaces.settings` column, {} when unset/invalid. */
+  getSpaceSettings(id: string): Promise<SpaceModelSettings>;
+  /** Replaces the space's model settings JSON; throws when the space does not exist. */
+  updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space>;
   createWorkItem(input: {
     space_id: string;
     requester: string;
@@ -173,6 +203,40 @@ function prUrlFromResult(result: string | undefined): string | null {
   }
 }
 
+const MODEL_SETTING_KEYS = ["model", "reasoning_effort", "fast_model", "reasoning_model"] as const;
+const MODEL_THINKING_LEVELS: readonly string[] = ["off", "low", "medium", "high"];
+
+/**
+ * Parses the `spaces.settings` JSON column into a SpaceModelSettings.
+ * Defensive (the column is only ever written by the store, but a hand-edited
+ * or older DB must not crash the reader): known keys with valid values
+ * survive; anything else is dropped. Invalid JSON yields {}.
+ */
+export function parseSpaceSettings(text: string | null | undefined): SpaceModelSettings {
+  if (!text?.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+  const out: SpaceModelSettings = {};
+  const record = parsed as Record<string, unknown>;
+  for (const key of MODEL_SETTING_KEYS) {
+    const value = record[key];
+    if (typeof value !== "string" || !value.trim()) continue;
+    const trimmed = value.trim();
+    if (key === "reasoning_effort") {
+      if (!MODEL_THINKING_LEVELS.includes(trimmed)) continue;
+      out.reasoning_effort = trimmed as SpaceModelSettings["reasoning_effort"];
+    } else {
+      out[key] = trimmed;
+    }
+  }
+  return out;
+}
+
 /**
  * Opens (creating if needed) the SQLite store at `dbPath` and runs the
  * idempotent schema migration (src/store/schema.sql). WAL mode + busy_timeout
@@ -192,6 +256,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   if (!workItemColumns.includes("repo")) {
     db.exec("ALTER TABLE work_items ADD COLUMN repo TEXT");
   }
+  // Idempotent migration (issue #64): databases created before the model
+  // settings column existed keep their spaces table (CREATE TABLE IF NOT
+  // EXISTS is a no-op), so add the column explicitly when it is missing.
+  const spaceColumns = (db.query("PRAGMA table_info(spaces)").all() as { name: string }[]).map((c) => c.name);
+  if (!spaceColumns.includes("settings")) {
+    db.exec("ALTER TABLE spaces ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'");
+  }
 
   const getSpaceStmt = db.query("SELECT * FROM spaces WHERE id = ?");
   const getWorkItemStmt = db.query("SELECT * FROM work_items WHERE id = ?");
@@ -204,8 +275,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const id = `${input.platform}:${input.channel_id}`;
     const t = Date.now();
     db.query(
-      `INSERT INTO spaces (id, platform, channel_id, name, policy_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, '{}', ?, ?)
+      `INSERT INTO spaces (id, platform, channel_id, name, policy_json, settings, created_at, updated_at)
+       VALUES (?, ?, ?, ?, '{}', '{}', ?, ?)
        ON CONFLICT(id) DO NOTHING`,
     ).run(id, input.platform, input.channel_id, input.name ?? null, t, t);
     return getSpaceStmt.get(id) as Space;
@@ -219,6 +290,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const row = db
       .query("UPDATE spaces SET policy_json = ?, updated_at = ? WHERE id = ? RETURNING *")
       .get(policyJson, Date.now(), id) as Space | null;
+    if (!row) throw new Error(`space not found: ${id}`);
+    return row;
+  }
+
+  async function getSpaceSettings(id: string): Promise<SpaceModelSettings> {
+    const space = await getSpace(id);
+    return space ? parseSpaceSettings(space.settings) : {};
+  }
+
+  async function updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space> {
+    const row = db
+      .query("UPDATE spaces SET settings = ?, updated_at = ? WHERE id = ? RETURNING *")
+      .get(JSON.stringify(settings), Date.now(), id) as Space | null;
     if (!row) throw new Error(`space not found: ${id}`);
     return row;
   }
@@ -410,6 +494,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getOrCreateSpace,
     getSpace,
     updatePolicy,
+    getSpaceSettings,
+    updateSpaceSettings,
     createWorkItem,
     claimNextWorkItem,
     transitionWorkItem,

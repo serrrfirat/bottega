@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
+import { createStore, parseSpaceSettings, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-store-"));
 const dbPath = join(dir, "test.db");
@@ -58,6 +58,91 @@ describe("spaces", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("model settings default to {} and round-trip per space (issue #64)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C2M" });
+    expect(await s.getSpaceSettings(space.id)).toEqual({});
+    expect(await s.getSpaceSettings("slack:missing")).toEqual({});
+
+    const updated = await s.updateSpaceSettings(space.id, {
+      model: "deepseek-v4-flash",
+      reasoning_effort: "medium",
+      fast_model: "flash-lite",
+      reasoning_model: "deepseek-reasoner",
+    });
+    expect(updated.settings).toBe(
+      JSON.stringify({
+        model: "deepseek-v4-flash",
+        reasoning_effort: "medium",
+        fast_model: "flash-lite",
+        reasoning_model: "deepseek-reasoner",
+      }),
+    );
+    expect(await s.getSpaceSettings(space.id)).toEqual({
+      model: "deepseek-v4-flash",
+      reasoning_effort: "medium",
+      fast_model: "flash-lite",
+      reasoning_model: "deepseek-reasoner",
+    });
+
+    // Another space is untouched (settings are per-space).
+    const other = await s.getOrCreateSpace({ platform: "telegram", channel_id: "T2M" });
+    expect(await s.getSpaceSettings(other.id)).toEqual({});
+
+    // updateSpaceSettings throws for a missing space.
+    expect(s.updateSpaceSettings("slack:missing", { model: "x" })).rejects.toThrow(/space not found/);
+  });
+
+  test("model settings survive a store reopen on the same file (issue #64)", async () => {
+    const dbPath = join(dir, "store-settings-persist.db");
+    const s1 = createStore(dbPath);
+    const space = await s1.getOrCreateSpace({ platform: "slack", channel_id: "C2P" });
+    await s1.updateSpaceSettings(space.id, { model: "deepseek-v4-flash", reasoning_effort: "high" });
+    s1.close();
+
+    const s2 = createStore(dbPath);
+    expect(await s2.getSpaceSettings(space.id)).toEqual({ model: "deepseek-v4-flash", reasoning_effort: "high" });
+    s2.close();
+  });
+
+  test("the settings column migration is idempotent on a pre-settings database (issue #64)", async () => {
+    const dbPath = join(dir, "store-settings-legacy.db");
+    // A database created before issue #64: spaces has no settings column.
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE spaces (
+        id          TEXT PRIMARY KEY,
+        platform    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        name        TEXT,
+        policy_json TEXT NOT NULL DEFAULT '{}',
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+    `);
+    legacy.close();
+
+    // First open migrates (column added with the '{}' default); a second
+    // open must be a no-op (idempotent).
+    const s1 = createStore(dbPath);
+    const space = await s1.getOrCreateSpace({ platform: "slack", channel_id: "C2L" });
+    expect(await s1.getSpaceSettings(space.id)).toEqual({});
+    await s1.updateSpaceSettings(space.id, { model: "migrated-model" });
+    s1.close();
+
+    const s2 = createStore(dbPath);
+    expect(await s2.getSpaceSettings(space.id)).toEqual({ model: "migrated-model" });
+    s2.close();
+  });
+
+  test("parseSpaceSettings drops unknown keys and invalid values", async () => {
+    expect(parseSpaceSettings(null)).toEqual({});
+    expect(parseSpaceSettings("not json")).toEqual({});
+    expect(parseSpaceSettings('{"model":"m","bogus":1}')).toEqual({ model: "m" });
+    expect(parseSpaceSettings('{"model":"  m  ","reasoning_effort":"ultra"}')).toEqual({ model: "m" });
+    expect(parseSpaceSettings('{"reasoning_effort":"high"}')).toEqual({ reasoning_effort: "high" });
   });
 });
 

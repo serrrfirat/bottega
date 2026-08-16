@@ -6,7 +6,7 @@ import type { AuditModule } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import { evaluatePolicyGate } from "../../policy/gate";
 import type { PolicyConfig } from "../../policy/config";
-import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions, type DriverEvent } from "./agent-driver";
+import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions, type DriverEvent, type ModelRole, type ModelRoleSwitchResult } from "./agent-driver";
 
 /**
  * ACP (Agent Client Protocol) driver — the second AgentDriver implementation.
@@ -339,6 +339,22 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   on(event: DriverEvent, cb: (data: unknown) => void): () => void {
     return this.#emitter.on(event, cb);
+  }
+
+  /**
+   * Documented not-supported (issue #64): ACP v1 has no per-session model
+   * switch message, and the spawned agent's own config governs its model.
+   * Returns a clear result so the `use_model` tool can surface it instead of
+   * pretending the switch happened.
+   */
+  async setModelRole(role: ModelRole): Promise<ModelRoleSwitchResult> {
+    return {
+      applied: false,
+      role,
+      model: null,
+      thinking_level: null,
+      reason: "ACP sessions cannot switch models mid-session: the agent's own config governs there",
+    };
   }
 
   async dispose(): Promise<void> {

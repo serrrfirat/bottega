@@ -42,3 +42,7 @@ export const EXTENSION_CALL_EVENT = "extension.call";
 export const MESSAGE_DROPPED_EVENT = "message_dropped";
 /** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */
 export const DIGEST_FAILED_EVENT = "digest.failed";
+/** Per-space model settings changed (payload {before, after, by}). */
+export const MODEL_SETTINGS_CHANGED_EVENT = "model.settings_changed";
+/** Session model role switched for the next turn (payload {role, model, thinking_level, by}). */
+export const MODEL_SWITCHED_EVENT = "model.switched";

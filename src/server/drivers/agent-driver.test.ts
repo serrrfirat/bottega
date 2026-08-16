@@ -10,8 +10,16 @@ import type { ExtensionRuntime } from "../../extensions/runtime";
 import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
-import { createStore } from "../../store/db";
-import { createOmpSdkDriver, sessionIdFromFilePath, SPACE_AGENT_TOOLS, spaceAgentToolNames } from "./agent-driver";
+import { createStore, type SpaceModelSettings } from "../../store/db";
+import {
+  createOmpSdkDriver,
+  OmpSessionDriver,
+  resolveRoleTarget,
+  sessionIdFromFilePath,
+  SPACE_AGENT_TOOLS,
+  spaceAgentToolNames,
+} from "./agent-driver";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 
 describe("omp sdk agent driver", () => {
   test("createSession materializes the space transcript file and disposes cleanly", async () => {
@@ -152,12 +160,13 @@ describe("omp sdk agent driver", () => {
     }
   });
 
-  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect tools, no executor tools", () => {
+  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect/model tools, no executor tools", () => {
     // The space agent is a participant, not an executor: it may read the
-    // workspace, delegate via task, and use the work-item + memory tools —
-    // never write/bash/edit (those are EXECUTOR_TOOLS in executor.ts). The
-    // connect capability (issue #52) is listed here; its definition rides
-    // the custom-tools path, see createOmpSdkDriver.
+    // workspace, delegate via task, and use the work-item + memory + model
+    // tools — never write/bash/edit (those are EXECUTOR_TOOLS in
+    // executor.ts). The connect capability (issue #52) is listed here; its
+    // definition rides the custom-tools path, see createOmpSdkDriver. The
+    // model tools (issue #64) are the chat settings/role-switch surface.
     const allowed: readonly string[] = SPACE_AGENT_TOOLS;
     expect([...allowed].sort()).toEqual(
       [
@@ -174,6 +183,8 @@ describe("omp sdk agent driver", () => {
         "connect_extension",
         "memory.save",
         "memory.search",
+        "model_settings",
+        "use_model",
       ].sort(),
     );
     expect(SPACE_AGENT_TOOLS).not.toContain("write");
@@ -298,5 +309,125 @@ describe("omp sdk agent driver", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("resolveRoleTarget (issue #64)", () => {
+  const settings: SpaceModelSettings = {
+    model: "deepseek-v4-flash",
+    reasoning_effort: "medium",
+    fast_model: "flash-lite",
+    reasoning_model: "deepseek-reasoner",
+  };
+
+  test("default → space model at the space's default effort", () => {
+    expect(resolveRoleTarget("default", settings)).toEqual({
+      modelId: "deepseek-v4-flash",
+      thinkingLevel: "medium",
+    });
+  });
+
+  test("fast → fast_model (falls back to model) at fixed low effort", () => {
+    expect(resolveRoleTarget("fast", settings)).toEqual({ modelId: "flash-lite", thinkingLevel: "low" });
+    expect(resolveRoleTarget("fast", { model: "m" })).toEqual({ modelId: "m", thinkingLevel: "low" });
+  });
+
+  test("reasoning → reasoning_model (falls back to model) at reasoning_effort, default high", () => {
+    expect(resolveRoleTarget("reasoning", settings)).toEqual({
+      modelId: "deepseek-reasoner",
+      thinkingLevel: "medium",
+    });
+    expect(resolveRoleTarget("reasoning", { model: "m" })).toEqual({ modelId: "m", thinkingLevel: "high" });
+    expect(resolveRoleTarget("reasoning", { model: "m", reasoning_effort: "off" })).toEqual({
+      modelId: "m",
+      thinkingLevel: "off",
+    });
+  });
+
+  test("unconfigured slots yield no switch (applied: false path)", () => {
+    expect(resolveRoleTarget("default", {})).toEqual({});
+    expect(resolveRoleTarget("fast", { fast_model: "f" })).toEqual({ modelId: "f", thinkingLevel: "low" });
+    expect(resolveRoleTarget("reasoning", { reasoning_effort: "high" })).toEqual({ thinkingLevel: "high" });
+  });
+});
+
+describe("OmpSessionDriver.setModelRole (issue #64)", () => {
+  /** A stub SDK session: records model/thinking switches, serves a fixed model list. */
+  function stubSession(models: Array<{ id: string; provider: string }> = []) {
+    const calls: Array<{ modelId: string; thinkingLevel?: string; persist?: boolean }> = [];
+    const thinkingCalls: string[] = [];
+    return {
+      session: {
+        getAvailableModels: () =>
+          models.map((m) => ({ id: m.id, provider: m.provider, name: m.id, api: "openai-completions", baseUrl: "http://x", reasoning: true, input: ["text"] })),
+        setModel: async (_model: { id: string }, _role?: string, options?: { thinkingLevel?: string; persist?: boolean }) => {
+          calls.push({ modelId: _model.id, thinkingLevel: options?.thinkingLevel, persist: options?.persist });
+          return { switched: true };
+        },
+        setThinkingLevel: (level?: string) => void thinkingCalls.push(level ?? ""),
+        subscribe: () => () => {},
+        beginDispose: () => {},
+        dispose: async () => {},
+        isStreaming: false,
+        prompt: async () => {},
+        steer: async () => {},
+        followUp: async () => {},
+        abort: async () => {},
+      } as unknown as AgentSession,
+      calls,
+      thinkingCalls,
+    };
+  }
+
+  function sessionWithSettings(spaceId: string, settings: SpaceModelSettings, models: Array<{ id: string; provider: string }> = []) {
+    const stub = stubSession(models);
+    const driver = new OmpSessionDriver({
+      spaceId,
+      session: stub.session,
+      onOutput: () => {},
+      getModelSettings: async () => settings,
+    });
+    return { driver, stub };
+  }
+
+  test("fast role applies fast_model at low effort, non-persisting", async () => {
+    const { driver, stub } = sessionWithSettings(
+      "slack:C1",
+      { model: "deep-model", fast_model: "flash-lite" },
+      [{ id: "flash-lite", provider: "opencode-go" }, { id: "deep-model", provider: "opencode-go" }],
+    );
+    const result = await driver.setModelRole("fast");
+    expect(result).toEqual({ applied: true, role: "fast", model: "flash-lite", thinking_level: "low" });
+    expect(stub.calls).toEqual([{ modelId: "flash-lite", thinkingLevel: "low", persist: false }]);
+  });
+
+  test("default role applies the space model; a missing model id fails closed", async () => {
+    // Model not in the session's available set → the switch throws rather
+    // than silently keeping the old model.
+    const { driver, stub } = sessionWithSettings("slack:C1", { model: "ghost-model" });
+    await expect(driver.setModelRole("default")).rejects.toThrow(/ghost-model.*not available/);
+    expect(stub.calls).toEqual([]);
+  });
+
+  test("an effort-only switch (reasoning with no model slots) calls setThinkingLevel", async () => {
+    const { driver, stub } = sessionWithSettings("slack:C1", { reasoning_effort: "high" });
+    const result = await driver.setModelRole("reasoning");
+    expect(result).toEqual({ applied: true, role: "reasoning", model: null, thinking_level: "high" });
+    expect(stub.calls).toEqual([]);
+    expect(stub.thinkingCalls).toEqual(["high"]);
+  });
+
+  test("no settings → applied: false without touching the session", async () => {
+    const { driver, stub } = sessionWithSettings("slack:C1", {});
+    const result = await driver.setModelRole("default");
+    expect(result).toEqual({
+      applied: false,
+      role: "default",
+      model: null,
+      thinking_level: null,
+      reason: "no model settings configured for this space",
+    });
+    expect(stub.calls).toEqual([]);
+    expect(stub.thinkingCalls).toEqual([]);
   });
 });

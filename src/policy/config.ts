@@ -132,6 +132,10 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // in non-yolo modes), search only queries (read).
   "memory.save": "write",
   "memory.search": "read",
+  // Model tools (issue #64): both mutate durable state (per-space settings,
+  // the live session's model) — write tier like memory.save.
+  model_settings: "write",
+  use_model: "write",
 };
 
 export interface MemoryInjectionConfig {

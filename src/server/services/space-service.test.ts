@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "bun:test";
 import type { Store, ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
-import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
+import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, parseConnectIntent } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
 import { parseOrgConfigYaml } from "../../policy/config";
@@ -224,6 +224,29 @@ describe("SpaceService session lifecycle", () => {
     expect(driver.created).toHaveLength(1);
     expect(driver.created[0].opts.spaceId).toBe("slack:C1");
     expect(driver.last().prompts).toEqual([{ text: "hello", opts: undefined }]);
+  });
+
+  test("live sessions register in the model-role registry and unregister on dispose (issue #64)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    vi.useFakeTimers();
+    try {
+      const modelRoles = new SessionModelRoleRegistry();
+      const service = new SpaceService({ store, adapter, driver, modelRoles, idleTimeoutMs: 20 });
+
+      expect(modelRoles.has("slack:C1")).toBe(false);
+      await service.handleInboundMessage(msg());
+
+      // The live session is the use_model switch target while it lives.
+      expect(modelRoles.has("slack:C1")).toBe(true);
+
+      vi.advanceTimersByTime(20); // idle timer fires; dispose runs
+      for (let i = 0; i < 5; i++) await Promise.resolve(); // flush the dispose finally-block
+      expect(modelRoles.has("slack:C1")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("each space gets its own session", async () => {
