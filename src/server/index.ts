@@ -3,6 +3,8 @@
  */
 import { createStore } from "../store/db";
 import { pruneDigestMemories } from "../memory/sqlite";
+import { maintainMemory, type ConsolidationModelCall } from "../memory/consolidation";
+import { sessionSearchToolDefinitions } from "../memory/session-search";
 import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
@@ -35,11 +37,13 @@ import {
   SessionModelRoleRegistry,
   sessionIdFromFilePath,
   type AgentDriver,
+  type AgentSessionDriver,
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
+import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -111,9 +115,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const orgPolicy = loadOrgPolicy(store);
   // One memory provider for the whole process: shared by the agent
   // memory tools, the context-injection extension, and digest-on-idle (#42).
-  // Selected from settings (#67): memory_backend.base_url set → mem0
-  // backend (compose ships it), else SQLite sharing the store's database
-  // handle.
+  // Explicit memory_backend.base_url settings select mem0 first; compose's
+  // MEM0_BASE_URL is the deployment fallback. An unset local environment
+  // keeps SQLite on the store database.
   const memoryProvider = resolveMemoryProvider(orgSettings, store.getDb());
   const schedulerRegistry = buildRegistry([
     standupDigestAction,
@@ -258,6 +262,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
               env: {
                 BOTTEGA_DB_PATH: process.env.BOTTEGA_DB_PATH ?? "data/bottega.db",
                 BOTTEGA_CONFIG_DIR: process.env.BOTTEGA_CONFIG_DIR ?? process.cwd(),
+                // Absolute because ACP starts the MCP child from the session workspace.
+                BOTTEGA_SESSION_DIR: join(process.cwd(), "data/sessions"),
                 // The MCP server boots the same extension registry (issue
                 // #61) so ACP agents see connect_extension + extension
                 // tools; the driver absolutizes the relative path because
@@ -325,6 +331,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           tools: [
             ...workItemToolDefinitions(store, { orgPolicy }),
             ...memoryToolDefinitions(memoryProvider, { audit }),
+            ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
             ...modelToolsDefinitions(store, { audit, modelRoles }),
             ...settingsToolDefinitions(store, { audit }),
             // Admin tools (issue #73): catalog browser, stack health,
@@ -359,6 +366,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       });
     });
   const driver = createDriver(agentDir);
+  const learning = createLearningService({
+    driver,
+    memory: memoryProvider,
+    audit,
+    autoExtract: orgPolicy.learning.autoExtract,
+  });
+
   // Boot-time guard (issue #80): createOmpSdkDriver installs the agent dir
   // as the process-global dir at construction; fail the boot here — not the
   // first prompt — when the SDK's model registry then resolves no available
@@ -368,10 +382,67 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     const available = await assertAgentDirModelAvailable(agentDir);
     console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
   }
+  let consolidationSequence = 0;
+  const consolidationModelCall: ConsolidationModelCall = async (systemPrompt, input) => {
+    let reply: string | undefined;
+    let sideSession: AgentSessionDriver | undefined;
+    let offMessage: (() => void) | undefined;
+    try {
+      sideSession = await driver.createSession({
+        spaceId: `memory-consolidation:${++consolidationSequence}`,
+        transcriptDir: "data/memory-consolidation",
+        allowTools: [],
+        appendSystemPrompt: systemPrompt,
+        onOutput: (_spaceId, text) => {
+          if (text.trim()) reply = text;
+        },
+      });
+      offMessage = sideSession.on("message", (data) => {
+        const text = (data as { text?: unknown } | null)?.text;
+        if (typeof text === "string" && text.trim()) reply = text;
+      });
+      // ACP v1 has no system-prompt field, so carry the instructions in-band
+      // on that driver while OMP receives them through appendSystemPrompt.
+      await sideSession.prompt(
+        orgPolicy.agentDriver === "acp" ? `${systemPrompt}\n\n${input}` : input,
+      );
+      return reply;
+    } finally {
+      offMessage?.();
+      if (sideSession) {
+        try {
+          await sideSession.dispose();
+        } catch (error) {
+          console.error("[memory-consolidation] side-session dispose failed:", error);
+        }
+      }
+    }
+  };
+
+  let consolidationInFlight: Promise<void> | undefined;
+  const runMemoryMaintenance = (): void => {
+    if (memoryProvider.backend !== "sqlite" || consolidationInFlight) return;
+    consolidationInFlight = (async () => {
+      try {
+        await maintainMemory(store.getDb(), consolidationModelCall);
+      } catch (error) {
+        console.error("[memory-consolidation] maintenance failed:", error);
+      } finally {
+        consolidationInFlight = undefined;
+      }
+    })();
+  };
+  const memoryMaintenanceInterval =
+    memoryProvider.backend === "sqlite"
+      ? setInterval(runMemoryMaintenance, 6 * 60 * 60 * 1_000)
+      : undefined;
+  memoryMaintenanceInterval?.unref?.();
+  runMemoryMaintenance();
   spaceService = new SpaceService({
     store,
     adapter,
     driver,
+    learning,
     // Per-space response mode (issue #55): the request-only directive is
     // appended at session creation.
     responseModeFor,
@@ -428,9 +499,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       scheduler.start();
     },
     async stop() {
+      if (memoryMaintenanceInterval) clearInterval(memoryMaintenanceInterval);
       deliveryPoller.stop();
       scheduler.stop();
       await spaceService.stop();
+      await consolidationInFlight;
       await adapter.stop();
       store.close();
     },

@@ -1,4 +1,5 @@
 import type { MemoryScope } from "./types";
+type BurstTimer = Timer;
 
 export interface ExtractionTurn {
   input: string;
@@ -15,8 +16,8 @@ export interface BurstBufferOptions {
   maxTurns?: number;
   now?: () => number;
   flush: (spaceId: string, turns: readonly ExtractionTurn[]) => Promise<void> | void;
-  setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
-  clearTimer?: (timer: NodeJS.Timeout) => void;
+  setTimer?: (callback: () => void, delayMs: number) => BurstTimer;
+  clearTimer?: (timer: BurstTimer) => void;
 }
 
 export interface BurstBuffer {
@@ -29,7 +30,7 @@ export interface BurstBuffer {
 interface PendingBurst {
   turns: ExtractionTurn[];
   updatedAt: number;
-  timer: NodeJS.Timeout | undefined;
+  timer: BurstTimer | undefined;
 }
 
 /**

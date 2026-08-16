@@ -55,7 +55,9 @@ describe("burst buffer", () => {
       quietMs: 100,
       maxTurns: 10,
       now: () => now,
-      flush: (spaceId, turns) => flushed.push({ spaceId, turns }),
+      flush: (spaceId, turns) => {
+        flushed.push({ spaceId, turns });
+      },
     });
 
     buffer.add("slack:C1", { input: "one", reply: "first" });
@@ -77,7 +79,9 @@ describe("burst buffer", () => {
     const buffer = createBurstBuffer({
       quietMs: 10_000,
       maxTurns: 2,
-      flush: (spaceId, turns) => flushed.push({ spaceId, turns }),
+      flush: (spaceId, turns) => {
+        flushed.push({ spaceId, turns });
+      },
     });
 
     buffer.add("slack:C1", { input: "one", reply: "first" });

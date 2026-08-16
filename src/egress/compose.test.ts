@@ -149,12 +149,11 @@ describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
     expect(env["OPENAI_API_KEY"]).toBe("${OPENAI_API_KEY:-}");
   });
 
-  test("server env no longer carries the memory backend URL (an org setting, issue #67)", () => {
+  test("server defaults MEM0_BASE_URL to the internal mem0 service (issue #135)", () => {
     const env = serviceEnv("server");
-    // The backend URL is a settings knob (memory_backend.base_url), not an
-    // env var: unset → SQLite memory. The optional API key stays env
-    // (secret; the OSS server only demands it when auth is enabled).
-    expect(env["MEM0_BASE_URL"]).toBeUndefined();
+    // Compose selects mem0 by default while an explicit project .env value
+    // can override it. Local development has no compose env and stays SQLite.
+    expect(env["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL:-http://mem0:8000}");
     expect(env["MEM0_API_KEY"]).toBe("${MEM0_API_KEY:-}");
   });
 });

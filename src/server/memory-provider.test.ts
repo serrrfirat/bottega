@@ -73,8 +73,9 @@ describe("resolveMemoryProvider (issue #43)", () => {
       const provider = resolveMemoryProvider(
         { memoryBackend: { baseUrl: stub.server.url.href } },
         freshDb(),
-        { MEM0_API_KEY: "m0sk-test" },
+        { MEM0_BASE_URL: "http://127.0.0.1:1", MEM0_API_KEY: "m0sk-test" },
       );
+      expect(provider.backend).toBe("mem0");
       const saved = await provider.save({ scope: "org", content: "selection test fact" });
       expect(saved.content).toBe("selection test fact");
       // Wire contract: org scope maps to a fixed agent_id, key travels as
@@ -92,15 +93,33 @@ describe("resolveMemoryProvider (issue #43)", () => {
     }
   });
 
+  test("MEM0_BASE_URL selects mem0 when the org setting is absent", async () => {
+    const stub = createStub();
+    try {
+      const provider = resolveMemoryProvider(
+        {},
+        freshDb(),
+        { MEM0_BASE_URL: stub.server.url.href },
+      );
+      expect(provider.backend).toBe("mem0");
+      await provider.save({ scope: "org", content: "environment fallback fact" });
+      expect(stub.requests).toHaveLength(1);
+      expect(stub.requests[0].path).toBe("/memories");
+    } finally {
+      await stub.stop();
+    }
+  });
+
   test("memory_backend.base_url unset → SQLite provider sharing the store database", async () => {
     const db = freshDb();
-    const provider = resolveMemoryProvider(null, db);
+    const provider = resolveMemoryProvider(null, db, {});
+    expect(provider.backend).toBe("sqlite");
     const saved = await provider.save({ scope: "org", content: "sqlite fallback fact" });
     expect(saved.id).toBeTruthy();
     const hits = await provider.search({ scope: "org", query: "sqlite fallback" });
     expect(hits.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
     // Same database handle: a second provider sees the same rows.
-    const again = resolveMemoryProvider({}, db);
+    const again = resolveMemoryProvider({}, db, {});
     const more = await again.search({ scope: "org", query: "sqlite fallback" });
     expect(more.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
   });

@@ -1,17 +1,14 @@
 /**
- * Memory provider selection (issues #43, #67).
+ * Memory provider selection (issues #43, #67, #135).
  *
- * The server picks its memory backend from the org settings blob (DB is
- * the source of truth — issue #67 env pruning moved the knob out of env):
- *   - memory_backend.base_url set → mem0 OSS server backend (self-hosted,
- *     shipped as the `mem0` compose service). MEM0_API_KEY stays an env
- *     secret (optional — the OSS server only demands a key when its auth
- *     is enabled).
- *   - otherwise → the SQLite provider (original default, #20).
+ * Resolution order:
+ *   1. Explicit org setting `memory_backend.base_url`.
+ *   2. `MEM0_BASE_URL` from the deployment environment.
+ *   3. SQLite sharing the store database.
  *
- * Pure: reads only the passed settings object (plus the env record for the
- * optional API key), so tests can drive both branches without touching
- * process.env.
+ * `MEM0_API_KEY` remains an optional environment secret. Pure apart from
+ * the default environment argument, so tests can drive every branch without
+ * mutating process.env.
  */
 import type { Database } from "bun:sqlite";
 import type { MemoryProvider } from "../memory/types";
@@ -23,14 +20,23 @@ export interface MemoryProviderSettings {
   memoryBackend?: { baseUrl?: string };
 }
 
+export type ResolvedMemoryProvider = MemoryProvider & {
+  readonly backend: "mem0" | "sqlite";
+};
+
 export function resolveMemoryProvider(
   settings: MemoryProviderSettings | null | undefined,
   storeDb: Database,
   env: Record<string, string | undefined> = process.env,
-): MemoryProvider {
-  const baseUrl = settings?.memoryBackend?.baseUrl;
+): ResolvedMemoryProvider {
+  const baseUrl = settings?.memoryBackend?.baseUrl || env.MEM0_BASE_URL;
   if (baseUrl) {
-    return createMem0MemoryProvider({ baseUrl, apiKey: env.MEM0_API_KEY });
+    return Object.assign(
+      createMem0MemoryProvider({ baseUrl, apiKey: env.MEM0_API_KEY }),
+      { backend: "mem0" as const },
+    );
   }
-  return createSqliteMemoryProvider(storeDb);
+  return Object.assign(createSqliteMemoryProvider(storeDb), {
+    backend: "sqlite" as const,
+  });
 }

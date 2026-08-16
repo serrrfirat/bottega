@@ -3,10 +3,6 @@
 # file is the per-deployment template, mounted from config/omp/ by compose.
 secrets:
   enabled: true
-# Automatic durable-fact extraction from human conversation bursts (#133).
-# Invalid values disable extraction; omit this block to keep the true default.
-learning:
-  auto_extract: true
 # Default model role (issue #78): pinned so the session never silently
 # shifts to the opencode-go provider's catalog default (kimi-k2.7-code)
 # when the catalog updates. When no opencode key is configured the model
