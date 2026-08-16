@@ -233,6 +233,53 @@ describe("startDeliveryPoller (issue #12)", () => {
     }
   });
 
+  test("a slow postMessage cannot overlap the next pass (issue #70)", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new FakeStore();
+      store.deliveryPending(SPACE, "wi_1", PR_URL);
+      // Slack latency under load: postMessage hangs until released, so the
+      // first pass is still inside the announce step when the interval
+      // elapses. The old setInterval loop started a second pass then, which
+      // re-read the audit trail BEFORE delivery.requested was recorded and
+      // double-announced. Chained ticks must wait for the pass to finish.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const adapter = new FakeAdapter();
+      const realPost = adapter.postMessage.bind(adapter);
+      adapter.postMessage = async (spaceId, text) => {
+        await gate;
+        return realPost(spaceId, text);
+      };
+
+      const poller = startDeliveryPoller({ store, adapter, intervalMs: 10 });
+      poller.start();
+      await flushMicrotasks();
+      expect(adapter.posted).toHaveLength(0); // first pass stuck in postMessage
+
+      // The interval elapses while the first pass is still in flight: the
+      // chained design has no timer scheduled until the pass completes.
+      vi.advanceTimersByTime(10);
+      await flushMicrotasks();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(adapter.posted).toHaveLength(0);
+
+      release(); // pass finishes: post + delivery.requested recorded
+      await flushMicrotasks();
+      expect(adapter.posted).toHaveLength(1);
+      expect(store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT)).toHaveLength(1);
+
+      // The chained tick after completion re-reads the trail and dedupes.
+      vi.advanceTimersByTime(10);
+      await flushMicrotasks();
+      poller.stop();
+      expect(adapter.posted).toHaveLength(1);
+      expect(store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("default interval is 5 seconds (documented contract)", () => {
     expect(DEFAULT_POLL_INTERVAL_MS).toBe(5000);
   });

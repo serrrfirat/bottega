@@ -272,6 +272,33 @@ async function waitForMessage(
   }
 }
 
+/**
+ * Bounded wait for the poller's delivery.requested audit row: the poller
+ * writes it AFTER its postMessage, and the executor's done state says
+ * nothing about when that write landed. Under CI load the poller's tick can
+ * arrive a beat later, so the assertion must poll instead of reading the
+ * trail at an arbitrary moment (issue #70). Deterministic time control
+ * cannot work here: the poller and executor are live loops on the real
+ * event loop (poller intervalMs 20), so the test waits on the real clock —
+ * same pattern as waitForState/waitForMessage below.
+ */
+async function waitForDeliveryRequested(
+  store: Harness["store"],
+  timeoutMs = 10_000,
+): Promise<Array<{ event_type: string; payload: string }>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const requested = await store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+    if (requested.length > 0) return requested;
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting for the delivery poller's delivery.requested audit row");
+    }
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 20);
+    await promise;
+  }
+}
+
 async function findOpenItem(harness: Harness, spaceId: string, timeoutMs = 30_000): Promise<WorkItem> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -402,7 +429,10 @@ describe("journey 2: work items + approvals + executor", () => {
         const pending = await harness.store.listAudit({ event_type: DELIVERY_PENDING_EVENT });
         expect(pending).toHaveLength(1);
         expect(JSON.parse(pending[0].payload)).toMatchObject({ id: item.id, pr_url: result.pr_url });
-        const requested = await harness.store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+        // The poller records delivery.requested AFTER its postMessage; under
+        // load that write can land a tick after `done`. Wait for the row
+        // (bounded) instead of asserting on a snapshot (issue #70).
+        const requested = await waitForDeliveryRequested(harness.store);
         expect(requested).toHaveLength(1);
         const announcedRows = harness.messages(dm).filter((m) => m.text.includes("PR ready:"));
         expect(announcedRows).toHaveLength(1);

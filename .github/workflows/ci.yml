@@ -14,7 +14,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
-          cache: true
+          # setup-bun v2 has NO `cache` input (it accepts only bun-version /
+          # no-cache); no-cache=false covers just the executable download.
+          # The `ci` job fits its 5-min budget without install caching, so
+          # nothing further is configured here (issue #70).
       - run: bun install --frozen-lockfile
       - run: bun check
       - run: bun test

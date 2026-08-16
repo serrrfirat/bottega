@@ -102,7 +102,8 @@ export async function pollPendingDeliveries(
 export function startDeliveryPoller(deps: DeliveryPollerDeps): DeliveryPoller {
   const log = deps.log ?? (() => {});
   const intervalMs = deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
 
   const tick = async (): Promise<void> => {
     try {
@@ -112,17 +113,29 @@ export function startDeliveryPoller(deps: DeliveryPollerDeps): DeliveryPoller {
       // One bad pass must not kill the loop; unposted rows retry next tick.
       log(`delivery poller: poll failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    // Chain the next pass from the END of this one: each pass re-reads the
+    // audit trail, so an overlapping pass (setInterval while postMessage is
+    // still in flight) would see the pending row unrecorded and announce it
+    // a second time. The next pass starts only after this one recorded its
+    // delivery.requested rows (issue #70).
+    if (running && timer === null) {
+      timer = setTimeout(() => {
+        timer = null;
+        void tick();
+      }, intervalMs);
+    }
   };
 
   return {
     start() {
-      if (timer !== null) return;
+      if (running) return;
+      running = true;
       void tick(); // announce anything pending from before boot immediately
-      timer = setInterval(tick, intervalMs);
     },
     stop() {
+      running = false;
       if (timer !== null) {
-        clearInterval(timer);
+        clearTimeout(timer);
         timer = null;
       }
     },
