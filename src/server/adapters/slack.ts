@@ -165,8 +165,48 @@ export function normalizeActionEvent(action: unknown, body: unknown): SlackActio
 }
 
 /**
+ * Renders Markdown-ish agent text as Slack mrkdwn (issue #84). Applied at
+ * the post/update boundary so everything the adapter sends renders in Slack
+ * instead of showing raw Markdown (`**bold**`, `# heading`, `- bullet`,
+ * `[label](url)`, `---`).
+ *
+ * Scope rule: rewrite ONLY constructs whose Markdown form Slack renders
+ * wrong and whose Slack form differs. Everything Slack already renders
+ * correctly — `` `inline code` ``, ``` fenced blocks, `> quotes`, ~strike~,
+ * single-marker `*bold*`/`_italic_`, `<@mention>`s, `:emoji:` — passes
+ * through untouched. Single asterisks are deliberately not rewritten
+ * (md-em vs Slack bold is ambiguous; corrupting correct Slack bold would be
+ * worse than leaving md-em unrendered).
+ */
+export function renderSlackText(markdown: string): string {
+  // Code (inline + fenced) is already valid Slack; protect it from the
+  // line transforms so `-`/`*`/`#`/`---` inside code stay verbatim.
+  const protectedChunks: string[] = [];
+  const masked = markdown.replace(/```[\s\S]*?```|`[^`\n]+`/g, (chunk) => {
+    protectedChunks.push(chunk);
+    return `\u0000${protectedChunks.length - 1}\u0000`;
+  });
+  const converted = masked
+    // **bold** → *bold* (md strong; Slack would show the ** literally).
+    .replace(/\*\*([^*\n]+)\*\*/g, "*$1*")
+    // # heading → *heading* (Slack has no headings; bold is the closest).
+    .replace(/^#{1,6}\s+(.+)$/gm, "*$1*")
+    // - / * / + line bullets → Slack's • bullets (leading indent kept).
+    .replace(/^([ \t]*)[-+*][ \t]+(.+)$/gm, "$1• $2")
+    // [label](url) → <url|label>.
+    .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, "<$2|$1>")
+    // Standalone --- / *** / ___ rules → dropped (Slack shows the raw line).
+    .replace(/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/gm, "");
+  return converted.replace(
+    /\u0000(\d+)\u0000/g,
+    (_, index: string) => protectedChunks[Number(index)]!,
+  );
+}
+
+/**
  * Maps adapter arguments onto `chat.postMessage` arguments. Pure so the
- * outbound rendering is testable without a live Slack connection.
+ * outbound rendering is testable without a live Slack connection. Text is
+ * rendered to Slack mrkdwn (issue #84) before it leaves the adapter.
  */
 export function buildPostMessageArgs(
   spaceId: string,
@@ -175,7 +215,7 @@ export function buildPostMessageArgs(
 ): { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } {
   return {
     channel: channelFromSpaceId(spaceId),
-    text,
+    text: renderSlackText(text),
     ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : {}),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : {}),
   };
@@ -183,14 +223,15 @@ export function buildPostMessageArgs(
 
 /**
  * Maps adapter arguments onto `chat.update` arguments. Pure so the
- * in-place edit rendering is testable without a live Slack connection.
+ * in-place edit rendering is testable without a live Slack connection. Text
+ * is rendered to Slack mrkdwn (issue #84) before it leaves the adapter.
  */
 export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
   text: string,
 ): { channel: string; ts: string; text: string } {
-  return { channel: channelFromSpaceId(spaceId), ts, text };
+  return { channel: channelFromSpaceId(spaceId), ts, text: renderSlackText(text) };
 }
 
 export interface MessageHandlerOptions {

@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import type { Store, ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, parseConnectIntent } from "./space-service";
+import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, parseConnectIntent } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
 import { parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
@@ -934,7 +934,7 @@ describe("SpaceService digest-on-idle", () => {
 });
 
 describe("response mode → session prompt directive (issue #55)", () => {
-  test("request-only sessions append the request-only directive to the prompt", async () => {
+  test("request-only sessions append the request-only directive after the Slack format directive", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
@@ -948,11 +948,13 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await service.handleInboundMessage(msg());
 
     expect(driver.created).toHaveLength(1);
-    expect(driver.created[0].opts.appendSystemPrompt).toBe(REQUEST_ONLY_DIRECTIVE);
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(
+      `${SLACK_FORMAT_DIRECTIVE}\n\n${REQUEST_ONLY_DIRECTIVE}`,
+    );
     await service.stop();
   });
 
-  test("always and mention sessions get no directive", async () => {
+  test("always and mention sessions carry the Slack format directive", async () => {
     for (const mode of ["always", "mention"] as const) {
       const { adapter } = fakeAdapter();
       const { store } = fakeStore();
@@ -967,12 +969,12 @@ describe("response mode → session prompt directive (issue #55)", () => {
       await service.handleInboundMessage(msg({ spaceId: `slack:${mode}` }));
 
       expect(driver.created).toHaveLength(1);
-      expect(driver.created[0].opts.appendSystemPrompt).toBeUndefined();
+      expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
       await service.stop();
     }
   });
 
-  test("without a resolver the default mode is always (no directive)", async () => {
+  test("without a resolver the default mode is always (still formats for Slack)", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
@@ -980,7 +982,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
 
     await service.handleInboundMessage(msg());
 
-    expect(driver.created[0].opts.appendSystemPrompt).toBeUndefined();
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
     await service.stop();
   });
 });

@@ -94,6 +94,15 @@ export const REQUEST_ONLY_DIRECTIVE =
   "Act only on explicit requests; stay silent on chatter — reply briefly or not at all.";
 
 /**
+ * Always-on output-format directive (issue #84): the model emits Markdown by
+ * reflex, but Slack renders mrkdwn, not Markdown. Appended to every space
+ * session so replies arrive in Slack-correct form; `renderSlackText` in the
+ * adapter is the deterministic backstop for whatever still slips through.
+ */
+export const SLACK_FORMAT_DIRECTIVE =
+  "Format replies for Slack, not Markdown: *bold*, _italic_, ~strike~, `inline code`, • bullets, <url|label> links; never **, # headings, md tables, or [label](url); keep @mentions and :emoji: as-is.";
+
+/**
  * Rotating status phrases posted on turn_start and replaced in place by the
  * real reply (or error text) when the turn completes (issue #40). Since #60,
  * turn_start is retry-safe: while a phrase is pending for the space, the next
@@ -273,7 +282,11 @@ export class SpaceService {
 
   async #createLive(spaceId: string): Promise<LiveSession> {
     const mode = await this.#responseModeFor(spaceId);
-    const appendSystemPrompt = mode === "request-only" ? REQUEST_ONLY_DIRECTIVE : undefined;
+    // Slack format always (issue #84); the request-only directive is
+    // appended on top for request-only spaces (issue #55).
+    const directives = [SLACK_FORMAT_DIRECTIVE];
+    if (mode === "request-only") directives.push(REQUEST_ONLY_DIRECTIVE);
+    const appendSystemPrompt = directives.join("\n\n");
     const session = await this.#driver.createSession({
       spaceId,
       transcriptDir: this.#transcriptDir,

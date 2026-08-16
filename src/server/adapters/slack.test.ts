@@ -15,6 +15,7 @@ import {
   normalizeMessage,
   registerActionHandler,
   registerMessageHandler,
+  renderSlackText,
   spaceIdFromChannel,
   type SlackAction,
   type MessageHandlerOptions,
@@ -305,6 +306,55 @@ describe("buildUpdateMessageArgs", () => {
       ts: "1.1",
       text: "updated",
     });
+  });
+});
+
+describe("renderSlackText (Markdown → Slack mrkdwn, issue #84)", () => {
+  test("md **bold** renders as Slack *bold*", () => {
+    expect(renderSlackText("this is **important** text")).toBe("this is *important* text");
+  });
+
+  test("headings become bold lines (Slack has no headings)", () => {
+    expect(renderSlackText("## Summary\nbody")).toBe("*Summary*\nbody");
+    expect(renderSlackText("# Title\n## Sub\n### Deep")).toBe("*Title*\n*Sub*\n*Deep*");
+  });
+
+  test("md line bullets become Slack • bullets", () => {
+    expect(renderSlackText("- one\n- two")).toBe("• one\n• two");
+    expect(renderSlackText("* one\n+ two")).toBe("• one\n• two");
+  });
+
+  test("indented sub-bullets keep their indent", () => {
+    expect(renderSlackText("- top\n  - nested")).toBe("• top\n  • nested");
+  });
+
+  test("md [label](url) links become Slack <url|label>", () => {
+    expect(renderSlackText("see [docs](https://example.com) today")).toBe(
+      "see <https://example.com|docs> today",
+    );
+  });
+
+  test("horizontal rules are dropped, not shown raw", () => {
+    expect(renderSlackText("a\n---\nb")).toBe("a\n\nb");
+  });
+
+  test("fenced code blocks pass through verbatim", () => {
+    const md = "before\n```\n# not a heading\n- not a bullet\n```\nafter";
+    expect(renderSlackText(md)).toBe("before\n```\n# not a heading\n- not a bullet\n```\nafter");
+  });
+
+  test("inline code passes through verbatim", () => {
+    expect(renderSlackText("run `git -b **x**` now")).toBe("run `git -b **x**` now");
+  });
+
+  test("already-correct Slack mrkdwn is not corrupted", () => {
+    expect(renderSlackText("*bold* _italic_ <https://example.com|link> <@U123>")).toBe(
+      "*bold* _italic_ <https://example.com|link> <@U123>",
+    );
+  });
+
+  test("plain text with no markup passes through", () => {
+    expect(renderSlackText("hello world")).toBe("hello world");
   });
 });
 
