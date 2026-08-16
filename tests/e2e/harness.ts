@@ -428,8 +428,12 @@ export interface HarnessConfig {
   /**
    * Extra SDK tool definitions the driver's policy gate must wrap before
    * execution (issue #69) — the same bucket as the memory/work-item tools.
+   * A factory receives the harness's live store/audit/registry (journeys
+   * wiring tools that depend on them — e.g. the admin tools, issue #73).
    */
-  gatedTools?: ToolDefinition[];
+  gatedTools?:
+    | ToolDefinition[]
+    | ((deps: { store: Store; audit: AuditModule; registry: ExtensionRegistry }) => ToolDefinition[]);
   /** Connect capability (issue #52/#61); omitted → the connect seams are absent. */
   connect?: ConnectExtensionDeps;
 }
@@ -587,6 +591,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // cross the driver-level policy gate before executing.
   const memoryTools = memoryToolDefinitions(memoryProvider, { audit });
   const workItemTools = workItemToolDefinitions(store, { orgPolicy });
+  const extraGatedTools =
+    typeof cfg.gatedTools === "function" ? cfg.gatedTools({ store, audit, registry: extensionRegistry }) : cfg.gatedTools ?? [];
   const driver = createOmpSdkDriver({
     agentDir,
     customTools: [
@@ -604,7 +610,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
       toolTier: (name) => extensionToolTier(name),
       knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
-      tools: [...memoryTools, ...workItemTools, ...(cfg.gatedTools ?? [])],
+      tools: [...memoryTools, ...workItemTools, ...extraGatedTools],
     },
     // Connect capability (issue #52): connect_extension is built per
     // session so the actor is the requesting principal.

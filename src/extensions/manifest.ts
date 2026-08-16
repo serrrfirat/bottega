@@ -108,6 +108,12 @@ export const PROJECT_TOOL_NAMES = [
   // Settings tool (issue #67): rides the SDK custom-tools path like the
   // memory tools — manifest tools must not shadow it.
   "settings",
+  // Admin tools (issue #73): ride the SDK custom-tools path through the
+  // driver's policy gate — manifest tools must not shadow them.
+  "catalog_browser",
+  "stack_health",
+  "deploy_info",
+  "first_run_wizard",
 ] as const;
 
 /**

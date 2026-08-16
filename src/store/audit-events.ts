@@ -48,3 +48,16 @@ export const DIGEST_FAILED_EVENT = "digest.failed";
 export const MODEL_SETTINGS_CHANGED_EVENT = "model.settings_changed";
 /** Session model role switched for the next turn (payload {role, model, thinking_level, by}). */
 export const MODEL_SWITCHED_EVENT = "model.switched";
+/**
+ * Admin tools (issue #73): every invocation of the four setup/onboarding
+ * surfaces appends its own `admin.*` row, on top of the gate's
+ * `policy.decision` row. Payloads stay compact (no full dumps).
+ */
+/** Extension catalog browsed or drafted (payload {action, spec?, query?, written_to?}). */
+export const ADMIN_CATALOG_BROWSER_EVENT = "admin.catalog_browser";
+/** Stack health check run (payload {ok, services: [{service, status}]}). */
+export const ADMIN_STACK_HEALTH_EVENT = "admin.stack_health";
+/** Deploy identity read (payload {image_tag, commit, uptime_seconds, config_dir}). */
+export const ADMIN_DEPLOY_INFO_EVENT = "admin.deploy_info";
+/** First-run wizard run (payload {ok, checks: [{name, ok}]}). */
+export const ADMIN_FIRST_RUN_EVENT = "admin.first_run_wizard";

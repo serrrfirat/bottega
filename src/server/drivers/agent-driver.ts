@@ -289,6 +289,12 @@ export const SPACE_AGENT_TOOLS = [
   "use_model",
   // Settings tool (issue #67): get/set the durable org/space settings.
   "settings",
+  // Admin tools (issue #73): catalog browser, stack health, deploy info
+  // (anyone), first-run wizard — admin-gated like the settings tool.
+  "catalog_browser",
+  "stack_health",
+  "deploy_info",
+  "first_run_wizard",
 ] as const;
 
 /**

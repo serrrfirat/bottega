@@ -103,10 +103,12 @@ export interface SnapshotDraft {
  * {@link CatalogError} when the catalog is unreachable or the spec is not
  * in it — pinning must never guess.
  */
-export async function fetchCatalogEntry(
-  specId: string,
-  opts: FetchCatalogOptions = {},
-): Promise<CatalogEntry> {
+/**
+ * Fetches and validates the catalog document (shared by the single-entry
+ * lookup and the browser's list). Throws {@link CatalogError} on any
+ * unreachable/malformed catalog — never guesses.
+ */
+async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<Record<string, unknown>[]> {
   const catalogUrl = opts.catalogUrl ?? process.env.INTEGRATIONS_CATALOG_URL ?? DEFAULT_CATALOG_URL;
   const fetchImpl = opts.fetchImpl ?? fetch;
   let body: string;
@@ -129,26 +131,62 @@ export async function fetchCatalogEntry(
   if (!Array.isArray(doc.data)) {
     throw new CatalogError(`catalog at ${catalogUrl} has no data array`);
   }
-  const entry = (doc.data as Record<string, unknown>[]).find(
+  return doc.data as Record<string, unknown>[];
+}
+
+/** Validates one catalog record into a {@link CatalogEntry}; throws on malformed records. */
+function parseCatalogRecord(record: Record<string, unknown>): CatalogEntry {
+  const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
+  for (const field of ["id", "slug", "name", "kind", "domain", "url"] as const) {
+    if (typeof record[field] !== "string" || record[field].trim() === "") {
+      throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
+    }
+  }
+  return {
+    id: record["id"] as string,
+    slug: record["slug"] as string,
+    name: record["name"] as string,
+    kind: record["kind"] as string,
+    domain: record["domain"] as string,
+    url: record["url"] as string,
+    ...(typeof record["description"] === "string" ? { description: record["description"] } : {}),
+  };
+}
+
+export async function fetchCatalogEntry(
+  specId: string,
+  opts: FetchCatalogOptions = {},
+): Promise<CatalogEntry> {
+  const catalogUrl = opts.catalogUrl ?? process.env.INTEGRATIONS_CATALOG_URL ?? DEFAULT_CATALOG_URL;
+  const entry = (await fetchCatalogDoc(opts)).find(
     (record) => record["slug"] === specId || record["id"] === specId,
   );
   if (entry === undefined) {
     throw new CatalogError(`spec "${specId}" not found in ${catalogUrl}`);
   }
-  for (const field of ["id", "slug", "name", "kind", "domain", "url"] as const) {
-    if (typeof entry[field] !== "string" || entry[field].trim() === "") {
-      throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
-    }
+  return parseCatalogRecord(entry);
+}
+
+/**
+ * Lists the whole catalog, optionally filtered by `query` (case-insensitive
+ * substring match against name, slug, id, kind, and domain). Throws
+ * {@link CatalogError} when the catalog is unreachable or any record is
+ * malformed — the browser never guesses or silently drops entries.
+ */
+export async function listCatalogEntries(
+  query?: string,
+  opts: FetchCatalogOptions = {},
+): Promise<CatalogEntry[]> {
+  let entries = (await fetchCatalogDoc(opts)).map((record) => parseCatalogRecord(record));
+  const needle = query?.trim().toLowerCase();
+  if (needle) {
+    entries = entries.filter((entry) =>
+      [entry.name, entry.slug, entry.id, entry.kind, entry.domain].some((field) =>
+        field.toLowerCase().includes(needle),
+      ),
+    );
   }
-  return {
-    id: entry["id"] as string,
-    slug: entry["slug"] as string,
-    name: entry["name"] as string,
-    kind: entry["kind"] as string,
-    domain: entry["domain"] as string,
-    url: entry["url"] as string,
-    ...(typeof entry["description"] === "string" ? { description: entry["description"] } : {}),
-  };
+  return entries;
 }
 
 /**

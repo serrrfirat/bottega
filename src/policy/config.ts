@@ -140,6 +140,14 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // Settings tool (issue #67): mutates the durable org/space settings blob
   // (write — prompts in non-yolo modes; reads go through the same gate).
   settings: "write",
+  // Admin tools (issue #73): setup/onboarding surfaces, admin-gated like
+  // the settings tool (write — prompts in non-yolo modes, so org-settings
+  // access is the gate). deploy_info is read-only identity info, open to
+  // anyone.
+  catalog_browser: "write",
+  stack_health: "write",
+  deploy_info: "read",
+  first_run_wizard: "write",
 };
 
 export interface MemoryInjectionConfig {

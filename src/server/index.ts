@@ -11,6 +11,7 @@ import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
+import { adminToolDefinitions } from "../tools/admin";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -225,6 +226,11 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
             ...memoryToolDefinitions(memoryProvider, { audit }),
             ...modelToolsDefinitions(store, { audit, modelRoles }),
             ...settingsToolDefinitions(store, { audit }),
+            // Admin tools (issue #73): catalog browser, stack health,
+            // deploy info, first-run wizard — gated like the settings
+            // tool (write tier → org-settings access via approval);
+            // deploy_info is read-tier (anyone).
+            ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
           ],
         },
         // Connect capability (issue #52): connect_extension is built per

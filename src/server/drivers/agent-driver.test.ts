@@ -243,6 +243,12 @@ describe("omp sdk agent driver", () => {
         "model_settings",
         "use_model",
         "settings",
+        // Admin tools (issue #73): catalog browser, stack health, deploy
+        // info, first-run wizard.
+        "catalog_browser",
+        "stack_health",
+        "deploy_info",
+        "first_run_wizard",
       ].sort(),
     );
     expect(SPACE_AGENT_TOOLS).not.toContain("write");
