@@ -88,6 +88,7 @@ import {
 } from "../extensions/connect";
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
+import { createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import type { ExtensionToolParam } from "../extensions/manifest";
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
@@ -469,6 +470,12 @@ if (import.meta.main) {
     // closed (DenyRouter) — the same rule as the memory gate above.
     router: DenyRouter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+    // Credential boundary (issue #123): when the proxy control URL + token
+    // are in the environment (local dev via scripts/dev.sh, compose via
+    // IRON_MANAGEMENT_API_KEY), authorize writes the secret file AND
+    // reloads the proxy — the same always-active injection path as the
+    // server entrypoint. Unset stays write-only (hermetic tests).
+    boundary: createSecretFileBoundary(proxyBoundaryControlFromEnv()),
   });
   const server = createMemoryMcpServer({
     provider: createSqliteMemoryProvider(store.getDb()),

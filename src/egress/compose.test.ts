@@ -26,6 +26,36 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     expect(vol.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
   });
 
+  test("iron-proxy receives the management API token for boundary reloads (issue #123)", () => {
+    // config/egress.yml -> management.api_key_env; the server's extension
+    // credential boundary reloads the proxy with this bearer token after
+    // writing each secret file. Empty -> the boundary stays write-only.
+    const env = serviceEnv("iron-proxy");
+    expect(env["IRON_MANAGEMENT_API_KEY"]).toBe("${IRON_MANAGEMENT_API_KEY:-}");
+  });
+
+  test("server wires the boundary control URL + token and trusts the MITM CA (issue #123)", () => {
+    const env = serviceEnv("server");
+    // The reload half of the credential boundary: both vars come from the
+    // same source so the server can POST /v1/reload (fail-closed 401
+    // without the token).
+    expect(env["BOTTEGA_PROXY_CONTROL_URL"]).toBe("http://iron-proxy:9092");
+    expect(env["BOTTEGA_PROXY_CONTROL_TOKEN"]).toBe("${IRON_MANAGEMENT_API_KEY:-}");
+    // Bun/Node verify the proxy's MITM leaf certs against the generated CA
+    // (the same certs/ dir the proxy mounts); without it HTTPS egress
+    // through the tunnel fails TLS.
+    expect(env["NODE_EXTRA_CA_CERTS"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    const vol = service("server")["volumes"] as string[];
+    expect(vol).toContain("./certs:/etc/iron-proxy/certs:ro");
+  });
+
+  test("executor trusts the MITM CA too (its HTTPS egress rides the tunnel)", () => {
+    const env = serviceEnv("executor");
+    expect(env["NODE_EXTRA_CA_CERTS"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    const vol = service("executor")["volumes"] as string[];
+    expect(vol).toContain("./certs:/etc/iron-proxy/certs:ro");
+  });
+
   test("iron-proxy has a static IP on the internal network", () => {
     const net = service("iron-proxy")["networks"] as Record<string, YamlNode>;
     expect((net["egress"] as Record<string, YamlNode>)["ipv4_address"]).toBe(IRON_PROXY_IP);

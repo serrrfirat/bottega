@@ -15,7 +15,17 @@ const judgeCfg = judge["config"] as Record<string, YamlNode>;
 
 describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   test("has the expected top-level sections", () => {
-    expect(Object.keys(cfg).sort()).toEqual(["dns", "log", "proxy", "tls", "transforms"]);
+    expect(Object.keys(cfg).sort()).toEqual(["dns", "log", "management", "proxy", "tls", "transforms"]);
+  });
+
+  test("management API is enabled for boundary reloads (issue #123)", () => {
+    // The extension credential boundary calls POST /v1/reload after writing
+    // each secret file; the management block must be present in the ONE
+    // committed config so both compose and local dev (docker-compose.dev.yml
+    // publishes 127.0.0.1:9092) can rotate credentials without a restart.
+    const mgmt = cfg["management"] as Record<string, YamlNode>;
+    expect(mgmt["listen"]).toBe(":9092");
+    expect(mgmt["api_key_env"]).toBe("IRON_MANAGEMENT_API_KEY");
   });
 
   test("DNS resolves everything to the proxy IP (default-deny routing)", () => {

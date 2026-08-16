@@ -21,7 +21,24 @@ bun check    # typecheck
 bun test     # 490+ tests across 36 files (store, policy, adapters, drivers, memory, extensions, deploy)
 scripts/smoke.sh  # local checks + compose validation + manual checklist
 scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
-bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
+bun run dev  # local server (needs Docker + .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
+```
+
+Local dev routes egress through the same iron-proxy as compose (issue #123):
+`bun run dev` now requires Docker Desktop and, on first run, pulls
+`ironsh/iron-proxy:0.49.0`, generates the gitignored MITM CA (`certs/`), and
+starts the proxy detached with the **same committed `config/egress.yml`**
+(via `docker-compose.dev.yml`: ports `127.0.0.1:8080`/`9092`, host `./data`
+bind) — the extension credential boundary (secret-file write + proxy reload)
+is always the injection path, and the egress judge stays fail-closed
+(`NEARAI_JUDGE_API_KEY` resolves from env → `.env` → Keychain service
+`bottega-near`; dev.sh refuses to boot without it). The server runs with
+`HTTP(S)_PROXY` at the tunnel, `NO_PROXY` for internal names, and
+`NODE_EXTRA_CA_CERTS` so Bun/Node trust the proxy's MITM certs. The proxy
+stays up between runs; stop it with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 ```
 
 Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
@@ -34,7 +51,7 @@ workspace — see [features.md](features.md#live-slack-qa-canary-issue-79).
 
 ### Prerequisites
 
-- Docker with Compose v2 (`docker compose version`)
+- Docker with Compose v2 (`docker compose version`) — required for the stack AND for local dev (`bun run dev` brings up iron-proxy, issue #123)
 - A Slack workspace where you can create apps
 - A GitHub org/repo the bot may push branches and open PRs to
 - Bun 1.3+ only for local development (`bun check`, `bun test`)
@@ -59,7 +76,8 @@ Copy `.env.example` to `.env` and fill in:
 | `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3) |
-| `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key | Referenced by `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied |
+| `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key | Referenced by `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied. Local dev: resolved from env → `.env` → Keychain service `bottega-near` (dev.sh refuses to boot without it) |
+| `IRON_MANAGEMENT_API_KEY` | iron-proxy management API token (#123) | The extension credential boundary's `POST /v1/reload` bearer token (`config/egress.yml` → `management.api_key_env`); set a strong value to enable immediate credential rotation. Local dev: generated per machine by dev.sh (`data/proxy-mgmt-token`, 0600) |
 | `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack ships a self-hosted mem0 service; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |

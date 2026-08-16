@@ -31,6 +31,13 @@ services:
       # allowlisted request fails the judge and is denied (fail closed).
       # Set it in .env; the proxy reads it from its own environment.
       NEARAI_JUDGE_API_KEY: ${NEARAI_JUDGE_API_KEY:-}
+      # Management API token (config/egress.yml -> management.api_key_env,
+      # issue #123): the server's extension credential boundary calls
+      # POST /v1/reload with this bearer token after writing each secret
+      # file, so credential rotation applies without a proxy restart. Set
+      # it in .env to enable reloads; empty → the server keeps the
+      # write-only boundary (the management endpoint 401s anyway).
+      IRON_MANAGEMENT_API_KEY: ${IRON_MANAGEMENT_API_KEY:-}
     volumes:
       - ./config/egress.yml:/etc/iron-proxy/egress.yml:ro
       # MITM CA, generated once per deployment (gitignored):
@@ -142,10 +149,23 @@ services:
     environment:
       HTTP_PROXY: http://iron-proxy:8080
       HTTPS_PROXY: http://iron-proxy:8080
+      # The MITM CA (iron-proxy terminates TLS with it, config/egress.yml
+      # -> tls): Bun/Node fetch verify the proxy's leaf certs against this
+      # CA — without it every HTTPS egress through the tunnel fails TLS.
+      # The same certs/ dir the proxy mounts; generated once per deployment
+      # (gitignored).
+      NODE_EXTRA_CA_CERTS: /etc/iron-proxy/certs/ca.crt
       # auth-broker/auth-gateway/mem0 are internal names: broker-mode traffic
       # and memory-backend calls must bypass the proxy (the allowlist would
       # 403 them).
       NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0
+      # Credential boundary (issue #123): the extension runtime reloads the
+      # proxy (POST /v1/reload) after writing each secret file, so rotation
+      # applies immediately. Both the URL and the token must be set — the
+      # server only wires the reload when both are non-empty (unset →
+      # write-only boundary, no reload).
+      BOTTEGA_PROXY_CONTROL_URL: http://iron-proxy:9092
+      BOTTEGA_PROXY_CONTROL_TOKEN: ${IRON_MANAGEMENT_API_KEY:-}
       # Credential boundary (issue #9): model keys resolve through the
       # broker, not from env. OMP_AUTH_BROKER_TOKEN is copied into .env
       # from the broker's first-boot token on the data volume
@@ -165,6 +185,9 @@ services:
       # OMP agent config per deployment: templates from config/omp/ (issue
       # #9), writable so the SDK can persist its placeholder key alongside.
       - ./config/omp:/app/data/omp-agent
+      # The egress MITM CA (NODE_EXTRA_CA_CERTS above): the proxy's leaf
+      # certs verify against it, so HTTPS egress through the tunnel works.
+      - ./certs:/etc/iron-proxy/certs:ro
     networks:
       - egress
 
@@ -192,6 +215,9 @@ services:
     environment:
       HTTP_PROXY: http://iron-proxy:8080
       HTTPS_PROXY: http://iron-proxy:8080
+      # The egress MITM CA (same reasoning as the server service): without
+      # it the executor's HTTPS egress through the tunnel fails TLS.
+      NODE_EXTRA_CA_CERTS: /etc/iron-proxy/certs/ca.crt
       NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway
       # Credential boundary (issue #9): the executor env carries NO provider
       # keys, channel tokens, or PATs — credentials resolve through the
@@ -206,6 +232,8 @@ services:
       - data:/app/data
       - data:/workspaces
       - ./config/omp:/app/data/omp-agent
+      # The egress MITM CA (NODE_EXTRA_CA_CERTS above).
+      - ./certs:/etc/iron-proxy/certs:ro
     networks:
       - egress
 

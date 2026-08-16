@@ -126,6 +126,18 @@ tls:
   ca_cert: "/etc/iron-proxy/certs/ca.crt"
   ca_key: "/etc/iron-proxy/certs/ca.key"
 
+management:
+  # Operator API (issue #123): the extension credential boundary calls
+  # POST /v1/reload after writing each secret file, so rotation applies
+  # immediately without a proxy restart. Bound to all interfaces so BOTH
+  # topologies reach it from the same config: compose (server ->
+  # http://iron-proxy:9092) and local dev (published 127.0.0.1:9092, via
+  # docker-compose.dev.yml). The bearer token lives in the env var named
+  # below — fail-closed: a reload without a valid token is 401, and the
+  # boundary only wires the reload when the URL AND token are both set.
+  listen: ":9092"
+  api_key_env: "IRON_MANAGEMENT_API_KEY"
+
 transforms:
   # 1. Static allowlist: NEAR.ai model endpoints (issue #8, #36) plus
   #    extension domains from config/extensions snapshots (issue #50).

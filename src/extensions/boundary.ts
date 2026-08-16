@@ -39,6 +39,26 @@ export function extensionSecretFileName(extensionId: string): string {
 }
 
 /**
+ * Proxy control wiring for the boundary (issue #123): the reload half needs
+ * BOTH the management URL and its bearer token — a token-less reload would
+ * 401 and fail every extension call, so the pair gates together. Unset
+ * (hermetic tests, unconfigured deployments) stays write-only.
+ *
+ * Env contract (set by scripts/dev.sh locally, by docker-compose.yml in
+ * deployment): `BOTTEGA_PROXY_CONTROL_URL` (management API base) and
+ * `BOTTEGA_PROXY_CONTROL_TOKEN` (the config's `management.api_key_env`
+ * value, mirrored to the proxy as `IRON_MANAGEMENT_API_KEY`).
+ */
+export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env): {
+  proxyControlUrl?: string;
+  proxyControlToken?: string;
+} {
+  const proxyControlUrl = env.BOTTEGA_PROXY_CONTROL_URL;
+  const proxyControlToken = env.BOTTEGA_PROXY_CONTROL_TOKEN;
+  return proxyControlUrl && proxyControlToken ? { proxyControlUrl, proxyControlToken } : {};
+}
+
+/**
  * The boundary contract. `authorize` makes the resolved credential
  * available to the proxy for the extension's allowlisted domains (writes
  * the secret file + best-effort reload). The credential payload itself is

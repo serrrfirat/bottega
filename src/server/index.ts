@@ -17,6 +17,7 @@ import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
+import { createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import { extensionToolDefinitions } from "../extensions/tools";
 import {
   assertAgentDirModelAvailable,
@@ -204,12 +205,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // the policy gate → credential ladder → egress boundary → audit. The
   // broker secret resolver for the boundary is issue #54's wiring, so
   // calls fail closed at the boundary until then.
+  // Credential boundary (issue #123): with BOTTEGA_PROXY_CONTROL_URL +
+  // token in the environment (local dev via scripts/dev.sh, compose via
+  // IRON_MANAGEMENT_API_KEY), authorize writes the secret file AND reloads
+  // the proxy — rotation applies immediately, and the boundary is ALWAYS
+  // the injection path. Unset (hermetic tests) stays write-only.
   const extensionRuntime = createExtensionRuntime({
     registry: extensionRegistry,
     store,
     audit,
     orgPolicy,
     router: approvalRouter,
+    boundary: createSecretFileBoundary(proxyBoundaryControlFromEnv()),
   });
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through

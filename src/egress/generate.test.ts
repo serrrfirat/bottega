@@ -68,6 +68,13 @@ describe("egress config generation", () => {
     expect(secretsEntries(renderEgressConfig(BASE_EGRESS_DOMAINS))).toBeNull();
   });
 
+  test("rendered config enables the management API for boundary reloads (issue #123)", () => {
+    const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS);
+    expect(yaml).toContain("management:");
+    expect(yaml).toContain('listen: ":9092"');
+    expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
+  });
+
   test("renderSecretsTransform emits one inject entry per extension with its domains", () => {
     const yaml = renderSecretsTransform([
       { extensionId: FIXTURE_EXTENSION_ID, domains: [FIXTURE_EXTENSION_DOMAIN, "api.example.com"] },

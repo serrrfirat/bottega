@@ -1,0 +1,29 @@
+# Local-dev iron-proxy override (issue #123): `bun run dev` (scripts/dev.sh)
+# reuses the SAME committed egress config as compose (single source of
+# truth) while making the proxy host-reachable and giving it the host's
+# gitignored ./data dir, so the boundary's secret files are what the proxy
+# injects.
+#
+# Used only by scripts/dev.sh:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d iron-proxy
+# The base docker-compose.yml stays unchanged: NO published ports in
+# deployment, and the named `data` volume stays the compose contract.
+#
+# Ports bind to 127.0.0.1 only — the egress gate never leaves this host:
+#   - 8080: the tunnel listener (HTTP_PROXY/HTTPS_PROXY of the dev server)
+#   - 9092: the management API (the boundary's POST /v1/reload, bearer
+#     token IRON_MANAGEMENT_API_KEY set by dev.sh)
+# The override replaces the volume list: config + CA mounts match the base
+# service, and `data:/data` becomes the host's ./data — the dev server
+# writes secret files to data/proxy-secrets (PROXY_SECRETS_DIR) and the
+# generated egress config reads them at /data/proxy-secrets
+# (PROXY_SECRETS_MOUNT_PATH), the same relative path.
+services:
+  iron-proxy:
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - ./config/egress.yml:/etc/iron-proxy/egress.yml:ro
+      - ./certs:/etc/iron-proxy/certs:ro
+      - ./data:/data
