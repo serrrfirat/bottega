@@ -59,6 +59,7 @@ interface SlackUserRow {
 interface SlackChannelRow {
   id: string;
   name: string;
+  is_archived?: boolean;
 }
 
 /** Minimal Slack Web API client (JSON bodies, bearer auth). */
@@ -105,7 +106,7 @@ export interface LiveSlackHandle {
   qaUserId: string;
   /** DM channel between the bot and the QA user (conversations.open / im.open). */
   dmChannelId: string;
-  /** Find-or-create the named public channel; invites bot + QA user. */
+  /** Find-or-create the named private channel; invites bot + QA user. */
   ensureChannel(name: string): Promise<ChannelEnsureResult>;
   /** Re-list users + channels into the sync caches. */
   refresh(): Promise<void>;
@@ -169,10 +170,12 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
   let channelsCache: SlackChannelRow[] = [];
   const refreshChannels = async () => {
     const res = await bot.call<{ channels: SlackChannelRow[] }>("conversations.list", {
-      types: "public_channel",
+      types: "public_channel,private_channel",
       limit: 200,
     });
-    channelsCache = res.channels;
+    // Archived rows are skipped so an archived `bottega-qa` is never
+    // revived/located — the name falls through to a fresh create.
+    channelsCache = res.channels.filter((c) => c.is_archived !== true);
   };
   await refreshChannels();
 
@@ -277,7 +280,7 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
       }
       const created = await bot.call<{ channel: { id: string } }>("conversations.create", {
         name,
-        is_private: false,
+        is_private: true,
       });
       await refreshChannels();
       const invited = await invite(created.channel.id);

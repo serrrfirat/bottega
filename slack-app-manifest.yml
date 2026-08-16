@@ -36,6 +36,11 @@ oauth_config:
       - channels:manage
       - channels:read
       - users:read
+      # Live-Slack QA canary (issue #81): create/locate the PRIVATE
+      # bottega-qa channel (groups:write) and list private channels
+      # (groups:read) so an archived one is never revived.
+      - groups:write
+      - groups:read
       # conversations.open for the QA user's DM.
       - im:write
     user:
