@@ -32,7 +32,7 @@
  * absent. CANARY_MODEL_REF overrides the model ref entirely.
  *
  * Keychain install: security add-generic-password -s bottega-slack-qa -a "$(whoami)" -w '<xoxp token>'
- * Full QA setup: README → "Live-Slack QA canary".
+ * Full QA setup: features.md → "Live-Slack QA canary".
  */
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
@@ -453,7 +453,7 @@ export async function runCanary(
       status: "skipped",
       message:
         `live-slack canary skipped — missing: ${resolved.missing.join(", ")} ` +
-        "(env or macOS Keychain; see README → “Live-Slack QA canary” for the QA user + token setup, issue #79)",
+        "(env or macOS Keychain; see features.md → “Live-Slack QA canary” for the QA user + token setup, issue #79)",
       journeys: [],
     };
   }

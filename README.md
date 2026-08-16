@@ -10,402 +10,25 @@ for SQLite state, sessions, and git credentials. Built with Bun + TypeScript on
 the [OMP](https://oh-my-pi.dev) agent core; the egress firewall is
 [iron-proxy](https://github.com/ironsh/iron-proxy) (Go, used unmodified).
 
----
+- [features.md](features.md) — user-facing capabilities: model settings, settings tool, memory, policy & approvals, extensions, live QA canary, limitations, roadmap.
+- [architecture.md](architecture.md) — the three primitives, components, agent driver abstraction, policy internals, extension registry design, data flow, safety, persistence, multiplayer, repository layout.
 
-## Architecture
+## Development
 
-### The model: three primitives
-
-1. **Spaces** — a space is a durable shared timeline (messages + work items +
-   participants) with its own policy. A Slack channel is a space
-   (`slack:<channel_id>`; threads share the channel space in v1). The space,
-   not the agent, owns the conversation: anyone can talk, steer, interrupt,
-   or approve at any time, and the timeline just keeps appending.
-2. **Work items** — the only thing an agent does autonomously. Each runs as
-   a scoped agent session with its own workspace, tool allowlist, policy
-   context, and audit trail, so parallel work is safe by construction; only
-   the conversation serializes in the space.
-3. **Actions & policy** — every agent action crosses one policy gate:
-   `tier × space policy × roles → allow | deny | ask-human`. Unknown action →
-   deny. Policy error → deny. Fail closed is the default.
-
-### Components
-
-```
- Slack (Socket Mode — no public ports)
-        │  adapter validates & normalizes (the ONLY ingress)
-        ▼
-┌─────────────────────────── server (Bun) ───────────────────────────┐
-│  slack.ts          Bolt adapter: message → space, replies, buttons  │
-│  space-service.ts  one AgentSessionDriver per ACTIVE space          │
-│  agent-driver.ts   AgentDriver abstraction (agents are pluggable)   │
-│  acp-driver.ts     ACP driver: spawns any ACP agent (e.g. omp acp)  │
-│  policy/*          action gate + approval router + audit writer     │
-│  delivery-poller.ts  posts "PR ready" announcements to the channel  │
-│  index.ts          wiring: store + adapter + driver + extensions    │
-└───────────────────────────────────┬──────────────────────────────────┘
-                                    │ SQLite (data/bottega.db, WAL)
-┌─────────────────────────── executor (Bun, container) ──────────────┐
-│  polls work_items (atomic claim) → workspace per item → agent       │
-│  session (AgentDriver, pre-approved policy scope) → branch → PR     │
-└───────────────────────────────────┬──────────────────────────────────┘
-                                    │ all outbound traffic
-                        ┌───────────▼───────────┐
-                        │  iron-proxy sidecar   │  default-deny allowlist,
-                        │  auth-broker/gateway  │  LLM-judge, DNS sinkhole,
-                        └───────────────────────┘  secrets at the boundary
+```bash
+bun install
+bun check    # typecheck
+bun test     # 490+ tests across 36 files (store, policy, adapters, drivers, memory, extensions, deploy)
+scripts/smoke.sh  # local checks + compose validation + manual checklist
+scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
+bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
 ```
 
-### Agent driver abstraction (agents are pluggable)
-
-The agent is **not** hardwired to OMP. Everything that talks to an agent —
-the space service, the executor — depends only on the `AgentDriver` /
-`AgentSessionDriver` interfaces in `src/server/drivers/agent-driver.ts`:
-
-```ts
-interface AgentSessionDriver {
-  prompt(text, opts?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
-  abort(): Promise<void>;
-  isStreaming(): boolean;
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb): () => void;
-  dispose(): Promise<void>;
-  setModelRole?(role: "default" | "fast" | "reasoning"): Promise<...>; // optional (issue #64)
-}
-interface AgentDriver {
-  createSession({ spaceId, transcriptDir, onOutput, cwd?, allowTools? }): Promise<AgentSessionDriver>;
-}
-```
-
-- **`createOmpSdkDriver`** (default) wraps the OMP SDK. It owns all
-  OMP-specific wiring: the space-agent tool allowlist (conversation/read-only
-  tools + `task` + `create_work_item`/`work_item_cancel`; **no** bash/write
-  on the space agent), file-backed transcripts
-  (`data/sessions/<space-id>.jsonl`), a private agent registry per session,
-  and the policy + audit extensions.
-- **`createAcpDriver`** spawns any ACP-speaking agent (default `omp acp`)
-  over stdio JSON-RPC 2.0 (newline-delimited, per the ACP v1 spec). This is
-  how a non-OMP agent plugs in later without touching bottega code. OMP is
-  the first engine, not a dependency. The org config selects the space-agent
-  driver with `agent.driver: acp | omp-sdk` (default `omp-sdk`; the ACP flip
-  is opt-in via config until proven — issue #26).
-- ACP sessions enforce policy over `session/request_permission`: every
-  inbound permission request runs through the same policy table the OMP
-  extensions use (tier × org config + space overlay → allow | deny |
-  ask-human), with audit on every decision. Unknown tools deny (fail
-  closed); ask-human routes through the same Slack button `ApprovalRouter`
-  as the OMP driver (issue #44), or `DenyRouter` in headless contexts.
-  With `agent.driver:
-  acp`, the bottega MCP server attaches to each session so bottega's own
-  tools stay reachable. The MCP surface is the **universal agent seam**
-  (issues #25/#61): memory (memory.save/search), the connect capability
-  (connect_extension), and every registered extension's manifest tools —
-  executed server-side through the same policy gate → credential ladder →
-  egress boundary → audit spine as in-session OMP tool calls, so any agent
-  (OMP, ACP, or future) gets identical enforcement. The tradeoff vs the OMP
-  driver is interception depth: ACP gives allow/deny only, no arg rewriting
-  or output redaction. It also cannot switch models mid-session:
-  `setModelRole` (issue #64) is an optional `AgentSessionDriver` hook that
-  the OMP driver implements (SDK `setModel`/`setThinkingLevel`) and the ACP
-  driver reports as not-supported — `use_model` surfaces that as an error.
-
-### Policy & approvals
-
-`src/policy/` implements the gate:
-
-1. **Tier** comes from the tool declaration (read / write / exec); unknown
-   tools are treated as exec, and unknown *names* always deny.
-2. **Policy** = org floor (`config.yml`, fail-closed when absent: everything
-   denies) + space overlay (`spaces.policy_json`, can only tighten). Strict
-   YAML-subset parsing; any structural error fails the policy closed.
-3. **Decision precedence** (issue #45): explicit tool `deny`/`prompt` wins →
-   `approvals.always_approve` contains the tool → allow → tier logic
-   (`prompt` and `exec` tier → `ask-human`; read/write + allow → allow).
-   Exec never fails open.
-4. **ask-human** posts an interactive Approve/Deny prompt to the space
-   channel (Slack block actions `bottega_approve` / `bottega_deny`, issue
-   #44) and resolves when a human clicks; the message is rewritten with the
-   outcome. Headless contexts (the executor) use `DenyRouter` — every
-   ask-human request there denies. Timeout (`approvals.timeout_minutes`,
-   default 5 min) → deny, prompt rewritten to expired.
-5. **`approvals.always_approve`** (org floor only; default off) lists
-   exec-tier tools that skip the ask-human prompt when their policy action
-   is `allow` — the space overlay can only *remove* entries, never add.
-   Auto-approvals audit `approval.resolved` with `approver: "policy"`.
-6. **Every decision** is audited (`policy.decision` with tool/tier/decision/
-   reason; args redacted), and every ask-human round-trip additionally
-   writes `approval.requested` / `approval.resolved` (approver = the Slack
-   user who clicked).
-
-**Response mode** (`response_mode: always | mention | request-only`, default
-`always`) controls when the space agent acts at all (issue #55). `always` is
-today's behavior: every non-bot message is a turn. `mention` spaces only
-forward messages that @mention the bot (DMs always pass), so unmentioned
-channel chatter never reaches the agent. `request-only` spaces forward
-everything (context stays coherent) but append a system-prompt directive
-telling the agent to act only on explicit requests. The org floor sets it in
-`config.yml`; the space overlay (`spaces.policy_json`) may change it but can
-only tighten (`always` → `mention` → `request-only`) — a looser overlay value
-is clamped to the org floor, mirroring the tools rule.
-
-**Extension policy** (`extensions:`, issue #56) gates which extensions a space
-may use at all, and whether org-scoped credentials may be used there:
-
-```yaml
-extensions:
-  allow: [linear, github]   # non-empty = only these ids are usable
-  deny: [attio]             # never usable; deny wins over allow
-  org_credentials: deny     # allow (default) | deny — org usage in auto scope
-```
-
-- `allow`/`deny` take registered extension ids; empty lists mean no
-  restriction (the registry is the base allowlist). Unknown ids in either
-  list are a structural error — the policy fails closed.
-- The space overlay can only tighten: `extensions.allow` lists ids to
-  *remove* from the org floor, `extensions.deny` lists ids to *add*, and
-  `org_credentials` clamps like response mode (`allow` → `deny`, never back).
-- Extension tool calls resolve against the allowlist **before** tier and
-  approval logic — a denied extension is denied outright (with reason +
-  audit) and never reaches credential resolution. `org_credentials: deny`
-  makes the credential ladder's `auto` scope skip org credentials.
-
-Executor sessions run with `preApproved: true` policy scope: the work item's
-pickup approval (the human-approved `create_work_item` call in the channel)
-**is** the authorization. Allowlisted exec tools are then permitted inside
-the workspace, while unknown tools still deny and explicit deny/prompt
-policies are never bypassed.
-
-### Extension registry (typed integrations)
-
-`src/extensions/` implements the registry (issue #50): an extension is a
-typed, declarative integration — **manifest + pinned spec snapshot + vault
-binding + policy**:
-
-1. **Manifest** (`manifest.ts`) — `{ id, label, vendor, kind: "mcp" | "cli",
-   mcp?: {serverUrl | command, transport}, cli?: {command, args, env?},
-   credentialSchema: {type: oauth | api_key, scopes?}, tools: [{name, tier,
-   description, params}], domains: [egress allowlist entries] }`. `kind`
-   decides the integration: **mcp** = the provider's OFFICIAL MCP server
-   (bottega never implements provider API clients), **cli** = a preinstalled
-   CLI in the tools image that bottega shells out to. Validation fails
-   closed: duplicate ids, malformed schemas, unresolvable bindings, tool
-   names shadowing runtime built-ins — anything invalid is rejected, never
-   partially registered.
-2. **Pinned spec snapshot** (`registry.ts`) — registration resolves the
-   provider's spec from the integrations.sh catalog and snapshots it locally
-   PINNED: per-org deployments resolve from `config/extensions/<id>.json`
-   files, never from the catalog at runtime. Snapshot format:
-   `{ schema: "bottega.extension-snapshot.v1", extensionId, pinnedAt,
-   source: { catalog, specId, vendorOfficial, reviewed }, manifest }`.
-   Community entries (`vendorOfficial: false`) require explicit
-   `reviewed: true` before they register. The catalog fetch itself
-   (integrations.sh) is a later issue; it only writes these files.
-3. **Vault binding & policy** — `credentialSchema` declares what the vault
-   must hold (oauth scopes / api_key); the broker/vault wiring and the three
-   provider extensions are their own issues. Tool `tier` declarations feed
-   both the SDK approval tier and the policy gate.
-4. **Wiring** — registry tools become SDK definitions (`tools.ts`) that ride
-   the custom-tools path into the space agent's restricted toolset; mcp
-   tools call the provider's official MCP server (streamable-http or stdio),
-   cli tools spawn the preinstalled command with `--name value` flags.
-   Extension `domains` merge into the iron-proxy allowlist via
-   `src/egress/generate.ts` (run `bun run src/egress/generate.ts` after
-   adding snapshots; `config/egress.yml` is the generated artifact).
-5. **Runtime** (`runtime.ts`, issue #53) — every extension tool call crosses
-   the safety spine: **policy gate first** (the extension allowlist +
-   manifest tier, shared with the in-process policy extension) → **credential
-   ladder** (`credentials.ts`, org/me/auto scopes over the store's registry
-   rows) → **egress boundary** (`boundary.ts`: the resolved credential is
-   written to the extension's secret file on the shared data volume, mode
-   0600, and iron-proxy's `secrets` transform **injects** it as the
-   `Authorization` header for the extension's allowlisted domains — the
-   call itself carries no credential, so nothing reaches agent env,
-   transcripts, or audit) → provider call → audit. Every call writes
-   `extension.call` `{extension, tool, actor, credential_id, decision}`;
-   denied calls never resolve a credential. The broker secret fetch that
-   feeds the boundary is the real-provider issue's wiring; until then calls
-   fail closed at the boundary.
-6. **Agent-agnostic surface** (`src/mcp/server.ts`, issue #61) — the bottega
-   MCP server (attached to every ACP session via `mcpServers`, #26)
-   advertises `connect_extension` + each registered extension's manifest
-   tools and executes them **server-side** through the same #53 runtime /
-   #52 connect capability. The gate, ladder, boundary, and audit apply
-   identically to every agent — no per-agent adapters. Headless MCP
-   contexts have no approval channel: ask-human fails closed (DenyRouter).
-7. **Connect intent seam** (`src/server/services/space-service.ts`, issue
-   #61) — inbound Slack messages matching the narrow patterns
-   `connect <extension>`, `connect <extension> as org`, `connect
-   <extension> as me` route directly to the connect capability: no agent
-   tool call, no session. Exact shapes only (case-insensitive; anything
-   with extra words, punctuation, or keys stays natural-language agent
-   territory). Bare / `as me` connects the sender's personal account
-   (unprivileged); `as org` crosses the policy gate with the space's
-   Slack approval router. api_key-type extensions still need the agent
-   tool (or CLI) to supply the key.
-
-The test-only fixture extension (`fixture.ts`) proves the shape end to end:
-registered → resolves → its tool appears in the space agent's toolset → its
-domain lands in the merged egress allowlist. No extension implementations
-ship in this issue — the three providers are their own issues.
-
-#### CLI surface (thick tools image + spawn path)
-
-`kind: "cli"` extensions run curated, preinstalled CLIs — zero client code,
-no SDK. Three pieces (issues #58, #62, #63):
-
-1. **Tools image** (`Dockerfile.tools`) — oven/bun:1 plus the curated CLI
-   set v1.1: GitHub/ops `gh`, `jq`, `curl`, `git`, `glab`, `yq` (v4),
-   `ripgrep`; Node toolchain `nodejs`, `npm`, `pnpm`, `yarn` (the base
-   image ships only a bun `node` shim with no npm, so the real toolchain
-   is installed); Python `python3`, `pip`, `uv`; build `build-essential`
-   (gcc/make) and `golang`; DB clients `sqlite3`, `postgresql-client`;
-   cloud `aws` (v2). Distro packages come from Debian trixie, installed
-   non-interactively; aws and yq are pinned downloads from their official
-   releases (Debian's yq is stuck at 2019-era v3). NO credentials are
-   baked in, ever. The app image (`Dockerfile`) builds **FROM** the tools
-   image (issue #62), so the single `bottega:${BOTTEGA_IMAGE_TAG}` image —
-   used by BOTH the server and the executor entrypoints — carries the
-   CLIs live on PATH in the executor container; build the tools image
-   first (`docker build -f Dockerfile.tools -t bottega-tools:ci .`). The
-   tools image is built in the CI **docker** job (not the fast
-   check/test job) so the default CI stays under 5 minutes, and locally
-   for extension development. Push/pull of a cached build from a registry
-   is a deploy concern, not this job's.
-2. **Spawn path** (`src/extensions/tools.ts`) — a cli tool executes the
-   manifest's binary with the manifest's fixed `args` first, then the
-   call's params as `--name value` flags (`--name` alone for boolean
-   true). The child env is the parent env minus credential-named variables
-   (`CREDENTIAL_ENV_RE` in `manifest.ts`), plus the manifest's
-   credential-free `env` delta — a manifest that declares a credential in
-   `cli.env` is rejected (fail closed).
-3. **Per-org CLI extension** — an org that needs a CLI outside the curated
-   set extends the image itself, never the default: append to
-   `Dockerfile.tools` in the org's fork (keeping the curated baseline
-   intact), or mount a local layer at deploy time (a one-line
-   `FROM bottega-tools:latest` image with the org's packages, or a volume
-   with static binaries). The curated set stays the baseline by design.
-
-**Heavy/optional layer (NOT default).** `Dockerfile.tools-heavy` stacks the
-Rust toolchain (rustup, minimal profile), `kubectl`, `helm`, and `gcloud`
-(+ GKE auth plugin) on the curated image. The default CI docker job builds
-`Dockerfile.tools` alone so it stays within budget — nothing builds the
-heavy layer by default. Build it explicitly where an org needs it:
-
-```
-docker build -f Dockerfile.tools -t bottega-tools:latest .
-docker build -f Dockerfile.tools-heavy -t bottega-tools-heavy:latest .
-```
-
-**Credentials never travel via env.** Auth for CLI tools happens at the
-iron-proxy boundary: the executor points `HTTPS_PROXY` at iron-proxy, the
-egress allowlist (`src/egress`) gates which domains are reachable, and the
-proxy injects the credential for the allowlisted domain at request time.
-Per-request credential selection (caller/scope → credential id) is the
-runtime's concern (issue #53); this surface delivers the spawn path and
-the no-credential-in-env guarantee. gRPC-heavy CLIs (gcloud, kubectl — both
-in the opt-in heavy layer above) do not fit the HTTP-proxy boundary and
-get partial support (documented limitation): they can run for
-non-authenticated operations, but credentialed gRPC calls are not
-supported.
-
-### Data flow: "issue shared in Slack gets implemented"
-
-```mermaid
-sequenceDiagram
-    participant H as Human in #team
-    participant A as Slack adapter
-    participant S as Space service
-    participant P as Policy gate
-    participant E as Executor
-    H->>A: "Can we fix the flaky checkout?"
-    A->>S: validated {space, principal, text}
-    S->>S: agent session (driver): steer or prompt
-    S->>A: reply streams to the channel
-    H->>A: "@agent take this" (pickup is explicit)
-    A->>S: create_work_item (exec tier)
-    S->>P: ask-human → H approves (v1: anyone in channel)
-    P->>S: approved → work item open
-    E->>E: claims row (atomic) → working, workspace, clone, branch
-    E->>E: agent session (pre-approved scope) implements
-    E->>E: push branch → PR via GitHub API (PAT from 0600 file)
-    E->>S: delivery_pending marker + evidence
-    S->>A: "PR ready: <url> — approve to finish" (delivery poller)
-    S->>S: approval recorded → review → done (requires pr_url)
-```
-
-### Safety model
-
-| Threat surface | Control |
-|---|---|
-| Untrusted ingress | Adapters validate every event; only adapters mint messages |
-| Credential exposure | Provider keys in auth-broker vault; Slack tokens only in server `.env`; git PAT only in a mode-0600 file on the data volume; OMP secret obfuscation (`secrets.enabled`) |
-| Malicious repo content | Work items run in the executor container in disposable workspaces; server never mounts repo paths |
-| Exfiltration / rogue egress | All outbound traffic through iron-proxy: default-deny allowlist (model endpoints: cloud-api.near.ai, *.completions.near.ai), LLM-judge on allowlisted traffic, DNS sinkhole (containers resolve only through the proxy) |
-| Unauthorized side effects | Policy gate on every tool call; exec prompts to humans; unknown → deny |
-| Data loss / tampering | Append-only audit (SQLite triggers reject UPDATE/DELETE), transcripts retained, never deleted |
-| Failure | Fail closed: parse errors, policy errors, model outages, missing tokens → deny or block with evidence |
-
-### Persistence & audit
-
-One SQLite file (`bun:sqlite`, WAL, busy_timeout for the server+executor
-two-process share), migrated idempotently at boot:
-
-- `spaces` — space registry + per-space policy overlay.
-- `work_items` — the queue and the state machine: `open → claimed → working
-  → review → done | blocked | aborted`, with a legal-move map enforced in the
-  store (single choke point) and obligations: `done` requires a `pr_url`,
-  `blocked` requires evidence, `review` requires a recorded approval. Stale
-  rows (`claimed`/`working` past a TTL) are recovered to `blocked` with
-  evidence on boot.
-- `audit` — append-only; UPDATE/DELETE rejected by triggers. Every policy
-  decision, approval, tool call (redacted), and work-item transition is a
-  row. Payloads are redacted (secret-shaped values → `[REDACTED]`) and capped
-  at 4 KB before write.
-
-The space timeline itself is the OMP session file (`.jsonl` under
-`data/sessions/`) — durable by construction, never deleted.
-
-### Multiplayer & concurrency
-
-- Many humans + one space agent: prompts during a stream **steer** (or queue
-  as follow-ups); anyone can interrupt (`abort`).
-- Idle spaces dispose their session (default 30 min) and cold-start on the
-  next message — disposal is cache eviction, never data loss.
-- Work items are independent sessions: parallel work is isolated by design.
-- One process, many sessions: each session gets a private agent registry
-  (OMP SDK requirement for concurrent top-level sessions).
-
----
-
-## Repository layout
-
-```
-src/
-  server/           index.ts (composition root)
-  server/adapters/  slack.ts
-  server/drivers/   agent-driver.ts (AgentDriver + OMP SDK), acp-driver.ts
-  server/services/  space-service.ts, delivery-poller.ts
-  policy/           config.ts, extension.ts, approval-router.ts, audit.ts
-  extensions/       registry (manifest + pinned snapshots + tool bridge)
-  store/            db.ts, schema.sql
-  tools/            work-items.ts, memory.ts, helpers.ts
-  memory/           sqlite.ts, mem0.ts, types.ts (providers behind one interface)
-  mcp/              server.ts (bottega-hosted MCP surface: memory + connect + extension tools, #25/#61)
-  executor.ts       containerized work-item runner (claim → PR)
-  yaml-subset.ts    shared strict YAML-subset parser (configs + tests)
-  egress/           generate.ts (allowlist from extension domains) + tests: compose topology, egress.yml, iron-proxy leg
-  secrets/          broker/gateway wiring + tests: credential boundary, omp templates, agent-dir
-config/
-  extensions/       pinned extension snapshots (one JSON per extension)
-  egress.yml        generated iron-proxy allowlist + judge policy
-  omp/              config.yml (secrets.enabled), secrets.yml, models.yml
-  org.yml           executor repos + git base
-  entrypoints/      broker.sh (auth-broker token bootstrap)
-Dockerfile          single image (server + executor entrypoints), bun user
-docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy, mem0
-slack-app-manifest.yml
-scripts/smoke.sh    local checks + manual checklist
-scripts/e2e-smoke.sh  compose e2e smoke leg: fail-closed boots + wiring (skip-gated)
-```
+Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
+for the PR-creation path (no live GitHub needed); everything else is hermetic
+unit tests over real SQLite — nothing hits a live LLM, Slack, or GitHub. The
+live-Slack QA canary (issue #79) boots the real stack against a real
+workspace — see [features.md](features.md#live-slack-qa-canary-issue-79).
 
 ## Deployment
 
@@ -418,16 +41,11 @@ scripts/e2e-smoke.sh  compose e2e smoke leg: fail-closed boots + wiring (skip-ga
 
 ### 1. Create the Slack app
 
-`slack-app-manifest.yml` in this repo declares the app (Socket Mode, bot
-scopes, event subscriptions).
+`slack-app-manifest.yml` in this repo declares the app (Socket Mode, bot scopes, event subscriptions).
 
-1. Open <https://api.slack.com/apps> → **Create New App** → **From an app
-   manifest** → paste the contents of `slack-app-manifest.yml` → **Create**.
-2. **Install to Workspace** and copy the **Bot User OAuth Token**
-   (`xoxb-...`) — that is `SLACK_BOT_TOKEN`.
-3. **App-Level Tokens** → **Generate Token** with the `connections:write`
-   scope and copy it (`xapp-...`) — that is `SLACK_APP_TOKEN`. Socket Mode
-   needs it; no request URL is required.
+1. Open <https://api.slack.com/apps> → **Create New App** → **From an app manifest** → paste the contents of `slack-app-manifest.yml` → **Create**.
+2. **Install to Workspace** and copy the **Bot User OAuth Token** (`xoxb-...`) — that is `SLACK_BOT_TOKEN`.
+3. **App-Level Tokens** → **Generate Token** with the `connections:write` scope and copy it (`xapp-...`) — that is `SLACK_APP_TOKEN`. Socket Mode needs it; no request URL is required.
 
 ### 2. Set up `.env`
 
@@ -446,18 +64,18 @@ Copy `.env.example` to `.env` and fill in:
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |
 
-`.env` carries secrets + deployment identity only (issue #67). Runtime
-knobs — approval timeouts, response mode, memory injection, extensions
-policy, repo allowlist, model defaults, workspaces dir, git/api base URLs,
-and the memory backend URL — live in the org settings blob in the DB,
-editable via the `settings` tool (see below), not in `.env`.
+`.env` carries secrets + deployment identity only (issue #67). Runtime knobs
+(approval timeouts, response mode, memory injection, extensions policy, repo
+allowlist, model defaults, workspaces dir, git/api base URLs, memory backend
+URL) live in the org settings blob in the DB, editable via the `settings`
+tool (see [features.md](features.md#settings-issue-67)), not in `.env`.
 
 Memory backend (issues #43, #67): unset `memory_backend.base_url` (the
 default) runs the SQLite memory fallback. To use the self-hosted mem0
 service, set the knob (e.g. `http://mem0:8000` inside compose) via the
-settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the
-backend switch applies on the next server start. `MEM0_API_KEY` stays an
-optional env secret for mem0 auth.
+settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the switch
+applies on the next server start. `MEM0_API_KEY` stays an optional env
+secret for mem0 auth.
 
 ### 3. First boot
 
@@ -482,121 +100,44 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 ```
 
 > The executor and server share one image (`bottega:${BOTTEGA_IMAGE_TAG}`,
-> built from the repo root) and differ only in entrypoint. The executor runs
-> only when the `executor` profile is enabled, as above. To run without the
-> executor, drop `--profile executor`.
+> built from the repo root) and differ only in entrypoint; the executor runs
+> only with the `executor` profile enabled, as above. Drop `--profile
+> executor` to run without it.
 
 ### Which repo does the executor work in?
 
 The repo is a property of the task, not of the deployment (issue #47): the
 agent derives it from the conversation — a mentioned repo, or org memory —
-and passes it to `create_work_item` ("fix the flaky checkout in bottega"
-→ `repo: "acme/bottega"`). Org memory is how the agent knows the repo
-names; seed an org-scope entry so it can answer "which repo?" without
-asking:
-
-```bash
-# via the memory.save tool in any space:
-memory.save {scope: "org", content: "our repos are acme/sandbox, acme/tooling"}
-```
+and passes it to `create_work_item` ("fix the flaky checkout in bottega" →
+`repo: "acme/bottega"`). Org memory is how the agent knows the repo names;
+seed an org-scope entry via the `memory.save` tool in any space, e.g.
+`memory.save {scope: "org", content: "our repos are acme/sandbox, acme/tooling"}`.
 
 The executor treats the org settings `repos` allowlist (issue #67; the
 `config/org.yml` `repos` list is the default until settings are set) as an
-**allowlist**: it refuses any repo not listed, whatever the conversation
-said. A work item with no repo at all is blocked with
-"repo not specified — ask the requester" — there is no first-configured-repo
-fallback. An empty allowlist means no pushes until a repo is configured.
-Set the allowlist, git base, or API base via the `settings` tool.
-
-### Model settings & model roles
-
-The space agent's model is configurable from chat (issue #64) — no config
-files, no restarts:
-
-- **`model_settings`** reads/writes the space's model settings, persisted
-  per space in the `spaces.settings` column (SQLite) and audited
-  (`model.settings_changed`). Slots: `model` (the space's default),
-  `reasoning_effort` (`off|low|medium|high`), `fast_model`,
-  `reasoning_model`. All slots are optional; unset slots fall back to
-  `model` at role-resolution time.
-- **`use_model`** switches the agent's model **role for the next turn**:
-  `default` (the space `model` at the space's default effort), `fast` (the
-  `fast_model` — or `model` — at low effort; simple tasks), `reasoning`
-  (the `reasoning_model` — or `model` — at `reasoning_effort`, default
-  high; hard tasks). Natural language like "use the fast model for this"
-  maps to `use_model {role: "fast"}`. Every switch is audited
-  (`model.switched`).
-
-Both are write-tier, so they prompt for approval in non-yolo policy modes,
-and they sit on the space-agent allowlist like the memory tools. The OMP
-driver implements the switch through the SDK's per-session model hooks
-(`setModel` + `setThinkingLevel`, session-only — the space's settings
-column is the persistence home, never the agent dir). The ACP driver does
-not support mid-session switches: ACP v1 has no model-switch message and
-the spawned agent's own config governs there — `use_model` reports this
-back as a clear error instead of pretending. Auto-routing by task
-complexity is explicitly v2: v1 is the agent *deciding* per task via
-`use_model`.
-
-### Settings (issue #67)
-
-Runtime configuration lives in the DB, not in agent-editable YAML: the
-`settings` tool (write-tier, audited `settings.changed`) reads and changes
-the org blob and per-space overlays from any space session. Org knobs:
-approval timeouts, `response_mode`, memory injection, extensions
-allow/deny + org_credentials, repo allowlist, model defaults
-(default/fast/reasoning + effort), workspaces dir, git/api base URLs, and
-the memory backend URL. Space scope covers the policy overlay knobs
-(`response_mode`, extensions tighten-only); per-space model knobs live in
-the `model_settings` tool (issue #64). Config files (`config.yml`,
-`config/org.yml`) remain the defaults — the DB wins when set.
-
-`models.yml` is a boot-time output (issue #67): at startup the server
-regenerates the agent-dir catalog from the settings blob's model ids; when
-settings carry none, the committed `config/omp/models.yml` template stays
-the default. The DB is the single source of truth — no agent-editable
-model YAML.
-
-The OMP SDK's model registry reads `models.yml` from the **process-global**
-agent dir (`getAgentDir()`), not from the session's `agentDir` option. The
-driver owns that seam (issue #80): `createOmpSdkDriver` installs the
-bottega agent dir (`data/omp-agent`) as the process-global dir at
-construction, so registry and session settings always read the deployment
-catalog — no `PI_CODING_AGENT_DIR` env is needed in dev, compose, or the
-executor. A boot-time guard then asserts the registry resolves ≥1
-**available** model from that catalog (env key, `models.yml` `apiKey`, or
-the auth-broker credential) and fails the boot with a message naming the
-agent dir + config instead of surfacing "No model selected" at the first
-space prompt. Local first runs get the catalog automatically: `scripts/dev.sh`
-copies the `config/omp/` templates into `data/omp-agent` when it is empty
-(compose mounts them).
+**allowlist**: it refuses any repo not listed. A work item with no repo is
+blocked with "repo not specified — ask the requester" — no
+first-configured-repo fallback; an empty allowlist means no pushes until a
+repo is configured. Set the allowlist, git base, or API base via the
+`settings` tool.
 
 ### First-run checklist
 
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.
-2. Invite the bot into a channel and @mention it — it should reply (the
-   space agent answers in-channel).
-3. Create a test work item (the `create_work_item` tool, passing a `repo`
-   that is on the allowlist — see "Which repo does the executor work in?"
-   below) — the executor claims it (`docker compose logs -f executor`),
-   implements it in a workspace, opens a PR, and the server posts
-   `PR ready: <url> — approve to finish` in the channel.
-4. Restart persistence: `docker compose down && up` — spaces, work items,
-   and the audit trail survive (they live on the `data` volume).
+2. Invite the bot into a channel and @mention it — it should reply (the space agent answers in-channel).
+3. Create a test work item (the `create_work_item` tool, passing a `repo` that is on the allowlist — see "Which repo does the executor work in?" above) — the executor claims it, implements it in a workspace, opens a PR, and the server posts `PR ready: <url> — approve to finish` in the channel.
+4. Restart persistence: `docker compose down && up` — spaces, work items, and the audit trail survive (they live on the `data` volume).
 
 ### Backup & rollback
 
-- **Backup** — everything that matters lives on the `data` volume (SQLite
-  store, sessions, transcripts, git credential file). Snapshot it on a
-  schedule and keep a copy off-host:
+- **Backup** — everything that matters lives on the `data` volume (SQLite store, sessions, transcripts, git credential file). Snapshot it on a schedule and keep a copy off-host:
 
   ```bash
   docker run --rm -v bottega_data:/data -v "$PWD":/backup alpine \
     tar czf /backup/bottega-data-$(date +%F).tar.gz /data
   ```
 
-  Find the exact volume name with `docker volume ls` (usually
-  `bottega_data`). Restore: stop the stack, untar over the volume, `up -d`.
+  Find the exact volume name with `docker volume ls` (usually `bottega_data`). Restore: stop the stack, untar over the volume, `up -d`.
 
 - **Rollback** — tag each deploy and pin the known-good tag in `.env`:
 
@@ -606,124 +147,4 @@ copies the `config/omp/` templates into `data/omp-agent` when it is empty
   docker compose --profile executor up -d
   ```
 
-  To roll back, set `BOTTEGA_IMAGE_TAG` to the previous tag and
-  `docker compose --profile executor up -d` — the old image is still in the
-  local store. Data is untouched by rollback (only the app containers
-  recreate).
-
-## Known limitations (v1)
-
-- **No auto-pickup** — the space agent creates work items only on an
-  explicit tool call; there is no auto-pickup policy flag.
-- **Approvals** — anyone in the channel can approve; there is no role model
-  yet. In-session exec approvals (e.g. `create_work_item`) resolve via the
-  Approve/Deny buttons (issue #44). The *delivery* approval button
-  round-trip (the human's decision resolving `working → review → done`) is
-  still a follow-up: today the server posts the PR + approval request as
-  text, and the item stays `working` until that path lands.
-- **Allowlisted repos only** — the executor works in the repo the
-  conversation names (via `create_work_item`'s `repo` param) and refuses
-  anything outside the settings `repos` allowlist (`config/org.yml` by
-  default); a work item without a repo is blocked for the requester to
-  specify. One shared executor container (no per-item container isolation
-  yet).
-- **Slack only** — Telegram, Teams, Meet, and the org observer are roadmap
-  (issue #13 is the Telegram adapter).
-- **No mid-session model switches on ACP** — `use_model` (issue #64) works
-  on the OMP driver; ACP sessions cannot switch models mid-session (the
-  agent's own config governs) and the tool reports it as an error.
-- **No auto model routing** — the agent picks the model role per task via
-  `use_model`; complexity-based auto-routing is v2.
-
-## Roadmap
-
-- Delivery approval buttons (resolving `working → review → done`
-  in-channel) — completes the delivery loop; in-session approvals already
-  resolve via buttons (issue #44).
-- Telegram adapter (grammY, long polling) — #13.
-- Per-work-item container isolation (deployment-only change).
-- Roles (explicit approvers) and SSO.
-- Non-OMP agents via the ACP driver — already wired, needs a second engine.
-
-## Development
-
-```bash
-bun install
-bun check    # typecheck
-bun test     # 490+ tests across 36 files (store, policy, adapters, drivers, memory, extensions, deploy)
-scripts/smoke.sh  # local checks + compose validation + manual checklist
-scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
-bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
-```
-
-Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
-for the PR-creation path (no live GitHub needed). Everything else is hermetic
-unit tests over real SQLite; nothing hits a live LLM, Slack, or GitHub.
-
-## Live-Slack QA canary (issue #79)
-
-The product-surface smoke test: it boots the REAL stack (production Socket
-Mode adapter + the real model via the deployment catalog,
-`config/omp/models.yml`) against a real Slack workspace and drives journeys
-AS a QA user — real messages in, real bot replies out, with per-journey
-pass/fail and Slack permalinks.
-
-```bash
-bun run canary --live-slack     # or LIVE_SLACK=1
-```
-
-Journeys: chat reply (DM + the `bottega-qa` channel, created when
-missing), memory save/search (a fact is stored and searched back), work
-item creation (always-approve policy path), and the connect intent seam.
-Skip-gated: without `--live-slack`/`LIVE_SLACK=1`, in CI, or with missing
-tokens it prints a clear skip message and exits 0. Generous per-journey
-timeouts (120s) — it waits for a real model and a real workspace.
-
-### QA user + tokens
-
-1. **Create the test user** — in your workspace admin, add a member named
-   `bottega-qa` (any name works; the canary looks it up by
-   `SLACK_QA_USER_NAME`, default `bottega-qa`, or take `SLACK_QA_USER_ID`
-   to skip the lookup). This is the "human at the product surface": the
-   canary posts as them, so their messages are indistinguishable from a
-   real user's.
-2. **Install the app** (`slack-app-manifest.yml` already declares the bot
-   scopes + the QA user scopes below) and install it to the workspace, so
-   the bot and the test user share it.
-3. **User-scoped token for the QA user** — create the app's user token
-   with the user's OAuth grant:
-   <https://api.slack.com/apps> → your app → **OAuth & Permissions** →
-   the user scopes must include `chat:write`, `im:history`, `im:write`,
-   `channels:history`, `channels:read`, `users:read` (the manifest
-   declares them) → **Install App** with the QA user's workspace session,
-   or **Add to Slack** while signed in as the QA user → copy the
-   **User OAuth Token** (`xoxp-...`). It is `SLACK_QA_USER_TOKEN`.
-4. **Bot + app tokens** — already needed for the server:
-   `SLACK_BOT_TOKEN` (`xoxb-...`) and `SLACK_APP_TOKEN` (`xapp-...`).
-   The canary additionally uses the bot's `channels:manage` +
-   `channels:read` + `users:read` scopes to create/locate `bottega-qa`
-   and look up the QA user (declared in the manifest).
-5. **Keychain install** (macOS; env vars win when set):
-
-```bash
-security add-generic-password -s bottega-slack-app -a "$(whoami)" -w '<xapp-...>'
-security add-generic-password -s bottega-slack-bot -a "$(whoami)" -w '<xoxb-...>'
-security add-generic-password -s bottega-slack-qa  -a "$(whoami)" -w '<xoxp-...>'
-```
-
-The canary reads env first (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`,
-`SLACK_QA_USER_TOKEN`, optional `SLACK_QA_USER_ID` / `SLACK_QA_USER_NAME` /
-`SLACK_QA_CHANNEL`), then the Keychain services `bottega-slack-app`,
-`bottega-slack-bot`, `bottega-slack-qa`.
-
-The live leg also needs the real model to answer: `bun run canary` (the
-issue #71 dispatcher) loads `NEAR_API_KEY` / `OPENCODE_API_KEY` from env or
-the Keychain (`bottega-near` / `bottega-opencode`, the `scripts/dev.sh`
-pattern) and the harness installs the deployment model catalog
-(`config/omp/models.yml`). **Prefer the NEAR key** — the NEAR gateway
-accepts the space agent's dotted tool names (`memory.save`,
-`memory.search`); the opencode-go gateway rejects them and journeys fail
-loudly on it (live finding, issue #71). `CANARY_MODEL_REF` overrides the
-model ref entirely. The QA user must have opened a DM with the bot once (or
-the canary opens it via `conversations.open`).
-
+  To roll back, set `BOTTEGA_IMAGE_TAG` to the previous tag and `docker compose --profile executor up -d` — the old image is still in the local store. Data is untouched by rollback (only the app containers recreate).

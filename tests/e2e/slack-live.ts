@@ -6,7 +6,7 @@
  * `@slack/bolt` is a production dependency, and direct fetch keeps the QA
  * tooling dependency-free and obvious. Every method used here is a Slack
  * Web API method called with a JSON body; the canary's own app manifest
- * scopes cover them (see slack-app-manifest.yml and the README's QA
+ * scopes cover them (see slack-app-manifest.yml and features.md's QA
  * section).
  *
  * Token roles:
@@ -152,7 +152,7 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
   if (!qaUserId) {
     throw new Error(
       `live-slack: QA user "${tokens.qaUserName ?? "bottega-qa"}" not found via users.list — ` +
-        "create the test user (README, issue #79) or pass SLACK_QA_USER_ID",
+        "create the test user (features.md, issue #79) or pass SLACK_QA_USER_ID",
     );
   }
 
