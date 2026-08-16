@@ -466,22 +466,17 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   /** Requests the agent sends to us (permission, fs, terminal, elicitation, ...). */
   #onInboundRequest(msg: { id: unknown; method: string; params?: unknown }): void {
-    if (msg.method === "session/request_permission") {
-      if (this.#policy) {
-        // Fire and forget: the resolution writes the JSON-RPC response.
-        void this.#resolvePermissionRequest(msg.id, msg.params).catch((err) => {
-          // Fail closed: an internal gate error denies the call.
-          console.error(`[acp-driver] permission gate error (${this.#spaceId}), denying:`, err);
-          this.#answerPermission(msg.id, false, msg.params);
-        });
-        return;
-      }
-      // No policy context: transport-only, nothing can run.
-      console.error(`[acp-driver] unsupported method from agent (${this.#spaceId}): ${msg.method}`);
-      this.#write({ jsonrpc: "2.0", id: msg.id, error: { code: METHOD_NOT_FOUND, message: `method not found: ${msg.method}` } });
+    if (msg.method === "session/request_permission" && this.#policy) {
+      // Fire and forget: the resolution writes the JSON-RPC response.
+      void this.#resolvePermissionRequest(msg.id, msg.params).catch((err) => {
+        // Fail closed: an internal gate error denies the call.
+        console.error(`[acp-driver] permission gate error (${this.#spaceId}), denying:`, err);
+        this.#answerPermission(msg.id, false, msg.params);
+      });
       return;
     }
-    // Transport only: v1 answers method-not-found until policy routing (#6) wires these.
+    // Transport only (no policy context for permission requests): v1 answers
+    // method-not-found until policy routing (#6) wires these — nothing can run.
     console.error(`[acp-driver] unsupported method from agent (${this.#spaceId}): ${msg.method}`);
     this.#write({ jsonrpc: "2.0", id: msg.id, error: { code: METHOD_NOT_FOUND, message: `method not found: ${msg.method}` } });
   }

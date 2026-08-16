@@ -211,7 +211,7 @@ export class SpaceService {
       // principal on every LLM call so user-scope search stays fresh.
       getPrincipal: () => this.#lastPrincipal.get(spaceId),
     });
-    session.on("turn_start", (data) => this.#onTurnStart(spaceId, data));
+    session.on("turn_start", () => this.#onTurnStart(spaceId));
     session.on("message", (data) => this.#onSessionMessage(spaceId, data));
     session.on("error", (data) => this.#onSessionError(spaceId, data));
     session.on("turn_end", (data) => this.#onTurnEnd(spaceId, data));
@@ -232,13 +232,10 @@ export class SpaceService {
     if (!live || live.disposing) return;
     live.disposing = true;
     clearTimeout(live.idleTimer);
-    try {
-      // Digest-on-idle (#42): summarize the conversation into org memory
-      // before the session is gone. Fail-soft — never blocks disposal.
-      await this.#maybeDigestOnIdle(live);
-    } catch (err) {
-      console.error(`[space-service] digest failed for ${spaceId}:`, err);
-    }
+    // Digest-on-idle (#42): summarize the conversation into org memory
+    // before the session is gone. Fail-soft — never blocks disposal
+    // (#maybeDigestOnIdle audits its own failures).
+    await this.#maybeDigestOnIdle(live);
     try {
       await live.session.dispose();
     } catch (err) {
@@ -270,7 +267,7 @@ export class SpaceService {
    * churn guard has fired (#60), phrases stay off until a turn produces
    * text or an error — no new posts, not just no updates.
    */
-  #onTurnStart(spaceId: string, _data: unknown): void {
+  #onTurnStart(spaceId: string): void {
     if (this.#digesting.has(spaceId)) return;
     this.#turnDelivered.delete(spaceId);
     if (this.#churnActive.has(spaceId)) return;

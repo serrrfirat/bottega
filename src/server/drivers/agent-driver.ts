@@ -134,7 +134,7 @@ export function sessionFilePath(transcriptDir: string, spaceId: string): string 
 export function sessionIdFromFilePath(file: string | null | undefined): string | undefined {
   if (!file) return undefined;
   const base = basename(file);
-  return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : base;
+  return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : undefined;
 }
 
 /**
