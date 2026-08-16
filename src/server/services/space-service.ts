@@ -101,7 +101,8 @@ export const REQUEST_ONLY_DIRECTIVE =
  * an OMP auto-retry loop never stacks phrases. A turn that ends with neither
  * message nor error leaves the phrase as-is.
  */
-const THINKING_PHRASES = [
+/** Rotating status phrases posted on turn_start; exported so tests (e2e #66) can assert the in-place replacement. */
+export const THINKING_PHRASES = [
   "Thinking…",
   "On it — thinking…",
   "Give me a second…",

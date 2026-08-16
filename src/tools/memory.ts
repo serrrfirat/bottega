@@ -12,7 +12,7 @@
  * trail verifiable without leaking it. Policy decisions are already
  * audited by the policy extension, so search appends nothing.
  */
-import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
@@ -41,11 +41,22 @@ export const memorySearchArgsSchema = z.object({
   limit: z.number().int().optional(),
 });
 
-export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryToolsExtensionOpts = {}): ExtensionFactory {
-  return (pi) => {
-    pi.registerTool({
-      name: "memory.save",
-      label: "Save to memory",
+/**
+ * The memory tools as SDK {@link ToolDefinition}s (issue #66): one source
+ * shared by the in-session extension surface and the e2e harness's
+ * customTools path. Restricted SDK sessions (restrictToolNames) drop
+ * extension-registered tools, so surfaces that must reach the tools in
+ * such sessions (the e2e harness) pass these definitions via
+ * `createAgentSession`'s customTools; the extension registers the same
+ * definitions for unrestricted sessions.
+ */
+export function memoryToolDefinitions(
+  provider: MemoryProvider,
+  opts: MemoryToolsExtensionOpts = {},
+): Array<ToolDefinition<typeof memorySaveArgsSchema> | ToolDefinition<typeof memorySearchArgsSchema>> {
+  const save: ToolDefinition<typeof memorySaveArgsSchema> = {
+    name: "memory.save",
+    label: "Save to memory",
       description:
         "Saves a memory entry to org-shared memory (scope: org) or a user's personal memory (scope: user; " +
         "principal required, or resolved from the session default). Content is stored by the memory " +
@@ -78,10 +89,9 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
           return toolError(errorMessage(err));
         }
       },
-    });
-
-    pi.registerTool({
-      name: "memory.search",
+    };
+  const search: ToolDefinition<typeof memorySearchArgsSchema> = {
+    name: "memory.search",
       label: "Search memory",
       description:
         "Searches saved memory entries in org or user scope (principal filters user scope). Returns " +
@@ -107,7 +117,14 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
           return toolError(errorMessage(err));
         }
       },
-    });
+    };
+  return [save, search];
+}
+
+export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryToolsExtensionOpts = {}): ExtensionFactory {
+  const definitions = memoryToolDefinitions(provider, opts);
+  return (pi) => {
+    for (const definition of definitions) pi.registerTool(definition as ToolDefinition);
   };
 }
 
