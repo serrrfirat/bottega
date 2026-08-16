@@ -74,10 +74,25 @@ describe("slack-app-manifest.yml (issue #12)", () => {
 });
 
 describe("Dockerfile + .dockerignore (issue #12)", () => {
-  test("image installs git (executor clone/push) and runs as the bun user", () => {
+  test("app image inherits the tools base so the curated CLIs live in both entrypoints", () => {
     const dockerfile = readRoot("Dockerfile");
-    expect(dockerfile).toContain("FROM oven/bun:1");
-    expect(dockerfile).toContain("apt-get install -y --no-install-recommends git");
+    const tools = readRoot("Dockerfile.tools");
+    // Issue #62: the single app image used by server AND executor builds
+    // FROM the tools image (issue #58) — no separate thin base, so gh/jq/
+    // curl/git are on PATH in the executor container at runtime.
+    expect(dockerfile).toContain("FROM bottega-tools:ci");
+    expect(dockerfile).not.toContain("FROM oven/bun:1");
+    // The tools base is the single source of truth for the CLI set and
+    // the bun runtime: oven/bun:1 keeps `bun` on PATH for the app
+    // entrypoints, and the curated set v1 is installed exactly once.
+    expect(tools).toContain("FROM oven/bun:1");
+    expect(tools).toContain(
+      "apt-get install -y --no-install-recommends git ca-certificates gh jq curl",
+    );
+    expect(dockerfile).not.toContain("apt-get install");
+    // The tools base ends with USER bun; the app build resets to root for
+    // its install/chown steps, then restores the runtime user.
+    expect(dockerfile).toContain("USER root");
     expect(dockerfile).toContain("WORKDIR /app");
     expect(dockerfile).toContain("USER bun");
     // Named volumes inherit image ownership on first mount: the writable

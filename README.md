@@ -224,17 +224,20 @@ ship in this issue — the three providers are their own issues.
 #### CLI surface (thick tools image + spawn path)
 
 `kind: "cli"` extensions run curated, preinstalled CLIs — zero client code,
-no SDK. Two pieces (issue #58):
+no SDK. Two pieces (issues #58, #62):
 
-1. **Tools image** (`Dockerfile.tools`) — a separate image from the thin app
-   image, based on the executor base, shipping the curated CLI set v1:
-   `gh`, `jq`, `git`, `curl` (Debian distro packages, installed
-   non-interactively). NO credentials are baked in, ever. The app image is
-   unchanged and independent; the tools image is built in the CI **docker**
-   job (not the fast check/test job) so the default CI stays under 5
-   minutes, and locally via `docker build -f Dockerfile.tools .` for
-   extension development. Push/pull of a cached build from a registry is a
-   deploy concern, not this job's.
+1. **Tools image** (`Dockerfile.tools`) — oven/bun:1 plus the curated CLI
+   set v1: `gh`, `jq`, `git`, `curl` (Debian distro packages, installed
+   non-interactively). NO credentials are baked in, ever. The app image
+   (`Dockerfile`) builds **FROM** the tools image (issue #62), so the
+   single `bottega:${BOTTEGA_IMAGE_TAG}` image — used by BOTH the server
+   and the executor entrypoints — carries the CLIs live on PATH in the
+   executor container; build the tools image first
+   (`docker build -f Dockerfile.tools -t bottega-tools:ci .`). The tools
+   image is built in the CI **docker** job (not the fast check/test job)
+   so the default CI stays under 5 minutes, and locally for extension
+   development. Push/pull of a cached build from a registry is a deploy
+   concern, not this job's.
 2. **Spawn path** (`src/extensions/tools.ts`) — a cli tool executes the
    manifest's binary with the manifest's fixed `args` first, then the
    call's params as `--name value` flags (`--name` alone for boolean
