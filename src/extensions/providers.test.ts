@@ -3,6 +3,16 @@
  * Attio) validate against the #50 validator, resolve through the registry,
  * feed the egress allowlist, and execute end-to-end through the tool bridge
  * against a stub MCP transport — no live calls in tests.
+ *
+ * Runtime seam (#53, not landed when #54 shipped): the registry seeds from
+ * config/extensions/ at server boot (server/index.ts) and the tool bridge
+ * (tools.ts) executes calls over the binding's MCP transport with the
+ * injectable `mcpTransport` seam. The #53 runtime adds the credential
+ * broker handoff (resolve(id) -> vault credential per the #51 ladder) and
+ * still needs one mapping: manifest tool names are bottega's v1 surface
+ * (e.g. linear.search_issues), while the official servers expose their own
+ * names (linear_search_issues / search_issues / search-records) — the
+ * bridge forwards the manifest name verbatim today.
  */
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
