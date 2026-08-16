@@ -501,6 +501,108 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
   });
 });
 
+describe("OmpSessionDriver error surfacing (issue #78)", () => {
+  /** Stub SDK session exposing the subscribe listener for event injection. */
+  function stubSession() {
+    let listener: ((event: unknown) => void) | undefined;
+    const session = {
+      subscribe: (cb: (event: unknown) => void) => {
+        listener = cb;
+        return () => {
+          listener = undefined;
+        };
+      },
+      beginDispose: () => {},
+      dispose: async () => {},
+      isStreaming: false,
+      prompt: async () => {},
+      steer: async () => {},
+      followUp: async () => {},
+      abort: async () => {},
+      getAvailableModels: () => [],
+    } as unknown as AgentSession;
+    return {
+      session,
+      emit: (event: unknown) => listener?.(event),
+    };
+  }
+
+  test("a provider-error message_end (empty content) carries its cause on the turn_end payload", async () => {
+    const { session, emit } = stubSession();
+    const turnEnds: unknown[] = [];
+    const messages: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("turn_end", (data) => turnEnds.push(data));
+    driver.on("message", (data) => messages.push(data));
+
+    const CAUSE = "400 No tool output found for tool call call_repro_1";
+    // The SDK's provider-error shape: empty content + stopReason "error" +
+    // errorMessage, then turn_end (no message_update in between).
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "error",
+        errorMessage: CAUSE,
+      },
+    });
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "" }] } });
+
+    expect(messages).toHaveLength(0); // empty content is never delivered
+    expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: CAUSE }]);
+  });
+
+  test("a message_end with real text delivers it; the cause still rides turn_end", async () => {
+    const { session, emit } = stubSession();
+    const turnEnds: unknown[] = [];
+    const messages: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("turn_end", (data) => turnEnds.push(data));
+    driver.on("message", (data) => messages.push(data));
+
+    emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial " } });
+    emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "partial reply" } });
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial reply" }], stopReason: "error", errorMessage: "boom mid-stream" } });
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "partial reply" }] } });
+
+    expect(messages).toEqual([{ spaceId: "slack:C1", text: "partial reply" }]);
+    expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: "boom mid-stream" }]);
+  });
+
+  test("turn_start clears the previous turn's cause; silent turn_end carries none", async () => {
+    const { session, emit } = stubSession();
+    const turnEnds: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("turn_end", (data) => turnEnds.push(data));
+
+    emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "stale cause" } });
+    emit({ type: "turn_end", message: {} });
+    emit({ type: "turn_start" });
+    emit({ type: "turn_end", message: {} });
+
+    expect(turnEnds).toEqual([
+      { spaceId: "slack:C1", error: "stale cause" },
+      { spaceId: "slack:C1", error: undefined },
+    ]);
+  });
+
+  test("a notice-level error is stashed AND still emitted as a driver error event", async () => {
+    const { session, emit } = stubSession();
+    const errors: unknown[] = [];
+    const turnEnds: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("error", (data) => errors.push(data));
+    driver.on("turn_end", (data) => turnEnds.push(data));
+
+    emit({ type: "notice", level: "error", message: "background flush failed" });
+    emit({ type: "turn_end", message: {} });
+
+    expect(errors).toEqual([{ spaceId: "slack:C1", message: "background flush failed" }]);
+    expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: "background flush failed" }]);
+  });
+});
+
 describe("process-global agent dir + boot guard (issue #80)", () => {
   const PROVIDER = "agentdir-test";
   const MODEL_ID = "model-1";

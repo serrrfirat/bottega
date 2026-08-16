@@ -884,6 +884,16 @@ export class OmpSessionDriver implements AgentSessionDriver {
   #unsubscribe: () => void;
   /** When a prompt runs with silent: true, output is captured but not delivered. */
   #silentTurn = false;
+  /**
+   * The latest provider/session error observed this turn (issue #78): the
+   * SDK's provider-error path emits a `message_end` whose assistant message
+   * carries `stopReason: "error"` + `errorMessage` and empty content (the
+   * 400 becomes an empty completion, silently dropped below). Stashing the
+   * reason here lets the empty-completion path surface the REAL cause (e.g.
+   * the 400 text) instead of the generic phrase. Cleared at turn_start so
+   * each turn's cause is fresh; absent when the turn errored silently.
+   */
+  #lastError: string | undefined;
 
   constructor(deps: {
     spaceId: string;
@@ -908,6 +918,13 @@ export class OmpSessionDriver implements AgentSessionDriver {
           break;
         }
         case "message_end": {
+          // Provider-error path (#78): the SDK's agent loop turns a failed
+          // request (e.g. the replay-ordering 400) into an assistant message
+          // with empty content + `errorMessage`, so the text below is empty
+          // and nothing would be delivered — keep the cause for the
+          // turn_end the loop emits right after.
+          const errorMessage = (event.message as { errorMessage?: unknown } | null)?.errorMessage;
+          if (typeof errorMessage === "string" && errorMessage.trim()) this.#lastError = errorMessage.trim();
           const text = [...this.#textByIndex.entries()]
             .sort(([a], [b]) => a - b)
             .map(([, part]) => part)
@@ -918,13 +935,20 @@ export class OmpSessionDriver implements AgentSessionDriver {
           break;
         }
         case "turn_start":
+          // A fresh turn starts with no cause; only this turn's errors count.
+          this.#lastError = undefined;
           this.#emitter.emit("turn_start", { spaceId: deps.spaceId });
           break;
         case "turn_end":
-          this.#emitter.emit("turn_end", { spaceId: deps.spaceId });
+          // Carry the cause (when one exists) so the empty-completion path
+          // can surface it instead of the generic phrase (#78).
+          this.#emitter.emit("turn_end", { spaceId: deps.spaceId, error: this.#lastError });
           break;
         case "notice":
-          if (event.level === "error") this.#emitter.emit("error", { spaceId: deps.spaceId, message: event.message });
+          if (event.level === "error") {
+            this.#lastError = event.message;
+            this.#emitter.emit("error", { spaceId: deps.spaceId, message: event.message });
+          }
           break;
         default:
           break;
