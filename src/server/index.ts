@@ -58,6 +58,13 @@ export interface BottegaServerOpts {
     adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
     timeoutMs: number;
   }) => ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
+  /**
+   * Agent dir override (issue #67): where the SDK agent config lives and
+   * models.yml is generated at boot. Defaults to {@link OMP_AGENT_DIR};
+   * tests override it with a temp dir so generation is observable without
+   * touching the deployment agent dir.
+   */
+  agentDir?: string;
 }
 
 export function main(opts: BottegaServerOpts = {}): BottegaServer {
@@ -96,12 +103,13 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   };
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
-  mkdirSync(OMP_AGENT_DIR, { recursive: true });
+  const agentDir = opts.agentDir ?? OMP_AGENT_DIR;
+  mkdirSync(agentDir, { recursive: true });
   // Boot-time generation (issue #67): the SDK reads models.yml from the
   // agent dir; the DB settings are the source of truth. Written only when
   // settings carry model ids — otherwise the mounted template stays.
   if (orgSettings !== null) {
-    regenerateModelsConfig(orgSettings, join(OMP_AGENT_DIR, "models.yml"));
+    regenerateModelsConfig(orgSettings, join(agentDir, "models.yml"));
   }
   // Wiring order matters: the policy gate (both drivers) needs the approval
   // router, the router needs the adapter, and the adapter's callbacks need
@@ -237,7 +245,7 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         },
       });
     });
-  const driver = createDriver(OMP_AGENT_DIR);
+  const driver = createDriver(agentDir);
   spaceService = new SpaceService({
     store,
     adapter,

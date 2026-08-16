@@ -442,15 +442,22 @@ Copy `.env.example` to `.env` and fill in:
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3) |
 | `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key | Referenced by `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied |
-| `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack runs a self-hosted mem0 server by default; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
+| `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack ships a self-hosted mem0 service; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |
 
-Memory backend (issue #43): `MEM0_BASE_URL` is prefilled in `.env.example`
-(internal compose URL), so memory starts on the self-hosted mem0 service out
-of the box — give it an LLM key (`OPENAI_API_KEY`, above). To run the SQLite
-memory fallback instead, set `MEM0_BASE_URL=` (empty) in `.env`; the server
-then treats it as unset and ignores the mem0 service.
+`.env` carries secrets + deployment identity only (issue #67). Runtime
+knobs — approval timeouts, response mode, memory injection, extensions
+policy, repo allowlist, model defaults, workspaces dir, git/api base URLs,
+and the memory backend URL — live in the org settings blob in the DB,
+editable via the `settings` tool (see below), not in `.env`.
+
+Memory backend (issues #43, #67): unset `memory_backend.base_url` (the
+default) runs the SQLite memory fallback. To use the self-hosted mem0
+service, set the knob (e.g. `http://mem0:8000` inside compose) via the
+settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the
+backend switch applies on the next server start. `MEM0_API_KEY` stays an
+optional env secret for mem0 auth.
 
 ### 3. First boot
 
@@ -493,11 +500,13 @@ asking:
 memory.save {scope: "org", content: "our repos are acme/sandbox, acme/tooling"}
 ```
 
-The executor treats `config/org.yml` `repos` (or `EXECUTOR_REPOS`) as an
+The executor treats the org settings `repos` allowlist (issue #67; the
+`config/org.yml` `repos` list is the default until settings are set) as an
 **allowlist**: it refuses any repo not listed, whatever the conversation
 said. A work item with no repo at all is blocked with
 "repo not specified — ask the requester" — there is no first-configured-repo
 fallback. An empty allowlist means no pushes until a repo is configured.
+Set the allowlist, git base, or API base via the `settings` tool.
 
 ### Model settings & model roles
 
@@ -528,6 +537,25 @@ the spawned agent's own config governs there — `use_model` reports this
 back as a clear error instead of pretending. Auto-routing by task
 complexity is explicitly v2: v1 is the agent *deciding* per task via
 `use_model`.
+
+### Settings (issue #67)
+
+Runtime configuration lives in the DB, not in agent-editable YAML: the
+`settings` tool (write-tier, audited `settings.changed`) reads and changes
+the org blob and per-space overlays from any space session. Org knobs:
+approval timeouts, `response_mode`, memory injection, extensions
+allow/deny + org_credentials, repo allowlist, model defaults
+(default/fast/reasoning + effort), workspaces dir, git/api base URLs, and
+the memory backend URL. Space scope covers the policy overlay knobs
+(`response_mode`, extensions tighten-only); per-space model knobs live in
+the `model_settings` tool (issue #64). Config files (`config.yml`,
+`config/org.yml`) remain the defaults — the DB wins when set.
+
+`models.yml` is a boot-time output (issue #67): at startup the server
+regenerates the agent-dir catalog from the settings blob's model ids; when
+settings carry none, the committed `config/omp/models.yml` template stays
+the default. The DB is the single source of truth — no agent-editable
+model YAML.
 
 ### First-run checklist
 
@@ -581,9 +609,10 @@ complexity is explicitly v2: v1 is the agent *deciding* per task via
   text, and the item stays `working` until that path lands.
 - **Allowlisted repos only** — the executor works in the repo the
   conversation names (via `create_work_item`'s `repo` param) and refuses
-  anything outside the `config/org.yml`/`EXECUTOR_REPOS` allowlist; a work
-  item without a repo is blocked for the requester to specify. One shared
-  executor container (no per-item container isolation yet).
+  anything outside the settings `repos` allowlist (`config/org.yml` by
+  default); a work item without a repo is blocked for the requester to
+  specify. One shared executor container (no per-item container isolation
+  yet).
 - **Slack only** — Telegram, Teams, Meet, and the org observer are roadmap
   (issue #13 is the Telegram adapter).
 - **No mid-session model switches on ACP** — `use_model` (issue #64) works

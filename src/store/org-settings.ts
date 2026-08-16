@@ -62,6 +62,16 @@ export interface OrgSettings {
   repos?: string[];
   /** Model defaults (default/fast/reasoning + effort); consumed by models.yml generation (Part B). */
   models?: OrgModelsSettings;
+  /** Workspace root for work-item checkouts; consumed by the executor (Part B). */
+  workspacesDir?: string;
+  /** Git base URL for clones/pushes; overrides config/org.yml (Part B). */
+  gitBaseUrl?: string;
+  /** GitHub REST API base for PR creation (Part B). */
+  apiBaseUrl?: string;
+  /** Local-dev only: tolerate a PAT file mode other than 0600 (Part B). */
+  allowLoosePat?: boolean;
+  /** Memory backend URL (mem0); unset → SQLite memory (Part B). */
+  memoryBackend?: { baseUrl?: string };
 }
 
 /** Raw snake_case blob shape accepted by setOrgSettings (mirrors config.yml keys). */
@@ -89,6 +99,11 @@ export interface OrgSettingsInput {
     reasoning?: string;
     effort?: string;
   };
+  workspaces_dir?: string;
+  git_base_url?: string;
+  api_base_url?: string;
+  allow_loose_pat?: boolean;
+  memory_backend?: { base_url?: string };
 }
 
 /** Thrown by the store helpers when the settings blob is malformed (fail closed). */
@@ -325,6 +340,47 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         }
       }
       if (sectionOk) out.models = parsed;
+    } else if (name === "workspaces_dir" || name === "git_base_url" || name === "api_base_url") {
+      if (typeof value !== "string" || value.trim() === "") {
+        fail(`${name} must be a non-empty string`);
+      } else if (name === "workspaces_dir") {
+        out.workspacesDir = value.trim();
+      } else if (name === "git_base_url") {
+        out.gitBaseUrl = value.trim();
+      } else {
+        out.apiBaseUrl = value.trim();
+      }
+    } else if (name === "allow_loose_pat") {
+      if (typeof value !== "boolean") {
+        fail("allow_loose_pat must be a boolean");
+      } else {
+        out.allowLoosePat = value;
+      }
+    } else if (name === "memory_backend") {
+      // The backend URL (mem0) — issue #67 env pruning moved the knob out
+      // of env. An EMPTY base_url clears the setting (SQLite fallback),
+      // mirroring the old MEM0_BASE_URL= contract; `memory_backend: {}`
+      // sets nothing.
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        fail("memory_backend must be an object");
+        continue;
+      }
+      const backend = value as Record<string, unknown>;
+      let sectionOk = true;
+      for (const [key, raw] of Object.entries(backend)) {
+        if (key === "base_url") {
+          if (typeof raw !== "string") {
+            sectionOk = false;
+            fail("memory_backend.base_url must be a string");
+          } else if (raw.trim() !== "") {
+            out.memoryBackend = { baseUrl: raw.trim() };
+          }
+        } else {
+          sectionOk = false;
+          fail(`memory_backend.${key}: unknown key`);
+        }
+      }
+      if (!sectionOk) out.memoryBackend = undefined;
     } else {
       fail(`unknown key '${name}'`);
     }

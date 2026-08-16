@@ -170,12 +170,12 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
     };
   }
   if (settings.responseMode !== undefined) input.response_mode = settings.responseMode;
-  if (settings.memory?.injection !== undefined) {
+  if (settings.memoryInjection !== undefined) {
     input.memory = {
       injection: {
-        ...(settings.memory.injection.enabled !== undefined ? { enabled: settings.memory.injection.enabled } : {}),
-        ...(settings.memory.injection.maxEntries !== undefined
-          ? { max_entries: settings.memory.injection.maxEntries }
+        ...(settings.memoryInjection.enabled !== undefined ? { enabled: settings.memoryInjection.enabled } : {}),
+        ...(settings.memoryInjection.maxEntries !== undefined
+          ? { max_entries: settings.memoryInjection.maxEntries }
           : {}),
       },
     };
@@ -229,6 +229,9 @@ export function settingsToolsExtension(store: Store, opts: SettingsToolsExtensio
       approval: "write",
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
         try {
+          if (params.set !== undefined && Object.keys(params.set).length === 0) {
+            return toolError("settings set requires at least one field");
+          }
           if (params.scope === "space") {
             return await handleSpace(store, opts, actor, params);
           }

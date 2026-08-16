@@ -215,13 +215,15 @@ describe("omp sdk agent driver", () => {
     }
   });
 
-  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect/model tools, no executor tools", () => {
+  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect/model/settings tools, no executor tools", () => {
     // The space agent is a participant, not an executor: it may read the
     // workspace, delegate via task, and use the work-item + memory + model
     // tools — never write/bash/edit (those are EXECUTOR_TOOLS in
     // executor.ts). The connect capability (issue #52) is listed here; its
     // definition rides the custom-tools path, see createOmpSdkDriver. The
-    // model tools (issue #64) are the chat settings/role-switch surface.
+    // model tools (issue #64) are the chat settings/role-switch surface;
+    // the settings tool (issue #67) is the durable org/space settings
+    // surface.
     const allowed: readonly string[] = SPACE_AGENT_TOOLS;
     expect([...allowed].sort()).toEqual(
       [
@@ -240,6 +242,7 @@ describe("omp sdk agent driver", () => {
         "memory.search",
         "model_settings",
         "use_model",
+        "settings",
       ].sort(),
     );
     expect(SPACE_AGENT_TOOLS).not.toContain("write");
