@@ -5,8 +5,8 @@ work together: work items get picked up, implemented in isolated workspaces,
 and delivered as pull requests — with every action policy-gated and audited.
 
 Per-org self-hosted: one `docker compose` stack (server, executor,
-auth-broker, auth-gateway, iron-proxy) plus a shared `data/` volume for
-SQLite state, sessions, and git credentials. Built with Bun + TypeScript on
+auth-broker, auth-gateway, iron-proxy, mem0) plus a shared `data/` volume
+for SQLite state, sessions, and git credentials. Built with Bun + TypeScript on
 the [OMP](https://oh-my-pi.dev) agent core; the egress firewall is
 [iron-proxy](https://github.com/ironsh/iron-proxy) (Go, used unmodified).
 
@@ -351,7 +351,7 @@ config/
   org.yml           executor repos + git base
   entrypoints/      broker.sh (auth-broker token bootstrap)
 Dockerfile          single image (server + executor entrypoints), bun user
-docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy
+docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy, mem0
 slack-app-manifest.yml
 scripts/smoke.sh    local checks + manual checklist
 scripts/e2e-smoke.sh  compose e2e smoke leg: fail-closed boots + wiring (skip-gated)
@@ -392,8 +392,15 @@ Copy `.env.example` to `.env` and fill in:
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3) |
 | `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key | Referenced by `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied |
+| `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack runs a self-hosted mem0 server by default; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |
+
+Memory backend (issue #43): `MEM0_BASE_URL` is prefilled in `.env.example`
+(internal compose URL), so memory starts on the self-hosted mem0 service out
+of the box — give it an LLM key (`OPENAI_API_KEY`, above). To run the SQLite
+memory fallback instead, set `MEM0_BASE_URL=` (empty) in `.env`; the server
+then treats it as unset and ignores the mem0 service.
 
 ### 3. First boot
 
@@ -515,7 +522,7 @@ fallback. An empty allowlist means no pushes until a repo is configured.
 ```bash
 bun install
 bun check    # typecheck
-bun test     # 270+ tests: store, policy, adapter, executor, deploy packaging
+bun test     # 490+ tests across 36 files (store, policy, adapters, drivers, memory, extensions, deploy)
 scripts/smoke.sh  # local checks + compose validation + manual checklist
 scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
 bun run dev  # local server (needs .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)

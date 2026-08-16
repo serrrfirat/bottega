@@ -108,7 +108,7 @@ rule below conflicts with a rule above, the user's explicit instructions win
 ```bash
 bun install          # Bun 1.3+; lockfile frozen in CI
 bun check            # tsc --noEmit — must exit 0
-bun test             # 270+ tests — must exit 0
+bun test             # 490+ tests across 36 files — must exit 0
 scripts/smoke.sh     # local checks + compose validation + manual checklist
 docker compose --profile executor config -q   # compose validity (CI does this)
 ```

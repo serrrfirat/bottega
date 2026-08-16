@@ -155,9 +155,11 @@ services:
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
       # Memory backend (issue #43): MEM0_BASE_URL defaults to the internal
       # mem0 service so a deployment starts memory on mem0 out of the box;
-      # unset it to fall back to SQLite. MEM0_API_KEY is optional (the OSS
-      # server only demands a key when its auth is enabled).
-      MEM0_BASE_URL: ${MEM0_BASE_URL:-http://mem0:8000}
+      # set it empty in .env (MEM0_BASE_URL=) to fall back to SQLite — the
+      # single-dash form passes the empty value through, the server treats
+      # it as unset. MEM0_API_KEY is optional (the OSS server only demands a
+      # key when its auth is enabled).
+      MEM0_BASE_URL: ${MEM0_BASE_URL-http://mem0:8000}
       MEM0_API_KEY: ${MEM0_API_KEY:-}
     volumes:
       # The app resolves its store/sessions/transcripts from the relative

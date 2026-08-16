@@ -121,7 +121,10 @@ describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
 
   test("server defaults memory to the internal mem0 URL (SQLite fallback when unset)", () => {
     const env = serviceEnv("server");
-    expect(env["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL:-http://mem0:8000}");
+    // Single-dash interpolation: an EMPTY MEM0_BASE_URL in .env passes
+    // through (the server then treats it as unset -> SQLite); `:-` would
+    // re-apply the default and make the documented fallback unreachable.
+    expect(env["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL-http://mem0:8000}");
     expect(env["MEM0_API_KEY"]).toBe("${MEM0_API_KEY:-}");
   });
 });
