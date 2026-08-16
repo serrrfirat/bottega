@@ -2,10 +2,11 @@
 #
 # The `server` (src/server/index.ts) and `executor` (src/executor.ts)
 # services in docker-compose.yml share this image and differ only in
-# entrypoint. The image inherits the curated CLI set v1 (gh, jq, curl,
-# git) from the tools image (issue #58), so `kind: cli` extension tools
-# and the executor's git shell-outs (issue #11) resolve on PATH in BOTH
-# entrypoints.
+# entrypoint. The image inherits the curated CLI set v1.1 (issue #63: gh,
+# jq, curl, git, glab, yq, rg, node/npm/pnpm/yarn, python3/pip/uv,
+# gcc/make, golang, sqlite3, postgresql-client, aws) from the tools image
+# (issue #58), so `kind: cli` extension tools and the executor's git
+# shell-outs (issue #11) resolve on PATH in BOTH entrypoints.
 #
 # Build order matters: the tools image must be built FIRST, because the
 # app image builds FROM it:

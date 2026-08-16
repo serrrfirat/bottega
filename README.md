@@ -250,20 +250,26 @@ ship in this issue — the three providers are their own issues.
 #### CLI surface (thick tools image + spawn path)
 
 `kind: "cli"` extensions run curated, preinstalled CLIs — zero client code,
-no SDK. Two pieces (issues #58, #62):
+no SDK. Three pieces (issues #58, #62, #63):
 
 1. **Tools image** (`Dockerfile.tools`) — oven/bun:1 plus the curated CLI
-   set v1: `gh`, `jq`, `git`, `curl` (Debian distro packages, installed
-   non-interactively). NO credentials are baked in, ever. The app image
-   (`Dockerfile`) builds **FROM** the tools image (issue #62), so the
-   single `bottega:${BOTTEGA_IMAGE_TAG}` image — used by BOTH the server
-   and the executor entrypoints — carries the CLIs live on PATH in the
-   executor container; build the tools image first
-   (`docker build -f Dockerfile.tools -t bottega-tools:ci .`). The tools
-   image is built in the CI **docker** job (not the fast check/test job)
-   so the default CI stays under 5 minutes, and locally for extension
-   development. Push/pull of a cached build from a registry is a deploy
-   concern, not this job's.
+   set v1.1: GitHub/ops `gh`, `jq`, `curl`, `git`, `glab`, `yq` (v4),
+   `ripgrep`; Node toolchain `nodejs`, `npm`, `pnpm`, `yarn` (the base
+   image ships only a bun `node` shim with no npm, so the real toolchain
+   is installed); Python `python3`, `pip`, `uv`; build `build-essential`
+   (gcc/make) and `golang`; DB clients `sqlite3`, `postgresql-client`;
+   cloud `aws` (v2). Distro packages come from Debian trixie, installed
+   non-interactively; aws and yq are pinned downloads from their official
+   releases (Debian's yq is stuck at 2019-era v3). NO credentials are
+   baked in, ever. The app image (`Dockerfile`) builds **FROM** the tools
+   image (issue #62), so the single `bottega:${BOTTEGA_IMAGE_TAG}` image —
+   used by BOTH the server and the executor entrypoints — carries the
+   CLIs live on PATH in the executor container; build the tools image
+   first (`docker build -f Dockerfile.tools -t bottega-tools:ci .`). The
+   tools image is built in the CI **docker** job (not the fast
+   check/test job) so the default CI stays under 5 minutes, and locally
+   for extension development. Push/pull of a cached build from a registry
+   is a deploy concern, not this job's.
 2. **Spawn path** (`src/extensions/tools.ts`) — a cli tool executes the
    manifest's binary with the manifest's fixed `args` first, then the
    call's params as `--name value` flags (`--name` alone for boolean
@@ -271,6 +277,23 @@ no SDK. Two pieces (issues #58, #62):
    (`CREDENTIAL_ENV_RE` in `manifest.ts`), plus the manifest's
    credential-free `env` delta — a manifest that declares a credential in
    `cli.env` is rejected (fail closed).
+3. **Per-org CLI extension** — an org that needs a CLI outside the curated
+   set extends the image itself, never the default: append to
+   `Dockerfile.tools` in the org's fork (keeping the curated baseline
+   intact), or mount a local layer at deploy time (a one-line
+   `FROM bottega-tools:latest` image with the org's packages, or a volume
+   with static binaries). The curated set stays the baseline by design.
+
+**Heavy/optional layer (NOT default).** `Dockerfile.tools-heavy` stacks the
+Rust toolchain (rustup, minimal profile), `kubectl`, `helm`, and `gcloud`
+(+ GKE auth plugin) on the curated image. The default CI docker job builds
+`Dockerfile.tools` alone so it stays within budget — nothing builds the
+heavy layer by default. Build it explicitly where an org needs it:
+
+```
+docker build -f Dockerfile.tools -t bottega-tools:latest .
+docker build -f Dockerfile.tools-heavy -t bottega-tools-heavy:latest .
+```
 
 **Credentials never travel via env.** Auth for CLI tools happens at the
 iron-proxy boundary: the executor points `HTTPS_PROXY` at iron-proxy, the
@@ -278,10 +301,11 @@ egress allowlist (`src/egress`) gates which domains are reachable, and the
 proxy injects the credential for the allowlisted domain at request time.
 Per-request credential selection (caller/scope → credential id) is the
 runtime's concern (issue #53); this surface delivers the spawn path and
-the no-credential-in-env guarantee. gRPC-heavy CLIs (gcloud, kubectl) do
-not fit the HTTP-proxy boundary and get partial support (documented
-limitation): they can run for non-authenticated operations, but
-credentialed gRPC calls are not supported.
+the no-credential-in-env guarantee. gRPC-heavy CLIs (gcloud, kubectl — both
+in the opt-in heavy layer above) do not fit the HTTP-proxy boundary and
+get partial support (documented limitation): they can run for
+non-authenticated operations, but credentialed gRPC calls are not
+supported.
 
 ### Data flow: "issue shared in Slack gets implemented"
 

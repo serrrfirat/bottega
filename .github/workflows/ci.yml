@@ -38,13 +38,13 @@ jobs:
       # the heavy layer (Dockerfile.tools-heavy) is per-org opt-in and not
       # built here.
       - name: Build tools image (timed)
-
-      - name: Build app image (inherits the tools base)
-        run: docker build -t bottega:ci .
         run: |
           start=$(date +%s)
           docker build -f Dockerfile.tools -t bottega-tools:ci .
           echo "tools_image_build_seconds=$(( $(date +%s) - start ))"
+
+      - name: Build app image (inherits the tools base)
+        run: docker build -t bottega:ci .
 
       - name: Tools image ships the curated CLI set v1.1
         run: |
