@@ -5,6 +5,8 @@ import {
   SessionManager,
   createAgentSession,
   type AgentSession,
+  type CreateAgentSessionOptions,
+  type CreateAgentSessionResult,
   type ExtensionFactory,
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
@@ -292,6 +294,17 @@ export function spaceAgentToolNames(extensionToolNames: readonly string[], allow
 }
 
 /**
+ * Session thinking level (issue #68). Mirrors the SDK's `ThinkingLevel`
+ * values (`@oh-my-pi/pi-agent-core`) — the SDK root does not re-export the
+ * type, so the driver re-declares it. "low" is a valid effort for
+ * openai-completions models (pi-catalog `Effort.Low`); "off" disables
+ * reasoning entirely (the documented fallback if empty responses persist).
+ * "inherit" is deliberately absent: in a server context there is no
+ * higher-level selector to defer to.
+ */
+export type DriverThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
  * Driver backed by the OMP SDK (`createAgentSession`). Sessions are
  * file-backed (SessionManager under `transcriptDir`, one JSONL per space —
  * the durable space timeline), tool-restricted to the allowlist above, and
@@ -319,9 +332,27 @@ export function createOmpSdkDriver(
     connectExtension?: ConnectExtensionDriverOpts;
     /** Per-space model settings (issue #64); see createSession's getModelSettings. */
     getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    /**
+     * Session thinking level (issue #68). Default "low": the space agent is
+     * a chat participant, and with no level set the SDK's default reasoning
+     * budget applied — deepseek-v4-flash consumed the whole token budget on
+     * reasoning and returned empty responses (`content: ''` +
+     * `finish_reason: length`, #60). "low" keeps the budget for answers;
+     * "off" is the fallback if empties persist. Per-space configurability
+     * lands with #64 (model settings); this sets the safe default.
+     */
+    thinkingLevel?: DriverThinkingLevel;
+    /**
+     * Session-factory seam (issue #68 tests): defaults to the SDK's
+     * `createAgentSession`. Injected by hermetic tests to assert the exact
+     * options the driver builds without touching the SDK.
+     */
+    createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
   } = {},
 ): AgentDriver {
   const customTools = opts.customTools ?? [];
+  const createSession = opts.createSession ?? createAgentSession;
+  const thinkingLevel: DriverThinkingLevel = opts.thinkingLevel ?? "low";
   return {
     async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt, getModelSettings }) {
       mkdirSync(transcriptDir, { recursive: true });
@@ -363,7 +394,7 @@ export function createOmpSdkDriver(
             }),
           ]
         : customTools;
-      const { session } = await createAgentSession({
+      const { session } = await createSession({
         cwd: sessionCwd,
         agentDir: opts.agentDir,
         sessionManager,
@@ -374,6 +405,12 @@ export function createOmpSdkDriver(
         extensions,
         // request-only directive (issue #55), appended to the rendered prompt.
         ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+        // Issue #68: keep the token budget for answers, not reasoning (see
+        // the thinkingLevel option on createOmpSdkDriver). The cast bridges
+        // the SDK's const-enum typing: Effort members type nominally in
+        // declaration files, but the runtime values are the same strings
+        // DriverThinkingLevel mirrors.
+        thinkingLevel: thinkingLevel as CreateAgentSessionOptions["thinkingLevel"],
         // Registry + connect tools (issues #50/#52) must surface in
         // restricted sessions; discovered extensions, MCP, and ambient
         // custom tools stay disabled.

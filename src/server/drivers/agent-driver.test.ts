@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentRegistry, SessionManager, createAgentSession } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, SessionManager, createAgentSession, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
 import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { extensionToolDefinitions } from "../../extensions/tools";
@@ -134,6 +134,61 @@ describe("omp sdk agent driver", () => {
       });
       expect(session.isStreaming()).toBe(false);
       await session.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("thinkingLevel defaults to low and reaches createAgentSession (issue #68)", async () => {
+    // Hermetic: the injected session factory captures the exact options the
+    // driver builds — no SDK session is created. The default must be "low"
+    // so the space agent's token budget goes to answers, not reasoning
+    // (deepseek-v4-flash returned empty responses when reasoning consumed
+    // the whole budget, #60/#68).
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      let receivedOptions: CreateAgentSessionOptions | undefined;
+      const driver = createOmpSdkDriver({
+        agentDir: join(dir, "agent"),
+        createSession: async (options) => {
+          receivedOptions = options;
+          throw new Error("factory stub: no real session");
+        },
+      });
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      expect(receivedOptions?.thinkingLevel).toBe("low" as CreateAgentSessionOptions["thinkingLevel"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("thinkingLevel override is passed through to createAgentSession (issue #68)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      let receivedOptions: CreateAgentSessionOptions | undefined;
+      const driver = createOmpSdkDriver({
+        agentDir: join(dir, "agent"),
+        thinkingLevel: "off",
+        createSession: async (options) => {
+          receivedOptions = options;
+          throw new Error("factory stub: no real session");
+        },
+      });
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      // "off" disables reasoning entirely — the documented fallback knob.
+      expect(receivedOptions?.thinkingLevel).toBe("off" as CreateAgentSessionOptions["thinkingLevel"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
