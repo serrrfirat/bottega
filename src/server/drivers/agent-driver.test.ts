@@ -598,9 +598,12 @@ describe("process-global agent dir + boot guard (issue #80)", () => {
     mkdirSync(agentDir, { recursive: true });
     try {
       createOmpSdkDriver({ agentDir });
-      // No models.yml → lenient leg: the guard resolves (returns the
-      // available count, 0 in this hermetic env) instead of failing the boot.
-      await expect(assertAgentDirModelAvailable(agentDir)).resolves.toBe(0);
+      // No models.yml → lenient leg: the guard RESOLVES (no fail-fast)
+      // instead of failing the boot. The count is the SDK's bundled/env
+      // view, which the full suite's process-global model cache populates —
+      // assert the contract (resolves, non-negative), not an order-dependent
+      // literal.
+      await expect(assertAgentDirModelAvailable(agentDir)).resolves.toBeGreaterThanOrEqual(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
