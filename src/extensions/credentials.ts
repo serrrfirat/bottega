@@ -16,16 +16,6 @@ import { EXTENSION_CREDENTIAL_RESOLVED_EVENT } from "../store/audit-events";
 
 export type CallScope = "org" | "me" | "auto";
 
-/**
- * The effective space policy as seen by the ladder. The caller derives
- * `orgUsageAllowed` from the space's policy (org floor + overlay); the
- * policy knob itself lands with the extension-policy surface (#52/#53).
- */
-export type SpacePolicyForCredentials = {
-  /** Whether the space policy allows using org-scoped credentials. */
-  orgUsageAllowed: boolean;
-};
-
 export type CredentialResolution =
   | { kind: "credential"; credential: ExtensionCredential }
   | { kind: "ask"; reason: string }
@@ -37,7 +27,12 @@ export type ResolveCredentialInput = {
   caller: string;
   /** Extension provider id, e.g. "github". */
   provider: string;
-  spacePolicy: SpacePolicyForCredentials;
+  /**
+   * Effective space policy: whether org-scoped credentials are allowed
+   * (derived from the org floor + overlay; the knob itself lands with the
+   * extension-policy surface, #52/#53).
+   */
+  spacePolicy: { orgUsageAllowed: boolean };
   /**
    * Registry lookup: personal lookups are pre-filtered to the caller by the
    * implementation, so the ladder never sees other people's rows.

@@ -48,9 +48,8 @@ export const MEMORY_LIMIT_DEFAULT = 5;
 export const MEMORY_LIMIT_MAX = 20;
 
 export function validateSaveInput(input: MemorySaveInput): void {
-  if (input.scope !== "org" && input.scope !== "user") {
-    throw new Error(`memory.save: invalid scope ${String(input.scope)}`);
-  }
+  // scope is a typed union; the zod schemas at the tool/MCP boundaries are
+  // the shape gate, so only the reachable semantic rules live here.
   if (input.scope === "user" && !input.principal) {
     throw new Error("memory.save: principal is required for user scope");
   }
@@ -60,9 +59,6 @@ export function validateSaveInput(input: MemorySaveInput): void {
 }
 
 export function validateSearchQuery(query: MemorySearchQuery): void {
-  if (query.scope !== "org" && query.scope !== "user") {
-    throw new Error(`memory.search: invalid scope ${String(query.scope)}`);
-  }
   // An empty query is a metadata-only listing (e.g. the newest digest for a
   // space, issue #42); without metadata filters it is a plain validation miss.
   const hasMetadataFilters = query.metadata !== undefined && Object.keys(query.metadata).length > 0;

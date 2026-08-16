@@ -85,16 +85,20 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
           evidence = [{ kind: "issue_url", url: canonical }];
         }
 
-        const item = await store.createWorkItem({
-          space_id: spaceId,
-          requester: params.requester ?? actor,
-          description,
-          evidence,
-          repo: params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined),
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],
-        };
+        try {
+          const item = await store.createWorkItem({
+            space_id: spaceId,
+            requester: params.requester ?? actor,
+            description,
+            evidence,
+            repo: params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined),
+          });
+          return {
+            content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],
+          };
+        } catch (err) {
+          return toolError(errorMessage(err));
+        }
       },
     });
 

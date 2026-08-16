@@ -75,7 +75,7 @@ export interface Mem0Options {
   timeoutMs?: number;
 }
 
-export const MEM0_DEFAULT_TIMEOUT_MS = 10_000;
+const MEM0_DEFAULT_TIMEOUT_MS = 10_000;
 /** Fixed agent_id backing org-scope memories when no agentId is configured. */
 export const MEM0_ORG_AGENT_ID = "bottega";
 
@@ -134,7 +134,10 @@ function scopeParams(
     // Org memory is shared across principals: pin it to one agent id.
     return { agent_id: agentId ?? MEM0_ORG_AGENT_ID };
   }
-  const params: Record<string, string> = { user_id: principal as string };
+  // user scope: user_id is only set when a principal is given (an omitted
+  // principal means "all users", matching the sqlite backend).
+  const params: Record<string, string> = {};
+  if (principal !== undefined) params.user_id = principal;
   if (agentId) params.agent_id = agentId;
   return params;
 }

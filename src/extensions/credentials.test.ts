@@ -86,18 +86,9 @@ describe("resolveCredential me scope", () => {
     expect(res).toEqual({ kind: "credential", credential: adas });
   });
 
-  test("missing personal credential errors with the connect-your-account message", () => {
-    const res = resolveCredential({
-      callScope: "me",
-      caller: "UADA",
-      provider: "github",
-      spacePolicy: { orgUsageAllowed: false },
-      findCredential: lookup([bobs]),
-    });
-    expect(res).toEqual({ kind: "error", message: "connect your github account" });
-  });
-
-  test("someone else's personal credential is never returned", () => {
+  // Missing and someone-else's-only are the same observable outcome: the
+  // ladder never guesses, so both surface the connect-your-account error.
+  test("missing personal credential (or only someone else's) errors with the connect-your-account message", () => {
     const res = resolveCredential({
       callScope: "me",
       caller: "UADA",

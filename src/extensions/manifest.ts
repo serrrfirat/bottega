@@ -125,10 +125,10 @@ export class ExtensionValidationError extends Error {
   }
 }
 
-const ID_RE = /^[a-z0-9][a-z0-9._-]*$/;
-/** Extension id format (shared with the policy parser, issue #56). */
-export const EXTENSION_ID_RE = ID_RE;
+/** Identifier charset shared by extension ids and tool names. */
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+/** Extension id format (shared with the policy parser, issue #56). */
+export const EXTENSION_ID_RE = NAME_RE;
 const DOMAIN_RE = /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
 
 /**
@@ -336,8 +336,8 @@ export function validateManifest(input: unknown): ExtensionManifest {
     throw new ExtensionValidationError("manifest must be an object");
   }
   const id = requiredString(input, "id");
-  if (!ID_RE.test(id)) {
-    throw new ExtensionValidationError(`id "${id}" must match ${ID_RE.source}`);
+  if (!NAME_RE.test(id)) {
+    throw new ExtensionValidationError(`id "${id}" must match ${NAME_RE.source}`);
   }
   const label = requiredString(input, "label");
   const vendor = requiredString(input, "vendor");

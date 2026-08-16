@@ -25,6 +25,7 @@
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionCredential } from "../store/db";
+import { errorMessage } from "../tools/helpers";
 
 /** The server-side secrets directory (shared with iron-proxy via the data volume). */
 export const PROXY_SECRETS_DIR = "data/proxy-secrets";
@@ -96,7 +97,7 @@ export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): Cre
               : undefined,
           });
         } catch (err) {
-          throw new Error(`extension credential boundary: proxy reload failed: ${(err as Error).message}`);
+          throw new Error(`extension credential boundary: proxy reload failed: ${errorMessage(err)}`);
         }
         if (!res.ok) {
           throw new Error(`extension credential boundary: proxy reload failed (${res.status})`);

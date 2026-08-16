@@ -17,7 +17,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { createAudit, type AuditModule } from "../policy/audit";
+import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
 import { createStore, type ExtensionCredential, type Store } from "../store/db";
@@ -62,7 +62,6 @@ async function seedPersonalCredential(store: Store, provider: string, owner: str
 interface RuntimeHarness {
   runtime: ExtensionRuntime;
   store: Store;
-  audit: AuditModule;
   boundary: CredentialBoundary & { calls: ExtensionCredential[] };
   transports: { bindings: McpBinding[] };
   mcpTransport: (binding: McpBinding) => Transport;
@@ -112,7 +111,7 @@ function makeHarness(opts: {
     boundary,
     mcpTransport,
   };
-  return { runtime: createExtensionRuntime(deps), store, audit: createAudit(store), boundary, transports, mcpTransport };
+  return { runtime: createExtensionRuntime(deps), store, boundary, transports, mcpTransport };
 }
 
 async function callRows(store: Store, eventType: string) {

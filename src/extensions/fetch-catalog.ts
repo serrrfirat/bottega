@@ -26,7 +26,12 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { parsePinnedSnapshot, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "./registry";
+import {
+  parsePinnedSnapshot,
+  SNAPSHOT_SCHEMA,
+  type PinnedSnapshot,
+  type SnapshotSource,
+} from "./registry";
 import {
   ExtensionValidationError,
   validateManifest,
@@ -78,7 +83,7 @@ export interface SnapshotDraft {
   schema: typeof SNAPSHOT_SCHEMA;
   extensionId: string;
   pinnedAt: string;
-  source: { catalog: string; specId: string; vendorOfficial: boolean; reviewed: boolean };
+  source: SnapshotSource;
   manifest: {
     id: string;
     label: string;
