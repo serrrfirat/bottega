@@ -1,11 +1,13 @@
 /**
- * Local-dev iron-proxy override (issue #123): docker-compose.dev.yml is the
- * dev-only delta on top of docker-compose.yml — host-reachable listeners
- * and the host's gitignored ./data bind, so `bun run dev` (scripts/dev.sh)
- * reuses the SAME committed config/egress.yml as compose while the host
- * server's boundary secret files (data/proxy-secrets) are what the proxy
- * injects. The base compose file keeps NO published ports (deployment
- * invariant, asserted in compose.test.ts).
+ * Local-dev iron-proxy override (issues #123, #126): docker-compose.dev.yml
+ * is the dev-only delta on top of docker-compose.yml — host-reachable
+ * listeners and the host's gitignored ./data bind, so `bun run dev`
+ * (scripts/dev.sh) loads the DEV-PERMISSIVE generated config
+ * (config/egress.dev.yml: allow-all "*" + no judge, secrets + management
+ * kept) into the dev proxy while the host server's boundary secret files
+ * (data/proxy-secrets) are what the proxy injects. The base compose file
+ * keeps the STRICT config/egress.yml (deployment contract) and NO
+ * published ports (invariant asserted in compose.test.ts).
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -29,9 +31,13 @@ describe("docker-compose.dev.yml (issue #123 local-dev iron-proxy override)", ()
     expect(ports.sort()).toEqual(["127.0.0.1:8080:8080", "127.0.0.1:9092:9092"]);
   });
 
-  test("keeps the committed config + CA mounts and binds the host ./data at /data", () => {
+  test("mounts the dev-permissive config (not the strict one), CA, and the host ./data at /data", () => {
     const vols = proxy["volumes"] as string[];
-    expect(vols).toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
+    expect(vols).toContain("./config/egress.dev.yml:/etc/iron-proxy/egress.yml:ro");
+    // The dev proxy must NOT mount the STRICT config/egress.yml: the dev
+    // config (allow-all + no judge, issue #126) is what makes local testing
+    // pass; the strict config stays the deployment contract (base compose).
+    expect(vols).not.toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
     expect(vols.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
     expect(vols).toContain("./data:/data");
     // The dev proxy must NOT use the compose named volume: the host server

@@ -21,6 +21,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
+import { renderDevEgressConfig, SNAPSHOTS_DIR } from "./generate";
+import { readPinnedSnapshots } from "../extensions/registry";
+import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 const PROXY_IMAGE = "ironsh/iron-proxy:0.49.0";
 /** Pinned tiny image with nslookup, used to query the proxy's DNS. */
@@ -215,6 +218,191 @@ describe("iron-proxy integration leg (skip-gated)", () => {
             const out = `${lookup.stdout.toString()}\n${lookup.stderr.toString()}`;
             expect(out).toContain(`Address: ${SINKHOLE_IP}`);
           }
+        } finally {
+          Bun.spawnSync(["docker", "rm", "-f", name], { timeout: 30_000 });
+        }
+      } finally {
+        target.stop(true);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    240_000,
+  );
+});
+
+/**
+ * Dev-permissive leg (issue #126): boots the pinned iron-proxy image with
+ * the REAL generated dev config (config/egress.dev.yml — allow-all "*" +
+ * no judge + secrets + management) and proves, against the actual binary:
+ *   - a host that is NOT on the strict allowlist passes (allow-all; the
+ *     strict config would 403 it),
+ *   - the secrets transform injects the boundary's secret file as the
+ *     Authorization header for an extension host (credential injection is
+ *     the core requirement and is KEPT in the dev config).
+ *
+ * No external network is contacted: both target hosts map to a local
+ * Bun.serve via --add-host host-gateway, and the injected secret is a
+ * leg-local value. Skip-gated like the strict leg (BOTTEGA_RUN_INTEGRATION=1).
+ */
+describe("iron-proxy dev-permissive leg (skip-gated)", () => {
+  test(
+    "the dev config allow-alls a non-strict host and injects the extension secret",
+    async () => {
+      const skip = (reason: string) => {
+        console.log(`[iron-proxy dev leg] SKIP: ${reason}`);
+      };
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run");
+        return;
+      }
+      const docker = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], { timeout: 10_000 });
+      if (!docker.success) {
+        skip(`docker unavailable (${docker.stderr.toString().trim().slice(0, 120) || "no daemon"}). Manual checklist: install Docker, pre-pull ${PROXY_IMAGE}, and re-run this leg.`);
+        return;
+      }
+      const pullIfMissing = (image: string): string | null => {
+        const inspect = Bun.spawnSync(["docker", "image", "inspect", image], { timeout: 10_000 });
+        if (inspect.success) return null;
+        const pull = Bun.spawnSync(["docker", "pull", image], { timeout: 120_000 });
+        return pull.success ? null : pull.stderr.toString().trim().slice(0, 120);
+      };
+      const proxyPullError = pullIfMissing(PROXY_IMAGE);
+      if (proxyPullError) {
+        skip(`could not pull ${PROXY_IMAGE} (${proxyPullError}). Manual checklist: pre-pull the image and re-run this leg.`);
+        return;
+      }
+
+      // The REAL generated dev config, with the committed extension entries
+      // (issue #53 injection rules) — the same file dev.sh mounts.
+      const extensionEntries = readPinnedSnapshots(SNAPSHOTS_DIR).map((s) => ({
+        extensionId: s.manifest.id,
+        domains: s.manifest.domains,
+      }));
+      const devConfig = renderDevEgressConfig(extensionEntries);
+      const secretsEntries = parseYamlSubset(devConfig)["transforms"] as YamlNode[];
+      if (!secretsEntries.some((t) => (t as Record<string, YamlNode>)["name"] === "secrets")) {
+        skip("generated dev config has no secrets transform — cannot prove injection");
+        return;
+      }
+
+      // Extension host with an injection rule; NOT on the strict allowlist.
+      const INJECT_HOST = "api.github.com";
+      // Host that is NOT on the strict allowlist at all — must still pass
+      // under the dev allow-all config (the strict config 403s it).
+      const PERMISSIVE_HOST = "bottega-permissive.test";
+      const SECRET_VALUE = "leg-secret-token";
+
+      // Local target: reached through the proxy via --add-host
+      // (host-gateway), never directly. Records the Authorization header it
+      // receives so the leg can prove the injection.
+      const seenAuth: string[] = [];
+      const target = Bun.serve({
+        hostname: "0.0.0.0",
+        port: 0,
+        fetch: (req) => {
+          seenAuth.push(req.headers.get("authorization") ?? "");
+          return new Response("target-ok");
+        },
+      });
+      const targetPort = (target as { port: number }).port;
+
+      // Temp dir under data/ (gitignored): Docker Desktop does not reliably
+      // bind-mount files from /tmp or /var/folders.
+      const dir = join(resolve(import.meta.dir, "../../data"), `ironproxy-dev-leg-${process.pid}`);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const certsDir = join(dir, "certs");
+      const secretsDir = join(dir, "secrets");
+      const cfgPath = join(dir, "egress.dev-leg.yml");
+      mkdirSync(certsDir, { recursive: true });
+      mkdirSync(secretsDir, { recursive: true });
+      try {
+        const genCa = Bun.spawnSync(
+          ["docker", "run", "--rm", "-v", `${certsDir}:/certs`, PROXY_IMAGE, "generate-ca", "-outdir", "/certs"],
+          { timeout: 60_000 },
+        );
+        if (!genCa.success) {
+          skip(`CA generation failed (${genCa.stderr.toString().trim().slice(0, 120)}). Manual checklist: run 'docker run --rm -v $PWD/certs:/certs ${PROXY_IMAGE} generate-ca -outdir /certs'.`);
+          return;
+        }
+        // The boundary's secret file for the github extension (what the
+        // runtime writes on the shared data volume in real dev).
+        writeFileSync(join(secretsDir, extensionSecretFileName("github")), SECRET_VALUE);
+        writeFileSync(cfgPath, devConfig);
+
+        const name = `bottega-ironproxy-dev-${process.pid}`;
+        const run = Bun.spawnSync(
+          [
+            "docker", "run", "-d", "--name", name,
+            `--add-host=${INJECT_HOST}:host-gateway`,
+            `--add-host=${PERMISSIVE_HOST}:host-gateway`,
+            "-p", "127.0.0.1::80",
+            // The management block (management.api_key_env) is fail-closed
+            // at BOOT: iron-proxy v0.49.0 refuses to start when
+            // IRON_MANAGEMENT_API_KEY is unset. dev.sh always exports it
+            // from data/proxy-mgmt-token (compose interpolation), so the
+            // running dev container's token always matches the boundary's
+            // BOTTEGA_PROXY_CONTROL_TOKEN — mirror that here.
+            "-e", "IRON_MANAGEMENT_API_KEY=leg-mgmt-token",
+            "-v", `${cfgPath}:/etc/iron-proxy/egress.yml:ro`,
+            "-v", `${certsDir}:/etc/iron-proxy/certs:ro`,
+            "-v", `${secretsDir}:${PROXY_SECRETS_MOUNT_PATH}:ro`,
+            PROXY_IMAGE,
+            "-config", "/etc/iron-proxy/egress.yml",
+          ],
+          { timeout: 30_000 },
+        );
+        if (!run.success) {
+          skip(`container start failed (${run.stderr.toString().trim().slice(0, 120)}). Manual checklist: check iron-proxy logs, then re-run this leg.`);
+          return;
+        }
+
+        try {
+          const ports = Bun.spawnSync(["docker", "port", name], { timeout: 10_000 }).stdout.toString();
+          const httpPort = Number((ports.match(/80\/tcp -> 127\.0\.0\.1:(\d+)/) ?? [])[1]);
+          if (!httpPort) {
+            skip(`published ports not found in \`docker port ${name}\` output: ${ports.trim().slice(0, 120)}`);
+            return;
+          }
+
+          // Readiness: a proxied request to the permissive host returns 200
+          // once the proxy is up (allow-all — nothing to deny).
+          const proxyUrl = `http://127.0.0.1:${httpPort}`;
+          const deadline = Date.now() + 60_000;
+          let ready = false;
+          while (Date.now() < deadline) {
+            try {
+              const res = await fetch(`http://${PERMISSIVE_HOST}:${targetPort}/`, { proxy: proxyUrl });
+              if (res.status === 200) {
+                ready = true;
+                break;
+              }
+            } catch {
+              // proxy not up yet
+            }
+            await Bun.sleep(500);
+          }
+          if (!ready) {
+            const logs = Bun.spawnSync(["docker", "logs", "--tail", "10", name], { timeout: 10_000 });
+            const tail = `${logs.stdout.toString()}\n${logs.stderr.toString()}`.trim().slice(0, 300);
+            skip(`proxy never became reachable (${tail || "no logs"}). Manual checklist: run the image with the dev config locally and inspect.`);
+            return;
+          }
+
+          // Assertions — the proxy is running the REAL dev config, so these
+          // are real findings.
+          const permissive = await fetch(`http://${PERMISSIVE_HOST}:${targetPort}/`, { proxy: proxyUrl });
+          expect(permissive.status).toBe(200);
+          expect(await permissive.text()).toBe("target-ok");
+          // No injection rule matches PERMISSIVE_HOST → no Authorization.
+          expect(seenAuth.at(-1)).toBe("");
+
+          // Extension host: 200 through the dev proxy AND the secrets
+          // transform injected the boundary's secret file as Bearer auth.
+          const injected = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
+          expect(injected.status).toBe(200);
+          expect(await injected.text()).toBe("target-ok");
+          expect(seenAuth.at(-1)).toBe(`Bearer ${SECRET_VALUE}`);
         } finally {
           Bun.spawnSync(["docker", "rm", "-f", name], { timeout: 30_000 });
         }

@@ -5,8 +5,11 @@ import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 import {
   BASE_EGRESS_DOMAINS,
+  DEV_EGRESS_CONFIG_PATH,
   mergedEgressDomains,
+  regenerateDevEgressConfig,
   regenerateEgressConfig,
+  renderDevEgressConfig,
   renderEgressConfig,
   SNAPSHOTS_DIR,
   renderSecretsTransform,
@@ -167,6 +170,67 @@ describe("egress config generation", () => {
       const outPath = join(dir, "egress.yml");
       regenerateEgressConfig(join(dir, "missing-snapshots"), outPath);
       expect(readFileSync(outPath, "utf8")).toBe(renderEgressConfig(BASE_EGRESS_DOMAINS));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dev-permissive egress config (issue #126)", () => {
+  const COMMITTED_DEV_EGRESS = readFileSync(resolve(import.meta.dir, `../../${DEV_EGRESS_CONFIG_PATH}`), "utf8");
+
+  test("the committed dev config is byte-identical to renderDevEgressConfig with the pinned extensions", () => {
+    // config/egress.dev.yml is a generated artifact (same discipline as the
+    // strict config): hand edits and generator drift both fail here.
+    expect(renderDevEgressConfig(EXTENSION_ENTRIES)).toBe(COMMITTED_DEV_EGRESS);
+  });
+
+  test("allow-all: the dev allowlist contains only \"*\"", () => {
+    // iron-proxy v0.49.0 hostmatch glob semantics: MatchGlob("*", name) is
+    // true for every host, so no request is denied at the allowlist layer.
+    expect(allowlistDomains(COMMITTED_DEV_EGRESS)).toEqual(["*"]);
+  });
+
+  test("no judge transform and no judge key", () => {
+    // The LLM policy gate was the dev restrictiveness (issue #126): the dev
+    // config must not contain the transform, and must not REFERENCE the key
+    // in any transform config (the header comment may mention it as
+    // documentation that dev needs none).
+    expect(COMMITTED_DEV_EGRESS).not.toContain("- name: judge");
+    expect(COMMITTED_DEV_EGRESS).not.toContain("egress-policy");
+    expect(COMMITTED_DEV_EGRESS).not.toContain('fallback: "deny"');
+    expect(COMMITTED_DEV_EGRESS).not.toContain('api_key_env: "NEARAI_JUDGE_API_KEY"');
+    expect(renderDevEgressConfig()).not.toContain("- name: judge");
+  });
+
+  test("keeps the secrets transform with the SAME injection entries as the strict config", () => {
+    // Credential injection (issue #53) is the core requirement: the dev
+    // proxy injects the boundary's secret files for the pinned extensions
+    // exactly like the strict config does.
+    expect(secretsEntries(COMMITTED_DEV_EGRESS)).toEqual(secretsEntries(COMMITTED_EGRESS));
+  });
+
+  test("keeps the management block for boundary reloads (issue #123)", () => {
+    expect(COMMITTED_DEV_EGRESS).toContain("management:");
+    expect(COMMITTED_DEV_EGRESS).toContain('listen: ":9092"');
+    expect(COMMITTED_DEV_EGRESS).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
+  });
+
+  test("rendering the dev config without extensions still allow-alls and keeps management", () => {
+    const yaml = renderDevEgressConfig();
+    expect(allowlistDomains(yaml)).toEqual(["*"]);
+    expect(secretsEntries(yaml)).toBeNull();
+    expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
+    expect(yaml).not.toContain("- name: judge");
+  });
+
+  test("regenerateDevEgressConfig writes the dev config and returns the rendered text", () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-dev-gen-"));
+    try {
+      const outPath = join(dir, "egress.dev.yml");
+      const yaml = regenerateDevEgressConfig(SNAPSHOTS_DIR, outPath);
+      expect(readFileSync(outPath, "utf8")).toBe(yaml);
+      expect(yaml).toBe(renderDevEgressConfig(EXTENSION_ENTRIES));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -100,27 +100,27 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph dev["local dev — scripts/dev.sh (TEMPORARY, tracked #126)"]
+    subgraph dev["local dev — scripts/dev.sh (dev-permissive, issue #126)"]
         SRV["server"]
-        ETC["extension traffic"]
-        CORE["platform + model traffic<br/>slack.com, *.slack.com, slack-edge.com,<br/>cloud-api.near.ai, *.completions.near.ai"]
+        ALL["all traffic — platform, model,<br/>web search, GitHub, extensions"]
     end
-    ETC --> DXP["iron-proxy — secret injection intact"]
-    CORE -. "NO_PROXY bypass" .-> DDIR["direct"]
+    ALL --> DXP["iron-proxy — dev config: allow-all '*' +<br/>no judge; secrets + management kept"]
 ```
 
-**Current dev state (#123 → #126).** `ec580a4` made iron-proxy default-on
-for local dev: the egress config is reloaded before the server boots
-(`POST /v1/reload` on the management API), and `bun run dev` fails closed
-without `NEARAI_JUDGE_API_KEY` — local dev never runs with open egress.
-However, the committed judge rules deny the server's own model calls (a
-context-free LLM denies bare model/API requests) and Slack domains aren't
-allowlisted at all, which broke the bot. `a3ecef3` added a **temporary
-restore**: `NO_PROXY` in `scripts/dev.sh` now bypasses the proxy for Slack
-socket/API + model endpoints. **Extension traffic stays proxied — the
-secret-injection path is untouched.** This is dev-only; the compose
-topology above still routes everything through the proxy. Revert the
-`NO_PROXY` line when the judge rules pass model/Slack traffic (#126).
+**Dev vs deployment egress (#123 → #126).** `ec580a4` made iron-proxy
+default-on for local dev: the egress config is reloaded before the server
+boots (`POST /v1/reload` on the management API). The strict config's judge
+rules denied the server's own model calls (a context-free LLM denies bare
+model/API requests) and Slack domains weren't allowlisted at all, which
+broke the bot under the dev proxy. Instead of loosening the deployment
+contract, local dev now loads the generated **dev-permissive config**
+(`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge, secrets +
+management kept; mounted only by docker-compose.dev.yml) — so ALL dev
+traffic passes the proxy and the secret-injection path stays intact. The
+temporary #126 `NO_PROXY` bypass in `scripts/dev.sh` is reverted (the dev
+proxy passes everything; routing through it is harmless). `NEARAI_JUDGE_API_KEY`
+is a deployment concern only. The compose topology above still routes
+everything through the strict config/egress.yml, unchanged.
 
 ## Agent driver abstraction (agents are pluggable)
 

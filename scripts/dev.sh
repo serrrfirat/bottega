@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
-# bottega local dev launcher (issues #24, #123).
+# bottega local dev launcher (issues #24, #123, #126).
 #
 # Loads NEAR_API_KEY from the macOS Keychain when it isn't in the
 # environment, then runs the server. The production path is unchanged:
 # servers resolve keys via the auth-broker vault or .env.
 #
-# Issue #123 — iron-proxy default-on: local dev routes egress through the
-# SAME iron-proxy (and the SAME committed config/egress.yml) as compose, and
-# the extension credential boundary (secret-file write + proxy reload) is
-# ALWAYS the injection path. `bun run dev` now requires Docker:
+# Issue #123/#126 — iron-proxy default-on, dev-PERMISSIVE: local dev routes
+# egress through the SAME iron-proxy as compose, but with the generated
+# DEV config (config/egress.dev.yml: allow-all allowlist "*" + NO judge,
+# secrets + management kept) instead of the strict config/egress.yml — so
+# web search (SDK providers), GitHub, Slack, and model endpoints all pass
+# the dev proxy (no 403s, no judge denials) while the extension credential
+# boundary (secret-file write + proxy reload) stays the injection path.
+# `bun run dev` now requires Docker:
 #   1. checks Docker is installed and the daemon is reachable (loud failure
 #      with the exact remedy — never silent);
 #   2. generates the MITM CA (certs/, gitignored) on first run;
-#   3. resolves the egress judge key NEARAI_JUDGE_API_KEY (env -> .env ->
-#      Keychain service bottega-near); missing -> LOUD failure, never silent
-#      open egress (the judge is fail-closed deny);
+#   3. resolves the dev management token (data/proxy-mgmt-token, 0600) —
+#      the boundary's reload half; no NEARAI_JUDGE_API_KEY is needed (the
+#      dev config has no judge — the strict config's judge key is a
+#      deployment concern, unchanged for compose);
 #   4. starts iron-proxy detached via the compose dev override
-#      (docker-compose.dev.yml: 127.0.0.1-bound 8080/9092 + ./data bind) and
-#      waits for the management API to answer a reload — that proves the
-#      egress config (allowlist + judge + secrets + management) parsed;
+#      (docker-compose.dev.yml: 127.0.0.1-bound 8080/9092 + ./data bind +
+#      the dev config mount) and waits for the management API to answer a
+#      reload — that proves the dev egress config (allowlist + secrets +
+#      management) parsed AND that the running container's
+#      IRON_MANAGEMENT_API_KEY matches data/proxy-mgmt-token (a stale
+#      container with a different token 401s the probe and fails loudly);
 #   5. exports the proxy env the server needs: HTTP(S)_PROXY, NO_PROXY (the
 #      same internal names as compose), NODE_EXTRA_CA_CERTS (Bun/Node verify
 #      the proxy's MITM leaf certs against the generated CA), and
@@ -35,7 +43,6 @@
 # Store the keys once:
 #   security add-generic-password -s bottega-near -a "$(whoami)" -w '<key>'
 #   security add-generic-password -s bottega-opencode -a "$(whoami)" -w '<key>'
-# (bottega-near serves both NEAR_API_KEY and the egress judge key #123.)
 #
 # Usage:
 #   bun run dev            # wrapper (this script)
@@ -66,22 +73,6 @@ fi
 
 # --- iron-proxy: local dev egress gate + credential boundary (issue #123) --
 
-# Value from the environment, else the project .env (quotes stripped), so
-# dev.sh, the proxy container (compose interpolation) and the server process
-# share ONE value.
-env_or_dotenv() { # <var>
-  local var="$1" line value
-  if [[ -n "${!var:-}" ]]; then printf '%s' "${!var}"; return 0; fi
-  if [[ -f .env ]] && line="$(grep -E "^${var}=" .env | tail -1 || true)" && [[ -n "$line" ]]; then
-    value="${line#*=}"
-    value="${value%\"}"; value="${value#\"}"
-    value="${value%\'}"; value="${value#\'}"
-    printf '%s' "$value"
-    return 0
-  fi
-  return 1
-}
-
 COMPOSE_DEV=(docker compose -f docker-compose.yml -f docker-compose.dev.yml)
 
 # 1. Docker gate (fail loudly — the dev topology cannot run without it).
@@ -97,8 +88,9 @@ if ! docker version >/dev/null 2>&1; then
   exit 1
 fi
 
-# 2. MITM CA (config/egress.yml -> tls): the proxy terminates HTTPS with it
-#    and the dev server must trust it (NODE_EXTRA_CA_CERTS below). Gitignored.
+# 2. MITM CA (config/egress.dev.yml -> tls): the proxy terminates HTTPS with
+#    it and the dev server must trust it (NODE_EXTRA_CA_CERTS below).
+#    Gitignored.
 if [[ ! -f certs/ca.crt ]]; then
   echo "iron-proxy: generating MITM CA (certs/, gitignored)..."
   mkdir -p certs
@@ -110,26 +102,12 @@ if [[ ! -f certs/ca.crt ]]; then
   echo "iron-proxy: MITM CA generated at certs/ca.crt"
 fi
 
-# 3. Judge key (fail closed): without NEARAI_JUDGE_API_KEY the judge LLM call
-#    fails and every allowlisted request is denied — never silently open.
-JUDGE_KEY="$(env_or_dotenv NEARAI_JUDGE_API_KEY || true)"
-if [[ -z "$JUDGE_KEY" ]] && command -v security >/dev/null 2>&1; then
-  JUDGE_KEY="$(security find-generic-password -s bottega-near -w 2>/dev/null || true)"
-fi
-if [[ -z "$JUDGE_KEY" ]]; then
-  echo "bottega dev: NEARAI_JUDGE_API_KEY is REQUIRED (issue #123) — the egress judge gates every model request and fails closed (deny) without a key; local dev never runs with open egress." >&2
-  echo "Store it in the Keychain (reuses the bottega-near entry):" >&2
-  echo "  security add-generic-password -s bottega-near -a \"$(whoami)\" -w '<key>'" >&2
-  echo "or set NEARAI_JUDGE_API_KEY in .env / your shell, then re-run:" >&2
-  echo "  bun run dev" >&2
-  exit 1
-fi
-export NEARAI_JUDGE_API_KEY="$JUDGE_KEY"
-echo "NEARAI_JUDGE_API_KEY resolved (env/.env/Keychain bottega-near)"
-
-# 4. Management API token for the boundary reload (issue #123). Persisted
+# 3. Management API token for the boundary reload (issue #123). Persisted
 #    (0600, gitignored data/) so consecutive dev runs REUSE a running proxy
-#    instead of recreating it with a fresh token each boot.
+#    instead of recreating it with a fresh token each boot. The dev config
+#    (config/egress.dev.yml) has NO judge, so NEARAI_JUDGE_API_KEY is not
+#    needed here — the strict config's judge key stays a deployment (.env /
+#    compose) concern.
 if [[ ! -f data/proxy-mgmt-token ]]; then
   mkdir -p data
   if command -v openssl >/dev/null 2>&1; then
@@ -144,9 +122,11 @@ export IRON_MANAGEMENT_API_KEY="$(<data/proxy-mgmt-token)"
 export BOTTEGA_PROXY_CONTROL_URL="http://127.0.0.1:9092"
 export BOTTEGA_PROXY_CONTROL_TOKEN="$IRON_MANAGEMENT_API_KEY"
 
-# 5. Start the proxy (detached, idempotent: a running container with the
+# 4. Start the proxy (detached, idempotent: a running container with the
 #    same config is reused) and wait for the management API — a successful
-#    POST /v1/reload proves the egress config parsed and loaded.
+#    POST /v1/reload proves the dev egress config parsed AND that the
+#    container's IRON_MANAGEMENT_API_KEY matches data/proxy-mgmt-token (the
+#    compose interpolation below exports the same token to the container).
 echo "iron-proxy: starting (${COMPOSE_DEV[*]} up -d iron-proxy)..."
 "${COMPOSE_DEV[@]}" up -d iron-proxy
 echo "iron-proxy: waiting for the management API (POST /v1/reload) on 127.0.0.1:9092..."
@@ -164,26 +144,25 @@ if [[ "$READY" != 1 ]]; then
   echo "bottega dev: iron-proxy did not become ready (issue #123). Diagnose:" >&2
   echo "  ${COMPOSE_DEV[*]} logs iron-proxy" >&2
   echo "  ${COMPOSE_DEV[*]} ps" >&2
+  echo "If the probe 401s, the running container's IRON_MANAGEMENT_API_KEY differs from" >&2
+  echo "data/proxy-mgmt-token (e.g. a container started outside dev.sh) — recreate it:" >&2
+  echo "  ${COMPOSE_DEV[*]} up -d --force-recreate iron-proxy" >&2
   exit 1
 fi
-echo "iron-proxy: ready (egress config loaded, management API answering)"
+echo "iron-proxy: ready (dev egress config loaded, management API answering)"
 
-# 6. Server proxy env (issue #123): same topology as compose — HTTP(S)_PROXY
+# 5. Server proxy env (issue #123): same topology as compose — HTTP(S)_PROXY
 #    at the tunnel, NO_PROXY for internal names, the MITM CA for Bun/Node
 #    TLS, and the boundary control URL/token (authorize writes the secret
 #    file AND reloads the proxy). The BOTTEGA_* vars reach the server
 #    process and the ACP driver's spawned MCP server via the environment.
+#    The #126 temporary NO_PROXY bypass is REVERTED: the dev proxy runs the
+#    permissive config (allow-all + no judge), so routing the server's core
+#    traffic (Slack, model endpoints, web search) through it is harmless and
+#    keeps secret injection on every proxied extension call.
 export HTTP_PROXY="http://127.0.0.1:8080"
 export HTTPS_PROXY="http://127.0.0.1:8080"
-# TEMPORARY RESTORE (issue #125 follow-up): the committed egress config's
-# judge transform denies the server's own model calls (a context-free LLM
-# denies bare model/API requests; Slack domains aren't allowlisted at all),
-# so routing platform + model traffic through the proxy breaks the bot.
-# Dev bypasses the proxy for the server's core traffic (Slack socket/API +
-# model endpoints); EXTENSION traffic (mcp.attio.com/api.github.com/
-# mcp.linear.app) stays proxied — the secret-injection path is untouched.
-# Revert this line when the egress judge rules pass model/Slack traffic.
-export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,slack.com,*.slack.com,slack-edge.com,cloud-api.near.ai,*.completions.near.ai,opencode.ai,*.opencode.ai"
+export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0"
 export NODE_EXTRA_CA_CERTS="$PWD/certs/ca.crt"
 
 exec bun run ${1:+--watch} src/server/index.ts

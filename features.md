@@ -250,21 +250,27 @@ is protected on the way out:
   proxy injects it as the `Authorization` header for the extension's
   allowlisted domains only. Nothing reaches agent env, transcripts, or
   audit.
-- **Local dev is the same topology** — `bun run dev` brings up iron-proxy,
-  reloads the egress config before the server boots, and fails closed if
-  the judge key (`NEARAI_JUDGE_API_KEY`) is missing: local dev never runs
-  with open egress.
+- **Local dev is the same topology, dev-permissive (issues #123, #126)** —
+  `bun run dev` brings up iron-proxy and reloads the egress config before
+  the server boots. The dev proxy runs the generated DEV config
+  (`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge), so
+  testing passes for web search, GitHub, Slack, and model endpoints alike;
+  the strict `config/egress.yml` (default-deny allowlist + LLM judge) stays
+  the deployment contract, unchanged. The extension credential boundary
+  (secret-file write + proxy reload) is the injection path in BOTH.
 
-**Current state in local dev (temporary, tracked in #126):** the committed
-egress judge rules currently deny the server's own model calls (a
-context-free LLM denies bare model/API requests) and Slack domains aren't
-allowlisted at all — so routing platform + model traffic through the proxy
-broke the bot. Until the judge rules are fixed, `scripts/dev.sh` bypasses
-the proxy for the server's core traffic (Slack socket/API + model
-endpoints). **Extension traffic (mcp.attio.com / api.github.com /
-mcp.linear.app) stays proxied — the secret-injection path is untouched.**
-The full compose topology still routes everything through the proxy; this
-bypass is a dev-only, temporary restore that gets reverted when #126 lands.
+**Dev vs deployment (issue #126):** the strict config's judge rules denied
+the server's own model calls (a context-free LLM denies bare model/API
+requests) and Slack domains weren't allowlisted at all, which broke the bot
+under the dev proxy. Instead of loosening the deployment contract, local dev
+now loads the permissive dev config: allow-all + no judge, with the secrets
+transform (extension credential injection) and the management block kept.
+The #125/#126 temporary `NO_PROXY` bypass in `scripts/dev.sh` is reverted —
+the dev proxy passes everything, so routing platform + model traffic through
+it is harmless and injection stays on every proxied extension call. The full
+compose topology still routes everything through the strict proxy; this
+permissiveness is dev-only (`config/egress.dev.yml` is mounted only by
+docker-compose.dev.yml).
 
 ## Live-Slack QA canary (issue #79)
 
