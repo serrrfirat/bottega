@@ -816,6 +816,27 @@ describe("org settings (issue #67)", () => {
     });
   });
 
+  test("onboarding.space_id round-trips; empty clears; malformed fails closed (issue #116)", () => {
+    const s = freshStore();
+    const parsed = s.setOrgSettings({ onboarding: { space_id: "slack:C123" } });
+    expect(parsed.ok).toBe(true);
+    expect(parsed.onboarding).toEqual({ spaceId: "slack:C123" });
+    expect(s.getOrgSettings()?.onboarding).toEqual({ spaceId: "slack:C123" });
+
+    // An empty space_id clears the setting (no boot post), mirroring
+    // memory_backend.base_url.
+    s.setOrgSettings({ onboarding: { space_id: "" } });
+    expect(s.getOrgSettings()?.onboarding).toBeUndefined();
+    expect(s.setOrgSettings({ onboarding: {} }).onboarding).toBeUndefined();
+
+    // Malformed values fail closed and write nothing.
+    const malformed = (v: object): OrgSettingsInput => v as unknown as OrgSettingsInput;
+    expect(() => s.setOrgSettings(malformed({ onboarding: { space_id: 42 } }))).toThrow(/onboarding\.space_id/);
+    expect(() => s.setOrgSettings(malformed({ onboarding: { channel: "C1" } }))).toThrow(/onboarding\.channel: unknown key/);
+    expect(() => s.setOrgSettings(malformed({ onboarding: "slack:C1" }))).toThrow(/onboarding must be an object/);
+    expect(s.getOrgSettings()?.onboarding).toBeUndefined();
+  });
+
   test("memory.injection.max_entries over the cap is clamped with a warning", () => {
     const s = freshStore();
     const parsed = s.setOrgSettings({ memory: { injection: { max_entries: 50 } } });

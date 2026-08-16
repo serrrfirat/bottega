@@ -15,7 +15,9 @@
  *   approval timeouts, always_approve, response_mode, memory injection,
  *   extensions allow/deny/org_credentials, repo allowlist, model defaults
  *   (default/fast/reasoning + effort), workspaces dir, git/api base URLs,
- *   loose-PAT dev override, memory backend URL. Set merges partially over
+ *   loose-PAT dev override, memory backend URL, onboarding space id
+ *   (issue #116: the space that receives the boot-time onboarding guide).
+ *   Set merges partially over
  *   the current blob; validation is fail-closed (setOrgSettings throws on
  *   invalid input and writes nothing).
  * - `space`: get/set the per-space policy overlay (spaces.policy_json) —
@@ -90,6 +92,11 @@ export const settingsSetSchema = z.object({
       base_url: z.string().optional(),
     })
     .optional(),
+  onboarding: z
+    .object({
+      space_id: z.string().optional(),
+    })
+    .optional(),
 });
 export type SettingsSetInput = z.infer<typeof settingsSetSchema>;
 
@@ -155,6 +162,9 @@ function mergeSettingsInput(base: OrgSettingsInput, partial: SettingsSetInput): 
   if (partial.memory_backend !== undefined) {
     out.memory_backend = { ...base.memory_backend, ...partial.memory_backend };
   }
+  if (partial.onboarding !== undefined) {
+    out.onboarding = { ...base.onboarding, ...partial.onboarding };
+  }
   return out;
 }
 
@@ -205,6 +215,9 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   if (settings.memoryBackend?.baseUrl !== undefined) {
     input.memory_backend = { base_url: settings.memoryBackend.baseUrl };
   }
+  if (settings.onboarding?.spaceId !== undefined) {
+    input.onboarding = { space_id: settings.onboarding.spaceId };
+  }
   return input;
 }
 
@@ -229,7 +242,8 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
-      "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url. Space scope knobs " +
+      "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url, onboarding.space_id " +
+      "(the space that receives the boot-time onboarding guide). Space scope knobs " +
       "(the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
       "allowlist), extensions.deny (ids to ADD), extensions.org_credentials. Omit `set` to read: " +
       "returns the stored settings plus the effective policy. Per-space model knobs live in the " +

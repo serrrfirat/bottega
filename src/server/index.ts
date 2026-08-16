@@ -11,7 +11,7 @@ import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
-import { adminToolDefinitions } from "../tools/admin";
+import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -28,6 +28,7 @@ import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
+import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +71,12 @@ export interface BottegaServerOpts {
    * touching the deployment agent dir.
    */
   agentDir?: string;
+  /**
+   * Boot-guide posting seam (issue #116): posts the boot-time onboarding
+   * guide to the configured onboarding space. Defaults to the Slack
+   * adapter's postMessage; tests inject a fake so no Slack call happens.
+   */
+  postOnboardingGuide?: (spaceId: string, text: string) => Promise<void>;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -136,6 +143,40 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     onAction: (a) => approvalRouter.handleAction(a),
     responseModeFor,
   });
+  // Boot-time onboarding guide (issue #116): proactive Slack-side setup.
+  // When any first-run check fails AND an onboarding space is configured
+  // (org settings onboarding.space_id), post ONE guided message naming the
+  // failing checks with a pointer to the first_run_wizard — once per boot
+  // by construction. Fail closed: no space configured → no post; a failed
+  // post is audited + logged, never a boot failure.
+  const onboardingSpaceId = orgSettings?.onboarding?.spaceId;
+  if (onboardingSpaceId !== undefined) {
+    const failing = runWizardChecks(store).filter((c) => !c.ok);
+    if (failing.length > 0) {
+      const postGuide =
+        opts.postOnboardingGuide ?? ((spaceId: string, text: string) => adapter.postMessage(spaceId, text));
+      const checks = failing.map((c) => ({ name: c.name, ok: c.ok }));
+      try {
+        await postGuide(onboardingSpaceId, onboardingGuideText(failing));
+        await audit.appendAudit({
+          space_id: onboardingSpaceId,
+          actor: "system",
+          event_type: ADMIN_ONBOARDING_BOOT_EVENT,
+          payload: { posted: true, checks },
+        });
+      } catch (err) {
+        console.error(`[boot] onboarding guide post to ${onboardingSpaceId} failed:`, err);
+        await audit
+          .appendAudit({
+            space_id: onboardingSpaceId,
+            actor: "system",
+            event_type: ADMIN_ONBOARDING_BOOT_EVENT,
+            payload: { posted: false, checks },
+          })
+          .catch(() => {});
+      }
+    }
+  }
   // Space sessions resolve ask-human via Slack buttons (issue #44). The
   // executor keeps DenyRouter (src/executor.ts): its work-item pickup
   // approval is the authorization, and nothing headless may run exec tools

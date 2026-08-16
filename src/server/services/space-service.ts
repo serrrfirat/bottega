@@ -1,10 +1,11 @@
 import type { AgentDriver, AgentSessionDriver, SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
+import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
+import { onboardingGuideText, runWizardChecks, type WizardCheck } from "../../tools/admin";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -54,6 +55,13 @@ export interface SpaceServiceDeps {
    * reach the session's setModelRole hook. Absent → no registration.
    */
   modelRoles?: SessionModelRoleRegistry;
+  /**
+   * Onboarding-check seam (issue #116): the shared first-run wizard checks
+   * (runWizardChecks — one source of truth with the `first_run_wizard` tool
+   * and the boot-time guide). Defaults to runWizardChecks(store); tests
+   * inject deterministic failing sets.
+   */
+  onboardingChecks?: () => WizardCheck[];
 }
 
 /** A connect-intent message parsed by {@link parseConnectIntent}. */
@@ -159,6 +167,7 @@ export class SpaceService {
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   readonly #connect: ConnectExtensionDeps | undefined;
   readonly #modelRoles: SessionModelRoleRegistry | undefined;
+  readonly #onboardingChecks: () => WizardCheck[];
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
@@ -189,6 +198,13 @@ export class SpaceService {
   readonly #turnDelivered = new Set<string>();
   /** Spaces mid-digest turn: their output must not reach the channel (#42). */
   readonly #digesting = new Set<string>();
+  /**
+   * Per-space onboarding-nudge dedupe (issue #116): space id → the
+   * failing-check snapshot the space was last nudged for. A broken setup
+   * nudges once until the missing set CHANGES; the record clears when the
+   * checks pass, so a later regression nudges fresh. Never per message.
+   */
+  readonly #nudged = new Map<string, string>();
   /** Rotates THINKING_PHRASES one step per turn. */
   #phraseIndex = 0;
 
@@ -204,6 +220,7 @@ export class SpaceService {
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
     this.#connect = deps.connect;
     this.#modelRoles = deps.modelRoles;
+    this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
@@ -430,7 +447,10 @@ export class SpaceService {
     this.#emptyTurnCount.delete(spaceId);
     this.#churnActive.delete(spaceId);
     const message = (data as { message?: unknown }).message;
-    this.#replaceOrPost(spaceId, typeof message === "string" ? message : "Something went wrong while thinking.");
+    const base = typeof message === "string" ? message : "Something went wrong while thinking.";
+    // A setup-blocked failure (provider/session) appends the one-line
+    // onboarding pointer (issue #116) — bounded by the per-space dedupe.
+    this.#replaceOrPost(spaceId, this.#nudgeText(spaceId, base));
   }
 
   /**
@@ -449,14 +469,55 @@ export class SpaceService {
    * Counts one empty completion for the space; beyond {@link EMPTY_TURN_LIMIT}
    * consecutive empties, surfaces {@link CHURN_MESSAGE} exactly once (in place
    * of the pending phrase, or fresh) and silences phrases until a non-empty
-   * turn — fail visible, not silent (#60).
+   * turn — fail visible, not silent (#60). The churn boundary is the
+   * missing-model-key path of the onboarding nudge (issue #116): when the
+   * shared checks fail, the one-line pointer is appended here.
    */
   #countEmptyTurn(spaceId: string): void {
     const count = (this.#emptyTurnCount.get(spaceId) ?? 0) + 1;
     this.#emptyTurnCount.set(spaceId, count);
     if (count <= EMPTY_TURN_LIMIT || this.#churnActive.has(spaceId)) return;
     this.#churnActive.add(spaceId);
-    this.#replaceOrPost(spaceId, CHURN_MESSAGE);
+    this.#replaceOrPost(spaceId, this.#nudgeText(spaceId, CHURN_MESSAGE));
+  }
+
+  /**
+   * Appends the one-line onboarding pointer (issue #116) when setup is
+   * incomplete: names the failing checks and points at `first_run_wizard`.
+   * Deduped per space on the failing-check snapshot — a broken setup nudges
+   * once until the missing set changes, and the record clears once the
+   * checks pass. Fail closed: a check failure (e.g. malformed settings)
+   * suppresses the nudge, never the turn output.
+   */
+  #nudgeText(spaceId: string, baseText: string): string {
+    let failing: WizardCheck[];
+    try {
+      failing = this.#onboardingChecks().filter((c) => !c.ok);
+    } catch (err) {
+      console.error(`[space-service] onboarding checks failed for ${spaceId}:`, err);
+      return baseText;
+    }
+    if (failing.length === 0) {
+      this.#nudged.delete(spaceId);
+      return baseText;
+    }
+    const snapshot = failing
+      .map((c) => c.name)
+      .sort()
+      .join(",");
+    if (this.#nudged.get(spaceId) === snapshot) return baseText;
+    this.#nudged.set(spaceId, snapshot);
+    void this.#store
+      .appendAudit({
+        space_id: spaceId,
+        actor: "system",
+        event_type: ADMIN_ONBOARDING_NUDGE_EVENT,
+        payload: JSON.stringify({ checks: failing.map((c) => ({ name: c.name, ok: c.ok })) }),
+      })
+      .catch((err) => {
+        console.error(`[space-service] onboarding nudge audit write failed for ${spaceId}:`, err);
+      });
+    return `${baseText}\n${onboardingGuideText(failing)}`;
   }
 
   /**

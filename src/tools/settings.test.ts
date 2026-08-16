@@ -156,6 +156,29 @@ describe("org scope (issue #67)", () => {
     }
   });
 
+  test("onboarding.space_id sets, round-trips, and merges (issue #116)", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store);
+      const res = await call(tool, { scope: "org", set: { onboarding: { space_id: "slack:C123" } } });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as { settings: { onboarding: { space_id: string } } };
+      expect(body.settings.onboarding.space_id).toBe("slack:C123");
+      expect(store.getOrgSettings()?.onboarding?.spaceId).toBe("slack:C123");
+
+      // A partial set keeps the onboarding knob.
+      await call(tool, { scope: "org", set: { response_mode: "mention" } });
+      const got = await call(tool, { scope: "org" });
+      const read = JSON.parse(got.text) as {
+        settings: { response_mode: string; onboarding: { space_id: string } };
+      };
+      expect(read.settings.response_mode).toBe("mention");
+      expect(read.settings.onboarding.space_id).toBe("slack:C123");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("invalid set fails closed and writes nothing", async () => {
     const { store, cleanup } = freshStore();
     try {

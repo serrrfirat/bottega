@@ -10,7 +10,8 @@ import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
 import type { AuditModule } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT } from "../../store/audit-events";
+import type { WizardCheck } from "../../tools/admin";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests
@@ -202,6 +203,9 @@ function fakeStore(): {
       audit.push(entry);
       return audit.length;
     },
+    // runWizardChecks (the default onboarding-checks seam, issue #116) reads
+    // org settings; no settings blob is the normal unset state.
+    getOrgSettings: () => null,
   } as unknown as Store;
   return { store, audit };
 }
@@ -480,7 +484,9 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    // All-pass checks: this test is about the error surface, not the
+    // onboarding nudge (issue #116).
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -619,7 +625,9 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    // All-pass checks: this test is about the churn surface, not the
+    // onboarding nudge (issue #116).
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -663,7 +671,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -690,7 +698,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1192,5 +1200,164 @@ describe("SpaceService connect intent (issue #61)", () => {
     expect(driver.created).toHaveLength(1);
     expect(driver.last().prompts[0]!.text).toBe("connect fixture.weather as me");
     await service.stop();
+  });
+});
+
+describe("SpaceService onboarding nudge (issue #116)", () => {
+  function failingChecks(names: string[]): WizardCheck[] {
+    return names.map((name) => ({ name, ok: false, detail: "test", fix: "test" }));
+  }
+
+  /**
+   * Flushes the phrase-post promise chain (post → pending-ts capture →
+   * posting-clear) — the chain is several microtask hops long, so a single
+   * `await Promise.resolve()` is not enough before the next turn event.
+   */
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+  }
+
+  test("the churn guard appends one first_run_wizard pointer naming the missing checks", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => failingChecks(["model_key", "slack_tokens"]),
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await flush();
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      await flush();
+    }
+
+    expect(posts).toHaveLength(1); // one phrase, replaced in place
+    const churn = updates.at(-1)!.text;
+    expect(churn).toContain(CHURN_MESSAGE);
+    expect(churn).toContain("first_run_wizard");
+    expect(churn).toContain("model_key");
+    expect(churn).toContain("slack_tokens");
+    const nudgeAudits = audit.filter((a) => a.event_type === ADMIN_ONBOARDING_NUDGE_EVENT);
+    expect(nudgeAudits).toHaveLength(1);
+    expect(nudgeAudits[0]!.space_id).toBe("slack:C1");
+    const payload = JSON.parse(nudgeAudits[0]!.payload) as { checks: Array<{ name: string; ok: boolean }> };
+    expect(payload.checks.map((c) => c.name).sort()).toEqual(["model_key", "slack_tokens"]);
+  });
+
+  test("a session error appends the pointer once, not per message (same missing set deduped)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => failingChecks(["broker_token", "git_pat"]),
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    // Several failing turns with the same missing set → one nudge total.
+    for (let i = 0; i < 4; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await flush();
+      session.emit("error", { spaceId: "slack:C1", message: `boom ${i}` });
+      await flush();
+    }
+
+    const nudged = updates.filter((u) => u.text.includes("first_run_wizard"));
+    expect(nudged).toHaveLength(1);
+    expect(nudged[0]!.text).toContain("broker_token");
+    expect(nudged[0]!.text).toContain("git_pat");
+    // 4 error updates total: the first carries the pointer, the rest are raw.
+    expect(updates).toHaveLength(4);
+    expect(audit.filter((a) => a.event_type === ADMIN_ONBOARDING_NUDGE_EVENT)).toHaveLength(1);
+  });
+
+  test("a changed failing set nudges again naming what remains (bounded until resolved)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    let missing = ["broker_token", "git_pat"];
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => failingChecks(missing),
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await flush();
+    session.emit("error", { spaceId: "slack:C1", message: "boom 1" });
+    await flush();
+    expect(updates.at(-1)!.text).toContain("broker_token");
+
+    // Fix broker_token: the remaining missing set is smaller → nudge again.
+    missing = ["git_pat"];
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await flush();
+    session.emit("error", { spaceId: "slack:C1", message: "boom 2" });
+    await flush();
+    expect(updates.at(-1)!.text).toContain("git_pat");
+    expect(updates.at(-1)!.text).not.toContain("broker_token");
+
+    // Fully resolved: no nudge, and the dedupe record clears (a later
+    // regression would nudge fresh).
+    missing = [];
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await flush();
+    session.emit("error", { spaceId: "slack:C1", message: "boom 3" });
+    await flush();
+    expect(updates.at(-1)!.text).toBe("boom 3");
+    const nudged = updates.filter((u) => u.text.includes("first_run_wizard"));
+    expect(nudged).toHaveLength(2);
+  });
+
+  test("all-pass checks never nudge, even on repeated failures", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await flush();
+      session.emit("error", { spaceId: "slack:C1", message: "boom" });
+      await flush();
+    }
+    expect(updates.filter((u) => u.text.includes("first_run_wizard"))).toHaveLength(0);
+    expect(updates).toHaveLength(3);
+    expect(updates.every((u) => u.text === "boom")).toBe(true);
+  });
+
+  test("a check failure suppresses the nudge, never the turn output (fail closed)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => {
+        throw new Error("malformed settings blob");
+      },
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    driver.last().emit("turn_start", { spaceId: "slack:C1" });
+    await flush();
+    driver.last().emit("error", { spaceId: "slack:C1", message: "boom" });
+    await flush();
+    expect(updates.at(-1)!.text).toBe("boom");
   });
 });

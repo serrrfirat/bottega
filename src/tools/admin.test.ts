@@ -32,7 +32,15 @@ import {
 import { decidePolicyCall, defaultPolicy, resolveTier } from "../policy/config";
 import type { AuditModule } from "../policy/audit";
 import type { ResolvedExtension } from "../extensions/registry";
-import { adminToolDefinitions, adminToolsExtension, type HealthProbeSeams, type ServiceStatus } from "./admin";
+import {
+  adminToolDefinitions,
+  adminToolsExtension,
+  onboardingGuideText,
+  runWizardChecks,
+  type HealthProbeSeams,
+  type ServiceStatus,
+  type WizardCheck,
+} from "./admin";
 
 const noopCtx = {} as unknown as ExtensionContext;
 
@@ -693,5 +701,36 @@ describe("first_run_wizard (issue #73)", () => {
       restoreEnv(envBackup);
       cleanup();
     }
+  });
+});
+
+describe("runWizardChecks extraction (issue #116)", () => {
+  test("the shared checks are exactly what the wizard tool surfaces (one source of truth)", async () => {
+    const envBackup = backupEnv();
+    const { store, dir, cleanup } = freshStore();
+    try {
+      for (const key of ENV_KEYS) delete process.env[key];
+      const gitTokenFile = join(dir, "data", "secrets", "github-pat");
+      const egressConfigPath = join(dir, "egress.yml");
+      const direct = runWizardChecks(store, { gitTokenFile, egressConfigPath });
+      expect(direct).toHaveLength(6);
+      const tool = findTool(loadTools(store, { gitTokenFile, egressConfigPath }), "first_run_wizard");
+      const res = await call(tool, {});
+      const body = JSON.parse(res.text) as { checks: WizardCheck[] };
+      expect(direct).toEqual(body.checks);
+    } finally {
+      restoreEnv(envBackup);
+      cleanup();
+    }
+  });
+
+  test("onboardingGuideText names the failing checks and points at the wizard", () => {
+    const text = onboardingGuideText([
+      { name: "model_key", ok: false, detail: "d", fix: "f" },
+      { name: "git_pat", ok: false, detail: "d", fix: "f" },
+    ]);
+    expect(text).toContain("model_key");
+    expect(text).toContain("git_pat");
+    expect(text).toContain("first_run_wizard");
   });
 });

@@ -61,3 +61,15 @@ export const ADMIN_STACK_HEALTH_EVENT = "admin.stack_health";
 export const ADMIN_DEPLOY_INFO_EVENT = "admin.deploy_info";
 /** First-run wizard run (payload {ok, checks: [{name, ok}]}). */
 export const ADMIN_FIRST_RUN_EVENT = "admin.first_run_wizard";
+/**
+ * Proactive onboarding (issue #116): boot-time guided setup post
+ * (payload {posted, checks: [{name, ok}]}; the onboarding space id rides
+ * the top-level space_id field). Never carries secrets.
+ */
+export const ADMIN_ONBOARDING_BOOT_EVENT = "admin.onboarding_boot";
+/**
+ * In-conversation onboarding nudge appended to a setup-blocked turn
+ * (payload {checks: [{name, ok}]}; space_id top-level). Written only when
+ * the nudge actually fires (dedupe suppressed repeats are not audited).
+ */
+export const ADMIN_ONBOARDING_NUDGE_EVENT = "admin.onboarding_nudge";

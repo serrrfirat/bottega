@@ -37,6 +37,11 @@
  * tokens, model key, broker token, git PAT file (mode 0600), egress
  * allowlist, memory backend (mem0 or SQLite fallback). Each check reports
  * pass/fail with the fix instruction; any failure fails the result loudly.
+ * The checklist is ONE shared source of truth (`runWizardChecks`) reused by
+ * the proactive onboarding surface (issue #116): the boot-time guided post
+ * (server boot, org setting `onboarding.space_id`) and the in-conversation
+ * nudge (space service) both name the same failing checks with the same
+ * one-line pointer (`onboardingGuideText`).
  */
 import type { ExtensionFactory, AgentToolResult, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
@@ -405,6 +410,67 @@ function memoryBackendCheck(store: Store): WizardCheck {
   };
 }
 
+/**
+ * The shared first-run checklist (issue #116): ONE source of truth for the
+ * `first_run_wizard` tool, the boot-time onboarding guide (src/server/
+ * index.ts), and the in-conversation nudge (space-service.ts). Runs every
+ * check and returns the full report; the path defaults mirror the wizard
+ * tool's (opts override them for tests/hermeticity).
+ */
+export function runWizardChecks(
+  store: Store,
+  opts: Pick<AdminToolsOpts, "gitTokenFile" | "egressConfigPath"> = {},
+): WizardCheck[] {
+  const slackApp = envValue("SLACK_APP_TOKEN");
+  const slackBot = envValue("SLACK_BOT_TOKEN");
+  const modelKey = envValue("OPENCODE_API_KEY") ?? envValue("NEAR_API_KEY");
+  const brokerToken = envValue("OMP_AUTH_BROKER_TOKEN");
+  const settings = store.getOrgSettings();
+  const tokenFile = opts.gitTokenFile ?? process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
+  return [
+    slackApp && slackBot
+      ? { name: "slack_tokens", ok: true, detail: "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are set", fix: "none" }
+      : {
+          name: "slack_tokens",
+          ok: false,
+          detail: `SLACK_APP_TOKEN set: ${slackApp !== null}, SLACK_BOT_TOKEN set: ${slackBot !== null}`,
+          fix: "create the Slack app from slack-app-manifest.yml and fill both tokens in .env",
+        },
+    modelKey
+      ? { name: "model_key", ok: true, detail: "a model key is resolvable (OPENCODE_API_KEY or NEAR_API_KEY)", fix: "none" }
+      : {
+          name: "model_key",
+          ok: false,
+          detail: "neither OPENCODE_API_KEY nor NEAR_API_KEY is set (or they are placeholders)",
+          fix: placeholderFix(
+            "OPENCODE_API_KEY or NEAR_API_KEY",
+            "the macOS Keychain (service: bottega-opencode / bottega-near) loads it for local dev",
+          ),
+        },
+    brokerToken
+      ? { name: "broker_token", ok: true, detail: "OMP_AUTH_BROKER_TOKEN is set", fix: "none" }
+      : {
+          name: "broker_token",
+          ok: false,
+          detail: "OMP_AUTH_BROKER_TOKEN is not set (or a placeholder)",
+          fix: "copy the broker token once: `docker compose exec auth-broker cat /data/.omp/auth-broker.token` → OMP_AUTH_BROKER_TOKEN in .env",
+        },
+    gitPatCheck(tokenFile, settings?.allowLoosePat ?? false),
+    egressAllowlistCheck(opts.egressConfigPath ?? "config/egress.yml"),
+    memoryBackendCheck(store),
+  ];
+}
+
+/**
+ * One-line onboarding pointer (issue #116): names the failing checks and
+ * points at the first-run wizard. Shared by the boot-time guided post and
+ * the in-conversation nudge — one wording, one source of truth.
+ */
+export function onboardingGuideText(failing: WizardCheck[]): string {
+  const names = failing.map((c) => c.name).join(", ");
+  return `Setup is incomplete — missing: ${names}. Run the \`first_run_wizard\` tool to see the full checklist.`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -613,44 +679,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
     approval: "write",
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
       try {
-        const slackApp = envValue("SLACK_APP_TOKEN");
-        const slackBot = envValue("SLACK_BOT_TOKEN");
-        const modelKey = envValue("OPENCODE_API_KEY") ?? envValue("NEAR_API_KEY");
-        const brokerToken = envValue("OMP_AUTH_BROKER_TOKEN");
-        const settings = store.getOrgSettings();
-        const tokenFile = opts.gitTokenFile ?? process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
-        const checks: WizardCheck[] = [
-          slackApp && slackBot
-            ? { name: "slack_tokens", ok: true, detail: "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are set", fix: "none" }
-            : {
-                name: "slack_tokens",
-                ok: false,
-                detail: `SLACK_APP_TOKEN set: ${slackApp !== null}, SLACK_BOT_TOKEN set: ${slackBot !== null}`,
-                fix: "create the Slack app from slack-app-manifest.yml and fill both tokens in .env",
-              },
-          modelKey
-            ? { name: "model_key", ok: true, detail: "a model key is resolvable (OPENCODE_API_KEY or NEAR_API_KEY)", fix: "none" }
-            : {
-                name: "model_key",
-                ok: false,
-                detail: "neither OPENCODE_API_KEY nor NEAR_API_KEY is set (or they are placeholders)",
-                fix: placeholderFix(
-                  "OPENCODE_API_KEY or NEAR_API_KEY",
-                  "the macOS Keychain (service: bottega-opencode / bottega-near) loads it for local dev",
-                ),
-              },
-          brokerToken
-            ? { name: "broker_token", ok: true, detail: "OMP_AUTH_BROKER_TOKEN is set", fix: "none" }
-            : {
-                name: "broker_token",
-                ok: false,
-                detail: "OMP_AUTH_BROKER_TOKEN is not set (or a placeholder)",
-                fix: "copy the broker token once: `docker compose exec auth-broker cat /data/.omp/auth-broker.token` → OMP_AUTH_BROKER_TOKEN in .env",
-              },
-          gitPatCheck(tokenFile, settings?.allowLoosePat ?? false),
-          egressAllowlistCheck(opts.egressConfigPath ?? "config/egress.yml"),
-          memoryBackendCheck(store),
-        ];
+        const checks = runWizardChecks(store, opts);
         const okCount = checks.filter((c) => c.ok).length;
         const allOk = okCount === checks.length;
         await audit?.appendAudit({

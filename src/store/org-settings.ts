@@ -72,6 +72,12 @@ export interface OrgSettings {
   allowLoosePat?: boolean;
   /** Memory backend URL (mem0); unset → SQLite memory (Part B). */
   memoryBackend?: { baseUrl?: string };
+  /**
+   * Proactive onboarding (issue #116): the space id (e.g. "slack:C123")
+   * that receives the boot-time guided setup post. Unset → no boot post
+   * (the in-conversation nudge still applies).
+   */
+  onboarding?: { spaceId?: string };
 }
 
 /** Raw snake_case blob shape accepted by setOrgSettings (mirrors config.yml keys). */
@@ -104,6 +110,8 @@ export interface OrgSettingsInput {
   api_base_url?: string;
   allow_loose_pat?: boolean;
   memory_backend?: { base_url?: string };
+  /** Proactive onboarding (issue #116): space id for the boot-time guide. */
+  onboarding?: { space_id?: string };
 }
 
 /** Thrown by the store helpers when the settings blob is malformed (fail closed). */
@@ -381,6 +389,31 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         }
       }
       if (!sectionOk) out.memoryBackend = undefined;
+    } else if (name === "onboarding") {
+      // Proactive onboarding (issue #116): the space id that receives the
+      // boot-time guided setup post. An EMPTY space_id clears the setting
+      // (no boot post), mirroring memory_backend.base_url; `onboarding: {}`
+      // sets nothing.
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        fail("onboarding must be an object");
+        continue;
+      }
+      const onboarding = value as Record<string, unknown>;
+      let sectionOk = true;
+      for (const [key, raw] of Object.entries(onboarding)) {
+        if (key === "space_id") {
+          if (typeof raw !== "string") {
+            sectionOk = false;
+            fail("onboarding.space_id must be a string");
+          } else if (raw.trim() !== "") {
+            out.onboarding = { spaceId: raw.trim() };
+          }
+        } else {
+          sectionOk = false;
+          fail(`onboarding.${key}: unknown key`);
+        }
+      }
+      if (!sectionOk) out.onboarding = undefined;
     } else {
       fail(`unknown key '${name}'`);
     }
