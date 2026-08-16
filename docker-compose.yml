@@ -173,10 +173,12 @@ services:
       # URL set with no token aborts at first credential resolution.
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
-      # Memory backend (issues #43, #67): the backend URL is an org SETTING
-      # (memory_backend.base_url, via the settings tool), not an env var —
-      # unset → SQLite memory. MEM0_API_KEY stays env (secret, optional:
-      # the OSS server only demands a key when its auth is enabled).
+      # Memory backend (issue #135): compose deployments default to the
+      # internal mem0 service. An explicit project .env value can point at a
+      # different server. Local development does not load this compose env,
+      # so its unset settings continue to select SQLite.
+      MEM0_BASE_URL: ${MEM0_BASE_URL:-http://mem0:8000}
+      # Optional secret: the OSS server only demands it when auth is enabled.
       MEM0_API_KEY: ${MEM0_API_KEY:-}
     volumes:
       # The app resolves its store/sessions/transcripts from the relative

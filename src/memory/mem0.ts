@@ -44,9 +44,9 @@
  *  - metadata values are coerced to strings (our contract is
  *    Record<string, string>; the server stores arbitrary JSON).
  *
- * Errors are never swallowed: non-2xx → Mem0Error with status + body
- * snippet; timeout → Mem0Error naming the op and deadline; network errors
- * are wrapped with context.
+ * Operational failures are never swallowed: non-2xx → Mem0Error with status
+ * + body snippet; timeout → Mem0Error naming the op and deadline; network
+ * errors are wrapped with context. Capability discovery alone fails soft.
  */
 import {
   MEMORY_LIMIT_DEFAULT,
@@ -81,6 +81,11 @@ export const MEM0_ORG_AGENT_ID = "bottega";
 
 /** Identity keys mem0 reserves for scoping; caller metadata may not set them. */
 const IDENTITY_KEYS = new Set(["user_id", "agent_id", "run_id"]);
+
+interface GraphCapabilities {
+  add: boolean;
+  search: boolean;
+}
 
 export class Mem0Error extends Error {
   readonly status: number | null;
@@ -198,6 +203,104 @@ async function requestJson(
   }
 }
 
+function resolveOpenApiRef(document: Record<string, unknown>, ref: string): unknown {
+  if (!ref.startsWith("#/")) return undefined;
+  let current: unknown = document;
+  for (const rawSegment of ref.slice(2).split("/")) {
+    const segment = rawSegment.replaceAll("~1", "/").replaceAll("~0", "~");
+    current = asRecord(current)[segment];
+  }
+  return current;
+}
+
+function schemaAdvertisesField(
+  document: Record<string, unknown>,
+  value: unknown,
+  field: string,
+  seen: Set<unknown> = new Set(),
+): boolean {
+  if (typeof value !== "object" || value === null || seen.has(value)) return false;
+  seen.add(value);
+  const record = asRecord(value);
+  if (Object.hasOwn(asRecord(record.properties), field)) return true;
+  if (typeof record.$ref === "string") {
+    return schemaAdvertisesField(document, resolveOpenApiRef(document, record.$ref), field, seen);
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"]) {
+    const variants = record[key];
+    if (Array.isArray(variants) && variants.some((item) => schemaAdvertisesField(document, item, field, seen))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function operationAdvertisesGraph(document: Record<string, unknown>, path: string): boolean {
+  const operation = asRecord(asRecord(asRecord(document.paths)[path]).post);
+  const content = asRecord(asRecord(operation.requestBody).content);
+  const schema = asRecord(content["application/json"]).schema;
+  return schemaAdvertisesField(document, schema, "enable_graph");
+}
+
+/**
+ * Older graph-store-enabled mem0 servers advertise `enable_graph` in their
+ * OpenAPI request schemas. Newer servers have native graph ranking always on
+ * and omit the flag, so a normal vector-shaped request is also the correct
+ * request for them. A missing/unreachable OpenAPI document must not disable
+ * ordinary memory operations.
+ */
+async function discoverGraphCapabilities(
+  baseUrl: string,
+  apiKey: string | undefined,
+  timeoutMs: number,
+): Promise<GraphCapabilities> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["x-api-key"] = apiKey;
+  try {
+    const response = await fetch(`${baseUrl}/openapi.json`, {
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) return { add: false, search: false };
+    const document = asRecord(await response.json());
+    return {
+      add: operationAdvertisesGraph(document, "/memories"),
+      search: operationAdvertisesGraph(document, "/search"),
+    };
+  } catch {
+    return { add: false, search: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestWithOptionalGraph(
+  baseUrl: string,
+  path: string,
+  body: Record<string, unknown>,
+  apiKey: string | undefined,
+  timeoutMs: number,
+  graphEnabled: boolean,
+  disableGraph: () => void,
+): Promise<unknown> {
+  if (!graphEnabled) return requestJson(baseUrl, path, body, apiKey, timeoutMs);
+  try {
+    return await requestJson(baseUrl, path, { ...body, enable_graph: true }, apiKey, timeoutMs);
+  } catch (error) {
+    // Only a schema-rejection that names the optional field proves graph is
+    // unsupported. Retrying other 400/422 failures could duplicate an add.
+    const unsupported =
+      error instanceof Mem0Error &&
+      (error.status === 400 || error.status === 422) &&
+      /enable_graph/i.test(error.body ?? "");
+    if (!unsupported) throw error;
+    disableGraph();
+    return requestJson(baseUrl, path, body, apiKey, timeoutMs);
+  }
+}
+
 /** Parse one mem0 result dict (add or search) into a MemoryEntry. */
 function parseEntry(result: unknown, scope: MemoryScope, principal: string | null): MemoryEntry {
   const row = asRecord(result);
@@ -221,21 +324,32 @@ async function saveToMem0(
   apiKey: string | undefined,
   agentId: string | undefined,
   timeoutMs: number,
+  getGraphCapabilities: () => Promise<GraphCapabilities>,
   input: MemorySaveInput,
 ): Promise<MemoryEntry> {
   const identity = scopeParams(input.scope, input.principal, agentId);
   const metadata = input.metadata ? stripIdentityKeys(input.metadata) : undefined;
-  const data = await requestJson(
+  const body = {
+    messages: [{ role: "user", content: input.content }],
+    ...identity,
+    ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+  };
+  const graph = await getGraphCapabilities();
+  const data = await requestWithOptionalGraph(
     baseUrl,
     "/memories",
-    {
-      messages: [{ role: "user", content: input.content }],
-      ...identity,
-      ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
-    },
+    body,
     apiKey,
     timeoutMs,
+    graph.add,
+    () => {
+      graph.add = false;
+    },
   );
+  // mem0 consolidates server-side during add: it extracts candidate facts,
+  // compares them with the scoped active pool, then emits ADD/UPDATE/DELETE
+  // (or no change) while retaining its own history. Our save maps the active
+  // result to MemoryEntry; bottega's separate audit remains append-only.
   const results = asRecord(data).results;
   const first = Array.isArray(results) ? results[0] : undefined;
   const row = asRecord(first);
@@ -263,6 +377,7 @@ async function searchMem0(
   apiKey: string | undefined,
   agentId: string | undefined,
   timeoutMs: number,
+  getGraphCapabilities: () => Promise<GraphCapabilities>,
   query: MemorySearchQuery,
 ): Promise<MemoryEntry[]> {
   // Scope first, then exact-match metadata filters. Identity keys in caller
@@ -271,16 +386,22 @@ async function searchMem0(
     ...scopeParams(query.scope, query.principal, agentId),
     ...(query.metadata ? stripIdentityKeys(query.metadata) : {}),
   };
-  const data = await requestJson(
+  const body = {
+    query: query.query,
+    filters,
+    top_k: query.limit ?? MEMORY_LIMIT_DEFAULT,
+  };
+  const graph = await getGraphCapabilities();
+  const data = await requestWithOptionalGraph(
     baseUrl,
     "/search",
-    {
-      query: query.query,
-      filters,
-      top_k: query.limit ?? MEMORY_LIMIT_DEFAULT,
-    },
+    body,
     apiKey,
     timeoutMs,
+    graph.search,
+    () => {
+      graph.search = false;
+    },
   );
   const results = asRecord(data).results;
   if (!Array.isArray(results)) return [];
@@ -297,6 +418,11 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
   const timeoutMs = opts.timeoutMs ?? MEM0_DEFAULT_TIMEOUT_MS;
   const apiKey = opts.apiKey;
   const agentId = opts.agentId;
+  let graphCapabilities: Promise<GraphCapabilities> | undefined;
+  const getGraphCapabilities = (): Promise<GraphCapabilities> => {
+    graphCapabilities ??= discoverGraphCapabilities(baseUrl, apiKey, timeoutMs);
+    return graphCapabilities;
+  };
 
   // NOTE: save/search are deliberately NOT async — validation must throw
   // synchronously so callers (and the conformance suite) see contract
@@ -305,11 +431,11 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
   return {
     save(input: MemorySaveInput): Promise<MemoryEntry> {
       validateSaveInput(input);
-      return saveToMem0(baseUrl, apiKey, agentId, timeoutMs, input);
+      return saveToMem0(baseUrl, apiKey, agentId, timeoutMs, getGraphCapabilities, input);
     },
     search(query: MemorySearchQuery): Promise<MemoryEntry[]> {
       validateSearchQuery(query);
-      return searchMem0(baseUrl, apiKey, agentId, timeoutMs, query);
+      return searchMem0(baseUrl, apiKey, agentId, timeoutMs, getGraphCapabilities, query);
     },
   };
 }

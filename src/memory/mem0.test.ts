@@ -15,6 +15,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import type { MemoryProvider } from "./types";
 import { asRecord, createMem0MemoryProvider, MEM0_ORG_AGENT_ID, stringifyMetadata } from "./mem0";
 import { runMemoryConformanceTests } from "./conformance.test";
+import { serviceEnv } from "../compose-test-utils";
 
 /** In-memory row emulating a stored mem0 memory (payload shape of the OSS server). */
 interface StubMemory {
@@ -40,6 +41,12 @@ interface StubOptions {
   emptyAdd?: boolean;
   /** Stored memories carry no created_at (createdAt fallback test). */
   noCreatedAt?: boolean;
+  /** OpenAPI advertises the legacy enable_graph request field. */
+  graphSupport?: boolean;
+  /** Reject enable_graph with a schema error despite advertising it. */
+  rejectGraph?: boolean;
+  /** Repeated identical scoped facts resolve to the existing active memory. */
+  consolidateDuplicates?: boolean;
 }
 
 interface StubHarness {
@@ -69,9 +76,45 @@ function createStub(options: StubOptions = {}): StubHarness {
       if (options.requireApiKey && req.headers.get("x-api-key") !== options.requireApiKey) {
         return Response.json({ detail: "Invalid or missing API key" }, { status: 401 });
       }
+      if (url.pathname === "/openapi.json" && req.method === "GET") {
+        const graphProperties = options.graphSupport
+          ? { enable_graph: { type: "boolean" } }
+          : {};
+        return Response.json({
+          paths: {
+            "/memories": {
+              post: {
+                requestBody: {
+                  content: {
+                    "application/json": { schema: { $ref: "#/components/schemas/MemoryCreate" } },
+                  },
+                },
+              },
+            },
+            "/search": {
+              post: {
+                requestBody: {
+                  content: {
+                    "application/json": { schema: { $ref: "#/components/schemas/SearchRequest" } },
+                  },
+                },
+              },
+            },
+          },
+          components: {
+            schemas: {
+              MemoryCreate: { type: "object", properties: graphProperties },
+              SearchRequest: { type: "object", properties: graphProperties },
+            },
+          },
+        });
+      }
       if (url.pathname === "/memories" && req.method === "POST") {
         const body = (await req.json()) as Record<string, unknown>;
         addBodies.push(body);
+        if (options.rejectGraph && body.enable_graph === true) {
+          return Response.json({ detail: "enable_graph is not supported" }, { status: 422 });
+        }
         if (options.slow) {
           // Hold the request open until the client's timeout aborts it — no
           // wall-clock sleep, deterministic under load.
@@ -93,17 +136,33 @@ function createStub(options: StubOptions = {}): StubHarness {
             { status: 422 },
           );
         }
+        const content = String(asRecord(messages[0]).content ?? "");
+        const userId = typeof body.user_id === "string" ? body.user_id : null;
+        const agentId = typeof body.agent_id === "string" ? body.agent_id : null;
+        const metadata = stringifyMetadata(asRecord(body.metadata));
+        if (options.consolidateDuplicates) {
+          const existing = memories.find(
+            (memory) =>
+              memory.memory === content &&
+              memory.user_id === userId &&
+              memory.agent_id === agentId &&
+              JSON.stringify(memory.metadata) === JSON.stringify(metadata),
+          );
+          if (existing) {
+            return Response.json({ results: [{ ...existing, event: "NONE" }] });
+          }
+        }
         const id = `mem-${++seq}`;
         const created_at = options.noCreatedAt
           ? ""
           : new Date(1_700_000_000_000 + seq * 1000).toISOString();
         const mem: StubMemory = {
           id,
-          memory: String(asRecord(messages[0]).content ?? ""),
+          memory: content,
           event: "ADD",
-          user_id: typeof body.user_id === "string" ? body.user_id : null,
-          agent_id: typeof body.agent_id === "string" ? body.agent_id : null,
-          metadata: stringifyMetadata(asRecord(body.metadata)),
+          user_id: userId,
+          agent_id: agentId,
+          metadata,
           created_at,
         };
         memories.push(mem);
@@ -124,6 +183,9 @@ function createStub(options: StubOptions = {}): StubHarness {
       if (url.pathname === "/search" && req.method === "POST") {
         const body = (await req.json()) as Record<string, unknown>;
         searchBodies.push(body);
+        if (options.rejectGraph && body.enable_graph === true) {
+          return Response.json({ detail: "enable_graph is not supported" }, { status: 422 });
+        }
         if (options.failSearch) return Response.json({ detail: "upstream search failed" }, { status: 500 });
         const filters = asRecord(body.filters);
         if (!filters.user_id && !filters.agent_id && !filters.run_id) {
@@ -286,6 +348,75 @@ describe("mem0 provider (stub-backed)", () => {
     expect(hits[0].principal).toBe("alice");
   });
 
+  test("enables graph add and search when OpenAPI advertises support, preserving user scope", async () => {
+    const graph = createStub({ graphSupport: true });
+    try {
+      const p = createMem0MemoryProvider({ baseUrl: graph.server.url.href, agentId: "graph-agent" });
+      const saved = await p.save({
+        scope: "user",
+        principal: "alice",
+        content: "Alice works with Bob on Bottega.",
+      });
+      const hits = await p.search({ scope: "user", principal: "alice", query: "Who works with Alice?" });
+
+      expect(graph.addBodies).toHaveLength(1);
+      expect(graph.addBodies[0].enable_graph).toBe(true);
+      expect(graph.addBodies[0].user_id).toBe("alice");
+      expect(graph.addBodies[0].agent_id).toBe("graph-agent");
+      expect(graph.searchBodies).toHaveLength(1);
+      expect(graph.searchBodies[0].enable_graph).toBe(true);
+      expect(graph.searchBodies[0].filters).toEqual({
+        user_id: "alice",
+        agent_id: "graph-agent",
+      });
+      expect(hits.map((hit) => hit.id)).toContain(saved.id);
+    } finally {
+      await graph.stop();
+    }
+  });
+
+  test("uses normal vector-shaped requests when graph is not advertised", async () => {
+    await provider.save({ scope: "org", content: "ordinary memory" });
+    await provider.search({ scope: "org", query: "ordinary" });
+
+    expect(stub.addBodies.at(-1)!.enable_graph).toBeUndefined();
+    expect(stub.searchBodies.at(-1)!.enable_graph).toBeUndefined();
+  });
+
+  test("retries without graph after a schema rejection and remembers the fallback", async () => {
+    const stale = createStub({ graphSupport: true, rejectGraph: true });
+    try {
+      const p = createMem0MemoryProvider({ baseUrl: stale.server.url.href });
+      const saved = await p.save({ scope: "org", content: "fallback fact" });
+      const hits = await p.search({ scope: "org", query: "fallback" });
+
+      expect(stale.addBodies.map((body) => body.enable_graph)).toEqual([true, undefined]);
+      expect(stale.searchBodies.map((body) => body.enable_graph)).toEqual([true, undefined]);
+      expect(hits.map((hit) => hit.id)).toContain(saved.id);
+
+      await p.save({ scope: "org", content: "second fallback fact" });
+      expect(stale.addBodies.at(-1)!.enable_graph).toBeUndefined();
+    } finally {
+      await stale.stop();
+    }
+  });
+
+  test("maps mem0 server-side duplicate consolidation to the existing active memory", async () => {
+    const consolidating = createStub({ consolidateDuplicates: true });
+    try {
+      const p = createMem0MemoryProvider({ baseUrl: consolidating.server.url.href });
+      const first = await p.save({ scope: "org", content: "Bottega deploys once per company." });
+      const duplicate = await p.save({ scope: "org", content: "Bottega deploys once per company." });
+      const hits = await p.search({ scope: "org", query: "deploys" });
+
+      expect(duplicate.id).toBe(first.id);
+      expect(consolidating.memories).toHaveLength(1);
+      expect(hits.map((hit) => hit.id)).toEqual([first.id]);
+    } finally {
+      await consolidating.stop();
+    }
+  });
+
   test("sends X-API-Key when apiKey is configured", async () => {
     const authed = createStub({ requireApiKey: "m0sk-secret" });
     try {
@@ -368,6 +499,12 @@ describe("mem0 conformance", () => {
   runMemoryConformanceTests(async () =>
     createMem0MemoryProvider({ baseUrl: stub.server.url.href, agentId: "conform-agent" }),
   );
+});
+
+describe("docker-compose.yml (issue #135 mem0 deployment default)", () => {
+  test("server defaults MEM0_BASE_URL to the internal mem0 service", () => {
+    expect(serviceEnv("server")["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL:-http://mem0:8000}");
+  });
 });
 
 describe("mem0 docker leg (skip-gated)", () => {
