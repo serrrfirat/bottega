@@ -1,3 +1,10 @@
+/**
+ * Extension tool bridge (issue #50): manifest tools become SDK definitions
+ * whose execution routes through the extension runtime (issue #53) — the
+ * bridge owns the SDK surface, the runtime owns gate → ladder → boundary →
+ * audit. These tests pin the SDK surface and the failure mapping; the
+ * runtime's own hermetic path lives in runtime.test.ts.
+ */
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,9 +14,15 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { createAudit } from "../policy/audit";
+import { DenyRouter } from "../policy/approval-router";
+import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
+import { createStore, type ExtensionCredential, type Store } from "../store/db";
 import { extensionToolDefinitions } from "./tools";
-import { createFixtureRegistry, FIXTURE_EXTENSION_TOOL } from "./fixture";
-import { validateManifest, type McpBinding } from "./manifest";
+import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_TOOL } from "./fixture";
+import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
+import { createExtensionRegistry } from "./registry";
+import { createExtensionRuntime, type ExtensionRuntime } from "./runtime";
 
 /** Minimal structural view of an omptype schema's parse surface. */
 interface ParsableSchema {
@@ -18,12 +31,59 @@ interface ParsableSchema {
 
 /** Full ToolDefinition execute signature; tests call with a fake context. */
 function run(def: ToolDefinition, params: Record<string, unknown>) {
-  return def.execute("1", params, undefined, undefined, {} as ExtensionContext);
+  return def.execute("1", params, undefined, undefined, {
+    sessionManager: { getSessionFile: () => null },
+  } as unknown as ExtensionContext);
+}
+
+const stubRuntime: ExtensionRuntime = {
+  execute: async () => ({ ok: false, error: "stub runtime" }),
+};
+
+/**
+ * A real runtime over the given manifests with fake-but-real deps: in-memory
+ * store with an org credential row per manifest, real audit module, DenyRouter,
+ * a recording boundary, and the injected MCP transport seam.
+ */
+function makeRuntime(
+  manifests: ExtensionManifest[],
+  opts: { mcpTransport?: (binding: McpBinding) => Transport; policy?: PolicyConfig } = {},
+): { runtime: ExtensionRuntime; store: Store; boundaryCalls: ExtensionCredential[] } {
+  const registry = createExtensionRegistry();
+  for (const manifest of manifests) registry.register(manifest);
+  const store = createStore(":memory:");
+  for (const manifest of manifests) {
+    void store.upsertExtensionCredential({
+      provider: manifest.id,
+      identityKey: "email:org@example.com",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 1,
+    });
+  }
+  const boundaryCalls: ExtensionCredential[] = [];
+  const runtime = createExtensionRuntime({
+    registry,
+    store,
+    audit: createAudit(store),
+    // The ad-hoc manifests are not in any allowlist and cross the tier
+    // stage as known tools with their manifest tier; the tools map allows
+    // everything not explicitly denied unless the test overrides it.
+    orgPolicy: opts.policy ?? parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+    router: DenyRouter,
+    boundary: {
+      async authorize(credential: ExtensionCredential) {
+        boundaryCalls.push(credential);
+      },
+    },
+    mcpTransport: opts.mcpTransport,
+  });
+  return { runtime, store, boundaryCalls };
 }
 
 describe("extension tool bridge", () => {
   test("the fixture tool becomes an SDK definition with tier read and typed params", async () => {
-    const definitions = extensionToolDefinitions(createFixtureRegistry().list());
+    const definitions = extensionToolDefinitions(createFixtureRegistry().list(), { runtime: stubRuntime });
     expect(definitions).toHaveLength(1);
     const definition = definitions[0];
     expect(definition.name).toBe(FIXTURE_EXTENSION_TOOL);
@@ -57,9 +117,13 @@ describe("extension tool bridge", () => {
       ],
       domains: ["api.example.com"],
     });
-    const [definition] = extensionToolDefinitions([{ manifest: cli }]);
+    const { runtime, boundaryCalls } = makeRuntime([cli]);
+    const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
     const result = await run(definition, { name: "world", loud: true });
     expect(result.content).toEqual([{ type: "text", text: "hello --name world --loud\n" }]);
+    // The cli path still resolves + injects the credential at the boundary.
+    expect(boundaryCalls).toHaveLength(1);
+    expect(boundaryCalls[0]!.provider).toBe("com.example.cli");
   });
 
   test("cli failures surface as tool errors, not silent no-ops", async () => {
@@ -73,7 +137,8 @@ describe("extension tool bridge", () => {
       tools: [{ name: "example.fail", tier: "read", description: "Always fails", params: [] }],
       domains: ["api.example.com"],
     });
-    const [definition] = extensionToolDefinitions([{ manifest: cli }]);
+    const { runtime } = makeRuntime([cli]);
+    const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
     const result = await run(definition, {});
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("exited 1");
@@ -124,7 +189,8 @@ describe("extension tool bridge", () => {
         ],
         domains: ["api.example.com"],
       });
-      const [definition] = extensionToolDefinitions([{ manifest: cli }]);
+      const { runtime } = makeRuntime([cli]);
+      const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
       const result = await run(definition, { name: "world", loud: true });
       const first = result.content[0];
       const output = first && "text" in first ? first.text : "";
@@ -191,22 +257,35 @@ describe("extension tool bridge", () => {
       void server.connect(serverTransport);
       return clientTransport;
     };
-    const [definition] = extensionToolDefinitions([{ manifest: mcp }], { mcpTransport });
+    const { runtime } = makeRuntime([mcp], { mcpTransport });
+    const [definition] = extensionToolDefinitions([{ manifest: mcp }], { runtime });
     const result = await run(definition, { city: "Lisbon" });
     expect(result.content).toEqual([{ type: "text", text: "sunny in Lisbon" }]);
   });
 
   test("mcp connection failures surface as tool errors", async () => {
-    const definitions = extensionToolDefinitions(createFixtureRegistry().list(), {
+    const { runtime } = makeRuntime([fixtureManifest()], {
       // Force the fixture's (unreachable) serverUrl through a transport that
       // fails immediately, proving failures fail closed as tool errors.
       mcpTransport: () => {
         throw new Error("connection refused");
       },
     });
+    const definitions = extensionToolDefinitions(createFixtureRegistry().list(), { runtime });
     const result = await run(definitions[0], { city: "Lisbon" });
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("connection refused");
+  });
+
+  test("a gate denial surfaces as a tool error, not a silent no-op", async () => {
+    const { runtime } = makeRuntime([fixtureManifest()], {
+      policy: parseOrgConfigYaml("tools:\n  weather.current: deny\n"),
+    });
+    const definitions = extensionToolDefinitions(createFixtureRegistry().list(), { runtime });
+    // The runtime's policy denies the tool before any credential work.
+    const result = await run(definitions[0], { city: "Lisbon" });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("policy:");
   });
 
   test("a cli extension without a tool still yields no definitions", () => {
@@ -220,6 +299,6 @@ describe("extension tool bridge", () => {
       tools: [],
       domains: ["api.example.com"],
     });
-    expect(extensionToolDefinitions([{ manifest: cli }])).toEqual([]);
+    expect(extensionToolDefinitions([{ manifest: cli }], { runtime: stubRuntime })).toEqual([]);
   });
 });

@@ -12,6 +12,7 @@ import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { createExtensionRegistry } from "../extensions/registry";
+import { createExtensionRuntime } from "../extensions/runtime";
 import { extensionToolDefinitions } from "../extensions/tools";
 import { createOmpSdkDriver, type AgentDriver } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
@@ -73,6 +74,12 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // config/extensions/ at boot. Per-org deployments resolve extensions from
   // these local files — never from the integrations.sh catalog at runtime.
   const extensionRegistry = createExtensionRegistry("config/extensions");
+  /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */
+  const extensionToolTier = (toolName: string) => {
+    const extensionId = extensionRegistry.extensionIdForTool(toolName);
+    if (extensionId === undefined) return undefined;
+    return extensionRegistry.resolve(extensionId)?.manifest.tools.find((tool) => tool.name === toolName)?.tier;
+  };
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
@@ -103,6 +110,17 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   approvalRouter = (opts.createApprovalRouter ?? ((deps) => new SlackApprovalRouter(deps)))({
     adapter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+  });
+  // Extension tool runtime (issue #53): every extension tool call crosses
+  // the policy gate → credential ladder → egress boundary → audit. The
+  // broker secret resolver for the boundary is issue #54's wiring, so
+  // calls fail closed at the boundary until then.
+  const extensionRuntime = createExtensionRuntime({
+    registry: extensionRegistry,
+    store,
+    audit,
+    orgPolicy,
+    router: approvalRouter,
   });
   const createDriver =
     opts.createDriver ??
@@ -137,8 +155,9 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         agentDir,
         // Registry tools (issue #50): typed extension tools ride the SDK
         // custom-tools path so they surface in the restricted space-agent
-        // toolset alongside the project extensions below.
-        customTools: extensionToolDefinitions(extensionRegistry.list()),
+        // toolset alongside the project extensions below; execution goes
+        // through the #53 runtime (gate → ladder → boundary → audit).
+        customTools: extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
         // Connect capability (issue #52): connect_extension is built per
         // session so the actor is the requesting principal; org-scope
         // connects gate through the same Slack-backed approval router as
@@ -159,6 +178,9 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
             // Extension policy seam (issue #56): resolve extension tool
             // calls against the space's allowlist before tier/approval.
             toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
+            // Extension tier seam (issue #53): an allowed extension crosses
+            // the tier stage as a known tool with its manifest tier.
+            toolTier: (name) => extensionToolTier(name),
             knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
           }),
           workItemsExtension(store, { orgPolicy }),

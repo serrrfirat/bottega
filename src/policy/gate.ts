@@ -24,7 +24,7 @@
 import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import type { AuditModule } from "./audit";
 import { requestWithTimeout, type ApprovalRequest, type ApprovalRouter } from "./approval-router";
-import { decidePolicyCall, resolveTier, unknownExtensionId, type Decision, type PolicyConfig } from "./config";
+import { decidePolicyCall, resolveTier, unknownExtensionId, type Decision, type PolicyConfig, type Tier } from "./config";
 
 export interface PolicyGateDeps {
   /** Resolves the effective policy for a space (org floor + overlay). */
@@ -41,6 +41,16 @@ export interface PolicyGateDeps {
    * unknown id is a structural error that fails the whole policy closed.
    */
   knownExtensionIds?: readonly string[];
+  /**
+   * Resolves the manifest tier of an extension tool (issue #53). Consulted
+   * ONLY for calls that carry an extensionId: an allowed extension then
+   * crosses the tier stage as a KNOWN tool with its declared tier (the
+   * allowlist is not a bypass — tier logic still applies). Absent or
+   * unresolved → the call falls through to the static table and denies as
+   * an unknown tool (fail closed). Built-in tools can never be re-tiered:
+   * the seam never runs without an extensionId.
+   */
+  toolTier?: (toolName: string) => Tier | undefined;
 }
 
 export interface PolicyGateCall {
@@ -84,11 +94,15 @@ export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateC
       policy = { ...policy, ok: false, errors: [...policy.errors, `extensions: unknown extension id '${unknown}'`] };
     }
   }
+  // Extension calls cross the tier stage with their manifest tier (issue
+  // #53); built-ins never reach this seam.
+  const extensionTier = call.extensionId !== undefined ? deps.toolTier?.(call.tool) : undefined;
   const { decision, reason, autoApproved } = decidePolicyCall(
     policy,
     call.tool,
     deps.preApproved ?? false,
     call.extensionId,
+    extensionTier,
   );
 
   await deps.audit.appendAudit({
@@ -97,7 +111,9 @@ export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateC
     event_type: POLICY_DECISION_EVENT,
     payload: {
       tool: call.tool,
-      tier: resolveTier(call.tool),
+      // Audit the tier the decision actually used: the manifest tier for
+      // extension calls, the static table otherwise.
+      tier: extensionTier ?? resolveTier(call.tool),
       decision,
       reason,
       // Args are redacted and capped by appendAudit before the row is written.

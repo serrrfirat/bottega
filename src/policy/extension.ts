@@ -23,7 +23,7 @@ import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import type { Store } from "../store/db";
 import type { AuditModule } from "./audit";
 import type { ApprovalRouter } from "./approval-router";
-import { loadSpacePolicy, type PolicyConfig } from "./config";
+import { loadSpacePolicy, type PolicyConfig, type Tier } from "./config";
 import { evaluatePolicyGate } from "./gate";
 
 export interface PolicyExtensionDeps {
@@ -50,6 +50,13 @@ export interface PolicyExtensionDeps {
    * deny as unknown tools — fail closed).
    */
   toolExtensionId?: (toolName: string) => string | undefined;
+  /**
+   * Extension manifest tier seam (issue #53): maps an extension tool name
+   * to its declared tier so an allowed extension crosses the tier stage as
+   * a KNOWN tool. Absent → extension tools deny as unknown (fail closed) —
+   * wire it wherever toolExtensionId is wired.
+   */
+  toolTier?: (toolName: string) => Tier | undefined;
   /**
    * Registered extension ids (issue #56): unknown ids in
    * `extensions.allow`/`extensions.deny` fail the policy closed. Absent →
@@ -81,6 +88,7 @@ async function gateToolCall(
         timeoutMs: deps.timeoutMs,
         preApproved: deps.preApproved,
         knownExtensionIds: deps.knownExtensionIds,
+        toolTier: deps.toolTier,
       },
       {
         tool: event.toolName,

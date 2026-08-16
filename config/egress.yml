@@ -78,5 +78,45 @@ transforms:
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
+  # 3. Secrets: boundary credential injection (issue #53). Extension calls
+  #    carry no credential — the runtime resolves the caller's credential
+  #    at call time and writes it to the extension's secret file on the
+  #    shared data volume (mode 0600, write-temp + rename); this transform
+  #    INJECTS it as the Authorization header for the extension's
+  #    allowlisted domains before egress. The file source re-reads on
+  #    config reload and on ttl expiry, so the credential rotates on a
+  #    running proxy. Judge runs BEFORE secrets so the LLM judge never sees
+  #    real credentials (iron-proxy README's recommended ordering).
+  - name: secrets
+    config:
+      secrets:
+        - source:
+            type: file
+            path: "/data/proxy-secrets/attio.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+          rules:
+            - host: "mcp.attio.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/github.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+          rules:
+            - host: "api.github.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/linear.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+          rules:
+            - host: "mcp.linear.app"
+
 log:
   level: "info"

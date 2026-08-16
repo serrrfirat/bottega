@@ -1,7 +1,8 @@
 /**
  * Egress config generation (issue #50): config/egress.yml is a generated
  * artifact — the static iron-proxy template plus the allowlist merged from
- * the extension registry's pinned snapshots (extension `domains` entries).
+ * the extension registry's pinned snapshots (extension `domains` entries)
+ * and the secrets transform for boundary credential injection (issue #53).
  *
  * Run `bun run src/egress/generate.ts` after adding or updating snapshots in
  * config/extensions/; the committed config/egress.yml is the generated
@@ -13,6 +14,7 @@
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { readPinnedSnapshots } from "../extensions/registry";
+import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 /** Base allowlist (issue #8 scope): NEAR.ai model endpoints. */
 export const BASE_EGRESS_DOMAINS = ["cloud-api.near.ai", "*.completions.near.ai"] as const;
@@ -32,13 +34,63 @@ export function mergedEgressDomains(extensionDomains: readonly string[]): string
   return merged;
 }
 
+/** One extension's credential-injection entry for the generated egress config (issue #53). */
+export interface ExtensionEgressEntry {
+  extensionId: string;
+  /** The extension's allowlisted domains; the proxy injects auth for these hosts. */
+  domains: string[];
+}
+
+/**
+ * Renders the `secrets` transform (iron-proxy v0.49.0 inject mode, issue
+ * #53): one entry per extension, sourcing the credential from the
+ * extension's secret file (written by the runtime's boundary) and
+ * injecting it as the Authorization header for the extension's domains.
+ * The judge transform runs BEFORE secrets so the LLM judge sees no real
+ * credentials (iron-proxy README's recommended ordering).
+ */
+export function renderSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
+  const entries = extensions
+    .map((extension) => {
+      const hostLines = extension.domains.map((domain) => `            - host: "${domain}"`).join("\n");
+      return `        - source:
+            type: file
+            path: "${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(extension.extensionId)}"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+          rules:
+${hostLines}`;
+    })
+    .join("\n");
+  return `  # 3. Secrets: boundary credential injection (issue #53). Extension calls
+  #    carry no credential — the runtime resolves the caller's credential
+  #    at call time and writes it to the extension's secret file on the
+  #    shared data volume (mode 0600, write-temp + rename); this transform
+  #    INJECTS it as the Authorization header for the extension's
+  #    allowlisted domains before egress. The file source re-reads on
+  #    config reload and on ttl expiry, so the credential rotates on a
+  #    running proxy. Judge runs BEFORE secrets so the LLM judge never sees
+  #    real credentials (iron-proxy README's recommended ordering).
+  - name: secrets
+    config:
+      secrets:
+${entries}
+`;
+}
+
 /**
  * Renders the full iron-proxy config (v0.49.0) with the given allowlist.
  * Byte-stable: rendering with {@link BASE_EGRESS_DOMAINS} reproduces the
  * committed config/egress.yml exactly.
  */
-export function renderEgressConfig(domains: readonly string[]): string {
+export function renderEgressConfig(
+  domains: readonly string[],
+  extensions: readonly ExtensionEgressEntry[] = [],
+): string {
   const domainLines = domains.map((domain) => `        - "${domain}"`).join("\n");
+  const secretsTransform = extensions.length > 0 ? `${renderSecretsTransform(extensions)}\n` : "";
   return `# iron-proxy egress policy for bottega (issue #8).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -115,27 +167,32 @@ ${domainLines}
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
-log:
+${secretsTransform}log:
   level: "info"
 `;
 }
 
 /**
  * Reads pinned snapshots from `snapshotsDir`, merges their domains into the
- * allowlist, writes config/egress.yml, and returns the rendered text.
- * Defaults are the deployment paths; CLI: `bun run src/egress/generate.ts`.
+ * allowlist and their credential-injection entries into the secrets
+ * transform (issue #53), writes config/egress.yml, and returns the
+ * rendered text. Defaults are the deployment paths; CLI:
+ * `bun run src/egress/generate.ts`.
  */
 export function regenerateEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = EGRESS_CONFIG_PATH,
 ): string {
+  const snapshots = readPinnedSnapshots(snapshotsDir);
   const extensionDomains: string[] = [];
-  for (const snapshot of readPinnedSnapshots(snapshotsDir)) {
+  const extensionEntries: ExtensionEgressEntry[] = [];
+  for (const snapshot of snapshots) {
     for (const domain of snapshot.manifest.domains) {
       if (!extensionDomains.includes(domain)) extensionDomains.push(domain);
     }
+    extensionEntries.push({ extensionId: snapshot.manifest.id, domains: snapshot.manifest.domains });
   }
-  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains));
+  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }

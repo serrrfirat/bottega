@@ -79,4 +79,30 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(prompt).toMatch(/DENY/i);
     expect(prompt).toMatch(/clearly required by the\s+current task/i);
   });
+
+  test("secrets transform (issue #53) runs AFTER judge and injects auth per extension", () => {
+    const secrets = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "secrets") as Record<
+      string,
+      YamlNode
+    >;
+    expect(secrets).toBeDefined();
+    // Ordering: allowlist, judge, secrets — the LLM judge must never see
+    // real credentials (iron-proxy README's recommended ordering).
+    const names = transforms.map((t) => (t as Record<string, YamlNode>)["name"] as string);
+    expect(names).toEqual(["allowlist", "judge", "secrets"]);
+    const cfg = secrets["config"] as Record<string, YamlNode>;
+    const entries = cfg["secrets"] as Record<string, YamlNode>[];
+    expect(entries).toHaveLength(3); // attio, github, linear
+    for (const entry of entries) {
+      const source = entry["source"] as Record<string, YamlNode>;
+      expect(source["type"]).toBe("file");
+      expect(source["path"] as string).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
+      const inject = entry["inject"] as Record<string, YamlNode>;
+      expect(inject["header"]).toBe("Authorization");
+      expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
+      const rules = entry["rules"] as Record<string, YamlNode>[];
+      expect(rules).toHaveLength(1);
+      expect(allowlistCfg["domains"] as string[]).toContain(String(rules[0]!["host"]));
+    }
+  });
 });

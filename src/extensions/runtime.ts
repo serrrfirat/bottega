@@ -1,0 +1,329 @@
+/**
+ * Extension tool runtime (issue #53): executes a manifest tool call through
+ * the safety spine — POLICY GATE first, then the credential ladder, then
+ * the provider's official MCP server (or preinstalled CLI), with every call
+ * audited as `extension.call`.
+ *
+ * Sequence per call (fail closed at every step):
+ *   1. resolve the manifest + tool from the registry (unknown → error audit,
+ *      no execution);
+ *   2. POLICY GATE (`evaluatePolicyGate`, shared with the in-process policy
+ *      extension and the ACP driver): denied calls never resolve a
+ *      credential. The call carries the extensionId so the extension
+ *      allowlist (issue #56) decides BEFORE tier/approval; the gate's
+ *      `toolTier` seam resolves the manifest tier so an allowed extension
+ *      crosses the tier stage as a known tool;
+ *   3. credential ladder (`resolveCredential`, issue #51): org / me / auto
+ *      scopes over the store's registry rows, audit
+ *      `extension.credential_resolved` on success;
+ *   4. credential boundary (`CredentialBoundary`, issue #53): the resolved
+ *      credential is injected at the egress proxy (secret file + reload);
+ *      the provider call carries NO credential — iron-proxy attaches the
+ *      Authorization header for the extension's allowlisted domains. The
+ *      credential never enters the agent env, transcripts, or audit;
+ *   5. provider call: kind "mcp" → the provider's OFFICIAL MCP server via
+ *      the MCP SDK client (streamable-http or stdio per the manifest
+ *      binding); kind "cli" → the preinstalled CLI with a credential-safe
+ *      env (issue #58). One client/process per call;
+ *   6. audit `extension.call` {extension, tool, actor, credential_id,
+ *      decision} — written for EVERY call, including denied and failed
+ *      ones (credential_id null unless the ladder resolved).
+ *
+ * The egress path: outbound calls ride the environment's HTTP(S)_PROXY
+ * (compose points them at iron-proxy's tunnel, src/egress) and NO_PROXY
+ * keeps internal names (localhost, data, auth-broker, mem0) direct — the
+ * proxy env passthrough is Bun-native (proven in src/egress/proxy-env.test.ts).
+ */
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
+import type { AuditModule } from "../policy/audit";
+import type { ApprovalRouter } from "../policy/approval-router";
+import { loadSpacePolicy, orgCredentialsAllowed, type PolicyConfig, type Tier } from "../policy/config";
+import { evaluatePolicyGate, type PolicyGateCall } from "../policy/gate";
+import type { ExtensionCredential, Store } from "../store/db";
+import { EXTENSION_CALL_EVENT } from "../store/audit-events";
+import { errorMessage } from "../tools/helpers";
+import { CREDENTIAL_ENV_RE, type CliBinding, type McpBinding } from "./manifest";
+import type { ExtensionRegistry } from "./registry";
+import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
+import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
+
+export type ExtensionCallDecision = "allow" | "deny" | "error";
+
+export interface ExtensionRuntimeCall {
+  /** Registry id of the extension (the manifest id / credential provider). */
+  extensionId: string;
+  /** A tool name declared by the extension's manifest. */
+  toolName: string;
+  args: Record<string, unknown>;
+  /** Actor recorded on audit rows and used for personal-scope ladder lookups. */
+  caller: string;
+  spaceId?: string;
+}
+
+export type ExtensionRuntimeResult =
+  | { ok: true; content: AgentToolResult["content"] }
+  | { ok: false; error: string };
+
+export interface ExtensionRuntime {
+  execute(call: ExtensionRuntimeCall): Promise<ExtensionRuntimeResult>;
+}
+
+export interface ExtensionRuntimeDeps {
+  registry: ExtensionRegistry;
+  /** Registry rows for the ladder + the credential-resolution audit row (#51). */
+  store: Pick<Store, "listExtensionCredentials" | "getSpace" | "appendAudit">;
+  audit: AuditModule;
+  /** Org floor policy; the space overlay is applied per call. */
+  orgPolicy: PolicyConfig;
+  /** Ask-human routing for the policy gate. */
+  router: ApprovalRouter;
+  /** Gate ask-human timeout in ms; defaults to the policy's approvals.timeout_minutes. */
+  timeoutMs?: number;
+  /** Ladder scope for every call; defaults to "auto" (org when the policy allows, else personal, else ask). */
+  callScope?: CallScope;
+  /**
+   * Egress boundary (issue #53): injects the resolved credential at the
+   * proxy. Defaults to the secret-file boundary ({@link createSecretFileBoundary});
+   * the broker secret resolver is issue #54's wiring, so the default fails
+   * closed until then.
+   */
+  boundary?: CredentialBoundary;
+  /**
+   * MCP transport factory (test seam): tests inject in-memory transports so
+   * tool execution is exercised hermetically. Defaults to the real
+   * streamable-http / stdio transports (no credential attached — the
+   * iron-proxy boundary injects auth).
+   */
+  mcpTransport?: (binding: McpBinding) => Transport;
+}
+
+export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRuntime {
+  const makeTransport = deps.mcpTransport ?? defaultMcpTransport;
+  const boundary = deps.boundary ?? createSecretFileBoundary();
+  const knownExtensionIds = deps.registry.list().map((entry) => entry.manifest.id);
+
+  /** Manifest tier of an extension tool, resolved for the gate's tier stage (issue #53). */
+  const toolTierFor = (toolName: string): Tier | undefined => {
+    const extensionId = deps.registry.extensionIdForTool(toolName);
+    if (extensionId === undefined) return undefined;
+    return deps.registry.resolve(extensionId)?.manifest.tools.find((tool) => tool.name === toolName)?.tier;
+  };
+
+  const loadPolicy = (spaceId: string | undefined) => loadSpacePolicy(deps.orgPolicy, deps.store, spaceId);
+
+  /** Audit row for every call; credential_id is null unless the ladder resolved one. */
+  const auditCall = (input: {
+    extensionId: string;
+    toolName: string;
+    actor: string;
+    spaceId?: string;
+    credentialId: string | null;
+    decision: ExtensionCallDecision;
+  }): Promise<number> =>
+    deps.audit.appendAudit({
+      space_id: input.spaceId ?? null,
+      actor: input.actor,
+      event_type: EXTENSION_CALL_EVENT,
+      payload: {
+        extension: input.extensionId,
+        tool: input.toolName,
+        actor: input.actor,
+        credential_id: input.credentialId,
+        decision: input.decision,
+      },
+    });
+
+  return {
+    async execute(call) {
+      const { extensionId, toolName, args, caller, spaceId } = call;
+      const resolved = deps.registry.resolve(extensionId);
+      const manifest = resolved?.manifest;
+      const tool = manifest?.tools.find((entry) => entry.name === toolName);
+
+      if (!manifest || !tool) {
+        await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
+        return {
+          ok: false,
+          error: !manifest
+            ? `extension "${extensionId}" is not registered`
+            : `tool "${toolName}" is not declared by extension "${extensionId}"`,
+        };
+      }
+
+      // 1. POLICY GATE FIRST — a denied call never resolves a credential.
+      // The extensionId rides the gate call so the extension allowlist
+      // (issue #56) decides before tier/approval; toolTier resolves the
+      // manifest tier for the tier stage (issue #53).
+      const gateCall: PolicyGateCall & { extensionId?: string } = {
+        tool: toolName,
+        args,
+        spaceId,
+        actor: caller,
+        extensionId,
+      };
+      const outcome = await evaluatePolicyGate(
+        {
+          loadPolicy,
+          audit: deps.audit,
+          router: deps.router,
+          timeoutMs: deps.timeoutMs,
+          knownExtensionIds,
+          toolTier: toolTierFor,
+        },
+        gateCall,
+      );
+      if (!outcome.allowed) {
+        await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "deny" });
+        return { ok: false, error: outcome.blockReason };
+      }
+
+      // 2. Credential ladder over the store's registry rows. Personal
+      // lookups are filtered to the caller — the ladder never sees other
+      // people's rows.
+      const policy = await loadPolicy(spaceId);
+      const rows = await deps.store.listExtensionCredentials(manifest.id);
+      const findCredential = (scope: "org" | "personal", owner: string | null): ExtensionCredential | null => {
+        if (scope === "org") return rows.find((row) => row.scope === "org" && row.owner === null) ?? null;
+        return rows.find((row) => row.scope === "personal" && row.owner === owner) ?? null;
+      };
+      const resolution = resolveCredential({
+        callScope: deps.callScope ?? "auto",
+        caller,
+        provider: manifest.id,
+        spacePolicy: { orgUsageAllowed: orgCredentialsAllowed(policy) },
+        findCredential,
+      });
+      if (resolution.kind !== "credential") {
+        // "ask" is a blocking signal too: the runtime never guesses an account.
+        await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
+        return { ok: false, error: resolution.kind === "ask" ? resolution.reason : resolution.message };
+      }
+      const credential = resolution.credential;
+      await recordCredentialResolution(deps.store, { actor: caller, spaceId, credential });
+      await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: credential.id, decision: "allow" });
+
+      // 3. Boundary injection + provider call. The credential stays at the
+      // boundary; the call carries no auth (iron-proxy attaches it for the
+      // extension's allowlisted domains). Failures (boundary write, proxy
+      // reload, transport, provider) are tool errors, never silent no-ops —
+      // the allow decision is already on the trail.
+      try {
+        await boundary.authorize(credential);
+        if (manifest.kind === "mcp") {
+          return await callMcpTool(makeTransport, manifest.mcp, tool.name, args);
+        }
+        return await callCliTool(manifest.cli, tool.name, args);
+      } catch (err) {
+        return { ok: false, error: `extension tool "${tool.name}" failed: ${errorMessage(err)}` };
+      }
+    },
+  };
+}
+
+function defaultMcpTransport(binding: McpBinding): Transport {
+  if (binding.transport === "streamable-http") {
+    // No client credential: iron-proxy injects the Authorization header for
+    // the extension's allowlisted domains at the boundary (issue #53).
+    return new StreamableHTTPClientTransport(new URL(binding.serverUrl));
+  }
+  return new StdioClientTransport({ command: binding.command });
+}
+
+/**
+ * Calls the provider's official MCP server (one client per call; the
+ * provider owns its connection lifecycle). Text content blocks pass
+ * through; other content types are stringified so the result always fits
+ * the agent tool result shape.
+ */
+async function callMcpTool(
+  makeTransport: (binding: McpBinding) => Transport,
+  binding: McpBinding,
+  toolName: string,
+  params: Record<string, unknown>,
+): Promise<ExtensionRuntimeResult> {
+  const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
+  try {
+    await client.connect(makeTransport(binding));
+    // The SDK's declared return is a union with an experimental task-based
+    // branch; passing CallToolResultSchema pins the runtime shape, so the
+    // cast is the documented contract (guarded below).
+    const result = (await client.callTool({ name: toolName, arguments: params }, CallToolResultSchema)) as CallToolResult;
+    // Task-based (experimental) results carry toolResult, not content; the
+    // runtime only forwards plain call results.
+    if (!("content" in result)) {
+      throw new Error(`MCP server returned a task-based result for "${toolName}" (not supported)`);
+    }
+    return {
+      ok: true,
+      content: result.content.map((block) =>
+        block.type === "text"
+          ? { type: "text" as const, text: block.text }
+          : { type: "text" as const, text: JSON.stringify(block) },
+      ),
+    };
+  } finally {
+    await client.close();
+  }
+}
+
+/**
+ * Shells out to the preinstalled CLI (tools image). Fixed args from the
+ * manifest come first, then the call's params as `--name value` flags
+ * (`--name` alone for boolean true). Exit code 0 -> stdout as the result;
+ * any other exit -> a tool error with stderr.
+ *
+ * Credential boundary (issue #58): the child env is the parent env minus
+ * credential-named variables, plus the manifest's (validated
+ * credential-free) `env` delta — CLIs never receive credentials via env.
+ * Auth happens at the iron-proxy boundary: HTTPS_PROXY points at iron-proxy
+ * (egress allowlist, src/egress), which injects the credential for the
+ * allowlisted domain per request. Bun's `env` option REPLACES the
+ * environment, so the merge must carry PATH and friends explicitly.
+ */
+async function callCliTool(
+  binding: CliBinding,
+  toolName: string,
+  params: Record<string, unknown>,
+): Promise<ExtensionRuntimeResult> {
+  const flagArgs: string[] = [];
+  for (const [name, value] of Object.entries(params)) {
+    if (typeof value === "boolean") {
+      if (value) flagArgs.push(`--${name}`);
+    } else {
+      flagArgs.push(`--${name}`, String(value));
+    }
+  }
+  const proc = Bun.spawnSync({
+    cmd: [binding.command, ...(binding.args ?? []), ...flagArgs],
+    env: { ...credentialSafeEnv(), ...binding.env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (proc.exitCode !== 0) {
+    const stderr = proc.stderr.toString().trim();
+    return {
+      ok: false,
+      error: `cli tool "${toolName}" exited ${proc.exitCode}${stderr ? `: ${stderr}` : ""}`,
+    };
+  }
+  return { ok: true, content: [{ type: "text", text: proc.stdout.toString() }] };
+}
+
+/**
+ * The parent environment minus credential-named variables
+ * ({@link CREDENTIAL_ENV_RE} in manifest.ts). Credentials must never reach
+ * a spawned CLI through the environment — the iron-proxy boundary is the
+ * only auth path (see {@link callCliTool}).
+ */
+export function credentialSafeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !CREDENTIAL_ENV_RE.test(name)) env[name] = value;
+  }
+  return env;
+}

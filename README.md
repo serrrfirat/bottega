@@ -201,6 +201,20 @@ binding + policy**:
    Extension `domains` merge into the iron-proxy allowlist via
    `src/egress/generate.ts` (run `bun run src/egress/generate.ts` after
    adding snapshots; `config/egress.yml` is the generated artifact).
+5. **Runtime** (`runtime.ts`, issue #53) — every extension tool call crosses
+   the safety spine: **policy gate first** (the extension allowlist +
+   manifest tier, shared with the in-process policy extension) → **credential
+   ladder** (`credentials.ts`, org/me/auto scopes over the store's registry
+   rows) → **egress boundary** (`boundary.ts`: the resolved credential is
+   written to the extension's secret file on the shared data volume, mode
+   0600, and iron-proxy's `secrets` transform **injects** it as the
+   `Authorization` header for the extension's allowlisted domains — the
+   call itself carries no credential, so nothing reaches agent env,
+   transcripts, or audit) → provider call → audit. Every call writes
+   `extension.call` `{extension, tool, actor, credential_id, decision}`;
+   denied calls never resolve a credential. The broker secret fetch that
+   feeds the boundary is the real-provider issue's wiring; until then calls
+   fail closed at the boundary.
 
 The test-only fixture extension (`fixture.ts`) proves the shape end to end:
 registered → resolves → its tool appears in the space agent's toolset → its

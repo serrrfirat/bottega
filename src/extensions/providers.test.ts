@@ -21,8 +21,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { createAudit } from "../policy/audit";
+import { DenyRouter } from "../policy/approval-router";
+import { parseOrgConfigYaml } from "../policy/config";
+import { createStore } from "../store/db";
 import { createExtensionRegistry, readPinnedSnapshots } from "./registry";
 import { extensionToolDefinitions } from "./tools";
+import { createExtensionRuntime } from "./runtime";
 import type { McpBinding } from "./manifest";
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
@@ -37,7 +42,41 @@ const TOOL_SURFACE = {
 } as const;
 
 function run(def: ToolDefinition, params: Record<string, unknown>) {
-  return def.execute("1", params, undefined, undefined, {} as ExtensionContext);
+  return def.execute("1", params, undefined, undefined, {
+    sessionManager: { getSessionFile: () => null },
+  } as unknown as ExtensionContext);
+}
+
+/**
+ * The #53 runtime over the pinned-snapshot registry: real in-memory store
+ * with an org credential row per provider, real audit, DenyRouter, and the
+ * injected MCP transport seam (issue #53 owns gate → ladder → boundary →
+ * audit; #54 exercises the provider tool surface through it).
+ */
+function makeRuntime(mcpTransport?: (binding: McpBinding) => Transport) {
+  const registry = createExtensionRegistry(SNAPSHOTS_DIR);
+  const store = createStore(":memory:");
+  for (const id of PROVIDERS) {
+    void store.upsertExtensionCredential({
+      provider: id,
+      identityKey: "email:org@example.com",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 1,
+    });
+  }
+  const runtime = createExtensionRuntime({
+    registry,
+    store,
+    audit: createAudit(store),
+    // The providers cross the tier stage as known tools with their manifest
+    // tiers; the tools map allows everything not explicitly denied.
+    orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+    router: DenyRouter,
+    boundary: { async authorize() {} },
+    mcpTransport,
+  });
+  return { registry, runtime };
 }
 
 describe("issue #54 pinned providers", () => {
@@ -84,7 +123,6 @@ describe("issue #54 pinned providers", () => {
   });
 
   test("linear executes end-to-end through the tool bridge against a stub transport", async () => {
-    const registry = createExtensionRegistry(SNAPSHOTS_DIR);
     const mcpTransport = (_binding: McpBinding): Transport => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "linear-stub", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -97,7 +135,8 @@ describe("issue #54 pinned providers", () => {
       void server.connect(serverTransport);
       return clientTransport;
     };
-    const definitions = extensionToolDefinitions(registry.list(), { mcpTransport });
+    const { registry, runtime } = makeRuntime(mcpTransport);
+    const definitions = extensionToolDefinitions(registry.list(), { runtime });
     const search = definitions.find((def) => def.name === "linear.search_issues");
     expect(search).toBeDefined();
     expect(search?.approval).toBe("read");
@@ -106,14 +145,12 @@ describe("issue #54 pinned providers", () => {
   });
 
   test("github (stdio binding) failures surface as tool errors, not silent no-ops", async () => {
-    const registry = createExtensionRegistry(SNAPSHOTS_DIR);
+    const { registry, runtime } = makeRuntime(() => {
+      throw new Error("github-mcp-server not in image");
+    });
     const github = registry.resolve("github");
     expect(github?.manifest.mcp).toEqual({ command: "github-mcp-server", transport: "stdio" });
-    const definitions = extensionToolDefinitions([github!], {
-      mcpTransport: () => {
-        throw new Error("github-mcp-server not in image");
-      },
-    });
+    const definitions = extensionToolDefinitions([github!], { runtime });
     const result = await run(definitions[0], { query: "repo:foo" });
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("not in image");

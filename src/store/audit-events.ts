@@ -30,6 +30,14 @@ export const MEMORY_WRITE_EVENT = "memory.write";
 export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolved";
 /** Extension connected through the connect capability (payload {extension, scope, owner}). */
 export const EXTENSION_CONNECTED_EVENT = "extension.connected";
+/**
+ * Extension tool call executed through the runtime (issue #53) — payload
+ * {extension, tool, actor, credential_id, decision}; decision is
+ * "allow" | "deny" | "error" (credential_id null unless the ladder resolved
+ * one). Written on EVERY runtime call, before or without execution when the
+ * gate or the ladder blocks it.
+ */
+export const EXTENSION_CALL_EVENT = "extension.call";
 /** Inbound message dropped (payload {reason, ts}). */
 export const MESSAGE_DROPPED_EVENT = "message_dropped";
 /** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */

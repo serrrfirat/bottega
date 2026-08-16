@@ -543,6 +543,7 @@ describe("policy extension wiring", () => {
     preApproved = false,
     ext: {
       toolExtensionId?: (toolName: string) => string | undefined;
+      toolTier?: (toolName: string) => Tier | undefined;
       knownExtensionIds?: string[];
     } = {},
   ): Map<string, ToolCallHandler> {
@@ -799,6 +800,60 @@ describe("policy extension wiring", () => {
     expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
     // The tier reason, not the allowlist reason: the allowlist let it through.
     expect(String(payload.reason)).toContain("known tool table");
+  });
+
+  test("an allowed extension with its manifest tier wired passes the gate (issue #53)", async () => {
+    const handlers = makeExtension(
+      "tools:\n  unknown: allow\nextensions:\n  allow:\n    - fixture.weather\n",
+      DenyRouter,
+      undefined,
+      false,
+      {
+        toolExtensionId: () => "fixture.weather",
+        toolTier: (name) => (name === "weather.current" ? "read" : undefined),
+        knownExtensionIds: ["fixture.weather"],
+      },
+    );
+    // Read tier + allow action → runs; the audit reports the manifest tier.
+    expect(await call(handlers, "weather.current", { city: "Lisbon" })).toBeUndefined();
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "weather.current", tier: "read", decision: "allow" });
+  });
+
+  test("a denied extension stays denied even with a wired tier (issue #53)", async () => {
+    const handlers = makeExtension(
+      "tools:\n  unknown: allow\nextensions:\n  deny:\n    - fixture.weather\n",
+      DenyRouter,
+      undefined,
+      false,
+      {
+        toolExtensionId: () => "fixture.weather",
+        toolTier: () => "read",
+        knownExtensionIds: ["fixture.weather"],
+      },
+    );
+    blocked(await call(handlers, "weather.current", {}));
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
+    expect(String(payload.reason)).toContain("extensions.deny");
+  });
+
+  test("an extension tool with a wired tier but a denied policy action blocks (issue #53)", async () => {
+    const handlers = makeExtension(
+      "tools:\n  weather.current: deny\n",
+      DenyRouter,
+      undefined,
+      false,
+      {
+        toolExtensionId: () => "fixture.weather",
+        toolTier: () => "read",
+        knownExtensionIds: ["fixture.weather"],
+      },
+    );
+    blocked(await call(handlers, "weather.current", {}));
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
+    expect(String(payload.reason)).toContain("policy denies the tool");
   });
 
   test("an unknown id in extensions.allow/deny fails the policy closed (issue #56)", async () => {

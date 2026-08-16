@@ -6,6 +6,7 @@ import { AgentRegistry, SessionManager, createAgentSession } from "@oh-my-pi/pi-
 import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { extensionToolDefinitions } from "../../extensions/tools";
+import type { ExtensionRuntime } from "../../extensions/runtime";
 import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
@@ -196,7 +197,11 @@ describe("omp sdk agent driver", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
     try {
       const registry = createFixtureRegistry();
-      const customTools = extensionToolDefinitions(registry.list());
+      // Session-surface tests only: no tool executes, so a stub runtime
+      // proves the bridge still yields definitions (execution is the #53
+      // runtime's job, tested in extensions/runtime.test.ts).
+      const stubRuntime: ExtensionRuntime = { execute: async () => ({ ok: false, error: "stub" }) };
+      const customTools = extensionToolDefinitions(registry.list(), { runtime: stubRuntime });
       mkdirSync(join(dir, "sessions"), { recursive: true });
       const sessionManager = SessionManager.create(process.cwd(), join(dir, "sessions"));
       await sessionManager.setSessionFile(join(dir, "sessions", "slack:C1.jsonl"));
@@ -226,7 +231,8 @@ describe("omp sdk agent driver", () => {
   test("createOmpSdkDriver accepts registry customTools and creates sessions", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
     try {
-      const customTools = extensionToolDefinitions(createFixtureRegistry().list());
+      const stubRuntime: ExtensionRuntime = { execute: async () => ({ ok: false, error: "stub" }) };
+      const customTools = extensionToolDefinitions(createFixtureRegistry().list(), { runtime: stubRuntime });
       const driver = createOmpSdkDriver({ agentDir: join(dir, "agent"), customTools });
       const session = await driver.createSession({
         spaceId: "slack:C1",
@@ -250,7 +256,9 @@ describe("omp sdk agent driver", () => {
       try {
         const registry = createFixtureRegistry();
         const customTools = [
-          ...extensionToolDefinitions(registry.list()),
+          ...extensionToolDefinitions(registry.list(), {
+            runtime: { execute: async () => ({ ok: false, error: "stub" }) },
+          }),
           connectExtensionToolDefinition({
             registry,
             store,

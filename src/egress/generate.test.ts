@@ -9,9 +9,10 @@ import {
   regenerateEgressConfig,
   renderEgressConfig,
   SNAPSHOTS_DIR,
+  renderSecretsTransform,
 } from "./generate";
 import { readPinnedSnapshots, SNAPSHOT_SCHEMA } from "../extensions/registry";
-import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN } from "../extensions/fixture";
+import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID } from "../extensions/fixture";
 
 const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
 
@@ -19,6 +20,12 @@ const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egr
  * live pinned files so the pinned expectation tracks new providers without
  * duplicating their domains here. */
 const EXTENSION_DOMAINS = readPinnedSnapshots(SNAPSHOTS_DIR).flatMap((s) => s.manifest.domains);
+
+/** Injection entries for the committed snapshots (issue #53). */
+const EXTENSION_ENTRIES = readPinnedSnapshots(SNAPSHOTS_DIR).map((s) => ({
+  extensionId: s.manifest.id,
+  domains: s.manifest.domains,
+}));
 
 function allowlistDomains(yaml: string): string[] {
   const cfg = parseYamlSubset(yaml);
@@ -31,18 +38,71 @@ function allowlistDomains(yaml: string): string[] {
   return config["domains"] as string[];
 }
 
+/** The secrets transform's entries from a rendered config, or null when absent. */
+function secretsEntries(yaml: string): Record<string, YamlNode>[] | null {
+  const cfg = parseYamlSubset(yaml);
+  const transforms = cfg["transforms"] as YamlNode[];
+  const secrets = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "secrets");
+  if (secrets === undefined) return null;
+  const config = (secrets as Record<string, YamlNode>)["config"] as Record<string, YamlNode>;
+  return config["secrets"] as Record<string, YamlNode>[];
+}
+
 describe("egress config generation", () => {
   test("rendering with the base + pinned extension domains reproduces the committed config byte-for-byte", () => {
     // config/egress.yml is a generated artifact; this pins it to the
     // template so hand edits and generator drift both fail here. The
-    // pinned extension domains (issue #54) are part of the committed
-    // output, so they join the base when reproducing it.
-    expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS))).toBe(COMMITTED_EGRESS);
+    // pinned extension domains (issue #54) and their credential-injection
+    // entries (issue #53) are part of the committed output.
+    expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS), EXTENSION_ENTRIES)).toBe(COMMITTED_EGRESS);
   });
 
   test("the committed allowlist contains the NEAR.ai model endpoints and the three provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
     expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
+  });
+
+  test("the committed secrets transform injects the Authorization header for every provider domain", () => {
+    const entries = secretsEntries(COMMITTED_EGRESS);
+    expect(entries).not.toBeNull();
+    expect(entries).toHaveLength(3);
+    for (const entry of entries ?? []) {
+      const source = entry["source"] as Record<string, YamlNode>;
+      expect(source["type"]).toBe("file");
+      expect(source["path"]).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
+      const inject = entry["inject"] as Record<string, YamlNode>;
+      expect(inject["header"]).toBe("Authorization");
+      expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
+      const rules = entry["rules"] as Record<string, YamlNode>[];
+      expect(rules).toHaveLength(1);
+      expect(EXTENSION_DOMAINS).toContain(String(rules[0]!["host"]));
+    }
+    // The fixture extension is not pinned in config/extensions, so its
+    // domain must not appear in the committed secrets transform.
+    const allHosts = (entries ?? []).flatMap((e) => {
+      const rules = e["rules"] as Record<string, YamlNode>[];
+      return rules.map((r) => String(r["host"]));
+    });
+    expect(allHosts).not.toContain(FIXTURE_EXTENSION_DOMAIN);
+  });
+
+  test("rendering without extensions emits no secrets transform (base config is unchanged)", () => {
+    expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).not.toContain("- name: secrets");
+    expect(secretsEntries(renderEgressConfig(BASE_EGRESS_DOMAINS))).toBeNull();
+  });
+
+  test("renderSecretsTransform emits one inject entry per extension with its domains", () => {
+    const yaml = renderSecretsTransform([
+      { extensionId: FIXTURE_EXTENSION_ID, domains: [FIXTURE_EXTENSION_DOMAIN, "api.example.com"] },
+    ]);
+    const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      source: { type: "file", path: `/data/proxy-secrets/${FIXTURE_EXTENSION_ID}.secret` },
+      inject: { header: "Authorization", formatter: "Bearer {{ .Value }}" },
+    });
+    const rules = entries[0]!["rules"] as Record<string, YamlNode>[];
+    expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
   });
 
   test("mergedEgressDomains appends extension domains after the base, deduped", () => {

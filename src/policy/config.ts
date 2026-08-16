@@ -285,6 +285,14 @@ export function decidePolicyCall(
   toolName: string,
   preApproved = false,
   extensionId?: string,
+  /**
+   * The extension tool's manifest tier (issue #53), resolved by the gate
+   * ONLY for calls carrying an extensionId. When present, the tool crosses
+   * the tier stage as KNOWN with that tier — the extension allowlist is
+   * not a bypass, tier logic still applies. Absent → the static table
+   * decides and extension tools deny as unknown (fail closed).
+   */
+  extensionTier?: Tier,
 ): { decision: Decision; reason: string; autoApproved: boolean } {
   if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}`, autoApproved: false };
   // Extension allowlist (issue #56): resolved BEFORE tier/approval — a
@@ -293,6 +301,14 @@ export function decidePolicyCall(
   if (extensionId !== undefined) {
     const ext = decideExtensionCall(policy, extensionId);
     if (ext.decision === "deny") return { decision: "deny", reason: ext.reason, autoApproved: false };
+    if (extensionTier !== undefined) {
+      const { decision, reason } = decideToolCall({
+        tier: extensionTier,
+        action: toolAction(policy, toolName),
+        toolKnown: true,
+      });
+      return { decision, reason, autoApproved: false };
+    }
   }
   const action = toolAction(policy, toolName);
   if (preApproved && isKnownTool(toolName) && resolveTier(toolName) === "exec" && action === "allow") {
