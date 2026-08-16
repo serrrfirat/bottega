@@ -167,26 +167,52 @@ export async function fetchCatalogEntry(
   return parseCatalogRecord(entry);
 }
 
+/** Result of a catalog listing: valid entries plus surfaced malformed-record diagnostics. */
+export interface CatalogListResult {
+  entries: CatalogEntry[];
+  /** Malformed records skipped from `entries` — surfaced, never silently dropped (issue #117). */
+  skipped: Array<{ specId: string; reason: string }>;
+}
+
 /**
  * Lists the whole catalog, optionally filtered by `query` (case-insensitive
  * substring match against name, slug, id, kind, and domain). Throws
- * {@link CatalogError} when the catalog is unreachable or any record is
- * malformed — the browser never guesses or silently drops entries.
+ * {@link CatalogError} when the catalog DOCUMENT is unreachable or malformed
+ * (never guesses). Individual malformed records are SKIPPED and surfaced in
+ * `skipped` — one bad vendor entry (e.g. a missing url) must not take down
+ * the whole list (issue #117); a record-level problem is never a silent drop.
  */
 export async function listCatalogEntries(
   query?: string,
   opts: FetchCatalogOptions = {},
-): Promise<CatalogEntry[]> {
-  let entries = (await fetchCatalogDoc(opts)).map((record) => parseCatalogRecord(record));
+): Promise<CatalogListResult> {
+  const records = await fetchCatalogDoc(opts);
+  const entries: CatalogEntry[] = [];
+  const skipped: CatalogListResult["skipped"] = [];
+  for (const record of records) {
+    try {
+      entries.push(parseCatalogRecord(record));
+    } catch (err) {
+      if (err instanceof CatalogError) {
+        const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
+        skipped.push({ specId, reason: err.message });
+        continue;
+      }
+      throw err;
+    }
+  }
   const needle = query?.trim().toLowerCase();
   if (needle) {
-    entries = entries.filter((entry) =>
-      [entry.name, entry.slug, entry.id, entry.kind, entry.domain].some((field) =>
-        field.toLowerCase().includes(needle),
+    return {
+      entries: entries.filter((entry) =>
+        [entry.name, entry.slug, entry.id, entry.kind, entry.domain].some((field) =>
+          field.toLowerCase().includes(needle),
+        ),
       ),
-    );
+      skipped,
+    };
   }
-  return entries;
+  return { entries, skipped };
 }
 
 /**

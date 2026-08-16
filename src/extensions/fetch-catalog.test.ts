@@ -7,6 +7,7 @@ import {
   DEFAULT_CATALOG_URL,
   buildSnapshotDraft,
   fetchCatalogEntry,
+  listCatalogEntries,
   pinSnapshotDraft,
   writeSnapshotDraft,
   type SnapshotDraft,
@@ -189,6 +190,70 @@ describe("fetch-catalog helper (issue #54)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/** Catalog doc with a valid linear entry and one malformed record (missing url). */
+function catalogWithBadEntry(): { version: number; generatedAt: string; data: unknown[] } {
+  return {
+    version: 1,
+    generatedAt: "2026-08-16T00:00:00.000Z",
+    data: [
+      {
+        id: "mcp/linear",
+        slug: "linear",
+        name: "Linear",
+        kind: "mcp",
+        domain: "linear.app",
+        url: "https://linear.app/docs/mcp",
+      },
+      {
+        id: "mcp/b12",
+        slug: "b12-website-generator",
+        name: "B12 Website Generator",
+        kind: "mcp",
+        domain: "b12.io",
+        // no url — the live integrations.sh failure mode (issue #117)
+      },
+    ],
+  };
+}
+
+describe("listCatalogEntries resilience (issue #117)", () => {
+  test("one malformed record is skipped and surfaced, the rest list fine", async () => {
+    const result = await listCatalogEntries(undefined, { fetchImpl: stubFetch(catalogWithBadEntry()) });
+    expect(result.entries.map((e) => e.slug)).toEqual(["linear"]);
+    expect(result.skipped).toEqual([
+      {
+        specId: "b12-website-generator",
+        reason: 'catalog fetch failed: entry "b12-website-generator" is missing a non-empty "url"',
+      },
+    ]);
+  });
+
+  test("the query filters valid entries only; skipped records stay surfaced", async () => {
+    const result = await listCatalogEntries("linear", { fetchImpl: stubFetch(catalogWithBadEntry()) });
+    expect(result.entries.map((e) => e.slug)).toEqual(["linear"]);
+    expect(result.skipped).toHaveLength(1);
+    // A query matching only the bad record still surfaces it as skipped, not as an entry.
+    const none = await listCatalogEntries("b12-website-generator", { fetchImpl: stubFetch(catalogWithBadEntry()) });
+    expect(none.entries).toEqual([]);
+    expect(none.skipped).toHaveLength(1);
+  });
+
+  test("a malformed catalog document still fails closed", async () => {
+    await expect(listCatalogEntries(undefined, { fetchImpl: stubFetch({ version: 1 }) })).rejects.toThrow(/no data array/);
+    await expect(
+      listCatalogEntries(undefined, {
+        fetchImpl: (async () => new Response("<html>not json</html>", { status: 200 })) as unknown as typeof fetch,
+      }),
+    ).rejects.toThrow(/not valid JSON/);
+  });
+
+  test("direct single-entry fetch of a malformed spec still fails closed", async () => {
+    await expect(fetchCatalogEntry("b12-website-generator", { fetchImpl: stubFetch(catalogWithBadEntry()) })).rejects.toThrow(
+      /missing a non-empty "url"/,
+    );
   });
 });
 

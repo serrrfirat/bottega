@@ -475,7 +475,9 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
         const pinned = opts.registry?.list() ?? [];
         const needle = params.query?.trim().toLowerCase() ?? "";
         const pinnedMatches = needle ? pinned.filter((entry) => pinnedMatchesQuery(entry, needle)) : pinned;
-        const catalogEntries = await listCatalogEntries(params.query, catalogOpts);
+        const catalogResult = await listCatalogEntries(params.query, catalogOpts);
+        const catalogEntries = catalogResult.entries;
+        const catalogSkipped = catalogResult.skipped;
         const truncated = catalogEntries.length > CATALOG_LIST_CAP;
         await audit?.appendAudit({
           actor,
@@ -486,6 +488,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             pinned_matches: pinnedMatches.length,
             catalog_matches: truncated ? CATALOG_LIST_CAP : catalogEntries.length,
             catalog_truncated: truncated,
+            catalog_skipped: catalogSkipped.length,
           },
         });
         return {
@@ -506,6 +509,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   ...(entry.description !== undefined ? { description: entry.description } : {}),
                 })),
                 catalog_truncated: truncated,
+                catalog_skipped: catalogSkipped.map((s) => ({ spec_id: s.specId, reason: s.reason })),
               }),
             },
           ],
