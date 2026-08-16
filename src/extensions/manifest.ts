@@ -122,6 +122,8 @@ export class ExtensionValidationError extends Error {
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9._-]*$/;
+/** Extension id format (shared with the policy parser, issue #56). */
+export const EXTENSION_ID_RE = ID_RE;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const DOMAIN_RE = /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
 

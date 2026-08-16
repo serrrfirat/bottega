@@ -81,6 +81,8 @@ export interface ExtensionRegistry {
   resolve(id: string): ResolvedExtension | undefined;
   /** Tool names of every registered extension, in registration order. */
   toolNames(): string[];
+  /** The extension id that owns a tool name, if any (issue #56: the gate's tool→extension seam). */
+  extensionIdForTool(toolName: string): string | undefined;
   /** Egress allowlist entries contributed by extensions (deduped). */
   egressDomains(): string[];
 }
@@ -223,6 +225,12 @@ export function createExtensionRegistry(snapshotsDir?: string): ExtensionRegistr
         }
       }
       return names;
+    },
+    extensionIdForTool: (toolName: string) => {
+      for (const entry of entries.values()) {
+        if (entry.manifest.tools.some((tool) => tool.name === toolName)) return entry.manifest.id;
+      }
+      return undefined;
     },
     egressDomains: () => {
       const domains: string[] = [];

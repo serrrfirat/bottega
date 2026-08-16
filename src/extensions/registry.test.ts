@@ -86,6 +86,15 @@ describe("extension registry", () => {
     expect(registry.toolNames()).toEqual([FIXTURE_EXTENSION_TOOL, "example.query"]);
   });
 
+  test("extensionIdForTool maps a tool name to its owning extension (issue #56)", () => {
+    const registry = createExtensionRegistry();
+    registry.register(fixtureManifest());
+    registry.register(cliManifest());
+    expect(registry.extensionIdForTool(FIXTURE_EXTENSION_TOOL)).toBe(FIXTURE_EXTENSION_ID);
+    expect(registry.extensionIdForTool("example.query")).toBe("com.example.cli");
+    expect(registry.extensionIdForTool("bash")).toBeUndefined();
+  });
+
   test("egressDomains unions extension domains, deduped", () => {
     const registry = createExtensionRegistry();
     registry.register(fixtureManifest());

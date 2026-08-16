@@ -140,7 +140,16 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         // toolset alongside the project extensions below.
         customTools: extensionToolDefinitions(extensionRegistry.list()),
         extensions: [
-          createPolicyExtension({ orgPolicy, audit, router: approvalRouter, store }),
+          createPolicyExtension({
+            orgPolicy,
+            audit,
+            router: approvalRouter,
+            store,
+            // Extension policy seam (issue #56): resolve extension tool
+            // calls against the space's allowlist before tier/approval.
+            toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
+            knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
+          }),
           workItemsExtension(store, { orgPolicy }),
           // Memory tools (issue #22, #43): provider chosen from env —
           // MEM0_BASE_URL set → mem0 backend (compose ships it), else SQLite

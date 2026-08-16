@@ -15,10 +15,13 @@ import { DenyRouter, type ApprovalRequest, type ApprovalRouter, type ApprovalRes
 import {
   DEFAULT_TIMEOUT_MINUTES,
   applySpaceOverlay,
+  decideExtensionCall,
+  decidePolicyCall,
   decideToolCall,
   defaultPolicy,
   isKnownTool,
   loadOrgConfig,
+  orgCredentialsAllowed,
   parseOrgConfigYaml,
   resolveTier,
   toolAction,
@@ -266,6 +269,106 @@ memory:
   });
 });
 
+describe("extension policy parsing (issue #56)", () => {
+  test("parses extensions allow/deny/org_credentials at the org floor", () => {
+    const p = parseOrgConfigYaml(`
+extensions:
+  allow:
+    - linear
+    - github
+  deny:
+    - attio
+  org_credentials: deny
+`);
+    expect(p.ok).toBe(true);
+    expect(p.extensionsAllow).toEqual(["linear", "github"]);
+    expect(p.extensionsDeny).toEqual(["attio"]);
+    expect(p.orgCredentials).toBe("deny");
+    expect(p.errors).toEqual([]);
+  });
+
+  test("extensions default to no restriction and org credentials allowed", () => {
+    const p = parseOrgConfigYaml("");
+    expect(p.ok).toBe(true);
+    expect(p.extensionsAllow).toEqual([]);
+    expect(p.extensionsDeny).toEqual([]);
+    expect(p.orgCredentials).toBe("allow");
+    expect(orgCredentialsAllowed(p)).toBe(true);
+  });
+
+  test("extensions section must be a block mapping", () => {
+    expect(parseOrgConfigYaml("extensions: nope\n").ok).toBe(false);
+  });
+
+  test("allow/deny must be lists of well-formed extension ids", () => {
+    expect(parseOrgConfigYaml("extensions:\n  allow: nope\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("extensions:\n  allow:\n    - Bad Id\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("extensions:\n  deny:\n    - -bad\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("extensions:\n  deny:\n    - linear\n    - github\n").ok).toBe(true);
+  });
+
+  test("invalid org_credentials warns and keeps the allow default", () => {
+    const p = parseOrgConfigYaml("extensions:\n  org_credentials: sometimes\n");
+    expect(p.ok).toBe(true);
+    expect(p.orgCredentials).toBe("allow");
+    expect(p.warnings.some((w) => w.includes("org_credentials"))).toBe(true);
+  });
+
+  test("unknown keys in the extensions section warn", () => {
+    const p = parseOrgConfigYaml("extensions:\n  telepathy: on\n");
+    expect(p.ok).toBe(true);
+    expect(p.warnings.some((w) => w.includes("extensions.telepathy"))).toBe(true);
+  });
+});
+
+describe("extension allowlist decisions (issue #56)", () => {
+  test("deny wins over allow", () => {
+    const p = parseOrgConfigYaml("extensions:\n  allow:\n    - linear\n  deny:\n    - linear\n");
+    expect(decideExtensionCall(p, "linear").decision).toBe("deny");
+    expect(decideExtensionCall(p, "linear").reason).toContain("extensions.deny");
+  });
+
+  test("a non-empty allow list restricts to the listed ids", () => {
+    const p = parseOrgConfigYaml("extensions:\n  allow:\n    - linear\n    - github\n");
+    expect(decideExtensionCall(p, "linear").decision).toBe("allow");
+    expect(decideExtensionCall(p, "attio").decision).toBe("deny");
+    expect(decideExtensionCall(p, "attio").reason).toContain("extensions.allow");
+  });
+
+  test("empty allow/deny lists impose no restriction (registry is the base allowlist)", () => {
+    expect(decideExtensionCall(parseOrgConfigYaml(""), "linear").decision).toBe("allow");
+  });
+
+  test("allowlist deny runs BEFORE tier/approval (preApproved and always_approve do not bypass)", () => {
+    const p = parseOrgConfigYaml(`
+tools:
+  bash: allow
+approvals:
+  always_approve:
+    - bash
+extensions:
+  deny:
+    - linear
+`);
+    const res = decidePolicyCall(p, "bash", true, "linear");
+    expect(res.decision).toBe("deny");
+    expect(res.reason).toContain("linear");
+    expect(res.autoApproved).toBe(false);
+  });
+
+  test("an allowed extension still crosses the tier logic (allowlist is not a bypass)", () => {
+    const p = parseOrgConfigYaml("tools:\n  unknown: allow\nextensions:\n  allow:\n    - fixture.weather\n");
+    const res = decidePolicyCall(p, "weather.current", false, "fixture.weather");
+    expect(res.decision).toBe("deny"); // unknown tool at tier stage
+    expect(res.reason).toContain("known tool table");
+  });
+
+  test("a call without an extension id is untouched by the allowlist", () => {
+    const p = parseOrgConfigYaml("tools:\n  bash: allow\nextensions:\n  deny:\n    - linear\n");
+    expect(decidePolicyCall(p, "bash", false).decision).toBe("ask-human");
+  });
+});
+
 describe("space overlay", () => {
   test("can only tighten the org floor", () => {
     const org = parseOrgConfigYaml("tools:\n  bash: deny\n  write: allow\n  read: prompt\n");
@@ -351,6 +454,54 @@ describe("space overlay", () => {
     expect(p.responseMode).toBe("mention");
     expect(p.warnings.some((w) => w.includes("response_mode"))).toBe(true);
   });
+
+  test("overlay extensions.allow can only remove org-floor entries; deny only adds (issue #56)", () => {
+    const org = parseOrgConfigYaml("extensions:\n  allow:\n    - linear\n    - github\n  deny:\n    - attio\n");
+    const p = applySpaceOverlay(org, JSON.stringify({ extensions: { allow: ["github"], deny: ["figma"] } }));
+    expect(p.ok).toBe(true);
+    expect(p.extensionsAllow).toEqual(["linear"]);
+    expect(p.extensionsDeny).toEqual(["attio", "figma"]);
+    // The overlay can never widen allow: entries absent from the org floor stay absent.
+    const widened = applySpaceOverlay(parseOrgConfigYaml(""), JSON.stringify({ extensions: { allow: ["linear"] } }));
+    expect(widened.ok).toBe(true);
+    expect(widened.extensionsAllow).toEqual([]);
+    // An id the org floor does not list is a no-op (removal only tightens).
+    const noop = applySpaceOverlay(org, JSON.stringify({ extensions: { allow: ["nope"], deny: ["attio"] } }));
+    expect(noop.ok).toBe(true);
+    expect(noop.extensionsAllow).toEqual(["linear", "github"]);
+    expect(noop.extensionsDeny).toEqual(["attio"]);
+  });
+
+  test("overlay extensions.org_credentials can only tighten, never loosen (issue #56)", () => {
+    const org = parseOrgConfigYaml("");
+    expect(org.orgCredentials).toBe("allow");
+    expect(applySpaceOverlay(org, JSON.stringify({ extensions: { org_credentials: "deny" } })).orgCredentials).toBe(
+      "deny",
+    );
+    // Loosening is clamped to the org floor (tighten rule).
+    const strictOrg = parseOrgConfigYaml("extensions:\n  org_credentials: deny\n");
+    expect(applySpaceOverlay(strictOrg, JSON.stringify({ extensions: { org_credentials: "allow" } })).orgCredentials).toBe(
+      "deny",
+    );
+    // The org floor stands when the overlay does not mention org_credentials.
+    expect(applySpaceOverlay(strictOrg, "").orgCredentials).toBe("deny");
+  });
+
+  test("invalid overlay extensions.org_credentials warns and keeps the org floor", () => {
+    const org = parseOrgConfigYaml("extensions:\n  org_credentials: deny\n");
+    const p = applySpaceOverlay(org, JSON.stringify({ extensions: { org_credentials: "nope" } }));
+    expect(p.ok).toBe(true);
+    expect(p.orgCredentials).toBe("deny");
+    expect(p.warnings.some((w) => w.includes("org_credentials"))).toBe(true);
+  });
+
+  test("malformed overlay extensions fail the space closed (issue #56)", () => {
+    const org = parseOrgConfigYaml("extensions:\n  allow:\n    - linear\n");
+    expect(applySpaceOverlay(org, JSON.stringify({ extensions: "nope" })).ok).toBe(false);
+    expect(applySpaceOverlay(org, JSON.stringify({ extensions: { allow: "linear" } })).ok).toBe(false);
+    expect(applySpaceOverlay(org, JSON.stringify({ extensions: { deny: [1] } })).ok).toBe(false);
+    expect(applySpaceOverlay(org, JSON.stringify({ extensions: { allow: ["Bad Id"] } })).ok).toBe(false);
+  });
 });
 
 describe("policy extension wiring", () => {
@@ -388,6 +539,10 @@ describe("policy extension wiring", () => {
     router: ApprovalRouter = DenyRouter,
     timeoutMs?: number,
     preApproved = false,
+    ext: {
+      toolExtensionId?: (toolName: string) => string | undefined;
+      knownExtensionIds?: string[];
+    } = {},
   ): Map<string, ToolCallHandler> {
     const { handlers, pi } = fakePi();
     createPolicyExtension({
@@ -397,6 +552,7 @@ describe("policy extension wiring", () => {
       store,
       timeoutMs,
       preApproved,
+      ...ext,
     })(pi);
     return handlers;
   }
@@ -606,5 +762,63 @@ describe("policy extension wiring", () => {
     const ctx = { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext;
     const res = await handlers.get("tool_call")!(toolCallEvent("read", { path: "x" }), ctx);
     expect(res).toBeUndefined();
+  });
+
+  test("extension allowlist denies BEFORE tier/approval with reason + audit (issue #56)", async () => {
+    const requestedBefore = (await audit.listAudit({ event_type: "approval.requested" })).length;
+    const handlers = makeExtension(
+      "tools:\n  bash: allow\napprovals:\n  always_approve:\n    - bash\nextensions:\n  deny:\n    - fixture.weather\n",
+      DenyRouter,
+      undefined,
+      true,
+      { toolExtensionId: (name) => (name === "bash" ? "fixture.weather" : undefined), knownExtensionIds: ["fixture.weather"] },
+    );
+    // The exec tool is allowlisted + pre-approved + always_approve — only the
+    // extension deny can block it, proving the allowlist runs before them.
+    const res = blocked(await call(handlers, "bash", { command: "ls" }));
+    expect(res.reason).toContain("fixture.weather");
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "bash", tier: "exec", decision: "deny" });
+    expect(String(payload.reason)).toContain("extensions.deny");
+    // Deny before approval: no ask-human round-trip happened.
+    expect(await audit.listAudit({ event_type: "approval.requested" })).toHaveLength(requestedBefore);
+  });
+
+  test("an allowed extension tool passes the allowlist and hits the tier logic (issue #56)", async () => {
+    const handlers = makeExtension(
+      "tools:\n  unknown: allow\nextensions:\n  allow:\n    - fixture.weather\n",
+      DenyRouter,
+      undefined,
+      false,
+      { toolExtensionId: () => "fixture.weather", knownExtensionIds: ["fixture.weather"] },
+    );
+    blocked(await call(handlers, "weather.current", {}));
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
+    // The tier reason, not the allowlist reason: the allowlist let it through.
+    expect(String(payload.reason)).toContain("known tool table");
+  });
+
+  test("an unknown id in extensions.allow/deny fails the policy closed (issue #56)", async () => {
+    const handlers = makeExtension(
+      "tools:\n  read: allow\nextensions:\n  allow:\n    - ghost.extension\n",
+      DenyRouter,
+      undefined,
+      false,
+      { toolExtensionId: () => undefined, knownExtensionIds: ["fixture.weather"] },
+    );
+    // Even a plainly allowed read tool denies: the space policy is invalid.
+    blocked(await call(handlers, "read", { path: "x" }));
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "read", decision: "deny" });
+    expect(String(payload.reason)).toContain("ghost.extension");
+  });
+
+  test("extension tools with no extension wiring stay on plain tier logic (fail closed)", async () => {
+    const handlers = makeExtension("tools:\n  unknown: allow\n");
+    blocked(await call(handlers, "weather.current", {}));
+    const payload = await lastAudit("policy.decision");
+    expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
+    expect(String(payload.reason)).toContain("known tool table");
   });
 });

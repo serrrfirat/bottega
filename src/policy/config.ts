@@ -13,6 +13,14 @@
  * policy action is `allow`; known tool names only, unknown names fail the
  * policy closed. The space overlay can only remove entries from that list.
  *
+ * `extensions` keys (issue #56): `allow`/`deny` id lists (empty = no
+ * restriction; non-empty allow = only those ids usable; deny wins over
+ * allow) and `org_credentials: allow|deny` (org-credential usage in `auto`
+ * resolution, default allow). The overlay tightens: it removes from the
+ * org allowlist, adds to the org deny list, and clamps org_credentials
+ * like response_mode. Ids are format-validated here and existence-validated
+ * against the registry at the gate (unknown id → fail closed).
+ *
  * YAML: deliberately dependency-free — parsed by the shared YAML-subset
  * parser (src/yaml-subset.ts). Anything outside that subset is a
  * structural error that fails the whole policy closed. A subset parser is
@@ -21,6 +29,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { EXTENSION_ID_RE } from "../extensions/manifest";
 import type { Store } from "../store/db";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
@@ -41,6 +50,14 @@ export const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
 export type ResponseMode = "always" | "mention" | "request-only";
 
 export const DEFAULT_RESPONSE_MODE: ResponseMode = "always";
+
+/**
+ * Per-space org-credential usage (issue #56): whether `auto` credential
+ * resolution may use org-scoped credentials in this space. Default allow —
+ * org usage is gated at connect by approval anyway.
+ */
+export type OrgCredentialsMode = "allow" | "deny";
+export const DEFAULT_ORG_CREDENTIALS: OrgCredentialsMode = "allow";
 
 export const DEFAULT_TIMEOUT_MINUTES = 5;
 export const DEFAULT_REQUIRED_APPROVERS = 1;
@@ -66,6 +83,28 @@ function normalizeResponseMode(value: unknown): ResponseMode | undefined {
 /** The stricter of two response modes (mention/request-only tighten; always is the floor). */
 export function stricterResponseMode(a: ResponseMode, b: ResponseMode): ResponseMode {
   return RESPONSE_MODE_STRICTNESS[b] > RESPONSE_MODE_STRICTNESS[a] ? b : a;
+}
+
+/** Tightening order for org-credential usage: allow → deny. */
+const ORG_CREDENTIALS_STRICTNESS: Record<OrgCredentialsMode, number> = { allow: 0, deny: 1 };
+const ORG_CREDENTIALS_VALUES: readonly OrgCredentialsMode[] = ["allow", "deny"];
+
+function normalizeOrgCredentials(value: unknown): OrgCredentialsMode | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (ORG_CREDENTIALS_VALUES as readonly string[]).includes(normalized)
+    ? (normalized as OrgCredentialsMode)
+    : undefined;
+}
+
+/** The stricter of two org-credential modes (deny tightens; allow is the floor). */
+export function stricterOrgCredentials(a: OrgCredentialsMode, b: OrgCredentialsMode): OrgCredentialsMode {
+  return ORG_CREDENTIALS_STRICTNESS[b] > ORG_CREDENTIALS_STRICTNESS[a] ? b : a;
+}
+
+/** Whether the space policy allows using org-scoped credentials (extensions.org_credentials, default allow). */
+export function orgCredentialsAllowed(policy: PolicyConfig): boolean {
+  return policy.orgCredentials === "allow";
 }
 
 /** Capability tier per known OMP tool. Unknown/malformed names resolve to exec. */
@@ -124,6 +163,20 @@ export interface PolicyConfig {
   agentDriver: AgentDriverName;
   /** Response mode (issue #55): when the space agent acts; org floor default is `always`. */
   responseMode: ResponseMode;
+  /**
+   * Extension allowlist (issue #56): the org floor's `extensions.allow`
+   * list. Empty = no allow restriction (the registry is the base
+   * allowlist); non-empty = only the listed extension ids may be used.
+   * The space overlay can only remove entries.
+   */
+  extensionsAllow: string[];
+  /**
+   * Extension deny list (issue #56): ids never usable, deny wins over
+   * allow. The space overlay can only add entries.
+   */
+  extensionsDeny: string[];
+  /** Org-credential usage (issue #56): `extensions.org_credentials`, default allow; overlay can only tighten. */
+  orgCredentials: OrgCredentialsMode;
   errors: string[];
   warnings: string[];
 }
@@ -145,6 +198,9 @@ export function defaultPolicy(): PolicyConfig {
 
     agentDriver: DEFAULT_AGENT_DRIVER,
     responseMode: DEFAULT_RESPONSE_MODE,
+    extensionsAllow: [],
+    extensionsDeny: [],
+    orgCredentials: DEFAULT_ORG_CREDENTIALS,
     errors: [],
     warnings: [],
   };
@@ -172,10 +228,49 @@ export function decideToolCall(input: {
 }
 
 /**
+ * The extension allowlist decision (issue #56), resolved BEFORE tier and
+ * approval logic:
+ * - an id in `extensions.deny` denies (deny wins over allow);
+ * - when `extensions.allow` is non-empty, only the listed ids are allowed;
+ * - both empty → no restriction (the registry is the base allowlist).
+ */
+export function decideExtensionCall(
+  policy: PolicyConfig,
+  extensionId: string,
+): { decision: "allow" | "deny"; reason: string } {
+  if (policy.extensionsDeny.includes(extensionId)) {
+    return {
+      decision: "deny",
+      reason: `extension '${extensionId}' is denied by this space's policy (extensions.deny)`,
+    };
+  }
+  if (policy.extensionsAllow.length > 0 && !policy.extensionsAllow.includes(extensionId)) {
+    return {
+      decision: "deny",
+      reason: `extension '${extensionId}' is not in this space's extension allowlist (extensions.allow)`,
+    };
+  }
+  return { decision: "allow", reason: "extension is allowed by this space's policy" };
+}
+
+/**
+ * The first id in `extensions.allow`/`extensions.deny` that is not a known
+ * (registered) extension id — a structural error that fails the policy
+ * closed (issue #56). Returns undefined when every listed id is known.
+ */
+export function unknownExtensionId(policy: PolicyConfig, knownIds: readonly string[]): string | undefined {
+  for (const id of [...policy.extensionsAllow, ...policy.extensionsDeny]) {
+    if (!knownIds.includes(id)) return id;
+  }
+  return undefined;
+}
+
+/**
  * The gate decision for one tool call, shared by every policy surface
  * (in-process extension, ACP permission handler — issue #26): an invalid
- * policy denies everything, then the tier × action table applies. The
- * executor's preApproved scope (issue #11) lets an allowlisted exec-tier
+ * policy denies everything, then the extension allowlist (issue #56) when
+ * the call belongs to an extension, then the tier × action table applies.
+ * The executor's preApproved scope (issue #11) lets an allowlisted exec-tier
  * tool run on the work item's pickup approval; explicit prompt/deny and
  * unknown tools are never bypassed. `autoApproved` marks an
  * always_approve decision (issue #45) so the caller can audit it as
@@ -185,8 +280,16 @@ export function decidePolicyCall(
   policy: PolicyConfig,
   toolName: string,
   preApproved = false,
+  extensionId?: string,
 ): { decision: Decision; reason: string; autoApproved: boolean } {
   if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}`, autoApproved: false };
+  // Extension allowlist (issue #56): resolved BEFORE tier/approval — a
+  // denied extension never reaches the approval ladder or credential
+  // resolution (the #53 runtime consumes this decision).
+  if (extensionId !== undefined) {
+    const ext = decideExtensionCall(policy, extensionId);
+    if (ext.decision === "deny") return { decision: "deny", reason: ext.reason, autoApproved: false };
+  }
   const action = toolAction(policy, toolName);
   if (preApproved && isKnownTool(toolName) && resolveTier(toolName) === "exec" && action === "allow") {
     return { decision: "allow", reason: "pre-approved executor session (work item pickup approval)", autoApproved: false };
@@ -221,6 +324,17 @@ function normalizeAction(value: unknown): PolicyAction | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
   return ACTION_VALUES.find((action) => action === normalized);
+}
+
+/** A list of well-formed extension ids, or undefined when malformed (fail closed). */
+function extensionIdList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids: string[] = [];
+  for (const raw of value) {
+    if (typeof raw !== "string" || !EXTENSION_ID_RE.test(raw)) return undefined;
+    ids.push(raw);
+  }
+  return [...new Set(ids)];
 }
 
 function structuralError(policy: PolicyConfig, message: string): PolicyConfig {
@@ -363,6 +477,41 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       for (const key of Object.keys(entries)) {
         if (key !== "driver") policy.warnings.push(`agent.${key}: unknown key ignored`);
       }
+    } else if (name === "extensions") {
+      // Extension policy (issue #56): `allow`/`deny` id lists and the
+      // org-credential usage knob. Malformed lists fail the policy closed
+      // (a typo would otherwise silently change what may run); existence
+      // against the registry is validated at the gate (unknownExtensionId).
+      const allow = extensionIdList(entries.allow);
+      if (allow !== undefined) {
+        policy.extensionsAllow = allow;
+      } else if (entries.allow !== undefined) {
+        return structuralError(policy, "extensions.allow must be a list of extension ids");
+      }
+      const deny = extensionIdList(entries.deny);
+      if (deny !== undefined) {
+        policy.extensionsDeny = deny;
+      } else if (entries.deny !== undefined) {
+        return structuralError(policy, "extensions.deny must be a list of extension ids");
+      }
+      // org_credentials: a usage knob like response_mode (issue #55) — an
+      // invalid value warns and keeps the allow default.
+      const orgCreds = scalarOrUndefined(entries.org_credentials);
+      if (orgCreds !== undefined) {
+        const mode = normalizeOrgCredentials(orgCreds);
+        if (mode) {
+          policy.orgCredentials = mode;
+        } else {
+          policy.warnings.push(
+            `extensions.org_credentials: invalid value '${orgCreds}' — using default '${DEFAULT_ORG_CREDENTIALS}'`,
+          );
+        }
+      }
+      for (const key of Object.keys(entries)) {
+        if (key !== "allow" && key !== "deny" && key !== "org_credentials") {
+          policy.warnings.push(`extensions.${key}: unknown key ignored`);
+        }
+      }
     } else {
       policy.warnings.push(`unknown section '${name}' ignored`);
     }
@@ -483,6 +632,49 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
       out.warnings.push(`overlay response_mode: invalid value '${shown}' — keeping org floor '${out.responseMode}'`);
     } else {
       out.responseMode = stricterResponseMode(out.responseMode, mode);
+    }
+  }
+
+  // Extension policy (issue #56): the overlay can only tighten — `allow`
+  // lists ids to REMOVE from the org floor allowlist, `deny` lists ids to
+  // ADD to the org deny list, and `org_credentials` clamps like
+  // response_mode. Malformed entries are a structural error (fail closed).
+  const extensionsEntry = overlay["extensions"];
+  if (extensionsEntry !== undefined) {
+    if (typeof extensionsEntry !== "object" || extensionsEntry === null || Array.isArray(extensionsEntry)) {
+      return structuralError(defaultPolicy(), "spaces.policy_json: extensions must be an object");
+    }
+    const ext = extensionsEntry as Record<string, unknown>;
+    const allowEntry = ext["allow"];
+    if (allowEntry !== undefined) {
+      const ids = extensionIdList(allowEntry);
+      if (!ids) {
+        return structuralError(defaultPolicy(), "spaces.policy_json: extensions.allow must be a list of extension ids");
+      }
+      // Removal can only fail in the safe direction: ids the org floor does
+      // not list are no-ops, and the overlay can never add entries.
+      const removed = new Set(ids);
+      out.extensionsAllow = out.extensionsAllow.filter((id) => !removed.has(id));
+    }
+    const denyEntry = ext["deny"];
+    if (denyEntry !== undefined) {
+      const ids = extensionIdList(denyEntry);
+      if (!ids) {
+        return structuralError(defaultPolicy(), "spaces.policy_json: extensions.deny must be a list of extension ids");
+      }
+      out.extensionsDeny = [...new Set([...out.extensionsDeny, ...ids])];
+    }
+    const orgCredsEntry = ext["org_credentials"];
+    if (orgCredsEntry !== undefined) {
+      const mode = normalizeOrgCredentials(orgCredsEntry);
+      if (!mode) {
+        const shown = typeof orgCredsEntry === "string" ? orgCredsEntry : "<non-scalar>";
+        out.warnings.push(
+          `overlay extensions.org_credentials: invalid value '${shown}' — keeping org floor '${out.orgCredentials}'`,
+        );
+      } else {
+        out.orgCredentials = stricterOrgCredentials(out.orgCredentials, mode);
+      }
     }
   }
 

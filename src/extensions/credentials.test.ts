@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, type ExtensionCredential, type Store } from "../store/db";
 import { EXTENSION_CREDENTIAL_RESOLVED_EVENT } from "../store/audit-events";
+import { orgCredentialsAllowed, parseOrgConfigYaml } from "../policy/config";
 import { accountPoolFor, recordCredentialResolution, resolveCredential } from "./credentials";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-creds-"));
@@ -186,6 +187,31 @@ describe("resolveCredential auto scope", () => {
       findCredential: lookup([bobs]),
     });
     expect(res.kind).toBe("ask");
+  });
+
+  test("auto honors the extensions.org_credentials policy gate (issue #56)", () => {
+    // org_credentials: deny (org floor) → the org credential is skipped even
+    // though it is connected; the caller's personal credential wins.
+    const deniedPolicy = parseOrgConfigYaml("extensions:\n  org_credentials: deny\n");
+    const denied = resolveCredential({
+      callScope: "auto",
+      caller: "UADA",
+      provider: "github",
+      spacePolicy: { orgUsageAllowed: orgCredentialsAllowed(deniedPolicy) },
+      findCredential: lookup([org, adas]),
+    });
+    expect(denied).toEqual({ kind: "credential", credential: adas });
+    // Default (allow) → the org credential wins.
+    const defaultPolicy = parseOrgConfigYaml("");
+    expect(orgCredentialsAllowed(defaultPolicy)).toBe(true);
+    const allowed = resolveCredential({
+      callScope: "auto",
+      caller: "UADA",
+      provider: "github",
+      spacePolicy: { orgUsageAllowed: orgCredentialsAllowed(defaultPolicy) },
+      findCredential: lookup([adas, org]),
+    });
+    expect(allowed).toEqual({ kind: "credential", credential: org });
   });
 });
 

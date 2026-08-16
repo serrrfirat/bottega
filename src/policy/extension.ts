@@ -43,6 +43,19 @@ export interface PolicyExtensionDeps {
    * audits; an explicit policy `prompt`/`deny` is never bypassed.
    */
   preApproved?: boolean;
+  /**
+   * Extension registry seam (issue #56): maps a tool name to its extension
+   * id so the gate resolves extension calls against the allowlist before
+   * tier/approval. Absent → extension tools follow plain tier logic (and
+   * deny as unknown tools — fail closed).
+   */
+  toolExtensionId?: (toolName: string) => string | undefined;
+  /**
+   * Registered extension ids (issue #56): unknown ids in
+   * `extensions.allow`/`extensions.deny` fail the policy closed. Absent →
+   * id validation is skipped (executor sessions have no extension tools).
+   */
+  knownExtensionIds?: readonly string[];
 }
 
 export default function createPolicyExtension(deps: PolicyExtensionDeps): ExtensionFactory {
@@ -67,8 +80,15 @@ async function gateToolCall(
         router: deps.router,
         timeoutMs: deps.timeoutMs,
         preApproved: deps.preApproved,
+        knownExtensionIds: deps.knownExtensionIds,
       },
-      { tool: event.toolName, args: event.input, spaceId, actor },
+      {
+        tool: event.toolName,
+        args: event.input,
+        spaceId,
+        actor,
+        extensionId: deps.toolExtensionId?.(event.toolName),
+      },
     );
     if (outcome.allowed) return;
     return { block: true, reason: outcome.blockReason };

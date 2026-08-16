@@ -24,7 +24,7 @@
 import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import type { AuditModule } from "./audit";
 import { requestWithTimeout, type ApprovalRequest, type ApprovalRouter } from "./approval-router";
-import { decidePolicyCall, resolveTier, type Decision, type PolicyConfig } from "./config";
+import { decidePolicyCall, resolveTier, unknownExtensionId, type Decision, type PolicyConfig } from "./config";
 
 export interface PolicyGateDeps {
   /** Resolves the effective policy for a space (org floor + overlay). */
@@ -35,6 +35,12 @@ export interface PolicyGateDeps {
   timeoutMs?: number;
   /** Executor-session scope (issue #11); see decidePolicyCall. */
   preApproved?: boolean;
+  /**
+   * Registered extension ids (issue #56). When provided, ids referenced by
+   * `extensions.allow`/`extensions.deny` are validated against it — an
+   * unknown id is a structural error that fails the whole policy closed.
+   */
+  knownExtensionIds?: readonly string[];
 }
 
 export interface PolicyGateCall {
@@ -43,6 +49,12 @@ export interface PolicyGateCall {
   spaceId?: string;
   /** Actor recorded on audit rows. */
   actor: string;
+  /**
+   * Extension id when the call is an extension tool (issue #56): the
+   * allowlist check runs before tier/approval — a denied extension never
+   * reaches approval or credential resolution.
+   */
+  extensionId?: string;
 }
 
 export interface PolicyGateOutcome {
@@ -63,8 +75,21 @@ export function summarizeArgs(input: unknown): string {
 }
 
 export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateCall): Promise<PolicyGateOutcome> {
-  const policy = await deps.loadPolicy(call.spaceId);
-  const { decision, reason, autoApproved } = decidePolicyCall(policy, call.tool, deps.preApproved ?? false);
+  let policy = await deps.loadPolicy(call.spaceId);
+  // Unknown extension ids in allow/deny are a structural error (issue #56):
+  // the whole policy fails closed — every decision in the space denies.
+  if (deps.knownExtensionIds !== undefined) {
+    const unknown = unknownExtensionId(policy, deps.knownExtensionIds);
+    if (unknown !== undefined) {
+      policy = { ...policy, ok: false, errors: [...policy.errors, `extensions: unknown extension id '${unknown}'`] };
+    }
+  }
+  const { decision, reason, autoApproved } = decidePolicyCall(
+    policy,
+    call.tool,
+    deps.preApproved ?? false,
+    call.extensionId,
+  );
 
   await deps.audit.appendAudit({
     space_id: call.spaceId ?? null,

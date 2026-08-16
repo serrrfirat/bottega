@@ -138,6 +138,27 @@ telling the agent to act only on explicit requests. The org floor sets it in
 only tighten (`always` → `mention` → `request-only`) — a looser overlay value
 is clamped to the org floor, mirroring the tools rule.
 
+**Extension policy** (`extensions:`, issue #56) gates which extensions a space
+may use at all, and whether org-scoped credentials may be used there:
+
+```yaml
+extensions:
+  allow: [linear, github]   # non-empty = only these ids are usable
+  deny: [attio]             # never usable; deny wins over allow
+  org_credentials: deny     # allow (default) | deny — org usage in auto scope
+```
+
+- `allow`/`deny` take registered extension ids; empty lists mean no
+  restriction (the registry is the base allowlist). Unknown ids in either
+  list are a structural error — the policy fails closed.
+- The space overlay can only tighten: `extensions.allow` lists ids to
+  *remove* from the org floor, `extensions.deny` lists ids to *add*, and
+  `org_credentials` clamps like response mode (`allow` → `deny`, never back).
+- Extension tool calls resolve against the allowlist **before** tier and
+  approval logic — a denied extension is denied outright (with reason +
+  audit) and never reaches credential resolution. `org_credentials: deny`
+  makes the credential ladder's `auto` scope skip org credentials.
+
 Executor sessions run with `preApproved: true` policy scope: the work item's
 pickup approval (the human-approved `create_work_item` call in the channel)
 **is** the authorization. Allowlisted exec tools are then permitted inside
