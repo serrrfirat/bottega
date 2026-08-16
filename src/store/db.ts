@@ -58,6 +58,7 @@ export type SpaceModelSettings = {
 };
 
 export type WorkItemState = "open" | "claimed" | "working" | "review" | "done" | "blocked" | "aborted";
+export type WorkItemDelivery = "git" | "extension" | "chat";
 
 export type WorkItem = {
   id: string;
@@ -65,6 +66,7 @@ export type WorkItem = {
   requester: string;
   description: string;
   repo: string | null;
+  delivery: WorkItemDelivery;
   state: WorkItemState;
   approvals: string;
   evidence: string;
@@ -156,6 +158,7 @@ export interface Store {
     requester: string;
     description: string;
     repo?: string;
+    delivery?: WorkItemDelivery;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem>;
@@ -234,16 +237,22 @@ const ALLOWED_TRANSITIONS: Record<WorkItemState, readonly WorkItemState[]> = {
 
 /**
  * Enforces the state machine and its obligations (single choke point for all
- * transitions): done requires result.pr_url, blocked requires non-empty
- * evidence, review requires a recorded approval.
+ * transitions): done requires a delivery-specific result, blocked requires
+ * non-empty evidence, and review requires a recorded approval.
  */
-function assertLegalTransition(from: WorkItemState, to: WorkItemState, opts?: TransitionOpts): void {
-  if (!ALLOWED_TRANSITIONS[from].includes(to)) {
+function assertLegalTransition(
+  from: WorkItemState,
+  to: WorkItemState,
+  delivery: WorkItemDelivery,
+  opts?: TransitionOpts,
+): void {
+  // Extension pickup authorizes headless completion (#128); git retains the
+  // working -> review -> done delivery-approval path. Chat has no worker yet.
+  const isDirectExtensionCompletion = delivery === "extension" && from === "working" && to === "done";
+  if (!ALLOWED_TRANSITIONS[from].includes(to) && !isDirectExtensionCompletion) {
     throw new Error(`illegal work item transition ${from} -> ${to}`);
   }
-  if (to === "done" && !prUrlFromResult(opts?.result)) {
-    throw new Error("work item cannot transition to done without result.pr_url");
-  }
+  if (to === "done") assertDoneResult(delivery, opts?.result);
   if (to === "blocked" && !opts?.evidence?.trim()) {
     throw new Error("work item cannot transition to blocked without evidence");
   }
@@ -252,16 +261,31 @@ function assertLegalTransition(from: WorkItemState, to: WorkItemState, opts?: Tr
   }
 }
 
-/** The pr_url from a result JSON string, or null when absent/invalid. */
-function prUrlFromResult(result: string | undefined): string | null {
-  if (!result) return null;
+/** Fails closed unless result JSON satisfies the selected delivery contract (issue #128). */
+function assertDoneResult(delivery: WorkItemDelivery, result: string | undefined): void {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(result);
-    const url = (parsed as { pr_url?: unknown } | null)?.pr_url;
-    return typeof url === "string" && url.trim().length > 0 ? url : null;
+    parsed = result ? JSON.parse(result) : null;
   } catch {
-    return null;
+    parsed = null;
   }
+  const record =
+    typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  if (delivery === "git" && !isNonEmptyString(record.pr_url)) {
+    throw new Error("git work item cannot transition to done without result.pr_url");
+  }
+  if (delivery === "extension" && !isNonEmptyString(record.url)) {
+    throw new Error("extension work item cannot transition to done without result.url");
+  }
+  if (!isNonEmptyString(record.summary)) {
+    throw new Error("work item cannot transition to done without result.summary");
+  }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 const MODEL_SETTING_KEYS = ["model", "reasoning_effort", "fast_model", "reasoning_model"] as const;
@@ -317,6 +341,14 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const workItemColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
   if (!workItemColumns.includes("repo")) {
     db.exec("ALTER TABLE work_items ADD COLUMN repo TEXT");
+  }
+  // Idempotent migration (issue #128): CREATE TABLE IF NOT EXISTS cannot add
+  // delivery to existing work_items tables. PRAGMA guards SQLite's otherwise
+  // non-idempotent ALTER TABLE; the default backfills every existing row.
+  if (!workItemColumns.includes("delivery")) {
+    db.exec(
+      "ALTER TABLE work_items ADD COLUMN delivery TEXT NOT NULL DEFAULT 'git' CHECK (delivery IN ('git','extension','chat'))",
+    );
   }
   // Idempotent migration (issue #64): databases created before the model
   // settings column existed keep their spaces table (CREATE TABLE IF NOT
@@ -417,20 +449,22 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     requester: string;
     description: string;
     repo?: string;
+    delivery?: WorkItemDelivery;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, description, repo, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
+      `INSERT INTO work_items (id, space_id, requester, description, repo, delivery, state, approvals, evidence, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
     ).run(
       id,
       input.space_id,
       input.requester,
       input.description,
       input.repo ?? null,
+      input.delivery ?? "git",
       JSON.stringify((input.evidence ?? []).map((e) => ({ ...e, at: t }))),
       t,
       t,
@@ -446,11 +480,18 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function claimNextWorkItem(): Promise<WorkItem | null> {
+    // Chat has no worker yet (#128): defer it behind executable deliveries so
+    // returning a chat item to open cannot starve git or extension work.
     const row = db
       .query(
         `UPDATE work_items
          SET state = 'claimed', updated_at = ?
-         WHERE id = (SELECT id FROM work_items WHERE state = 'open' ORDER BY created_at LIMIT 1)
+         WHERE id = (
+           SELECT id FROM work_items
+           WHERE state = 'open'
+           ORDER BY (delivery = 'chat') ASC, created_at ASC
+           LIMIT 1
+         )
          RETURNING *`,
       )
       .get(Date.now()) as WorkItem | null;
@@ -463,7 +504,9 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     to: WorkItemState,
     opts?: TransitionOpts,
   ): Promise<WorkItem> {
-    assertLegalTransition(from, to, opts);
+    const current = getWorkItemStmt.get(id) as WorkItem | null;
+    if (!current) throw new Error(`work item not found: ${id}`);
+    assertLegalTransition(from, to, current.delivery, opts);
     const t = Date.now();
     const appendJson = (column: string): string => `json_set(${column}, '$[#]', json(?))`;
     const sets: string[] = ["state = ?", "updated_at = ?"];

@@ -31,11 +31,13 @@ CREATE TABLE IF NOT EXISTS work_items (
   description  TEXT NOT NULL,
   repo         TEXT,                     -- owner/repo the agent derived from the conversation (issue #47);
                                          -- null = not specified (executor blocks and asks the requester)
+  delivery     TEXT NOT NULL DEFAULT 'git'
+               CHECK (delivery IN ('git','extension','chat')), -- delivery-neutral work kind (issue #128)
   state        TEXT NOT NULL DEFAULT 'open'
                CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
   approvals    TEXT NOT NULL DEFAULT '[]',-- JSON array of {approver, at}
   evidence     TEXT NOT NULL DEFAULT '[]',-- JSON array of {kind, url, at}
-  result       TEXT,                     -- JSON: {pr_url, summary}
+  result       TEXT,                     -- JSON: {pr_url, summary}, {url, summary}, or {summary}
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );

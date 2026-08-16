@@ -3,7 +3,14 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, parseSpaceSettings, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
+import {
+  createStore,
+  parseSpaceSettings,
+  recoverStaleWorkItems,
+  type Store,
+  type WorkItemDelivery,
+  type WorkItemState,
+} from "./db";
 import type { OrgSettingsInput } from "./org-settings";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-store-"));
@@ -258,6 +265,7 @@ describe("work items", () => {
     expect(item.space_id).toBe(space.id);
     expect(item.requester).toBe("U1");
     expect(item.repo).toBeNull();
+    expect(item.delivery).toBe("git");
     expect(item.state).toBe("open");
     expect(item.approvals).toBe("[]");
     expect(item.evidence).toBe("[]");
@@ -266,6 +274,21 @@ describe("work items", () => {
 
     const got = await s.getWorkItem(item.id);
     expect(got).toEqual(item);
+  });
+
+  test("createWorkItem round-trips explicit extension and chat delivery kinds", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C10-delivery" });
+    for (const delivery of ["extension", "chat"] satisfies WorkItemDelivery[]) {
+      const item = await s.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: `${delivery} work`,
+        delivery,
+      });
+      expect(item.delivery).toBe(delivery);
+      expect((await s.getWorkItem(item.id))?.delivery).toBe(delivery);
+    }
   });
 
   test("createWorkItem stores an optional repo (issue #47)", async () => {
@@ -326,6 +349,53 @@ describe("work items", () => {
     s2.close();
   });
 
+  test("the delivery column migration defaults existing work items to git and is idempotent (issue #128)", async () => {
+    const dbPath = join(dir, "store-pre-delivery.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE spaces (
+        id          TEXT PRIMARY KEY,
+        platform    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        name        TEXT,
+        policy_json TEXT NOT NULL DEFAULT '{}',
+        settings    TEXT NOT NULL DEFAULT '{}',
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+      CREATE TABLE work_items (
+        id           TEXT PRIMARY KEY,
+        space_id     TEXT NOT NULL REFERENCES spaces(id),
+        requester    TEXT NOT NULL,
+        description  TEXT NOT NULL,
+        repo         TEXT,
+        state        TEXT NOT NULL DEFAULT 'open'
+                     CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
+        approvals    TEXT NOT NULL DEFAULT '[]',
+        evidence     TEXT NOT NULL DEFAULT '[]',
+        result       TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+      );
+      INSERT INTO spaces (id, platform, channel_id, policy_json, settings, created_at, updated_at)
+      VALUES ('slack:legacy', 'slack', 'legacy', '{}', '{}', 1, 1);
+      INSERT INTO work_items
+        (id, space_id, requester, description, repo, state, approvals, evidence, result, created_at, updated_at)
+      VALUES ('wi_legacy', 'slack:legacy', 'U1', 'existing work', NULL, 'open', '[]', '[]', NULL, 1, 1);
+    `);
+    legacy.close();
+
+    const s1 = createStore(dbPath);
+    const columns = s1.getDb().query("PRAGMA table_info(work_items)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("delivery");
+    expect((await s1.getWorkItem("wi_legacy"))?.delivery).toBe("git");
+    s1.close();
+
+    const s2 = createStore(dbPath);
+    expect((await s2.getWorkItem("wi_legacy"))?.delivery).toBe("git");
+    s2.close();
+  });
+
   test("createWorkItem rejects an unknown space (foreign key)", async () => {
     const s = freshStore();
     await expect(
@@ -353,6 +423,26 @@ describe("work items", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("claimNextWorkItem prioritizes executable delivery while still claiming a lone chat item (issue #128)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C11-delivery" });
+    const chat = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "answer in channel",
+      delivery: "chat",
+    });
+    const extension = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "create a ticket",
+      delivery: "extension",
+    });
+
+    expect((await s.claimNextWorkItem())?.id).toBe(extension.id);
+    expect((await s.claimNextWorkItem())?.id).toBe(chat.id);
   });
 
   test("two concurrent claimNextWorkItem calls have exactly one winner", async () => {
@@ -471,10 +561,10 @@ describe("work items", () => {
     await s.transitionWorkItem(item4.id, "claimed", "working");
     await s.transitionWorkItem(item4.id, "working", "review", { approval: { approver: "U9" } });
     const done = await s.transitionWorkItem(item4.id, "review", "done", {
-      result: JSON.stringify({ pr_url: "https://example.com/pr/42" }),
+      result: JSON.stringify({ pr_url: "https://example.com/pr/42", summary: "shipped" }),
     });
     expect(done.state).toBe("done");
-    expect(JSON.parse(done.result!)).toEqual({ pr_url: "https://example.com/pr/42" });
+    expect(JSON.parse(done.result!)).toEqual({ pr_url: "https://example.com/pr/42", summary: "shipped" });
 
     // claimed -> working -> review -> aborted
     const item5 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal5" });
@@ -518,7 +608,9 @@ describe("work items", () => {
           await s.claimNextWorkItem();
           await s.transitionWorkItem(item.id, "claimed", "working");
           await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
-          await s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ pr_url: "x" }) });
+          await s.transitionWorkItem(item.id, "review", "done", {
+            result: JSON.stringify({ pr_url: "x", summary: "done" }),
+          });
           return item.id;
         case "blocked":
           await s.claimNextWorkItem();
@@ -539,7 +631,7 @@ describe("work items", () => {
         if (LEGAL[from].includes(to)) continue;
         const obligationOpts =
           to === "done"
-            ? { result: JSON.stringify({ pr_url: "x" }) }
+            ? { result: JSON.stringify({ pr_url: "x", summary: "done" }) }
             : to === "blocked"
               ? { evidence: "e" }
               : to === "review"
@@ -552,27 +644,91 @@ describe("work items", () => {
     }
   });
 
-  test("done requires a result with a pr_url", async () => {
+  test("done enforces the result obligations for each delivery kind (issue #128)", async () => {
+    const cases: Array<{
+      delivery: WorkItemDelivery;
+      result: Record<string, string>;
+      succeeds: boolean;
+      error?: RegExp;
+    }> = [
+      { delivery: "git", result: { summary: "shipped" }, succeeds: false, error: /pr_url/ },
+      {
+        delivery: "git",
+        result: { pr_url: "https://example.com/pr/1", summary: "shipped" },
+        succeeds: true,
+      },
+      { delivery: "git", result: { pr_url: "https://example.com/pr/1" }, succeeds: false, error: /summary/ },
+      {
+        delivery: "extension",
+        result: { url: "https://example.com/ticket/1", summary: "created ticket" },
+        succeeds: true,
+      },
+      { delivery: "extension", result: { summary: "created ticket" }, succeeds: false, error: /result\.url/ },
+      {
+        delivery: "extension",
+        result: { url: "https://example.com/ticket/1" },
+        succeeds: false,
+        error: /summary/,
+      },
+      { delivery: "chat", result: { summary: "the answer" }, succeeds: true },
+      { delivery: "chat", result: { summary: "" }, succeeds: false, error: /summary/ },
+    ];
+
+    for (const [index, entry] of cases.entries()) {
+      const s = freshStore();
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: `C1C-${index}` });
+      const item = await s.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: `${entry.delivery} done obligations`,
+        delivery: entry.delivery,
+      });
+      await s.claimNextWorkItem();
+      await s.transitionWorkItem(item.id, "claimed", "working");
+      await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+
+      const transition = s.transitionWorkItem(item.id, "review", "done", {
+        result: JSON.stringify(entry.result),
+      });
+      if (entry.succeeds) {
+        expect((await transition).state).toBe("done");
+      } else {
+        await expect(transition).rejects.toThrow(entry.error);
+        expect((await s.getWorkItem(item.id))?.state).toBe("review");
+      }
+    }
+  });
+
+  test("extension delivery can complete from working while git still requires review (issue #128)", async () => {
     const s = freshStore();
-    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1C" });
-    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "done obligations" });
-    await s.claimNextWorkItem();
-    await s.transitionWorkItem(item.id, "claimed", "working");
-    await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1C-direct" });
 
-    await expect(s.transitionWorkItem(item.id, "review", "done")).rejects.toThrow(/pr_url/);
-    await expect(s.transitionWorkItem(item.id, "review", "done", { result: "not json" })).rejects.toThrow(/pr_url/);
-    await expect(
-      s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ pr_url: "" }) }),
-    ).rejects.toThrow(/pr_url/);
-    await expect(
-      s.transitionWorkItem(item.id, "review", "done", { result: JSON.stringify({ url: "https://example.com" }) }),
-    ).rejects.toThrow(/pr_url/);
-
-    const done = await s.transitionWorkItem(item.id, "review", "done", {
-      result: JSON.stringify({ pr_url: "https://example.com/pr/1" }),
+    const extension = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "create an external object",
+      delivery: "extension",
     });
-    expect(done.state).toBe("done");
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(extension.id, "claimed", "working");
+    const completed = await s.transitionWorkItem(extension.id, "working", "done", {
+      result: JSON.stringify({ url: "https://example.com/ticket/1", summary: "created ticket" }),
+    });
+    expect(completed.state).toBe("done");
+
+    const git = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "ship code",
+      delivery: "git",
+    });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(git.id, "claimed", "working");
+    await expect(
+      s.transitionWorkItem(git.id, "working", "done", {
+        result: JSON.stringify({ pr_url: "https://example.com/pr/1", summary: "shipped" }),
+      }),
+    ).rejects.toThrow(/illegal work item transition/);
   });
 
   test("blocked requires non-empty evidence", async () => {
@@ -658,7 +814,7 @@ describe("work items", () => {
     await s.transitionWorkItem(item.id, "claimed", "working", { by: "executor:1" });
     await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" }, by: "executor:1" });
     await s.transitionWorkItem(item.id, "review", "done", {
-      result: JSON.stringify({ pr_url: "https://example.com/pr/9" }),
+      result: JSON.stringify({ pr_url: "https://example.com/pr/9", summary: "shipped" }),
       by: "executor:1",
     });
 

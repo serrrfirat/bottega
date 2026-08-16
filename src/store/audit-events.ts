@@ -18,6 +18,12 @@ export const WORK_ITEM_FAILED_EVENT = "work_item.failed";
 export const DELIVERY_PENDING_EVENT = "work_item.delivery_pending";
 /** Server announcement of a pending delivery (payload {id, pr_url, summary}). */
 export const DELIVERY_REQUESTED_EVENT = "delivery.requested";
+/**
+ * Completed delivery (payload {id, kind, url?, summary}). This never shares
+ * `delivery.requested`'s event name because issue #33 requires one payload
+ * schema per audit event name.
+ */
+export const DELIVERY_COMPLETED_EVENT = "delivery.completed";
 /** Policy gate decision (payload {tool, tier, decision, reason, args}). */
 export const POLICY_DECISION_EVENT = "policy.decision";
 /** Human approval asked for a policy-prompted tool call (payload {tool, reason}). */

@@ -44,6 +44,7 @@ export const createWorkItemArgsSchema = z.object({
   description: z.string(),
   requester: z.string().optional(),
   repo: z.string().optional(),
+  delivery: z.enum(["git", "extension", "chat"]).optional(),
 });
 export const cancelWorkItemArgsSchema = z.object({ id: z.string() });
 
@@ -65,20 +66,22 @@ export function workItemToolDefinitions(
     name: "create_work_item",
     label: "Create work item",
     description:
-      "Creates a work item in the space's queue (state: open) that an executor agent can pick up and " +
-      "work autonomously. Use it when asked to handle something (e.g. \"@agent handle this\"). " +
-      "GitHub issue-URL pickup: when the user shares a GitHub issue URL, derive the repo and issue " +
-      "number from the URL and include them; the link is recorded as evidence. " +
-      "The optional `repo` (\"owner/repo\") names the repository the task lives in — derive it from the " +
-      "URL or the conversation (e.g. \"fix the flaky checkout in bottega\" → repo \"acme/bottega\"); " +
-      "omit it when neither says, and the executor will block asking the requester. " +
-      "The executor only ever pushes to repos on the allowlist (org settings repos, config/org.yml by default). " +
+      "Creates a delivery-neutral work item in the space's queue (state: open) for autonomous handling. " +
+      "Use it when asked to handle something (e.g. \"@agent handle this\"). " +
+      "Set `delivery` to `git` (default) for repository work, `extension` for work through the space's " +
+      "connected extensions, or `chat` for an answer delivered in-channel. Extension and chat items do " +
+      "not create an external repository object and do not need `repo`. " +
+      "For git delivery, optional `repo` (\"owner/repo\") names the task repository; derive it from a " +
+      "GitHub issue URL or the conversation. When any description contains a GitHub issue URL, the link " +
+      "is recorded as evidence; repo derivation from that URL applies only to git delivery. " +
+      "Git delivery can only push to repos on the allowlist (org settings repos, config/org.yml by default). " +
       "Requires human approval (exec-tier tool).",
     parameters: createWorkItemArgsSchema,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (!params.description.trim()) return toolError("description must not be empty");
-      if (params.repo !== undefined && !params.repo.trim()) {
+      const delivery = params.delivery ?? "git";
+      if (delivery === "git" && params.repo !== undefined && !params.repo.trim()) {
         return toolError("repo must be a non-empty string when provided");
       }
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
@@ -89,11 +92,9 @@ export function workItemToolDefinitions(
       // the first tool call in a space works (E2E journey 2 finding).
       await store.getOrCreateSpace({ platform: "slack", channel_id: channelFromSpaceId(spaceId) });
 
-      // Issue-URL pickup (#48): a parseable GitHub issue URL in the
-      // description is the source of truth for the repo + issue number.
-      // The canonical URL is guaranteed present in the description, the
-      // link is recorded as evidence, and the repo is derived into the
-      // repo column unless the caller provided one explicitly.
+      // Issue-URL pickup (#48, #128): every delivery kind preserves a
+      // parseable URL as evidence. Only git delivery derives the repo; the
+      // canonical URL remains in the description for durable context.
       let description = params.description;
       let evidence: Array<{ kind: string; url: string }> | undefined;
       const parsed = parseGithubIssueUrl(description);
@@ -108,8 +109,12 @@ export function workItemToolDefinitions(
           space_id: spaceId,
           requester: params.requester ?? actor,
           description,
+          delivery,
           evidence,
-          repo: params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined),
+          repo:
+            delivery === "git"
+              ? params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined)
+              : undefined,
         });
         return {
           content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],

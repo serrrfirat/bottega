@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
 import { defaultPolicy } from "../policy/config";
-import { parseGithubIssueUrl, workItemsExtension } from "./work-items";
+import { createWorkItemArgsSchema, parseGithubIssueUrl, workItemsExtension } from "./work-items";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-tools-"));
 const stores: Store[] = [];
@@ -47,6 +47,13 @@ describe("workItemsExtension registration", () => {
       expect(t.parameters).toBeDefined();
       expect(t.approval).toBe("exec");
     }
+  });
+
+  test("describes all delivery kinds without requiring a repo for non-git work (issue #128)", () => {
+    const [createTool] = loadTools(freshStore());
+    expect(createTool.description).toContain("connected extensions");
+    expect(createTool.description).toContain("delivered in-channel");
+    expect(createTool.description).toContain("do not need `repo`");
   });
 });
 
@@ -124,6 +131,7 @@ describe("create_work_item", () => {
     expect(item?.state).toBe("open");
     expect(item?.requester).toBe("agent");
     expect(item?.description).toBe("ship the queue");
+    expect(item?.delivery).toBe("git");
 
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
     expect(rows).toHaveLength(1);
@@ -166,6 +174,52 @@ describe("create_work_item", () => {
     expect(res.isError).not.toBe(true);
     const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
     expect(item?.repo).toBe("acme/bottega");
+  });
+
+  test("passes explicit delivery kinds through and ignores repo for non-git work (issue #128)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T3-delivery" });
+    const [createTool] = loadTools(s);
+    for (const delivery of ["extension", "chat"] as const) {
+      const res = await createTool.execute(
+        "tc1",
+        { description: `${delivery} task`, delivery, repo: "ignored/repo" },
+        undefined,
+        undefined,
+        ctxFor(space.id),
+      );
+      expect(res.isError).not.toBe(true);
+      const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+      expect(item?.delivery).toBe(delivery);
+      expect(item?.repo).toBeNull();
+    }
+  });
+
+  test("rejects delivery kinds outside the public tool schema (issue #128)", () => {
+    expect(createWorkItemArgsSchema.safeParse({ description: "valid", delivery: "extension" }).success).toBe(true);
+    expect(createWorkItemArgsSchema.safeParse({ description: "invalid", delivery: "email" }).success).toBe(false);
+  });
+
+  test("keeps GitHub issue evidence without deriving a repo for extension delivery (issue #128)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T3-extension-evidence" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      {
+        description: "Create a ticket from https://github.com/acme/bottega/issues/42",
+        delivery: "extension",
+      },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.repo).toBeNull();
+    expect(JSON.parse(item!.evidence)).toEqual([
+      { kind: "issue_url", url: "https://github.com/acme/bottega/issues/42", at: expect.any(Number) },
+    ]);
   });
 
   test("omits repo when not provided (nullable column stays null)", async () => {
@@ -213,6 +267,7 @@ describe("create_work_item", () => {
     expect(res.isError).not.toBe(true);
     const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
     expect(item?.repo).toBe("acme/bottega");
+    expect(item?.delivery).toBe("git");
     expect(item?.description).toBe(
       "Fix the flaky checkout http://github.com/acme/bottega/issues/42\nhttps://github.com/acme/bottega/issues/42",
     );
