@@ -139,6 +139,17 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         // custom-tools path so they surface in the restricted space-agent
         // toolset alongside the project extensions below.
         customTools: extensionToolDefinitions(extensionRegistry.list()),
+        // Connect capability (issue #52): connect_extension is built per
+        // session so the actor is the requesting principal; org-scope
+        // connects gate through the same Slack-backed approval router as
+        // every exec-tier tool call.
+        connectExtension: {
+          registry: extensionRegistry,
+          store,
+          audit,
+          loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+          router: approvalRouter,
+        },
         extensions: [
           createPolicyExtension({
             orgPolicy,

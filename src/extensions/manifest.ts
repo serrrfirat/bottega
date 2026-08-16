@@ -99,6 +99,10 @@ export type ExtensionManifest =
 export const PROJECT_TOOL_NAMES = [
   "create_work_item",
   "work_item_cancel",
+  // Connect capability (issue #52): the per-session connect tool rides the
+  // custom-tools path (see SPACE_AGENT_TOOLS) — manifest tools must not
+  // shadow it.
+  "connect_extension",
   "memory.save",
   "memory.search",
 ] as const;

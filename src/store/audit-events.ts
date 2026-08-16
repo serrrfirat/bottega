@@ -28,6 +28,8 @@ export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 export const MEMORY_WRITE_EVENT = "memory.write";
 /** Extension credential resolved through the scope ladder (payload {provider, scope, identity_key, credential_id, broker_credential_id}). */
 export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolved";
+/** Extension connected through the connect capability (payload {extension, scope, owner}). */
+export const EXTENSION_CONNECTED_EVENT = "extension.connected";
 /** Inbound message dropped (payload {reason, ts}). */
 export const MESSAGE_DROPPED_EVENT = "message_dropped";
 /** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */

@@ -3,9 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRegistry, SessionManager, createAgentSession } from "@oh-my-pi/pi-coding-agent";
+import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { extensionToolDefinitions } from "../../extensions/tools";
-import { createOmpSdkDriver, SPACE_AGENT_TOOLS, spaceAgentToolNames } from "./agent-driver";
+import { createAudit } from "../../policy/audit";
+import { DenyRouter } from "../../policy/approval-router";
+import { parseOrgConfigYaml } from "../../policy/config";
+import { createStore } from "../../store/db";
+import { createOmpSdkDriver, sessionIdFromFilePath, SPACE_AGENT_TOOLS, spaceAgentToolNames } from "./agent-driver";
 
 describe("omp sdk agent driver", () => {
   test("createSession materializes the space transcript file and disposes cleanly", async () => {
@@ -146,10 +151,12 @@ describe("omp sdk agent driver", () => {
     }
   });
 
-  test("space-agent allowlist: conversation/read-only + task + queue/memory tools, no executor tools", () => {
+  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect tools, no executor tools", () => {
     // The space agent is a participant, not an executor: it may read the
     // workspace, delegate via task, and use the work-item + memory tools —
-    // never write/bash/edit (those are EXECUTOR_TOOLS in executor.ts).
+    // never write/bash/edit (those are EXECUTOR_TOOLS in executor.ts). The
+    // connect capability (issue #52) is listed here; its definition rides
+    // the custom-tools path, see createOmpSdkDriver.
     const allowed: readonly string[] = SPACE_AGENT_TOOLS;
     expect([...allowed].sort()).toEqual(
       [
@@ -163,6 +170,7 @@ describe("omp sdk agent driver", () => {
         "task",
         "create_work_item",
         "work_item_cancel",
+        "connect_extension",
         "memory.save",
         "memory.search",
       ].sort(),
@@ -227,6 +235,58 @@ describe("omp sdk agent driver", () => {
       });
       expect(session.isStreaming()).toBe(false);
       await session.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("connect_extension appears in the space agent's toolset when wired (issue #52)", async () => {
+    // The connect tool is built per session by createOmpSdkDriver (custom
+    // tools + toolNames + allowRestrictedCustomTools); this pins the exact
+    // session options the driver builds, mirroring the fixture test above.
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const store = createStore(join(dir, "test.db"));
+      try {
+        const registry = createFixtureRegistry();
+        const customTools = [
+          ...extensionToolDefinitions(registry.list()),
+          connectExtensionToolDefinition({
+            registry,
+            store,
+            audit: createAudit(store),
+            broker: async () => ({ identityKey: "email:ada@example.com", brokerCredentialId: 1 }),
+            gate: {
+              loadPolicy: () => Promise.resolve(parseOrgConfigYaml("")),
+              router: DenyRouter,
+            },
+            getPrincipal: () => "UADA",
+            spaceIdFromFile: sessionIdFromFilePath,
+          }),
+        ];
+        mkdirSync(join(dir, "sessions"), { recursive: true });
+        const sessionManager = SessionManager.create(process.cwd(), join(dir, "sessions"));
+        await sessionManager.setSessionFile(join(dir, "sessions", "slack:C1.jsonl"));
+        const { session } = await createAgentSession({
+          cwd: process.cwd(),
+          agentDir: join(dir, "agent"),
+          sessionManager,
+          agentRegistry: new AgentRegistry(),
+          restrictToolNames: true,
+          toolNames: spaceAgentToolNames(customTools.map((tool) => tool.name)),
+          customTools,
+          allowRestrictedCustomTools: true,
+          extensions: [],
+        });
+        const active = session.getActiveToolNames();
+        expect(active).toContain("connect_extension");
+        expect(active).toContain("weather.current");
+        expect(active).not.toContain("write"); // restricted: no executor tools
+        session.beginDispose();
+        await session.dispose();
+      } finally {
+        store.close();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

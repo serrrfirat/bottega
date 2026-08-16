@@ -10,6 +10,16 @@ import {
 } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider } from "../../memory/types";
 import { memoryContextExtension } from "../../tools/memory-context";
+import {
+  connectExtensionToolDefinition,
+  connectViaAuthBroker,
+  type BrokerConnector,
+} from "../../extensions/connect";
+import type { ExtensionRegistry } from "../../extensions/registry";
+import type { AuditModule } from "../../policy/audit";
+import type { ApprovalRouter } from "../../policy/approval-router";
+import type { PolicyConfig } from "../../policy/config";
+import type { Store } from "../../store/db";
 
 /** Driver-level memory-context wiring (issue #42): mirrors the extension opts. */
 export interface MemoryContextDriverOpts {
@@ -18,6 +28,24 @@ export interface MemoryContextDriverOpts {
   maxEntries?: number;
   maxBytes?: number;
   enabled?: boolean;
+}
+
+/**
+ * Connect-capability wiring (issue #52): the per-session `connect_extension`
+ * tool definition. Built per session so it closes over the session's
+ * `getPrincipal` — the connect actor must be the requesting principal
+ * (personal connects record owner = actor).
+ */
+export interface ConnectExtensionDriverOpts {
+  registry: Pick<ExtensionRegistry, "resolve">;
+  store: Pick<Store, "upsertExtensionCredential">;
+  audit: AuditModule;
+  loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
+  router: ApprovalRouter;
+  /** Ask-human timeout in ms; defaults to the policy's `approvals.timeout_minutes`. */
+  timeoutMs?: number;
+  /** Broker seam; defaults to the production auth-broker connector. */
+  broker?: BrokerConnector;
 }
 
 /**
@@ -114,7 +142,10 @@ export function sessionIdFromFilePath(file: string | null | undefined): string |
  * delegating to work executors. Deliberately no bash/write/edit — the space
  * agent is a participant, not an executor. The work item queue tools
  * (issue #10) are listed so the agent can create and cancel work items, and
- * the memory tools (issue #22) so it can save and search memory.
+ * the memory tools (issue #22) so it can save and search memory. The
+ * connect capability (issue #52) rides the custom-tools path
+ * (createOmpSdkDriver builds its definition per session) and is listed here
+ * so the allowlist documents it — keep in sync with PROJECT_TOOL_NAMES.
  */
 export const SPACE_AGENT_TOOLS = [
   "read",
@@ -127,6 +158,7 @@ export const SPACE_AGENT_TOOLS = [
   "task",
   "create_work_item",
   "work_item_cancel",
+  "connect_extension",
   "memory.save",
   "memory.search",
 ] as const;
@@ -170,6 +202,8 @@ export function createOmpSdkDriver(
     extensions?: ExtensionFactory[];
     customTools?: ToolDefinition[];
     memoryContext?: MemoryContextDriverOpts;
+    /** Connect capability (issue #52); omitted → the connect tool is absent (e.g. executor sessions). */
+    connectExtension?: ConnectExtensionDriverOpts;
   } = {},
 ): AgentDriver {
   const customTools = opts.customTools ?? [];
@@ -193,20 +227,42 @@ export function createOmpSdkDriver(
           }),
         );
       }
+      // The connect tool (issue #52) rides the custom-tools path — restricted
+      // sessions skip extension factories — and is built per session so the
+      // actor is the session's principal (personal connects record the owner).
+      const sessionCustomTools = opts.connectExtension
+        ? [
+            ...customTools,
+            connectExtensionToolDefinition({
+              registry: opts.connectExtension.registry,
+              store: opts.connectExtension.store,
+              audit: opts.connectExtension.audit,
+              broker: opts.connectExtension.broker ?? connectViaAuthBroker,
+              gate: {
+                loadPolicy: opts.connectExtension.loadPolicy,
+                router: opts.connectExtension.router,
+                timeoutMs: opts.connectExtension.timeoutMs,
+              },
+              getPrincipal,
+              spaceIdFromFile: sessionIdFromFilePath,
+            }),
+          ]
+        : customTools;
       const { session } = await createAgentSession({
         cwd: sessionCwd,
         agentDir: opts.agentDir,
         sessionManager,
         agentRegistry: new AgentRegistry(),
         restrictToolNames: true,
-        toolNames: spaceAgentToolNames(customTools.map((tool) => tool.name), allowTools),
+        toolNames: spaceAgentToolNames(sessionCustomTools.map((tool) => tool.name), allowTools),
         // Extension seam: policy + audit extensions plug in here (#6/#7).
         extensions,
         // request-only directive (issue #55), appended to the rendered prompt.
         ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
-        // Registry tools (issue #50) must surface in restricted sessions;
-        // discovered extensions, MCP, and ambient custom tools stay disabled.
-        customTools,
+        // Registry + connect tools (issues #50/#52) must surface in
+        // restricted sessions; discovered extensions, MCP, and ambient
+        // custom tools stay disabled.
+        customTools: sessionCustomTools,
         allowRestrictedCustomTools: true,
       });
       return new OmpSessionDriver({ spaceId, session, onOutput });

@@ -73,7 +73,9 @@ describe("tier resolution", () => {
     for (const t of ["write", "edit", "memory.save"]) expect(resolveTier(t)).toBe("write");
   });
   test("exec-tier tools", () => {
-    for (const t of ["bash", "task", "create_work_item", "work_item_cancel"]) expect(resolveTier(t)).toBe("exec");
+    for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension"]) {
+      expect(resolveTier(t)).toBe("exec");
+    }
   });
   test("unknown tools resolve to exec (unknown/malformed → exec)", () => {
     expect(resolveTier("some_custom_tool")).toBe("exec");
