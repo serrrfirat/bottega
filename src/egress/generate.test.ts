@@ -66,6 +66,10 @@ describe("egress config generation", () => {
     expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
   });
 
+  test("the base allowlist permits Slack file downloads", () => {
+    expect(BASE_EGRESS_DOMAINS).toContain("files.slack.com");
+  });
+
   test("rendering without extensions emits no secrets transform (base config is unchanged)", () => {
     expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).not.toContain("- name: secrets");
     expect(secretsEntries(renderEgressConfig(BASE_EGRESS_DOMAINS))).toBeNull();
@@ -97,6 +101,7 @@ describe("egress config generation", () => {
       "cloud-api.near.ai",
       "*.completions.near.ai",
       "raw.githubusercontent.com",
+      "files.slack.com",
       "a.example.com",
       "b.example.com",
     ]);
@@ -157,6 +162,7 @@ describe("egress config generation", () => {
         "cloud-api.near.ai",
         "*.completions.near.ai",
         "raw.githubusercontent.com",
+        "files.slack.com",
         FIXTURE_EXTENSION_DOMAIN,
       ]);
     } finally {

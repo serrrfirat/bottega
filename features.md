@@ -92,6 +92,18 @@ and give mem0 an LLM key (`OPENAI_API_KEY`, see README); the switch applies
 on the next server start. `MEM0_API_KEY` stays an optional env secret for
 mem0 auth.
 
+## Durable objects (issue #124)
+
+Slack file shares attach to the space as durable, content-addressed objects,
+including PDF, XLS/XLSX, CSV, and image files. Agents list them with
+`object.list` and read supported content with `object.get`. Agents can also
+create derived text objects with `object.create`.
+
+Text extraction supports `text/plain`, `text/csv`, `application/json`, and
+`text/markdown`. PDF and XLS/XLSX objects are stored and attached, but
+`object.get` returns an explicit unsupported-format error until per-format
+extractors land.
+
 ## Policy & approvals (user-facing)
 
 Every agent action is policy-gated; here is what that looks like from the
@@ -366,6 +378,8 @@ the canary opens it via `conversations.open`).
 - **Dev egress restore is temporary** — in local dev, platform + model
   traffic bypasses the proxy until the egress judge rules pass them
   (tracked in #126); extension traffic stays proxied.
+- **No PDF/XLSX binary content extraction yet** — these objects store and
+  attach normally; per-format extractors are a follow-up.
 
 ## Roadmap
 

@@ -40,6 +40,10 @@ export const SCHEDULER_FIRE_EVENT = "scheduler.fire";
 export const SCHEDULER_MISSED_EVENT = "scheduler.missed";
 /** Scheduler could not run a handler (payload {id, action, error}). */
 export const SCHEDULER_ERROR_EVENT = "scheduler.error";
+/** Object attached from an inbound message (payload {id, name, mime, size, sha256, by}). */
+export const OBJECT_ATTACHED_EVENT = "object.attached";
+/** Object created by an agent tool (payload {id, name, mime, size, by}). */
+export const OBJECT_CREATED_EVENT = "object.created";
 /** Org/space settings changed (payload {scope, space?, actor, before, after}). */
 export const SETTINGS_CHANGED_EVENT = "settings.changed";
 /** Extension credential resolved through the scope ladder (payload {provider, scope, identity_key, credential_id, broker_credential_id}). */

@@ -19,11 +19,12 @@ import { resolve } from "node:path";
 import { readPinnedSnapshots } from "../extensions/registry";
 import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
-/** Base allowlist: NEAR.ai model endpoints plus the example KB host (issue #91). */
+/** Base allowlist: NEAR.ai model endpoints plus the example KB host (issue #91) and Slack file downloads (issue #124). */
 export const BASE_EGRESS_DOMAINS = [
   "cloud-api.near.ai",
   "*.completions.near.ai",
   "raw.githubusercontent.com",
+  "files.slack.com",
 ] as const;
 
 /** Where pinned snapshots live; mounted/baked per deployment. */

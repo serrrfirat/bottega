@@ -13,6 +13,7 @@ import { createStore, type Space } from "../store/db";
 import { createAudit } from "./audit";
 import { DenyRouter, type ApprovalRequest, type ApprovalRouter, type ApprovalResolution } from "./approval-router";
 import {
+  DEFAULT_OBJECT_MAX_SIZE_BYTES,
   DEFAULT_TIMEOUT_MINUTES,
   applySpaceOverlay,
   decideExtensionCall,
@@ -76,14 +77,18 @@ describe("tier resolution", () => {
       "lsp",
       "memory.search",
       "session_search",
+      "object.list",
+      "object.get",
     ]) {
       expect(resolveTier(t)).toBe("read");
+      expect(isKnownTool(t)).toBe(true);
     }
   });
   test("write-tier tools", () => {
-    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model"]) expect(resolveTier(t)).toBe("write");
-    expect(isKnownTool("model_settings")).toBe(true);
-    expect(isKnownTool("use_model")).toBe(true);
+    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model", "object.create"]) {
+      expect(resolveTier(t)).toBe("write");
+      expect(isKnownTool(t)).toBe(true);
+    }
   });
   test("exec-tier tools", () => {
     for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension"]) {
@@ -200,6 +205,32 @@ approvals:
     expect(invalid.ok).toBe(true);
     expect(invalid.learning.autoExtract).toBe(false);
     expect(invalid.warnings).toContain("learning.auto_extract: invalid (true|false) — disabled");
+  test("objects.max_size_bytes defaults and parses a positive integer", () => {
+    expect(defaultPolicy().objects.maxSizeBytes).toBe(DEFAULT_OBJECT_MAX_SIZE_BYTES);
+    expect(parseOrgConfigYaml("").objects.maxSizeBytes).toBe(DEFAULT_OBJECT_MAX_SIZE_BYTES);
+
+    const configured = parseOrgConfigYaml("objects:\n  max_size_bytes: 2048\n");
+    expect(configured.ok).toBe(true);
+    expect(configured.objects.maxSizeBytes).toBe(2048);
+  });
+
+  test("a malformed objects section fails the policy closed", () => {
+    for (const text of [
+      "objects: nope\n",
+      "objects:\n  max_size_bytes: nope\n",
+      "objects:\n  max_size_bytes: 0\n",
+      "objects:\n  max_size_bytes:\n    nested: 1\n",
+    ]) {
+      const policy = parseOrgConfigYaml(text);
+      expect(policy.ok).toBe(false);
+      expect(policy.objects.maxSizeBytes).toBe(DEFAULT_OBJECT_MAX_SIZE_BYTES);
+    }
+  });
+
+  test("space overlays preserve the org object size limit", () => {
+    const org = parseOrgConfigYaml("objects:\n  max_size_bytes: 4096\n");
+    const policy = applySpaceOverlay(org, JSON.stringify({ tools: { bash: "deny" } }));
+    expect(policy.objects.maxSizeBytes).toBe(4096);
   });
 
   test("memory.injection parses and invalid values warn, not fail", () => {
@@ -918,6 +949,8 @@ memory:
   injection:
     enabled: true
     max_entries: 5
+objects:
+  max_size_bytes: 4096
 extensions:
   allow:
     - linear
@@ -937,6 +970,7 @@ extensions:
     expect(p.extensionsAllow).toEqual([]);
     expect(p.extensionsDeny).toEqual(["attio"]);
     expect(p.orgCredentials).toBe("deny");
+    expect(p.objects.maxSizeBytes).toBe(4096);
     // Keys the DB does not set keep the file floor.
     expect(toolAction(p, "bash")).toBe("allow");
   });

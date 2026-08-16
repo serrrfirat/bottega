@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, parseSpaceSettings, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
@@ -144,6 +144,108 @@ describe("spaces", () => {
     expect(parseSpaceSettings('{"model":"m","bogus":1}')).toEqual({ model: "m" });
     expect(parseSpaceSettings('{"model":"  m  ","reasoning_effort":"ultra"}')).toEqual({ model: "m" });
     expect(parseSpaceSettings('{"reasoning_effort":"high"}')).toEqual({ reasoning_effort: "high" });
+  });
+});
+
+describe("objects", () => {
+  test("createObject writes one content-addressed blob and one row per object", async () => {
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "COBJECT1" });
+    const bytes = new TextEncoder().encode("shared content");
+    const differentBytes = new TextEncoder().encode("different content");
+    const sha256 = "a".repeat(64);
+    const first = await store.createObject({
+      space_id: space.id,
+      name: "first.txt",
+      mime: "text/plain",
+      size: bytes.byteLength,
+      sha256,
+      uploaded_by: "U1",
+      bytes,
+    });
+    const second = await store.createObject({
+      space_id: space.id,
+      name: "second.txt",
+      mime: "text/plain",
+      size: differentBytes.byteLength,
+      sha256,
+      uploaded_by: "U2",
+      bytes: differentBytes,
+    });
+
+    expect(first.id).toMatch(/^obj_/);
+    expect(second.id).toMatch(/^obj_/);
+    expect(second.id).not.toBe(first.id);
+    expect(await store.getObject(first.id)).toEqual(first);
+    expect(await store.getObject(second.id)).toEqual(second);
+    expect(readFileSync(join(dir, "objects", sha256), "utf8")).toBe("shared content");
+    expect(readdirSync(join(dir, "objects")).filter((name) => name === sha256)).toHaveLength(1);
+    expect(await store.listObjects(space.id)).toHaveLength(2);
+  });
+
+  test("listObjects is scoped to a space and returns newest first", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstSpace = await store.getOrCreateSpace({ platform: "slack", channel_id: "COBJECT2" });
+      const otherSpace = await store.getOrCreateSpace({ platform: "slack", channel_id: "COBJECT3" });
+      const bytes = new TextEncoder().encode("x");
+      const older = await store.createObject({
+        space_id: firstSpace.id,
+        name: "older.txt",
+        mime: "text/plain",
+        size: bytes.byteLength,
+        sha256: "b".repeat(64),
+        uploaded_by: "U1",
+        bytes,
+      });
+      vi.advanceTimersByTime(1);
+      const newer = await store.createObject({
+        space_id: firstSpace.id,
+        name: "newer.txt",
+        mime: "text/plain",
+        size: bytes.byteLength,
+        sha256: "c".repeat(64),
+        uploaded_by: "U1",
+        bytes,
+      });
+      await store.createObject({
+        space_id: otherSpace.id,
+        name: "other.txt",
+        mime: "text/plain",
+        size: bytes.byteLength,
+        sha256: "d".repeat(64),
+        uploaded_by: "U1",
+        bytes,
+      });
+
+      expect((await store.listObjects(firstSpace.id)).map((object) => object.id)).toEqual([
+        newer.id,
+        older.id,
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("getObject and readObjectBytes return null when data is missing", async () => {
+    expect(await store.getObject("obj_missing")).toBeNull();
+    expect(await store.readObjectBytes("obj_missing")).toBeNull();
+
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "COBJECT4" });
+    const bytes = new TextEncoder().encode("round trip");
+    const sha256 = "e".repeat(64);
+    const object = await store.createObject({
+      space_id: space.id,
+      name: "round-trip.txt",
+      mime: "text/plain",
+      size: bytes.byteLength,
+      sha256,
+      uploaded_by: "U1",
+      bytes,
+    });
+    expect(await store.readObjectBytes(object.id)).toEqual(bytes);
+
+    unlinkSync(join(dir, "objects", sha256));
+    expect(await store.readObjectBytes(object.id)).toBeNull();
   });
 });
 

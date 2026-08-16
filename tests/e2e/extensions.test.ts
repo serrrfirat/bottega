@@ -167,6 +167,12 @@ function recordingAdapter(): {
     async updateMessage(spaceId, ts, text) {
       updates.push({ spaceId, ts, text });
     },
+    async downloadFile() {
+      throw new Error("not used");
+    },
+    async uploadFile() {
+      return undefined;
+    },
     async addReaction() {},
     async removeReaction() {},
     async start() {},
@@ -221,6 +227,8 @@ function makeConnectJourney(opts: { policy?: PolicyConfig; router?: ApprovalRout
     store,
     adapter,
     driver,
+    audit: createAudit(store),
+    orgPolicy,
     idleTimeoutMs: 60_000,
     transcriptDir: join(dir, "sessions"),
     connect: {

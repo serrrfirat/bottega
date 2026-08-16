@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import type { AgentDriver, AgentSessionDriver, SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
+import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
-import type { ResponseMode } from "../../policy/config";
+import type { AuditModule } from "../../policy/audit";
+import type { PolicyConfig, ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { onboardingGuideText, runWizardChecks, type WizardCheck } from "../../tools/admin";
@@ -16,6 +18,10 @@ export const DEFAULT_DIGEST_TIMEOUT_MS = 60_000;
 export interface SpaceServiceDeps {
   store: Store;
   adapter: SlackAdapter;
+  /** Audit sink for attachment events. */
+  audit: AuditModule;
+  /** Org object-size policy. */
+  orgPolicy: PolicyConfig;
   /** Session factory seam. */
   driver: AgentDriver;
   /** Idle timeout before a space's live session is disposed. Default 30 min. */
@@ -216,6 +222,8 @@ export class SpaceService {
   readonly #store: Store;
   readonly #adapter: SlackAdapter;
   readonly #driver: AgentDriver;
+  readonly #audit: AuditModule;
+  readonly #orgPolicy: PolicyConfig;
   readonly #idleTimeoutMs: number;
   readonly #transcriptDir: string;
   readonly #memoryProvider: MemoryProvider | undefined;
@@ -303,6 +311,8 @@ export class SpaceService {
     this.#store = deps.store;
     this.#adapter = deps.adapter;
     this.#driver = deps.driver;
+    this.#audit = deps.audit;
+    this.#orgPolicy = deps.orgPolicy;
     this.#idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.#transcriptDir = deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR;
     this.#memoryProvider = deps.memoryProvider;
@@ -368,21 +378,74 @@ export class SpaceService {
       this.#postThinkingPhrase(msg.spaceId);
       this.#addReceiptReaction(msg);
       this.#auditReceipt(msg);
+      const turnText = await this.#ingestAttachments(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
       this.#learning?.recordInput(msg);
       if (live.session.isStreaming()) {
         // Streaming turn (issue #120): phrase updates coalesce on the cadence.
         this.#streamingTurns.add(msg.spaceId);
-        await live.session.prompt(msg.text, { streamingBehavior: "steer" });
+        await live.session.prompt(turnText, { streamingBehavior: "steer" });
       } else {
         // Non-streaming turn: replies update in place immediately, unbatched.
         this.#streamingTurns.delete(msg.spaceId);
-        await live.session.prompt(msg.text);
+        await live.session.prompt(turnText);
       }
     } catch (err) {
       console.error(`[space-service] failed to handle message in ${msg.spaceId}:`, err);
     }
+  }
+
+  async #ingestAttachments(msg: SlackMessage): Promise<string> {
+    if (!msg.files?.length) return msg.text;
+    let turnText = msg.text;
+    const appendNote = (note: string): void => {
+      turnText = turnText ? `${turnText}\n${note}` : note;
+    };
+    for (const file of msg.files) {
+      const limit = this.#orgPolicy.objects.maxSizeBytes;
+      if (file.size > limit) {
+        appendNote(`[attachment skipped: ${file.name} exceeds ${limit}B limit]`);
+        continue;
+      }
+      try {
+        await this.#store.getOrCreateSpace({
+          platform: "slack",
+          channel_id: channelFromSpaceId(msg.spaceId),
+        });
+        const download = await this.#adapter.downloadFile(file.id);
+        const sha256 = createHash("sha256").update(download.bytes).digest("hex");
+        const object = await this.#store.createObject({
+          space_id: msg.spaceId,
+          name: file.name,
+          mime: file.mimeType,
+          size: file.size,
+          sha256,
+          uploaded_by: msg.principal,
+          bytes: download.bytes,
+        });
+        await this.#audit.appendAudit({
+          space_id: msg.spaceId,
+          actor: msg.principal,
+          event_type: OBJECT_ATTACHED_EVENT,
+          payload: {
+            id: object.id,
+            name: object.name,
+            mime: object.mime,
+            size: object.size,
+            sha256: object.sha256,
+            by: msg.principal,
+          },
+        });
+        appendNote(
+          `[attachment: ${object.name} (${object.mime}, ${object.size} B) — object ${object.id}]`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        appendNote(`[attachment failed: ${file.name}: ${message}]`);
+      }
+    }
+    return turnText;
   }
 
   async stop(): Promise<void> {

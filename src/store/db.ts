@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
 import type { OrgSettings, OrgSettingsInput } from "./org-settings";
@@ -20,6 +20,17 @@ export type Space = {
   settings: string;
   created_at: number;
   updated_at: number;
+};
+
+export type SpaceObject = {
+  id: string;
+  space_id: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  uploaded_by: string;
+  created_at: number;
 };
 
 /**
@@ -128,6 +139,18 @@ export interface Store {
   getSpaceSettings(id: string): Promise<SpaceModelSettings>;
   /** Replaces the space's model settings JSON; throws when the space does not exist. */
   updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space>;
+  createObject(input: {
+    space_id: string;
+    name: string;
+    mime: string;
+    size: number;
+    sha256: string;
+    uploaded_by: string;
+    bytes: Uint8Array;
+  }): Promise<SpaceObject>;
+  listObjects(space_id: string): Promise<SpaceObject[]>;
+  getObject(id: string): Promise<SpaceObject | null>;
+  readObjectBytes(id: string): Promise<Uint8Array | null>;
   createWorkItem(input: {
     space_id: string;
     requester: string;
@@ -281,7 +304,8 @@ export function parseSpaceSettings(text: string | null | undefined): SpaceModelS
  * so the server and the executor can share the file.
  */
 export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
-  mkdirSync(dirname(dbPath), { recursive: true });
+  const objectsDir = join(dirname(dbPath), "objects");
+  mkdirSync(objectsDir, { recursive: true });
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA busy_timeout = 5000;");
@@ -305,6 +329,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const getSpaceStmt = db.query("SELECT * FROM spaces WHERE id = ?");
   const getWorkItemStmt = db.query("SELECT * FROM work_items WHERE id = ?");
   const getSchedulerJobStmt = db.query("SELECT * FROM scheduler_jobs WHERE id = ?");
+  const getObjectStmt = db.query("SELECT * FROM objects WHERE id = ?");
 
   async function getOrCreateSpace(input: {
     platform: "slack" | "telegram";
@@ -344,6 +369,47 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .get(JSON.stringify(settings), Date.now(), id) as Space | null;
     if (!row) throw new Error(`space not found: ${id}`);
     return row;
+  }
+
+  async function createObject(input: {
+    space_id: string;
+    name: string;
+    mime: string;
+    size: number;
+    sha256: string;
+    uploaded_by: string;
+    bytes: Uint8Array;
+  }): Promise<SpaceObject> {
+    const id = `obj_${randomUUID()}`;
+    const created_at = Date.now();
+    const blobPath = join(objectsDir, input.sha256);
+    if (!existsSync(blobPath)) writeFileSync(blobPath, input.bytes);
+    db.query(
+      `INSERT INTO objects (id, space_id, name, mime, size, sha256, uploaded_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, input.space_id, input.name, input.mime, input.size, input.sha256, input.uploaded_by, created_at);
+    return getObjectStmt.get(id) as SpaceObject;
+  }
+
+  async function listObjects(space_id: string): Promise<SpaceObject[]> {
+    return db
+      .query("SELECT * FROM objects WHERE space_id = ? ORDER BY created_at DESC")
+      .all(space_id) as SpaceObject[];
+  }
+
+  async function getObject(id: string): Promise<SpaceObject | null> {
+    return (getObjectStmt.get(id) as SpaceObject | null) ?? null;
+  }
+
+  async function readObjectBytes(id: string): Promise<Uint8Array | null> {
+    const object = await getObject(id);
+    if (!object) return null;
+    try {
+      return readFileSync(join(objectsDir, object.sha256));
+    } catch (err) {
+      if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") return null;
+      throw err;
+    }
   }
 
   async function createWorkItem(input: {
@@ -633,6 +699,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     updatePolicy,
     getSpaceSettings,
     updateSpaceSettings,
+    createObject,
+    listObjects,
+    getObject,
+    readObjectBytes,
     createWorkItem,
     claimNextWorkItem,
     transitionWorkItem,

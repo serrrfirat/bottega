@@ -11,6 +11,7 @@ import type { ApprovalRouter } from "../policy/approval-router";
 import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
+import { objectToolDefinitions } from "../tools/objects";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
@@ -327,11 +328,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // selected from the org settings (#67): memory_backend.base_url
           // set → mem0 backend (compose ships it), else SQLite sharing the
           // store's database handle; every save is audited via the policy
-          // audit module), model tools (issue #64), settings (issue #67).
+          // audit module), objects (issue #124), model tools (issue #64),
+          // settings (issue #67).
           tools: [
             ...workItemToolDefinitions(store, { orgPolicy }),
             ...memoryToolDefinitions(memoryProvider, { audit }),
             ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
+            ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
             ...modelToolsDefinitions(store, { audit, modelRoles }),
             ...settingsToolDefinitions(store, { audit }),
             // Admin tools (issue #73): catalog browser, stack health,
@@ -443,6 +446,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     driver,
     learning,
+    audit,
+    orgPolicy,
     // Per-space response mode (issue #55): the request-only directive is
     // appended at session creation.
     responseModeFor,

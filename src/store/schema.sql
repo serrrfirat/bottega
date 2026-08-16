@@ -12,6 +12,18 @@ CREATE TABLE IF NOT EXISTS spaces (
   updated_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS objects (
+  id          TEXT PRIMARY KEY,          -- "obj_<uuid>"
+  space_id    TEXT NOT NULL REFERENCES spaces(id),
+  name        TEXT NOT NULL,
+  mime        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  sha256      TEXT NOT NULL,
+  uploaded_by TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_objects_space ON objects(space_id, created_at);
+
 CREATE TABLE IF NOT EXISTS work_items (
   id           TEXT PRIMARY KEY,         -- "wi_<uuid>"
   space_id     TEXT NOT NULL REFERENCES spaces(id),

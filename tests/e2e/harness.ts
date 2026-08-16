@@ -798,6 +798,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     store,
     adapter,
     driver,
+    audit,
+    orgPolicy,
     responseModeFor,
     memoryProvider,
     digestPrune: (spaceId, keep) => {

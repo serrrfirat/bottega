@@ -31,6 +31,9 @@ oauth_config:
       - channels:history
       - groups:history
       - im:history
+      # File shares in, agent uploads out (epic #124).
+      - files:read
+      - files:write
       # Live-Slack QA canary (issue #79): create/locate the bottega-qa
       # channel, invite bot + QA user, list channels/users.
       - channels:manage

@@ -1,17 +1,23 @@
-import { describe, expect, test, vi } from "bun:test";
-import type { Store, ExtensionCredential } from "../../store/db";
+import { afterAll, describe, expect, test, vi } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { createStore, type Store, type ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, emptyResponseFallback, churnMessageText, parseConnectIntent } from "./space-service";
+import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, emptyResponseFallback, churnMessageText, parseConnectIntent } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
-import { parseOrgConfigYaml } from "../../policy/config";
+import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
-import type { AuditModule } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT } from "../../store/audit-events";
+import { createAudit, type AuditModule } from "../../policy/audit";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
+import { objectToolDefinitions } from "../../tools/objects";
+import { sha256Hex } from "../../tools/memory";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests
@@ -177,17 +183,35 @@ class FakeMemoryProvider implements MemoryProvider {
   }
 }
 
-function fakeAdapter(opts: { deferPost?: boolean; failUpdateCalls?: number; failReactions?: boolean } = {}): {
+interface FakeDownloadedFile {
+  name: string;
+  mimeType: string;
+  size: number;
+  bytes: Uint8Array;
+}
+
+function fakeAdapter(
+  opts: {
+    deferPost?: boolean;
+    failUpdateCalls?: number;
+    failReactions?: boolean;
+    downloads?: Record<string, FakeDownloadedFile | Error>;
+  } = {},
+): {
   adapter: SlackAdapter;
   posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
+  downloadedFileIds: string[];
+  uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }>;
   releasePost: () => void;
 } {
-  const { deferPost = false, failUpdateCalls = 0, failReactions = false } = opts;
+  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {} } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
+  const downloadedFileIds: string[] = [];
+  const uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }> = [];
   let releasePost = () => {};
   /** updateMessage calls still to reject (issue #120 429 simulation); fail-soft means the service must cope. */
   let failuresLeft = failUpdateCalls;
@@ -209,6 +233,17 @@ function fakeAdapter(opts: { deferPost?: boolean; failUpdateCalls?: number; fail
       }
       updates.push({ spaceId, ts, text });
     },
+    async downloadFile(fileId) {
+      downloadedFileIds.push(fileId);
+      const file = downloads[fileId];
+      if (!file) throw new Error(`missing fake download: ${fileId}`);
+      if (file instanceof Error) throw file;
+      return file;
+    },
+    async uploadFile(spaceId, name, mimeType, content) {
+      uploads.push({ spaceId, name, mimeType, content });
+      return `upload-${uploads.length}`;
+    },
     async addReaction(spaceId, ts) {
       if (failReactions) throw new Error("missing_scope: reactions:write");
       reactions.push({ kind: "add", spaceId, ts });
@@ -219,7 +254,15 @@ function fakeAdapter(opts: { deferPost?: boolean; failUpdateCalls?: number; fail
     async start() {},
     async stop() {},
   };
-  return { adapter, posts, updates, reactions, releasePost: () => releasePost() };
+  return {
+    adapter,
+    posts,
+    updates,
+    reactions,
+    downloadedFileIds,
+    uploads,
+    releasePost: () => releasePost(),
+  };
 }
 
 function fakeStore(): {
@@ -236,6 +279,7 @@ function fakeStore(): {
     // org settings; no settings blob is the normal unset state.
     getOrgSettings: () => null,
   } as unknown as Store;
+
   return { store, audit };
 }
 
@@ -243,12 +287,216 @@ function msg(overrides: Partial<SlackMessage> = {}): SlackMessage {
   return { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1", ...overrides };
 }
 
+function makeSpaceService(
+  deps: Omit<SpaceServiceDeps, "audit" | "orgPolicy"> &
+    Partial<Pick<SpaceServiceDeps, "audit" | "orgPolicy">>,
+): SpaceService {
+  return new SpaceService({
+    audit: createAudit(deps.store),
+    orgPolicy: defaultPolicy(),
+    ...deps,
+  });
+}
+
+const objectTestDir = mkdtempSync(join(tmpdir(), "bottega-space-objects-"));
+const objectTestStores: Store[] = [];
+
+function freshObjectStore(): Store {
+  const store = createStore(join(objectTestDir, `store-${objectTestStores.length}.db`));
+  objectTestStores.push(store);
+  return store;
+}
+
+afterAll(() => {
+  for (const store of objectTestStores) store.close();
+  rmSync(objectTestDir, { recursive: true, force: true });
+});
+
+function objectToolContext(spaceId: string): ExtensionContext {
+  return {
+    sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
+  } as unknown as ExtensionContext;
+}
+
+describe("SpaceService durable object ingest (issue #124)", () => {
+  test("stores inbound files, audits them, and puts the object id in the agent turn", async () => {
+    const store = freshObjectStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const bytes = new TextEncoder().encode("name,value\nalpha,1");
+    const { adapter, downloadedFileIds } = fakeAdapter({
+      downloads: {
+        F1: { name: "report.csv", mimeType: "text/csv", size: bytes.byteLength, bytes },
+      },
+    });
+    const driver = new FakeDriver();
+    const orgPolicy = defaultPolicy();
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      audit: createAudit(store),
+      orgPolicy,
+      onboardingChecks: () => [],
+    });
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: space.id,
+        files: [{ id: "F1", name: "report.csv", mimeType: "text/csv", size: bytes.byteLength }],
+      }),
+    );
+
+    expect(downloadedFileIds).toEqual(["F1"]);
+    const objects = await store.listObjects(space.id);
+    expect(objects).toHaveLength(1);
+    const object = objects[0]!;
+    expect(object.name).toBe("report.csv");
+    expect(object.mime).toBe("text/csv");
+    expect(object.sha256).toBe(sha256Hex("name,value\nalpha,1"));
+    const storedBytes = await store.readObjectBytes(object.id);
+    if (!storedBytes) throw new Error("attached object bytes are missing");
+    expect(new TextDecoder().decode(storedBytes)).toBe("name,value\nalpha,1");
+    expect(driver.last().prompts[0]!.text).toBe(
+      `hello\n[attachment: report.csv (text/csv, ${bytes.byteLength} B) — object ${object.id}]`,
+    );
+
+    const auditRows = await store.listAudit({ space: space.id, event_type: OBJECT_ATTACHED_EVENT });
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]!.actor).toBe("U1");
+    expect(JSON.parse(auditRows[0]!.payload)).toEqual({
+      id: object.id,
+      name: object.name,
+      mime: object.mime,
+      size: object.size,
+      sha256: object.sha256,
+      by: "U1",
+    });
+    await service.stop();
+  });
+
+  test("skips oversized files with the configured limit in the turn and no object row", async () => {
+    const store = freshObjectStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C2" });
+    const { adapter, downloadedFileIds } = fakeAdapter();
+    const driver = new FakeDriver();
+    const orgPolicy = defaultPolicy();
+    orgPolicy.objects.maxSizeBytes = 3;
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      audit: createAudit(store),
+      orgPolicy,
+      onboardingChecks: () => [],
+    });
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: space.id,
+        text: "",
+        files: [{ id: "F2", name: "large.pdf", mimeType: "application/pdf", size: 4 }],
+      }),
+    );
+
+    expect(downloadedFileIds).toEqual([]);
+    expect(await store.listObjects(space.id)).toEqual([]);
+    expect(driver.last().prompts[0]!.text).toBe("[attachment skipped: large.pdf exceeds 3B limit]");
+    await service.stop();
+  });
+
+  test("reports a download failure in the turn and still prompts the agent", async () => {
+    const store = freshObjectStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C3" });
+    const { adapter } = fakeAdapter({ downloads: { F3: new Error("Slack download unavailable") } });
+    const driver = new FakeDriver();
+    const orgPolicy = defaultPolicy();
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      audit: createAudit(store),
+      orgPolicy,
+      onboardingChecks: () => [],
+    });
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: space.id,
+        text: "summarize this",
+        files: [{ id: "F3", name: "broken.csv", mimeType: "text/csv", size: 12 }],
+      }),
+    );
+
+    expect(await store.listObjects(space.id)).toEqual([]);
+    expect(driver.last().prompts[0]!.text).toBe(
+      "summarize this\n[attachment failed: broken.csv: Slack download unavailable]",
+    );
+    await service.stop();
+  });
+
+  test("ingested CSV is readable through object.get while PDF returns an explicit format error", async () => {
+    const store = freshObjectStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C4" });
+    const csvBytes = new TextEncoder().encode("a,b\n1,2");
+    const pdfBytes = new TextEncoder().encode("%PDF");
+    const { adapter } = fakeAdapter({
+      downloads: {
+        F4: { name: "data.csv", mimeType: "text/csv", size: csvBytes.byteLength, bytes: csvBytes },
+        F5: { name: "paper.pdf", mimeType: "application/pdf", size: pdfBytes.byteLength, bytes: pdfBytes },
+      },
+    });
+    const driver = new FakeDriver();
+    const orgPolicy = defaultPolicy();
+    const audit = createAudit(store);
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      audit,
+      orgPolicy,
+      onboardingChecks: () => [],
+    });
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: space.id,
+        files: [
+          { id: "F4", name: "data.csv", mimeType: "text/csv", size: csvBytes.byteLength },
+          { id: "F5", name: "paper.pdf", mimeType: "application/pdf", size: pdfBytes.byteLength },
+        ],
+      }),
+    );
+
+    const objects = await store.listObjects(space.id);
+    const csv = objects.find((object) => object.mime === "text/csv")!;
+    const pdf = objects.find((object) => object.mime === "application/pdf")!;
+    const get = objectToolDefinitions(store, { orgPolicy, audit, adapter }).find(
+      (tool) => tool.name === "object.get",
+    )!;
+    const context = objectToolContext(space.id);
+
+    const csvResult = await get.execute("tc1", { id: csv.id }, undefined, undefined, context);
+    const csvText = csvResult.content.find((content) => content.type === "text");
+    if (!csvText || csvText.type !== "text") throw new Error("object.get did not return text");
+    expect(JSON.parse(csvText.text).content).toBe("a,b\n1,2");
+
+    const pdfResult = await get.execute("tc2", { id: pdf.id }, undefined, undefined, context);
+    const pdfText = pdfResult.content.find((content) => content.type === "text");
+    if (!pdfText || pdfText.type !== "text") throw new Error("object.get did not return text");
+    expect(pdfResult.isError).toBe(true);
+    expect(pdfText.text).toBe(
+      `object ${pdf.id}: cannot extract text from application/pdf (unsupported format)`,
+    );
+    await service.stop();
+  });
+});
+
 describe("SpaceService session lifecycle", () => {
   test("sessions are lazy: the first message cold-starts a session that gets the prompt", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     expect(driver.created).toHaveLength(0); // no session until a message arrives
 
@@ -266,7 +514,7 @@ describe("SpaceService session lifecycle", () => {
     vi.useFakeTimers();
     try {
       const modelRoles = new SessionModelRoleRegistry();
-      const service = new SpaceService({ store, adapter, driver, modelRoles, idleTimeoutMs: 20 });
+      const service = makeSpaceService({ store, adapter, driver, modelRoles, idleTimeoutMs: 20 });
 
       expect(modelRoles.has("slack:C1")).toBe(false);
       await service.handleInboundMessage(msg());
@@ -286,7 +534,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ spaceId: "slack:C1" }));
     await service.handleInboundMessage(msg({ spaceId: "slack:C2" }));
@@ -300,7 +548,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ text: "first" }));
     driver.last().streaming = true;
@@ -318,7 +566,7 @@ describe("SpaceService session lifecycle", () => {
     const driver = new FakeDriver();
     vi.useFakeTimers();
     try {
-      const service = new SpaceService({ store, adapter, driver, idleTimeoutMs: 20 });
+      const service = makeSpaceService({ store, adapter, driver, idleTimeoutMs: 20 });
 
       await service.handleInboundMessage(msg({ text: "first" }));
       const first = driver.last();
@@ -341,7 +589,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, transcriptDir: "data/sessions" });
+    const service = makeSpaceService({ store, adapter, driver, transcriptDir: "data/sessions" });
 
     await service.handleInboundMessage(msg());
 
@@ -355,7 +603,7 @@ describe("SpaceService session lifecycle", () => {
     const driver = new FakeDriver();
     vi.useFakeTimers();
     try {
-      const service = new SpaceService({ store, adapter, driver, idleTimeoutMs: 20 });
+      const service = makeSpaceService({ store, adapter, driver, idleTimeoutMs: 20 });
 
       await service.handleInboundMessage(msg({ ts: "1.1" }));
       driver.last().deferDispose = true;
@@ -402,7 +650,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ spaceId: "slack:C1" }));
     await service.handleInboundMessage(msg({ spaceId: "slack:C2" }));
@@ -416,7 +664,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ text: "ok" }));
     driver.last().failPrompt = true;
@@ -429,7 +677,7 @@ describe("SpaceService session lifecycle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ principal: "U1", ts: "1.1" }));
     await service.handleInboundMessage(msg({ principal: "U2", ts: "2.2" }));
@@ -445,7 +693,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().emit("message", { spaceId: "slack:C1", text: "agent reply" });
@@ -460,7 +708,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.created[0].opts.onOutput("slack:C1", "output channel");
@@ -478,7 +726,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -501,7 +749,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
     const dm = driver.last();
@@ -537,7 +785,7 @@ describe("SpaceService output routing", () => {
     const driver = new FakeDriver();
     // All-pass checks: this test is about the error surface, not the
     // onboarding nudge (issue #116).
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -557,7 +805,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates, releasePost } = fakeAdapter({ deferPost: true });
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" })); // phrase post parks in flight
     driver.last().emit("message", { spaceId: "slack:C1", text: "late answer" });
@@ -579,7 +827,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -596,7 +844,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -618,7 +866,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates, releasePost } = fakeAdapter({ deferPost: true });
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -644,7 +892,7 @@ describe("SpaceService output routing", () => {
       const { adapter, posts, updates } = fakeAdapter();
       const { store } = fakeStore();
       const driver = new FakeDriver();
-      const service = new SpaceService({ store, adapter, driver });
+      const service = makeSpaceService({ store, adapter, driver });
 
       await service.handleInboundMessage(msg({ ts: "1.1" }));
       const session = driver.last();
@@ -665,7 +913,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -695,7 +943,7 @@ describe("SpaceService output routing", () => {
     const driver = new FakeDriver();
     // All-pass checks: this test is about the churn surface, not the
     // onboarding nudge (issue #116).
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -741,7 +989,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -769,7 +1017,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg());
     const session = driver.last();
@@ -808,7 +1056,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg());
     const session = driver.last();
@@ -834,7 +1082,7 @@ describe("SpaceService output routing", () => {
     const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg());
     const session = driver.last();
@@ -851,7 +1099,7 @@ describe("SpaceService output routing", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -883,7 +1131,7 @@ describe("SpaceService output routing", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg());
     const session = driver.last();
@@ -902,7 +1150,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
     vi.useFakeTimers();
     try {
       // Cold start, then steer the running (streaming) session. The receipt
@@ -950,7 +1198,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
     const { adapter, posts, updates } = fakeAdapter({ failUpdateCalls: 2 });
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
     vi.useFakeTimers();
     try {
       await service.handleInboundMessage(msg({ ts: "1.1" }));
@@ -987,7 +1235,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1008,7 +1256,7 @@ describe("SpaceService digest-on-idle", () => {
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 
     await service.handleInboundMessage(msg({ text: "hello", ts: "1.1" }));
     const first = driver.last();
@@ -1047,7 +1295,7 @@ describe("SpaceService digest-on-idle", () => {
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
     const prunes: Array<{ spaceId: string; keep: number }> = [];
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1068,7 +1316,7 @@ describe("SpaceService digest-on-idle", () => {
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
     provider.digests.push({ space: "slack:C1", since: "0.1", until: "1.1" });
-    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 
     await service.handleInboundMessage(msg({ ts: "1.1" })); // same ts as the marker
     await service.stop();
@@ -1083,7 +1331,7 @@ describe("SpaceService digest-on-idle", () => {
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1107,7 +1355,7 @@ describe("SpaceService digest-on-idle", () => {
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1131,7 +1379,7 @@ describe("SpaceService digest-on-idle", () => {
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1170,7 +1418,7 @@ describe("SpaceService digest-on-idle", () => {
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const service = new SpaceService({ store, adapter, driver, memoryProvider: provider });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1187,7 +1435,7 @@ describe("SpaceService digest-on-idle", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1204,7 +1452,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1225,7 +1473,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
       const { adapter } = fakeAdapter();
       const { store } = fakeStore();
       const driver = new FakeDriver();
-      const service = new SpaceService({
+      const service = makeSpaceService({
         store,
         adapter,
         driver,
@@ -1244,7 +1492,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg());
 
@@ -1349,7 +1597,7 @@ describe("SpaceService connect intent (issue #61)", () => {
 
   test("connect <ext> as me connects for the sender with no agent turn", async () => {
     const h = makeConnectHarness();
-    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as me", ts: "2.2" }));
 
@@ -1376,7 +1624,7 @@ describe("SpaceService connect intent (issue #61)", () => {
 
   test("bare connect <ext> defaults to the sender's personal account", async () => {
     const h = makeConnectHarness();
-    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "Connect fixture.weather", principal: "U2", ts: "3.3" }));
 
@@ -1388,7 +1636,7 @@ describe("SpaceService connect intent (issue #61)", () => {
 
   test("connect <ext> as org crosses the gate; denied without approval", async () => {
     const h = makeConnectHarness({ router: DenyRouter });
-    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
 
@@ -1403,7 +1651,7 @@ describe("SpaceService connect intent (issue #61)", () => {
 
   test("connect <ext> as org with an approving router connects the org account", async () => {
     const h = makeConnectHarness({ router: new RecordingRouter() });
-    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
 
@@ -1418,7 +1666,7 @@ describe("SpaceService connect intent (issue #61)", () => {
 
   test("unknown extensions post the failure without a session", async () => {
     const h = makeConnectHarness();
-    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect nope.xyz as me" }));
 
@@ -1439,7 +1687,7 @@ describe("SpaceService connect intent (issue #61)", () => {
       const { adapter } = fakeAdapter();
       const { store } = fakeStore();
       const driver = new FakeDriver();
-      const service = new SpaceService({ store, adapter, driver, connect: h.deps });
+      const service = makeSpaceService({ store, adapter, driver, connect: h.deps });
       await service.handleInboundMessage(msg({ text }));
       expect(driver.created).toHaveLength(1);
       expect(driver.last().prompts[0]!.text).toBe(text);
@@ -1451,7 +1699,7 @@ describe("SpaceService connect intent (issue #61)", () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as me" }));
 
@@ -1479,7 +1727,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1512,7 +1760,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const { adapter, updates } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1544,7 +1792,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const { store } = fakeStore();
     const driver = new FakeDriver();
     let missing = ["broker_token", "git_pat"];
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1584,7 +1832,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1605,7 +1853,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({
+    const service = makeSpaceService({
       store,
       adapter,
       driver,
@@ -1629,7 +1877,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { store } = fakeStore();
     const driver = new FakeDriver();
     driver.deferCreate = true;
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     const inbound = service.handleInboundMessage(msg({ ts: "1.1" })); // cold-start parks on the gate
     await Promise.resolve();
@@ -1648,7 +1896,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter, reactions } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
@@ -1665,7 +1913,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter, reactions } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().emit("error", { spaceId: "slack:C1", message: "boom" });
@@ -1677,7 +1925,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter, reactions } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().streaming = true;
@@ -1697,7 +1945,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter, posts, updates, reactions } = fakeAdapter({ failReactions: true });
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     expect(reactions).toHaveLength(0); // the add failed and was logged
@@ -1714,7 +1962,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const received = audit.find((a) => a.event_type === MESSAGE_RECEIVED_EVENT);
@@ -1737,7 +1985,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     const { adapter } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
-    const service = new SpaceService({ store, adapter, driver });
+    const service = makeSpaceService({ store, adapter, driver });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().emit("message", { spaceId: "slack:C1", text: "" });

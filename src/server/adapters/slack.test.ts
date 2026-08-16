@@ -112,6 +112,55 @@ describe("normalizeMessage", () => {
     });
   });
 
+  test("maps file_share attachments and accepts empty text", () => {
+    expect(
+      normalizeMessage({
+        ...channelEvent,
+        subtype: "file_share",
+        text: "",
+        files: [
+          { id: "F123", name: "notes.txt", mimetype: "text/plain", size: 12 },
+          { id: "F456", name: "data.csv", mimetype: "text/csv", size: 34 },
+          { name: "missing-id.txt", mimetype: "text/plain", size: 1 },
+        ],
+      }),
+    ).toEqual({
+      spaceId: "slack:C123ABC",
+      principal: "U456",
+      text: "",
+      ts: "1723700000.000100",
+      files: [
+        { id: "F123", name: "notes.txt", mimeType: "text/plain", size: 12 },
+        { id: "F456", name: "data.csv", mimeType: "text/csv", size: 34 },
+      ],
+    });
+  });
+
+  test("accepts a file_share event with no text", () => {
+    expect(
+      normalizeMessage({
+        type: "message",
+        subtype: "file_share",
+        channel: "C123ABC",
+        user: "U456",
+        ts: "1723700000.000100",
+        files: [{ id: "F123", name: "notes.txt", mimetype: "text/plain", size: 12 }],
+      }),
+    ).toMatchObject({ text: "", files: [{ id: "F123", name: "notes.txt" }] });
+  });
+
+  test("drops bot-authored file_share messages", () => {
+    expect(
+      normalizeMessage({
+        ...channelEvent,
+        subtype: "file_share",
+        bot_id: "B999",
+        files: [{ id: "F123", name: "notes.txt", mimetype: "text/plain", size: 12 }],
+      }),
+    ).toBeNull();
+  });
+
+
   test("drops bot messages", () => {
     expect(normalizeMessage({ ...channelEvent, bot_id: "B999" })).toBeNull();
     expect(normalizeMessage({ ...channelEvent, subtype: "bot_message" })).toBeNull();
@@ -359,7 +408,7 @@ describe("renderSlackText (Markdown → Slack mrkdwn, issue #84)", () => {
 });
 
 describe("createSlackAdapter", () => {
-  test("returns an adapter exposing postMessage, updateMessage, reactions, start and stop", () => {
+  test("returns an adapter exposing messages, files, reactions, start and stop", () => {
     const adapter = createSlackAdapter({
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -369,8 +418,118 @@ describe("createSlackAdapter", () => {
     expect(typeof adapter.updateMessage).toBe("function");
     expect(typeof adapter.addReaction).toBe("function");
     expect(typeof adapter.removeReaction).toBe("function");
+    expect(typeof adapter.downloadFile).toBe("function");
+    expect(typeof adapter.uploadFile).toBe("function");
     expect(typeof adapter.start).toBe("function");
     expect(typeof adapter.stop).toBe("function");
+  });
+});
+
+describe("Slack file API roundtrips", () => {
+  const BOT_TOKEN = "xoxb-file-test-token";
+  const DOWNLOAD_BYTES = new TextEncoder().encode("attachment body");
+
+  function bootFilesApi() {
+    let baseUrl = "";
+    const state: {
+      infoFile?: string;
+      downloadAuth?: string | null;
+      uploadFilename?: string;
+      uploadLength?: string;
+      uploadChannel?: string;
+      uploadedBytes?: Uint8Array;
+    } = {};
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (url.pathname === "/api/files.info") {
+          const form = new URLSearchParams(await request.text());
+          state.infoFile = form.get("file") ?? undefined;
+          return Response.json({
+            ok: true,
+            file: {
+              id: "F123",
+              name: "notes.txt",
+              mimetype: "text/plain",
+              size: DOWNLOAD_BYTES.byteLength,
+              url_private_download: `${baseUrl}/download/F123`,
+            },
+          });
+        }
+        if (url.pathname === "/download/F123") {
+          state.downloadAuth = request.headers.get("authorization");
+          return new Response(DOWNLOAD_BYTES);
+        }
+        if (url.pathname === "/api/files.getUploadURLExternal") {
+          const form = new URLSearchParams(await request.text());
+          state.uploadFilename = form.get("filename") ?? undefined;
+          state.uploadLength = form.get("length") ?? undefined;
+          return Response.json({
+            ok: true,
+            file_id: "F-UPLOAD",
+            upload_url: `${baseUrl}/upload/F-UPLOAD`,
+          });
+        }
+        if (url.pathname === "/upload/F-UPLOAD") {
+          state.uploadedBytes = new Uint8Array(await request.arrayBuffer());
+          return new Response("ok");
+        }
+        if (url.pathname === "/api/files.completeUploadExternal") {
+          const form = new URLSearchParams(await request.text());
+          state.uploadChannel = form.get("channel_id") ?? undefined;
+          return Response.json({ ok: true, files: [{ id: "F-UPLOAD" }] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    baseUrl = `http://127.0.0.1:${server.port}`;
+    const adapter = createSlackAdapter({
+      appToken: "xapp-file-test-token",
+      botToken: BOT_TOKEN,
+      onMessage: async () => {},
+      clientOptions: { slackApiUrl: `${baseUrl}/api` },
+    });
+    return { adapter, state, server };
+  }
+
+  test("downloadFile returns Slack metadata and authenticated bytes", async () => {
+    const api = bootFilesApi();
+    try {
+      const file = await api.adapter.downloadFile("F123");
+
+      expect(file).toEqual({
+        name: "notes.txt",
+        mimeType: "text/plain",
+        size: DOWNLOAD_BYTES.byteLength,
+        bytes: DOWNLOAD_BYTES,
+      });
+      expect(api.state.infoFile).toBe("F123");
+      expect(api.state.downloadAuth).toBe(`Bearer ${BOT_TOKEN}`);
+    } finally {
+      api.server.stop(true);
+    }
+  });
+
+  test("uploadFile sends the channel, filename, and bytes through files.uploadV2", async () => {
+    const api = bootFilesApi();
+    const content = new Uint8Array([0, 1, 2, 255]);
+    try {
+      const id = await api.adapter.uploadFile(
+        "slack:C123ABC",
+        "artifact.bin",
+        "application/octet-stream",
+        content,
+      );
+
+      expect(id).toBe("F-UPLOAD");
+      expect(api.state.uploadChannel).toBe("C123ABC");
+      expect(api.state.uploadFilename).toBe("artifact.bin");
+      expect(api.state.uploadLength).toBe(String(content.byteLength));
+      expect(api.state.uploadedBytes).toEqual(content);
+    } finally {
+      api.server.stop(true);
+    }
   });
 });
 

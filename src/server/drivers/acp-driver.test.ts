@@ -9,7 +9,7 @@ import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVEN
 import { createStore } from "../../store/db";
 import { createAudit, type AuditModule } from "../../policy/audit";
 import { DenyRouter, type ApprovalRouter } from "../../policy/approval-router";
-import { loadSpacePolicy, parseOrgConfigYaml } from "../../policy/config";
+import { defaultPolicy, loadSpacePolicy, parseOrgConfigYaml } from "../../policy/config";
 import { createAcpDriver, type AcpMcpServerEntry, type AcpPolicyContext } from "./acp-driver";
 import type { AgentSessionDriver } from "./agent-driver";
 import { SpaceService } from "../services/space-service";
@@ -295,6 +295,12 @@ describe("acp driver", () => {
       async updateMessage(spaceId, ts, text) {
         updates.push({ spaceId, ts, text });
       },
+      async downloadFile() {
+        throw new Error("not used");
+      },
+      async uploadFile() {
+        return undefined;
+      },
       async addReaction() {},
       async removeReaction() {},
       async start() {},
@@ -305,6 +311,8 @@ describe("acp driver", () => {
       store,
       adapter,
       driver,
+      audit: createAudit(store),
+      orgPolicy: defaultPolicy(),
       idleTimeoutMs: 60_000,
       transcriptDir: join(dir, "sessions"),
     });

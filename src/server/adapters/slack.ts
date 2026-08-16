@@ -1,5 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import type { ChatPostMessageArguments } from "@slack/web-api";
+import type { ChatPostMessageArguments, FilesInfoResponse } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
@@ -34,6 +34,7 @@ export interface SlackMessage {
   principal: string;
   text: string;
   ts: string;
+  files?: Array<{ id: string; name: string; mimeType: string; size: number }>;
 }
 
 /** Approval button action ids (issue #44); the buttons and the router's action handler share these. */
@@ -62,6 +63,17 @@ export interface SlackAdapter {
   ): Promise<string | undefined>;
   /** Replaces the text of an already-posted message (chat.update). */
   updateMessage(spaceId: string, ts: string, text: string): Promise<void>;
+  /** Downloads a Slack file and returns its normalized metadata and bytes. */
+  downloadFile(
+    fileId: string,
+  ): Promise<{ name: string; mimeType: string; size: number; bytes: Uint8Array }>;
+  /** Uploads bytes to a Slack channel and resolves with the created file id. */
+  uploadFile(
+    spaceId: string,
+    name: string,
+    mimeType: string,
+    content: Uint8Array,
+  ): Promise<string | undefined>;
   /**
    * Adds a reaction to the message at `ts` (receipt ack, issue #119).
    * `name` is the emoji name without colons, default `eyes` (👀). Callers
@@ -124,24 +136,50 @@ export function isMentionedMessage(
 /**
  * Normalizes a raw Slack message event into a {@link SlackMessage}.
  *
- * Returns `null` for anything unparseable (missing channel/user/text/ts,
- * non-object payloads, bot messages) instead of throwing — the caller drops
- * and logs those.
+ * Returns `null` for anything unparseable (missing channel/user/ts and
+ * neither text nor files, non-object payloads, bot messages) instead of
+ * throwing — the caller drops and logs those.
  */
 export function normalizeMessage(event: unknown): SlackMessage | null {
   if (typeof event !== "object" || event === null) return null;
   const raw = event as Record<string, unknown>;
   if (isBotMessage(raw)) return null;
   const { channel, user, text, ts } = raw;
+  const hasFiles = Array.isArray(raw.files) && raw.files.length > 0;
+  const files: NonNullable<SlackMessage["files"]> = [];
+  if (Array.isArray(raw.files)) {
+    for (const file of raw.files) {
+      if (typeof file !== "object" || file === null) continue;
+      if (
+        !("id" in file) ||
+        typeof file.id !== "string" ||
+        !("name" in file) ||
+        typeof file.name !== "string" ||
+        !("mimetype" in file) ||
+        typeof file.mimetype !== "string" ||
+        !("size" in file) ||
+        typeof file.size !== "number"
+      ) {
+        continue;
+      }
+      files.push({ id: file.id, name: file.name, mimeType: file.mimetype, size: file.size });
+    }
+  }
   if (
     typeof channel !== "string" ||
     typeof user !== "string" ||
-    typeof text !== "string" ||
-    typeof ts !== "string"
+    typeof ts !== "string" ||
+    (typeof text !== "string" && !hasFiles)
   ) {
     return null;
   }
-  return { spaceId: spaceIdFromChannel(channel), principal: user, text, ts };
+  return {
+    spaceId: spaceIdFromChannel(channel),
+    principal: user,
+    text: typeof text === "string" ? text : "",
+    ts,
+    ...(files.length > 0 ? { files } : {}),
+  };
 }
 
 /**
@@ -372,6 +410,70 @@ export function createSlackAdapter(opts: {
     },
     async updateMessage(spaceId, ts, text) {
       await app.client.chat.update(buildUpdateMessageArgs(spaceId, ts, text));
+    },
+    async downloadFile(fileId) {
+      let info: FilesInfoResponse;
+      try {
+        info = await app.client.files.info({ file: fileId });
+      } catch (cause) {
+        throw new Error(`slack: files.info failed for file ${fileId}`, { cause });
+      }
+      const file = info.file;
+      if (
+        typeof file?.name !== "string" ||
+        typeof file.mimetype !== "string" ||
+        typeof file.size !== "number" ||
+        typeof file.url_private_download !== "string"
+      ) {
+        throw new Error(`slack: files.info returned incomplete metadata for file ${fileId}`);
+      }
+      let response: Response;
+      try {
+        response = await fetch(file.url_private_download, {
+          headers: { Authorization: `Bearer ${opts.botToken}` },
+        });
+      } catch (cause) {
+        throw new Error(`slack: download request failed for file ${fileId}`, { cause });
+      }
+      if (!response.ok) {
+        throw new Error(
+          `slack: download request failed for file ${fileId} (${response.status} ${response.statusText})`,
+        );
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch (cause) {
+        throw new Error(`slack: failed to read downloaded file ${fileId}`, { cause });
+      }
+      return {
+        name: file.name,
+        mimeType: file.mimetype,
+        size: file.size,
+        bytes,
+      };
+    },
+    async uploadFile(spaceId, name, _mimeType, content) {
+      // files.uploadV2 infers MIME from the filename extension; its binary
+      // input is a Buffer rather than the caller-facing Uint8Array.
+      const result = await app.client.files.uploadV2({
+        channel_id: channelFromSpaceId(spaceId),
+        filename: name,
+        file: Buffer.from(content),
+      });
+      if (!("files" in result) || !Array.isArray(result.files)) return undefined;
+      const completion = result.files[0];
+      if (
+        typeof completion !== "object" ||
+        completion === null ||
+        !("files" in completion) ||
+        !Array.isArray(completion.files)
+      ) {
+        return undefined;
+      }
+      const file = completion.files[0];
+      if (typeof file !== "object" || file === null || !("id" in file)) return undefined;
+      return typeof file.id === "string" ? file.id : undefined;
     },
     async addReaction(spaceId, ts, name) {
       await app.client.reactions.add({

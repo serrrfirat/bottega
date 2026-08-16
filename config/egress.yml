@@ -59,6 +59,7 @@ transforms:
         - "cloud-api.near.ai"
         - "*.completions.near.ai"
         - "raw.githubusercontent.com"
+        - "files.slack.com"
         - "mcp.attio.com"
         - "api.github.com"
         - "mcp.linear.app"

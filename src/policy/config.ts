@@ -64,6 +64,7 @@ export type OrgCredentialsMode = "allow" | "deny";
 const DEFAULT_ORG_CREDENTIALS: OrgCredentialsMode = "allow";
 
 export const DEFAULT_TIMEOUT_MINUTES = 5;
+export const DEFAULT_OBJECT_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
 
 /** Tightening order for response modes: always → mention → request-only. */
@@ -136,6 +137,9 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // Transcript full-text search (issue #136): indexes durable session
   // messages but never mutates the transcripts themselves.
   session_search: "read",
+  "object.list": "read",
+  "object.get": "read",
+  "object.create": "write",
   // Model tools (issue #64): both mutate durable state (per-space settings,
   // the live session's model) — write tier like memory.save.
   model_settings: "write",
@@ -194,6 +198,8 @@ export interface PolicyConfig {
   memory: { injection: MemoryInjectionConfig };
   /** Automatic learning settings; org floor only. */
   learning: LearningConfig;
+  /** Durable object limits from the org config; space overlays cannot change them. */
+  objects: { maxSizeBytes: number };
 
   /** Space-agent driver (`agent.driver` in config.yml, issue #26). Default omp-sdk; acp is opt-in. */
   agentDriver: AgentDriverName;
@@ -231,6 +237,7 @@ export function defaultPolicy(): PolicyConfig {
     alwaysApprove: [],
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
     learning: { autoExtract: true },
+    objects: { maxSizeBytes: DEFAULT_OBJECT_MAX_SIZE_BYTES },
 
     agentDriver: DEFAULT_AGENT_DRIVER,
     responseMode: DEFAULT_RESPONSE_MODE,
@@ -496,6 +503,18 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         }
         policy.alwaysApprove = names;
       }
+    } else if (name === "objects") {
+      const maxSizeBytesEntry = entries.max_size_bytes;
+      if (maxSizeBytesEntry !== undefined) {
+        const maxSizeBytes = parsePositiveInt(scalarOrUndefined(maxSizeBytesEntry));
+        if (maxSizeBytes === undefined) {
+          return structuralError(policy, "objects.max_size_bytes must be a positive integer");
+        }
+        policy.objects.maxSizeBytes = maxSizeBytes;
+      }
+      for (const key of Object.keys(entries)) {
+        if (key !== "max_size_bytes") policy.warnings.push(`objects.${key}: unknown key ignored`);
+      }
     } else if (name === "memory") {
       const injection = entries.injection;
       if (injection !== undefined) {
@@ -621,6 +640,7 @@ function clonePolicy(p: PolicyConfig): PolicyConfig {
     tools: { ...p.tools },
     memory: { injection: { ...p.memory.injection } },
     learning: { ...p.learning },
+    objects: { ...p.objects },
     errors: [...p.errors],
     warnings: [...p.warnings],
   };
