@@ -193,7 +193,11 @@ describe("fetch-catalog helper (issue #54)", () => {
   });
 });
 
-/** Catalog doc with a valid linear entry and one malformed record (missing url). */
+/**
+ * Catalog doc: a valid linear entry (with url), a url-less entry (LISTABLE —
+ * the live integrations.sh failure mode, issue #118), and one truly
+ * unlistable record (missing a renderable field) that must be skipped.
+ */
 function catalogWithBadEntry(): { version: number; generatedAt: string; data: unknown[] } {
   return {
     version: 1,
@@ -213,30 +217,57 @@ function catalogWithBadEntry(): { version: number; generatedAt: string; data: un
         name: "B12 Website Generator",
         kind: "mcp",
         domain: "b12.io",
-        // no url — the live integrations.sh failure mode (issue #117)
+        // no url — listable (issue #118); the strict draft/pin paths still reject it
+      },
+      {
+        id: "mcp/broken",
+        slug: "broken-entry",
+        kind: "mcp",
+        domain: "broken.io",
+        // no name — truly unlistable (missing a renderable field)
       },
     ],
   };
 }
 
-describe("listCatalogEntries resilience (issue #117)", () => {
-  test("one malformed record is skipped and surfaced, the rest list fine", async () => {
+describe("listCatalogEntries resilience (issue #117, #118)", () => {
+  test("a url-less record lists fine; only truly unlistable records are skipped", async () => {
     const result = await listCatalogEntries(undefined, { fetchImpl: stubFetch(catalogWithBadEntry()) });
-    expect(result.entries.map((e) => e.slug)).toEqual(["linear"]);
+    expect(result.entries.map((e) => e.slug)).toEqual(["linear", "b12-website-generator"]);
+    // url is omitted for the url-less entry, never fabricated.
+    expect(result.entries[1].url).toBeUndefined();
     expect(result.skipped).toEqual([
       {
-        specId: "b12-website-generator",
-        reason: 'catalog fetch failed: entry "b12-website-generator" is missing a non-empty "url"',
+        specId: "broken-entry",
+        reason: 'catalog fetch failed: entry "broken-entry" is missing a non-empty "name"',
       },
     ]);
+  });
+
+  test("a catalog where most entries lack url lists them all with url omitted", async () => {
+    const data = Array.from({ length: 5 }, (_, i) => ({
+      id: `mcp/spec${i}`,
+      slug: `spec${i}`,
+      name: `Spec ${i}`,
+      kind: "mcp",
+      domain: `spec${i}.example.com`,
+      ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : {}), // only spec0 has url
+    }));
+    const result = await listCatalogEntries(undefined, {
+      fetchImpl: stubFetch({ version: 1, generatedAt: "2026-08-16T00:00:00.000Z", data }),
+    });
+    expect(result.entries).toHaveLength(5);
+    expect(result.skipped).toEqual([]);
+    expect(result.entries[0].url).toBe("https://spec0.example.com/docs");
+    expect(result.entries[1].url).toBeUndefined();
   });
 
   test("the query filters valid entries only; skipped records stay surfaced", async () => {
     const result = await listCatalogEntries("linear", { fetchImpl: stubFetch(catalogWithBadEntry()) });
     expect(result.entries.map((e) => e.slug)).toEqual(["linear"]);
     expect(result.skipped).toHaveLength(1);
-    // A query matching only the bad record still surfaces it as skipped, not as an entry.
-    const none = await listCatalogEntries("b12-website-generator", { fetchImpl: stubFetch(catalogWithBadEntry()) });
+    // A query matching only the unlistable record still surfaces it as skipped, not as an entry.
+    const none = await listCatalogEntries("broken-entry", { fetchImpl: stubFetch(catalogWithBadEntry()) });
     expect(none.entries).toEqual([]);
     expect(none.skipped).toHaveLength(1);
   });

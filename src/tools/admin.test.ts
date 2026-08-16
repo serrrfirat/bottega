@@ -281,6 +281,39 @@ describe("catalog_browser (issue #73)", () => {
     }
   });
 
+  test("list tolerates a broadly url-less catalog: entries listed, url omitted, skipped capped", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const data: unknown[] = Array.from({ length: 6 }, (_, i) => ({
+        id: `mcp/spec${i}`,
+        slug: `spec${i}`,
+        kind: "mcp",
+        name: `Spec ${i}`,
+        domain: `spec${i}.example.com`,
+        ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : {}), // only spec0 has url
+      }));
+      // 5 truly unlistable records (missing name) — more than the 3-example cap.
+      for (let i = 0; i < 5; i++) {
+        data.push({ id: `mcp/broken${i}`, slug: `broken${i}`, kind: "mcp", domain: "broken.io" });
+      }
+      const tools = loadTools(store, { catalog: { fetchImpl: stubFetch({ version: 1, data }) } });
+      const res = await call(tools[0], { action: "list" });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as {
+        catalog: Array<{ slug: string; url?: string }>;
+        catalog_skipped: { count: number; examples: Array<{ spec_id: string }> };
+      };
+      expect(body.catalog).toHaveLength(6);
+      expect(body.catalog[0].url).toBe("https://spec0.example.com/docs");
+      expect(body.catalog[1].url).toBeUndefined();
+      // Compact diagnostics: total count + up to 3 examples, never the full wall.
+      expect(body.catalog_skipped.count).toBe(5);
+      expect(body.catalog_skipped.examples).toHaveLength(3);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("unreachable or malformed catalog fails closed (error result, no guesses)", async () => {
     const { store, cleanup } = freshStore();
     try {

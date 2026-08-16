@@ -63,8 +63,12 @@ export interface CatalogEntry {
   kind: string;
   /** Provider hostname the entry points at, e.g. "linear.app". */
   domain: string;
-  /** Vendor documentation URL for the integration. */
-  url: string;
+  /**
+   * Vendor documentation URL. OPTIONAL for listing — the live integrations.sh
+   * catalog omits it for most entries (issue #118). Required by the strict
+   * draft/pin paths (`fetchCatalogEntry`, `pinSnapshotDraft`).
+   */
+  url?: string;
   description?: string;
 }
 
@@ -134,7 +138,11 @@ async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<Record<string
   return doc.data as Record<string, unknown>[];
 }
 
-/** Validates one catalog record into a {@link CatalogEntry}; throws on malformed records. */
+/**
+ * STRICT record validation for the draft/pin paths: requires every field
+ * including `url` — an explicitly requested or pinned entry must have
+ * complete provenance. Throws {@link CatalogError} on malformed records.
+ */
 function parseCatalogRecord(record: Record<string, unknown>): CatalogEntry {
   const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
   for (const field of ["id", "slug", "name", "kind", "domain", "url"] as const) {
@@ -149,6 +157,33 @@ function parseCatalogRecord(record: Record<string, unknown>): CatalogEntry {
     kind: record["kind"] as string,
     domain: record["domain"] as string,
     url: record["url"] as string,
+    ...(typeof record["description"] === "string" ? { description: record["description"] } : {}),
+  };
+}
+
+/**
+ * LENIENT record validation for LISTING (issue #118): a record is listable
+ * with id/slug/name/kind/domain — `url` is NOT required (the live catalog
+ * omits it for most entries) and is included only when present, never
+ * fabricated. Truly unlistable records (missing a renderable field) throw
+ * {@link CatalogError}.
+ */
+function parseListableRecord(record: Record<string, unknown>): CatalogEntry {
+  const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
+  for (const field of ["id", "slug", "name", "kind", "domain"] as const) {
+    if (typeof record[field] !== "string" || record[field].trim() === "") {
+      throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
+    }
+  }
+  return {
+    id: record["id"] as string,
+    slug: record["slug"] as string,
+    name: record["name"] as string,
+    kind: record["kind"] as string,
+    domain: record["domain"] as string,
+    ...(typeof record["url"] === "string" && record["url"].trim() !== ""
+      ? { url: record["url"] as string }
+      : {}),
     ...(typeof record["description"] === "string" ? { description: record["description"] } : {}),
   };
 }
@@ -178,9 +213,11 @@ export interface CatalogListResult {
  * Lists the whole catalog, optionally filtered by `query` (case-insensitive
  * substring match against name, slug, id, kind, and domain). Throws
  * {@link CatalogError} when the catalog DOCUMENT is unreachable or malformed
- * (never guesses). Individual malformed records are SKIPPED and surfaced in
- * `skipped` — one bad vendor entry (e.g. a missing url) must not take down
- * the whole list (issue #117); a record-level problem is never a silent drop.
+ * (never guesses). Records are validated LENIENTLY for listing: id/slug/name/
+ * kind/domain suffice, `url` is optional (issue #118). Truly unlistable
+ * records are SKIPPED and surfaced in `skipped` — one bad vendor entry must
+ * not take down the whole list (issue #117); a record-level problem is never
+ * a silent drop.
  */
 export async function listCatalogEntries(
   query?: string,
@@ -191,7 +228,7 @@ export async function listCatalogEntries(
   const skipped: CatalogListResult["skipped"] = [];
   for (const record of records) {
     try {
-      entries.push(parseCatalogRecord(record));
+      entries.push(parseListableRecord(record));
     } catch (err) {
       if (err instanceof CatalogError) {
         const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");

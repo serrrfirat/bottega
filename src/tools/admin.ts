@@ -505,11 +505,18 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   name: entry.name,
                   kind: entry.kind,
                   domain: entry.domain,
-                  url: entry.url,
+                  ...(entry.url !== undefined ? { url: entry.url } : {}),
                   ...(entry.description !== undefined ? { description: entry.description } : {}),
                 })),
                 catalog_truncated: truncated,
-                catalog_skipped: catalogSkipped.map((s) => ({ spec_id: s.specId, reason: s.reason })),
+                // Compact skipped diagnostics: total count + up to 3 examples,
+                // never the full wall (issue #118).
+                catalog_skipped: {
+                  count: catalogSkipped.length,
+                  ...(catalogSkipped.length > 0
+                    ? { examples: catalogSkipped.slice(0, 3).map((s) => ({ spec_id: s.specId, reason: s.reason })) }
+                    : {}),
+                },
               }),
             },
           ],
