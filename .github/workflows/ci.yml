@@ -27,24 +27,35 @@ jobs:
       - name: Compose file is valid
         run: docker compose --profile executor config -q
 
-      # Tools image (issues #58/#62): built here in the docker job — NOT in
-      # the fast `ci` job — so the default check/test path stays under 5
+      # Tools image (issues #58/#62/#63): built here in the docker job — NOT
+      # in the fast `ci` job — so the default check/test path stays under 5
       # min. The app image builds FROM it, so the tools image MUST come
       # first; the app build then reuses the cached base layers and only
       # adds the bun install + COPY layers. Pushing/pulling a cached build
       # from a registry is a deploy issue (delivery), not this job's
-      # concern.
-      - name: Build tools image
-        run: docker build -f Dockerfile.tools -t bottega-tools:ci .
+      # concern. Timed so the cold-build delta of the curated set is
+      # visible per run (issue #63): the default set is deliberately lean;
+      # the heavy layer (Dockerfile.tools-heavy) is per-org opt-in and not
+      # built here.
+      - name: Build tools image (timed)
 
       - name: Build app image (inherits the tools base)
         run: docker build -t bottega:ci .
-
-      - name: Tools image ships the curated CLI set v1
         run: |
-          docker run --rm bottega-tools:ci sh -c \
-            'gh --version && jq --version && curl --version && git --version' \
-            >/dev/null
+          start=$(date +%s)
+          docker build -f Dockerfile.tools -t bottega-tools:ci .
+          echo "tools_image_build_seconds=$(( $(date +%s) - start ))"
+
+      - name: Tools image ships the curated CLI set v1.1
+        run: |
+          docker run --rm bottega-tools:ci sh -c '
+            gh --version >/dev/null && jq --version >/dev/null && curl --version >/dev/null && git --version >/dev/null &&
+            node --version >/dev/null && npm --version >/dev/null && pnpm --version >/dev/null && yarn --version >/dev/null &&
+            python3 --version >/dev/null && pip3 --version >/dev/null && uv --version >/dev/null &&
+            gcc --version >/dev/null && make --version >/dev/null && go version >/dev/null &&
+            sqlite3 --version >/dev/null && psql --version >/dev/null &&
+            aws --version >/dev/null && glab --version >/dev/null && yq --version >/dev/null && rg --version >/dev/null
+          ' && echo "tools image smoke OK"
 
       - name: Executor image carries the curated CLIs on PATH
         run: |
