@@ -142,7 +142,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   /** Every tool call audits its policy decision, like the in-session gate. */
   const auditDecision = (
     tool: string,
-    tier: string,
+    tier: Tier,
     decision: Decision,
     reason: string,
     args: unknown,

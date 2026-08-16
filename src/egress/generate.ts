@@ -184,14 +184,10 @@ export function regenerateEgressConfig(
   outPath: string = EGRESS_CONFIG_PATH,
 ): string {
   const snapshots = readPinnedSnapshots(snapshotsDir);
-  const extensionDomains: string[] = [];
-  const extensionEntries: ExtensionEgressEntry[] = [];
-  for (const snapshot of snapshots) {
-    for (const domain of snapshot.manifest.domains) {
-      if (!extensionDomains.includes(domain)) extensionDomains.push(domain);
-    }
-    extensionEntries.push({ extensionId: snapshot.manifest.id, domains: snapshot.manifest.domains });
-  }
+  // mergedEgressDomains prepends the base domains and dedupes, so the raw
+  // per-snapshot domains pass through as-is (order-stable).
+  const extensionDomains = snapshots.flatMap((s) => s.manifest.domains);
+  const extensionEntries = snapshots.map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
   const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;

@@ -107,11 +107,11 @@ export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Pro
       item = await deps.store.claimNextWorkItem();
     } catch (err) {
       console.log(`claim failed: ${(err as Error).message}`);
-      await sleep(pollIntervalMs);
+      await Bun.sleep(pollIntervalMs);
       continue;
     }
     if (!item) {
-      await sleep(pollIntervalMs);
+      await Bun.sleep(pollIntervalMs);
       continue;
     }
     await processItem(deps, cfg, item);
@@ -427,12 +427,6 @@ async function git(args: string[], opts: { cwd?: string; env?: Record<string, st
   if (code !== 0) {
     throw new Error(`git ${args.join(" ")} failed (${code}): ${(err.trim() || "no output").slice(0, 2000)}`);
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
 }
 
 if (import.meta.main) {

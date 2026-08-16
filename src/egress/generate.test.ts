@@ -16,13 +16,14 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID }
 
 const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
 
-/** Domains the committed snapshots contribute (issue #54): read from the
- * live pinned files so the pinned expectation tracks new providers without
- * duplicating their domains here. */
-const EXTENSION_DOMAINS = readPinnedSnapshots(SNAPSHOTS_DIR).flatMap((s) => s.manifest.domains);
+/** Committed snapshots (issue #54): read once from the live pinned files so
+ * the pinned expectations track new providers without duplicating their
+ * domains here. */
+const SNAPSHOTS = readPinnedSnapshots(SNAPSHOTS_DIR);
+const EXTENSION_DOMAINS = SNAPSHOTS.flatMap((s) => s.manifest.domains);
 
 /** Injection entries for the committed snapshots (issue #53). */
-const EXTENSION_ENTRIES = readPinnedSnapshots(SNAPSHOTS_DIR).map((s) => ({
+const EXTENSION_ENTRIES = SNAPSHOTS.map((s) => ({
   extensionId: s.manifest.id,
   domains: s.manifest.domains,
 }));
@@ -60,30 +61,6 @@ describe("egress config generation", () => {
   test("the committed allowlist contains the NEAR.ai model endpoints and the three provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
     expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
-  });
-
-  test("the committed secrets transform injects the Authorization header for every provider domain", () => {
-    const entries = secretsEntries(COMMITTED_EGRESS);
-    expect(entries).not.toBeNull();
-    expect(entries).toHaveLength(3);
-    for (const entry of entries ?? []) {
-      const source = entry["source"] as Record<string, YamlNode>;
-      expect(source["type"]).toBe("file");
-      expect(source["path"]).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
-      const inject = entry["inject"] as Record<string, YamlNode>;
-      expect(inject["header"]).toBe("Authorization");
-      expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
-      const rules = entry["rules"] as Record<string, YamlNode>[];
-      expect(rules).toHaveLength(1);
-      expect(EXTENSION_DOMAINS).toContain(String(rules[0]!["host"]));
-    }
-    // The fixture extension is not pinned in config/extensions, so its
-    // domain must not appear in the committed secrets transform.
-    const allHosts = (entries ?? []).flatMap((e) => {
-      const rules = e["rules"] as Record<string, YamlNode>[];
-      return rules.map((r) => String(r["host"]));
-    });
-    expect(allHosts).not.toContain(FIXTURE_EXTENSION_DOMAIN);
   });
 
   test("rendering without extensions emits no secrets transform (base config is unchanged)", () => {

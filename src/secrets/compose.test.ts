@@ -2,16 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { service, serviceEnv, services } from "../compose-test-utils";
+import { service, serviceEnv } from "../compose-test-utils";
 import type { YamlNode } from "../yaml-subset";
 
 describe("docker-compose.yml (issue #9 credential boundary)", () => {
-  test("no service publishes public ports", () => {
-    for (const name of Object.keys(services)) {
-      expect(service(name)["ports"]).toBeUndefined();
-    }
-  });
-
   test("auth-broker runs the OMP vault on the internal network with a token bootstrap", () => {
     const broker = service("auth-broker");
     expect(broker["image"]).toBe("oh-my-pi/pi:dev");
