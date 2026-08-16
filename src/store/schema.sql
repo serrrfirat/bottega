@@ -57,6 +57,22 @@ CREATE TABLE IF NOT EXISTS org_settings (
   updated_at INTEGER NOT NULL
 );
 
+-- Durable UTC cron jobs (issue #86). The typed action registry validates
+-- action names before insert; the runner disables unknown legacy rows.
+CREATE TABLE IF NOT EXISTS scheduler_jobs (
+  id            TEXT PRIMARY KEY,        -- "sj_<uuid>"
+  action        TEXT NOT NULL,
+  cron          TEXT NOT NULL,           -- five-field UTC cron
+  params        TEXT NOT NULL DEFAULT '{}',
+  space_id      TEXT,
+  created_by    TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  next_fire_at  INTEGER NOT NULL,
+  last_fired_at INTEGER,
+  last_result   TEXT CHECK (last_result IN ('ok','error')),
+  enabled       INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS audit (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,

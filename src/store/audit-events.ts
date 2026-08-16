@@ -26,6 +26,16 @@ export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 /** Memory saved (payload {scope, principal, id, content_hash}). */
 export const MEMORY_WRITE_EVENT = "memory.write";
+/** Scheduler job created (payload {id, action, cron, space_id?}). */
+export const SCHEDULER_JOB_CREATED_EVENT = "scheduler.job_created";
+/** Scheduler job deleted (payload {id}). */
+export const SCHEDULER_JOB_DELETED_EVENT = "scheduler.job_deleted";
+/** Scheduler handler completed (payload {id, action, space_id?, result}). */
+export const SCHEDULER_FIRE_EVENT = "scheduler.fire";
+/** Scheduler skipped an occurrence missed while down (payload {id, action, scheduled_for}). */
+export const SCHEDULER_MISSED_EVENT = "scheduler.missed";
+/** Scheduler could not run a handler (payload {id, action, error}). */
+export const SCHEDULER_ERROR_EVENT = "scheduler.error";
 /** Org/space settings changed (payload {scope, space?, actor, before, after}). */
 export const SETTINGS_CHANGED_EVENT = "settings.changed";
 /** Extension credential resolved through the scope ladder (payload {provider, scope, identity_key, credential_id, broker_credential_id}). */

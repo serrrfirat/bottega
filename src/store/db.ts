@@ -5,6 +5,10 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
 import type { OrgSettings, OrgSettingsInput } from "./org-settings";
+import { KNOWN_ACTIONS } from "../scheduler/actions";
+import { nextCronFire } from "../scheduler/cron";
+import { schedulerJobFromRow, type SchedulerJobRow } from "../scheduler/store";
+import type { SchedulerActionName, SchedulerJob } from "../scheduler/types";
 
 export type Space = {
   id: string;
@@ -165,6 +169,22 @@ export interface Store {
    * OrgSettingsParseError when the input is malformed and writes nothing.
    */
   setOrgSettings(settings: OrgSettingsInput): OrgSettings;
+  /** Durable UTC cron jobs and their last/next fire state (issue #86). */
+  createSchedulerJob(input: {
+    action: string;
+    cron: string;
+    params?: Record<string, string>;
+    spaceId?: string | null;
+    createdBy: string;
+  }): Promise<SchedulerJob>;
+  getSchedulerJob(id: string): Promise<SchedulerJob | null>;
+  listSchedulerJobs(): Promise<SchedulerJob[]>;
+  /** Returns false when no row existed. */
+  deleteSchedulerJob(id: string): Promise<boolean>;
+  updateSchedulerNextFire(id: string, nextFireAt: number): Promise<void>;
+  /** Records a result and advances from `at` to the next cron occurrence. */
+  markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void>;
+  setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
   /** The underlying Database handle — memory providers share this file (#20). */
@@ -173,6 +193,10 @@ export interface Store {
 }
 
 const DEFAULT_DB_PATH = "data/bottega.db";
+
+function isKnownSchedulerAction(action: string): action is SchedulerActionName {
+  return KNOWN_ACTIONS.some((known) => known === action);
+}
 
 /** Allowed state machine moves (issue #10). The atomic claim implements open -> claimed. */
 const ALLOWED_TRANSITIONS: Record<WorkItemState, readonly WorkItemState[]> = {
@@ -280,6 +304,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
 
   const getSpaceStmt = db.query("SELECT * FROM spaces WHERE id = ?");
   const getWorkItemStmt = db.query("SELECT * FROM work_items WHERE id = ?");
+  const getSchedulerJobStmt = db.query("SELECT * FROM scheduler_jobs WHERE id = ?");
 
   async function getOrCreateSpace(input: {
     platform: "slack" | "telegram";
@@ -448,6 +473,84 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .all(provider) as ExtensionCredential[];
   }
 
+  async function createSchedulerJob(input: {
+    action: string;
+    cron: string;
+    params?: Record<string, string>;
+    spaceId?: string | null;
+    createdBy: string;
+  }): Promise<SchedulerJob> {
+    if (!isKnownSchedulerAction(input.action)) {
+      throw new Error(`unknown scheduler action: ${input.action}`);
+    }
+    const params = input.params ?? {};
+    if (Object.values(params).some((value) => typeof value !== "string")) {
+      throw new Error("scheduler job params must contain only string values");
+    }
+    const id = `sj_${randomUUID()}`;
+    const createdAt = Date.now();
+    const nextFireAt = nextCronFire(input.cron, createdAt);
+    const row = db
+      .query(
+        `INSERT INTO scheduler_jobs
+         (id, action, cron, params, space_id, created_by, created_at, next_fire_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING *`,
+      )
+      .get(
+        id,
+        input.action,
+        input.cron,
+        JSON.stringify(params),
+        input.spaceId ?? null,
+        input.createdBy,
+        createdAt,
+        nextFireAt,
+      ) as SchedulerJobRow;
+    return schedulerJobFromRow(row);
+  }
+
+  async function getSchedulerJob(id: string): Promise<SchedulerJob | null> {
+    const row = getSchedulerJobStmt.get(id) as SchedulerJobRow | null;
+    return row ? schedulerJobFromRow(row) : null;
+  }
+
+  async function listSchedulerJobs(): Promise<SchedulerJob[]> {
+    const rows = db
+      .query("SELECT * FROM scheduler_jobs ORDER BY created_at, id")
+      .all() as SchedulerJobRow[];
+    return rows.map(schedulerJobFromRow);
+  }
+
+  async function deleteSchedulerJob(id: string): Promise<boolean> {
+    return db.query("DELETE FROM scheduler_jobs WHERE id = ?").run(id).changes > 0;
+  }
+
+  async function updateSchedulerNextFire(id: string, nextFireAt: number): Promise<void> {
+    if (!Number.isSafeInteger(nextFireAt)) throw new Error("scheduler nextFireAt must be a safe integer");
+    const result = db.query("UPDATE scheduler_jobs SET next_fire_at = ? WHERE id = ?").run(nextFireAt, id);
+    if (result.changes === 0) throw new Error(`scheduler job not found: ${id}`);
+  }
+
+  async function markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void> {
+    if (!Number.isSafeInteger(at)) throw new Error("scheduler fire time must be a safe integer");
+    const row = getSchedulerJobStmt.get(id) as SchedulerJobRow | null;
+    if (!row) throw new Error(`scheduler job not found: ${id}`);
+    const nextFireAt = nextCronFire(row.cron, at);
+    db.query(
+      `UPDATE scheduler_jobs
+       SET last_fired_at = ?, last_result = ?, next_fire_at = ?
+       WHERE id = ?`,
+    ).run(at, result, nextFireAt, id);
+  }
+
+  async function setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void> {
+    const result = db
+      .query("UPDATE scheduler_jobs SET enabled = ? WHERE id = ?")
+      .run(enabled ? 1 : 0, id);
+    if (result.changes === 0) throw new Error(`scheduler job not found: ${id}`);
+  }
+
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
     const t = Date.now();
     const cutoff = t - olderThanMs;
@@ -539,6 +642,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     listExtensionCredentials,
     getOrgSettings,
     setOrgSettings,
+    createSchedulerJob,
+    getSchedulerJob,
+    listSchedulerJobs,
+    deleteSchedulerJob,
+    updateSchedulerNextFire,
+    markSchedulerFired,
+    setSchedulerJobEnabled,
     appendAudit,
     listAudit,
     getDb: () => db,

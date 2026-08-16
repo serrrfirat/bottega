@@ -148,6 +148,12 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   stack_health: "write",
   deploy_info: "read",
   first_run_wizard: "write",
+  list_scheduler_jobs: "read",
+  // Proactive-layer tools (issues #86, #91): scheduler mutations stay
+  // exec-tier, listing is read-only, and KB ingestion is a durable write.
+  create_scheduler_job: "exec",
+  delete_scheduler_job: "exec",
+  kb_ingest: "write",
 };
 
 export interface MemoryInjectionConfig {
