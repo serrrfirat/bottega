@@ -6,7 +6,12 @@ import type {
 } from "./types";
 
 /** The only action names accepted by durable job creation. Handlers are wired elsewhere. */
-export const KNOWN_ACTIONS = ["standup_digest", "reflection", "org_pulse"] as const satisfies readonly SchedulerActionName[];
+export const KNOWN_ACTIONS = [
+  "standup_digest",
+  "reflection",
+  "org_pulse",
+  "recurring_work",
+] as const satisfies readonly SchedulerActionName[];
 
 /** Builds a name-to-handler registry and rejects ambiguous duplicate registrations. */
 export function buildRegistry(actions: SchedulerAction[]): SchedulerActionRegistry {
