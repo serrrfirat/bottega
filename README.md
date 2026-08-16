@@ -186,6 +186,39 @@ registered → resolves → its tool appears in the space agent's toolset → it
 domain lands in the merged egress allowlist. No extension implementations
 ship in this issue — the three providers are their own issues.
 
+#### CLI surface (thick tools image + spawn path)
+
+`kind: "cli"` extensions run curated, preinstalled CLIs — zero client code,
+no SDK. Two pieces (issue #58):
+
+1. **Tools image** (`Dockerfile.tools`) — a separate image from the thin app
+   image, based on the executor base, shipping the curated CLI set v1:
+   `gh`, `jq`, `git`, `curl` (Debian distro packages, installed
+   non-interactively). NO credentials are baked in, ever. The app image is
+   unchanged and independent; the tools image is built in the CI **docker**
+   job (not the fast check/test job) so the default CI stays under 5
+   minutes, and locally via `docker build -f Dockerfile.tools .` for
+   extension development. Push/pull of a cached build from a registry is a
+   deploy concern, not this job's.
+2. **Spawn path** (`src/extensions/tools.ts`) — a cli tool executes the
+   manifest's binary with the manifest's fixed `args` first, then the
+   call's params as `--name value` flags (`--name` alone for boolean
+   true). The child env is the parent env minus credential-named variables
+   (`CREDENTIAL_ENV_RE` in `manifest.ts`), plus the manifest's
+   credential-free `env` delta — a manifest that declares a credential in
+   `cli.env` is rejected (fail closed).
+
+**Credentials never travel via env.** Auth for CLI tools happens at the
+iron-proxy boundary: the executor points `HTTPS_PROXY` at iron-proxy, the
+egress allowlist (`src/egress`) gates which domains are reachable, and the
+proxy injects the credential for the allowlisted domain at request time.
+Per-request credential selection (caller/scope → credential id) is the
+runtime's concern (issue #53); this surface delivers the spawn path and
+the no-credential-in-env guarantee. gRPC-heavy CLIs (gcloud, kubectl) do
+not fit the HTTP-proxy boundary and get partial support (documented
+limitation): they can run for non-authenticated operations, but
+credentialed gRPC calls are not supported.
+
 ### Data flow: "issue shared in Slack gets implemented"
 
 ```mermaid
