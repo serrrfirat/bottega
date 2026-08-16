@@ -1,18 +1,61 @@
-# bottega tools image (issue #58): the executor base (oven/bun:1 + git +
-# ca-certificates, same as the app image) plus the curated CLI set v1 —
-# gh, jq, curl. CLIs are installed non-interactively from the distro repos
-# (Debian trixie); NO credentials are baked in, ever.
+# bottega tools image (issues #58, #63): the executor base (oven/bun:1 + git +
+# ca-certificates, same as the app image) plus the curated CLI set v1.1:
+#   - GitHub/ops:   gh, jq, curl, git, glab, yq (v4), ripgrep
+#   - Node:         nodejs, npm, pnpm, yarn — the base image ships only a bun
+#                   `node` shim (no npm), so the real toolchain is installed
+#   - Python:       python3, pip, uv
+#   - Build:        build-essential (gcc/make), golang
+#   - Databases:    sqlite3, postgresql-client
+#   - Cloud:        aws CLI v2
+# Distro packages are installed non-interactively from Debian trixie;
+# binaries Debian does not ship (aws v2) or ships too old (yq v3, 2019
+# syntax) are pinned via ARG and downloaded from their official releases.
+# NO credentials are baked in, ever.
 #
 # The thin app image (Dockerfile) stays unchanged and independent: this
 # image is built only in the CI docker job (see .github/workflows/ci.yml)
 # or locally for extension development. Auth for these CLIs happens at the
 # iron-proxy boundary (HTTPS_PROXY through the egress allowlist) — the
 # proxy injects the credential per allowlisted domain at request time.
+#
+# The heavy/optional layer (Rust toolchain, kubectl, helm, gcloud) lives in
+# Dockerfile.tools-heavy and is NOT part of the default image: per-org
+# opt-in, built explicitly where needed (README "CLI surface").
 FROM oven/bun:1
 
+# Pins for binaries downloaded from official releases (bump deliberately).
+ARG AWS_CLI_VERSION=2.36.24
+ARG YQ_VERSION=v4.53.3
+
+# Single distro layer: everything Debian trixie ships goes in here. The
+# base image's `node` is a bun shim without npm, so the real nodejs/npm is
+# installed and the shim symlink is repointed to it before the npm-based
+# toolchains (pnpm, yarn) are installed.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates gh jq curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl jq gh \
+        nodejs npm \
+        build-essential golang-go \
+        python3 python3-pip \
+        sqlite3 postgresql-client \
+        ripgrep glab unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/node /usr/local/bin/node \
+    # pnpm@9 pinned: Debian trixie ships node 20, and pnpm 10+ requires
+    # node >= 22.13 (latest pnpm fails hard on node 20).
+    && npm install -g --no-audit --no-fund pnpm@9 yarn \
+    && pip install --no-cache-dir --break-system-packages uv \
+    && rm -rf /root/.npm
+
+# aws CLI v2: official installer, arch-aware (uname -m = x86_64/aarch64).
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m)-${AWS_CLI_VERSION}.zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp/aws-cli \
+    && /tmp/aws-cli/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws-cli
+
+# yq v4 (mikefarah): official binary; release assets use amd64/arm64.
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')" -o /usr/local/bin/yq \
+    && chmod +x /usr/local/bin/yq
 
 WORKDIR /app
 
