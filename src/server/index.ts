@@ -6,7 +6,7 @@ import { pruneDigestMemories } from "../memory/sqlite";
 import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
-import { loadOrgConfig, loadSpacePolicy, type ResponseMode } from "../policy/config";
+import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/config";
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
@@ -66,7 +66,7 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
 
   const store = createStore();
   const audit = createAudit(store);
-  const orgPolicy = loadOrgConfig();
+  const orgPolicy = loadOrgPolicy(store);
   // One memory provider for the whole process: shared by the agent
   // memory tools, the context-injection extension, and digest-on-idle (#42).
   // Chosen from env (#43): MEM0_BASE_URL set → mem0 backend (compose ships

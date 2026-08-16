@@ -32,7 +32,7 @@ import { createStore, recoverStaleWorkItems, type Store, type WorkItem } from ".
 import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
-import { loadOrgConfig } from "./policy/config";
+import { loadOrgPolicy } from "./policy/config";
 import createPolicyExtension from "./policy/extension";
 import { createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
@@ -432,7 +432,7 @@ async function git(args: string[], opts: { cwd?: string; env?: Record<string, st
 if (import.meta.main) {
   const store = createStore();
   const audit = createAudit(store);
-  const orgPolicy = loadOrgConfig();
+  const orgPolicy = loadOrgPolicy(store);
   mkdirSync("data/omp-agent", { recursive: true });
   // Pre-approved session: the work item's pickup approval IS the
   // authorization for allowlisted exec-tier tools (bash) inside the

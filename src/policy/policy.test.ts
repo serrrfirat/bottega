@@ -21,6 +21,8 @@ import {
   defaultPolicy,
   isKnownTool,
   loadOrgConfig,
+  loadOrgPolicy,
+  loadSpacePolicy,
   orgCredentialsAllowed,
   parseOrgConfigYaml,
   resolveTier,
@@ -865,5 +867,132 @@ describe("policy extension wiring", () => {
     const payload = await lastAudit("policy.decision");
     expect(payload).toMatchObject({ tool: "weather.current", decision: "deny" });
     expect(String(payload.reason)).toContain("known tool table");
+  });
+});
+
+describe("DB-first org policy (issue #67)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "bottega-dbfirst-"));
+  const store = createStore(join(dir, "test.db"));
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeConfig(text: string): void {
+    writeFileSync(join(dir, "config.yml"), text);
+  }
+
+  test("DB settings override the config-file floor; untouched keys keep the file", () => {
+    writeConfig(`
+tools:
+  bash: allow
+approvals:
+  timeout_minutes: 5
+  always_approve:
+    - bash
+response_mode: always
+memory:
+  injection:
+    enabled: true
+    max_entries: 5
+extensions:
+  allow:
+    - linear
+`);
+    store.setOrgSettings({
+      approvals: { timeout_minutes: 9, always_approve: [] },
+      response_mode: "request-only",
+      memory: { injection: { enabled: false, max_entries: 3 } },
+      extensions: { allow: [], deny: ["attio"], org_credentials: "deny" },
+    });
+    const p = loadOrgPolicy(store, dir);
+    expect(p.ok).toBe(true);
+    expect(p.timeoutMinutes).toBe(9);
+    expect(p.alwaysApprove).toEqual([]);
+    expect(p.responseMode).toBe("request-only");
+    expect(p.memory.injection).toEqual({ enabled: false, maxEntries: 3 });
+    expect(p.extensionsAllow).toEqual([]);
+    expect(p.extensionsDeny).toEqual(["attio"]);
+    expect(p.orgCredentials).toBe("deny");
+    // Keys the DB does not set keep the file floor.
+    expect(toolAction(p, "bash")).toBe("allow");
+  });
+
+  test("no DB row: the file-only path is unchanged", () => {
+    const s = createStore(join(dir, "fileonly.db"));
+    try {
+      writeConfig("tools:\n  bash: deny\napprovals:\n  timeout_minutes: 11\n");
+      const p = loadOrgPolicy(s, dir);
+      expect(p.ok).toBe(true);
+      expect(p.timeoutMinutes).toBe(11);
+      expect(toolAction(p, "bash")).toBe("deny");
+      expect(p.responseMode).toBe("always");
+    } finally {
+      s.close();
+    }
+  });
+
+  test("no config file: DB settings sit on the built-in defaults", () => {
+    const emptyDir = mkdtempSync(join(tmpdir(), "bottega-dbfirst-nofile-"));
+    const s = createStore(join(emptyDir, "test.db"));
+    try {
+      s.setOrgSettings({ response_mode: "mention", approvals: { timeout_minutes: 7 } });
+      const p = loadOrgPolicy(s, emptyDir);
+      expect(p.ok).toBe(true);
+      expect(p.responseMode).toBe("mention");
+      expect(p.timeoutMinutes).toBe(7);
+      expect(toolAction(p, "read")).toBe("deny"); // fail-closed default floor
+      expect(p.memory.injection).toEqual({ enabled: true, maxEntries: 5 });
+    } finally {
+      s.close();
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed DB settings fail the policy closed (never a silent fallback)", () => {
+    const s = createStore(join(dir, "malformed.db"));
+    try {
+      s.getDb()
+        .query("INSERT INTO org_settings (id, settings, updated_at) VALUES (1, ?, ?)")
+        .run('{"approvals": "nope"}', Date.now());
+      const p = loadOrgPolicy(s, dir);
+      expect(p.ok).toBe(false);
+      expect(p.errors[0]).toContain("org_settings");
+      expect(decidePolicyCall(p, "read", false).decision).toBe("deny");
+      expect(decidePolicyCall(p, "read", false).reason).toContain("policy invalid");
+    } finally {
+      s.close();
+    }
+  });
+
+  test("the space overlay wins over both: tightens the DB-merged org, loosening is clamped", async () => {
+    writeConfig("response_mode: always\n");
+    store.setOrgSettings({ response_mode: "mention" });
+    const org = loadOrgPolicy(store, dir);
+    expect(org.responseMode).toBe("mention"); // DB beats file
+    // Overlay tightening applies on top of the DB value.
+    const tight = await store.getOrCreateSpace({ platform: "slack", channel_id: "DBF1" });
+    await store.updatePolicy(tight.id, JSON.stringify({ response_mode: "request-only" }));
+    expect((await loadSpacePolicy(org, store, tight.id)).responseMode).toBe("request-only");
+    // Overlay loosening is clamped to the DB value (tighten rule).
+    const loose = await store.getOrCreateSpace({ platform: "slack", channel_id: "DBF2" });
+    await store.updatePolicy(loose.id, JSON.stringify({ response_mode: "always" }));
+    expect((await loadSpacePolicy(org, store, loose.id)).responseMode).toBe("mention");
+  });
+
+  test("overlay extensions tighten a DB-set allowlist", async () => {
+    writeConfig("extensions:\n  allow:\n    - linear\n");
+    store.setOrgSettings({ extensions: { allow: ["linear", "github"] } });
+    const org = loadOrgPolicy(store, dir);
+    expect(org.extensionsAllow).toEqual(["linear", "github"]); // DB replaces the file list
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "DBF3" });
+    // Overlay removes github from the DB allowlist and adds attio to deny.
+    await store.updatePolicy(space.id, JSON.stringify({ extensions: { allow: ["github"], deny: ["attio"] } }));
+    const eff = await loadSpacePolicy(org, store, space.id);
+    expect(eff.extensionsAllow).toEqual(["linear"]);
+    expect(eff.extensionsDeny).toEqual(["attio"]);
+    expect(decideExtensionCall(eff, "linear").decision).toBe("allow");
+    expect(decideExtensionCall(eff, "github").decision).toBe("deny"); // removed by the overlay
   });
 });

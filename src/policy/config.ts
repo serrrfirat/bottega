@@ -34,6 +34,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { EXTENSION_ID_RE } from "../extensions/manifest";
 import type { Store } from "../store/db";
+import type { OrgSettings } from "../store/org-settings";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 export type Tier = "read" | "write" | "exec";
@@ -704,6 +705,57 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
   }
 
   return out;
+}
+
+/**
+ * Merges org DB settings onto the config-file floor (issue #67): the DB is
+ * authoritative — a knob the settings blob sets OVERRIDES the file value,
+ * looser or tighter (unlike the space overlay, which can only tighten);
+ * knobs the blob does not set keep the file value. Malformed settings never
+ * reach this function: the store helpers throw and loadOrgPolicy fails the
+ * policy closed. `repos`/`models` are validated in the blob but consumed
+ * outside PolicyConfig (Part B) and are not merged here.
+ */
+export function applyOrgSettings(file: PolicyConfig, settings: OrgSettings): PolicyConfig {
+  const out = clonePolicy(file);
+  const approvals = settings.approvals;
+  if (approvals) {
+    if (approvals.timeoutMinutes !== undefined) out.timeoutMinutes = approvals.timeoutMinutes;
+    if (approvals.alwaysApprove !== undefined) out.alwaysApprove = [...approvals.alwaysApprove];
+  }
+  if (settings.responseMode !== undefined) out.responseMode = settings.responseMode;
+  const memory = settings.memoryInjection;
+  if (memory) {
+    if (memory.enabled !== undefined) out.memory.injection.enabled = memory.enabled;
+    if (memory.maxEntries !== undefined) out.memory.injection.maxEntries = memory.maxEntries;
+  }
+  const extensions = settings.extensions;
+  if (extensions) {
+    if (extensions.allow !== undefined) out.extensionsAllow = [...extensions.allow];
+    if (extensions.deny !== undefined) out.extensionsDeny = [...extensions.deny];
+    if (extensions.orgCredentials !== undefined) out.orgCredentials = extensions.orgCredentials;
+  }
+  return out;
+}
+
+/**
+ * Loads the org policy DB-first (issue #67): the config-file floor
+ * (config.yml, else built-in defaults) is overridden by the org_settings
+ * singleton when a row exists; the per-space overlay still applies on top
+ * via loadSpacePolicy. A malformed settings blob fails the whole policy
+ * closed (every decision denies) — never a silent fallback to file values.
+ * Sync: bun:sqlite is synchronous and the boot loaders are sync.
+ */
+export function loadOrgPolicy(store: Pick<Store, "getOrgSettings">, dir?: string): PolicyConfig {
+  const policy = loadOrgConfig(dir);
+  if (!policy.ok) return policy;
+  let settings: OrgSettings | null;
+  try {
+    settings = store.getOrgSettings();
+  } catch (err) {
+    return structuralError(policy, `org_settings: ${(err as Error).message}`);
+  }
+  return settings ? applyOrgSettings(policy, settings) : policy;
 }
 
 /**

@@ -69,7 +69,7 @@ import { createAudit } from "../policy/audit";
 import {
   applySpaceOverlay,
   decidePolicyCall,
-  loadOrgConfig,
+  loadOrgPolicy,
   resolveTier,
   type Decision,
   type PolicyConfig,
@@ -437,7 +437,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
 if (import.meta.main) {
   const dbPath = process.env.BOTTEGA_DB_PATH ?? "data/bottega.db";
   const store = createStore(dbPath);
-  const orgPolicy = loadOrgConfig(process.env.BOTTEGA_CONFIG_DIR);
+  const orgPolicy = loadOrgPolicy(store, process.env.BOTTEGA_CONFIG_DIR);
 
   // Per-session space: apply the space's overlay so the session's policy
   // floor is enforced (mirrors policyFor in src/policy/extension.ts).
