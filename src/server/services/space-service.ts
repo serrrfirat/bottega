@@ -4,6 +4,7 @@ import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
+import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -39,6 +40,40 @@ export interface SpaceServiceDeps {
    * next cold start (sessions are disposed after the idle timeout).
    */
   responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
+  /**
+   * Connect capability (issue #61): when wired, inbound messages matching
+   * the narrow connect patterns ({@link parseConnectIntent}) route directly
+   * to the connect capability — no agent tool call, no session. Works
+   * identically for OMP, ACP, and any future surface; humans never depend
+   * on the agent having the tool. Everything else stays agent territory.
+   */
+  connect?: ConnectExtensionDeps;
+}
+
+/** A connect-intent message parsed by {@link parseConnectIntent}. */
+export interface ConnectIntent {
+  extension: string;
+  scope: ConnectScope;
+}
+
+/**
+ * Parses a Slack message into a connect intent (issue #61). Narrow, exact
+ * shapes only — everything else is natural-language agent territory:
+ *
+ *   `connect <extension>`         → scope "personal" (the sender's account)
+ *   `connect <extension> as org`  → scope "org" (privileged: policy gate +
+ *                                   approval via the space's router)
+ *   `connect <extension> as me`   → scope "personal"
+ *
+ * Matching is case-insensitive over the whole trimmed phrase; the
+ * extension token is a registry-style id (`[A-Za-z0-9._-]`). Any
+ * deviation — extra words, punctuation, `connect X Y`, api keys — returns
+ * null and stays with the agent.
+ */
+export function parseConnectIntent(text: string): ConnectIntent | null {
+  const match = /^connect\s+([A-Za-z0-9._-]+)(?:\s+as\s+(org|me))?$/i.exec(text.trim());
+  if (!match) return null;
+  return { extension: match[1]!, scope: match[2]?.toLowerCase() === "org" ? "org" : "personal" };
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -106,6 +141,7 @@ export class SpaceService {
   readonly #digestPrune: ((spaceId: string, keep: number) => Promise<void> | void) | undefined;
   readonly #digestTimeoutMs: number;
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
+  readonly #connect: ConnectExtensionDeps | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
@@ -149,10 +185,23 @@ export class SpaceService {
     this.#digestPrune = deps.digestPrune;
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
+    this.#connect = deps.connect;
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
     try {
+      // Connect intent seam (issue #61): exact `connect X` / `connect X as
+      // org|me` shapes route straight to the connect capability — no agent
+      // tool call, no session cold-start. Non-matching messages (anything
+      // with extra words, punctuation, or keys) stay agent territory.
+      const connect = this.#connect;
+      if (connect) {
+        const intent = parseConnectIntent(msg.text);
+        if (intent) {
+          await this.#handleConnectIntent(msg, intent, connect);
+          return;
+        }
+      }
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) {
         // Session is mid-dispose: drop the message and audit the drop.
@@ -179,6 +228,23 @@ export class SpaceService {
   async stop(): Promise<void> {
     const live = [...this.#sessions.values()];
     await Promise.all(live.map((entry) => this.#disposeSession(entry.spaceId)));
+  }
+
+  /**
+   * Runs a parsed connect intent against the connect capability and posts
+   * the outcome to the space (threaded under the intent message, like a
+   * normal reply). Personal connects run for the sender with no gate; org
+   * connects cross the capability's policy gate (Slack approval router).
+   * Failures inside connectExtension are outcomes — posted, never thrown.
+   */
+  async #handleConnectIntent(msg: SlackMessage, intent: ConnectIntent, deps: ConnectExtensionDeps): Promise<void> {
+    this.#lastInboundTs.set(msg.spaceId, msg.ts);
+    this.#lastPrincipal.set(msg.spaceId, msg.principal);
+    const outcome = await connectExtension(
+      { extension: intent.extension, scope: intent.scope, actor: msg.principal, spaceId: msg.spaceId },
+      deps,
+    );
+    await this.#adapter.postMessage(msg.spaceId, outcome.message, this.#replyOpts(msg.spaceId));
   }
 
   /** Returns null when the space's session is mid-dispose (message must be dropped). */

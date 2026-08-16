@@ -94,10 +94,15 @@ interface AgentDriver {
   closed); ask-human routes through the same Slack button `ApprovalRouter`
   as the OMP driver (issue #44), or `DenyRouter` in headless contexts.
   With `agent.driver:
-  acp`, the bottega MCP server (memory.save/search, issue #25) attaches to
-  each session so bottega's own tools stay reachable. The tradeoff vs the
-  OMP driver is interception depth: ACP gives allow/deny only, no arg
-  rewriting or output redaction.
+  acp`, the bottega MCP server attaches to each session so bottega's own
+  tools stay reachable. The MCP surface is the **universal agent seam**
+  (issues #25/#61): memory (memory.save/search), the connect capability
+  (connect_extension), and every registered extension's manifest tools —
+  executed server-side through the same policy gate → credential ladder →
+  egress boundary → audit spine as in-session OMP tool calls, so any agent
+  (OMP, ACP, or future) gets identical enforcement. The tradeoff vs the OMP
+  driver is interception depth: ACP gives allow/deny only, no arg rewriting
+  or output redaction.
 
 ### Policy & approvals
 
@@ -215,6 +220,23 @@ binding + policy**:
    denied calls never resolve a credential. The broker secret fetch that
    feeds the boundary is the real-provider issue's wiring; until then calls
    fail closed at the boundary.
+6. **Agent-agnostic surface** (`src/mcp/server.ts`, issue #61) — the bottega
+   MCP server (attached to every ACP session via `mcpServers`, #26)
+   advertises `connect_extension` + each registered extension's manifest
+   tools and executes them **server-side** through the same #53 runtime /
+   #52 connect capability. The gate, ladder, boundary, and audit apply
+   identically to every agent — no per-agent adapters. Headless MCP
+   contexts have no approval channel: ask-human fails closed (DenyRouter).
+7. **Connect intent seam** (`src/server/services/space-service.ts`, issue
+   #61) — inbound Slack messages matching the narrow patterns
+   `connect <extension>`, `connect <extension> as org`, `connect
+   <extension> as me` route directly to the connect capability: no agent
+   tool call, no session. Exact shapes only (case-insensitive; anything
+   with extra words, punctuation, or keys stays natural-language agent
+   territory). Bare / `as me` connects the sender's personal account
+   (unprivileged); `as org` crosses the policy gate with the space's
+   Slack approval router. api_key-type extensions still need the agent
+   tool (or CLI) to supply the key.
 
 The test-only fixture extension (`fixture.ts`) proves the shape end to end:
 registered → resolves → its tool appears in the space agent's toolset → its
@@ -339,7 +361,7 @@ src/
   store/            db.ts, schema.sql
   tools/            work-items.ts, memory.ts, helpers.ts
   memory/           sqlite.ts, mem0.ts, types.ts (providers behind one interface)
-  mcp/              server.ts (bottega-hosted MCP memory surface, #25)
+  mcp/              server.ts (bottega-hosted MCP surface: memory + connect + extension tools, #25/#61)
   executor.ts       containerized work-item runner (claim → PR)
   yaml-subset.ts    shared strict YAML-subset parser (configs + tests)
   egress/           generate.ts (allowlist from extension domains) + tests: compose topology, egress.yml, iron-proxy leg

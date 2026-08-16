@@ -1,10 +1,16 @@
 import { describe, expect, test, vi } from "bun:test";
-import type { Store } from "../../store/db";
+import type { Store, ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE } from "./space-service";
+import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, parseConnectIntent } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
+import { parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
+import type { ConnectExtensionDeps } from "../../extensions/connect";
+import { createFixtureRegistry } from "../../extensions/fixture";
+import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
+import type { AuditModule } from "../../policy/audit";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-events";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests
@@ -952,6 +958,214 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await service.handleInboundMessage(msg());
 
     expect(driver.created[0].opts.appendSystemPrompt).toBeUndefined();
+    await service.stop();
+  });
+});
+
+describe("parseConnectIntent (issue #61)", () => {
+  test("exact connect shapes parse; everything else is null", () => {
+    expect(parseConnectIntent("connect github")).toEqual({ extension: "github", scope: "personal" });
+    expect(parseConnectIntent("connect github as org")).toEqual({ extension: "github", scope: "org" });
+    expect(parseConnectIntent("connect github as me")).toEqual({ extension: "github", scope: "personal" });
+    expect(parseConnectIntent("connect fixture.weather as org")).toEqual({ extension: "fixture.weather", scope: "org" });
+    // Case-insensitive keyword + scope, whole-phrase match.
+    expect(parseConnectIntent("Connect GitHub as Org")).toEqual({ extension: "GitHub", scope: "org" });
+    expect(parseConnectIntent("  connect linear as me  ")).toEqual({ extension: "linear", scope: "personal" });
+
+    // Any deviation stays agent territory.
+    expect(parseConnectIntent("connect github please")).toBeNull();
+    expect(parseConnectIntent("can you connect github")).toBeNull();
+    expect(parseConnectIntent("connect github as org now")).toBeNull();
+    expect(parseConnectIntent("connect github with key 123")).toBeNull();
+    expect(parseConnectIntent("connect github, please")).toBeNull();
+    expect(parseConnectIntent("connect")).toBeNull();
+    expect(parseConnectIntent("")).toBeNull();
+    expect(parseConnectIntent("connection github")).toBeNull();
+  });
+});
+
+describe("SpaceService connect intent (issue #61)", () => {
+  /** Approved-request router for org connects; DenyRouter is the default. */
+  class RecordingRouter implements ApprovalRouter {
+    readonly requests: ApprovalRequest[] = [];
+    constructor(private resolution: ApprovalResolution = { approved: true }) {}
+    async request(d: ApprovalRequest): Promise<ApprovalResolution> {
+      this.requests.push(d);
+      return this.resolution;
+    }
+  }
+
+  interface ConnectHarness {
+    deps: ConnectExtensionDeps;
+    adapter: SlackAdapter;
+    posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
+    store: Store;
+    driver: FakeDriver;
+    brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }>;
+    audit: Array<{ space_id?: string | null; actor: string; event_type: string; payload: unknown }>;
+    rows: ExtensionCredential[];
+  }
+
+  function makeConnectHarness(opts: { router?: ApprovalRouter } = {}): ConnectHarness {
+    const { adapter, posts } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
+    const audit: Array<{ space_id?: string | null; actor: string; event_type: string; payload: unknown }> = [];
+    const rows: ExtensionCredential[] = [];
+    const registry = createFixtureRegistry();
+    const deps: ConnectExtensionDeps = {
+      registry,
+      store: {
+        upsertExtensionCredential: async (input: {
+          provider: string;
+          identityKey: string;
+          owner: string | null;
+          scope: "org" | "personal";
+          brokerCredentialId: number;
+        }) => {
+          const credential: ExtensionCredential = {
+            id: `cred_${rows.length + 1}`,
+            provider: input.provider,
+            identity_key: input.identityKey,
+            owner: input.owner,
+            scope: input.scope,
+            broker_credential_id: input.brokerCredentialId,
+            created_at: 0,
+          };
+          rows.push(credential);
+          return credential;
+        },
+      } as unknown as ConnectExtensionDeps["store"],
+      audit: {
+        appendAudit: async (entry) => {
+          audit.push(entry);
+          return audit.length;
+        },
+        listAudit: async () => [],
+      } as AuditModule,
+      broker: async (input) => {
+        brokerCalls.push(input);
+        return { identityKey: null, brokerCredentialId: 9 };
+      },
+      gate: {
+        loadPolicy: () => Promise.resolve(parseOrgConfigYaml("tools:\n  connect_extension: allow\n")),
+        router: opts.router ?? DenyRouter,
+      },
+    };
+    return { deps, adapter, posts, store, driver, brokerCalls, audit, rows };
+  }
+
+  test("connect <ext> as me connects for the sender with no agent turn", async () => {
+    const h = makeConnectHarness();
+    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect fixture.weather as me", ts: "2.2" }));
+
+    // No session, no agent tool call: the capability answered directly.
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts).toEqual([
+      { spaceId: "slack:C1", text: "Fixture Weather connected as @U1", opts: { threadTs: "2.2" } },
+    ]);
+    expect(h.brokerCalls).toEqual([{ provider: "fixture.weather", credentialType: "api_key" }]);
+    expect(h.rows).toHaveLength(1);
+    expect(h.rows[0]!.scope).toBe("personal");
+    expect(h.rows[0]!.owner).toBe("U1");
+    expect(h.rows[0]!.broker_credential_id).toBe(9);
+
+    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
+    expect(connected).toMatchObject({
+      space_id: "slack:C1",
+      actor: "U1",
+      payload: { extension: "fixture.weather", scope: "personal", owner: "U1" },
+    });
+    // Personal connects are unprivileged: no policy decision row.
+    expect(h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT)).toHaveLength(0);
+  });
+
+  test("bare connect <ext> defaults to the sender's personal account", async () => {
+    const h = makeConnectHarness();
+    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "Connect fixture.weather", principal: "U2", ts: "3.3" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("Fixture Weather connected as @U2");
+    expect(h.rows[0]!.scope).toBe("personal");
+    expect(h.rows[0]!.owner).toBe("U2");
+  });
+
+  test("connect <ext> as org crosses the gate; denied without approval", async () => {
+    const h = makeConnectHarness({ router: DenyRouter });
+    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("policy: approval denied");
+    expect(h.brokerCalls).toHaveLength(0);
+    expect(h.rows).toHaveLength(0);
+    const decisions = h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.payload).toMatchObject({ tool: "connect_extension", decision: "ask-human" });
+  });
+
+  test("connect <ext> as org with an approving router connects the org account", async () => {
+    const h = makeConnectHarness({ router: new RecordingRouter() });
+    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("Fixture Weather connected as an organization");
+    expect(h.rows).toHaveLength(1);
+    expect(h.rows[0]!.scope).toBe("org");
+    expect(h.rows[0]!.owner).toBeNull();
+    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
+    expect(connected!.payload).toMatchObject({ extension: "fixture.weather", scope: "org", owner: null });
+  });
+
+  test("unknown extensions post the failure without a session", async () => {
+    const h = makeConnectHarness();
+    const service = new SpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect nope.xyz as me" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toContain('unknown extension "nope.xyz"');
+    expect(h.brokerCalls).toHaveLength(0);
+  });
+
+  test("non-matching messages stay agent territory (session gets the prompt)", async () => {
+    const h = makeConnectHarness();
+    const texts = [
+      "connect fixture.weather please",
+      "can you connect github as an org?",
+      "connect fixture.weather as org now",
+      "what weather do you know?",
+    ];
+    for (const text of texts) {
+      const { adapter } = fakeAdapter();
+      const { store } = fakeStore();
+      const driver = new FakeDriver();
+      const service = new SpaceService({ store, adapter, driver, connect: h.deps });
+      await service.handleInboundMessage(msg({ text }));
+      expect(driver.created).toHaveLength(1);
+      expect(driver.last().prompts[0]!.text).toBe(text);
+      await service.stop();
+    }
+  });
+
+  test("without connect deps every message goes to the agent", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ text: "connect fixture.weather as me" }));
+
+    expect(driver.created).toHaveLength(1);
+    expect(driver.last().prompts[0]!.text).toBe("connect fixture.weather as me");
     await service.stop();
   });
 });

@@ -16,8 +16,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createStore, type AuditRow, type Store } from "../store/db";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { createStore, type AuditRow, type Store, type ExtensionCredential } from "../store/db";
 import { sha256Hex } from "../tools/memory";
+import { createSqliteMemoryProvider } from "../memory/sqlite";
+import { createAudit } from "../policy/audit";
+import { DenyRouter } from "../policy/approval-router";
+import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
+import {
+  APPROVAL_REQUESTED_EVENT,
+  APPROVAL_RESOLVED_EVENT,
+  EXTENSION_CALL_EVENT,
+  EXTENSION_CONNECTED_EVENT,
+  EXTENSION_CREDENTIAL_RESOLVED_EVENT,
+  POLICY_DECISION_EVENT,
+} from "../store/audit-events";
+import type { CredentialBoundary } from "../extensions/boundary";
+import type { BrokerConnector } from "../extensions/connect";
+import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "../extensions/fixture";
+import type { ExtensionManifest, McpBinding } from "../extensions/manifest";
+import { createExtensionRuntime } from "../extensions/runtime";
+import { createMemoryMcpServer } from "./server";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
 
@@ -26,6 +48,8 @@ interface LaunchOpts {
   /** Space overlay JSON; seeds a space row and boots the server pinned to it. */
   policyJson?: string;
   defaultPrincipal?: string;
+  /** Pinned snapshots seeded into a temp extensions dir (BOTTEGA_EXTENSIONS_DIR). */
+  extensions?: ExtensionManifest[];
 }
 
 interface Harness {
@@ -63,6 +87,24 @@ async function launch(opts: LaunchOpts): Promise<Harness> {
   };
   if (spaceId) env.BOTTEGA_SPACE_ID = spaceId;
   if (opts.defaultPrincipal) env.BOTTEGA_MCP_DEFAULT_PRINCIPAL = opts.defaultPrincipal;
+  // Pin an empty extensions dir so the spawned server never picks up the
+  // repo's real snapshots via the cwd-relative default; seed it when the
+  // test asks for extensions (issue #61).
+  const extDir = join(dir, "extensions");
+  mkdirSync(extDir, { recursive: true });
+  for (const manifest of opts.extensions ?? []) {
+    writeFileSync(
+      join(extDir, `${manifest.id}.json`),
+      JSON.stringify({
+        schema: "bottega.extension-snapshot.v1",
+        extensionId: manifest.id,
+        pinnedAt: "2026-08-16T00:00:00.000Z",
+        source: { catalog: "https://integrations.sh/api.json", specId: manifest.id, vendorOfficial: true, reviewed: true },
+        manifest,
+      }),
+    );
+  }
+  env.BOTTEGA_EXTENSIONS_DIR = extDir;
 
   const transport = new StdioClientTransport({
     command: "bun",
@@ -104,11 +146,22 @@ interface ToolCallResult {
 const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n";
 
 describe("MCP server conformance (spawned entrypoint)", () => {
-  test("initialize + tools/list returns memory.save and memory.search with schemas", async () => {
+  test("initialize + tools/list returns the capability tools (memory + connect) with schemas", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
     try {
       const { tools } = await h.client.listTools();
-      expect(tools.map((t) => t.name).sort()).toEqual(["memory.save", "memory.search"]);
+      // connect_extension is a core capability: advertised even when no
+      // extension snapshots are seeded (issue #61).
+      expect(tools.map((t) => t.name).sort()).toEqual(["connect_extension", "memory.save", "memory.search"]);
+
+      const connect = tools.find((t) => t.name === "connect_extension")!;
+      expect((connect.description ?? "").length).toBeGreaterThan(0);
+      const connectProps = connect.inputSchema.properties as Record<string, { type?: string; enum?: string[] }>;
+      expect(Object.keys(connectProps).sort()).toEqual(["api_key", "extension", "scope"]);
+      expect(connectProps.scope?.enum).toEqual(["org", "personal"]);
+      expect(connectProps.extension?.type).toBe("string");
+      expect(connect.inputSchema.required).toContain("extension");
+      expect(connect.inputSchema.required).toContain("scope");
 
       const save = tools.find((t) => t.name === "memory.save")!;
       expect((save.description ?? "").length).toBeGreaterThan(0);
@@ -262,6 +315,342 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       await h.cleanup();
     }
   });
+});
+
+/** Org floor allowing extension calls (unknown default) + memory + connect. */
+const EXT_ALLOW = "tools:\n  unknown: allow\n  memory.save: allow\n  memory.search: allow\n  connect_extension: allow\n";
+
+describe("MCP server extension surface (spawned entrypoint)", () => {
+  test("advertises connect_extension and the registry's manifest tools", async () => {
+    const h = await launch({ configYaml: EXT_ALLOW, extensions: [fixtureManifest()] });
+    try {
+      const { tools } = await h.client.listTools();
+      expect(tools.map((t) => t.name).sort()).toEqual([
+        "connect_extension",
+        "memory.save",
+        "memory.search",
+        FIXTURE_EXTENSION_TOOL,
+      ]);
+
+      const weather = tools.find((t) => t.name === FIXTURE_EXTENSION_TOOL)!;
+      expect((weather.description ?? "").length).toBeGreaterThan(0);
+      const props = weather.inputSchema.properties as Record<string, { type?: string }>;
+      expect(props.city?.type).toBe("string");
+      expect(weather.inputSchema.required).toEqual(["city"]);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("extension tool calls run the runtime: policy allow, ladder fail-closed, audited", async () => {
+    const h = await launch({ configYaml: EXT_ALLOW, extensions: [fixtureManifest()] });
+    try {
+      // No credential seeded: the call clears the gate, then fails closed at
+      // the credential ladder — the provider (unreachable) is never touched.
+      const res = (await h.client.callTool({
+        name: FIXTURE_EXTENSION_TOOL,
+        arguments: { city: "Lisbon" },
+      })) as ToolCallResult;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text ?? "").toContain("no fixture.weather credential is available");
+
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(payload(decisions[0]!).tool).toBe(FIXTURE_EXTENSION_TOOL);
+      expect(payload(decisions[0]!).decision).toBe("allow");
+      expect(payload(decisions[0]!).tier).toBe("read");
+      const calls = await auditRows(h.store, EXTENSION_CALL_EVENT);
+      expect(calls).toHaveLength(1);
+      expect(payload(calls[0]!).decision).toBe("error");
+      expect(payload(calls[0]!).credential_id).toBeNull();
+      expect(await auditRows(h.store, EXTENSION_CREDENTIAL_RESOLVED_EVENT)).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("the session space's overlay denies an extension the org floor allows", async () => {
+    const h = await launch({
+      configYaml: EXT_ALLOW,
+      policyJson: JSON.stringify({ extensions: { deny: [FIXTURE_EXTENSION_ID] } }),
+      extensions: [fixtureManifest()],
+    });
+    try {
+      const res = (await h.client.callTool({
+        name: FIXTURE_EXTENSION_TOOL,
+        arguments: { city: "Lisbon" },
+      })) as ToolCallResult;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text ?? "").toContain("denied by this space's policy");
+
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(payload(decisions[0]!).decision).toBe("deny");
+      expect(decisions[0]!.space_id).toBe(h.spaceId!);
+      const calls = await auditRows(h.store, EXTENSION_CALL_EVENT);
+      expect(calls).toHaveLength(1);
+      expect(payload(calls[0]!).decision).toBe("deny");
+      expect(payload(calls[0]!).credential_id).toBeNull();
+      expect(await auditRows(h.store, EXTENSION_CREDENTIAL_RESOLVED_EVENT)).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("MCP server extension surface (in-process deps)", () => {
+  /** Fake egress boundary: records the credential, never touches the proxy. */
+  function makeBoundary(): CredentialBoundary & { calls: ExtensionCredential[] } {
+    const calls: ExtensionCredential[] = [];
+    return {
+      calls,
+      async authorize(credential: ExtensionCredential) {
+        calls.push(credential);
+      },
+    };
+  }
+
+  interface InProcessHarness {
+    client: Client;
+    store: Store;
+    boundary: CredentialBoundary & { calls: ExtensionCredential[] };
+    brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }>;
+    cleanup: () => Promise<void>;
+  }
+
+  /** In-process server with injected runtime deps (real store + audit, fake boundary/broker/transport). */
+  async function makeInProcessHarness(opts: { policy?: PolicyConfig; defaultPrincipal?: string } = {}): Promise<InProcessHarness> {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const registry = createFixtureRegistry();
+    const policy = opts.policy ?? parseOrgConfigYaml(EXT_ALLOW);
+    const boundary = makeBoundary();
+    const brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
+    const broker: BrokerConnector = async (input) => {
+      brokerCalls.push(input);
+      return { identityKey: null, brokerCredentialId: 42 };
+    };
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      // Stub provider MCP server: returns the city echoed back (hermetic —
+      // the fixture's serverUrl is intentionally unreachable).
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const stub = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      stub.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const args = request.params.arguments as Record<string, unknown>;
+        return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+      });
+      void stub.connect(serverTransport);
+      return clientTransport;
+    };
+    const runtime = createExtensionRuntime({
+      registry,
+      store,
+      audit,
+      orgPolicy: policy,
+      router: DenyRouter,
+      boundary,
+      mcpTransport,
+    });
+    const server = createMemoryMcpServer({
+      provider: createSqliteMemoryProvider(store.getDb()),
+      policy,
+      audit,
+      spaceId: "slack:C1",
+      defaultPrincipal: opts.defaultPrincipal ?? "U123",
+      extensions: {
+        runtime,
+        registry,
+        connect: {
+          registry,
+          store,
+          audit,
+          broker,
+          gate: { loadPolicy: () => Promise.resolve(policy), router: DenyRouter, timeoutMs: 1_000 },
+        },
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    void server.connect(serverTransport);
+    const client = new Client({ name: "bottega-mcp-inproc-test", version: "0.0.1" }, { capabilities: {} });
+    await client.connect(clientTransport);
+    return {
+      client,
+      store,
+      boundary,
+      brokerCalls,
+      cleanup: async () => {
+        await client.close();
+        await server.close();
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test("calls a fixture extension tool through the runtime: gate → ladder → boundary → audit", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      await h.store.upsertExtensionCredential({
+        provider: FIXTURE_EXTENSION_ID,
+        identityKey: "email:org@example.com",
+        owner: null,
+        scope: "org",
+        brokerCredentialId: 7,
+      });
+
+      const res = (await h.client.callTool({
+        name: FIXTURE_EXTENSION_TOOL,
+        arguments: { city: "Lisbon" },
+      })) as ToolCallResult;
+      expect(res.isError).not.toBe(true);
+      expect(res.content[0]?.text ?? "").toBe("sunny in Lisbon");
+
+      // Egress boundary received the resolved org credential (metadata only).
+      expect(h.boundary.calls).toHaveLength(1);
+      expect(h.boundary.calls[0]!.scope).toBe("org");
+      expect(h.boundary.calls[0]!.identity_key).toBe("email:org@example.com");
+
+      // Audit trail: policy decision (manifest tier) + ladder resolution + call.
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(payload(decisions[0]!).tool).toBe(FIXTURE_EXTENSION_TOOL);
+      expect(payload(decisions[0]!).decision).toBe("allow");
+      expect(payload(decisions[0]!).tier).toBe("read");
+      const resolutions = await auditRows(h.store, EXTENSION_CREDENTIAL_RESOLVED_EVENT);
+      expect(resolutions).toHaveLength(1);
+      const calls = await auditRows(h.store, EXTENSION_CALL_EVENT);
+      expect(calls).toHaveLength(1);
+      expect(payload(calls[0]!).decision).toBe("allow");
+      expect(payload(calls[0]!).credential_id).toBe(h.boundary.calls[0]!.id);
+      expect(payload(calls[0]!).actor).toBe("U123");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("a policy-denied extension tool fails closed before the ladder", async () => {
+    const h = await makeInProcessHarness({
+      policy: parseOrgConfigYaml(
+        "extensions:\n  deny:\n    - fixture.weather\n" + "tools:\n  unknown: allow\n  connect_extension: allow\n",
+      ),
+    });
+    try {
+      await h.store.upsertExtensionCredential({
+        provider: FIXTURE_EXTENSION_ID,
+        identityKey: "email:org@example.com",
+        owner: null,
+        scope: "org",
+        brokerCredentialId: 7,
+      });
+
+      const res = (await h.client.callTool({
+        name: FIXTURE_EXTENSION_TOOL,
+        arguments: { city: "Lisbon" },
+      })) as ToolCallResult;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text ?? "").toContain("denied by this space's policy");
+
+      expect(h.boundary.calls).toHaveLength(0);
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(payload(decisions[0]!).decision).toBe("deny");
+      const calls = await auditRows(h.store, EXTENSION_CALL_EVENT);
+      expect(calls).toHaveLength(1);
+      expect(payload(calls[0]!).decision).toBe("deny");
+      expect(payload(calls[0]!).credential_id).toBeNull();
+      expect(await auditRows(h.store, EXTENSION_CREDENTIAL_RESOLVED_EVENT)).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_extension personal connects for the session principal and audits", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      const res = (await h.client.callTool({
+        name: "connect_extension",
+        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+      })) as ToolCallResult;
+      expect(res.isError).not.toBe(true);
+      expect(res.content[0]?.text ?? "").toBe("Fixture Weather connected as @U123");
+
+      expect(h.brokerCalls).toEqual([{ provider: FIXTURE_EXTENSION_ID, credentialType: "api_key" }]);
+      const rows = await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.scope).toBe("personal");
+      expect(rows[0]!.owner).toBe("U123");
+
+      const connected = await auditRows(h.store, EXTENSION_CONNECTED_EVENT);
+      expect(connected).toHaveLength(1);
+      expect(connected[0]!.space_id).toBe("slack:C1");
+      expect(payload(connected[0]!)).toMatchObject({
+        extension: FIXTURE_EXTENSION_ID,
+        scope: "personal",
+        owner: "U123",
+      });
+      // Personal connects are unprivileged: no policy decision row.
+      expect(await auditRows(h.store, POLICY_DECISION_EVENT)).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_extension org fails closed without an approval channel", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      const res = (await h.client.callTool({
+        name: "connect_extension",
+        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "org" },
+      })) as ToolCallResult;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text ?? "").toContain("policy: approval denied");
+
+      // The broker is never reached and no credential row is written.
+      expect(h.brokerCalls).toHaveLength(0);
+      expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
+
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(payload(decisions[0]!).tool).toBe("connect_extension");
+      expect(payload(decisions[0]!).decision).toBe("ask-human");
+      expect(payload(decisions[0]!).tier).toBe("exec");
+      expect(await auditRows(h.store, APPROVAL_REQUESTED_EVENT)).toHaveLength(1);
+      const resolved = await auditRows(h.store, APPROVAL_RESOLVED_EVENT);
+      expect(resolved).toHaveLength(1);
+      expect(payload(resolved[0]!).approved).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_extension with an unknown extension is a tool error", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      const res = (await h.client.callTool({
+        name: "connect_extension",
+        arguments: { extension: "nope.xyz", scope: "personal" },
+      })) as ToolCallResult;
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text ?? "").toContain("unknown extension");
+      expect(h.brokerCalls).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("invalid connect_extension arguments are protocol errors", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      await expect(
+        h.client.callTool({ name: "connect_extension", arguments: { extension: FIXTURE_EXTENSION_ID } }),
+      ).rejects.toThrow(/scope/);
+      await expect(
+        h.client.callTool({ name: "connect_extension", arguments: { scope: "personal" } }),
+      ).rejects.toThrow(/extension/);
+      await expect(
+        h.client.callTool({ name: "connect_extension", arguments: { extension: 7, scope: "personal" } }),
+      ).rejects.toThrow(/extension/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
 });
 
 describe("MCP server policy + audit enforcement", () => {

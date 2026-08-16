@@ -119,7 +119,7 @@ const DISPOSE_CLOSE_TIMEOUT_MS = 2_000;
  */
 function toEnvPairs(env: Record<string, string>): Array<{ name: string; value: string }> {
   const absolutize: Record<string, string> = {};
-  for (const key of ["BOTTEGA_DB_PATH", "BOTTEGA_CONFIG_DIR"]) {
+  for (const key of ["BOTTEGA_DB_PATH", "BOTTEGA_CONFIG_DIR", "BOTTEGA_EXTENSIONS_DIR"]) {
     const value = env[key];
     if (value && !isAbsolute(value)) absolutize[key] = resolve(process.cwd(), value);
   }

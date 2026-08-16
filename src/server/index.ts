@@ -11,6 +11,7 @@ import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
 import { createAcpDriver } from "./drivers/acp-driver";
+import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { extensionToolDefinitions } from "../extensions/tools";
@@ -140,6 +141,11 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
               env: {
                 BOTTEGA_DB_PATH: process.env.BOTTEGA_DB_PATH ?? "data/bottega.db",
                 BOTTEGA_CONFIG_DIR: process.env.BOTTEGA_CONFIG_DIR ?? process.cwd(),
+                // The MCP server boots the same extension registry (issue
+                // #61) so ACP agents see connect_extension + extension
+                // tools; the driver absolutizes the relative path because
+                // the spawned server runs with the agent session's cwd.
+                BOTTEGA_EXTENSIONS_DIR: "config/extensions",
               },
             },
           ],
@@ -211,6 +217,21 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
     memoryProvider,
     digestPrune: (spaceId, keep) => {
       pruneDigestMemories(store.getDb(), spaceId, keep);
+    },
+    // Connect intent seam (issue #61): `connect X` / `connect X as org|me`
+    // messages route straight to the connect capability — no agent tool
+    // call. Org connects gate through the same Slack approval router as
+    // every exec-tier tool call; personal connects run for the sender.
+    connect: {
+      registry: extensionRegistry,
+      store,
+      audit,
+      broker: connectViaAuthBroker,
+      gate: {
+        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+        router: approvalRouter,
+        timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+      },
     },
   });
   // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
