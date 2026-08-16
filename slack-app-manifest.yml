@@ -45,6 +45,10 @@ oauth_config:
       - chat:write
       - channels:history
       - channels:read
+      - groups:history
+      - im:history
+      - im:write
+      - users:read
       - im:history
       - im:write
       - users:read
