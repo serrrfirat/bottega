@@ -67,8 +67,15 @@ export function renderModelsConfig(settings: ModelCatalogSettings): string | nul
 # quoted because org-chosen ids may contain characters outside the YAML
 # subset's plain scalars.
 providers:
-  # Primary model (issue #37): deepseek-v4-flash via the built-in opencode-go
-  # provider. Key from env/Keychain (service: bottega-opencode).
+  # Primary model (issue #37, pinned #78): deepseek-v4-flash via the
+  # built-in opencode-go provider. Key from env/Keychain (service:
+  # bottega-opencode). The entry is KEY-ONLY: opencode-go is a built-in
+  # SDK catalog provider (deepseek-v4-flash ships there with its transport
+  # metadata), and the SDK's models.yml validation treats any provider
+  # declaration as CUSTOM — redeclaring its models without a baseUrl fails
+  # the boot guard. The pin lives in config.yml (modelRoles.default), so
+  # the session can never silently shift to the catalog default
+  # (kimi-k2.7-code).
   opencode-go:
     apiKey: OPENCODE_API_KEY
   # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key

@@ -7,9 +7,10 @@
  * session's model is the REAL provider: `bootHarness({ realModel: true })`
  * installs the deployment model catalog (config/omp/models.yml) into the
  * temp agent dir, so agent turns hit the real gateway instead of the
- * scripted stub. The default model is the NEAR one (near/zai-org/GLM-5.1-FP8)
- * — the opencode-go gateway rejects the space agent's dotted tool names
- * (live finding, issue #71), so it is used only via CANARY_MODEL_REF.
+ * scripted stub. The default model is the NEAR one (near/zai-org/GLM-5.1-FP8).
+ * The opencode-go primary is usable too since the driver flattens dotted
+ * tool names at the session boundary (issue #78); both paths pass, and
+ * CANARY_MODEL_REF overrides to switch providers.
  *
  * Assertions are SEMANTIC end-states — the real model decides its own tool
  * calls, so exact tool sequences are never asserted:

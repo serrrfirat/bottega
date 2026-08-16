@@ -10,8 +10,15 @@
 # (set in .env or via the Keychain dev loader). The key value never appears
 # in this file, agent config, or transcripts.
 providers:
-  # Primary model (issue #37): deepseek-v4-flash via the built-in opencode-go
-  # provider. Key from env/Keychain (service: bottega-opencode).
+  # Primary model (issue #37, pinned #78): deepseek-v4-flash via the
+  # built-in opencode-go provider. Key from env/Keychain (service:
+  # bottega-opencode). The entry is deliberately KEY-ONLY: opencode-go is a
+  # built-in SDK catalog provider (deepseek-v4-flash ships there with its
+  # transport metadata), and the SDK's models.yml validation treats any
+  # provider declaration as CUSTOM — redeclaring its models without a
+  # baseUrl fails the boot guard. The pin lives in config.yml
+  # (modelRoles.default), so the session can never silently shift to the
+  # provider catalog default (kimi-k2.7-code).
   opencode-go:
     apiKey: OPENCODE_API_KEY
   # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key

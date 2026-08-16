@@ -59,7 +59,7 @@ if [[ -n "${CANARY_MODEL_REF:-}" ]]; then
 elif [[ -n "${NEAR_API_KEY:-}" ]]; then
   echo "canary: model near/zai-org/GLM-5.1-FP8 (NEAR — accepts the space agent's tool names)"
 elif [[ -n "${OPENCODE_API_KEY:-}" ]]; then
-  echo "canary: model opencode-go/deepseek-v4-flash (opencode; its gateway rejects dotted tool names — expect loud failures)"
+  echo "canary: model opencode-go/deepseek-v4-flash (opencode; the driver flattens dotted tool names for its gateway, issue #78)"
 fi
 if [[ "${CANARY_FULL:-}" == "1" ]]; then
   echo "canary: CANARY_FULL=1 — the executor end-to-end leg runs (slow)"

@@ -52,7 +52,10 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
     async () => {
       const h = await harness(
         [
-          { type: "tool_calls", calls: [{ name: "memory.save", args: { scope: "org", content: "denied payload" } }] },
+          // Session-facing name is flattened (issue #78): the driver
+          // registers gateway-safe names; the gate still audits the
+          // canonical `memory.save`.
+          { type: "tool_calls", calls: [{ name: "memory_save", args: { scope: "org", content: "denied payload" } }] },
           { type: "text", text: "blocked" },
         ],
         "tools:\n  memory.save: deny\n",

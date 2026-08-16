@@ -3,6 +3,13 @@
 # file is the per-deployment template, mounted from config/omp/ by compose.
 secrets:
   enabled: true
+# Default model role (issue #78): pinned so the session never silently
+# shifts to the opencode-go provider's catalog default (kimi-k2.7-code)
+# when the catalog updates. When no opencode key is configured the model
+# is unavailable and the SDK falls back to the first available provider
+# (NEAR AI Cloud) — the #36 fallback design is preserved.
+modelRoles:
+  default: opencode-go/deepseek-v4-flash
 # approvalMode is deliberately unset: the policy extension (issue #6) owns
 # tool-call gating (tier x space policy -> allow | deny | ask-human), so
 # OMP's own approval prompts stay off.

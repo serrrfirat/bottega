@@ -447,13 +447,12 @@ export const CANARY_MODEL_REFS = {
 /**
  * Picks the canary default model from the environment:
  *   - `CANARY_MODEL_REF`, when set, wins (explicit override);
- *   - else the NEAR fallback (`near/zai-org/GLM-5.1-FP8`) — the provider
- *     that ACCEPTS the space agent's dotted tool names (memory.save,
- *     memory.search, extension tools). The opencode-go gateway (Console Go)
- *     validates tool names against `^[a-zA-Z0-9_-]+$` and 400s on them
- *     (live canary finding, issue #71), so the opencode-go primary is used
- *     only as a last resort — journeys on it fail loudly with the
- *     transcript captured, which is the canary's diagnosis job.
+ *   - else the NEAR fallback (`near/zai-org/GLM-5.1-FP8`).
+ * The NEAR provider remains the default because it is the exercise-the-
+ * canary-JOURNEYS model; the opencode-go primary (issue #37) is now usable
+ * too — the driver flattens dotted tool names at the session boundary
+ * (issue #78), and the opencode gateway accepts the flat names, so
+ * `CANARY_MODEL_REF=opencode-go/deepseek-v4-flash bun run canary` passes.
  * Returns null when no key is available.
  */
 export function pickRealModelRef(env: Record<string, string | undefined> = process.env): string | null {

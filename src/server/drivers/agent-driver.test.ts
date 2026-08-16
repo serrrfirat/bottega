@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type CreateAgentSessionOptions, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
@@ -12,10 +12,13 @@ import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
 import { createStore, type SpaceModelSettings } from "../../store/db";
+import { POLICY_DECISION_EVENT } from "../../store/audit-events";
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
   OmpSessionDriver,
+  opencodeSafeToolName,
+  opencodeToolNameMap,
   resolveRoleTarget,
   sessionIdFromFilePath,
   SPACE_AGENT_TOOLS,
@@ -598,6 +601,97 @@ describe("process-global agent dir + boot guard (issue #80)", () => {
       // No models.yml → lenient leg: the guard resolves (returns the
       // available count, 0 in this hermetic env) instead of failing the boot.
       await expect(assertAgentDirModelAvailable(agentDir)).resolves.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("opencode tool-name transform (issue #78)", () => {
+  test("opencodeSafeToolName flattens gateway-rejected names, leaves safe names alone", () => {
+    expect(opencodeSafeToolName("memory.save")).toBe("memory_save");
+    expect(opencodeSafeToolName("memory.search")).toBe("memory_search");
+    expect(opencodeSafeToolName("linear.search_issues")).toBe("linear_search_issues");
+    expect(opencodeSafeToolName("attio.contacts.list")).toBe("attio_contacts_list");
+    expect(opencodeSafeToolName("create_work_item")).toBe("create_work_item");
+    expect(opencodeSafeToolName("read")).toBe("read");
+    expect(opencodeToolNameMap(["memory.save", "read", "memory.search"])).toEqual(
+      new Map([
+        ["memory.save", "memory_save"],
+        ["memory.search", "memory_search"],
+      ]),
+    );
+  });
+
+  test("the driver registers flat session names while the gate audits the canonical name", async () => {
+    // Hermetic: the injected session factory captures the exact options the
+    // driver builds. The gated definition keeps its canonical name in the
+    // gate's closure, so the model-facing (flat) name and the audit
+    // (canonical) name coexist — the opencode gateway sees no dots and the
+    // attribution trail keeps memory.save.
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const store = createStore(join(dir, "test.db"));
+      const audit = createAudit(store);
+      const orgPolicy = parseOrgConfigYaml("tools:\n  memory.save: allow\n");
+      let receivedOptions: CreateAgentSessionOptions | undefined;
+      const driver = createOmpSdkDriver({
+        agentDir: join(dir, "agent"),
+        gate: {
+          orgPolicy,
+          audit,
+          router: DenyRouter,
+          store,
+          tools: [
+            {
+              name: "memory.save",
+              label: "memory.save",
+              description: "Save a memory",
+              parameters: z.object({ content: z.string() }),
+              async execute() {
+                return { content: [{ type: "text", text: "saved" }] };
+              },
+            },
+          ],
+        },
+        createSession: async (options) => {
+          receivedOptions = options;
+          throw new Error("factory stub: no real session");
+        },
+      });
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+
+      // Session-facing surface is flat: the gateway-safe name is what the
+      // model sees on the wire and in toolNames.
+      const flatDef = receivedOptions?.customTools?.find(
+        (tool): tool is ToolDefinition => "name" in tool && tool.name === "memory_save",
+      );
+      expect(flatDef).toBeDefined();
+      expect(receivedOptions?.customTools?.some((tool) => "name" in tool && tool.name === "memory.save")).toBe(false);
+      expect(receivedOptions?.toolNames).toContain("memory_save");
+      expect(receivedOptions?.toolNames).not.toContain("memory.save");
+
+      // Executing the flat definition crosses the gate under the CANONICAL
+      // name: the policy decision row and the audit trail keep memory.save.
+      const result = await flatDef!.execute(
+        "call_1",
+        { content: "x" },
+        undefined,
+        undefined,
+        {
+          sessionManager: { getSessionFile: () => join(dir, "sessions", "slack:C1.jsonl") },
+        } as never,
+      );
+      expect(result).toEqual({ content: [{ type: "text", text: "saved" }] });
+      const rows = await store.listAudit({ event_type: POLICY_DECISION_EVENT });
+      const decisions = rows.map((row) => JSON.parse(row.payload) as { tool: string; decision: string });
+      expect(decisions.find((row) => row.tool === "memory.save")?.decision).toBe("allow");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

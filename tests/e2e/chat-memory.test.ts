@@ -61,11 +61,14 @@ describe("e2e journey 1: chat + memory", () => {
       const turns: StubTurn[] = [
         {
           type: "tool_calls",
-          calls: [{ name: "memory.save", args: { scope: "org", content: "the build runs with bun test" } }],
+          // Session-facing names are flattened (issue #78): the opencode-go
+          // gateway 400s dotted tool names, so the driver registers
+          // gateway-safe names and the gate/audit keep the canonical ones.
+          calls: [{ name: "memory_save", args: { scope: "org", content: "the build runs with bun test" } }],
         },
         {
           type: "tool_calls",
-          calls: [{ name: "memory.search", args: { scope: "org", query: "build" } }],
+          calls: [{ name: "memory_search", args: { scope: "org", query: "build" } }],
         },
         { type: "text", text: "saved and found" },
       ];

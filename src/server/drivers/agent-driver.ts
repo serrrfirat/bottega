@@ -409,6 +409,51 @@ export function markToolDefinition<TDef extends ToolDefinition>(def: TDef): TDef
 }
 
 /**
+ * opencode-go gateway tool-name constraint (issue #78): the Console Go
+ * gateway validates tool names against `^[a-zA-Z0-9_-]+$` and 400s every
+ * request carrying a dotted name (memory.save, memory.search, the
+ * namespace extension tools — attio.* / github.* / linear.*), which is why
+ * opencode sessions returned empty completions. NEAR/GLM accept dotted
+ * names; flat names are accepted by BOTH gateways, so the session's
+ * model-facing tool names are flattened at the driver boundary. The
+ * canonical dotted names survive everywhere that matters: the policy gate
+ * and tool implementations close over the ORIGINAL definition (audit rows
+ * keep `memory.save`), the extension runtime routes by its own manifest
+ * tool names, and the MCP server is a separate surface — only the names
+ * the model sees (prompts, wire definitions, transcripts) are flat.
+ *
+ * Restricted sessions cannot hook the SDK's provider payload path
+ * (extension `before_provider_request` handlers are inert under
+ * restrictToolNames — the SDK loads zero extensions), so a wire-level
+ * rewrite is not reachable; the flatten-on-registration below is the
+ * provider-boundary transform, and the "map back" happens at dispatch:
+ * the model's flat call executes the SAME canonical tool implementation,
+ * so attribution stays canonical.
+ */
+export const OPENCODE_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+/** Flattens a tool name to the gateway-safe charset (`.` → `_`, etc.). */
+export function opencodeSafeToolName(name: string): string {
+  return OPENCODE_TOOL_NAME_PATTERN.test(name) ? name : name.replace(/[^a-zA-Z0-9_-]+/g, "_");
+}
+
+/** Canonical → flat map for every tool whose name the gateway would reject. */
+export function opencodeToolNameMap(names: readonly string[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const name of names) {
+    const flat = opencodeSafeToolName(name);
+    if (flat !== name) map.set(name, flat);
+  }
+  return map;
+}
+
+/** Re-registers a tool definition under its gateway-safe name (identity when unchanged). */
+export function withOpencodeSafeName<TDef extends ToolDefinition>(def: TDef): TDef {
+  const name = opencodeSafeToolName(def.name);
+  return name === def.name ? def : { ...def, name, label: name };
+}
+
+/**
  * Wraps a tool definition so every call crosses the shared policy gate
  * (issue #69): load the space's effective policy, decide (tier × action),
  * audit, and route ask-human through the approval router — then run the
@@ -692,7 +737,13 @@ export function createOmpSdkDriver(
         // The SDK discriminates customTools by the hidden __isToolDefinition
         // flag (issue #69): unmarked objects are re-bound to the CustomTool
         // execute signature, which breaks ToolDefinition-style executes.
-      ].map(markToolDefinition);
+      ]
+        .map(markToolDefinition)
+        // opencode gateway tool-name transform (issue #78): every tool the
+        // gateway would reject is re-registered under its flat name. The
+        // policy gate wrappers above closed over the ORIGINAL definitions,
+        // so decisions and audit rows keep the canonical dotted names.
+        .map(withOpencodeSafeName);
       // Turn-start memory injection (#42) at the driver boundary: restricted
       // sessions cannot hook the SDK's `context` event, so org memories
       // flagged `metadata: { inject: "1" }` ride the per-cold-start
@@ -719,7 +770,12 @@ export function createOmpSdkDriver(
         sessionManager,
         agentRegistry: new AgentRegistry(),
         restrictToolNames: true,
-        toolNames: spaceAgentToolNames(allSessionTools.map((tool) => tool.name), allowTools),
+        toolNames: spaceAgentToolNames(
+          allSessionTools.map((tool) => tool.name),
+          // The allowlist vocabulary stays canonical (policy/gate), but the
+          // session's toolNames must name the gateway-safe forms (issue #78).
+          (allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS]).map(opencodeSafeToolName),
+        ),
         // Extension seam: kept for unrestricted sessions and API compat; under
         // restrictToolNames the SDK ignores it (issue #69) — the gate and the
         // gated definitions above are the live path.
