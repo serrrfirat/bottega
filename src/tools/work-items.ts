@@ -12,6 +12,7 @@
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
+import { channelFromSpaceId } from "../server/adapters/slack";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
 import { errorMessage, toolError } from "./helpers";
 import type { Store } from "../store/db";
@@ -70,6 +71,11 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
         }
         const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
         if (!spaceId) return toolError("work items require a space session");
+        // The space row is the FK parent of work items and the audit trail,
+        // but no server path creates it eagerly — the session file is the
+        // only durable space record until a row exists. Create it lazily so
+        // the first tool call in a space works (E2E journey 2 finding).
+        await store.getOrCreateSpace({ platform: "slack", channel_id: channelFromSpaceId(spaceId) });
 
         // Issue-URL pickup (#48): a parseable GitHub issue URL in the
         // description is the source of truth for the repo + issue number.

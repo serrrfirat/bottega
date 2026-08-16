@@ -100,6 +100,20 @@ describe("parseGithubIssueUrl", () => {
 });
 
 describe("create_work_item", () => {
+  test("creates the space row lazily when the session's space is missing (E2E journey finding)", async () => {
+    // No getOrCreateSpace call up front: the tool must create the FK parent
+    // itself, because no server path materializes space rows eagerly.
+    const s = freshStore();
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute("tc1", { description: "ship it" }, undefined, undefined, ctxFor("slack:C42"));
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.space_id).toBe("slack:C42");
+    const space = await s.getSpace("slack:C42");
+    expect(space).not.toBeNull();
+    expect(space?.channel_id).toBe("C42");
+  });
+
   test("creates an open item in the space, defaults requester to the actor, and audits", async () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T1" });
