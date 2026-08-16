@@ -20,8 +20,9 @@ do, and why it matters. For how it works under the hood, see
 | **Memory** | The agent remembers facts per user or per org and uses them across conversations. |
 | **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
 | **Extensions** | Connect tools like GitHub, Linear, or Attio from chat; agents use them through one safe pipe. |
-| **Proactive scheduler** | Standups, end-of-day reflections, weekly pulse, and knowledge-base ingestion on a schedule. |
-| **Work items** | The agent picks up a request, works in an isolated workspace, and delivers a pull request. |
+| **Proactive scheduler** | Standups, reflections, weekly pulse, knowledge ingestion, and recurring connected-service work on a schedule. |
+| **Work items** | One queue delivers repository, connected-extension, or in-channel work. |
+| **Department personas** | Give each space role guidance and a minimum visible toolset without weakening policy. |
 | **Audit trail** | Every decision, approval, and tool call is recorded, append-only, and never deleted. |
 
 ## Model settings & model roles (issue #64)
@@ -212,6 +213,34 @@ The test-only fixture extension proves the shape end to end: registered →
 resolves → its tool appears in the space agent's toolset → its domain lands
 in the merged egress allowlist. No extension implementations ship in this
 issue — the three providers are their own issues.
+
+## Co-worker work delivery (epic #122)
+
+The work queue now supports coding and non-code operations through one
+audited lifecycle:
+
+- **Delivery-neutral work items (#128)** — `create_work_item` accepts `git`,
+  `extension`, or `chat` delivery. Git remains the default. Executable items
+  are claimed before chat items, and each delivery kind has a typed result
+  contract.
+- **Extension-delivered work (#129)** — the executor runs extension items in
+  a headless worker session with memory and the space's connected tools.
+  Pickup approval authorizes the run; extension policy, credentials, and
+  egress still fail closed. A valid external URL and summary complete the
+  item. Failures move it to `blocked` with evidence.
+- **Department personas (#130)** — each space can select a persona through
+  `spaces.policy_json`. Prompt fragments and tool floors come from
+  `config/personas/<id>.md` and `<id>.tools.yml`. Unknown or incomplete
+  personas fall back to `default`; the policy gate can still deny every
+  surfaced tool.
+- **Recurring non-code jobs (#131)** — the scheduler's `recurring_work`
+  action creates one extension-delivery item per fire. Scheduled work uses
+  the same queue, audits, policy gates, stale recovery, and blocked failure
+  state as manually requested work.
+
+Why it matters: a team can ask one co-worker to ship code, update a connected
+system, answer in channel, or repeat operational work without adding a second
+execution path.
 
 ## Proactive scheduler, learning, and knowledge base (epic #111)
 

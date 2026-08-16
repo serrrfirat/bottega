@@ -23,6 +23,7 @@ import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
 import { standupDigestAction } from "../scheduler/standup";
 import { reflectionAction } from "../scheduler/reflection";
 import { orgPulseAction } from "../scheduler/observer";
+import { recurringWorkAction } from "../scheduler/recurring-work";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -124,6 +125,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     standupDigestAction,
     reflectionAction,
     orgPulseAction,
+    recurringWorkAction,
   ]);
   const kbDeps: KbToolDependencies = {
     memoryProvider,

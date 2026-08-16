@@ -18,7 +18,7 @@ the [OMP](https://oh-my-pi.dev) agent core; the egress firewall is
 ```bash
 bun install
 bun check    # typecheck
-bun test     # 490+ tests across 36 files (store, policy, adapters, drivers, memory, extensions, deploy)
+bun test     # 865 tests across 67 files (861 passed, 4 skip-gated in the current environment)
 scripts/smoke.sh  # local checks + compose validation + manual checklist
 scripts/e2e-smoke.sh  # compose e2e smoke: fail-closed boots + broker token + SQLite schema (skip-gated, needs Docker)
 bun run dev  # local server (needs Docker + .env; or keys in Keychain: security add-generic-password -s bottega-opencode -a $(whoami) -w '<key>' and -s bottega-near ...)
@@ -108,6 +108,57 @@ approvals:
 `approvals.always_approve`. Remove the `approvals` block when every
 scheduler mutation should require an Approve button. Listing is read-only,
 and KB ingestion is write-tier, so neither needs `always_approve`.
+
+## Work items
+
+`create_work_item` stores delivery-neutral work in one durable queue. Set
+`delivery` to one of:
+
+- `git` (default) — repository work. The executor uses an isolated workspace,
+  pushes a branch, opens a pull request, and waits for delivery approval.
+- `extension` — connected-service work, such as creating a Linear issue or
+  updating an Attio record. The executor starts a headless worker session with
+  the space's connected extension tools and records `{"url","summary"}` as
+  the result. Approval to pick up the item authorizes this worker run. Tool
+  policy, credential scope, and egress rules still apply. Any worker, tool,
+  policy, timeout, or result-validation failure moves the item to `blocked`
+  with evidence.
+- `chat` — work intended for an in-channel answer. The executor leaves these
+  items for the space agent instead of treating them as git or extension work.
+
+Department personas add role guidance and a minimum visible toolset when a
+space session starts. Persona files live at `config/personas/<id>.md` and
+`config/personas/<id>.tools.yml`. Select one in `spaces.policy_json`:
+
+```json
+{"persona":"ops"}
+```
+
+An absent, invalid, unknown, or incomplete persona falls back to `default`.
+The persona tool list only controls visibility. The normal space and org policy
+still gates each call and can deny it.
+
+Recurring non-code work uses the same queue. Create a `recurring_work`
+scheduler job with `params.space` and `params.description`; each fire creates
+one `delivery=extension` item instead of bypassing claim, audit, policy, or
+failure handling. For example, run a weekly operations report at 09:00 UTC on
+Mondays:
+
+```json
+{
+  "action": "recurring_work",
+  "cron": "0 9 * * 1",
+  "params": {
+    "space": "slack:C123",
+    "description": "Prepare the weekly operations report"
+  }
+}
+```
+
+Extension hosts must remain on the iron-proxy egress allowlist in every
+deployment. The shipped Attio, Linear, and GitHub extension hosts are already
+allowlisted. Add a host to the static allowlist when adding an extension;
+connected credentials never bypass the proxy or its judge.
 
 ## Deployment
 
