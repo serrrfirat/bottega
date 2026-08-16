@@ -1,0 +1,23 @@
+# bottega tools image (issue #58): the executor base (oven/bun:1 + git +
+# ca-certificates, same as the app image) plus the curated CLI set v1 —
+# gh, jq, curl. CLIs are installed non-interactively from the distro repos
+# (Debian trixie); NO credentials are baked in, ever.
+#
+# The thin app image (Dockerfile) stays unchanged and independent: this
+# image is built only in the CI docker job (see .github/workflows/ci.yml)
+# or locally for extension development. Auth for these CLIs happens at the
+# iron-proxy boundary (HTTPS_PROXY through the egress allowlist) — the
+# proxy injects the credential per allowlisted domain at request time.
+FROM oven/bun:1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates gh jq curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Runtime user: the base image's `bun` user (uid 1000), like the app image.
+USER bun
+
+# No CMD: tools run as extension CLI spawns (src/extensions/tools.ts) or via
+# `docker run bottega-tools <command>` for development.
