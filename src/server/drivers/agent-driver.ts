@@ -304,13 +304,23 @@ export const SPACE_AGENT_TOOLS = [
 
 /**
  * The session tool name list: the space-agent allowlist (or an explicit
- * allowTools override) plus extension tool names. The SDK's restricted
- * sessions only surface custom tools that are ALSO named here (see
- * allowRestrictedCustomTools in createAgentSession), so extension tools must
- * be merged into the list the driver passes.
+ * allowTools override), the persona floor, and extension tool names. The
+ * persona floor only controls visibility; the policy gate still decides
+ * whether a surfaced tool call is allowed (issue #130).
+ *
+ * The SDK's restricted sessions only surface custom tools that are ALSO
+ * named here (see allowRestrictedCustomTools), so extension tools must be
+ * merged into the list the driver passes.
  */
-export function spaceAgentToolNames(extensionToolNames: readonly string[], allowTools?: readonly string[]): string[] {
+export function spaceAgentToolNames(
+  extensionToolNames: readonly string[],
+  allowTools?: readonly string[],
+  toolFloor: readonly string[] = [],
+): string[] {
   const names = allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS];
+  for (const name of toolFloor) {
+    if (!names.includes(name)) names.push(name);
+  }
   for (const name of extensionToolNames) {
     if (!names.includes(name)) names.push(name);
   }

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { AgentDriver, AgentSessionDriver, SessionModelRoleRegistry } from "../drivers/agent-driver";
 import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
+import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
@@ -9,6 +11,7 @@ import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage }
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { onboardingGuideText, runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
+import { loadPersona } from "../personas";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -71,6 +74,8 @@ export interface SpaceServiceDeps {
    * inject deterministic failing sets.
    */
   onboardingChecks?: () => WizardCheck[];
+  /** Persona config root override; defaults to BOTTEGA_CONFIG_DIR or process.cwd() (issue #130). */
+  personaDir?: string;
 }
 
 /** A connect-intent message parsed by {@link parseConnectIntent}. */
@@ -234,6 +239,7 @@ export class SpaceService {
   readonly #modelRoles: SessionModelRoleRegistry | undefined;
   readonly #learning: LearningService | undefined;
   readonly #onboardingChecks: () => WizardCheck[];
+  readonly #personaDir: string | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
@@ -323,6 +329,7 @@ export class SpaceService {
     this.#modelRoles = deps.modelRoles;
     this.#learning = deps.learning;
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
+    this.#personaDir = deps.personaDir;
   }
 
   /**
@@ -488,16 +495,27 @@ export class SpaceService {
   }
 
   async #createLive(spaceId: string): Promise<LiveSession> {
-    const mode = await this.#responseModeFor(spaceId);
-    // Slack format always (issue #84); the request-only directive is
-    // appended on top for request-only spaces (issue #55).
-    const directives = [SLACK_FORMAT_DIRECTIVE];
+    const modePromise = this.#responseModeFor(spaceId);
+    // Store is required in production. The runtime branch keeps older
+    // protocol-only test doubles on the original single-await cold-start path.
+    const getSpace = (this.#store as Partial<Store>).getSpace;
+    const [mode, space] = getSpace
+      ? await Promise.all([modePromise, getSpace.call(this.#store, spaceId)])
+      : [await modePromise, undefined];
+    const persona = space ? loadPersona(space.policy_json, this.#personaDir) : undefined;
+    // Persona guidance is additive (#130): Slack formatting and response-mode
+    // directives remain part of every cold-start prompt.
+    const directives = [persona?.prompt ?? "", SLACK_FORMAT_DIRECTIVE];
     if (mode === "request-only") directives.push(REQUEST_ONLY_DIRECTIVE);
-    const appendSystemPrompt = directives.join("\n\n");
+    const appendSystemPrompt = directives.filter(Boolean).join("\n\n");
     const session = await this.#driver.createSession({
       spaceId,
       transcriptDir: this.#transcriptDir,
       appendSystemPrompt,
+      // A persona floor widens only the visible session toolset (#130).
+      // The existing per-space policy gate still decides whether each call
+      // is allowed, so a restrictive space overlay always wins.
+      allowTools: spaceAgentToolNames([], undefined, persona?.toolFloor),
       // Output arrives on the session's event channel below. onOutput is the
       // same signal (both drivers emit both), so it must stay unconsumed or
       // every reply would be posted twice.

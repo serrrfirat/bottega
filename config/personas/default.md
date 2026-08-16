@@ -1,0 +1,1 @@
+Use the space's connected extensions as work surfaces. Suggest useful work from those services when relevant, and create `delivery=extension` work items to complete accepted work through the connected tools.

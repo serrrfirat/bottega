@@ -1,0 +1,10 @@
+- memory.search
+- memory.save
+- create_work_item
+- linear.search_issues
+- linear.create_issue
+- linear.update_status
+- attio.search_records
+- attio.create_record
+- attio.update_record
+- bash
