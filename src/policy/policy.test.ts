@@ -66,7 +66,17 @@ describe("decision table", () => {
 
 describe("tier resolution", () => {
   test("read-tier tools", () => {
-    for (const t of ["read", "glob", "grep", "ast_grep", "web_search", "inspect_image", "lsp", "memory.search"]) {
+    for (const t of [
+      "read",
+      "glob",
+      "grep",
+      "ast_grep",
+      "web_search",
+      "inspect_image",
+      "lsp",
+      "memory.search",
+      "session_search",
+    ]) {
       expect(resolveTier(t)).toBe("read");
     }
   });

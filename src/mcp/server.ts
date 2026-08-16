@@ -1,13 +1,13 @@
 /**
- * Bottega-hosted MCP server (issue #25, #61): exposes the bottega capability
- * surface — memory, the connect capability, and registered extension tools
- * — to ANY ACP agent with an MCP client.
+ * Bottega-hosted MCP server (issues #25, #61, #136): exposes the bottega
+ * capability surface — memory, transcript search, the connect capability,
+ * and registered extension tools — to ANY ACP agent with an MCP client.
  *
  * The ACP driver attaches this server to a session via `session/new`'s
  * `mcpServers` field; the agent spawns `bun run src/mcp/server.ts` (stdio
- * transport) as a child process and sees `memory.save` / `memory.search`
- * as native tools. Because the tools execute **server-side**, the policy
- * gate and the audit trail apply at execution time no matter which agent
+ * transport) as a child process and sees `memory.save`, `memory.search`,
+ * and `session_search` as native tools. Because tools execute server-side,
+ * the policy gate and audit trail apply at execution time no matter which agent
  * called them — the MCP surface is not a bypass of `src/policy/config.ts`
  * or `src/policy/audit.ts`.
  *
@@ -28,7 +28,7 @@
  * the MCP spec.
  *
  * Policy at execution (mirrors src/policy/extension.ts):
- *   - tier from TIER_BY_TOOL (memory.save=write, memory.search=read)
+ *   - tier from TIER_BY_TOOL (memory.save=write; memory.search/session_search=read)
  *   - org config.yml floor + the session space's overlay
  *   - allow → run; deny → MCP error (no execution); ask-human → MCP error:
  *     a headless MCP context has no approval channel (ACP permission
@@ -57,13 +57,20 @@
  *   BOTTEGA_SPACE_ID               session space (policy overlay + audit rows)
  *   BOTTEGA_MCP_DEFAULT_PRINCIPAL  default principal for user-scope saves,
  *                                  extension tool calls, and connects
+ *   BOTTEGA_SESSION_DIR            transcript JSONL dir (default data/sessions)
  */
+import type { Database } from "bun:sqlite";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
+import {
+  indexSessionFiles,
+  searchSessions,
+  sessionSearchArgsSchema,
+} from "../memory/session-search";
 import type { AuditModule } from "../policy/audit";
 import { createAudit } from "../policy/audit";
 import {
@@ -98,6 +105,8 @@ export interface MemoryMcpServerOptions {
   /** Org floor + space overlay, already merged (mirrors policyFor in the extension). */
   policy: PolicyConfig;
   audit: Pick<AuditModule, "appendAudit">;
+  /** Shared SQLite handle + durable JSONL directory for transcript search. */
+  sessionSearch: { db: Database; transcriptDir: string };
   /** Session space; recorded on audit rows. */
   spaceId?: string | null;
   /** Principal used for user-scope saves when the call omits `principal`. */
@@ -182,6 +191,17 @@ const searchJsonSchema = {
     limit: { type: "integer", minimum: 1, maximum: 20 },
   },
   required: ["query", "scope"],
+  additionalProperties: false,
+} as const;
+
+const sessionSearchJsonSchema = {
+  type: "object",
+  properties: {
+    query: { type: "string", minLength: 1 },
+    space: { type: "string", minLength: 1 },
+    limit: { type: "integer", minimum: 1, maximum: 20 },
+  },
+  required: ["query"],
   additionalProperties: false,
 } as const;
 
@@ -324,6 +344,26 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     }
   };
 
+  const callSessionSearch = async (callArgs: unknown) => {
+    const tool = "session_search";
+    const parsed = sessionSearchArgsSchema.safeParse(callArgs);
+    if (!parsed.success) {
+      throw new McpError(ErrorCode.InvalidParams, `${tool}: invalid arguments: ${zodIssues(parsed.error)}`);
+    }
+    const args = parsed.data;
+    const gate = gateTool(opts.policy, tool);
+    await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
+    if (gate.error) throw gate.error;
+
+    try {
+      indexSessionFiles(opts.sessionSearch.db, opts.sessionSearch.transcriptDir);
+      const entries = searchSessions(opts.sessionSearch.db, args);
+      return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorMessage(error) }], isError: true };
+    }
+  };
+
   const extensions = opts.extensions;
 
   /**
@@ -401,6 +441,13 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           "matching entries with content, metadata, and creation time. Read-only.",
         inputSchema: searchJsonSchema,
       },
+      {
+        name: "session_search",
+        description:
+          "Searches durable session transcripts with full-text ranking and an optional exact space filter. " +
+          "Returns redacted, truncated message excerpts with source file, line, and timestamp. Read-only.",
+        inputSchema: sessionSearchJsonSchema,
+      },
       ...(extensions
         ? [
             {
@@ -423,6 +470,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     const { name, arguments: args } = request.params;
     if (name === "memory.save") return callSave(args);
     if (name === "memory.search") return callSearch(args);
+    if (name === "session_search") return callSessionSearch(args);
     if (extensions) {
       if (name === CONNECT_EXTENSION_TOOL) return callConnect(args);
       const extensionId = extensions.registry.extensionIdForTool(name);
@@ -483,6 +531,10 @@ if (import.meta.main) {
     audit,
     spaceId,
     defaultPrincipal: process.env.BOTTEGA_MCP_DEFAULT_PRINCIPAL,
+    sessionSearch: {
+      db: store.getDb(),
+      transcriptDir: process.env.BOTTEGA_SESSION_DIR ?? "data/sessions",
+    },
     extensions: {
       runtime: extensionRuntime,
       registry: extensionRegistry,

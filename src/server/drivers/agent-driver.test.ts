@@ -220,7 +220,7 @@ describe("omp sdk agent driver", () => {
     }
   });
 
-  test("space-agent allowlist: conversation/read-only + task + queue/memory/connect/model/settings tools, no executor tools", () => {
+  test("space-agent allowlist: conversation/read-only + task + queue/memory/session/connect/model/settings tools, no executor tools", () => {
     // The space agent is a participant, not an executor: it may read the
     // workspace, delegate via task, and use the work-item + memory + model
     // tools — never write/bash/edit (those are EXECUTOR_TOOLS in
@@ -245,6 +245,7 @@ describe("omp sdk agent driver", () => {
         "connect_extension",
         "memory.save",
         "memory.search",
+        "session_search",
         "model_settings",
         "use_model",
         "settings",

@@ -67,6 +67,8 @@ async function launch(opts: LaunchOpts): Promise<Harness> {
   const configDir = join(dir, "config");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "config.yml"), opts.configYaml);
+  const sessionsDir = join(dir, "sessions");
+  mkdirSync(sessionsDir);
 
   // Seed the space overlay before the server boots (server reads it at boot).
   let spaceId: string | undefined;
@@ -84,6 +86,7 @@ async function launch(opts: LaunchOpts): Promise<Harness> {
   const env: Record<string, string> = {
     BOTTEGA_DB_PATH: dbPath,
     BOTTEGA_CONFIG_DIR: configDir,
+    BOTTEGA_SESSION_DIR: sessionsDir,
   };
   if (spaceId) env.BOTTEGA_SPACE_ID = spaceId;
   if (opts.defaultPrincipal) env.BOTTEGA_MCP_DEFAULT_PRINCIPAL = opts.defaultPrincipal;
@@ -142,8 +145,8 @@ interface ToolCallResult {
   isError?: boolean;
 }
 
-/** Org floor allowing both memory tools; the common case for conformance tests. */
-const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n";
+/** Org floor allowing the built-in memory and transcript-search tools. */
+const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  session_search: allow\n";
 
 describe("MCP server conformance (spawned entrypoint)", () => {
   test("initialize + tools/list returns the capability tools (memory + connect) with schemas", async () => {
@@ -152,7 +155,12 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       const { tools } = await h.client.listTools();
       // connect_extension is a core capability: advertised even when no
       // extension snapshots are seeded (issue #61).
-      expect(tools.map((t) => t.name).sort()).toEqual(["connect_extension", "memory.save", "memory.search"]);
+      expect(tools.map((t) => t.name).sort()).toEqual([
+        "connect_extension",
+        "memory.save",
+        "memory.search",
+        "session_search",
+      ]);
 
       const connect = tools.find((t) => t.name === "connect_extension")!;
       expect((connect.description ?? "").length).toBeGreaterThan(0);
@@ -178,6 +186,44 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(searchProps.query?.type).toBe("string");
       expect(search.inputSchema.required).toContain("query");
       expect(search.inputSchema.required).toContain("scope");
+
+      const sessionSearch = tools.find((t) => t.name === "session_search")!;
+      const sessionSearchProps = sessionSearch.inputSchema.properties as Record<string, { type?: string }>;
+      expect(Object.keys(sessionSearchProps).sort()).toEqual(["limit", "query", "space"]);
+      expect(sessionSearchProps.query?.type).toBe("string");
+      expect(sessionSearch.inputSchema.required).toEqual(["query"]);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("tools/call session_search indexes and searches transcript JSONL", async () => {
+    const h = await launch({ configYaml: ALLOW_ALL });
+    try {
+      writeFileSync(
+        join(h.dir, "sessions", "slack:C9.jsonl"),
+        `${JSON.stringify({
+          type: "message",
+          id: "m1",
+          parentId: null,
+          timestamp: "2026-08-17T01:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "release train is green" }] },
+        })}\n`,
+      );
+      const result = (await h.client.callTool({
+        name: "session_search",
+        arguments: { query: "release", space: "slack:C9" },
+      })) as ToolCallResult;
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0]!.text!) as unknown).toEqual([
+        {
+          space: "slack:C9",
+          file: "slack:C9.jsonl",
+          line: 1,
+          timestamp: "2026-08-17T01:00:00.000Z",
+          text: "release train is green",
+        },
+      ]);
     } finally {
       await h.cleanup();
     }
@@ -318,7 +364,8 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 });
 
 /** Org floor allowing extension calls (unknown default) + memory + connect. */
-const EXT_ALLOW = "tools:\n  unknown: allow\n  memory.save: allow\n  memory.search: allow\n  connect_extension: allow\n";
+const EXT_ALLOW =
+  "tools:\n  unknown: allow\n  memory.save: allow\n  memory.search: allow\n  session_search: allow\n  connect_extension: allow\n";
 
 describe("MCP server extension surface (spawned entrypoint)", () => {
   test("advertises connect_extension and the registry's manifest tools", async () => {
@@ -329,6 +376,7 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "connect_extension",
         "memory.save",
         "memory.search",
+        "session_search",
         FIXTURE_EXTENSION_TOOL,
       ]);
 
@@ -456,6 +504,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       audit,
       spaceId: "slack:C1",
       defaultPrincipal: opts.defaultPrincipal ?? "U123",
+      sessionSearch: { db: store.getDb(), transcriptDir: join(dir, "sessions") },
       extensions: {
         runtime,
         registry,

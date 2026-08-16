@@ -133,6 +133,9 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // in non-yolo modes), search only queries (read).
   "memory.save": "write",
   "memory.search": "read",
+  // Transcript full-text search (issue #136): indexes durable session
+  // messages but never mutates the transcripts themselves.
+  session_search: "read",
   // Model tools (issue #64): both mutate durable state (per-space settings,
   // the live session's model) — write tier like memory.save.
   model_settings: "write",
