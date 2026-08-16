@@ -4,6 +4,11 @@
 # the executor end-to-end leg). The harness installs the deployment model
 # catalog (config/omp/models.yml) and the driver resolves the real gateway.
 #
+# --live-slack / LIVE_SLACK=1 dispatches to the issue #79 leg instead: the
+# QA canary against a REAL Slack workspace (production Socket Mode adapter,
+# QA user token; tests/e2e/canary.ts). It resolves its own tokens + model
+# keys and prints its own skip messages.
+#
 # Loads NEAR_API_KEY + OPENCODE_API_KEY from the macOS Keychain when not in
 # the environment (the dev.sh pattern, issue #24), skips with a clear
 # message when neither is available. NEVER part of CI: real model calls cost
@@ -14,10 +19,18 @@
 #   security add-generic-password -s bottega-opencode -a "$(whoami)" -w '<your key>'
 #
 # Usage:
-#   bun run canary            # chat + memory + work-item journeys
+#   bun run canary            # chat + memory + work-item journeys (real model, emulated Slack)
+#   bun run canary --live-slack   # the QA canary against a real Slack workspace (#79)
 #   CANARY_FULL=1 bun run canary   # + executor end-to-end (slow)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Live-Slack leg (issue #79): dispatch before the emulated-leg key loading —
+# the live runner resolves tokens AND model keys itself (env/Keychain).
+if [[ "${1:-}" == "--live-slack" || "${LIVE_SLACK:-}" == "1" ]]; then
+  shift || true
+  exec bun run tests/e2e/canary.ts --live-slack "$@"
+fi
 
 if [[ -z "${NEAR_API_KEY:-}" ]] && command -v security >/dev/null 2>&1; then
   if KEY="$(security find-generic-password -s bottega-near -w 2>/dev/null)"; then

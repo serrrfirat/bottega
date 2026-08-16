@@ -645,3 +645,71 @@ bun run dev  # local server (needs .env; or keys in Keychain: security add-gener
 Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
 for the PR-creation path (no live GitHub needed). Everything else is hermetic
 unit tests over real SQLite; nothing hits a live LLM, Slack, or GitHub.
+
+## Live-Slack QA canary (issue #79)
+
+The product-surface smoke test: it boots the REAL stack (production Socket
+Mode adapter + the real model via the deployment catalog,
+`config/omp/models.yml`) against a real Slack workspace and drives journeys
+AS a QA user — real messages in, real bot replies out, with per-journey
+pass/fail and Slack permalinks.
+
+```bash
+bun run canary --live-slack     # or LIVE_SLACK=1
+```
+
+Journeys: chat reply (DM + the `bottega-qa` channel, created when
+missing), memory save/search (a fact is stored and searched back), work
+item creation (always-approve policy path), and the connect intent seam.
+Skip-gated: without `--live-slack`/`LIVE_SLACK=1`, in CI, or with missing
+tokens it prints a clear skip message and exits 0. Generous per-journey
+timeouts (120s) — it waits for a real model and a real workspace.
+
+### QA user + tokens
+
+1. **Create the test user** — in your workspace admin, add a member named
+   `bottega-qa` (any name works; the canary looks it up by
+   `SLACK_QA_USER_NAME`, default `bottega-qa`, or take `SLACK_QA_USER_ID`
+   to skip the lookup). This is the "human at the product surface": the
+   canary posts as them, so their messages are indistinguishable from a
+   real user's.
+2. **Install the app** (`slack-app-manifest.yml` already declares the bot
+   scopes + the QA user scopes below) and install it to the workspace, so
+   the bot and the test user share it.
+3. **User-scoped token for the QA user** — create the app's user token
+   with the user's OAuth grant:
+   <https://api.slack.com/apps> → your app → **OAuth & Permissions** →
+   the user scopes must include `chat:write`, `im:history`, `im:write`,
+   `channels:history`, `channels:read`, `users:read` (the manifest
+   declares them) → **Install App** with the QA user's workspace session,
+   or **Add to Slack** while signed in as the QA user → copy the
+   **User OAuth Token** (`xoxp-...`). It is `SLACK_QA_USER_TOKEN`.
+4. **Bot + app tokens** — already needed for the server:
+   `SLACK_BOT_TOKEN` (`xoxb-...`) and `SLACK_APP_TOKEN` (`xapp-...`).
+   The canary additionally uses the bot's `channels:manage` +
+   `channels:read` + `users:read` scopes to create/locate `bottega-qa`
+   and look up the QA user (declared in the manifest).
+5. **Keychain install** (macOS; env vars win when set):
+
+```bash
+security add-generic-password -s bottega-slack-app -a "$(whoami)" -w '<xapp-...>'
+security add-generic-password -s bottega-slack-bot -a "$(whoami)" -w '<xoxb-...>'
+security add-generic-password -s bottega-slack-qa  -a "$(whoami)" -w '<xoxp-...>'
+```
+
+The canary reads env first (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`,
+`SLACK_QA_USER_TOKEN`, optional `SLACK_QA_USER_ID` / `SLACK_QA_USER_NAME` /
+`SLACK_QA_CHANNEL`), then the Keychain services `bottega-slack-app`,
+`bottega-slack-bot`, `bottega-slack-qa`.
+
+The live leg also needs the real model to answer: `bun run canary` (the
+issue #71 dispatcher) loads `NEAR_API_KEY` / `OPENCODE_API_KEY` from env or
+the Keychain (`bottega-near` / `bottega-opencode`, the `scripts/dev.sh`
+pattern) and the harness installs the deployment model catalog
+(`config/omp/models.yml`). **Prefer the NEAR key** — the NEAR gateway
+accepts the space agent's dotted tool names (`memory.save`,
+`memory.search`); the opencode-go gateway rejects them and journeys fail
+loudly on it (live finding, issue #71). `CANARY_MODEL_REF` overrides the
+model ref entirely. The QA user must have opened a DM with the bot once (or
+the canary opens it via `conversations.open`).
+

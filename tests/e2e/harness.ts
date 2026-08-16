@@ -27,6 +27,16 @@
  * Boundaries that stay emulated: Slack (emulator), the model (stub), and
  * the filesystem (temp dirs). Docker legs (mem0, iron-proxy, real OMP)
  * stay skip-gated — this harness is hermetic and CI-safe.
+ *
+ * Live-Slack canary mode (issue #79): `bootHarness({ realSlack: true,
+ * realModel: true, slackTokens })` swaps BOTH boundaries for the real
+ * product surface — the production Socket Mode adapter (real workspace,
+ * real tokens) and the real model provider (the #71 deployment model
+ * catalog, config/omp/models.yml, keys from env/Keychain). Inbound is
+ * driven through the real API as the QA user (chat.postMessage as_user)
+ * and outbound is read back via conversations.history. This mode NEVER
+ * runs in CI and is skip-gated on tokens; the QA canary runner
+ * (tests/e2e/canary.ts) owns that gate.
  */
 import { App, type Logger } from "@slack/bolt";
 import { createServer } from "@emulators/core";
@@ -49,7 +59,8 @@ import type { ExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
-import type { ConnectExtensionDeps } from "../../src/extensions/connect";
+import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps } from "../../src/extensions/connect";
+import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
 import type { McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -332,6 +343,28 @@ export interface EmulatorMessage {
   thread_ts?: string;
 }
 
+/**
+ * The Slack boundary both modes expose: the emulator handle (live store)
+ * and the live handle (cached API mirror) implement this shape, so harness
+ * callers never branch on the mode for sync lookups. Live reads go through
+ * {@link Harness.liveSlack} instead (fresh API reads).
+ */
+export interface SlackHandle {
+  /** `http://127.0.0.1:<port>` (emulator) or "" (live). */
+  baseUrl: string;
+  /** Outbound message store: emulator storage, or a live history mirror. */
+  store: {
+    messages: { all(): EmulatorMessage[] };
+    users: { findOneBy(field: string, value: string): { user_id?: string } | undefined };
+    channels: { findOneBy(field: string, value: string): { channel_id?: string } | undefined };
+  };
+  /** DM channel id between the bot and the human (emulator) / QA user (live). */
+  dmChannelId: string;
+  channelId(name: string): string | undefined;
+  user(name: string): string | undefined;
+  stop(): void;
+}
+
 function bootSlackEmulator(): SlackEmulatorHandle {
   const probe = Bun.serve({ port: 0, fetch: () => new Response() });
   const port = probe.port;
@@ -474,6 +507,22 @@ export interface HarnessConfig {
     | ((deps: { store: Store; audit: AuditModule; registry: ExtensionRegistry }) => ToolDefinition[]);
   /** Connect capability (issue #52/#61); omitted → the connect seams are absent. */
   connect?: ConnectExtensionDeps;
+  /**
+   * Live-Slack canary mode (issue #79): use the REAL Socket Mode adapter
+   * against the workspace tokens instead of the emulator + processEvent.
+   * Inbound posts as the QA user (chat.postMessage as_user); outbound is
+   * read back via conversations.history. NEVER in CI; requires
+   * {@link slackTokens} — see tests/e2e/canary.ts for the skip gate.
+   */
+  realSlack?: boolean;
+  /** Workspace tokens for {@link realSlack}; required when realSlack is set. */
+  slackTokens?: LiveSlackTokens;
+  /**
+   * Live canary connect wiring (issue #79): like {@link connect} but the
+   * harness supplies its own store/audit/registry — only the broker seam is
+   * caller's (defaults to the production connectViaAuthBroker).
+   */
+  liveConnect?: { broker?: BrokerConnector; timeoutMs?: number };
 }
 
 export interface Harness {
@@ -486,7 +535,9 @@ export interface Harness {
   /** The real Bolt app with the message + action handlers installed. */
   app: App;
   modelStub: ModelStub;
-  slack: SlackEmulatorHandle;
+  slack: SlackHandle;
+  /** Defined in realSlack mode: the live handle (fresh API reads, QA user identity). */
+  liveSlack?: LiveSlackHandle;
   extensionRegistry: ExtensionRegistry;
   orgPolicy: PolicyConfig;
   /** The model ref pinned as the session default role (stub ref, or the real ref in canary mode). */
@@ -531,6 +582,13 @@ function nextTs(): string {
  * in a finally (or afterEach) — it is idempotent.
  */
 export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
+  const realSlack = cfg.realSlack === true;
+  if (realSlack && !cfg.slackTokens) {
+    throw new Error(
+      "bootHarness({ realSlack: true }) requires slackTokens — the live leg never runs without " +
+        "workspace tokens (issue #79); use tests/e2e/canary.ts, which skip-gates on them",
+    );
+  }
   const tempDir = mkdtempSync(join(tmpdir(), "bottega-e2e-"));
   const configDir = join(tempDir, "config");
   const agentDir = join(tempDir, "omp-agent");
@@ -603,7 +661,14 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const memoryProvider = createSqliteMemoryProvider(store.getDb());
 
   // --- Slack: emulator (outbound) + adapter + Bolt app (inbound, #29) ------
-  const slack = bootSlackEmulator();
+  // realSlack mode (issue #79) replaces the emulator boundary with the REAL
+  // Socket Mode adapter: inbound arrives over the socket from the workspace,
+  // outbound posts to it. Everything downstream (space service, driver,
+  // policy) is identical either way.
+  const slack: SlackHandle = realSlack
+    ? await bootLiveSlack(cfg.slackTokens!)
+    : bootSlackEmulator();
+  const liveSlack = realSlack ? (slack as LiveSlackHandle) : undefined;
   // Per-space policy overlays accept a space id ("slack:C…"), a seeded
   // channel name ("ops"), or a raw channel id.
   for (const [spaceKey, policyJson] of Object.entries(cfg.spacePolicy ?? {})) {
@@ -614,20 +679,32 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     await store.updatePolicy(space.id, policyJson);
   }
   const responseModeFor = async (spaceId: string) => (await loadSpacePolicy(orgPolicy, store, spaceId)).responseMode;
-  const humanUserId = slack.user(HUMAN_USER_NAME)!;
-  const botUserId = slack.user(BOT_USER_NAME)!;
+  const humanUserId = realSlack ? liveSlack!.qaUserId : slack.user(HUMAN_USER_NAME)!;
+  const botUserId = realSlack ? liveSlack!.botUserId : slack.user(BOT_USER_NAME)!;
   let spaceService: SpaceService;
   let approvalRouter: HarnessApprovalRouter;
-  const adapter = createSlackAdapter({
-    appToken: APP_TOKEN,
-    botToken: BOT_TOKEN,
-    onMessage: (m) => spaceService.handleInboundMessage(m),
-    onAction: async (a) => {
-      await approvalRouter.handleAction?.(a);
-    },
-    clientOptions: { slackApiUrl: `${slack.baseUrl}/api` },
-    responseModeFor,
-  });
+  const adapter = createSlackAdapter(
+    realSlack
+      ? {
+          appToken: cfg.slackTokens!.appToken,
+          botToken: cfg.slackTokens!.botToken,
+          onMessage: (m) => spaceService.handleInboundMessage(m),
+          onAction: async (a) => {
+            await approvalRouter.handleAction?.(a);
+          },
+          responseModeFor,
+        }
+      : {
+          appToken: APP_TOKEN,
+          botToken: BOT_TOKEN,
+          onMessage: (m) => spaceService.handleInboundMessage(m),
+          onAction: async (a) => {
+            await approvalRouter.handleAction?.(a);
+          },
+          clientOptions: { slackApiUrl: `${slack.baseUrl}/api` },
+          responseModeFor,
+        },
+  );
   // Approval router seam (issue #44): default auto-approve so write-tier
   // tool calls flow in journey 1; journeys that test approvals pass their
   // own router (the Slack button router posts through the harness adapter).
@@ -635,6 +712,24 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
 
   // --- driver: real OMP SDK pointed at the stub ----------------------------
   const extensionRegistry = cfg.registry ?? createExtensionRegistry("config/extensions");
+  // Connect capability (issue #52/#61): the caller's full deps, or the live
+  // canary's convenience wiring (issue #79) — the harness's own
+  // store/audit/registry with the production broker seam.
+  const connectDeps: ConnectExtensionDeps | undefined =
+    cfg.connect ??
+    (cfg.liveConnect !== undefined
+      ? {
+          registry: extensionRegistry,
+          store,
+          audit,
+          broker: cfg.liveConnect.broker ?? connectViaAuthBroker,
+          gate: {
+            loadPolicy: async (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+            router: approvalRouter,
+            ...(cfg.liveConnect.timeoutMs !== undefined ? { timeoutMs: cfg.liveConnect.timeoutMs } : {}),
+          },
+        }
+      : undefined);
   /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */
   const extensionToolTier = (toolName: string) => {
     const extensionId = extensionRegistry.extensionIdForTool(toolName);
@@ -680,16 +775,16 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     },
     // Connect capability (issue #52): connect_extension is built per
     // session so the actor is the requesting principal.
-    ...(cfg.connect !== undefined
+    ...(connectDeps !== undefined
       ? {
           connectExtension: {
-            registry: cfg.connect.registry,
-            store: cfg.connect.store,
-            audit: cfg.connect.audit,
-            broker: cfg.connect.broker,
-            loadPolicy: cfg.connect.gate.loadPolicy,
-            router: cfg.connect.gate.router,
-            timeoutMs: cfg.connect.gate.timeoutMs,
+            registry: connectDeps.registry,
+            store: connectDeps.store,
+            audit: connectDeps.audit,
+            broker: connectDeps.broker,
+            loadPolicy: connectDeps.gate.loadPolicy,
+            router: connectDeps.gate.router,
+            timeoutMs: connectDeps.gate.timeoutMs,
           },
         }
       : {}),
@@ -712,26 +807,37 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     },
     idleTimeoutMs: cfg.idleTimeoutMs ?? 30_000,
     transcriptDir,
-    ...(cfg.connect !== undefined ? { connect: cfg.connect } : {}),
+    ...(connectDeps !== undefined ? { connect: connectDeps } : {}),
   });
 
   // --- inbound Bolt app (the #29 seam) ----------------------------------------
+  // Emulator mode: the harness's own app routes processEvent-injected
+  // events (never started). Live mode: the ADAPTER's app owns the Socket
+  // Mode receiver — inbound arrives from the real workspace over the
+  // socket — so this app is inert and no handlers are installed on it.
   const app = new App({
-    appToken: APP_TOKEN,
+    appToken: realSlack ? cfg.slackTokens!.appToken : APP_TOKEN,
     // The default HTTP receiver requires a signing secret at construction;
     // it is never started, so nothing listens or talks to Slack.
     signingSecret: "test-signing-secret",
     tokenVerificationEnabled: false,
-    authorize: async () => ({ botToken: BOT_TOKEN }),
+    authorize: async () => ({ botToken: realSlack ? cfg.slackTokens!.botToken : BOT_TOKEN }),
     logger: QUIET_LOGGER,
   });
-  registerMessageHandler(app, (m) => spaceService.handleInboundMessage(m), {
-    responseModeFor,
-    botUserId: () => botUserId,
-  });
-  registerActionHandler(app, async (a) => {
-    await approvalRouter.handleAction?.(a);
-  });
+  if (!realSlack) {
+    registerMessageHandler(app, (m) => spaceService.handleInboundMessage(m), {
+      responseModeFor,
+      botUserId: () => botUserId,
+    });
+    registerActionHandler(app, async (a) => {
+      await approvalRouter.handleAction?.(a);
+    });
+  }
+
+  // Live mode: connect the Socket Mode websocket — inbound events only
+  // arrive once the adapter is started (it also resolves the bot user id
+  // for mention filtering via auth.test).
+  if (realSlack) await adapter.start();
 
   let cleaned = false;
   const cleanup = async () => {
@@ -740,6 +846,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     try {
       await spaceService.stop();
     } finally {
+      // Live mode: close the Socket Mode websocket; emulator mode the
+      // adapter's app was never started, so there is nothing to stop.
+      if (realSlack) await adapter.stop();
       slack.stop();
       modelStub.stop();
       store.close();
@@ -764,6 +873,13 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     configDir,
     transcriptDir,
     async deliverMessage(channelId, text, extra = {}) {
+      if (realSlack) {
+        // Live mode: post through the REAL API as the QA user; the message
+        // event then arrives over the Socket Mode websocket exactly like a
+        // human's (extra event fields are an emulator-only affordance).
+        await liveSlack!.postAsUser(channelId, text);
+        return;
+      }
       await app.processEvent({
         body: {
           type: "event_callback",
@@ -773,6 +889,14 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       });
     },
     async deliverAction({ actionId, value, channelId, messageTs, user = humanUserId }) {
+      if (realSlack) {
+        // Slack buttons cannot be clicked through the API — live journeys
+        // use the always-approve router instead (issue #79).
+        throw new Error(
+          "deliverAction is unavailable in realSlack mode: Slack approval buttons cannot be " +
+            "clicked via the API; use the always-approve router (issue #79)",
+        );
+      }
       await app.processEvent({
         body: {
           type: "block_actions",
@@ -785,10 +909,13 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
         ack: async () => {},
       });
     },
+    // Live mode note: `messages` reflects the mirror's last refresh —
+    // prefer `liveSlack.history(channelId)` for fresh reads (canary).
     messages(channelId?: string) {
-      const all = slack.store.messages.all() as unknown as EmulatorMessage[];
+      const all = slack.store.messages.all();
       return channelId ? all.filter((m) => m.channel_id === channelId) : all;
     },
+    ...(liveSlack !== undefined ? { liveSlack } : {}),
     cleanup,
   };
 }

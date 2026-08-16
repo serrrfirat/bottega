@@ -31,6 +31,23 @@ oauth_config:
       - channels:history
       - groups:history
       - im:history
+      # Live-Slack QA canary (issue #79): create/locate the bottega-qa
+      # channel, invite bot + QA user, list channels/users.
+      - channels:manage
+      - channels:read
+      - users:read
+      # conversations.open for the QA user's DM.
+      - im:write
+    user:
+      # Live-Slack QA canary (issue #79): the QA user token sends messages
+      # as the QA user (chat:write) and reads back bot replies
+      # (im:history/channels:history); conversations.list for the channel.
+      - chat:write
+      - channels:history
+      - channels:read
+      - im:history
+      - im:write
+      - users:read
 settings:
   # Interactive components (approval buttons, issue #44): block_actions need
   # interactivity enabled. Socket Mode delivers the payloads over the same
