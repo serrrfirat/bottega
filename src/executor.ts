@@ -37,7 +37,6 @@ import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-ev
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { loadOrgPolicy } from "./policy/config";
-import createPolicyExtension from "./policy/extension";
 import { createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
@@ -449,10 +448,19 @@ if (import.meta.main) {
   mkdirSync("data/omp-agent", { recursive: true });
   // Pre-approved session: the work item's pickup approval IS the
   // authorization for allowlisted exec-tier tools (bash) inside the
-  // workspace; unknown tools still deny and every decision audits.
+  // workspace; unknown tools still deny and every decision audits. The
+  // policy gate rides the driver's custom-tools bridge (issue #69): the
+  // extension seam is inert under restrictToolNames, so the gate wraps
+  // every allowlisted built-in (read/write/glob/grep/bash) instead.
   const driver = createOmpSdkDriver({
     agentDir: "data/omp-agent",
-    extensions: [createPolicyExtension({ orgPolicy, audit, router: DenyRouter, store, preApproved: true })],
+    gate: {
+      orgPolicy,
+      audit,
+      router: DenyRouter,
+      store,
+      preApproved: true,
+    },
   });
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());

@@ -30,7 +30,7 @@
  * policy for the scope (file floor + DB + overlay), so the agent sees what
  * actually governs, not just what is stored.
  */
-import type { ExtensionFactory, AgentToolResult } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory, AgentToolResult, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { Store } from "../store/db";
 import { type OrgSettings, type OrgSettingsInput } from "../store/org-settings";
@@ -208,39 +208,54 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   return input;
 }
 
-export function settingsToolsExtension(store: Store, opts: SettingsToolsExtensionOpts = {}): ExtensionFactory {
+export type SettingsToolDefinition = ToolDefinition<typeof settingsArgsSchema>;
+
+/**
+ * The settings tool as an SDK {@link ToolDefinition} (issue #69): one source
+ * shared by the in-session extension surface and the driver's gatedTools
+ * path. Restricted SDK sessions (restrictToolNames) drop extension-registered
+ * tools entirely, so the definition rides the custom-tools path in such
+ * sessions; the extension registers the same definition for unrestricted
+ * sessions.
+ */
+export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensionOpts = {}): ToolDefinition[] {
   const actor = opts.actor ?? "agent";
-  return (pi) => {
-    pi.registerTool({
-      name: "settings",
-      label: "Read or change bottega settings",
-      description:
-        "Reads or changes the durable org/per-space settings (the DB, not config files — the DB is the " +
-        "source of truth; config files are defaults). Write-tier: prompts for approval in non-yolo modes. " +
-        "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
-        "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
-        "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
-        "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url. Space scope knobs " +
-        "(the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
-        "allowlist), extensions.deny (ids to ADD), extensions.org_credentials. Omit `set` to read: " +
-        "returns the stored settings plus the effective policy. Per-space model knobs live in the " +
-        "model_settings tool.",
-      parameters: settingsArgsSchema,
-      approval: "write",
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
-        try {
-          if (params.set !== undefined && Object.keys(params.set).length === 0) {
-            return toolError("settings set requires at least one field");
-          }
-          if (params.scope === "space") {
-            return await handleSpace(store, opts, actor, params);
-          }
-          return await handleOrg(store, opts, actor, params);
-        } catch (err) {
-          return toolError(errorMessage(err));
+  const definition: SettingsToolDefinition = {
+    name: "settings",
+    label: "Read or change bottega settings",
+    description:
+      "Reads or changes the durable org/per-space settings (the DB, not config files — the DB is the " +
+      "source of truth; config files are defaults). Write-tier: prompts for approval in non-yolo modes. " +
+      "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
+      "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
+      "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
+      "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url. Space scope knobs " +
+      "(the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
+      "allowlist), extensions.deny (ids to ADD), extensions.org_credentials. Omit `set` to read: " +
+      "returns the stored settings plus the effective policy. Per-space model knobs live in the " +
+      "model_settings tool.",
+    parameters: settingsArgsSchema,
+    approval: "write",
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
+      try {
+        if (params.set !== undefined && Object.keys(params.set).length === 0) {
+          return toolError("settings set requires at least one field");
         }
-      },
-    });
+        if (params.scope === "space") {
+          return await handleSpace(store, opts, actor, params);
+        }
+        return await handleOrg(store, opts, actor, params);
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+    },
+  };
+  return [definition];
+}
+
+export function settingsToolsExtension(store: Store, opts: SettingsToolsExtensionOpts = {}): ExtensionFactory {
+  return (pi) => {
+    for (const definition of settingsToolDefinitions(store, opts)) pi.registerTool(definition);
   };
 }
 

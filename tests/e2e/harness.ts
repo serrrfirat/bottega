@@ -5,10 +5,12 @@
  *   - store          real SQLite on a temp file (src/store/db.ts)
  *   - audit / policy real audit module + org config + per-space overlay
  *   - memory         real SQLite provider sharing the store's db handle
- *   - driver         real `createOmpSdkDriver` with the project extensions
- *                    (policy gate, work items, memory tools, memory-context
- *                    injection) — pointed at the model stub by a per-test
- *                    models.yml `baseUrl` override in a temp agent dir
+ *   - driver         real `createOmpSdkDriver` with the project wiring
+ *                    (policy gate on the custom-tools bridge, work items,
+ *                    memory tools, memory-context injection via the
+ *                    appendSystemPrompt seam — issue #69) — pointed at the
+ *                    model stub by a per-test models.yml `baseUrl` override
+ *                    in a temp agent dir
  *   - spaceService   real SpaceService (thinking phrases, digest-on-idle,
  *                    response modes)
  *   - Slack          real adapter (`createSlackAdapter`) for OUTBOUND
@@ -39,12 +41,10 @@ import type { AuditModule } from "../../src/policy/audit";
 import { createAudit } from "../../src/policy/audit";
 import type { ApprovalRouter } from "../../src/policy/approval-router";
 import { loadOrgConfig, loadSpacePolicy, type PolicyConfig } from "../../src/policy/config";
-import createPolicyExtension from "../../src/policy/extension";
 import type { MemoryProvider } from "../../src/memory/types";
 import { createSqliteMemoryProvider, pruneDigestMemories } from "../../src/memory/sqlite";
-import { workItemsExtension } from "../../src/tools/work-items";
-import { memoryToolsExtension, memoryToolDefinitions } from "../../src/tools/memory";
-import { renderInjection } from "../../src/tools/memory-context";
+import { workItemToolDefinitions } from "../../src/tools/work-items";
+import { memoryToolDefinitions } from "../../src/tools/memory";
 import type { ExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
@@ -421,11 +421,15 @@ export interface HarnessConfig {
   mcpTransport?: (binding: McpBinding) => Transport;
   /**
    * Extra SDK tool definitions merged into the session's customTools
-   * (restricted sessions only surface customTools — extension-registered
-   * tools are dropped, so journeys pass the definitions they need, e.g.
-   * memory tools via memoryToolDefinitions).
+   * (already-gated tools — e.g. registry extension tools that run through
+   * the #53 runtime; the driver never double-wraps them).
    */
   customTools?: ToolDefinition[];
+  /**
+   * Extra SDK tool definitions the driver's policy gate must wrap before
+   * execution (issue #69) — the same bucket as the memory/work-item tools.
+   */
+  gatedTools?: ToolDefinition[];
   /** Connect capability (issue #52/#61); omitted → the connect seams are absent. */
   connect?: ConnectExtensionDeps;
 }
@@ -476,35 +480,6 @@ const BASE_TS_SECONDS = Math.floor(Date.now() / 1000);
 function nextTs(): string {
   tsCounter += 1;
   return `${BASE_TS_SECONDS}.${String(tsCounter).padStart(6, "0")}`;
-}
-
-/**
- * Turn-start memory injection (issue #42) at the harness boundary.
- *
- * The real in-session mechanism (the memory-context extension the driver
- * attaches via `memoryContext`) is inert under the SDK's restricted
- * sessions: `createAgentSession` only evaluates inline extension factories
- * when `restrictToolNames` is false (sdk.ts), and the driver hardcodes it
- * true — so no extension can hook the per-turn context event today. The
- * harness therefore performs the injection through the driver's documented
- * per-cold-start `appendSystemPrompt` seam (cold start == the first turn's
- * start): org memories flagged `metadata: { inject: "1" }` are listed
- * through the real provider and rendered with the extension's own
- * renderer, so the model's request carries the memory at turn start and
- * the session transcript stays untouched. `maxEntries` 0 disables
- * injection (org policy `memory.injection.enabled`).
- */
-function withTurnStartInjection(driver: AgentDriver, memory: MemoryProvider, maxEntries: number): AgentDriver {
-  if (maxEntries <= 0) return driver;
-  return {
-    async createSession(opts) {
-      const flagged = await memory.search({ query: "", scope: "org", metadata: { inject: "1" }, limit: maxEntries });
-      const body = renderInjection(flagged, maxEntries, 4096);
-      if (!body) return driver.createSession(opts);
-      const appended = opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n${body}` : body;
-      return driver.createSession({ ...opts, appendSystemPrompt: appended });
-    },
-  };
 }
 
 /**
@@ -606,55 +581,52 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     router: approvalRouter,
     ...(cfg.mcpTransport !== undefined ? { mcpTransport: cfg.mcpTransport } : {}),
   });
-  // Memory tools ride the customTools path: restricted SDK sessions drop
-  // extension-registered tools, so the shared definitions (the same ones
-  // memoryToolsExtension registers) surface here.
+  // Memory/work-item tools ride the gated customTools path (issue #69):
+  // restricted SDK sessions drop extension-registered tools, so the shared
+  // definitions (the same ones the extensions register) surface here and
+  // cross the driver-level policy gate before executing.
   const memoryTools = memoryToolDefinitions(memoryProvider, { audit });
-  const driver = withTurnStartInjection(
-    createOmpSdkDriver({
-      agentDir,
-      customTools: [
-        ...memoryTools,
-        ...(cfg.customTools ?? []),
-        ...extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
-      ],
-      // Connect capability (issue #52): connect_extension is built per
-      // session so the actor is the requesting principal.
-      ...(cfg.connect !== undefined
-        ? {
-            connectExtension: {
-              registry: cfg.connect.registry,
-              store: cfg.connect.store,
-              audit: cfg.connect.audit,
-              broker: cfg.connect.broker,
-              loadPolicy: cfg.connect.gate.loadPolicy,
-              router: cfg.connect.gate.router,
-              timeoutMs: cfg.connect.gate.timeoutMs,
-            },
-          }
-        : {}),
-      extensions: [
-        createPolicyExtension({
-          orgPolicy,
-          audit,
-          router: approvalRouter,
-          store,
-          toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
-          toolTier: (name) => extensionToolTier(name),
-          knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
-        }),
-        workItemsExtension(store, { orgPolicy }),
-        memoryToolsExtension(memoryProvider, { audit }),
-      ],
-      memoryContext: {
-        provider: memoryProvider,
-        enabled: orgPolicy.memory.injection.enabled,
-        maxEntries: orgPolicy.memory.injection.maxEntries,
-      },
-    }),
-    memoryProvider,
-    orgPolicy.memory.injection.enabled ? orgPolicy.memory.injection.maxEntries : 0,
-  );
+  const workItemTools = workItemToolDefinitions(store, { orgPolicy });
+  const driver = createOmpSdkDriver({
+    agentDir,
+    customTools: [
+      ...(cfg.customTools ?? []),
+      ...extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
+    ],
+    // Policy gate on the custom-tools bridge (issue #69): the extension
+    // seam is inert under restrictToolNames, so the gate wraps the gated
+    // definitions AND the allowlisted built-ins (read/glob/grep/task/...).
+    gate: {
+      orgPolicy,
+      audit,
+      router: approvalRouter,
+      store,
+      toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
+      toolTier: (name) => extensionToolTier(name),
+      knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
+      tools: [...memoryTools, ...workItemTools, ...(cfg.gatedTools ?? [])],
+    },
+    // Connect capability (issue #52): connect_extension is built per
+    // session so the actor is the requesting principal.
+    ...(cfg.connect !== undefined
+      ? {
+          connectExtension: {
+            registry: cfg.connect.registry,
+            store: cfg.connect.store,
+            audit: cfg.connect.audit,
+            broker: cfg.connect.broker,
+            loadPolicy: cfg.connect.gate.loadPolicy,
+            router: cfg.connect.gate.router,
+            timeoutMs: cfg.connect.gate.timeoutMs,
+          },
+        }
+      : {}),
+    memoryContext: {
+      provider: memoryProvider,
+      enabled: orgPolicy.memory.injection.enabled,
+      maxEntries: orgPolicy.memory.injection.maxEntries,
+    },
+  });
 
   // --- space service ---------------------------------------------------------
   spaceService = new SpaceService({

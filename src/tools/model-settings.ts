@@ -21,7 +21,7 @@
  * governs there) — the registry surfaces the driver's documented
  * not-supported result as a tool error.
  */
-import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath, type ModelRole, type SessionModelRoleRegistry } from "../server/drivers/agent-driver";
 import type { AuditModule } from "../policy/audit";
@@ -63,96 +63,114 @@ const useModelSchema = z.object({
 /** Argument shapes of the model tools; exported for tests (mirrors memory.ts). */
 export { modelSettingsSchema, useModelSchema };
 
-export function modelToolsExtension(store: Store, opts: ModelToolsExtensionOpts): ExtensionFactory {
+/**
+ * The model tools as SDK {@link ToolDefinition}s (issue #69): one source
+ * shared by the in-session extension surface and the driver's gatedTools
+ * path. Restricted SDK sessions (restrictToolNames) drop extension-registered
+ * tools entirely, so the definitions ride the custom-tools path in such
+ * sessions; the extension registers the same definitions for unrestricted
+ * sessions.
+ */
+export function modelToolsDefinitions(
+  store: Store,
+  opts: ModelToolsExtensionOpts,
+): ToolDefinition[] {
   const actor = opts.actor ?? "agent";
-  return (pi) => {
-    pi.registerTool({
-      name: "model_settings",
-      label: "Per-space model settings",
-      description:
-        "Reads or updates this space's model settings, which persist per space and are audited. " +
-        "With no `set` argument, returns the current settings. `set` writes a partial update: " +
-        "`model` (the space's default model id), `reasoning_effort` (off|low|medium|high — the " +
-        "thinking effort for the reasoning role and the space's default effort), `fast_model` " +
-        "and `reasoning_model` (model ids for the fast/reasoning roles; unset slots fall back to " +
-        "`model`). Model ids are the ids the session lists (e.g. \"deepseek-v4-flash\"). " +
-        "Write-tier: prompts for approval in non-yolo modes.",
-      parameters: modelSettingsSchema,
-      approval: "write",
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-        if (!spaceId) return toolError("model settings require a space session");
-        const before = await store.getSpaceSettings(spaceId);
-        if (!params.set) {
-          return { content: [{ type: "text", text: JSON.stringify(before) }] };
-        }
-        if (Object.keys(params.set).length === 0) {
-          return toolError("model_settings set requires at least one field");
-        }
-        // Normalize: whitespace-only strings are rejected (the schema's
-        // min(1) only bounds length), everything else is trimmed before
-        // persist so settings never store padded ids.
-        const after: SpaceModelSettings & Record<string, string | undefined> = { ...before };
-        for (const [key, raw] of Object.entries(params.set)) {
-          if (typeof raw !== "string") continue; // reasoning_effort enum value
-          const trimmed = raw.trim();
-          if (!trimmed) return toolError(`model_settings ${key} must not be empty`);
-          after[key] = trimmed;
-        }
-        try {
-          await store.updateSpaceSettings(spaceId, after);
-          await opts.audit?.appendAudit({
-            actor,
-            space_id: spaceId,
-            event_type: MODEL_SETTINGS_CHANGED_EVENT,
-            payload: { before, after, by: actor },
-          });
-          return { content: [{ type: "text", text: JSON.stringify(after) }] };
-        } catch (err) {
-          return toolError(errorMessage(err));
-        }
-      },
-    });
 
-    pi.registerTool({
-      name: "use_model",
-      label: "Switch model role for the next turn",
-      description:
-        "Switches the agent's model role for the NEXT turn: `default` (the space's `model` setting " +
-        "at the space's default effort), `fast` (the space's `fast_model` — or its `model` when " +
-        "unset — at low effort; use for simple tasks), or `reasoning` (the space's `reasoning_model` " +
-        "— or its `model` when unset — at the space's `reasoning_effort`, default high; use for hard " +
-        "tasks). Natural-language requests like \"use the fast model for this\" map to " +
-        "use_model {role: \"fast\"}. Configure slots with the model_settings tool; without settings " +
-        "nothing switches. Write-tier: prompts for approval in non-yolo modes.",
-      parameters: useModelSchema,
-      approval: "write",
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-        if (!spaceId) return toolError("use_model requires a space session");
-        if (!opts.modelRoles) {
-          return toolError("model role switching is not wired in this deployment");
-        }
-        try {
-          const outcome = await opts.modelRoles.switchRole(spaceId, params.role as ModelRole);
-          if (!outcome.ok) return toolError(outcome.error);
-          const { result } = outcome;
-          await opts.audit?.appendAudit({
-            actor,
-            space_id: spaceId,
-            event_type: MODEL_SWITCHED_EVENT,
-            payload: {
-              role: result.role,
-              model: result.model,
-              thinking_level: result.thinking_level,
-              by: actor,
-            },
-          });
-          return { content: [{ type: "text", text: JSON.stringify(result) }] };
-        } catch (err) {
-          return toolError(errorMessage(err));
-        }
-      },
-    });
+  const settingsTool: ToolDefinition<typeof modelSettingsSchema> = {
+    name: "model_settings",
+    label: "Per-space model settings",
+    description:
+      "Reads or updates this space's model settings, which persist per space and are audited. " +
+      "With no `set` argument, returns the current settings. `set` writes a partial update: " +
+      "`model` (the space's default model id), `reasoning_effort` (off|low|medium|high — the " +
+      "thinking effort for the reasoning role and the space's default effort), `fast_model` " +
+      "and `reasoning_model` (model ids for the fast/reasoning roles; unset slots fall back to " +
+      "`model`). Model ids are the ids the session lists (e.g. \"deepseek-v4-flash\"). " +
+      "Write-tier: prompts for approval in non-yolo modes.",
+    parameters: modelSettingsSchema,
+    approval: "write",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      if (!spaceId) return toolError("model settings require a space session");
+      const before = await store.getSpaceSettings(spaceId);
+      if (!params.set) {
+        return { content: [{ type: "text", text: JSON.stringify(before) }] };
+      }
+      if (Object.keys(params.set).length === 0) {
+        return toolError("model_settings set requires at least one field");
+      }
+      // Normalize: whitespace-only strings are rejected (the schema's
+      // min(1) only bounds length), everything else is trimmed before
+      // persist so settings never store padded ids.
+      const after: SpaceModelSettings & Record<string, string | undefined> = { ...before };
+      for (const [key, raw] of Object.entries(params.set)) {
+        if (typeof raw !== "string") continue; // reasoning_effort enum value
+        const trimmed = raw.trim();
+        if (!trimmed) return toolError(`model_settings ${key} must not be empty`);
+        after[key] = trimmed;
+      }
+      try {
+        await store.updateSpaceSettings(spaceId, after);
+        await opts.audit?.appendAudit({
+          actor,
+          space_id: spaceId,
+          event_type: MODEL_SETTINGS_CHANGED_EVENT,
+          payload: { before, after, by: actor },
+        });
+        return { content: [{ type: "text", text: JSON.stringify(after) }] };
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+    },
+  };
+
+  const useModelTool: ToolDefinition<typeof useModelSchema> = {
+    name: "use_model",
+    label: "Switch model role for the next turn",
+    description:
+      "Switches the agent's model role for the NEXT turn: `default` (the space's `model` setting " +
+      "at the space's default effort), `fast` (the space's `fast_model` — or its `model` when " +
+      "unset — at low effort; use for simple tasks), or `reasoning` (the space's `reasoning_model` " +
+      "— or its `model` when unset — at the space's `reasoning_effort`, default high; use for hard " +
+      "tasks). Natural-language requests like \"use the fast model for this\" map to " +
+      "use_model {role: \"fast\"}. Configure slots with the model_settings tool; without settings " +
+      "nothing switches. Write-tier: prompts for approval in non-yolo modes.",
+    parameters: useModelSchema,
+    approval: "write",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      if (!spaceId) return toolError("use_model requires a space session");
+      if (!opts.modelRoles) {
+        return toolError("model role switching is not wired in this deployment");
+      }
+      try {
+        const outcome = await opts.modelRoles.switchRole(spaceId, params.role as ModelRole);
+        if (!outcome.ok) return toolError(outcome.error);
+        const { result } = outcome;
+        await opts.audit?.appendAudit({
+          actor,
+          space_id: spaceId,
+          event_type: MODEL_SWITCHED_EVENT,
+          payload: {
+            role: result.role,
+            model: result.model,
+            thinking_level: result.thinking_level,
+            by: actor,
+          },
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+    },
+  };
+
+  return [settingsTool, useModelTool];
+}
+
+export function modelToolsExtension(store: Store, opts: ModelToolsExtensionOpts): ExtensionFactory {
+  return (pi) => {
+    for (const definition of modelToolsDefinitions(store, opts)) pi.registerTool(definition);
   };
 }

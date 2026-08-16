@@ -4,6 +4,7 @@ import {
   AgentRegistry,
   SessionManager,
   createAgentSession,
+  z,
   type AgentSession,
   type CreateAgentSessionOptions,
   type CreateAgentSessionResult,
@@ -11,8 +12,9 @@ import {
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider } from "../../memory/types";
+import { MEMORY_LIMIT_MAX } from "../../memory/types";
 import type { SpaceModelSettings } from "../../store/db";
-import { memoryContextExtension } from "../../tools/memory-context";
+import { renderInjection } from "../../tools/memory-context";
 import {
   connectExtensionToolDefinition,
   connectViaAuthBroker,
@@ -22,9 +24,18 @@ import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import type { PolicyConfig } from "../../policy/config";
+import { loadSpacePolicy } from "../../policy/config";
+import { evaluatePolicyGate, type PolicyGateOutcome } from "../../policy/gate";
+import type { PolicyExtensionDeps } from "../../policy/extension";
 import type { Store } from "../../store/db";
 
-/** Driver-level memory-context wiring (issue #42): mirrors the extension opts. */
+/**
+ * Driver-level memory-context wiring (issue #42): org memories flagged
+ * `metadata: { inject: "1" }` are injected into the model's context at
+ * session cold start via the `appendSystemPrompt` seam. Restricted SDK
+ * sessions cannot hook the extension `context` event, so the driver renders
+ * the injection itself (same renderer as the extension).
+ */
 export interface MemoryContextDriverOpts {
   provider: MemoryProvider;
   defaultPrincipal?: string;
@@ -296,6 +307,175 @@ export function spaceAgentToolNames(extensionToolNames: readonly string[], allow
 }
 
 /**
+ * Driver-level policy gate wiring (issue #69): restricted SDK sessions
+ * (`restrictToolNames: true`) never evaluate inline extension factories
+ * (sdk.ts), so the policy extension's `tool_call` interception is inert in
+ * production. This option moves the same decision table (tier × space
+ * policy → allow | deny | ask-human, audited, Slack-routed approvals) onto
+ * the custom-tools bridge: every definition in `tools` — and every
+ * allowlisted built-in the driver wraps — crosses the gate before it
+ * executes. Definitions that run their own gate (connect_extension,
+ * registry extension tools via the #53 runtime) stay in `customTools` and
+ * are never double-gated.
+ */
+export interface DriverPolicyGateOpts extends PolicyExtensionDeps {
+  /**
+   * Tool definitions the gate must wrap (memory/work-item/model tools,
+   * issue #69). Omitted → only allowlisted built-ins are gated.
+   */
+  tools?: ToolDefinition[];
+}
+
+/**
+ * Allowlisted built-ins the driver can gate: re-registered as thin custom
+ * definitions whose execute runs the policy gate, then delegates to the
+ * SDK's native implementation via the documented same-tool `ctx.invokeTool`
+ * seam. Deliberately excludes `lsp` (the SDK disables it for restricted
+ * sessions — enableLsp defaults false) and `inspect_image` (model-dependent
+ * lifecycle): wrapping those would surface tools the SDK itself would not
+ * build. Custom definitions supplied by the caller always win over these
+ * wrappers.
+ */
+const GATE_WRAPPED_BUILTINS = [
+  "read",
+  "glob",
+  "grep",
+  "ast_grep",
+  "web_search",
+  "task",
+  "write",
+  "edit",
+  "bash",
+] as const;
+
+/**
+ * Caller-declared parameter hints for the wrapped built-ins (issue #69).
+ * The native implementation validates strictly and rejects bad args with
+ * its own schema, so the wrapper only needs a permissive passthrough shape
+ * that guides the model without drifting from the SDK's schemas.
+ */
+const GATE_WRAPPED_BUILTIN_PARAMS: Record<(typeof GATE_WRAPPED_BUILTINS)[number], ReturnType<typeof z.object>> = {
+  read: z.object({ path: z.string(), offset: z.number().int().optional(), limit: z.number().int().optional() }).passthrough(),
+  glob: z.object({ pattern: z.string(), path: z.string().optional(), limit: z.number().int().optional() }).passthrough(),
+  grep: z.object({ pattern: z.string(), path: z.string().optional(), case: z.boolean().optional() }).passthrough(),
+  ast_grep: z.object({ pattern: z.string(), path: z.string().optional() }).passthrough(),
+  web_search: z.object({ query: z.string() }).passthrough(),
+  task: z.object({ description: z.string(), prompt: z.string(), agent: z.string().optional() }).passthrough(),
+  write: z.object({ path: z.string(), content: z.string() }).passthrough(),
+  edit: z.object({ path: z.string(), old_string: z.string(), new_string: z.string() }).passthrough(),
+  bash: z.object({ command: z.string(), timeout: z.number().int().optional() }).passthrough(),
+};
+
+const GATE_WRAPPED_BUILTIN_DESCRIPTIONS: Record<(typeof GATE_WRAPPED_BUILTINS)[number], string> = {
+  read: "Read a file from the workspace. Args: path (string, required), offset (int, optional), limit (int, optional).",
+  glob: "List files matching a glob pattern. Args: pattern (string, required), path (string, optional), limit (int, optional).",
+  grep: "Search file contents with a regex pattern. Args: pattern (string, required), path (string, optional), case (boolean, optional).",
+  ast_grep: "Search code structurally with an AST pattern. Args: pattern (string, required), path (string, optional).",
+  web_search: "Search the web. Args: query (string, required).",
+  task: "Delegate a task to a subagent. Args: description (string, required), prompt (string, required), agent (string, optional).",
+  write: "Write content to a file at path. Args: path (string, required), content (string, required).",
+  edit: "Apply a string replacement to a file at path. Args: path (string, required), old_string (string, required), new_string (string, required).",
+  bash: "Run a shell command in the workspace. Args: command (string, required), timeout (int, optional).",
+};
+
+/**
+ * Marks an SDK tool definition so the SDK treats it as a
+ * {@link ToolDefinition} rather than a legacy CustomTool (issue #69).
+ *
+ * `createAgentSession`'s customTools accepts both shapes and discriminates
+ * on a hidden `__isToolDefinition` flag (sdk.ts `isCustomTool`): an
+ * UNMARKED plain object is treated as a CustomTool and its execute is
+ * re-bound to the CustomTool signature
+ * `(toolCallId, params, onUpdate, customToolContext, signal)` — which
+ * silently shifts a ToolDefinition-style execute's `(signal, onUpdate,
+ * ctx)` arguments and breaks `ctx.sessionManager` access. The SDK marks
+ * its own converted definitions with a private symbol; the runtime check
+ * reads the same-named string property, so definitions passed through this
+ * helper get the full ExtensionContext (sessionManager + the same-tool
+ * `ctx.invokeTool` delegation seam for wrapped built-ins).
+ */
+export function markToolDefinition<TDef extends ToolDefinition>(def: TDef): TDef {
+  return { ...def, __isToolDefinition: true } as TDef & { __isToolDefinition: boolean };
+}
+
+/**
+ * Wraps a tool definition so every call crosses the shared policy gate
+ * (issue #69): load the space's effective policy, decide (tier × action),
+ * audit, and route ask-human through the approval router — then run the
+ * original execute only when the call is allowed. A denied call throws the
+ * gate's block reason, which the SDK surfaces to the model as a blocked
+ * tool result (the same shape the policy extension's `{block: true}`
+ * produced). Fail closed: any gate error denies the call.
+ */
+export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: PolicyExtensionDeps): TDef {
+  const execute = def.execute;
+  const actor = deps.actor ?? "agent";
+  return {
+    ...def,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      let outcome: PolicyGateOutcome;
+      try {
+        outcome = await evaluatePolicyGate(
+          {
+            loadPolicy: (sid) => loadSpacePolicy(deps.orgPolicy, deps.store, sid),
+            audit: deps.audit,
+            router: deps.router,
+            timeoutMs: deps.timeoutMs,
+            preApproved: deps.preApproved,
+            knownExtensionIds: deps.knownExtensionIds,
+            toolTier: deps.toolTier,
+          },
+          {
+            tool: def.name,
+            args: params,
+            spaceId,
+            actor,
+            extensionId: deps.toolExtensionId?.(def.name),
+          },
+        );
+      } catch (err) {
+        // Fail closed: an internal gate error must never let the tool run.
+        console.error("[policy] gate error (denying tool call):", err);
+        throw new Error("policy: gate error — denied");
+      }
+      // A deliberate deny surfaces as a blocked tool result to the model,
+      // the same shape the policy extension's `{block: true}` produced.
+      if (!outcome.allowed) throw new Error(outcome.blockReason);
+      return execute.call(def, toolCallId, params, signal, onUpdate, ctx);
+    },
+  } as TDef;
+}
+
+/**
+ * Thin definitions for allowlisted built-ins the gate must cover (issue
+ * #69): gate first, then delegate to the SDK's native implementation via
+ * the same-tool `ctx.invokeTool` seam (the SDK's documented way for a
+ * re-registered built-in to reach the original).
+ */
+function gatedBuiltinDefinitions(names: readonly string[]): ToolDefinition[] {
+  return names.map((name) => {
+    const def: ToolDefinition = {
+      name,
+      label: name,
+      description: GATE_WRAPPED_BUILTIN_DESCRIPTIONS[name as (typeof GATE_WRAPPED_BUILTINS)[number]],
+      parameters: GATE_WRAPPED_BUILTIN_PARAMS[name as (typeof GATE_WRAPPED_BUILTINS)[number]],
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        // Delegation runs the unwrapped native built-in with this call's
+        // context (abort signal, progress callback, provider metadata), so
+        // the wrapped tool behaves exactly like the native one — the gate
+        // is the only difference.
+        if (!ctx.invokeTool) {
+          throw new Error(`policy: built-in '${name}' has no native implementation to delegate to`);
+        }
+        return ctx.invokeTool(params as Record<string, unknown>);
+      },
+    };
+    return def;
+  });
+}
+
+/**
  * Session thinking level (issue #68). Mirrors the SDK's `ThinkingLevel`
  * values (`@oh-my-pi/pi-agent-core`) — the SDK root does not re-export the
  * type, so the driver re-declares it. "low" is a valid effort for
@@ -311,24 +491,32 @@ export type DriverThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" 
  * file-backed (SessionManager under `transcriptDir`, one JSONL per space —
  * the durable space timeline), tool-restricted to the allowlist above, and
  * registered in a private AgentRegistry (SDK requirement for concurrent
- * top-level sessions). `extensions` is OMP-typed by design: the AgentDriver
- * abstraction stays engine-free, and OMP-specific options live on this
- * factory (policy + audit extensions plug in here, issues #6/#7).
+ * top-level sessions).
  *
- * `memoryContext` (issue #42) wraps every session with the memory-context
- * injection extension, built per session so it closes over the session's
- * `getPrincipal` — the smallest analogue of the MCP server's per-session
- * BOTTEGA_SPACE_ID pattern (the ACP driver documents this path instead).
+ * Restricted sessions (restrictToolNames, hardcoded true) never evaluate
+ * inline extension factories (sdk.ts), so extension-only wiring is inert:
+ * the policy gate, extension-registered tools, and the memory-context
+ * injection extension never run. The driver therefore wires all three on
+ * the SDK's custom-tools path (issue #69):
  *
- * `customTools` (issue #50) carries the extension registry's tool
- * definitions; restricted sessions skip extension factories entirely, so
- * registry tools ride the SDK's custom-tools path instead.
+ * - `gate` moves the policy gate (issues #6/#7: tier × space policy →
+ *   allow | deny | ask-human, audited, Slack-routed approvals) onto the
+ *   tool bridge: every definition in `gate.tools` and every allowlisted
+ *   built-in the driver wraps crosses the gate before it executes;
+ * - `customTools` carries definitions that gate themselves (registry tools
+ *   via the #53 runtime, the per-session connect tool, issue #52);
+ * - `memoryContext` (issue #42) injects org memory flagged `inject: "1"`
+ *   through the per-cold-start `appendSystemPrompt` seam — the same
+ *   renderer the extension used, reached from the driver because the
+ *   extension's `context` hook cannot fire in restricted sessions.
  */
 export function createOmpSdkDriver(
   opts: {
     agentDir?: string;
     extensions?: ExtensionFactory[];
     customTools?: ToolDefinition[];
+    /** Policy gate wiring (issue #69); see {@link DriverPolicyGateOpts}. */
+    gate?: DriverPolicyGateOpts;
     memoryContext?: MemoryContextDriverOpts;
     /** Connect capability (issue #52); omitted → the connect tool is absent (e.g. executor sessions). */
     connectExtension?: ConnectExtensionDriverOpts;
@@ -363,18 +551,6 @@ export function createOmpSdkDriver(
       // Missing/empty files start fresh; existing files resume the space's
       // transcript (server restarts keep history intact).
       await sessionManager.setSessionFile(sessionFilePath(transcriptDir, spaceId));
-      const extensions = [...(opts.extensions ?? [])];
-      if (opts.memoryContext) {
-        extensions.push(
-          memoryContextExtension(opts.memoryContext.provider, {
-            defaultPrincipal: opts.memoryContext.defaultPrincipal,
-            maxEntries: opts.memoryContext.maxEntries,
-            maxBytes: opts.memoryContext.maxBytes,
-            enabled: opts.memoryContext.enabled,
-            getPrincipal,
-          }),
-        );
-      }
       // The connect tool (issue #52) rides the custom-tools path — restricted
       // sessions skip extension factories — and is built per session so the
       // actor is the session's principal (personal connects record the owner).
@@ -396,17 +572,67 @@ export function createOmpSdkDriver(
             }),
           ]
         : customTools;
+      // Policy gate (issue #69): the driver wraps the caller's gated
+      // definitions AND the allowlisted built-ins that would otherwise run
+      // with no enforcement (the extension seam is inert under restrict).
+      // Built-ins the caller already defines (customTools) win; connect and
+      // registry tools gate themselves and are never double-gated.
+      const gate = opts.gate;
+      const gatedTools = gate ? (gate.tools ?? []).map((def) => withPolicyGate(def, gate)) : [];
+      const customNames = new Set(
+        [...gatedTools, ...sessionCustomTools].map((def) => def.name),
+      );
+      const builtinNames = gate
+        ? spaceAgentToolNames([...customNames], allowTools).filter(
+            (name) =>
+              !customNames.has(name) &&
+              (GATE_WRAPPED_BUILTINS as readonly string[]).includes(name),
+          )
+        : [];
+      const allSessionTools = [
+        ...gatedTools,
+        // Built-in wrappers delegate to the native tool AFTER the gate
+        // (issue #69): every allowlisted built-in crosses the decision
+        // table, then runs through the SDK's same-tool delegation seam.
+        ...gatedBuiltinDefinitions(builtinNames).map((def) => withPolicyGate(def, gate!)),
+        ...sessionCustomTools,
+        // The SDK discriminates customTools by the hidden __isToolDefinition
+        // flag (issue #69): unmarked objects are re-bound to the CustomTool
+        // execute signature, which breaks ToolDefinition-style executes.
+      ].map(markToolDefinition);
+      // Turn-start memory injection (#42) at the driver boundary: restricted
+      // sessions cannot hook the SDK's `context` event, so org memories
+      // flagged `metadata: { inject: "1" }` ride the per-cold-start
+      // appendSystemPrompt seam (cold start == the first turn's start),
+      // rendered with the extension's own renderer. maxEntries 0 disables
+      // injection (org policy `memory.injection.enabled`).
+      let effectiveAppend = appendSystemPrompt;
+      if (opts.memoryContext && opts.memoryContext.enabled !== false) {
+        const maxEntries = opts.memoryContext.maxEntries ?? 5;
+        const maxBytes = opts.memoryContext.maxBytes ?? 4096;
+        const limit = Math.min(maxEntries, MEMORY_LIMIT_MAX);
+        const flagged = await opts.memoryContext.provider.search({
+          query: "",
+          scope: "org",
+          metadata: { inject: "1" },
+          limit,
+        });
+        const body = renderInjection(flagged, maxEntries, maxBytes);
+        if (body) effectiveAppend = effectiveAppend ? `${effectiveAppend}\n\n${body}` : body;
+      }
       const { session } = await createSession({
         cwd: sessionCwd,
         agentDir: opts.agentDir,
         sessionManager,
         agentRegistry: new AgentRegistry(),
         restrictToolNames: true,
-        toolNames: spaceAgentToolNames(sessionCustomTools.map((tool) => tool.name), allowTools),
-        // Extension seam: policy + audit extensions plug in here (#6/#7).
-        extensions,
+        toolNames: spaceAgentToolNames(allSessionTools.map((tool) => tool.name), allowTools),
+        // Extension seam: kept for unrestricted sessions and API compat; under
+        // restrictToolNames the SDK ignores it (issue #69) — the gate and the
+        // gated definitions above are the live path.
+        extensions: opts.extensions ?? [],
         // request-only directive (issue #55), appended to the rendered prompt.
-        ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+        ...(effectiveAppend ? { appendSystemPrompt: effectiveAppend } : {}),
         // Issue #68: keep the token budget for answers, not reasoning (see
         // the thinkingLevel option on createOmpSdkDriver). The cast bridges
         // the SDK's const-enum typing: Effort members type nominally in
@@ -416,7 +642,7 @@ export function createOmpSdkDriver(
         // Registry + connect tools (issues #50/#52) must surface in
         // restricted sessions; discovered extensions, MCP, and ambient
         // custom tools stay disabled.
-        customTools: sessionCustomTools,
+        customTools: allSessionTools,
         allowRestrictedCustomTools: true,
       });
       return new OmpSessionDriver({

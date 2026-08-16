@@ -69,7 +69,13 @@ describe("e2e journey 1: chat + memory", () => {
         },
         { type: "text", text: "saved and found" },
       ];
-      const h = await bootHarness({ modelTurns: turns });
+      const h = await bootHarness({
+        // Fail-closed default policy denies unlisted tools; the gate is
+        // live on the custom-tools bridge (issue #69), so the journey
+        // explicitly allows the memory tools it scripts.
+        orgConfigYaml: "tools:\n  memory.save: allow\n  memory.search: allow\n",
+        modelTurns: turns,
+      });
       try {
         await h.deliverMessage(h.slack.dmChannelId, "remember: the build runs with bun test");
         // Request 1 = save call, 2 = search call, 3 = final text.
@@ -79,11 +85,11 @@ describe("e2e journey 1: chat + memory", () => {
         expect(found.map((e) => e.content)).toContain("the build runs with bun test");
 
         // The tool calls executed through the real provider and were
-        // audited with a content hash, never the content. (The in-session
-        // policy-gate extension is inert under the SDK's restricted
-        // sessions — pre-existing driver wiring — so no policy.decision
-        // rows are written by this path.)
+        // audited with a content hash, never the content. The policy gate
+        // rides the driver's custom-tools bridge (issue #69), so every
+        // call also wrote a `policy.decision` row.
         const audit = await h.audit.listAudit({});
+        expect(audit.filter((r) => r.event_type === "policy.decision").length).toBeGreaterThanOrEqual(2);
         expect(audit.filter((r) => r.event_type === "memory.write").length).toBeGreaterThanOrEqual(1);
         const writeRow = audit.find((r) => r.event_type === "memory.write")!;
         expect(writeRow.payload).not.toContain("bun test");

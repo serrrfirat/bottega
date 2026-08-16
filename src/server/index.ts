@@ -7,11 +7,10 @@ import { resolveMemoryProvider } from "./memory-provider";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/config";
-import createPolicyExtension from "../policy/extension";
-import { workItemsExtension } from "../tools/work-items";
-import { memoryToolsExtension } from "../tools/memory";
-import { modelToolsExtension } from "../tools/model-settings";
-import { settingsToolsExtension } from "../tools/settings";
+import { workItemToolDefinitions } from "../tools/work-items";
+import { memoryToolDefinitions } from "../tools/memory";
+import { modelToolsDefinitions } from "../tools/model-settings";
+import { settingsToolDefinitions } from "../tools/settings";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -192,13 +191,46 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         agentDir,
         // Registry tools (issue #50): typed extension tools ride the SDK
         // custom-tools path so they surface in the restricted space-agent
-        // toolset alongside the project extensions below; execution goes
-        // through the #53 runtime (gate → ladder → boundary → audit).
+        // toolset; execution goes through the #53 runtime, which runs its
+        // OWN policy gate (gate → ladder → boundary → audit), so they are
+        // never wrapped by the driver gate below.
         customTools: extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
+        // Policy gate (issue #69): restricted SDK sessions never evaluate
+        // inline extension factories (sdk.ts), so the policy extension's
+        // tool_call interception is inert in production. The gate moves to
+        // the custom-tools bridge: every gated tool definition below AND
+        // every allowlisted built-in (read/glob/grep/task/...) crosses the
+        // shared decision table (tier × space policy → allow | deny |
+        // ask-human, audited, Slack-routed approvals) before executing.
+        gate: {
+          orgPolicy,
+          audit,
+          router: approvalRouter,
+          store,
+          // Extension policy seam (issue #56): resolve extension tool
+          // calls against the space's allowlist before tier/approval.
+          toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
+          // Extension tier seam (issue #53): an allowed extension crosses
+          // the tier stage as a known tool with its manifest tier.
+          toolTier: (name) => extensionToolTier(name),
+          knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
+          // The in-session tool surface, as SDK tool definitions (issue
+          // #69): work items (issue #10), memory (issues #22/#43 — provider
+          // selected from the org settings (#67): memory_backend.base_url
+          // set → mem0 backend (compose ships it), else SQLite sharing the
+          // store's database handle; every save is audited via the policy
+          // audit module), model tools (issue #64), settings (issue #67).
+          tools: [
+            ...workItemToolDefinitions(store, { orgPolicy }),
+            ...memoryToolDefinitions(memoryProvider, { audit }),
+            ...modelToolsDefinitions(store, { audit, modelRoles }),
+            ...settingsToolDefinitions(store, { audit }),
+          ],
+        },
         // Connect capability (issue #52): connect_extension is built per
         // session so the actor is the requesting principal; org-scope
         // connects gate through the same Slack-backed approval router as
-        // every exec-tier tool call.
+        // every exec-tier tool call (its own gate — never double-wrapped).
         connectExtension: {
           registry: extensionRegistry,
           store,
@@ -209,34 +241,6 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
         // Per-space model settings (issue #64): the OMP session resolves
         // use_model roles against the space's settings column.
         getModelSettings: (spaceId) => store.getSpaceSettings(spaceId),
-        extensions: [
-          createPolicyExtension({
-            orgPolicy,
-            audit,
-            router: approvalRouter,
-            store,
-            // Extension policy seam (issue #56): resolve extension tool
-            // calls against the space's allowlist before tier/approval.
-            toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
-            // Extension tier seam (issue #53): an allowed extension crosses
-            // the tier stage as a known tool with its manifest tier.
-            toolTier: (name) => extensionToolTier(name),
-            knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
-          }),
-          workItemsExtension(store, { orgPolicy }),
-          // Memory tools (issue #22, #43): provider selected from the org
-          // settings (#67) — memory_backend.base_url set → mem0 backend
-          // (compose ships it), else SQLite sharing the store's database
-          // handle. Every save is audited via the policy audit module.
-          memoryToolsExtension(memoryProvider, { audit }),
-          // Model tools (issue #64): chat-driven per-space model settings
-          // (persisted in spaces.settings, audited) + next-turn model role
-          // switching through the live-session registry.
-          modelToolsExtension(store, { audit, modelRoles }),
-          // Settings tool (issue #67): get/set the durable org/space
-          // settings — write-tier, every set audited `settings.changed`.
-          settingsToolsExtension(store, { audit }),
-        ],
         // Turn-start memory injection (#42), gated by the org policy config.
         memoryContext: {
           provider: memoryProvider,
