@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, parseSpaceSettings, recoverStaleWorkItems, type Store, type WorkItemState } from "./db";
+import type { OrgSettingsInput } from "./org-settings";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-store-"));
 const dbPath = join(dir, "test.db");
@@ -734,6 +735,112 @@ describe("migration", () => {
     });
     expect(row.scope).toBe("personal");
     s1.close();
+    s2.close();
+  });
+});
+
+describe("org settings (issue #67)", () => {
+  test("getOrgSettings returns null when no row exists", () => {
+    const s = freshStore();
+    expect(s.getOrgSettings()).toBeNull();
+  });
+
+  test("set/get round-trips the validated camelCase shape", () => {
+    const s = freshStore();
+    const parsed = s.setOrgSettings({
+      approvals: { timeout_minutes: 7, always_approve: ["bash", "create_work_item"] },
+      response_mode: "mention",
+      memory: { injection: { enabled: false, max_entries: 3 } },
+      extensions: { allow: ["linear"], deny: ["attio"], org_credentials: "deny" },
+      repos: ["acme/sandbox"],
+      models: { default: "deepseek-v4-flash", fast: "deepseek-v4-flash", reasoning: "glm-5", effort: "medium" },
+    });
+    expect(parsed.ok).toBe(true);
+    expect(s.getOrgSettings()).toEqual({
+      ok: true,
+      errors: [],
+      warnings: [],
+      approvals: { timeoutMinutes: 7, alwaysApprove: ["bash", "create_work_item"] },
+      responseMode: "mention",
+      memoryInjection: { enabled: false, maxEntries: 3 },
+      extensions: { allow: ["linear"], deny: ["attio"], orgCredentials: "deny" },
+      repos: ["acme/sandbox"],
+      models: { default: "deepseek-v4-flash", fast: "deepseek-v4-flash", reasoning: "glm-5", effort: "medium" },
+    });
+  });
+
+  test("setOrgSettings upserts the singleton row (id=1) and the CHECK pins it", () => {
+    const s = freshStore();
+    s.setOrgSettings({ response_mode: "mention" });
+    s.setOrgSettings({ response_mode: "request-only" });
+    expect(s.getOrgSettings()?.responseMode).toBe("request-only");
+    const rows = s.getDb().query("SELECT id FROM org_settings").all() as { id: number }[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(1);
+    expect(() =>
+      s.getDb().query("INSERT INTO org_settings (id, settings, updated_at) VALUES (2, '{}', 0)").run(),
+    ).toThrow(/CHECK/);
+  });
+
+  test("setOrgSettings rejects malformed input and writes nothing (fail closed)", () => {
+    const s = freshStore();
+    // Deliberately malformed values: cast across the typed-input boundary so
+    // the runtime validator is exercised (the API type already rejects these).
+    const malformed = (v: object): OrgSettingsInput => v as unknown as OrgSettingsInput;
+    expect(() => s.setOrgSettings(malformed({ approvals: { timeout_minutes: -1 } }))).toThrow(/timeout_minutes/);
+    expect(() => s.setOrgSettings(malformed({ response_mode: "whenever" }))).toThrow(/response_mode/);
+    expect(() => s.setOrgSettings(malformed({ extensions: { allow: ["Bad Id"] } }))).toThrow(/extensions\.allow/);
+    expect(() => s.setOrgSettings(malformed({ approvals: { always_approve: ["some_new_tool"] } }))).toThrow(/always_approve/);
+    expect(() => s.setOrgSettings(malformed({ repos: ["no-slash"] }))).toThrow(/repos/);
+    expect(() => s.setOrgSettings(malformed({ models: { effort: "" } }))).toThrow(/models\.effort/);
+    expect(() => s.setOrgSettings(malformed({ unknown_key: 1 }))).toThrow(/unknown key/);
+    expect(s.getOrgSettings()).toBeNull();
+  });
+
+  test("a malformed blob already in the DB fails getOrgSettings closed", () => {
+    const s = freshStore();
+    s.getDb()
+      .query("INSERT INTO org_settings (id, settings, updated_at) VALUES (1, ?, ?)")
+      .run('{"approvals": "nope"}', Date.now());
+    expect(() => s.getOrgSettings()).toThrow(/approvals must be an object/);
+  });
+
+  test("empty and partial blobs validate", () => {
+    const s = freshStore();
+    expect(s.setOrgSettings({}).ok).toBe(true);
+    expect(s.setOrgSettings({ approvals: { timeout_minutes: 9 } })).toEqual({
+      ok: true,
+      errors: [],
+      warnings: [],
+      approvals: { timeoutMinutes: 9 },
+    });
+  });
+
+  test("memory.injection.max_entries over the cap is clamped with a warning", () => {
+    const s = freshStore();
+    const parsed = s.setOrgSettings({ memory: { injection: { max_entries: 50 } } });
+    expect(parsed.ok).toBe(true);
+    expect(parsed.memoryInjection).toEqual({ maxEntries: 20 });
+    expect(parsed.warnings).toHaveLength(1);
+  });
+
+  test("the org_settings migration is idempotent and adds the table to pre-#67 databases", () => {
+    const legacyPath = join(dir, "store-org-settings-legacy.db");
+    // A database created before issue #67: no org_settings table.
+    const legacy = new Database(legacyPath);
+    legacy.exec(
+      "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, space_id TEXT, actor TEXT NOT NULL, event_type TEXT NOT NULL, payload TEXT NOT NULL);",
+    );
+    legacy.close();
+
+    const s1 = createStore(legacyPath);
+    const parsed = s1.setOrgSettings({ response_mode: "mention" });
+    expect(parsed.responseMode).toBe("mention");
+    s1.close();
+
+    // A second open re-runs the migration: no-op, data intact.
+    const s2 = createStore(legacyPath);
+    expect(s2.getOrgSettings()?.responseMode).toBe("mention");
     s2.close();
   });
 });

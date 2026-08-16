@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS extension_credentials (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
 
+-- Org settings singleton (issue #67): id=1 row holding the JSON settings
+-- blob (approvals, response_mode, memory.injection, extensions, repos,
+-- model defaults). DB-first policy: org DB settings override the
+-- config-file floor; per-space policy continues in spaces.policy_json.
+-- The CHECK pins the singleton; the store upserts id=1.
+CREATE TABLE IF NOT EXISTS org_settings (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  settings   TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,

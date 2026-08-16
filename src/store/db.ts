@@ -3,6 +3,8 @@ import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-eve
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
+import type { OrgSettings, OrgSettingsInput } from "./org-settings";
 
 export type Space = {
   id: string;
@@ -151,6 +153,18 @@ export interface Store {
     brokerCredentialId: number;
   }): Promise<ExtensionCredential>;
   listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
+  /**
+   * Org settings singleton (issue #67): the validated settings blob, or
+   * null when no row exists. Sync (bun:sqlite is synchronous, like getDb).
+   * Throws OrgSettingsParseError on a malformed blob — fail closed, never
+   * a silently-defaulted settings object.
+   */
+  getOrgSettings(): OrgSettings | null;
+  /**
+   * Validates and upserts the org settings blob (id=1). Throws
+   * OrgSettingsParseError when the input is malformed and writes nothing.
+   */
+  setOrgSettings(settings: OrgSettingsInput): OrgSettings;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
   /** The underlying Database handle — memory providers share this file (#20). */
@@ -458,6 +472,26 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return stale.length;
   }
 
+  function getOrgSettings(): OrgSettings | null {
+    const row = db.query("SELECT settings FROM org_settings WHERE id = 1").get() as
+      | { settings: string }
+      | null;
+    if (!row) return null;
+    const parsed = parseOrgSettingsJson(row.settings);
+    if (!parsed.ok) throw new OrgSettingsParseError(parsed.errors);
+    return parsed;
+  }
+
+  function setOrgSettings(settings: OrgSettingsInput): OrgSettings {
+    const parsed = parseOrgSettingsJson(JSON.stringify(settings));
+    if (!parsed.ok) throw new OrgSettingsParseError(parsed.errors);
+    db.query(
+      `INSERT INTO org_settings (id, settings, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET settings = excluded.settings, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify(settings), Date.now());
+    return parsed;
+  }
+
   async function appendAudit(entry: AuditEntry): Promise<number> {
     const res = db
       .query("INSERT INTO audit (ts, space_id, actor, event_type, payload) VALUES (?, ?, ?, ?, ?)")
@@ -503,6 +537,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     markStaleWorkItems,
     upsertExtensionCredential,
     listExtensionCredentials,
+    getOrgSettings,
+    setOrgSettings,
     appendAudit,
     listAudit,
     getDb: () => db,
