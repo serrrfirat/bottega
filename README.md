@@ -104,6 +104,44 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 > only with the `executor` profile enabled, as above. Drop `--profile
 > executor` to run without it.
 
+### GitHub credentials: the two token paths
+
+There are exactly two credential paths, and they never overlap. The server
+**never sets `GITHUB_TOKEN`** and no token ever enters the environment,
+image, or chat.
+
+1. **Executor git PAT (file, mode 0600)** — `data/secrets/github-pat` on the
+   shared data volume. This is the *git credential*: the executor reads it
+   through a generated `GIT_ASKPASS` helper for `git push` / PR work, and the
+   same file authorizes the GitHub API calls the executor makes. A mode other
+   than 0600 fails boot closed. It is never in env, never in the image, and
+   the server never touches it.
+
+2. **Extension credential (auth-broker vault)** — the GitHub extension's MCP
+   tools (`github.search_issues`, `github.create_issue`, …) resolve their
+   credential from the auth-broker vault via the #51 ladder. Connect it with
+   the `connect` capability and choose the scope:
+
+   - `connect github as me` — **personal**: the credential binds to *your*
+     Slack identity and resolves only for your calls (the ladder filters
+     personal rows by owner). This is the default scope and the right choice
+     for humans: *your own GitHub calls use your own connected credential*.
+   - `connect github as org` — **org**: ONE credential shared org-wide,
+     intended for service accounts and unattended flows. Sharing a personal
+     token org-wide is discouraged — prefer per-person connects. Org usage of
+     extension credentials can be denied per space (`extensions.org_credentials`,
+     #56).
+
+   Either scope requires an extension policy entry (`extensions.allow`) for
+   the space; the tool then runs through the normal policy gate.
+
+**Never paste tokens into chat.** Transcripts are durable and never deleted,
+so a token pasted into Slack is a permanent leak (and may end up in org
+memory). `memory.save` refuses credential-shaped content (GitHub PATs, Slack
+`xox*` tokens, OpenAI `sk-` keys, AWS `AKIA…`, …) with a clear error — if you
+ever need to hand the bot a credential, use `connect <extension> as me|org`
+or the PAT file above, never a chat message.
+
 ### Which repo does the executor work in?
 
 The repo is a property of the task, not of the deployment (issue #47): the

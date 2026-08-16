@@ -185,6 +185,51 @@ describe("memory.save", () => {
     expect(res.isError).toBe(true);
     expect(resultText(res)).toMatch(/disk full/);
   });
+
+  test("rejects credential-shaped content with nothing written and nothing audited (issue #121)", async () => {
+    const provider = new FakeProvider();
+    const { audit, rows } = fakeAudit();
+    const [saveTool] = loadTools(provider, { audit });
+
+    // The exact family from the #121 incident: a fine-grained GitHub PAT
+    // the user pasted into chat after the agent asked for one.
+    const secrets = [
+      "github_pat_11ABCDEFG_0abcdef1234567890abcdef1234567890abc",
+      "ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD",
+      "gho_1234567890abcdefghijklmnopqrstuvwxyzABCD",
+      "my token is xoxb-1234567890-abcdefghijklmnop",
+      "sk-abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+      "AKIAIOSFODNN7EXAMPLE",
+      "near-abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+    ];
+    for (const content of secrets) {
+      const res = await saveTool.execute("tc1", { content, scope: "org" }, undefined, undefined, noopCtx);
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toMatch(/secrets don't belong in memory/i);
+    }
+    // Fail closed: nothing persisted, no audit row — the token never lands
+    // in durable memory or the audit trail.
+    expect(provider.saved).toHaveLength(0);
+    expect(rows).toHaveLength(0);
+  });
+
+  test("does not reject prose that merely mentions a token prefix (issue #121)", async () => {
+    const provider = new FakeProvider();
+    const { audit, rows } = fakeAudit();
+    const [saveTool] = loadTools(provider, { audit });
+
+    for (const content of [
+      "the PAT file lives at data/secrets/github-pat with mode 0600",
+      "github_pat_ is the prefix of fine-grained tokens",
+      "we keep the xoxb- format tokens in the vault, not memory",
+      "sk- keys are for OpenAI",
+    ]) {
+      const res = await saveTool.execute("tc1", { content, scope: "org" }, undefined, undefined, noopCtx);
+      expect(res.isError).not.toBe(true);
+    }
+    expect(provider.saved).toHaveLength(4);
+    expect(rows).toHaveLength(4);
+  });
 });
 
 describe("memory.search", () => {

@@ -19,7 +19,7 @@ import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
 import { createStore, type ExtensionCredential, type Store } from "../store/db";
 import { extensionToolDefinitions } from "./tools";
-import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_TOOL } from "./fixture";
+import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "./runtime";
@@ -300,5 +300,72 @@ describe("extension tool bridge", () => {
       domains: ["api.example.com"],
     });
     expect(extensionToolDefinitions([{ manifest: cli }], { runtime: stubRuntime })).toEqual([]);
+  });
+
+  test("getCaller resolves the session principal so the ladder matches the caller's personal credential (issue #121)", async () => {
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const args = request.params.arguments as Record<string, unknown>;
+        return { content: [{ type: "text", text: `sunny in ${args["city"]}` }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const { runtime, store, boundaryCalls } = makeRuntime([fixtureManifest()], {
+      mcpTransport,
+      // auto must NOT fall through to the org credential: deny org usage so
+      // the ladder resolves the caller's own personal row.
+      policy: parseOrgConfigYaml("tools:\n  unknown: allow\nextensions:\n  org_credentials: deny\n"),
+    });
+    // Ada's personal credential, exactly like `connect github as me` stores.
+    await store.upsertExtensionCredential({
+      provider: FIXTURE_EXTENSION_ID,
+      identityKey: "email:ada@example.com",
+      owner: "UADA",
+      scope: "personal",
+      brokerCredentialId: 2,
+    });
+    const [definition] = extensionToolDefinitions(
+      [{ manifest: fixtureManifest() }],
+      {
+        runtime,
+        // The adapter layer (index.ts) wires this seam from the space's
+        // last inbound principal; here the session file selects Ada.
+        getCaller: (ctx) => (ctx.sessionManager?.getSessionFile() === "slack:C1.jsonl" ? "UADA" : undefined),
+      },
+    );
+    const result = await definition.execute("1", { city: "Lisbon" }, undefined, undefined, {
+      sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
+    } as unknown as ExtensionContext);
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toEqual([{ type: "text", text: "sunny in Lisbon" }]);
+    // The boundary saw ADA's row — the personal credential resolved.
+    expect(boundaryCalls).toHaveLength(1);
+    expect(boundaryCalls[0]!.owner).toBe("UADA");
+    expect(boundaryCalls[0]!.scope).toBe("personal");
+  });
+
+  test("without getCaller the bridge falls back to caller 'agent' and a personal lookup asks (issue #121)", async () => {
+    const { runtime, store, boundaryCalls } = makeRuntime([fixtureManifest()], {
+      // Same org-denied policy: with caller "agent" there is no personal row
+      // to match, so the ladder must ask instead of guessing.
+      policy: parseOrgConfigYaml("tools:\n  unknown: allow\nextensions:\n  org_credentials: deny\n"),
+    });
+    await store.upsertExtensionCredential({
+      provider: FIXTURE_EXTENSION_ID,
+      identityKey: "email:ada@example.com",
+      owner: "UADA",
+      scope: "personal",
+      brokerCredentialId: 2,
+    });
+    // No getCaller: the bridge's documented default is caller "agent".
+    const [definition] = extensionToolDefinitions([{ manifest: fixtureManifest() }], { runtime });
+    const result = await run(definition, { city: "Lisbon" });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(/no fixture\.weather credential is available/);
+    // Nothing resolved: no boundary injection, no credential audit.
+    expect(boundaryCalls).toHaveLength(0);
   });
 });

@@ -21,7 +21,10 @@ import { extensionToolDefinitions } from "../extensions/tools";
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
+  ensureAgentDirModelPin,
+  OMP_CONFIG_TEMPLATE,
   SessionModelRoleRegistry,
+  sessionIdFromFilePath,
   type AgentDriver,
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
@@ -122,6 +125,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // settings carry model ids — otherwise the mounted template stays.
   if (orgSettings !== null) {
     regenerateModelsConfig(orgSettings, join(agentDir, "models.yml"));
+  }
+  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles
+  // from the agent dir's config.yml; host-dev agent dirs are never re-synced
+  // from config/omp, so a stale copy without the pin makes every session
+  // silently fall back to the provider catalog default (kimi-k2.7-code),
+  // which the Console Go gateway 400s into empty completions. Sync the pin
+  // before the driver guard runs.
+  const pinSync = ensureAgentDirModelPin(agentDir);
+  if (pinSync === "created" || pinSync === "patched") {
+    console.log(
+      `bottega boot: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`,
+    );
   }
   // Wiring order matters: the policy gate (both drivers) needs the approval
   // router, the router needs the adapter, and the adapter's callbacks need
@@ -241,7 +256,22 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         // toolset; execution goes through the #53 runtime, which runs its
         // OWN policy gate (gate → ladder → boundary → audit), so they are
         // never wrapped by the driver gate below.
-        customTools: extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
+        //
+        // Issue #121: every extension call carries the space's REAL
+        // principal (the latest inbound user) via the bridge's getCaller
+        // seam, so the #51 ladder's personal scope matches — `connect
+        // github as me` resolves the caller's OWN credential. Without this
+        // the bridge falls back to caller "agent", a personal lookup never
+        // matches, and the model ends up asking the user to paste a PAT
+        // into chat. spaceService is late-bound (constructed after the
+        // driver); the closure reads it only at call time.
+        customTools: extensionToolDefinitions(extensionRegistry.list(), {
+          runtime: extensionRuntime,
+          getCaller: (ctx) => {
+            const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
+            return spaceId ? spaceService.getLastPrincipal(spaceId) : undefined;
+          },
+        }),
         // Policy gate (issue #69): restricted SDK sessions never evaluate
         // inline extension factories (sdk.ts), so the policy extension's
         // tool_call interception is inert in production. The gate moves to

@@ -11,6 +11,13 @@
  * the content itself: memory is user data, and the hash keeps the audit
  * trail verifiable without leaking it. Policy decisions are already
  * audited by the policy gate, so search appends nothing.
+ *
+ * Issue #121: memory.save REFUSES obvious credential-shaped content (PATs,
+ * Slack/OpenAI/AWS keys — see {@link looksLikeObviousSecret}) with a clear
+ * error, writing nothing and auditing nothing. Memory is durable and
+ * never deleted, so a pasted token would be a permanent leak; credentials
+ * belong in the auth-broker vault (`connect <extension> as me|org`) or the
+ * executor's 0600 PAT file, never in memory or chat.
  */
 import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
@@ -19,6 +26,34 @@ import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
+
+/**
+ * Obvious credential shapes rejected by memory.save (issue #121): the token
+ * families a user might paste into chat after an agent asked for one.
+ * Word-bounded so prose mentioning a prefix is not refused. The list is
+ * deliberately narrow and fail-closed: a false positive refuses one save
+ * (the user rephrases), a false negative leaks a live credential into
+ * durable memory that is never deleted.
+ */
+const OBVIOUS_SECRET_PATTERNS: readonly RegExp[] = [
+  // GitHub fine-grained PATs (github_pat_<22>_<59>) and classic PATs.
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+  // GitHub classic PATs / OAuth / user-to-server / server-to-server tokens.
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  // Slack bot/app/user tokens (xoxb- / xoxa- / xoxp- / xoxr- / xoxs-).
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+  // OpenAI-style API keys.
+  /\bsk-[A-Za-z0-9]{20,}\b/,
+  // AWS access key ids.
+  /\bAKIA[0-9A-Z]{16}\b/,
+  // NEAR-style API keys (the repo's secret templates use the same shape).
+  /\bnear-[A-Za-z0-9]{20,}\b/,
+];
+
+/** True when content looks like an obvious credential; memory.save refuses these. */
+export function looksLikeObviousSecret(content: string): boolean {
+  return OBVIOUS_SECRET_PATTERNS.some((pattern) => pattern.test(content));
+}
 
 export interface MemoryToolsExtensionOpts {
   /** Principal used for user-scope saves when the call omits `principal`. */
@@ -70,6 +105,17 @@ export function memoryToolDefinitions(
         validateSaveInput(input);
       } catch (err) {
         return toolError(errorMessage(err));
+      }
+      // Fail closed (issue #121): a credential-shaped save is refused with
+      // a clear error BEFORE anything is written or audited — memory is
+      // durable and never deleted, so a pasted token would be a permanent
+      // leak. Credentials belong in the vault (connect_extension) or the
+      // executor PAT file, not in memory.
+      if (looksLikeObviousSecret(input.content)) {
+        return toolError(
+          "memory.save refuses credential-shaped content — secrets don't belong in memory (memory and transcripts are durable and never deleted). " +
+            "Connect credentials instead (`connect <extension> as me|org`), or install the executor PAT file (mode 0600) — never paste tokens into chat.",
+        );
       }
       try {
         const entry = await provider.save(input);
