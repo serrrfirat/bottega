@@ -84,11 +84,19 @@ describe("Dockerfile + .dockerignore (issue #12)", () => {
     expect(dockerfile).not.toContain("FROM oven/bun:1");
     // The tools base is the single source of truth for the CLI set and
     // the bun runtime: oven/bun:1 keeps `bun` on PATH for the app
-    // entrypoints, and the curated set v1 is installed exactly once.
+    // entrypoints, and the curated set v1.1 (issue #63) is installed in a
+    // single apt layer, exactly once.
     expect(tools).toContain("FROM oven/bun:1");
-    expect(tools).toContain(
-      "apt-get install -y --no-install-recommends git ca-certificates gh jq curl",
-    );
+    expect(tools).toContain("apt-get update");
+    expect(tools).toContain("apt-get install -y --no-install-recommends");
+    for (const pkg of [
+      "git", "ca-certificates", "gh", "jq", "curl",
+      "nodejs", "npm", "build-essential", "golang-go",
+      "python3", "python3-pip", "sqlite3", "postgresql-client",
+      "ripgrep", "glab", "unzip",
+    ]) {
+      expect(tools).toContain(pkg);
+    }
     expect(dockerfile).not.toContain("apt-get install");
     // The tools base ends with USER bun; the app build resets to root for
     // its install/chown steps, then restores the runtime user.
