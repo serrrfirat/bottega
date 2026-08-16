@@ -44,12 +44,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 mkdir -p data/omp-agent
-if [[ ! -f data/omp-agent/models.yml ]]; then
-  cp config/omp/config.yml config/omp/models.yml config/omp/secrets.yml data/omp-agent/
-  echo "omp agent dir: deployment templates copied from config/omp/ into data/omp-agent/"
-else
-  echo "omp agent dir: data/omp-agent (existing catalog kept — models.yml is generated from settings at boot when model ids are set)"
-fi
+bun run scripts/seed-agent-dir.ts data/omp-agent config/omp
 
 if [[ -z "${NEAR_API_KEY:-}" ]] && command -v security >/dev/null 2>&1; then
   if KEY="$(security find-generic-password -s bottega-near -w 2>/dev/null)"; then
