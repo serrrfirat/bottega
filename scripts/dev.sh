@@ -183,7 +183,7 @@ export HTTPS_PROXY="http://127.0.0.1:8080"
 # model endpoints); EXTENSION traffic (mcp.attio.com/api.github.com/
 # mcp.linear.app) stays proxied — the secret-injection path is untouched.
 # Revert this line when the egress judge rules pass model/Slack traffic.
-export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,slack.com,*.slack.com,slack-edge.com,cloud-api.near.ai,*.completions.near.ai"
+export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,slack.com,*.slack.com,slack-edge.com,cloud-api.near.ai,*.completions.near.ai,opencode.ai,*.opencode.ai"
 export NODE_EXTRA_CA_CERTS="$PWD/certs/ca.crt"
 
 exec bun run ${1:+--watch} src/server/index.ts
