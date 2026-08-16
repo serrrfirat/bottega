@@ -551,6 +551,9 @@ describe("org config parsing (issue #33)", () => {
   test("an inline-sequence repos entry fails closed with a clear boot error", async () => {
     const fx = makeFixture();
     try {
+      // Settings without repos/git_base_url → the file is the fallback
+      // source and its malformed flow collection must still fail closed.
+      fx.store.setOrgSettings({ workspaces_dir: join(fx.dir, "workspaces"), api_base_url: fx.emulatorBase });
       writeFileSync(join(fx.orgConfigDir, "org.yml"), `git_base_url: "file://${join(fx.dir, "bare")}"\nrepos: ["acme/sandbox"]\n`);
       await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/config\/org\.yml: .*flow collections/);
     } finally {
@@ -561,11 +564,27 @@ describe("org config parsing (issue #33)", () => {
   test("a malformed repos entry (non-string) fails closed", async () => {
     const fx = makeFixture();
     try {
+      fx.store.setOrgSettings({ workspaces_dir: join(fx.dir, "workspaces"), api_base_url: fx.emulatorBase });
       writeFileSync(
         join(fx.orgConfigDir, "org.yml"),
         `git_base_url: "file://${join(fx.dir, "bare")}"\nrepos:\n  - acme/sandbox\n  - broken: entry\n`,
       );
       await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/config\/org\.yml: .*owner\/repo strings/);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("settings covering repos + git base never consult the file (settings-only boot)", async () => {
+    const fx = makeFixture();
+    try {
+      // The fixture seeds settings for repos + git_base_url + api_base_url,
+      // so a broken org.yml is irrelevant — the DB is the source of truth.
+      writeFileSync(join(fx.orgConfigDir, "org.yml"), "this: [is, not, valid, yaml: for: the: subset\n");
+      const cfg = await prepareExecutor(makeDeps(fx));
+      expect(cfg.repoAllowlist).toEqual(["acme/sandbox", "acme/tooling"]);
+      expect(cfg.gitBaseUrl).toBe(`file://${join(fx.dir, "bare")}`);
+      expect(cfg.apiBaseUrl).toBe(fx.emulatorBase);
     } finally {
       fx.cleanup();
     }

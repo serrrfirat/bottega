@@ -370,10 +370,15 @@ function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string }
 
 function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   // Issue #67: runtime knobs live in the org settings blob (DB is the
-  // source of truth); config/org.yml is the default/fallback. A malformed
+  // source of truth); config/org.yml is the default/fallback, parsed only
+  // when settings do NOT cover the keys it provides (repos or git base) —
+  // a settings-driven deployment never depends on the file. A malformed
   // blob fails the executor boot closed (getOrgSettings throws).
   const settings = deps.store.getOrgSettings();
-  const fileConfig = loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
+  const needsFile = settings?.repos === undefined || settings?.gitBaseUrl === undefined;
+  const fileConfig = needsFile
+    ? loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR)
+    : { repos: [] as string[], gitBaseUrl: "https://github.com" };
   const repos = settings?.repos ?? fileConfig.repos;
   const gitBaseUrl = (settings?.gitBaseUrl ?? fileConfig.gitBaseUrl).replace(/\/+$/, "");
   const apiBaseUrl = (settings?.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
