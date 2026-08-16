@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveModelFromSettings, pickDefaultAvailableModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { ensureAgentDirModelPin } from "../../src/server/drivers/agent-driver";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -80,6 +81,47 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     const config = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
     expect(config).toContain("modelRoles:");
     expect(config).toContain("default: opencode-go/deepseek-v4-flash");
+  });
+
+  test("ensureAgentDirModelPin syncs the pin into a stale agent-dir config (issue #78 recurrence)", () => {
+    // The recurrence root cause: the SDK reads modelRoles from the agent
+    // dir's config.yml, and host-dev agent dirs are never re-synced from
+    // config/omp — a stale copy without the pin silently falls back to the
+    // provider catalog default (kimi-k2.7-code). The boot sync must patch
+    // such a file without touching operator customizations.
+    const dir = mkdtempSync(join(tmpdir(), "bottega-pin-"));
+    const template = "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n";
+    try {
+      // Stale config (pre-#78 copy): no pin, operator customizations intact.
+      const stale = "# OMP agent settings\nsecrets:\n  enabled: true\n";
+      writeFileSync(join(dir, "config.yml"), stale);
+      expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("skipped"); // no template at that path
+      writeFileSync(join(dir, "template.yml"), template);
+      expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("patched");
+      const patched = readFileSync(join(dir, "config.yml"), "utf8");
+      expect(patched).toContain("secrets:\n  enabled: true");
+      expect(patched).toContain("modelRoles:\n  default: opencode-go/deepseek-v4-flash");
+      // Second run: already pinned → untouched.
+      expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("unchanged");
+      // Missing agent-dir config → template copy (compose-equivalent first boot).
+      const empty = mkdtempSync(join(tmpdir(), "bottega-pin-"));
+      try {
+        expect(ensureAgentDirModelPin(empty, join(dir, "template.yml"))).toBe("created");
+        expect(readFileSync(join(empty, "config.yml"), "utf8")).toBe(template);
+      } finally {
+        rmSync(empty, { recursive: true, force: true });
+      }
+      // Unparseable config → left alone, never a crash.
+      const broken = mkdtempSync(join(tmpdir(), "bottega-pin-"));
+      try {
+        writeFileSync(join(broken, "config.yml"), "key: [unclosed\n");
+        expect(ensureAgentDirModelPin(broken, join(dir, "template.yml"))).toBe("skipped");
+      } finally {
+        rmSync(broken, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -161,6 +203,120 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
     const text = (parsed.output ?? [])
       .filter((item) => item.type === "message")
       .flatMap((item) => (item as { content?: Array<{ text?: string }> }).content ?? [])
+      .map((block) => block.text ?? "")
+      .join("");
+    expect(text.trim().length).toBeGreaterThan(0);
+  }, 60_000);
+
+  test("the boot pin lands in the agent dir and the fixed path returns non-empty text (recurrence regression)", async () => {
+    // Regression for the recurrence: the pin must reach the RUNTIME agent
+    // dir (ensureAgentDirModelPin), not just the committed template, so the
+    // SDK resolves deepseek-v4-flash — and the resolved endpoint answers
+    // with non-empty text on the text path.
+    const agentDir = mkdtempSync(join(tmpdir(), "bottega-pin-live-"));
+    try {
+      const modelsPath = join(agentDir, "models.yml");
+      writeFileSync(modelsPath, readFileSync(join(REPO_ROOT, "config/omp/models.yml"), "utf8"));
+      // A stale agent dir (the recurrence state): config.yml without the pin.
+      writeFileSync(
+        join(agentDir, "config.yml"),
+        "# OMP agent settings (stale, pre-#78)\nsecrets:\n  enabled: true\n",
+      );
+      expect(ensureAgentDirModelPin(agentDir)).toBe("patched");
+      const patched = readFileSync(join(agentDir, "config.yml"), "utf8");
+      expect(patched).toContain("modelRoles:\n  default: opencode-go/deepseek-v4-flash");
+
+      process.env.OPENCODE_API_KEY ??= KEY;
+      const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);
+      await registry.refresh();
+      const available = registry.getAvailable();
+      const settings = {
+        getModelRole: (role: string) => (role === "default" ? "opencode-go/deepseek-v4-flash" : undefined),
+      } as unknown as Settings;
+      const resolved = resolveModelFromSettings({ settings, availableModels: available });
+      expect(resolved?.provider).toBe("opencode-go");
+      expect(resolved?.id).toBe("deepseek-v4-flash");
+      if (!resolved) throw new Error("resolveModelFromSettings returned no model for the pinned role");
+      expect(resolved.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+
+      // The resolved endpoint answers with non-empty text (both reasoning
+      // levels; maxTokens is generous in the catalog — not the failure).
+      for (const effort of ["minimal", "medium"]) {
+        const res = await fetch(`${resolved.baseUrl}/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${KEY}` },
+          body: JSON.stringify({
+            model: "deepseek-v4-flash",
+            input: [{ role: "user", content: [{ type: "input_text", text: "Reply with exactly: hello world" }] }],
+            max_output_tokens: 2048,
+            reasoning: { effort },
+            stream: false,
+            store: false,
+          }),
+        });
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as {
+          output?: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>;
+        };
+        const text = (body.output ?? [])
+          .filter((item) => item.type === "message")
+          .flatMap((item) => item.content ?? [])
+          .map((block) => block.text ?? "")
+          .join("");
+        expect(text.trim().length).toBeGreaterThan(0);
+      }
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("the Console Go gateway requires tool outputs adjacent to their calls (replay-shape constraint)", async () => {
+    // Live recurrence mechanism (2026-08-16): the SDK's responses replay can
+    // carry a function_call whose output is not immediately after it (e.g.
+    // after a subagent-context merge), and Console Go 400s the whole request
+    // with "No tool output found" — the SDK retries 10x and the space agent
+    // surfaces empty completions. The correct replay shape (call + adjacent
+    // output) is accepted. This pins the gateway constraint so the replay
+    // shape stays regression-tested at the provider boundary.
+    const baseUrl = "https://opencode.ai/zen/go/v1";
+    const headers = { "content-type": "application/json", authorization: `Bearer ${KEY}` };
+    const callInput = (items: unknown[]) =>
+      JSON.stringify({
+        model: "deepseek-v4-flash",
+        input: items,
+        max_output_tokens: 2048,
+        reasoning: { effort: "minimal" },
+        stream: false,
+        store: false,
+      });
+    // Broken shape: function_call followed by an assistant turn before any output.
+    const broken = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers,
+      body: callInput([
+        { role: "user", content: [{ type: "input_text", text: "use the bash tool to echo hi" }] },
+        { type: "function_call", call_id: "call_repro_1", name: "bash", arguments: "{}" },
+        { role: "assistant", content: [{ type: "output_text", text: "let me run that" }] },
+      ]),
+    });
+    expect(broken.status).toBe(400);
+    expect(await broken.text()).toContain("No tool output found");
+    // Correct shape: each call immediately followed by its output.
+    const ok = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers,
+      body: callInput([
+        { role: "user", content: [{ type: "input_text", text: "use the bash tool to echo hi" }] },
+        { type: "function_call", call_id: "call_repro_2", name: "bash", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_repro_2", output: "hi\n" },
+        { role: "user", content: [{ type: "input_text", text: "now reply: done" }] },
+      ]),
+    });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { output?: Array<{ type: string; content?: Array<{ text?: string }> }> };
+    const text = (body.output ?? [])
+      .filter((item) => item.type === "message")
+      .flatMap((item) => item.content ?? [])
       .map((block) => block.text ?? "")
       .join("");
     expect(text.trim().length).toBeGreaterThan(0);

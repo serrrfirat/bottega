@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
   AgentRegistry,
@@ -609,6 +609,71 @@ export async function assertAgentDirModelAvailable(agentDir: string): Promise<nu
     return fromDeclared.length;
   }
   return available.length;
+}
+
+/**
+ * The committed OMP agent-dir config template (config.yml). Under compose it
+ * is mounted over the agent dir, but in host dev the agent dir is never
+ * re-synced — so a stale copy from before the #78 pin lands can persist.
+ */
+export const OMP_CONFIG_TEMPLATE = "config/omp/config.yml";
+
+/**
+ * Guarantees the SDK's agent-dir config.yml carries the `modelRoles` pin
+ * from the committed template (issue #78 recurrence). The SDK reads the
+ * agent dir's config.yml at session creation; when it lacks the pin, the
+ * session silently falls back to the provider catalog default
+ * (kimi-k2.7-code for opencode-go) instead of the pinned deepseek-v4-flash
+ * — the "OMP repository fallback" — and the Console Go gateway 400s that
+ * path (dotted tool names) into empty completions.
+ *
+ * Operator customizations are never overwritten: a config that already
+ * defines `modelRoles` (or that this parser cannot read) is left untouched,
+ * and only the pin block is appended to a stale file. When the agent-dir
+ * config is missing entirely, the template is copied (the compose-equivalent
+ * first boot). Returns what was done for boot logging and tests.
+ */
+export function ensureAgentDirModelPin(agentDir: string, templatePath: string = OMP_CONFIG_TEMPLATE): "created" | "patched" | "unchanged" | "skipped" {
+  const agentConfigPath = join(agentDir, "config.yml");
+  let existing: string | null = null;
+  try {
+    existing = readFileSync(agentConfigPath, "utf8");
+  } catch (err) {
+    if (!(typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT")) return "skipped";
+  }
+  let template: string | null = null;
+  try {
+    template = readFileSync(templatePath, "utf8");
+  } catch {
+    return "skipped";
+  }
+  if (existing === null) {
+    writeFileSync(agentConfigPath, template);
+    return "created";
+  }
+  // Already pinned, or an unparseable file: leave the operator's config alone.
+  try {
+    const parsed = parseYamlSubset(existing);
+    if (parsed.modelRoles !== undefined) return "unchanged";
+  } catch {
+    return "skipped";
+  }
+  // Render the template's modelRoles block (e.g. `default: <provider>/<model>`).
+  let roleBlock: string | null = null;
+  try {
+    const templateParsed = parseYamlSubset(template);
+    const roles = templateParsed.modelRoles;
+    if (roles === undefined || typeof roles !== "object" || Array.isArray(roles)) return "unchanged";
+    const lines = Object.entries(roles)
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+      .map(([key, value]) => `  ${key}: ${value}`);
+    if (lines.length === 0) return "unchanged";
+    roleBlock = `\nmodelRoles:\n${lines.join("\n")}\n`;
+  } catch {
+    return "skipped";
+  }
+  appendFileSync(agentConfigPath, roleBlock);
+  return "patched";
 }
 
 /**

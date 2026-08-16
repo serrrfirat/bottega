@@ -56,6 +56,7 @@ import type { ExtensionManifest, McpBinding } from "../../src/extensions/manifes
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "../../src/extensions/runtime";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { SpaceService } from "../../src/server/services/space-service";
+import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import type { AgentDriver, AgentSessionDriver } from "../../src/server/drivers/agent-driver";
 import { createAcpDriver, type AcpPolicyContext } from "../../src/server/drivers/acp-driver";
 import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAdapter } from "../../src/server/adapters/slack";
@@ -360,11 +361,14 @@ describe("journey 3: connect as me / as org (space-service connect intent)", () 
       ts: "1.4",
     });
     // The seam is narrow: the message went to the agent (recorded by the
-    // driver double) and the connect capability was never touched.
+    // driver double) and the connect capability was never touched. The
+    // receipt phrase (issue #119) is the ONLY post — a status phrase, not
+    // a connect action.
     expect(h.driver.prompts).toEqual([{ spaceId: "slack:C1", text: "can you connect github please" }]);
     expect(h.broker.calls).toHaveLength(0);
     expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
-    expect(h.posts).toHaveLength(0);
+    expect(h.posts).toHaveLength(1);
+    expect(THINKING_PHRASES).toContain(h.posts[0]!.text);
   });
 });
 

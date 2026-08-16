@@ -37,7 +37,7 @@ import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-ev
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { loadOrgPolicy } from "./policy/config";
-import { assertAgentDirModelAvailable, createOmpSdkDriver, type AgentDriver } from "./server/drivers/agent-driver";
+import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver } from "./server/drivers/agent-driver";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 /**
@@ -460,6 +460,14 @@ if (import.meta.main) {
   const audit = createAudit(store);
   const orgPolicy = loadOrgPolicy(store);
   mkdirSync("data/omp-agent", { recursive: true });
+  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
+  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
+  // config/omp, so a stale copy without the pin silently falls back to the
+  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
+  const pinSync = ensureAgentDirModelPin("data/omp-agent");
+  if (pinSync === "created" || pinSync === "patched") {
+    console.log(`bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`);
+  }
   // Pre-approved session: the work item's pickup approval IS the
   // authorization for allowlisted exec-tier tools (bash) inside the
   // workspace; unknown tools still deny and every decision audits. The
