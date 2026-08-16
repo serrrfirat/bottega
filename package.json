@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bash scripts/dev.sh",
+    "canary": "bash scripts/canary.sh",
     "check": "tsc --noEmit",
     "test": "bun test",
     "test:e2e": "bun test tests/e2e/",

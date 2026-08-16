@@ -32,7 +32,7 @@ import { App, type Logger } from "@slack/bolt";
 import { createServer } from "@emulators/core";
 import slackPlugin, { getSlackStore, seedFromConfig } from "@emulators/slack";
 import type { SlackStore } from "@emulators/slack";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Store } from "../../src/store/db";
@@ -404,9 +404,47 @@ export type HarnessApprovalRouter = ApprovalRouter & {
   handleAction?(a: SlackAction): Promise<void>;
 };
 
+/** The canary model refs (issue #71): the deployment template's providers (config/omp/models.yml). */
+export const CANARY_MODEL_REFS = {
+  /** Primary (issue #37): deepseek-v4-flash via the built-in opencode-go provider. */
+  opencode: "opencode-go/deepseek-v4-flash",
+  /** Fallback (issue #36): NEAR AI Cloud gateway. */
+  near: "near/zai-org/GLM-5.1-FP8",
+} as const;
+
+/**
+ * Picks the canary default model from the environment:
+ *   - `CANARY_MODEL_REF`, when set, wins (explicit override);
+ *   - else the NEAR fallback (`near/zai-org/GLM-5.1-FP8`) — the provider
+ *     that ACCEPTS the space agent's dotted tool names (memory.save,
+ *     memory.search, extension tools). The opencode-go gateway (Console Go)
+ *     validates tool names against `^[a-zA-Z0-9_-]+$` and 400s on them
+ *     (live canary finding, issue #71), so the opencode-go primary is used
+ *     only as a last resort — journeys on it fail loudly with the
+ *     transcript captured, which is the canary's diagnosis job.
+ * Returns null when no key is available.
+ */
+export function pickRealModelRef(env: Record<string, string | undefined> = process.env): string | null {
+  if (env.CANARY_MODEL_REF) return env.CANARY_MODEL_REF;
+  if (env.NEAR_API_KEY) return CANARY_MODEL_REFS.near;
+  if (env.OPENCODE_API_KEY) return CANARY_MODEL_REFS.opencode;
+  return null;
+}
+
 export interface HarnessConfig {
   /** Scripted model turns; defaults to a single "ok" text turn (repeats). */
   modelTurns?: StubTurn[];
+  /**
+   * Canary mode (issue #71): the driver resolves the REAL provider — the
+   * temp agent dir gets the deployment model catalog (config/omp/models.yml:
+   * opencode-go primary, NEAR fallback; keys from env/Keychain) instead of
+   * the stub override, and the default model role pins a real model ref.
+   * The stub stays up for /v1/models-style needs; agent turns hit the real
+   * gateway and model-stub requests are never asserted in canary mode.
+   */
+  realModel?: boolean;
+  /** Canary mode: the default-role model ref; defaults to {@link pickRealModelRef}. */
+  realModelRef?: string;
   /** Org policy `config.yml` text; defaults to no file → default policy. */
   orgConfigYaml?: string;
   /** Per-space policy overlay: spaceId → policy_json (e.g. response_mode). */
@@ -451,6 +489,8 @@ export interface Harness {
   slack: SlackEmulatorHandle;
   extensionRegistry: ExtensionRegistry;
   orgPolicy: PolicyConfig;
+  /** The model ref pinned as the session default role (stub ref, or the real ref in canary mode). */
+  modelRef: string;
   /** Temp OMP agent dir (models.yml + config.yml live here). */
   agentDir: string;
   /** Temp org config dir (bottega config.yml). */
@@ -507,25 +547,51 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // --- model stub + temp agent dir (models.yml baseUrl override) -----------
   const modelStub = createModelStub();
   if (cfg.modelTurns !== undefined) modelStub.respond(cfg.modelTurns);
-  writeFileSync(
-    join(agentDir, "models.yml"),
-    [
-      "providers:",
-      `  ${STUB_PROVIDER}:`,
-      "    api: openai-completions",
-      `    baseUrl: "${modelStub.baseUrl}"`,
-      '    apiKey: "e2e-test-key"',
-      "    models:",
-      `      - id: ${STUB_MODEL_ID}`,
-      '        name: "E2E Stub Model"',
-      "        contextWindow: 128000",
-      "        maxTokens: 4096",
-      "",
-    ].join("\n"),
-  );
+  // Canary mode (issue #71): the agent dir gets the DEPLOYMENT model catalog
+  // (config/omp/models.yml — opencode-go primary, NEAR fallback, keys from
+  // env, never a stub baseUrl), so the driver resolves the real gateway.
+  // The stub stays up for /v1/models-style needs; agent turns hit the real
+  // provider and its requests are never asserted in canary mode.
+  let modelRef: string;
+  if (cfg.realModel === true) {
+    const realModelRef = cfg.realModelRef ?? pickRealModelRef();
+    if (realModelRef === null) {
+      throw new Error(
+        "canary harness: no model key in env — set OPENCODE_API_KEY or NEAR_API_KEY " +
+          "(`bun run canary` loads both from the Keychain, the dev.sh pattern)",
+      );
+    }
+    modelRef = realModelRef;
+    const templatePath = join(import.meta.dir, "../../config/omp/models.yml");
+    let template: string;
+    try {
+      template = readFileSync(templatePath, "utf8");
+    } catch {
+      throw new Error(`canary harness: missing model catalog template at ${templatePath}`);
+    }
+    writeFileSync(join(agentDir, "models.yml"), template);
+  } else {
+    modelRef = STUB_MODEL_REF;
+    writeFileSync(
+      join(agentDir, "models.yml"),
+      [
+        "providers:",
+        `  ${STUB_PROVIDER}:`,
+        "    api: openai-completions",
+        `    baseUrl: "${modelStub.baseUrl}"`,
+        '    apiKey: "e2e-test-key"',
+        "    models:",
+        `      - id: ${STUB_MODEL_ID}`,
+        '        name: "E2E Stub Model"',
+        "        contextWindow: 128000",
+        "        maxTokens: 4096",
+        "",
+      ].join("\n"),
+    );
+  }
   // Pin the session's default model deterministically (CI and local alike):
   // settings are read from this agent dir, never the developer's ~/.omp.
-  writeFileSync(join(agentDir, "config.yml"), ["modelRoles:", `  default: ${STUB_MODEL_REF}`, ""].join("\n"));
+  writeFileSync(join(agentDir, "config.yml"), ["modelRoles:", `  default: ${modelRef}`, ""].join("\n"));
 
   // --- store / audit / policy / memory -------------------------------------
   const store = createStore(dbPath);
@@ -693,6 +759,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     slack,
     extensionRegistry,
     orgPolicy,
+    modelRef,
     agentDir,
     configDir,
     transcriptDir,
