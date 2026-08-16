@@ -175,7 +175,15 @@ echo "iron-proxy: ready (egress config loaded, management API answering)"
 #    process and the ACP driver's spawned MCP server via the environment.
 export HTTP_PROXY="http://127.0.0.1:8080"
 export HTTPS_PROXY="http://127.0.0.1:8080"
-export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0"
+# TEMPORARY RESTORE (issue #125 follow-up): the committed egress config's
+# judge transform denies the server's own model calls (a context-free LLM
+# denies bare model/API requests; Slack domains aren't allowlisted at all),
+# so routing platform + model traffic through the proxy breaks the bot.
+# Dev bypasses the proxy for the server's core traffic (Slack socket/API +
+# model endpoints); EXTENSION traffic (mcp.attio.com/api.github.com/
+# mcp.linear.app) stays proxied — the secret-injection path is untouched.
+# Revert this line when the egress judge rules pass model/Slack traffic.
+export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,slack.com,*.slack.com,slack-edge.com,cloud-api.near.ai,*.completions.near.ai"
 export NODE_EXTRA_CA_CERTS="$PWD/certs/ca.crt"
 
 exec bun run ${1:+--watch} src/server/index.ts
