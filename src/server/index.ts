@@ -47,6 +47,7 @@ import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapt
 import { SpaceService } from "./services/space-service";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,6 +96,16 @@ export interface BottegaServerOpts {
    * adapter's postMessage; tests inject a fake so no Slack call happens.
    */
   postOnboardingGuide?: (spaceId: string, text: string) => Promise<void>;
+  /**
+   * Session-toolset observation seam (testing-gaps audit 2026-08-17):
+   * receives the space-agent custom-tools bridge definitions wired at
+   * boot — work items (#10), memory (#22/#43), model/settings/admin tools
+   * (#64/#67/#73), scheduler administration (#86/#111), and the KB ingest
+   * tool (#91). Caller-level boot tests assert the scheduler + KB wiring
+   * is registered without opening a live session (which would need the
+   * SDK + a model).
+   */
+  onSessionToolset?: (tools: ToolDefinition[]) => void;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -247,6 +258,30 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // session; the model tools extension resolves use_model switches through
   // it. Created here (before both) because the two share it.
   const modelRoles = new SessionModelRoleRegistry();
+  // Space-agent session toolset (issue #69): the gated custom-tools bridge
+  // definitions every restricted session carries — work items (#10), memory
+  // (issues #22/#43 — provider selected from the org settings (#67):
+  // memory_backend.base_url set → mem0 backend (compose ships it), else
+  // SQLite sharing the store's database handle; every save is audited via
+  // the policy audit module), session search (#132), objects (#124), model
+  // tools (#64), settings (#67), admin (#73), scheduler administration
+  // (#86/#111), KB ingest (#91). Hoisted out of the driver factory so the
+  // onSessionToolset seam can expose the wiring to caller-level boot tests.
+  const sessionToolset = [
+    ...workItemToolDefinitions(store, { orgPolicy }),
+    ...memoryToolDefinitions(memoryProvider, { audit }),
+    ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
+    ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
+    ...modelToolsDefinitions(store, { audit, modelRoles }),
+    ...settingsToolDefinitions(store, { audit }),
+    // Admin tools (issue #73): catalog browser, stack health, deploy info,
+    // first-run wizard — gated like the settings tool (write tier →
+    // org-settings access via approval); deploy_info is read-tier (anyone).
+    ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
+    ...schedulerToolDefinitions(store, audit, schedulerRegistry),
+    ...kbToolDefinitions(kbDeps),
+  ];
+  opts.onSessionToolset?.(sessionToolset);
   const createDriver =
     opts.createDriver ??
     ((agentDir: string) => {
@@ -326,27 +361,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           toolTier: (name) => extensionToolTier(name),
           knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
           // The in-session tool surface, as SDK tool definitions (issue
-          // #69): work items (issue #10), memory (issues #22/#43 — provider
-          // selected from the org settings (#67): memory_backend.base_url
-          // set → mem0 backend (compose ships it), else SQLite sharing the
-          // store's database handle; every save is audited via the policy
-          // audit module), objects (issue #124), model tools (issue #64),
-          // settings (issue #67).
-          tools: [
-            ...workItemToolDefinitions(store, { orgPolicy }),
-            ...memoryToolDefinitions(memoryProvider, { audit }),
-            ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
-            ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
-            ...modelToolsDefinitions(store, { audit, modelRoles }),
-            ...settingsToolDefinitions(store, { audit }),
-            // Admin tools (issue #73): catalog browser, stack health,
-            // deploy info, first-run wizard — gated like the settings
-            // tool (write tier → org-settings access via approval);
-            // deploy_info is read-tier (anyone).
-            ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
-            ...schedulerToolDefinitions(store, audit, schedulerRegistry),
-            ...kbToolDefinitions(kbDeps),
-          ],
+          // #69) — see sessionToolset above.
+          tools: sessionToolset,
         },
         // Connect capability (issue #52): connect_extension is built per
         // session so the actor is the requesting principal; org-scope

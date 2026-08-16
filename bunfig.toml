@@ -1,0 +1,24 @@
+# Test-runner coverage configuration (testing-gaps audit 2026-08-17, gap #3).
+#
+# Measured on the current tree with `bun test --coverage` (2026-08-17):
+#   All files: 92.01% functions / 91.34% lines
+#   src/server/index.ts: 89.23% lines (raised from 81.4% by the boot-wiring
+#   test — src/server/boot-wiring.test.ts drives a real main() and asserts
+#   the scheduler #111 + KB #91 wiring from the caller).
+#
+# Floor the suite must hold: 85% lines AND 85% functions, enforced by
+# scripts/check-coverage.ts on the "All files" aggregate. It is NOT wired
+# here via bunfig's `coverageThreshold` because bun 1.3.14 enforces that key
+# PER FILE, not on the suite aggregate (oven-sh/bun#17028): with any
+# meaningful value the run fails on the repo's many low-coverage files,
+# which would turn CI red on first wiring. Coverage stays opt-in
+# (`bun test --coverage`): forcing `coverage = true` makes single-file
+# `bun test src/foo.test.ts` runs compute the subset's coverage and exit
+# non-zero on passing tests with no message.
+[test]
+coveragePathIgnorePatterns = [
+  # Live-connection-only helpers: they exercise real external services and
+  # are never covered by the hermetic suite (they would drag the aggregate).
+  "tests/e2e/slack-live.ts",
+  "tests/e2e/canary.ts",
+]
