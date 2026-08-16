@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -74,6 +77,90 @@ describe("extension tool bridge", () => {
     const result = await run(definition, {});
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("exited 1");
+  });
+
+  test("cli tools spawn a PATH-resolved stub with mapped args and NO credentials in env", async () => {
+    // Hermetic stub CLI on PATH (issue #58): dumps its invocation and env so
+    // the test can assert the arg mapping and the credential boundary.
+    const stubDir = mkdtempSync(join(tmpdir(), "bottega-cli-stub-"));
+    const originalPath = process.env.PATH;
+    const originalToken = process.env.GITHUB_TOKEN;
+    const originalMarker = process.env.BOTTEGA_CLI_TEST_MARKER;
+    try {
+      const stub = join(stubDir, "stub-cli");
+      writeFileSync(
+        stub,
+        [
+          "#!/usr/bin/env bash",
+          'echo "cmd=$(basename "$0")"',
+          'echo "args=$*"',
+          "env | sort",
+        ].join("\n") + "\n",
+      );
+      chmodSync(stub, 0o755);
+      process.env.PATH = `${stubDir}:${originalPath ?? ""}`;
+      // The parent's environment carries a credential and a benign marker;
+      // only the marker may reach the child.
+      process.env.GITHUB_TOKEN = "ghp_fakecredential_do_not_leak";
+      process.env.BOTTEGA_CLI_TEST_MARKER = "marker-pass";
+
+      const cli = validateManifest({
+        id: "com.example.stubcli",
+        label: "Stub CLI",
+        vendor: "example",
+        kind: "cli",
+        cli: { command: "stub-cli", args: ["fixed"], env: { GH_CONFIG_DIR: "/etc/gh" } },
+        credentialSchema: { type: "api_key" },
+        tools: [
+          {
+            name: "stub.greet",
+            tier: "read",
+            description: "Greets through the stub",
+            params: [
+              { name: "name", type: "string", required: true },
+              { name: "loud", type: "boolean" },
+            ],
+          },
+        ],
+        domains: ["api.example.com"],
+      });
+      const [definition] = extensionToolDefinitions([{ manifest: cli }]);
+      const result = await run(definition, { name: "world", loud: true });
+      const first = result.content[0];
+      const output = first && "text" in first ? first.text : "";
+      // Spawn path: command resolved on PATH, manifest fixed args first,
+      // then params as --name value flags (--name alone for booleans).
+      expect(output).toContain("cmd=stub-cli");
+      expect(output).toContain("args=fixed --name world --loud");
+      // Non-credential parent env passes through; manifest env delta applies.
+      expect(output).toContain("BOTTEGA_CLI_TEST_MARKER=marker-pass");
+      expect(output).toContain("GH_CONFIG_DIR=/etc/gh");
+      // The no-cred-in-env guarantee: the parent's credential never reaches
+      // the spawned CLI (iron-proxy boundary is the only auth path).
+      expect(output).not.toContain("ghp_fakecredential_do_not_leak");
+    } finally {
+      process.env.PATH = originalPath;
+      if (originalToken === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = originalToken;
+      if (originalMarker === undefined) delete process.env.BOTTEGA_CLI_TEST_MARKER;
+      else process.env.BOTTEGA_CLI_TEST_MARKER = originalMarker;
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a cli manifest declaring a credential in cli.env is rejected (fail closed)", () => {
+    expect(() =>
+      validateManifest({
+        id: "com.example.sneaky",
+        label: "Sneaky CLI",
+        vendor: "example",
+        kind: "cli",
+        cli: { command: "gh", env: { GITHUB_TOKEN: "ghp_stored" } },
+        credentialSchema: { type: "api_key" },
+        tools: [{ name: "sneaky.list", tier: "read", description: "Lists", params: [] }],
+        domains: ["api.github.com"],
+      }),
+    ).toThrow(/looks like a credential/);
   });
 
   test("mcp extension tools call the provider's official MCP server over the injected transport", async () => {

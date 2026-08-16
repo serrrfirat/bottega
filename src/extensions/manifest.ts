@@ -125,6 +125,20 @@ const ID_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const DOMAIN_RE = /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
 
+/**
+ * Environment variable names that carry credentials. The CLI credential
+ * boundary (issue #58) is the iron-proxy, never the environment: bottega
+ * strips these from the env it passes to spawned CLIs, and a manifest that
+ * declares one in `cli.env` is rejected (fail closed). A name pattern is a
+ * guard, not a vault — the proxy remains the actual authorization boundary.
+ */
+export const CREDENTIAL_ENV_RE =
+  /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API[-_]?KEY|ACCESS[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL|AUTHORIZATION)(?:_|$)/i;
+
+function isCredentialEnvKey(name: string): boolean {
+  return CREDENTIAL_ENV_RE.test(name);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -205,6 +219,12 @@ function validateCliBinding(value: unknown): CliBinding {
   if (env !== undefined) {
     if (!isRecord(env) || Object.values(env).some((entry) => typeof entry !== "string")) {
       throw new ExtensionValidationError("cli.env must be a string-to-string mapping");
+    }
+    const credentialKey = Object.keys(env).find(isCredentialEnvKey);
+    if (credentialKey !== undefined) {
+      throw new ExtensionValidationError(
+        `cli.env key "${credentialKey}" looks like a credential — CLIs never receive credentials via env (iron-proxy boundary only)`,
+      );
     }
   }
   return {

@@ -9,6 +9,12 @@
  * the tools image, with params passed as `--name value` flags. One client
  * connection per tool call (provider issues own connection lifecycle).
  *
+ * Credential boundary (issue #58): spawned CLIs never receive credentials
+ * via env — the child env is the parent env minus credential-named
+ * variables (plus the manifest's credential-free env delta). Auth happens
+ * at the iron-proxy boundary (HTTPS_PROXY through the egress allowlist),
+ * never in bottega.
+ *
  * Manifest tool names are already validated against the runtime's reserved
  * names (manifest.ts), so definitions can never shadow a built-in tool.
  */
@@ -19,7 +25,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { toolError } from "../tools/helpers";
-import type { CliBinding, ExtensionToolParam, McpBinding } from "./manifest";
+import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionToolParam, type McpBinding } from "./manifest";
 import type { ResolvedExtension } from "./registry";
 
 export interface ExtensionToolBridgeOptions {
@@ -128,6 +134,14 @@ async function callMcpTool(
  * manifest come first, then the call's params as `--name value` flags
  * (`--name` alone for boolean true). Exit code 0 -> stdout as the result;
  * any other exit -> a tool error with stderr.
+ *
+ * Credential boundary (issue #58): the child env is the parent env minus
+ * credential-named variables, plus the manifest's (validated
+ * credential-free) `env` delta — CLIs never receive credentials via env.
+ * Auth happens at the iron-proxy boundary: HTTPS_PROXY points at iron-proxy
+ * (egress allowlist, src/egress), which injects the credential for the
+ * allowlisted domain per request. Bun's `env` option REPLACES the
+ * environment, so the merge must carry PATH and friends explicitly.
  */
 async function callCliTool(
   binding: CliBinding,
@@ -144,7 +158,7 @@ async function callCliTool(
   }
   const proc = Bun.spawnSync({
     cmd: [binding.command, ...(binding.args ?? []), ...flagArgs],
-    env: binding.env,
+    env: { ...credentialSafeEnv(), ...binding.env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -153,4 +167,18 @@ async function callCliTool(
     return toolError(`cli tool "${toolName}" exited ${proc.exitCode}${stderr ? `: ${stderr}` : ""}`);
   }
   return { content: [{ type: "text", text: proc.stdout.toString() }] };
+}
+
+/**
+ * The parent environment minus credential-named variables
+ * ({@link CREDENTIAL_ENV_RE} in manifest.ts). Credentials must never reach
+ * a spawned CLI through the environment — the iron-proxy boundary is the
+ * only auth path (see {@link callCliTool}).
+ */
+export function credentialSafeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !CREDENTIAL_ENV_RE.test(name)) env[name] = value;
+  }
+  return env;
 }
