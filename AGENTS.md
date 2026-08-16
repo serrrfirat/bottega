@@ -56,6 +56,11 @@ rule below conflicts with a rule above, the user's explicit instructions win
   involved — that's what the emulate.dev tests are for.
 - Test through the caller, not the helper: a policy gate is covered by driving
   the extension wiring, not only the pure decision function.
+- **Chat-discovered bugs ship a hermetic regression test** (user-mandated,
+  2026-08-17): a fix for a bug found in conversation must include a test that
+  reproduces the exact failure (e.g. an unwired seam defaulting to a wrong
+  actor) and FAILS on the old code — the regression test is part of the fix,
+  not an option.
 
 ### Error handling & security
 - **No silent failures**: propagate with context (`throw new Error(...)` with
@@ -95,7 +100,8 @@ rule below conflicts with a rule above, the user's explicit instructions win
 2. **Issues found during chat are dispatched immediately.** When a bug or
    problem surfaces in conversation (not from a plan), create the issue AND
    start a task subagent in its own worktree to fix it right away — the main
-   agent does not fix chat-discovered issues itself.
+   agent does not fix chat-discovered issues itself. The fix must include a
+   hermetic regression test that reproduces the failure (see Testing).
 3. **Ship to `main` directly** — no PRs (tried, user changed the workflow).
    Push with `git push origin <branch>:main` after `git pull --rebase origin
    main` (retry rebase up to 3x on rejection).
