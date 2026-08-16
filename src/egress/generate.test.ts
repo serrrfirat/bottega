@@ -58,7 +58,7 @@ describe("egress config generation", () => {
     expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS), EXTENSION_ENTRIES)).toBe(COMMITTED_EGRESS);
   });
 
-  test("the committed allowlist contains the NEAR.ai model endpoints and the three provider domains", () => {
+  test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
     expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
   });
@@ -93,6 +93,7 @@ describe("egress config generation", () => {
     expect(mergedEgressDomains(["a.example.com", "b.example.com", "cloud-api.near.ai"])).toEqual([
       "cloud-api.near.ai",
       "*.completions.near.ai",
+      "raw.githubusercontent.com",
       "a.example.com",
       "b.example.com",
     ]);
@@ -152,6 +153,7 @@ describe("egress config generation", () => {
       expect(allowlistDomains(yaml)).toEqual([
         "cloud-api.near.ai",
         "*.completions.near.ai",
+        "raw.githubusercontent.com",
         FIXTURE_EXTENSION_DOMAIN,
       ]);
     } finally {

@@ -1,0 +1,8 @@
+# Knowledge-base sources (issue #91).
+# Each source is {id, url, type?}; type defaults to html and is informational.
+# The URL host MUST also be allowlisted in src/egress/generate.ts and pass
+# the egress judge. Uncomment and edit a source before running kb_ingest.
+sources:
+  # - id: bottega-readme
+  #   url: https://raw.githubusercontent.com/serrrfirat/bottega/main/README.md
+  #   type: markdown
