@@ -1,0 +1,58 @@
+{
+  "schema": "bottega.extension-snapshot.v1",
+  "extensionId": "github",
+  "pinnedAt": "2026-08-16T00:00:00.000Z",
+  "source": {
+    "catalog": "https://github.com/github/github-mcp-server",
+    "specId": "github-mcp-server",
+    "vendorOfficial": true,
+    "reviewed": true
+  },
+  "manifest": {
+    "id": "github",
+    "label": "GitHub",
+    "vendor": "GitHub",
+    "kind": "mcp",
+    "mcp": {
+      "command": "github-mcp-server",
+      "transport": "stdio"
+    },
+    "credentialSchema": {
+      "type": "api_key"
+    },
+    "tools": [
+      {
+        "name": "github.search_issues",
+        "tier": "read",
+        "description": "Search GitHub issues across repositories using the search query syntax, optionally limited.",
+        "params": [
+          { "name": "query", "type": "string", "description": "GitHub issue search query", "required": true },
+          { "name": "limit", "type": "number", "description": "Max results (default 10)" }
+        ]
+      },
+      {
+        "name": "github.create_issue",
+        "tier": "write",
+        "description": "Create an issue in a GitHub repository. Repo push/PRs stay the executor's job (#47); this is an API-level tool.",
+        "params": [
+          { "name": "owner", "type": "string", "description": "Repository owner", "required": true },
+          { "name": "repo", "type": "string", "description": "Repository name", "required": true },
+          { "name": "title", "type": "string", "description": "Issue title", "required": true },
+          { "name": "body", "type": "string", "description": "Issue body" }
+        ]
+      },
+      {
+        "name": "github.add_comment",
+        "tier": "write",
+        "description": "Add a comment to an existing GitHub issue.",
+        "params": [
+          { "name": "owner", "type": "string", "description": "Repository owner", "required": true },
+          { "name": "repo", "type": "string", "description": "Repository name", "required": true },
+          { "name": "issueNumber", "type": "number", "description": "Issue number", "required": true },
+          { "name": "body", "type": "string", "description": "Comment body", "required": true }
+        ]
+      }
+    ],
+    "domains": ["api.github.com"]
+  }
+}

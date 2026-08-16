@@ -44,6 +44,9 @@ transforms:
       domains:
         - "cloud-api.near.ai"
         - "*.completions.near.ai"
+        - "mcp.attio.com"
+        - "api.github.com"
+        - "mcp.linear.app"
 
   # 2. Judge: LLM policy gate. Fires on every request that passed the
   #    allowlist. Independent circuit breaker + timeout per instance.

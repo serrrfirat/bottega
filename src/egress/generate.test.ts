@@ -3,11 +3,22 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
-import { BASE_EGRESS_DOMAINS, mergedEgressDomains, regenerateEgressConfig, renderEgressConfig } from "./generate";
-import { SNAPSHOT_SCHEMA } from "../extensions/registry";
+import {
+  BASE_EGRESS_DOMAINS,
+  mergedEgressDomains,
+  regenerateEgressConfig,
+  renderEgressConfig,
+  SNAPSHOTS_DIR,
+} from "./generate";
+import { readPinnedSnapshots, SNAPSHOT_SCHEMA } from "../extensions/registry";
 import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN } from "../extensions/fixture";
 
 const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
+
+/** Domains the committed snapshots contribute (issue #54): read from the
+ * live pinned files so the pinned expectation tracks new providers without
+ * duplicating their domains here. */
+const EXTENSION_DOMAINS = readPinnedSnapshots(SNAPSHOTS_DIR).flatMap((s) => s.manifest.domains);
 
 function allowlistDomains(yaml: string): string[] {
   const cfg = parseYamlSubset(yaml);
@@ -21,14 +32,17 @@ function allowlistDomains(yaml: string): string[] {
 }
 
 describe("egress config generation", () => {
-  test("rendering with the base domains reproduces the committed config byte-for-byte", () => {
+  test("rendering with the base + pinned extension domains reproduces the committed config byte-for-byte", () => {
     // config/egress.yml is a generated artifact; this pins it to the
-    // template so hand edits and generator drift both fail here.
-    expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).toBe(COMMITTED_EGRESS);
+    // template so hand edits and generator drift both fail here. The
+    // pinned extension domains (issue #54) are part of the committed
+    // output, so they join the base when reproducing it.
+    expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS))).toBe(COMMITTED_EGRESS);
   });
 
-  test("the committed allowlist still contains the NEAR.ai model endpoints", () => {
-    expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(["cloud-api.near.ai", "*.completions.near.ai"]);
+  test("the committed allowlist contains the NEAR.ai model endpoints and the three provider domains", () => {
+    expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
+    expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
   });
 
   test("mergedEgressDomains appends extension domains after the base, deduped", () => {
@@ -101,12 +115,12 @@ describe("egress config generation", () => {
     }
   });
 
-  test("regenerate with no snapshots reproduces the committed config", () => {
+  test("regenerate with no snapshots reproduces the base-only config", () => {
     const dir = mkdtempSync(join(tmpdir(), "egress-gen-"));
     try {
       const outPath = join(dir, "egress.yml");
       regenerateEgressConfig(join(dir, "missing-snapshots"), outPath);
-      expect(readFileSync(outPath, "utf8")).toBe(COMMITTED_EGRESS);
+      expect(readFileSync(outPath, "utf8")).toBe(renderEgressConfig(BASE_EGRESS_DOMAINS));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

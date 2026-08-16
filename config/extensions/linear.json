@@ -1,0 +1,56 @@
+{
+  "schema": "bottega.extension-snapshot.v1",
+  "extensionId": "linear",
+  "pinnedAt": "2026-08-16T00:00:00.000Z",
+  "source": {
+    "catalog": "https://integrations.sh/api.json",
+    "specId": "linear",
+    "vendorOfficial": true,
+    "reviewed": true
+  },
+  "manifest": {
+    "id": "linear",
+    "label": "Linear",
+    "vendor": "Linear",
+    "kind": "mcp",
+    "mcp": {
+      "serverUrl": "https://mcp.linear.app/mcp",
+      "transport": "streamable-http"
+    },
+    "credentialSchema": {
+      "type": "oauth",
+      "scopes": ["read", "write"]
+    },
+    "tools": [
+      {
+        "name": "linear.search_issues",
+        "tier": "read",
+        "description": "Search Linear issues by query text (title, description, or identifier), optionally limited.",
+        "params": [
+          { "name": "query", "type": "string", "description": "Search text", "required": true },
+          { "name": "limit", "type": "number", "description": "Max results (default 10)" }
+        ]
+      },
+      {
+        "name": "linear.create_issue",
+        "tier": "write",
+        "description": "Create a Linear issue in the given team (or the user's default team).",
+        "params": [
+          { "name": "title", "type": "string", "description": "Issue title", "required": true },
+          { "name": "teamId", "type": "string", "description": "Team id; defaults to the user's default team" },
+          { "name": "description", "type": "string", "description": "Issue description" }
+        ]
+      },
+      {
+        "name": "linear.update_status",
+        "tier": "write",
+        "description": "Move a Linear issue to a workflow state by name (e.g. \"In Progress\", \"Done\").",
+        "params": [
+          { "name": "issueId", "type": "string", "description": "Issue identifier (e.g. ABC-123)", "required": true },
+          { "name": "status", "type": "string", "description": "Workflow state name", "required": true }
+        ]
+      }
+    ],
+    "domains": ["mcp.linear.app"]
+  }
+}
