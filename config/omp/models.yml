@@ -21,6 +21,10 @@ providers:
     baseUrl: "https://cloud-api.near.ai/v1"
     apiKey: NEAR_API_KEY
     models:
+      - id: deepseek-ai/DeepSeek-V4-Flash
+        name: DeepSeek V4 Flash via NEAR AI Cloud
+        contextWindow: 128000
+        maxTokens: 8192
       - id: zai-org/GLM-5.1-FP8
         name: GLM 5.1 FP8 via NEAR AI Cloud
         contextWindow: 128000
