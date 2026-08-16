@@ -5,7 +5,7 @@
  * re-seed, including after data/ is wiped by a shared-worktree git clean.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seedAgentDir, AGENT_DIR_TEMPLATES } from "./seed-agent-dir";
@@ -14,6 +14,8 @@ function freshDirs(): { agentDir: string; templateDir: string; cleanup: () => vo
   const root = mkdtempSync(join(tmpdir(), "seed-agent-dir-"));
   const agentDir = join(root, "agent");
   const templateDir = join(root, "templates");
+  mkdirSync(agentDir);
+  mkdirSync(templateDir);
   writeFileSync(join(templateDir, "config.yml"), "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n");
   writeFileSync(join(templateDir, "models.yml"), "providers: {}\n");
   writeFileSync(join(templateDir, "secrets.yml"), "secrets: {}\n");
