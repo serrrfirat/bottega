@@ -6,15 +6,15 @@ definitions in `AGENTS.md` → "Test tiers"), the test files that provide the
 evidence, the gaps, and the next tier action. Audit only — backfill work is
 tracked in the follow-up issue (#29).
 
-Baseline verified on 2026-08-16 (`feat/28-audit`, before any changes):
+Current verification on 2026-08-17 (`epic #111` proactive-layer integration):
 
 - `bun check` — clean.
-- `bun test` — 214 tests across 22 files, 0 failures.
-- Skip-gated legs observed: the mem0 Docker leg **skipped with evidence**
-  (container boots, then crashes: `openai.OpenAIError: The api_key client
-  option must be set…` — needs an LLM/embedder key, exactly the documented
-  gate); the real-`omp acp` handshake leg **ran and passed** (local `omp`
-  binary present).
+- `bun test` — 775 passed, 2 skipped, 0 failed across 60 files.
+- Skip-gated legs: the mem0 Docker integration and real iron-proxy
+  integration both skipped because `BOTTEGA_RUN_INTEGRATION=1` was not set.
+  The real-`omp` ACP permission probe also logged its documented
+  environment skip because the local ACP turn failed; its hermetic fake-ACP
+  coverage passed.
 
 ## Module table
 
@@ -31,6 +31,9 @@ Baseline verified on 2026-08-16 (`feat/28-audit`, before any changes):
 | `policy/approval-router.ts` | unit | `policy.test.ts` | `DenyRouter` covered through extension wiring (headless exec-tier blocks). Trivial seam otherwise. | No action. |
 | `policy/audit.ts` | hermetic | `audit.test.ts` | Redaction cases (Slack tokens, `sk-`, AKIA, github_pat, Bearer, key:value), append round-trip + filters, string payloads, redaction-on-write, payload cap truncate/whole, **append-only enforced via raw UPDATE/DELETE → ABORT** on real SQLite. | Minor: exact cap boundary and multi-byte truncation edge are not asserted (cap loop slices UTF-16 code units). |
 | `store/db.ts` | hermetic | `db.test.ts` | Best-covered module: spaces, work-item full lifecycle, **concurrent claim race across two connections**, complete legal/illegal transition matrix, obligations (done→pr_url, blocked→evidence, review→approval), stale recovery + its audit rows, per-transition auditing, audit immutability triggers, migration idempotency across connections. | No action — at tier. |
+| `scheduler/{types,cron,store,runner,actions,scheduler-tools}.ts` | unit + hermetic | `scheduler/cron.test.ts`, `scheduler/store.test.ts`, `scheduler/runner.test.ts` | Five-field UTC cron parsing, durable SQLite round-trips, action registry, policy tiers, tool create/delete audits, first-tick missed-run handling, success/error/timeout firing, non-overlapping loop, and start/stop are covered. | No action — at tier for the deterministic scheduler core. |
+| `scheduler/{proactive-config,standup,reflection,observer}.ts` | hermetic | `scheduler/proactive-config.test.ts`, `scheduler/standup.test.ts`, `scheduler/reflection.test.ts`, `scheduler/observer.test.ts` | Real temp SQLite stores plus fake posting/memory seams cover opt-in fail-closed behavior, response-mode suppression, UTC windows, digest/reflection writes and audits, observer source citations, read audits, and failure containment. Live scheduled Slack posting remains the README manual live-fire check. | Keep the real-Slack leg manual and credential-gated. |
+| `kb/{config,ingest}.ts`, `tools/kb-tools.ts` | hermetic | `kb/config.test.ts`, `kb/ingest.test.ts`, `tools/kb-tools.test.ts` | Strict source config, deterministic HTML/text chunking, byte/time limits, local `Bun.serve` fetches, append-only org-memory writes, write audits, all/source selection, and policy tier are covered without live network access. | Live source reachability through iron-proxy stays in the skip-gated proxy leg and deployment checklist. |
 | `extensions/credentials.ts` | unit + hermetic | `credentials.test.ts` | Resolution ladder (issue #51) exhaustively branch-tested: org (resolve, missing → "connect <ext> as an organization", never falls back to personal), me (resolve, missing → "connect your <ext> account", owner isolation — someone else's personal row never returned, never falls back to org), auto (org-wins-when-policy-allows, fallback to personal when not allowed / org missing, ask with policy-aware reason when nothing available — never guesses), broker account-pool mapping seam (`accountPoolFor`), audit wrapper against the **real** store (`extension.credential_resolved` rows carry actor + credential id + broker credential id). | No action — at tier. Runtime broker-pool wiring (writing the pool file for the resolved account) is tracked as #53's job. |
 | `tools/work-items.ts` | hermetic | `work-items.test.ts` | Registration, create (requester default/override, no-space fail, empty description), cancel (requester, non-requester denied, policy approvers allowed, unknown id / terminal states) — all against the **real** store. | No action. |
 | `tools/memory-context.ts` | hermetic | `memory-context.test.ts` | Injection extension (#42): prepended developer message, org + user (session principal) scoping, latest-user-text query, entry + byte budget caps, dedupe by content, no re-injection per turn (agent_start reset + in-conversation marker), disabled no-op, blank/no-hit skips, `renderInjection` edges. | No action — at tier. The real-model leg is manual/opt-in by design (hermetic contract is the fake-provider handler). |

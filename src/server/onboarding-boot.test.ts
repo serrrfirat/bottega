@@ -43,6 +43,10 @@ function tempEnv(): BootEnv {
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
   };
   process.chdir(dir);
+  // The server boots the KB config (issue #91): a fresh deployment root
+  // ships the empty-sources config like the committed config/kb.yml.
+  mkdirSync(join(dir, "config"));
+  writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
   process.env.SLACK_APP_TOKEN = "xapp-1-test";
   process.env.SLACK_BOT_TOKEN = "xoxb-test";
   delete process.env.BOTTEGA_CONFIG_DIR;

@@ -47,6 +47,65 @@ unit tests over real SQLite — nothing hits a live LLM, Slack, or GitHub. The
 live-Slack QA canary (issue #79) boots the real stack against a real
 workspace — see [features.md](features.md#live-slack-qa-canary-issue-79).
 
+## Proactive layer (scheduler, digests, reflections, KB)
+
+The durable scheduler runs registered actions on five-field UTC cron
+schedules. Create a weekday standup at 09:00 UTC with the
+`create_scheduler_job` tool:
+
+```json
+{
+  "action": "standup_digest",
+  "cron": "0 9 * * 1-5",
+  "params": {"space": "slack:C123"}
+}
+```
+
+Standups and reflections are per-space opt-ins. Set the space's
+`spaces.policy_json` value to include:
+
+```json
+{"proactive":{"standup":true,"reflection":true}}
+```
+
+Both flags default to `false`. A proactive action posts only when the
+space's effective `response_mode` is `always`; mention and request-only
+spaces never receive unsolicited posts. On restart, the scheduler skips
+overdue occurrences instead of catching up, advances each job to its next
+future occurrence, and records `scheduler.missed` in the audit trail.
+
+The `org_pulse` action is a weekly, read-only summary of recent digest and
+reflection memories. Create it with no job-level space and set
+`params` to `{"pulse_space":"slack:C123"}` so the summary posts to that
+Slack space.
+
+Knowledge-base sources live in `config/kb.yml`. After adding a source, run
+the `kb_ingest` tool with `{"source":"source-id"}`, or omit `source` to
+ingest all configured sources. Each source host must also be in
+`src/egress/generate.ts`'s static allowlist, and requests must still pass
+the compose egress judge.
+
+These tools fail closed until the deployment-local, gitignored
+`config.yml` allows them. Use this exact policy block:
+
+```yaml
+tools:
+  create_scheduler_job: allow
+  list_scheduler_jobs: allow
+  delete_scheduler_job: allow
+  kb_ingest: allow
+approvals:
+  always_approve:
+    - create_scheduler_job
+    - delete_scheduler_job
+```
+
+`create_scheduler_job` and `delete_scheduler_job` are exec-tier tools:
+`action: allow` still asks a human unless they appear in
+`approvals.always_approve`. Remove the `approvals` block when every
+scheduler mutation should require an Approve button. Listing is read-only,
+and KB ingestion is write-tier, so neither needs `always_approve`.
+
 ## Deployment
 
 ### Prerequisites
@@ -183,6 +242,7 @@ repo is configured. Set the allowlist, git base, or API base via the
 2. Invite the bot into a channel and @mention it — it should reply (the space agent answers in-channel).
 3. Create a test work item (the `create_work_item` tool, passing a `repo` that is on the allowlist — see "Which repo does the executor work in?" above) — the executor claims it, implements it in a workspace, opens a PR, and the server posts `PR ready: <url> — approve to finish` in the channel.
 4. Restart persistence: `docker compose down && up` — spaces, work items, and the audit trail survive (they live on the `data` volume).
+5. Scheduled live-fire (requires `.env` and Slack): create a job due in the next minute, confirm one channel post, then confirm `list_scheduler_jobs` advanced `nextFireAt` and the audit trail contains `scheduler.fire`.
 
 ### Backup & rollback
 

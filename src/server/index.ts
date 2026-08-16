@@ -12,6 +12,14 @@ import { memoryToolDefinitions } from "../tools/memory";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
+import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
+import { loadKbConfig } from "../kb/config";
+import { buildRegistry } from "../scheduler/actions";
+import { startScheduler } from "../scheduler/runner";
+import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
+import { standupDigestAction } from "../scheduler/standup";
+import { reflectionAction } from "../scheduler/reflection";
+import { orgPulseAction } from "../scheduler/observer";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -107,6 +115,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // backend (compose ships it), else SQLite sharing the store's database
   // handle.
   const memoryProvider = resolveMemoryProvider(orgSettings, store.getDb());
+  const schedulerRegistry = buildRegistry([
+    standupDigestAction,
+    reflectionAction,
+    orgPulseAction,
+  ]);
+  const kbDeps: KbToolDependencies = {
+    memoryProvider,
+    audit,
+    config: loadKbConfig(),
+  };
   // Extension registry (issue #50): loads pinned spec snapshots from
   // config/extensions/ at boot. Per-org deployments resolve extensions from
   // these local files — never from the integrations.sh catalog at runtime.
@@ -314,6 +332,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
             // tool (write tier → org-settings access via approval);
             // deploy_info is read-tier (anyone).
             ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
+            ...schedulerToolDefinitions(store, audit, schedulerRegistry),
+            ...kbToolDefinitions(kbDeps),
           ],
         },
         // Connect capability (issue #52): connect_extension is built per
@@ -391,14 +411,25 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     log: (line) => console.log(line),
   });
+  const scheduler = startScheduler({
+    store,
+    audit,
+    registry: schedulerRegistry,
+    memoryProvider,
+    postMessage: (spaceId, text) => adapter.postMessage(spaceId, text),
+    loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+    log: (line) => console.log(line),
+  });
 
   return {
     async start() {
       await adapter.start();
       deliveryPoller.start();
+      scheduler.start();
     },
     async stop() {
       deliveryPoller.stop();
+      scheduler.stop();
       await spaceService.stop();
       await adapter.stop();
       store.close();

@@ -179,6 +179,31 @@ resolves → its tool appears in the space agent's toolset → its domain lands
 in the merged egress allowlist. No extension implementations ship in this
 issue — the three providers are their own issues.
 
+## Proactive scheduler, learning, and knowledge base (epic #111)
+
+- **Durable UTC scheduler (#86)** — three policy-gated tools create, list,
+  and delete recurring five-field cron jobs. Jobs survive restarts, never
+  overlap scheduler passes, and record created, deleted, fired, missed, and
+  failed events in the audit trail. The boot policy skips missed runs
+  instead of replaying a backlog.
+- **Standup digest (#92)** — an opted-in space can post a weekday summary
+  of work finished yesterday, work still open, and blocked items. Each
+  digest includes item details and pull-request links, saves an org-memory
+  digest, and keeps the existing per-space digest cap.
+- **Daily reflection (#93)** — an opted-in space derives deterministic
+  facts from that day's work items and audit events. It saves append-only
+  org memories for finished work, blockers, errors, and activity. It does
+  not call a model.
+- **Org pulse observer (#90)** — a weekly, read-only action summarizes the
+  last seven days of digest and reflection memories into a configured Slack
+  pulse space. The post cites memory ids and dates, and every observer read
+  is audited.
+- **Knowledge-base ingestion (#91)** — `config/kb.yml` declares document
+  sources, and the `kb_ingest` tool fetches, chunks, and saves them as
+  append-only org memories. Ingestion is deterministic and model-free.
+  Source hosts remain subject to both the static egress allowlist and the
+  egress judge.
+
 ## Live-Slack QA canary (issue #79)
 
 The product-surface smoke test: it boots the REAL stack (production Socket
@@ -262,8 +287,9 @@ the canary opens it via `conversations.open`).
   default); a work item without a repo is blocked for the requester to
   specify. One shared executor container (no per-item container isolation
   yet).
-- **Slack only** — Telegram, Teams, Meet, and the org observer are roadmap
-  (issue #13 is the Telegram adapter).
+- **Slack only** — the org pulse observer now ships on Slack, with live
+  scheduled-post verification kept as a manual deployment check. Telegram,
+  Teams, and Meet remain roadmap (issue #13 is the Telegram adapter).
 - **No mid-session model switches on ACP** — `use_model` (issue #64) works
   on the OMP driver; ACP sessions cannot switch models mid-session (the
   agent's own config governs) and the tool reports it as an error.

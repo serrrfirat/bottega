@@ -24,6 +24,8 @@ function tempEnv(): { dir: string; cleanup(): void } {
     configDir: process.env.BOTTEGA_CONFIG_DIR,
   };
   process.chdir(dir);
+  mkdirSync(join(dir, "config"));
+  writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
   process.env.SLACK_APP_TOKEN = "xapp-1-test";
   process.env.SLACK_BOT_TOKEN = "xoxb-test";
   delete process.env.BOTTEGA_CONFIG_DIR;
