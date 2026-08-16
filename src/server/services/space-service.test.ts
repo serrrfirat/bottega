@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE } from "./space-service";
+import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 
@@ -157,16 +157,24 @@ class FakeMemoryProvider implements MemoryProvider {
   }
 }
 
-function fakeAdapter(): {
+function fakeAdapter(opts: { deferPost?: boolean } = {}): {
   adapter: SlackAdapter;
   posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
+  releasePost: () => void;
 } {
+  const { deferPost = false } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
+  let releasePost = () => {};
   const adapter: SlackAdapter = {
-    async postMessage(spaceId, text, opts) {
-      posts.push({ spaceId, text, opts });
+    async postMessage(spaceId, text, postOpts) {
+      posts.push({ spaceId, text, opts: postOpts });
+      if (deferPost) {
+        await new Promise<void>((resolve) => {
+          releasePost = resolve;
+        });
+      }
       return `ts-${posts.length}`; // deterministic ts per post
     },
     async updateMessage(spaceId, ts, text) {
@@ -175,7 +183,7 @@ function fakeAdapter(): {
     async start() {},
     async stop() {},
   };
-  return { adapter, posts, updates };
+  return { adapter, posts, updates, releasePost: () => releasePost() };
 }
 
 function fakeStore(): {
@@ -485,6 +493,200 @@ describe("SpaceService output routing", () => {
 
     expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
     expect(updates).toHaveLength(0); // phrase stays, never replaced
+  });
+
+  test("a retry's turn_start updates the pending phrase in place — one message max (issue #60)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+
+    session.emit("turn_start", { spaceId: "slack:C1" }); // first attempt
+    await Promise.resolve();
+    session.emit("turn_start", { spaceId: "slack:C1" }); // OMP auto-retry: another attempt
+    await Promise.resolve();
+
+    expect(posts).toHaveLength(1); // exactly one phrase posted
+    expect(posts[0]).toEqual({ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } });
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" }]); // replaced in place
+  });
+
+  test("a turn_start while the phrase post is in flight never posts a second phrase (issue #60)", async () => {
+    const { adapter, posts, updates, releasePost } = fakeAdapter({ deferPost: true });
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+
+    session.emit("turn_start", { spaceId: "slack:C1" }); // post parked in flight
+    await Promise.resolve();
+    session.emit("turn_start", { spaceId: "slack:C1" }); // retry before the ts is known
+    await Promise.resolve();
+    expect(posts).toHaveLength(1); // second turn_start must not post
+
+    releasePost(); // the in-flight post resolves; it becomes the one phrase
+    await Promise.resolve();
+    await Promise.resolve();
+    session.emit("turn_start", { spaceId: "slack:C1" }); // now it updates in place
+    await Promise.resolve();
+
+    expect(posts).toHaveLength(1);
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" }]);
+  });
+
+  test("an empty message text replaces the phrase with the empty-response fallback (issue #60)", async () => {
+    for (const empty of ["", "   ", "\n\t"]) {
+      const { adapter, posts, updates } = fakeAdapter();
+      const { store } = fakeStore();
+      const driver = new FakeDriver();
+      const service = new SpaceService({ store, adapter, driver });
+
+      await service.handleInboundMessage(msg({ ts: "1.1" }));
+      const session = driver.last();
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("message", { spaceId: "slack:C1", text: empty });
+      await Promise.resolve();
+
+      expect(posts).toHaveLength(1); // phrase only
+      expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: EMPTY_RESPONSE_FALLBACK }]);
+    }
+  });
+
+  test("an empty completion is counted, and a later real reply resets the streak (issue #60)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i < EMPTY_TURN_LIMIT; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("message", { spaceId: "slack:C1", text: "" });
+      await Promise.resolve();
+    }
+    expect(posts).toHaveLength(1); // never stacked, even across empties
+    // Each turn: a rotation update (turn_start, i>0) plus a fallback update
+    // (empty message) — all replaced in place on the same ts.
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2 - 1);
+    expect(updates.every((u) => u.spaceId === "slack:C1" && u.ts === "ts-1")).toBe(true);
+    expect(updates.filter((u) => u.text === EMPTY_RESPONSE_FALLBACK)).toHaveLength(EMPTY_TURN_LIMIT);
+
+    // A real reply ends the streak and replaces the phrase.
+    session.emit("message", { spaceId: "slack:C1", text: "finally an answer" });
+    await Promise.resolve();
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "finally an answer" });
+    expect(posts).toHaveLength(1);
+  });
+
+  test(`${EMPTY_TURN_LIMIT + 1} empty turns surface one churn message, then phrases stop posting (issue #60)`, async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    // Real retry-loop shape: silent turn_start/turn_end pairs (empty output is
+    // filtered before the message event by both drivers).
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+    }
+
+    expect(posts).toHaveLength(1); // one phrase, never stacked
+    // Three in-place rotations + one churn message = all on the same ts.
+    expect(updates).toEqual([
+      { spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: "Give me a second…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: "Working on it…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: CHURN_MESSAGE },
+    ]);
+
+    // Silence: further retries neither post nor update.
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(1);
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT + 1);
+
+    // A non-empty turn re-arms phrases and posts fresh (churn message is final).
+    session.emit("message", { spaceId: "slack:C1", text: "recovered" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(2); // churn message + fresh reply
+    expect(posts[1]).toEqual({ spaceId: "slack:C1", text: "recovered", opts: { threadTs: "1.1" } });
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(3); // phrases are back
+  });
+
+  test("empty message events past the limit surface one churn message, then silence (issue #60)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("message", { spaceId: "slack:C1", text: "" });
+      await Promise.resolve();
+    }
+
+    expect(posts).toHaveLength(1); // one message total, replaced in place throughout
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: CHURN_MESSAGE });
+
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    session.emit("message", { spaceId: "slack:C1", text: "" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(1);
+    // Rotations (N) + fallbacks (N) + churn (1) — churn shown exactly once.
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2 + 1);
+  });
+
+  test("dispose clears the pending phrase and churn state (issue #60)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    // Push the space into churn-silenced state with a pending phrase.
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+    }
+    expect(posts).toHaveLength(1);
+    expect(updates.at(-1)?.text).toBe(CHURN_MESSAGE);
+
+    await service.stop(); // dispose every live session
+
+    // A cold start must not inherit the stale pending ts or the churn silence.
+    await service.handleInboundMessage(msg({ ts: "2.2" }));
+    const fresh = driver.last();
+    expect(fresh).not.toBe(session);
+    fresh.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(2); // fresh phrase posted: pending cleared, silence lifted
+    fresh.emit("message", { spaceId: "slack:C1", text: "the answer" });
+    await Promise.resolve();
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-2", text: "the answer" });
   });
 
   test("the session driver emits message events to subscribers (contract surface)", async () => {

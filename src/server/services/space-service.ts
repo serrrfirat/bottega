@@ -54,8 +54,11 @@ export const REQUEST_ONLY_DIRECTIVE =
 
 /**
  * Rotating status phrases posted on turn_start and replaced in place by the
- * real reply (or error text) when the turn completes (issue #40). A turn
- * that ends with neither message nor error leaves the phrase as-is.
+ * real reply (or error text) when the turn completes (issue #40). Since #60,
+ * turn_start is retry-safe: while a phrase is pending for the space, the next
+ * rotating phrase UPDATES it in place instead of posting a second message, so
+ * an OMP auto-retry loop never stacks phrases. A turn that ends with neither
+ * message nor error leaves the phrase as-is.
  */
 const THINKING_PHRASES = [
   "Thinking…",
@@ -64,6 +67,21 @@ const THINKING_PHRASES = [
   "Working on it…",
   "Let me think…",
 ];
+
+/**
+ * Consecutive empty completions that trip the churn guard (issue #60): beyond
+ * this many, one visible churn message replaces the phrase and phrases stay
+ * off until a non-empty turn. Root cause: reasoning-only output (content
+ * empty when the token budget is consumed by reasoning) or a stale gateway
+ * route — either way OMP auto-retries and every retry re-fires turn_start.
+ */
+export const EMPTY_TURN_LIMIT = 3;
+
+/** Shown on a `message` event whose text is empty/whitespace (issue #60). */
+export const EMPTY_RESPONSE_FALLBACK = "Hmm — I got an empty response, retrying…";
+
+/** Surfaced once after {@link EMPTY_TURN_LIMIT} consecutive empty turns (issue #60). */
+export const CHURN_MESSAGE = "I keep getting empty responses — check the model key?";
 
 interface LiveSession {
   spaceId: string;
@@ -94,8 +112,28 @@ export class SpaceService {
   readonly #lastInboundTs = new Map<string, string>();
   /** Principal of the latest inbound message per space (memory injection, #42). */
   readonly #lastPrincipal = new Map<string, string>();
-  /** ts of the in-place thinking phrase per space; consumed when the reply lands. */
+  /**
+   * ts of the in-place thinking phrase per space; consumed when the reply lands.
+   * NOTE: the ts is only known after postMessage resolves — the posting guard
+   * below covers the in-flight window so a second phrase can never be posted.
+   */
   readonly #pendingThinkingTs = new Map<string, string>();
+  /**
+   * Spaces whose phrase postMessage is still in flight (ts not yet known).
+   * A turn_start during this window skips posting — the in-flight post
+   * becomes the space's one phrase (issue #60: stacking is impossible).
+   */
+  readonly #phrasePosting = new Set<string>();
+  /**
+   * Consecutive empty completions per space (churn guard, #60). Reset by any
+   * non-empty message or error; a new inbound message does not reset it, so
+   * phrases stay off until a turn actually produces text.
+   */
+  readonly #emptyTurnCount = new Map<string, number>();
+  /** Spaces whose churn message is already surfaced; phrases stay off (#60). */
+  readonly #churnActive = new Set<string>();
+  /** Spaces whose current turn already delivered a message or an error (#60). */
+  readonly #turnDelivered = new Set<string>();
   /** Spaces mid-digest turn: their output must not reach the channel (#42). */
   readonly #digesting = new Set<string>();
   /** Rotates THINKING_PHRASES one step per turn. */
@@ -176,6 +214,7 @@ export class SpaceService {
     session.on("turn_start", (data) => this.#onTurnStart(spaceId, data));
     session.on("message", (data) => this.#onSessionMessage(spaceId, data));
     session.on("error", (data) => this.#onSessionError(spaceId, data));
+    session.on("turn_end", (data) => this.#onTurnEnd(spaceId, data));
     const live: LiveSession = {
       spaceId,
       session,
@@ -211,6 +250,10 @@ export class SpaceService {
       this.#lastInboundTs.delete(spaceId);
       this.#lastPrincipal.delete(spaceId);
       this.#pendingThinkingTs.delete(spaceId);
+      this.#phrasePosting.delete(spaceId);
+      this.#emptyTurnCount.delete(spaceId);
+      this.#churnActive.delete(spaceId);
+      this.#turnDelivered.delete(spaceId);
       this.#sessions.delete(spaceId);
     }
   }
@@ -218,21 +261,47 @@ export class SpaceService {
   /**
    * Turn started: post a rotating thinking phrase immediately so the space
    * shows activity, and remember its ts to replace in place when the reply
-   * (or an error) lands. A turn that ends with neither leaves the phrase.
-   * Digest turns are invisible to the channel (their output is memory, #42).
+   * (or an error) lands. Retry-safe (#60): OMP auto-retries empty completions
+   * and each attempt fires turn_start, so a pending phrase is UPDATED with
+   * the next rotating phrase instead of stacking a second message — one
+   * message max per space at any time. A turn_start while a phrase post is
+   * still in flight (ts unknown yet) skips posting entirely. Digest turns
+   * are invisible to the channel (their output is memory, #42). After the
+   * churn guard has fired (#60), phrases stay off until a turn produces
+   * text or an error — no new posts, not just no updates.
    */
   #onTurnStart(spaceId: string, _data: unknown): void {
     if (this.#digesting.has(spaceId)) return;
-    const phrase = THINKING_PHRASES[this.#phraseIndex % THINKING_PHRASES.length];
-    this.#phraseIndex += 1;
+    this.#turnDelivered.delete(spaceId);
+    if (this.#churnActive.has(spaceId)) return;
+    const pendingTs = this.#pendingThinkingTs.get(spaceId);
+    if (pendingTs !== undefined) {
+      // A retry (or second turn) while the phrase is up: replace in place.
+      void this.#adapter.updateMessage(spaceId, pendingTs, this.#nextPhrase()).catch((err) => {
+        console.error(`[space-service] failed to update thinking phrase in ${spaceId}:`, err);
+      });
+      return;
+    }
+    if (this.#phrasePosting.has(spaceId)) return; // in flight — it becomes the phrase
+    this.#phrasePosting.add(spaceId);
     void this.#adapter
-      .postMessage(spaceId, phrase, this.#replyOpts(spaceId))
+      .postMessage(spaceId, this.#nextPhrase(), this.#replyOpts(spaceId))
       .then((ts) => {
         if (ts !== undefined) this.#pendingThinkingTs.set(spaceId, ts);
       })
       .catch((err) => {
         console.error(`[space-service] failed to post thinking phrase to ${spaceId}:`, err);
+      })
+      .finally(() => {
+        this.#phrasePosting.delete(spaceId);
       });
+  }
+
+  /** Next rotating phrase; advances the shared rotation index. */
+  #nextPhrase(): string {
+    const phrase = THINKING_PHRASES[this.#phraseIndex % THINKING_PHRASES.length];
+    this.#phraseIndex += 1;
+    return phrase;
   }
 
   /** Complete reply text: replace the thinking phrase in place (or post fresh). */
@@ -240,6 +309,26 @@ export class SpaceService {
     if (this.#digesting.has(spaceId)) return;
     const text = (data as { text?: unknown }).text;
     if (typeof text !== "string") return;
+    this.#turnDelivered.add(spaceId);
+    if (!text.trim()) {
+      // Empty completion (#60): replace the phrase with a visible fallback so
+      // the retry loop is never silent, and count it for the churn guard. The
+      // pending ts is deliberately kept: a retry's turn_start then replaces
+      // the phrase in place instead of stacking a new message.
+      this.#countEmptyTurn(spaceId);
+      if (!this.#churnActive.has(spaceId)) {
+        const pendingTs = this.#pendingThinkingTs.get(spaceId);
+        if (pendingTs !== undefined) {
+          void this.#adapter.updateMessage(spaceId, pendingTs, EMPTY_RESPONSE_FALLBACK).catch((err) => {
+            console.error(`[space-service] failed to update empty-response phrase in ${spaceId}:`, err);
+          });
+        }
+      }
+      return;
+    }
+    // Real text: the empty streak is over, phrases re-arm.
+    this.#emptyTurnCount.delete(spaceId);
+    this.#churnActive.delete(spaceId);
     this.#replaceOrPost(spaceId, text);
   }
 
@@ -247,8 +336,38 @@ export class SpaceService {
   #onSessionError(spaceId: string, data: unknown): void {
     console.error(`[space-service] session error (${spaceId}):`, data);
     if (this.#digesting.has(spaceId)) return;
+    this.#turnDelivered.add(spaceId);
+    // An error is a visible outcome: it breaks the empty streak and re-arms phrases.
+    this.#emptyTurnCount.delete(spaceId);
+    this.#churnActive.delete(spaceId);
     const message = (data as { message?: unknown }).message;
     this.#replaceOrPost(spaceId, typeof message === "string" ? message : "Something went wrong while thinking.");
+  }
+
+  /**
+   * Turn ended without a delivered message or error (#60): an empty
+   * completion. Both drivers filter empty text before the "message" event
+   * (`if (text) deliver`), so the retry loop arrives here as silent
+   * turn_start/turn_end pairs — this is what must trip the churn guard.
+   */
+  #onTurnEnd(spaceId: string, _data: unknown): void {
+    if (this.#digesting.has(spaceId)) return;
+    if (this.#turnDelivered.has(spaceId)) return;
+    this.#countEmptyTurn(spaceId);
+  }
+
+  /**
+   * Counts one empty completion for the space; beyond {@link EMPTY_TURN_LIMIT}
+   * consecutive empties, surfaces {@link CHURN_MESSAGE} exactly once (in place
+   * of the pending phrase, or fresh) and silences phrases until a non-empty
+   * turn — fail visible, not silent (#60).
+   */
+  #countEmptyTurn(spaceId: string): void {
+    const count = (this.#emptyTurnCount.get(spaceId) ?? 0) + 1;
+    this.#emptyTurnCount.set(spaceId, count);
+    if (count <= EMPTY_TURN_LIMIT || this.#churnActive.has(spaceId)) return;
+    this.#churnActive.add(spaceId);
+    this.#replaceOrPost(spaceId, CHURN_MESSAGE);
   }
 
   /**
