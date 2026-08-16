@@ -25,12 +25,11 @@ import {
   parseOrgConfigYaml,
   resolveTier,
   toolAction,
+  type Decision,
   type PolicyAction,
   type Tier,
 } from "./config";
 import createPolicyExtension from "./extension";
-
-type Decision = "allow" | "deny" | "ask-human";
 
 const ALL_ACTIONS: PolicyAction[] = ["allow", "deny", "prompt"];
 const ALL_TIERS: Tier[] = ["read", "write", "exec"];
@@ -94,7 +93,6 @@ tools:
   write: allow
 approvals:
   timeout_minutes: 7
-  required_for_org_change: 2
 `);
     expect(p.ok).toBe(true);
     expect(toolAction(p, "bash")).toBe("deny");
@@ -102,7 +100,6 @@ approvals:
     expect(toolAction(p, "write")).toBe("allow");
     expect(p.unknownAction).toBe("deny");
     expect(p.timeoutMinutes).toBe(7);
-    expect(p.requiredApprovers).toBe(2);
     expect(p.approvers).toEqual([]);
     expect(p.alwaysApprove).toEqual([]);
     expect(p.errors).toEqual([]);
@@ -128,6 +125,16 @@ approvals:
   test("always_approve must be a list of tool names (issue #45)", () => {
     expect(parseOrgConfigYaml("approvals:\n  always_approve: nope\n").ok).toBe(false);
     expect(parseOrgConfigYaml("approvals:\n  always_approve:\n    - 42\n").ok).toBe(false);
+  });
+
+  test("unknown approvals keys warn instead of parsing silently (issue #65)", () => {
+    // required_for_org_change was removed in #65 as never-consumed dead
+    // surface; a leftover key (or a typo) must not look configured.
+    const p = parseOrgConfigYaml("approvals:\n  required_for_org_change: 2\n  timeout_minute: 7\n");
+    expect(p.ok).toBe(true);
+    expect(p.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
+    expect(p.warnings.some((w) => w.includes("approvals.required_for_org_change"))).toBe(true);
+    expect(p.warnings.some((w) => w.includes("approvals.timeout_minute"))).toBe(true);
   });
 
   test("trailing comments and quoted actions parse (shared YAML parser)", () => {
@@ -165,7 +172,6 @@ approvals:
     expect(toolAction(p, "read")).toBe("deny");
     expect(p.unknownAction).toBe("deny");
     expect(p.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
-    expect(p.requiredApprovers).toBe(1);
     // Memory-context injection defaults (issue #42): enabled, 5 entries.
     expect(p.memory.injection).toEqual({ enabled: true, maxEntries: 5 });
   });
@@ -682,36 +688,21 @@ describe("policy extension wiring", () => {
   test("explicit deny beats always_approve (issue #45)", async () => {
     const resolvedBefore = (await audit.listAudit({ event_type: "approval.resolved" })).length;
     const handlers = makeExtension("tools:\n  bash: deny\napprovals:\n  always_approve:\n    - bash\n");
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
     expect(await lastAudit("policy.decision")).toMatchObject({ tool: "bash", decision: "deny" });
     expect(await audit.listAudit({ event_type: "approval.resolved" })).toHaveLength(resolvedBefore);
   });
 
   test("explicit prompt beats always_approve (issue #45)", async () => {
     const handlers = makeExtension("tools:\n  bash: prompt\napprovals:\n  always_approve:\n    - bash\n");
-    const res = await call(handlers, "bash", { command: "ls" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }));
     // The ask-human path ran (DenyRouter), not the auto-approval.
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: false });
   });
 
   test("an unknown tool in always_approve fails the policy closed (issue #45)", async () => {
     const handlers = makeExtension("approvals:\n  always_approve:\n    - some_new_tool\n");
-    const res = await call(handlers, "read", { path: "x" });
-    if (typeof res === "object" && res !== null) {
-      expect(res.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "read", { path: "x" }));
     expect(await lastAudit("policy.decision")).toMatchObject({ tool: "read", decision: "deny" });
   });
 
@@ -722,12 +713,7 @@ describe("policy extension wiring", () => {
       DenyRouter,
     );
     // Space with the removal overlay: the exec tool goes back to ask-human → denied.
-    const blocked = await call(handlers, "bash", { command: "ls" }, space.id);
-    if (typeof blocked === "object" && blocked !== null) {
-      expect(blocked.block).toBe(true);
-    } else {
-      expect.unreachable("expected a block result");
-    }
+    blocked(await call(handlers, "bash", { command: "ls" }, space.id));
     // Space without the overlay (org floor list intact): auto-approved.
     expect(await call(handlers, "bash", { command: "ls" }, space2.id)).toBeUndefined();
     expect(await lastAudit("approval.resolved")).toMatchObject({ approved: true, approver: "policy" });

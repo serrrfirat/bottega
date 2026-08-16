@@ -7,11 +7,14 @@
  * allows. A missing config.yml is a fail-closed default policy (everything
  * denies unless explicitly allowed).
  *
- * `approvals` keys: `timeout_minutes` (ask-human timeout, default 5),
- * `required_for_org_change` (reserved), and `always_approve` (issue #45) —
- * an allowlist of exec-tier tools that skip the ask-human prompt when their
- * policy action is `allow`; known tool names only, unknown names fail the
- * policy closed. The space overlay can only remove entries from that list.
+ * `approvals` keys: `timeout_minutes` (ask-human timeout, default 5) and
+ * `always_approve` (issue #45) — an allowlist of exec-tier tools that skip
+ * the ask-human prompt when their policy action is `allow`; known tool
+ * names only, unknown names fail the policy closed. The space overlay can
+ * only remove entries from that list. Unknown keys in `approvals` warn
+ * (the org-change quorum knob `required_for_org_change` was removed in
+ * #65 as never-consumed dead surface; a leftover key warns, it no longer
+ * parses).
  *
  * `extensions` keys (issue #56): `allow`/`deny` id lists (empty = no
  * restriction; non-empty allow = only those ids usable; deny wins over
@@ -39,7 +42,7 @@ export type Decision = "allow" | "deny" | "ask-human";
 
 /** Space-agent driver selected by the org config (`agent.driver`, issue #26). */
 export type AgentDriverName = "acp" | "omp-sdk";
-export const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
+const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
 /**
  * Per-space response mode (issue #55): when the agent acts at all.
  * - `always`: every non-bot message is a turn (today's behavior).
@@ -49,7 +52,7 @@ export const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
  */
 export type ResponseMode = "always" | "mention" | "request-only";
 
-export const DEFAULT_RESPONSE_MODE: ResponseMode = "always";
+const DEFAULT_RESPONSE_MODE: ResponseMode = "always";
 
 /**
  * Per-space org-credential usage (issue #56): whether `auto` credential
@@ -57,11 +60,10 @@ export const DEFAULT_RESPONSE_MODE: ResponseMode = "always";
  * org usage is gated at connect by approval anyway.
  */
 export type OrgCredentialsMode = "allow" | "deny";
-export const DEFAULT_ORG_CREDENTIALS: OrgCredentialsMode = "allow";
+const DEFAULT_ORG_CREDENTIALS: OrgCredentialsMode = "allow";
 
 export const DEFAULT_TIMEOUT_MINUTES = 5;
-export const DEFAULT_REQUIRED_APPROVERS = 1;
-export const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
+const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
 
 /** Tightening order for response modes: always → mention → request-only. */
 const RESPONSE_MODE_STRICTNESS: Record<ResponseMode, number> = {
@@ -81,7 +83,7 @@ function normalizeResponseMode(value: unknown): ResponseMode | undefined {
 }
 
 /** The stricter of two response modes (mention/request-only tighten; always is the floor). */
-export function stricterResponseMode(a: ResponseMode, b: ResponseMode): ResponseMode {
+function stricterResponseMode(a: ResponseMode, b: ResponseMode): ResponseMode {
   return RESPONSE_MODE_STRICTNESS[b] > RESPONSE_MODE_STRICTNESS[a] ? b : a;
 }
 
@@ -98,7 +100,7 @@ function normalizeOrgCredentials(value: unknown): OrgCredentialsMode | undefined
 }
 
 /** The stricter of two org-credential modes (deny tightens; allow is the floor). */
-export function stricterOrgCredentials(a: OrgCredentialsMode, b: OrgCredentialsMode): OrgCredentialsMode {
+function stricterOrgCredentials(a: OrgCredentialsMode, b: OrgCredentialsMode): OrgCredentialsMode {
   return ORG_CREDENTIALS_STRICTNESS[b] > ORG_CREDENTIALS_STRICTNESS[a] ? b : a;
 }
 
@@ -148,8 +150,6 @@ export interface PolicyConfig {
   unknownAction: PolicyAction;
   /** Ask-human timeout for the approval router. */
   timeoutMinutes: number;
-  /** Approvers required for org-level changes (consumed by the Slack router, later issue). */
-  requiredApprovers: number;
   /** Space approvers (issue #33): the overlay's `approvers` list; org floor default is none. */
   approvers: string[];
   /**
@@ -186,8 +186,8 @@ export interface PolicyConfig {
 }
 
 /** `memory.injection.max_entries` default and ceiling (search caps at 20). */
-export const DEFAULT_MEMORY_INJECTION_MAX_ENTRIES = 5;
-export const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
+const DEFAULT_MEMORY_INJECTION_MAX_ENTRIES = 5;
+const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
 
 export function defaultPolicy(): PolicyConfig {
   return {
@@ -195,7 +195,6 @@ export function defaultPolicy(): PolicyConfig {
     tools: {},
     unknownAction: DEFAULT_UNKNOWN_ACTION,
     timeoutMinutes: DEFAULT_TIMEOUT_MINUTES,
-    requiredApprovers: DEFAULT_REQUIRED_APPROVERS,
     approvers: [],
     alwaysApprove: [],
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
@@ -437,11 +436,13 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       } else if (entries.timeout_minutes !== undefined) {
         policy.warnings.push("approvals.timeout_minutes: invalid — using default");
       }
-      const required = parsePositiveInt(scalarOrUndefined(entries.required_for_org_change));
-      if (required !== undefined) {
-        policy.requiredApprovers = required;
-      } else if (entries.required_for_org_change !== undefined) {
-        policy.warnings.push("approvals.required_for_org_change: invalid — using default");
+      // Unknown keys warn instead of parsing silently (mirrors the agent /
+      // extensions sections): a stale `required_for_org_change` or a typo'd
+      // knob must not look configured.
+      for (const key of Object.keys(entries)) {
+        if (key !== "timeout_minutes" && key !== "always_approve") {
+          policy.warnings.push(`approvals.${key}: unknown key ignored`);
+        }
       }
       // always_approve (issue #45): an opt-in allowlist of exec-tier tools
       // that skip the ask-human prompt. Known tool names only — an unknown

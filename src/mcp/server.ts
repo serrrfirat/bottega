@@ -54,17 +54,16 @@ import type { AuditModule } from "../policy/audit";
 import { createAudit } from "../policy/audit";
 import {
   applySpaceOverlay,
-  decideToolCall,
-  isKnownTool,
+  decidePolicyCall,
   loadOrgConfig,
   resolveTier,
-  toolAction,
   type Decision,
   type PolicyConfig,
   type Tier,
 } from "../policy/config";
+import { summarizeArgs } from "../policy/gate";
 import { createStore } from "../store/db";
-import { MEMORY_WRITE_EVENT } from "../store/audit-events";
+import { MEMORY_WRITE_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { memorySaveArgsSchema, memorySearchArgsSchema, sha256Hex } from "../tools/memory";
 
@@ -77,14 +76,6 @@ export interface MemoryMcpServerOptions {
   spaceId?: string | null;
   /** Principal used for user-scope saves when the call omits `principal`. */
   defaultPrincipal?: string;
-}
-
-/** Cap for the args summary embedded in policy.decision rows (appendAudit redacts + caps too). */
-const ARGS_SUMMARY_MAX = 1000;
-
-function summarizeArgs(input: unknown): string {
-  const text = JSON.stringify(input) ?? "";
-  return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;
 }
 
 /** Flattens a parse failure into a single-line message for the client. */
@@ -102,22 +93,14 @@ interface GateResult {
 }
 
 /**
- * The action gate (mirrors the policy extension's decide + fail-closed
- * deny). ask-human has no approval channel in the headless MCP context:
- * it fails closed (DenyRouter-equivalent) with the decision recorded in
- * the audit.
+ * The action gate (one implementation of the shared decision table —
+ * decidePolicyCall, issue #26). ask-human has no approval channel in the
+ * headless MCP context: it fails closed (DenyRouter-equivalent) with the
+ * decision recorded in the audit.
  */
 function gateTool(policy: PolicyConfig, tool: string): GateResult {
   const tier = resolveTier(tool);
-  if (!policy.ok) {
-    const reason = `policy invalid: ${policy.errors[0] ?? "parse error"}`;
-    return { decision: "deny", reason, tier, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
-  }
-  const { decision, reason } = decideToolCall({
-    tier,
-    action: toolAction(policy, tool),
-    toolKnown: isKnownTool(tool),
-  });
+  const { decision, reason } = decidePolicyCall(policy, tool);
   if (decision === "allow") return { decision, reason, tier, error: null };
   if (decision === "deny") return { decision, reason, tier, error: new McpError(ErrorCode.InvalidRequest, `policy: ${reason}`) };
   return {
@@ -167,7 +150,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     opts.audit.appendAudit({
       space_id: opts.spaceId ?? null,
       actor,
-      event_type: "policy.decision",
+      event_type: POLICY_DECISION_EVENT,
       payload: { tool, tier, decision, reason, args: summarizeArgs(args) },
     });
 

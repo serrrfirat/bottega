@@ -1,4 +1,4 @@
-import type { AuditRow, Store } from "../store/db";
+import type { AuditRow, ListAuditOpts, Store } from "../store/db";
 
 /** Payload cap before write (issue #7): oversized payloads are truncated, never dropped. */
 export const MAX_PAYLOAD_BYTES = 4 * 1024;
@@ -50,7 +50,7 @@ export interface AuditModule {
     event_type: string;
     payload: Record<string, unknown> | string;
   }): Promise<number>;
-  listAudit(opts: { space?: string; since?: number; event_type?: string; limit?: number }): Promise<AuditRow[]>;
+  listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
 }
 
 /**
