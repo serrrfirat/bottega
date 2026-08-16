@@ -8,7 +8,7 @@
  * authenticated user resolved from the Bearer token, which is how the
  * "token from the FILE, never env" contract is asserted.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
@@ -17,7 +17,12 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, type Store, type WorkItem, type WorkItemState } from "./store/db";
-import { DELIVERY_PENDING_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./store/audit-events";
+import {
+  DELIVERY_COMPLETED_EVENT,
+  DELIVERY_PENDING_EVENT,
+  EXTENSION_CALL_EVENT,
+  WORK_ITEM_TRANSITION_EVENT,
+} from "./store/audit-events";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
@@ -25,7 +30,18 @@ import {
   type DeliveryApproval,
   type DeliveryInfo,
   type ExecutorDeps,
+  type ExtensionWorkerToolset,
 } from "./executor";
+import { createAudit } from "./policy/audit";
+import { DenyRouter } from "./policy/approval-router";
+import { defaultPolicy } from "./policy/config";
+import { createExtensionRuntime, type ExtensionRuntime } from "./extensions/runtime";
+import { createExtensionRegistry } from "./extensions/registry";
+import { extensionToolDefinitions } from "./extensions/tools";
+import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./extensions/fixture";
+import { resolveMemoryProvider } from "./server/memory-provider";
+import { memoryToolDefinitions } from "./tools/memory";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./server/drivers/agent-driver";
 
 // --- Fakes ------------------------------------------------------------------
@@ -36,14 +52,18 @@ class FakeSession implements AgentSessionDriver {
   constructor(
     readonly opts: { spaceId: string; transcriptDir: string; cwd: string; allowTools: readonly string[] },
     private readonly failure: Error | null,
+    private readonly emittedError: string | null,
     private readonly messageText: string,
+    private readonly onPrompt: (() => Promise<void>) | null,
   ) {}
 
   async prompt(text: string, _opts?: AgentTurnOptions): Promise<void> {
     this.prompts.push(text);
     if (this.failure) throw this.failure;
     this.emit("turn_start", {});
+    await this.onPrompt?.();
     this.emit("message", { spaceId: this.opts.spaceId, text: this.messageText });
+    if (this.emittedError) this.emit("error", { message: this.emittedError });
     this.emit("turn_end", {});
   }
   async abort(): Promise<void> {}
@@ -66,7 +86,10 @@ class FakeDriver implements AgentDriver {
   sessions: FakeSession[] = [];
   /** When set, the next session's prompt throws it (failure-path tests). */
   failure: Error | null = null;
+  /** When set, the next session emits the driver's asynchronous error event. */
+  emittedError: string | null = null;
   messageText = "implemented the requested change";
+  onPrompt: (() => Promise<void>) | null = null;
 
   async createSession(opts: {
     spaceId: string;
@@ -83,7 +106,9 @@ class FakeDriver implements AgentDriver {
         allowTools: opts.allowTools ?? [],
       },
       this.failure,
+      this.emittedError,
       this.messageText,
+      this.onPrompt,
     );
     this.sessions.push(session);
     return session;
@@ -239,6 +264,75 @@ function makeDeps(fx: Fixture, overrides: Partial<ExecutorDeps> = {}): ExecutorD
   };
 }
 
+function makeExtensionToolset(
+  fx: Fixture,
+  runtime: ExtensionRuntime = {
+    execute: async () => ({ ok: true, content: [{ type: "text", text: "fixture tool completed" }] }),
+  },
+): ExtensionWorkerToolset {
+  const audit = createAudit(fx.store);
+  const registry = createFixtureRegistry();
+  return {
+    memoryTools: memoryToolDefinitions(
+      resolveMemoryProvider(fx.store.getOrgSettings(), fx.store.getDb()),
+      { audit },
+    ),
+    extensionTools: extensionToolDefinitions(registry.list(), {
+      runtime,
+      getCaller: () => "executor",
+    }),
+  };
+}
+
+function makeExtensionDeps(
+  fx: Fixture,
+  toolset: ExtensionWorkerToolset = makeExtensionToolset(fx),
+): ExecutorDeps {
+  return makeDeps(fx, {
+    getExtensionWorkerToolset: () => toolset,
+    extensionSessionTimeoutMs: 1_000,
+  });
+}
+
+async function executeExtensionTool(tool: ToolDefinition, params: Record<string, unknown>, spaceId: string): Promise<void> {
+  const result = await tool.execute(
+    "test-call",
+    params as never,
+    new AbortController().signal,
+    () => {},
+    {
+      sessionManager: {
+        getSessionFile: () => join("/tmp", `${spaceId}.jsonl`),
+      },
+    } as never,
+  );
+  if (result.isError) {
+    const message = result.content
+      .filter((block): block is Extract<(typeof result.content)[number], { type: "text" }> => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    throw new Error(message || "extension tool failed");
+  }
+}
+
+async function waitForTransition(
+  store: Store,
+  from: WorkItemState,
+  to: WorkItemState,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+    if (rows.some((row) => {
+      const payload = JSON.parse(row.payload) as { from?: string; to?: string };
+      return payload.from === from && payload.to === to;
+    })) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for transition ${from} -> ${to}`);
+    await Bun.sleep(10);
+  }
+}
+
 /** Runs the executor loop and aborts it once the item settles. */
 async function runUntil(fx: Fixture, itemId: string, state: WorkItemState, deps: ExecutorDeps): Promise<WorkItem> {
   const ac = new AbortController();
@@ -273,6 +367,7 @@ describe("claim loop", () => {
         requester: "U1",
         description: "add a health check endpoint",
         repo: "acme/sandbox",
+        delivery: "git",
       });
 
       const done = await runUntil(fx, item.id, "done", makeDeps(fx));
@@ -524,6 +619,291 @@ describe("claim loop", () => {
   });
 });
 
+
+describe("delivery routing (issue #129)", () => {
+  test("extension delivery completes without git and audits the external object", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText =
+        'Task complete.\n{"url":"https://linear.example/issue/OPS-42","summary":"Created the operations ticket"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create a Linear ticket for the outage follow-up",
+        delivery: "extension",
+      });
+
+      const done = await runUntil(fx, item.id, "done", makeExtensionDeps(fx));
+
+      expect(JSON.parse(done.result!)).toEqual({
+        url: "https://linear.example/issue/OPS-42",
+        summary: "Created the operations ticket",
+      });
+      expect(fx.deliveries).toHaveLength(0);
+      expect(existsSync(join(fx.workspacesDir, item.id))).toBe(false);
+
+      const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+      expect(transitions.map((row) => JSON.parse(row.payload))).toEqual(
+        expect.arrayContaining([
+          { from: "claimed", to: "working", by: "executor" },
+          { from: "working", to: "done", by: "executor" },
+        ]),
+      );
+      const completed = await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT });
+      expect(completed).toHaveLength(1);
+      expect(JSON.parse(completed[0].payload)).toEqual({
+        id: item.id,
+        kind: "extension",
+        url: "https://linear.example/issue/OPS-42",
+        summary: "Created the operations ticket",
+      });
+
+      expect(fx.driver.sessions).toHaveLength(1);
+      const session = fx.driver.sessions[0];
+      expect(session.opts.spaceId).toBe(space.id);
+      expect(session.opts.transcriptDir).toBe(join(fx.transcriptsDir, item.id));
+      expect(session.opts.allowTools).toEqual([
+        "memory.save",
+        "memory.search",
+        FIXTURE_EXTENSION_TOOL,
+      ]);
+      expect(session.prompts[0]).toContain(`work item ${item.id}`);
+      expect(session.prompts[0]).toContain(`space ${space.id}`);
+      expect(session.prompts[0]).toContain(item.description);
+      expect(session.prompts[0]).toContain('{"url": "<external object URL or empty string>", "summary": "<deliverable summary>"}');
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an extension envelope without a URL blocks under the delivery model", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText = '{"summary":"Updated the external record"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "update the customer record",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toContain("result.url");
+      expect(await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a missing JSON envelope blocks with non-empty evidence", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText = "finished the external task but forgot the result envelope";
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create the external object",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toMatch(/JSON envelope/);
+      expect(blocked.result).toBeNull();
+      expect(await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an extension session throw blocks with evidence", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.failure = new Error("extension worker transport crashed");
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "update the external object",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toContain("transport crashed");
+      expect(await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an emitted extension session error blocks with evidence", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText = '{"url":"https://attio.example/records/1","summary":"Updated the contact"}';
+      fx.driver.emittedError = "model stream failed after output";
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "update the Attio contact",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toContain("model stream failed");
+      expect(await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("chat delivery returns claimed items to open and logs the handoff", async () => {
+    const fx = makeFixture();
+    const lines: string[] = [];
+    const log = spyOn(console, "log").mockImplementation((message?: unknown, ...args: unknown[]) => {
+      lines.push([message, ...args].map(String).join(" "));
+    });
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "reply in the current conversation",
+        delivery: "chat",
+      });
+      const ac = new AbortController();
+      const run = runExecutor(makeDeps(fx), ac.signal);
+      try {
+        await waitForTransition(fx.store, "claimed", "open");
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      expect((await fx.store.getWorkItem(item.id))?.state).toBe("open");
+      expect(fx.driver.sessions).toHaveLength(0);
+      expect(lines.some((line) => line.includes("chat delivery is handled by the space agent"))).toBe(true);
+      const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+      expect(transitions.map((row) => JSON.parse(row.payload))).not.toEqual(
+        expect.arrayContaining([{ from: "working", to: "blocked", by: "executor" }]),
+      );
+    } finally {
+      log.mockRestore();
+      fx.cleanup();
+    }
+  });
+
+  test("an older chat item does not block a newer extension delivery", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText =
+        '{"url":"https://linear.example/issue/OPS-43","summary":"Created the queued ticket"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const chat = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "reply later in chat",
+        delivery: "chat",
+      });
+      const extension = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create the queued external ticket",
+        delivery: "extension",
+      });
+
+      const done = await runUntil(fx, extension.id, "done", makeExtensionDeps(fx));
+
+      expect(JSON.parse(done.result!)).toMatchObject({ url: "https://linear.example/issue/OPS-43" });
+      expect((await fx.store.getWorkItem(chat.id))?.state).toBe("open");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an unknown extension call blocks and audits the runtime error", async () => {
+    const fx = makeFixture();
+    try {
+      const audit = createAudit(fx.store);
+      const runtime = createExtensionRuntime({
+        registry: createExtensionRegistry(),
+        store: fx.store,
+        audit,
+        orgPolicy: defaultPolicy(),
+        router: DenyRouter,
+      });
+      const toolset = makeExtensionToolset(fx, runtime);
+      fx.driver.onPrompt = () =>
+        executeExtensionTool(toolset.extensionTools[0], { city: "Istanbul" }, fx.spaceId);
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "call an unknown extension",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx, toolset));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toContain("not registered");
+      const calls = await fx.store.listAudit({ event_type: EXTENSION_CALL_EVENT });
+      expect(calls.map((row) => JSON.parse(row.payload))).toContainEqual({
+        extension: FIXTURE_EXTENSION_ID,
+        tool: FIXTURE_EXTENSION_TOOL,
+        actor: "executor",
+        credential_id: null,
+        decision: "error",
+      });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a denied extension call blocks and audits the denial", async () => {
+    const fx = makeFixture();
+    try {
+      const audit = createAudit(fx.store);
+      const registry = createFixtureRegistry();
+      const runtime = createExtensionRuntime({
+        registry,
+        store: fx.store,
+        audit,
+        orgPolicy: { ...defaultPolicy(), extensionsDeny: [FIXTURE_EXTENSION_ID] },
+        router: DenyRouter,
+      });
+      const toolset = makeExtensionToolset(fx, runtime);
+      fx.driver.onPrompt = () =>
+        executeExtensionTool(toolset.extensionTools[0], { city: "Istanbul" }, fx.spaceId);
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "call a denied extension",
+        delivery: "extension",
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeExtensionDeps(fx, toolset));
+
+      expect(JSON.parse(blocked.evidence)[0].url).toContain("denied");
+      const calls = await fx.store.listAudit({ event_type: EXTENSION_CALL_EVENT });
+      expect(calls.map((row) => JSON.parse(row.payload))).toContainEqual({
+        extension: FIXTURE_EXTENSION_ID,
+        tool: FIXTURE_EXTENSION_TOOL,
+        actor: "executor",
+        credential_id: null,
+        decision: "deny",
+      });
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
 describe("org config parsing (issue #33)", () => {
   test("trailing comments and quoted repo entries parse to the correct allowlist and git base", async () => {
     const fx = makeFixture();

@@ -1,12 +1,12 @@
 /**
- * Executor: containerized work-item runner with git delivery (issue #11).
+ * Executor: containerized work-item delivery runner (issues #11 and #129).
  *
- * One claim loop, one agent session per work item, no orchestration
- * framework. Boots with stale-run recovery (#10), then per item:
+ * One claim loop, one agent session per executable work item, no
+ * orchestration framework. Boots with stale-run recovery (#10), then routes:
  *
- *   open → claimed (store) → working → [agent session in a fresh workspace]
- *   → push bottega/<id> → PR via GitHub API → review (recorded approval)
- *   → done | blocked
+ *   git       → workspace → agent → push → PR → review → done | blocked
+ *   extension → memory/extension agent → external object → done | blocked
+ *   chat      → returned to open for the space agent
  *
  * Credential boundary: the git PAT lives in a FILE (default
  * data/secrets/github-pat, mode 0600, env-overridable via
@@ -20,7 +20,7 @@
  * dir, and allow_loose_pat live in the org settings blob (DB — source of
  * truth); config/org.yml stays the default/fallback.
  *
- * Delivery approval contract: after the PR is opened the executor writes a
+ * Git delivery approval contract: after the PR is opened the executor writes a
  * `work_item.delivery_pending` audit marker, then calls the `onDelivery`
  * seam. The server hook (follow-up, TODO in src/server) posts the PR + an
  * approval request to the space channel and resolves with the human's
@@ -33,11 +33,17 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createStore, recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
-import { DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
-import { createAudit } from "./policy/audit";
+import { DELIVERY_COMPLETED_EVENT, DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
+import { createAudit, type AuditModule } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
-import { loadOrgPolicy } from "./policy/config";
-import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver } from "./server/drivers/agent-driver";
+import { loadOrgPolicy, type PolicyConfig } from "./policy/config";
+import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver, type AgentSessionDriver } from "./server/drivers/agent-driver";
+import { resolveMemoryProvider } from "./server/memory-provider";
+import { createExtensionRegistry } from "./extensions/registry";
+import { createExtensionRuntime } from "./extensions/runtime";
+import { extensionToolDefinitions } from "./extensions/tools";
+import { memoryToolDefinitions } from "./tools/memory";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 
 /**
@@ -57,6 +63,16 @@ export interface DeliveryApproval {
   approver: string;
 }
 
+/**
+ * The executor driver's two custom-tool lanes. Memory definitions are
+ * wrapped by the driver's policy gate; extension definitions stay in the
+ * driver's customTools lane because the extension runtime gates them.
+ */
+export interface ExtensionWorkerToolset {
+  memoryTools: ToolDefinition[];
+  extensionTools: ToolDefinition[];
+}
+
 export interface ExecutorDeps {
   store: Store;
   driver: AgentDriver;
@@ -74,6 +90,13 @@ export interface ExecutorDeps {
    */
   agentDir?: string;
   /**
+   * Process-scoped extension worker tools. Production supplies a lazy,
+   * memoized getter so the registry/runtime/provider are built once.
+   */
+  getExtensionWorkerToolset?: () => ExtensionWorkerToolset;
+  /** Headless extension-session timeout. Default: the 30-minute stale-run window. */
+  extensionSessionTimeoutMs?: number;
+  /**
    * Delivery approval seam: called with the opened PR, resolves the human
    * decision. `null` → delivery denied (item blocked). Absent → the
    * executor logs the pending request and waits indefinitely.
@@ -88,6 +111,36 @@ const DEFAULT_ORG_CONFIG_DIR = "config";
 const BASE_BRANCH = "main";
 const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
 
+/**
+ * Builds the extension worker's process-scoped resources. The caller owns
+ * memoization because the same definitions must configure the OMP driver
+ * before the first restricted session is created.
+ */
+export function createExtensionWorkerToolset(deps: {
+  store: Store;
+  audit: AuditModule;
+  orgPolicy: PolicyConfig;
+  extensionsDir?: string;
+}): ExtensionWorkerToolset {
+  const registry = createExtensionRegistry(
+    deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
+  );
+  const runtime = createExtensionRuntime({
+    registry,
+    store: deps.store,
+    audit: deps.audit,
+    orgPolicy: deps.orgPolicy,
+    router: DenyRouter,
+  });
+  const memoryProvider = resolveMemoryProvider(deps.store.getOrgSettings(), deps.store.getDb());
+  return {
+    memoryTools: memoryToolDefinitions(memoryProvider, { audit: deps.audit }),
+    extensionTools: extensionToolDefinitions(registry.list(), {
+      runtime,
+      getCaller: () => "executor",
+    }),
+  };
+}
 interface ExecutorConfig {
   /** Authorization fence (issue #47): the only owner/repo pairs the executor may clone/push to. */
   repoAllowlist: string[];
@@ -109,6 +162,10 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
 
 export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Promise<void> {
   const cfg = await prepareExecutor(deps);
+  // The production dependency is a lazy getter. Resolve it before the
+  // model-registry guard because createOmpSdkDriver installs agentDir as
+  // process-global state used by that guard.
+  void deps.driver;
   // Boot-time guard (issue #80), same fail-fast as the server: the driver
   // installed the agent dir as the process-global dir at construction, so
   // verify the registry resolves an available model from ITS catalog before
@@ -132,12 +189,24 @@ export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Pro
       continue;
     }
     await processItem(deps, cfg, item);
+    // A chat item returns to open. Yield before it can be observed again so
+    // an otherwise chat-only queue never becomes a synchronous hot loop.
+    if (item.delivery === "chat") await Bun.sleep(pollIntervalMs);
   }
 }
 
 /** Full lifecycle of one claimed item. Never throws: failures land the item in blocked. */
 async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkItem): Promise<void> {
-  const workspace = join(cfg.workspacesDir, item.id);
+  if (item.delivery === "chat") {
+    try {
+      await deps.store.transitionWorkItem(item.id, "claimed", "open", { by: "executor" });
+      console.log(`[${item.id}] chat delivery is handled by the space agent`);
+    } catch (err) {
+      console.log(`[${item.id}] chat handoff failed (item no longer claimed): ${(err as Error).message}`);
+    }
+    return;
+  }
+
   try {
     await deps.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
   } catch (err) {
@@ -146,6 +215,12 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     return;
   }
   try {
+    if (item.delivery === "extension") {
+      await extensionWorkerPath(deps, cfg, item);
+      return;
+    }
+
+    const workspace = join(cfg.workspacesDir, item.id);
     // Repo gate (issue #47): the repo comes from the conversation, the
     // allowlist is the authorization fence. Fail closed before any git work.
     const repo = item.repo;
@@ -172,8 +247,8 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     // Delivered: drop the checkout (the transcript stays for the audit trail).
     rmSync(workspace, { recursive: true, force: true });
   } catch (err) {
-    // Failure: the workspace is kept for forensics; the item is blocked
-    // with evidence — never silently dropped.
+    // Failure: git workspaces are kept for forensics; every delivery kind
+    // lands the item in blocked with evidence — never silently dropped.
     const message = err instanceof Error ? err.message : String(err);
     console.log(`[${item.id}] blocked: ${message}`);
     try {
@@ -190,6 +265,155 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
       });
     }
   }
+}
+
+interface ExtensionDeliveryResult {
+  url?: string;
+  summary: string;
+}
+
+/**
+ * Runs one non-git work item with memory + extension tools. The real space
+ * id names the session so extension calls load that space's policy; the
+ * per-item transcript subdirectory prevents worker sessions from sharing
+ * the space agent's conversation transcript.
+ */
+async function extensionWorkerPath(
+  deps: ExecutorDeps,
+  cfg: ExecutorConfig,
+  item: WorkItem,
+): Promise<void> {
+  const toolset = deps.getExtensionWorkerToolset?.();
+  if (!toolset) {
+    throw new Error("extension worker tools are not configured");
+  }
+  const allowTools = [...toolset.memoryTools, ...toolset.extensionTools].map((tool) => tool.name);
+  const session = await deps.driver.createSession({
+    spaceId: item.space_id,
+    transcriptDir: join(cfg.transcriptDir, item.id),
+    allowTools,
+    onOutput: (_spaceId, text) => console.log(`[${item.id}] extension agent: ${text}`),
+  });
+  let finalOutput = "";
+  let sessionError: Error | null = null;
+  const offMessage = session.on("message", (data) => {
+    const text = (data as { text?: unknown } | null)?.text;
+    if (typeof text === "string") finalOutput = text;
+  });
+  const offError = session.on("error", (data) => {
+    const text = (data as { message?: unknown } | null)?.message;
+    sessionError = new Error(typeof text === "string" ? text : "extension worker session error");
+  });
+  try {
+    await promptExtensionWorker(
+      session,
+      [
+        `You are the bottega extension worker for work item ${item.id} in space ${item.space_id}.`,
+        "Complete the task using the available tools. The task may require creating or updating an",
+        "external object through the connected extensions.",
+        "",
+        `Work item: ${item.description}`,
+        "",
+        "Reply with EXACTLY a JSON envelope on the last line, with no markdown fences:",
+        '{"url": "<external object URL or empty string>", "summary": "<deliverable summary>"}',
+      ].join("\n"),
+      deps.extensionSessionTimeoutMs ?? DEFAULT_STALE_AFTER_MS,
+    );
+    if (sessionError) throw sessionError;
+  } finally {
+    offMessage();
+    offError();
+    await session.dispose();
+  }
+
+  const delivery = parseExtensionDeliveryEnvelope(finalOutput);
+  const result = JSON.stringify({
+    ...(delivery.url ? { url: delivery.url } : {}),
+    summary: delivery.summary,
+  });
+  await deps.store.transitionWorkItem(item.id, "working", "done", { result, by: "executor" });
+  await deps.store.appendAudit({
+    space_id: item.space_id,
+    actor: "executor",
+    event_type: DELIVERY_COMPLETED_EVENT,
+    payload: JSON.stringify({
+      id: item.id,
+      kind: "extension",
+      ...(delivery.url ? { url: delivery.url } : {}),
+      summary: delivery.summary,
+    }),
+  });
+  console.log(`[${item.id}] extension delivery completed${delivery.url ? `: ${delivery.url}` : ""}`);
+}
+
+async function promptExtensionWorker(
+  session: AgentSessionDriver,
+  prompt: string,
+  timeoutMs: number,
+): Promise<void> {
+  const timeoutError = new Error(`extension worker session timed out after ${timeoutMs} ms`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError), timeoutMs);
+  });
+  try {
+    await Promise.race([
+      session.prompt(prompt, { streamingBehavior: "followUp" }),
+      timeout,
+    ]);
+  } catch (err) {
+    if (err === timeoutError) {
+      try {
+        await session.abort();
+      } catch (abortErr) {
+        throw new Error(`${timeoutError.message}; abort failed: ${abortErr instanceof Error ? abortErr.message : String(abortErr)}`);
+      }
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Reads the last JSON-object line from model output. Prose or markdown
+ * before/after the envelope is tolerated, but summary must be non-empty.
+ * A missing or blank URL is normalized away; the store's delivery-specific
+ * done obligation then rejects it for extension items.
+ */
+function parseExtensionDeliveryEnvelope(output: string): ExtensionDeliveryResult {
+  let validationError = "missing JSON object";
+  for (const line of output.trim().split(/\r?\n/).reverse()) {
+    const start = line.indexOf("{");
+    const end = line.lastIndexOf("}");
+    if (start < 0 || end <= start) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line.slice(start, end + 1));
+    } catch {
+      validationError = "invalid JSON";
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      validationError = "envelope must be an object";
+      continue;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.summary !== "string" || record.summary.trim() === "") {
+      validationError = "summary must be a non-empty string";
+      continue;
+    }
+    if (record.url !== undefined && typeof record.url !== "string") {
+      validationError = "url must be a string when present";
+      continue;
+    }
+    const url = typeof record.url === "string" ? record.url.trim() : "";
+    return {
+      ...(url ? { url } : {}),
+      summary: record.summary.trim(),
+    };
+  }
+  throw new Error(`extension worker output missing a valid JSON envelope (${validationError})`);
 }
 
 async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string, workspace: string): Promise<void> {
@@ -468,26 +692,49 @@ if (import.meta.main) {
   if (pinSync === "created" || pinSync === "patched") {
     console.log(`bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`);
   }
-  // Pre-approved session: the work item's pickup approval IS the
-  // authorization for allowlisted exec-tier tools (bash) inside the
-  // workspace; unknown tools still deny and every decision audits. The
-  // policy gate rides the driver's custom-tools bridge (issue #69): the
-  // extension seam is inert under restrictToolNames, so the gate wraps
-  // every allowlisted built-in (read/write/glob/grep/bash) instead.
-  const driver = createOmpSdkDriver({
-    agentDir: "data/omp-agent",
-    gate: {
-      orgPolicy,
-      audit,
-      router: DenyRouter,
-      store,
-      preApproved: true,
+  // One registry/runtime/provider/toolset per executor process. The getter
+  // defers construction until runExecutor resolves the driver, then shares
+  // the exact same definitions with session routing.
+  let cachedWorkerToolset: ExtensionWorkerToolset | undefined;
+  const getExtensionWorkerToolset = (): ExtensionWorkerToolset => {
+    if (cachedWorkerToolset === undefined) {
+      cachedWorkerToolset = createExtensionWorkerToolset({ store, audit, orgPolicy });
+    }
+    return cachedWorkerToolset;
+  };
+  let driver: AgentDriver | undefined;
+  const executorDeps: ExecutorDeps = {
+    store,
+    get driver() {
+      if (driver === undefined) {
+        const workerTools = getExtensionWorkerToolset();
+        // Pre-approved session: the work item's pickup approval IS the
+        // authorization for allowlisted exec-tier built-ins. Memory tools
+        // ride this driver gate. Extension definitions stay in customTools
+        // because createExtensionRuntime runs its own policy gate and must
+        // never be double-wrapped.
+        driver = createOmpSdkDriver({
+          agentDir: "data/omp-agent",
+          customTools: workerTools.extensionTools,
+          gate: {
+            orgPolicy,
+            audit,
+            router: DenyRouter,
+            store,
+            preApproved: true,
+            tools: workerTools.memoryTools,
+          },
+        });
+      }
+      return driver;
     },
-  });
+    getExtensionWorkerToolset,
+    orgConfigDir: "config",
+  };
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());
   process.on("SIGTERM", () => ac.abort());
-  runExecutor({ store, driver, orgConfigDir: "config" }, ac.signal).catch((err) => {
+  runExecutor(executorDeps, ac.signal).catch((err) => {
     console.error("bottega executor: fatal", err);
     process.exit(1);
   });
