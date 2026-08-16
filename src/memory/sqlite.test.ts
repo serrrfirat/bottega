@@ -10,7 +10,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { createSqliteMemoryProvider, pruneDigestMemories } from "./sqlite";
+import { createSqliteMemoryProvider, ftsAvailable, pruneDigestMemories } from "./sqlite";
 import { runMemoryConformanceTests } from "./conformance.test";
 import { createStore } from "../store/db";
 
@@ -151,5 +151,48 @@ describe("sqlite memory backend specifics", () => {
     expect(other).toHaveLength(1);
     const plain = await p.search({ scope: "org", query: "plain" });
     expect(plain).toHaveLength(1);
+  });
+
+  test("FTS5 ranks an exact concise match above a partial document match", async () => {
+    expect(ftsAvailable()).toBe(true);
+    const db = freshDb();
+    createSqliteMemoryProvider(db);
+    const insert = db.query(
+      "INSERT INTO memories (id, scope, principal, content, metadata_json, created_at) VALUES (?, 'org', NULL, ?, '{}', ?)",
+    );
+    insert.run("mem_partial", "The project phoenix launch plan contains several unrelated operational details", 2_000);
+    insert.run("mem_exact", "project phoenix launch", 1_000);
+
+    const hits = await createSqliteMemoryProvider(db).search({
+      scope: "org",
+      query: "project phoenix launch",
+    });
+    expect(hits.map((entry) => entry.id)).toEqual(["mem_exact", "mem_partial"]);
+  });
+
+  test("FTS5 blends recency into otherwise equal BM25 scores", async () => {
+    const now = 90 * 24 * 60 * 60 * 1_000;
+    const db = freshDb();
+    createSqliteMemoryProvider(db, { now: () => now });
+    const insert = db.query(
+      "INSERT INTO memories (id, scope, principal, content, metadata_json, created_at) VALUES (?, 'org', NULL, ?, '{}', ?)",
+    );
+    insert.run("mem_old", "same ranked memory", 0);
+    insert.run("mem_recent", "same ranked memory", now);
+
+    const hits = await createSqliteMemoryProvider(db, { now: () => now }).search({
+      scope: "org",
+      query: "same ranked memory",
+    });
+    expect(hits.map((entry) => entry.id)).toEqual(["mem_recent", "mem_old"]);
+  });
+
+  test("forced FTS fallback retains literal LIKE substring behavior", async () => {
+    const p = createSqliteMemoryProvider(freshDb(), { forceFtsFallback: true });
+    await p.save({ scope: "org", content: "alphabet soup" });
+    await p.save({ scope: "org", content: "unrelated" });
+
+    const hits = await p.search({ scope: "org", query: "pha" });
+    expect(hits.map((entry) => entry.content)).toEqual(["alphabet soup"]);
   });
 });
