@@ -359,7 +359,7 @@ describe("renderSlackText (Markdown → Slack mrkdwn, issue #84)", () => {
 });
 
 describe("createSlackAdapter", () => {
-  test("returns an adapter exposing postMessage, updateMessage, start and stop", () => {
+  test("returns an adapter exposing postMessage, updateMessage, reactions, start and stop", () => {
     const adapter = createSlackAdapter({
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -367,6 +367,8 @@ describe("createSlackAdapter", () => {
     });
     expect(typeof adapter.postMessage).toBe("function");
     expect(typeof adapter.updateMessage).toBe("function");
+    expect(typeof adapter.addReaction).toBe("function");
+    expect(typeof adapter.removeReaction).toBe("function");
     expect(typeof adapter.start).toBe("function");
     expect(typeof adapter.stop).toBe("function");
   });

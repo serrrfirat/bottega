@@ -42,6 +42,20 @@ export const EXTENSION_CONNECTED_EVENT = "extension.connected";
 export const EXTENSION_CALL_EVENT = "extension.call";
 /** Inbound message dropped (payload {reason, ts}). */
 export const MESSAGE_DROPPED_EVENT = "message_dropped";
+/**
+ * Inbound message received (payload {ts}; actor = sender). Written at
+ * receipt — before the session cold-start — so the trail can join receipt
+ * to reply (issue #119). Never carries message text (secrets stay out).
+ */
+export const MESSAGE_RECEIVED_EVENT = "message.in";
+/**
+ * Agent reply delivered (payload {latency_ms, phrase_ms?}; actor = system).
+ * Written when a real reply (or an error) replaces the thinking phrase;
+ * latency_ms is receipt → reply, phrase_ms is receipt → phrase posted.
+ * Empty completions and churn messages are retry bookkeeping, not replies,
+ * and write no row (issue #119).
+ */
+export const MESSAGE_REPLIED_EVENT = "message.reply";
 /** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */
 export const DIGEST_FAILED_EVENT = "digest.failed";
 /** Per-space model settings changed (payload {before, after, by}). */

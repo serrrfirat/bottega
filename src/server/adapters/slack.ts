@@ -62,6 +62,15 @@ export interface SlackAdapter {
   ): Promise<string | undefined>;
   /** Replaces the text of an already-posted message (chat.update). */
   updateMessage(spaceId: string, ts: string, text: string): Promise<void>;
+  /**
+   * Adds a reaction to the message at `ts` (receipt ack, issue #119).
+   * `name` is the emoji name without colons, default `eyes` (👀). Callers
+   * treat failures as non-fatal — a missing `reactions:write` scope
+   * surfaces as a logged error, never a blocked turn.
+   */
+  addReaction(spaceId: string, ts: string, name?: string): Promise<void>;
+  /** Removes the reaction from the message at `ts` once the reply lands (issue #119). */
+  removeReaction(spaceId: string, ts: string, name?: string): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -363,6 +372,20 @@ export function createSlackAdapter(opts: {
     },
     async updateMessage(spaceId, ts, text) {
       await app.client.chat.update(buildUpdateMessageArgs(spaceId, ts, text));
+    },
+    async addReaction(spaceId, ts, name) {
+      await app.client.reactions.add({
+        channel: channelFromSpaceId(spaceId),
+        name: name ?? "eyes",
+        timestamp: ts,
+      });
+    },
+    async removeReaction(spaceId, ts, name) {
+      await app.client.reactions.remove({
+        channel: channelFromSpaceId(spaceId),
+        name: name ?? "eyes",
+        timestamp: ts,
+      });
     },
     start: async () => {
       // The bot's user id (issue #55): auth.test needs only the bot token

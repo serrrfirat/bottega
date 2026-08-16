@@ -166,6 +166,8 @@ function recordingAdapter(): {
     async updateMessage(spaceId, ts, text) {
       updates.push({ spaceId, ts, text });
     },
+    async addReaction() {},
+    async removeReaction() {},
     async start() {},
     async stop() {},
   };

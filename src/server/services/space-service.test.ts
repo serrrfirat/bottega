@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import type { Store, ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, parseConnectIntent } from "./space-service";
+import { SpaceService, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, emptyResponseFallback, churnMessageText, parseConnectIntent } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
 import { parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
@@ -10,7 +10,7 @@ import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
 import type { AuditModule } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 
 // ---------------------------------------------------------------------------
@@ -103,11 +103,24 @@ interface CreateSessionOpts {
 
 class FakeDriver implements AgentDriver {
   readonly created: Array<{ opts: CreateSessionOpts; session: FakeSession }> = [];
+  /** When set, createSession parks until finishCreate() — proves receipt ordering (issue #119). */
+  deferCreate = false;
+  private createGate?: { promise: Promise<void>; resolve: () => void };
 
   async createSession(opts: CreateSessionOpts): Promise<AgentSessionDriver> {
     const session = new FakeSession(opts.spaceId);
     this.created.push({ opts, session });
+    if (this.deferCreate) {
+      const gate = Promise.withResolvers<void>();
+      this.createGate = gate;
+      await gate.promise;
+    }
     return session;
+  }
+
+  finishCreate(): void {
+    this.createGate?.resolve();
+    this.createGate = undefined;
   }
 
   last(): FakeSession {
@@ -164,16 +177,20 @@ class FakeMemoryProvider implements MemoryProvider {
   }
 }
 
-function fakeAdapter(opts: { deferPost?: boolean } = {}): {
+function fakeAdapter(opts: { deferPost?: boolean; failUpdateCalls?: number; failReactions?: boolean } = {}): {
   adapter: SlackAdapter;
   posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
+  reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
   releasePost: () => void;
 } {
-  const { deferPost = false } = opts;
+  const { deferPost = false, failUpdateCalls = 0, failReactions = false } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
+  const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let releasePost = () => {};
+  /** updateMessage calls still to reject (issue #120 429 simulation); fail-soft means the service must cope. */
+  let failuresLeft = failUpdateCalls;
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, postOpts) {
       posts.push({ spaceId, text, opts: postOpts });
@@ -185,12 +202,24 @@ function fakeAdapter(opts: { deferPost?: boolean } = {}): {
       return `ts-${posts.length}`; // deterministic ts per post
     },
     async updateMessage(spaceId, ts, text) {
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        // Slack chat.update 429 shape: rate_limited with retry_after.
+        throw new Error("rate_limited");
+      }
       updates.push({ spaceId, ts, text });
+    },
+    async addReaction(spaceId, ts) {
+      if (failReactions) throw new Error("missing_scope: reactions:write");
+      reactions.push({ kind: "add", spaceId, ts });
+    },
+    async removeReaction(spaceId, ts) {
+      reactions.push({ kind: "remove", spaceId, ts });
     },
     async start() {},
     async stop() {},
   };
-  return { adapter, posts, updates, releasePost: () => releasePost() };
+  return { adapter, posts, updates, reactions, releasePost: () => releasePost() };
 }
 
 function fakeStore(): {
@@ -321,7 +350,7 @@ describe("SpaceService session lifecycle", () => {
   });
 
   test("a message queued mid-dispose is dropped and audited; cold start works after dispose settles", async () => {
-    const { adapter } = fakeAdapter();
+    const { adapter, posts, reactions } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     vi.useFakeTimers();
@@ -338,7 +367,18 @@ describe("SpaceService session lifecycle", () => {
 
       expect(driver.last().prompts).toHaveLength(1); // dropped, never prompted
       expect(driver.created).toHaveLength(1); // no cold start while disposing
+      // The dropped message gets no phrase and no reaction (issue #119: a
+      // receipt claim must not outlive a message that is discarded); the
+      // first message's receipt activity stands alone.
+      expect(posts).toHaveLength(1);
+      expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
       expect(audit).toEqual([
+        {
+          space_id: "slack:C1",
+          actor: "U1",
+          event_type: MESSAGE_RECEIVED_EVENT,
+          payload: JSON.stringify({ ts: "1.1" }),
+        },
         {
           space_id: "slack:C1",
           actor: "U1",
@@ -402,7 +442,7 @@ describe("SpaceService session lifecycle", () => {
 
 describe("SpaceService output routing", () => {
   test("agent output is posted to the adapter threaded under the latest inbound message", async () => {
-    const { adapter, posts } = fakeAdapter();
+    const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = new SpaceService({ store, adapter, driver });
@@ -411,11 +451,13 @@ describe("SpaceService output routing", () => {
     driver.last().emit("message", { spaceId: "slack:C1", text: "agent reply" });
     await Promise.resolve();
 
-    expect(posts).toEqual([{ spaceId: "slack:C1", text: "agent reply", opts: { threadTs: "1.1" } }]);
+    // The phrase posted at receipt; the reply replaced it in place.
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "agent reply" }]);
   });
 
   test("onOutput is unconsumed: the message event is the single post channel", async () => {
-    const { adapter, posts } = fakeAdapter();
+    const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = new SpaceService({ store, adapter, driver });
@@ -423,11 +465,13 @@ describe("SpaceService output routing", () => {
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.created[0].opts.onOutput("slack:C1", "output channel");
     await Promise.resolve();
-    expect(posts).toHaveLength(0); // no double post from the legacy channel
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]); // receipt phrase only
+    expect(updates).toHaveLength(0); // no double post from the legacy channel
 
     driver.last().emit("message", { spaceId: "slack:C1", text: "event channel" });
     await Promise.resolve();
-    expect(posts).toEqual([{ spaceId: "slack:C1", text: "event channel", opts: { threadTs: "1.1" } }]);
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "event channel" }]); // replaced in place
+    expect(posts).toHaveLength(1);
   });
 
   test("turn_start posts a thinking phrase; the message event replaces it in place", async () => {
@@ -439,14 +483,17 @@ describe("SpaceService output routing", () => {
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
 
+    // The phrase is already up from receipt (issue #119); turn_start rotates it.
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+
     session.emit("turn_start", { spaceId: "slack:C1" });
     await Promise.resolve(); // settle the phrase post so its ts is captured
-    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" }]);
 
     session.emit("message", { spaceId: "slack:C1", text: "the answer" });
     await Promise.resolve();
 
-    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "the answer" }]);
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "the answer" });
     expect(posts).toHaveLength(1); // replaced in place, nothing posted fresh
   });
 
@@ -470,12 +517,16 @@ describe("SpaceService output routing", () => {
     channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
     await Promise.resolve();
 
+    // Phrases post at receipt (issue #119) and rotate on turn_start; both
+    // spaces hold exactly one message, replaced in place by each reply.
     expect(posts).toEqual([
       { spaceId: "slack:D1", text: "Thinking…", opts: undefined },
-      { spaceId: "slack:C1", text: "On it — thinking…", opts: { threadTs: "9.9" } },
+      { spaceId: "slack:C1", text: "Give me a second…", opts: { threadTs: "9.9" } },
     ]);
     expect(updates).toEqual([
+      { spaceId: "slack:D1", ts: "ts-1", text: "On it — thinking…" },
       { spaceId: "slack:D1", ts: "ts-1", text: "dm answer" },
+      { spaceId: "slack:C1", ts: "ts-2", text: "Working on it…" },
       { spaceId: "slack:C1", ts: "ts-2", text: "channel answer" },
     ]);
   });
@@ -495,22 +546,33 @@ describe("SpaceService output routing", () => {
     session.emit("error", { spaceId: "slack:C1", message: "model exploded" });
     await Promise.resolve();
 
-    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "model exploded" }]);
+    expect(updates).toEqual([
+      { spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: "model exploded" },
+    ]);
     expect(posts).toHaveLength(1); // phrase only; error replaced it
   });
 
-  test("a reply with no pending phrase falls back to posting fresh", async () => {
-    const { adapter, posts, updates } = fakeAdapter();
+  test("a reply that lands while the phrase post is in flight falls back to posting fresh", async () => {
+    const { adapter, posts, updates, releasePost } = fakeAdapter({ deferPost: true });
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = new SpaceService({ store, adapter, driver });
 
-    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    await service.handleInboundMessage(msg({ ts: "1.1" })); // phrase post parks in flight
     driver.last().emit("message", { spaceId: "slack:C1", text: "late answer" });
     await Promise.resolve();
 
-    expect(posts).toEqual([{ spaceId: "slack:C1", text: "late answer", opts: { threadTs: "1.1" } }]);
+    expect(posts).toEqual([
+      { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } },
+      { spaceId: "slack:C1", text: "late answer", opts: { threadTs: "1.1" } },
+    ]);
     expect(updates).toHaveLength(0);
+
+    releasePost(); // settle the later post; the phrase ts was never captured, so nothing collapses
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(posts).toHaveLength(2);
   });
 
   test("a turn that ends with neither message nor error leaves the phrase as-is", async () => {
@@ -527,7 +589,7 @@ describe("SpaceService output routing", () => {
     await Promise.resolve();
 
     expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
-    expect(updates).toHaveLength(0); // phrase stays, never replaced
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" }]); // rotation only; phrase stays
   });
 
   test("a retry's turn_start updates the pending phrase in place — one message max (issue #60)", async () => {
@@ -544,9 +606,12 @@ describe("SpaceService output routing", () => {
     session.emit("turn_start", { spaceId: "slack:C1" }); // OMP auto-retry: another attempt
     await Promise.resolve();
 
-    expect(posts).toHaveLength(1); // exactly one phrase posted
+    expect(posts).toHaveLength(1); // exactly one phrase posted (at receipt, issue #119)
     expect(posts[0]).toEqual({ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } });
-    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" }]); // replaced in place
+    expect(updates).toEqual([
+      { spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: "Give me a second…" },
+    ]); // each retry replaced in place
   });
 
   test("a turn_start while the phrase post is in flight never posts a second phrase (issue #60)", async () => {
@@ -589,7 +654,10 @@ describe("SpaceService output routing", () => {
       await Promise.resolve();
 
       expect(posts).toHaveLength(1); // phrase only
-      expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: EMPTY_RESPONSE_FALLBACK }]);
+      expect(updates).toEqual([
+        { spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" },
+        { spaceId: "slack:C1", ts: "ts-1", text: EMPTY_RESPONSE_FALLBACK },
+      ]);
     }
   });
 
@@ -608,9 +676,9 @@ describe("SpaceService output routing", () => {
       await Promise.resolve();
     }
     expect(posts).toHaveLength(1); // never stacked, even across empties
-    // Each turn: a rotation update (turn_start, i>0) plus a fallback update
+    // Each turn: a rotation update (turn_start) plus a fallback update
     // (empty message) — all replaced in place on the same ts.
-    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2 - 1);
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2);
     expect(updates.every((u) => u.spaceId === "slack:C1" && u.ts === "ts-1")).toBe(true);
     expect(updates.filter((u) => u.text === EMPTY_RESPONSE_FALLBACK)).toHaveLength(EMPTY_TURN_LIMIT);
 
@@ -641,11 +709,13 @@ describe("SpaceService output routing", () => {
     }
 
     expect(posts).toHaveLength(1); // one phrase, never stacked
-    // Three in-place rotations + one churn message = all on the same ts.
+    // Four in-place rotations (receipt made the first turn_start a rotation
+    // too) + one churn message = all on the same ts.
     expect(updates).toEqual([
       { spaceId: "slack:C1", ts: "ts-1", text: "On it — thinking…" },
       { spaceId: "slack:C1", ts: "ts-1", text: "Give me a second…" },
       { spaceId: "slack:C1", ts: "ts-1", text: "Working on it…" },
+      { spaceId: "slack:C1", ts: "ts-1", text: "Let me think…" },
       { spaceId: "slack:C1", ts: "ts-1", text: CHURN_MESSAGE },
     ]);
 
@@ -655,7 +725,7 @@ describe("SpaceService output routing", () => {
     session.emit("turn_end", { spaceId: "slack:C1" });
     await Promise.resolve();
     expect(posts).toHaveLength(1);
-    expect(updates).toHaveLength(EMPTY_TURN_LIMIT + 1);
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT + 2);
 
     // A non-empty turn re-arms phrases and posts fresh (churn message is final).
     session.emit("message", { spaceId: "slack:C1", text: "recovered" });
@@ -690,8 +760,91 @@ describe("SpaceService output routing", () => {
     session.emit("message", { spaceId: "slack:C1", text: "" });
     await Promise.resolve();
     expect(posts).toHaveLength(1);
-    // Rotations (N) + fallbacks (N) + churn (1) — churn shown exactly once.
-    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2 + 1);
+    // Rotations (N+1: the receipt phrase turns the first turn_start into a
+    // rotation) + fallbacks (N) + churn (1) — churn shown exactly once.
+    expect(updates).toHaveLength(EMPTY_TURN_LIMIT * 2 + 2);
+  });
+
+  test("a provider-error cause rides the churn message, still bounded by the churn guard (issue #78)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg());
+    const session = driver.last();
+    const CAUSE = "400 No tool output found for tool call call_repro_1";
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("turn_end", { spaceId: "slack:C1", error: CAUSE });
+      await Promise.resolve();
+    }
+    expect(posts).toHaveLength(1); // one phrase, never stacked
+    const churn = updates.at(-1)!.text;
+    expect(churn).toContain(CAUSE);
+    expect(churn).toContain(CHURN_MESSAGE.split(" — ")[0]!); // same churn shape
+    expect(churn).not.toContain("check the model key?"); // cause supersedes the guess
+
+    // Churn guard holds: further error-empties neither post nor update.
+    const updateCount = updates.length;
+    for (let i = 0; i < 3; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("turn_end", { spaceId: "slack:C1", error: CAUSE });
+      await Promise.resolve();
+    }
+    expect(updates).toHaveLength(updateCount);
+    expect(posts).toHaveLength(1);
+
+    // A real reply ends the streak, re-arms phrases, and posts fresh.
+    session.emit("message", { spaceId: "slack:C1", text: "recovered" });
+    await Promise.resolve();
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toEqual({ spaceId: "slack:C1", text: "recovered", opts: { threadTs: "1.1" } });
+  });
+
+  test("an empty message event carries the provider-error cause in the fallback (issue #78)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg());
+    const session = driver.last();
+    const CAUSE = "400 No tool output found for tool call call_repro_1";
+    session.emit("message", { spaceId: "slack:C1", text: "", error: CAUSE });
+    await Promise.resolve();
+
+    expect(posts).toHaveLength(1); // phrase only
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: emptyResponseFallback(CAUSE) }]);
+    expect(updates[0]!.text).toContain(CAUSE);
+    expect(updates[0]!.text).not.toContain("Hmm — I got an empty response, retrying…");
+  });
+
+  test("an unknown/absent cause keeps the exact legacy phrases (issue #78)", async () => {
+    // Fail closed at the boundary: no cause, or whitespace-only, → legacy text.
+    expect(emptyResponseFallback(undefined)).toBe(EMPTY_RESPONSE_FALLBACK);
+    expect(emptyResponseFallback("")).toBe(EMPTY_RESPONSE_FALLBACK);
+    expect(emptyResponseFallback("   ")).toBe(EMPTY_RESPONSE_FALLBACK);
+    expect(churnMessageText(undefined)).toBe(CHURN_MESSAGE);
+    expect(churnMessageText("")).toBe(CHURN_MESSAGE);
+
+    // And the churn path end-to-end: turn_end without a cause → exact phrase.
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg());
+    const session = driver.last();
+    for (let i = 0; i < EMPTY_TURN_LIMIT + 1; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+    }
+    expect(updates.at(-1)!.text).toBe(CHURN_MESSAGE);
   });
 
   test("dispose clears the pending phrase and churn state (issue #60)", async () => {
@@ -744,6 +897,111 @@ describe("SpaceService output routing", () => {
   });
 });
 
+describe("SpaceService streaming phrase batching (issue #120)", () => {
+  test("a streamed turn coalesces in-place updates to the cadence and always delivers the final text", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    vi.useFakeTimers();
+    try {
+      // Cold start, then steer the running (streaming) session. The receipt
+      // phrase (issue #119) and the steer rotation settle before we measure.
+      await service.handleInboundMessage(msg({ ts: "1.1" }));
+      const session = driver.last();
+      session.streaming = true;
+      await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+      await Promise.resolve();
+      const base = updates.length;
+
+      // Burst of stream chunks inside one turn: coalesced, nothing sent yet.
+      for (const chunk of ["The", "The quick", "The quick brown", "The quick brown fox"]) {
+        session.emit("message", { spaceId: "slack:C1", text: chunk });
+      }
+      await Promise.resolve();
+      expect(updates).toHaveLength(base); // batched: no per-chunk spam
+
+      vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS); // one cadence tick
+      await Promise.resolve();
+      expect(updates).toHaveLength(base + 1); // at most one update per tick
+      expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "The quick brown fox" }); // latest text only
+
+      // More chunks, turn ends before the next tick: the final text still lands.
+      session.emit("message", { spaceId: "slack:C1", text: "The quick brown fox jumps" });
+      session.emit("message", { spaceId: "slack:C1", text: "The quick brown fox jumps over the lazy dog" });
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+
+      expect(updates).toHaveLength(base + 2); // tick update + final flush
+      expect(updates.at(-1)).toEqual({
+        spaceId: "slack:C1",
+        ts: "ts-1",
+        text: "The quick brown fox jumps over the lazy dog", // the full reply
+      });
+      expect(posts).toHaveLength(1); // one message, replaced in place throughout (#40/#60)
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a rate-limited interim update is logged and skipped, but the final text still lands (issue #120)", async () => {
+    // Two failures: the steer rotation and the interim stream flush both 429;
+    // the final flush (turn_end) succeeds and must still land.
+    const { adapter, posts, updates } = fakeAdapter({ failUpdateCalls: 2 });
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    vi.useFakeTimers();
+    try {
+      await service.handleInboundMessage(msg({ ts: "1.1" }));
+      const session = driver.last();
+      session.streaming = true;
+      await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+      await Promise.resolve();
+
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        session.emit("message", { spaceId: "slack:C1", text: "interim text" });
+        vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS); // cadence tick → 429
+        await Promise.resolve();
+        expect(updates).toHaveLength(0); // rate-limited: nothing landed
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("streaming phrase update failed in slack:C1"),
+        ); // logged, fail-soft — never thrown into the turn path
+
+        // The turn's final text arrives; turn ends before the next tick.
+        session.emit("message", { spaceId: "slack:C1", text: "final full reply" });
+        session.emit("turn_end", { spaceId: "slack:C1" });
+        await Promise.resolve();
+        expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "final full reply" }]);
+      } finally {
+        errorSpy.mockRestore();
+      }
+      expect(posts).toHaveLength(1); // still one message, replaced in place
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("non-streaming replies update in place immediately — no batching, no duplication (issue #120)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    await Promise.resolve(); // receipt phrase post settles
+    session.emit("message", { spaceId: "slack:C1", text: "the answer" });
+    await Promise.resolve();
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await Promise.resolve();
+
+    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "the answer" }]); // immediate, exactly once
+    expect(posts).toHaveLength(1); // phrase only; replaced in place
+  });
+});
+
 describe("SpaceService digest-on-idle", () => {
   test("dispose digests new messages into org memory, advances the marker, and disposes", async () => {
     const { adapter } = fakeAdapter();
@@ -769,7 +1027,7 @@ describe("SpaceService digest-on-idle", () => {
       },
     ]);
     expect(first.disposed).toBe(true);
-    expect(audit).toHaveLength(0); // no failure audited
+    expect(audit.filter((a) => a.event_type === DIGEST_FAILED_EVENT)).toHaveLength(0); // no failure audited
 
     // Marker advanced: the next digest reads `until` from the newest digest.
     await service.handleInboundMessage(msg({ text: "more", ts: "2.2" }));
@@ -833,7 +1091,7 @@ describe("SpaceService digest-on-idle", () => {
     await service.stop();
 
     expect(provider.saved).toHaveLength(0);
-    expect(audit).toEqual([
+    expect(audit.filter((a) => a.event_type === DIGEST_FAILED_EVENT)).toEqual([
       {
         space_id: "slack:C1",
         actor: "system",
@@ -857,7 +1115,7 @@ describe("SpaceService digest-on-idle", () => {
     await service.stop();
 
     expect(provider.saved).toHaveLength(0);
-    expect(audit).toEqual([
+    expect(audit.filter((a) => a.event_type === DIGEST_FAILED_EVENT)).toEqual([
       {
         space_id: "slack:C1",
         actor: "system",
@@ -891,7 +1149,7 @@ describe("SpaceService digest-on-idle", () => {
       for (let i = 0; i < 10; i++) await Promise.resolve(); // flush the timeout chain
 
       expect(provider.saved).toHaveLength(0);
-      expect(audit).toEqual([
+      expect(audit.filter((a) => a.event_type === DIGEST_FAILED_EVENT)).toEqual([
         {
           space_id: "slack:C1",
           actor: "system",
@@ -1275,8 +1533,9 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     expect(nudged).toHaveLength(1);
     expect(nudged[0]!.text).toContain("broker_token");
     expect(nudged[0]!.text).toContain("git_pat");
-    // 4 error updates total: the first carries the pointer, the rest are raw.
-    expect(updates).toHaveLength(4);
+    // 4 error updates total (each preceded by a phrase rotation): the first
+    // carries the pointer, the rest are raw.
+    expect(updates.filter((u) => u.text.startsWith("boom"))).toHaveLength(4);
     expect(audit.filter((a) => a.event_type === ADMIN_ONBOARDING_NUDGE_EVENT)).toHaveLength(1);
   });
 
@@ -1336,8 +1595,10 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
       await flush();
     }
     expect(updates.filter((u) => u.text.includes("first_run_wizard"))).toHaveLength(0);
-    expect(updates).toHaveLength(3);
-    expect(updates.every((u) => u.text === "boom")).toBe(true);
+    // Each error replaces the pending phrase in place (clearing its ts), so
+    // only the first turn_start rotates; the rest post fresh.
+    expect(updates.filter((u) => u.text === "boom")).toHaveLength(3);
+    expect(updates).toHaveLength(4);
   });
 
   test("a check failure suppresses the nudge, never the turn output (fail closed)", async () => {
@@ -1359,5 +1620,132 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     driver.last().emit("error", { spaceId: "slack:C1", message: "boom" });
     await flush();
     expect(updates.at(-1)!.text).toBe("boom");
+  });
+});
+
+describe("SpaceService receipt responsiveness (issue #119)", () => {
+  test("the phrase posts on receipt, before a slow session creation completes (issue #119)", async () => {
+    const { adapter, posts, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    driver.deferCreate = true;
+    const service = new SpaceService({ store, adapter, driver });
+
+    const inbound = service.handleInboundMessage(msg({ ts: "1.1" })); // cold-start parks on the gate
+    await Promise.resolve();
+
+    // While createSession is still pending, the space already shows the
+    // phrase and the receipt reaction (issue #119).
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+    expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+
+    driver.finishCreate();
+    await inbound;
+    expect(driver.last().prompts).toEqual([{ text: "hello", opts: undefined }]);
+  });
+
+  test("a receipt reaction is added on receipt and removed when the reply lands (issue #119)", async () => {
+    const { adapter, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+
+    driver.last().emit("message", { spaceId: "slack:C1", text: "the answer" });
+    await Promise.resolve();
+    expect(reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
+    ]);
+  });
+
+  test("a session error also clears the receipt reaction (issue #119)", async () => {
+    const { adapter, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    driver.last().emit("error", { spaceId: "slack:C1", message: "boom" });
+    await Promise.resolve();
+    expect(reactions.at(-1)).toEqual({ kind: "remove", spaceId: "slack:C1", ts: "1.1" });
+  });
+
+  test("steered messages are each acked; the reply clears every pending reaction (issue #119)", async () => {
+    const { adapter, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    driver.last().streaming = true;
+    await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+    expect(reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "add", spaceId: "slack:C1", ts: "2.2" },
+    ]);
+
+    driver.last().emit("message", { spaceId: "slack:C1", text: "reply" });
+    driver.last().emit("turn_end", { spaceId: "slack:C1" }); // streaming finals clear on turn_end
+    await Promise.resolve();
+    expect(reactions.filter((r) => r.kind === "remove").map((r) => r.ts).sort()).toEqual(["1.1", "2.2"]);
+  });
+
+  test("a missing reactions scope degrades to a log; the turn is unaffected (issue #119)", async () => {
+    const { adapter, posts, updates, reactions } = fakeAdapter({ failReactions: true });
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    expect(reactions).toHaveLength(0); // the add failed and was logged
+
+    driver.last().emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    driver.last().emit("message", { spaceId: "slack:C1", text: "still answers" });
+    await Promise.resolve();
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "still answers" });
+  });
+
+  test("audit rows carry receipt and reply timing (issue #119)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const received = audit.find((a) => a.event_type === MESSAGE_RECEIVED_EVENT);
+    expect(received).toMatchObject({
+      space_id: "slack:C1",
+      actor: "U1",
+      payload: JSON.stringify({ ts: "1.1" }),
+    });
+
+    driver.last().emit("message", { spaceId: "slack:C1", text: "the answer" });
+    await Promise.resolve();
+    const replied = audit.find((a) => a.event_type === MESSAGE_REPLIED_EVENT);
+    expect(replied).toMatchObject({ space_id: "slack:C1", actor: "system" });
+    const payload = JSON.parse(replied!.payload) as { latency_ms: number; phrase_ms?: number };
+    expect(payload.latency_ms).toBeGreaterThanOrEqual(0);
+    expect(payload.phrase_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  test("an empty completion is not a reply: no message.reply row until real text lands (issue #119)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = new SpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    driver.last().emit("message", { spaceId: "slack:C1", text: "" });
+    await Promise.resolve();
+    expect(audit.filter((a) => a.event_type === MESSAGE_REPLIED_EVENT)).toHaveLength(0);
+
+    driver.last().emit("message", { spaceId: "slack:C1", text: "real answer" });
+    await Promise.resolve();
+    expect(audit.filter((a) => a.event_type === MESSAGE_REPLIED_EVENT)).toHaveLength(1);
   });
 });
