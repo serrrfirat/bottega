@@ -7,6 +7,7 @@
     "dev": "bash scripts/dev.sh",
     "check": "tsc --noEmit",
     "test": "bun test",
+    "test:e2e": "bun test tests/e2e/",
     "dev:watch": "bash scripts/dev.sh --watch"
   },
   "devDependencies": {
