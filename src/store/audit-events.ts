@@ -26,6 +26,8 @@ export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 /** Memory saved (payload {scope, principal, id, content_hash}). */
 export const MEMORY_WRITE_EVENT = "memory.write";
+/** Observer read/post/failure (payload {scope, metadata, count}, {pulse_space, posted}, or {error}). */
+export const OBSERVER_READ_EVENT = "observer.read";
 /** Scheduler job created (payload {id, action, cron, space_id?}). */
 export const SCHEDULER_JOB_CREATED_EVENT = "scheduler.job_created";
 /** Scheduler job deleted (payload {id}). */
