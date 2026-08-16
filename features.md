@@ -1,57 +1,79 @@
 # Features
 
-User-facing capabilities of bottega: what people and agents can do in a
-space. For how it works under the hood, see [architecture.md](architecture.md);
-for setup and development, see [README.md](README.md).
+bottega is a coding agent that lives in your Slack workspace. You talk to it
+in a channel like you would talk to a teammate; it turns that conversation
+into real, tracked work — from a shared issue to a finished pull request —
+and it remembers what it learns, follows your team's rules, and leaves an
+audit trail for everything it does.
 
-## Model settings & model roles
+This document is the product view: what you, your team, and your agents can
+do, and why it matters. For how it works under the hood, see
+[architecture.md](architecture.md); for setup and development, see
+[README.md](README.md).
 
-The space agent's model is configurable from chat (issue #64) — no config
-files, no restarts:
+## At a glance
 
-- **`model_settings`** reads/writes the space's model settings, persisted
-  per space in the `spaces.settings` column (SQLite) and audited
-  (`model.settings_changed`). Slots: `model` (the space's default),
+| Capability | What you get |
+| --- | --- |
+| **Model settings** | Pick the model and thinking effort from chat — no config files, no restarts. |
+| **Org settings** | Runtime configuration in the database, editable from any space. |
+| **Memory** | The agent remembers facts per user or per org and uses them across conversations. |
+| **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
+| **Extensions** | Connect tools like GitHub, Linear, or Attio from chat; agents use them through one safe pipe. |
+| **Proactive scheduler** | Standups, end-of-day reflections, weekly pulse, and knowledge-base ingestion on a schedule. |
+| **Work items** | The agent picks up a request, works in an isolated workspace, and delivers a pull request. |
+| **Audit trail** | Every decision, approval, and tool call is recorded, append-only, and never deleted. |
+
+## Model settings & model roles (issue #64)
+
+Every space can have its own model configuration, changed from chat — no
+config files, no restarts:
+
+- **`model_settings`** — read or change the space's model slots, persisted
+  per space and audited. Slots: `model` (the space's default),
   `reasoning_effort` (`off|low|medium|high`), `fast_model`,
-  `reasoning_model`. All slots are optional; unset slots fall back to
-  `model` at role-resolution time.
-- **`use_model`** switches the agent's model **role for the next turn**:
-  `default` (the space `model` at the space's default effort), `fast` (the
-  `fast_model` — or `model` — at low effort; simple tasks), `reasoning`
-  (the `reasoning_model` — or `model` — at `reasoning_effort`, default
-  high; hard tasks). Natural language like "use the fast model for this"
-  maps to `use_model {role: "fast"}`. Every switch is audited
-  (`model.switched`).
+  `reasoning_model`. Unset slots fall back to `model` at role-resolution
+  time.
+- **`use_model`** — switch the agent's model **role for the next turn**:
+  `default` (the space model at its default effort), `fast` (the fast model
+  at low effort — simple tasks), `reasoning` (the reasoning model at the
+  space's reasoning effort, default high — hard tasks). Natural language
+  like "use the fast model for this" maps to `use_model {role: "fast"}`.
+  Every switch is audited.
 
-Both are write-tier, so they prompt for approval in non-yolo policy modes,
-and they sit on the space-agent allowlist like the memory tools. The OMP
-driver implements the switch through the SDK's per-session model hooks
-(`setModel` + `setThinkingLevel`, session-only — the space's settings
-column is the persistence home, never the agent dir). The ACP driver does
-not support mid-session switches: ACP v1 has no model-switch message and
-the spawned agent's own config governs there — `use_model` reports this
-back as a clear error instead of pretending. Auto-routing by task
-complexity is explicitly v2: v1 is the agent *deciding* per task via
-`use_model`.
+Why it matters: teams get the speed of a cheap model for routine work and
+the depth of a reasoning model for hard problems — without an admin
+round-trip.
+
+Both tools are write-tier, so they prompt for approval in non-yolo policy
+modes, and they sit on the space-agent allowlist like the memory tools.
+Mid-session switches work on the OMP driver (session-only, via the SDK's
+per-session model hooks — the space's settings column is the persistence
+home, never the agent dir). The ACP driver cannot switch models mid-session
+(ACP v1 has no model-switch message; the spawned agent's own config
+governs) and `use_model` reports that as a clear error instead of
+pretending. Complexity-based auto-routing is explicitly v2: v1 is the agent
+*deciding* per task via `use_model`.
 
 ## Settings (issue #67)
 
-Runtime configuration lives in the DB, not in agent-editable YAML: the
-`settings` tool (write-tier, audited `settings.changed`) reads and changes
-the org blob and per-space overlays from any space session. Org knobs:
-approval timeouts, `response_mode`, memory injection, extensions
-allow/deny + org_credentials, repo allowlist, model defaults
-(default/fast/reasoning + effort), workspaces dir, git/api base URLs, and
-the memory backend URL. Space scope covers the policy overlay knobs
-(`response_mode`, extensions tighten-only); per-space model knobs live in
-the `model_settings` tool (issue #64). Config files (`config.yml`,
-`config/org.yml`) remain the defaults — the DB wins when set.
+Runtime configuration lives in the database, not in agent-editable YAML:
+the `settings` tool (write-tier, audited) reads and changes the org blob
+and per-space overlays from any space session.
 
-`models.yml` is a boot-time output (issue #67): at startup the server
-regenerates the agent-dir catalog from the settings blob's model ids; when
+- **Org knobs** — approval timeouts, `response_mode`, memory injection,
+  extensions allow/deny + org credentials, repo allowlist, model defaults
+  (default/fast/reasoning + effort), workspaces dir, git/api base URLs, and
+  the memory backend URL.
+- **Space scope** — the policy overlay knobs (`response_mode`, extensions
+  tighten-only); per-space model knobs live in the `model_settings` tool.
+
+Config files (`config.yml`, `config/org.yml`) remain the defaults — the DB
+wins when set. `models.yml` is a boot-time output: the server regenerates
+the agent-dir catalog from the settings blob's model ids at startup; when
 settings carry none, the committed `config/omp/models.yml` template stays
-the default. The DB is the single source of truth — no agent-editable
-model YAML.
+the default. The DB is the single source of truth — no agent-editable model
+YAML.
 
 ## Memory
 
@@ -63,7 +85,7 @@ without asking. Org memory feeds work-item handoff (the agent derives the
 repo for `create_work_item` from a mentioned repo or org memory) and the
 connect intent seam.
 
-Backend (issues #43, #67): unset `memory_backend.base_url` (the default)
+Backend (issues #43, #67): the default (unset `memory_backend.base_url`)
 runs the SQLite memory fallback. To use the self-hosted mem0 service, set
 the knob (e.g. `http://mem0:8000` inside compose) via the `settings` tool
 and give mem0 an LLM key (`OPENAI_API_KEY`, see README); the switch applies
@@ -172,7 +194,7 @@ image that bottega shells out to. What users can do:
 
 Registry internals (snapshots, wiring, the runtime safety spine, the CLI
 spawn path) are in
-[architecture.md](architecture.md#extension-registry-typed-integrations).
+[architecture.md](architecture.md#extension-runtime-the-safety-spine).
 
 The test-only fixture extension proves the shape end to end: registered →
 resolves → its tool appears in the space agent's toolset → its domain lands
@@ -180,6 +202,9 @@ in the merged egress allowlist. No extension implementations ship in this
 issue — the three providers are their own issues.
 
 ## Proactive scheduler, learning, and knowledge base (epic #111)
+
+The agent doesn't only react — it can work on a schedule, on its own, when
+a space opts in.
 
 - **Durable UTC scheduler (#86)** — three policy-gated tools create, list,
   and delete recurring five-field cron jobs. Jobs survive restarts, never
@@ -203,6 +228,43 @@ issue — the three providers are their own issues.
   append-only org memories. Ingestion is deterministic and model-free.
   Source hosts remain subject to both the static egress allowlist and the
   egress judge.
+
+Why it matters: your team gets a daily digest and a learning loop without
+anyone running reports — and the facts the agent learns stay in org memory
+for the whole workspace.
+
+## Data protection & egress
+
+What happens when the agent talks to the outside world, and how your data
+is protected on the way out:
+
+- **Default-deny egress** — all outbound traffic from the stack goes
+  through iron-proxy, a sidecar that is the *only* path out of the
+  container network. Only allowlisted domains are reachable at all, every
+  allowlisted request is judged by a policy LLM ("deny unless clearly
+  required by the task and safe"), and DNS is sinkholed so nothing leaks
+  around the proxy.
+- **Credentials never travel with the call** — extension calls carry no
+  credential. The runtime resolves the caller's credential at call time,
+  writes it to a mode-0600 secret file on the shared data volume, and the
+  proxy injects it as the `Authorization` header for the extension's
+  allowlisted domains only. Nothing reaches agent env, transcripts, or
+  audit.
+- **Local dev is the same topology** — `bun run dev` brings up iron-proxy,
+  reloads the egress config before the server boots, and fails closed if
+  the judge key (`NEARAI_JUDGE_API_KEY`) is missing: local dev never runs
+  with open egress.
+
+**Current state in local dev (temporary, tracked in #126):** the committed
+egress judge rules currently deny the server's own model calls (a
+context-free LLM denies bare model/API requests) and Slack domains aren't
+allowlisted at all — so routing platform + model traffic through the proxy
+broke the bot. Until the judge rules are fixed, `scripts/dev.sh` bypasses
+the proxy for the server's core traffic (Slack socket/API + model
+endpoints). **Extension traffic (mcp.attio.com / api.github.com /
+mcp.linear.app) stays proxied — the secret-injection path is untouched.**
+The full compose topology still routes everything through the proxy; this
+bypass is a dev-only, temporary restore that gets reverted when #126 lands.
 
 ## Live-Slack QA canary (issue #79)
 
@@ -295,6 +357,9 @@ the canary opens it via `conversations.open`).
   agent's own config governs) and the tool reports it as an error.
 - **No auto model routing** — the agent picks the model role per task via
   `use_model`; complexity-based auto-routing is v2.
+- **Dev egress restore is temporary** — in local dev, platform + model
+  traffic bypasses the proxy until the egress judge rules pass them
+  (tracked in #126); extension traffic stays proxied.
 
 ## Roadmap
 
