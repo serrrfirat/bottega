@@ -108,7 +108,11 @@ rule below conflicts with a rule above, the user's explicit instructions win
    session (restart on crash). If it refuses to boot (fail-closed guards:
    Slack tokens missing from server `.env` — boot throws; provider keys
    missing from the macOS Keychain), state the blocker explicitly and finish
-   all work that does not need it live.
+   all work that does not need it live. Only ONE server per `SLACK_APP_TOKEN`
+   may run — a second Socket Mode connection with the same token breaks
+   message delivery (events drop, the bot goes silent). Before starting,
+   check for an existing server (`pgrep -fl "src/server/index.ts"`); restart
+   the existing one instead of starting a second.
 7. **Implementation is delegated to task agents.** Any code change ships via
    a task subagent given complete, self-contained instructions (targets,
    change steps, acceptance); the main agent handles tracking (issues, todos)
