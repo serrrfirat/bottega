@@ -160,6 +160,14 @@ double local.
 
 - Fail closed everywhere: unknown tool → deny; policy parse error → deny;
   missing tokens → refuse to boot.
+- **Policy footgun: `always_approve` ≠ allow.** A tool must be listed under
+  `tools:` (action `allow`) BEFORE it can auto-approve; `always_approve` only
+  skips the ask-human prompt for tools whose action is already `allow`.
+  Unlisted tools fall back to `unknownAction` (deny). When adding a tool: add
+  it to `tools:` AND (if exec-tier) to `approvals.always_approve` — verify
+  with the loader, not by eye:
+  `bun -e 'import {loadOrgConfig,decidePolicyCall} from "./src/policy/config.ts"; const p=loadOrgConfig(); console.log(decidePolicyCall(p,"create_work_item"))'`
+  (expect `{decision:"allow", reason:"auto-approved by policy (approvals.always_approve)", autoApproved:true}`).
 - No credentials in code, env, image, or tests: provider keys via the
   auth-broker vault, Slack tokens only in server `.env`, the git PAT only in a
   mode-0600 file on the data volume.
