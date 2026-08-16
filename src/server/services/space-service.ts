@@ -6,6 +6,7 @@ import type { ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { onboardingGuideText, runWizardChecks, type WizardCheck } from "../../tools/admin";
+import type { LearningService } from "./learning";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -55,6 +56,8 @@ export interface SpaceServiceDeps {
    * reach the session's setModelRole hook. Absent → no registration.
    */
   modelRoles?: SessionModelRoleRegistry;
+  /** Automatic-memory observer for human Slack turns. */
+  learning?: LearningService;
   /**
    * Onboarding-check seam (issue #116): the shared first-run wizard checks
    * (runWizardChecks — one source of truth with the `first_run_wizard` tool
@@ -185,6 +188,7 @@ interface LiveSession {
   spaceId: string;
   session: AgentSessionDriver;
   idleTimer: ReturnType<typeof setTimeout>;
+  detachLearning: () => void;
   disposing: boolean;
 }
 
@@ -220,6 +224,7 @@ export class SpaceService {
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   readonly #connect: ConnectExtensionDeps | undefined;
   readonly #modelRoles: SessionModelRoleRegistry | undefined;
+  readonly #learning: LearningService | undefined;
   readonly #onboardingChecks: () => WizardCheck[];
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
@@ -306,6 +311,7 @@ export class SpaceService {
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
     this.#connect = deps.connect;
     this.#modelRoles = deps.modelRoles;
+    this.#learning = deps.learning;
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
   }
 
@@ -364,6 +370,7 @@ export class SpaceService {
       this.#auditReceipt(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
+      this.#learning?.recordInput(msg);
       if (live.session.isStreaming()) {
         // Streaming turn (issue #120): phrase updates coalesce on the cadence.
         this.#streamingTurns.add(msg.spaceId);
@@ -381,6 +388,8 @@ export class SpaceService {
   async stop(): Promise<void> {
     const live = [...this.#sessions.values()];
     await Promise.all(live.map((entry) => this.#disposeSession(entry.spaceId)));
+    await this.#learning?.drain();
+    this.#learning?.close();
   }
 
   /**
@@ -438,9 +447,11 @@ export class SpaceService {
     session.on("message", (data) => this.#onSessionMessage(spaceId, data));
     session.on("error", (data) => this.#onSessionError(spaceId, data));
     session.on("turn_end", (data) => this.#onTurnEnd(spaceId, data));
+    const detachLearning = this.#learning?.attachSession(spaceId, session) ?? (() => {});
     const live: LiveSession = {
       spaceId,
       session,
+      detachLearning,
       disposing: false,
       idleTimer: setTimeout(() => void this.#disposeSession(spaceId), this.#idleTimeoutMs),
     };
@@ -458,6 +469,7 @@ export class SpaceService {
     if (!live || live.disposing) return;
     live.disposing = true;
     clearTimeout(live.idleTimer);
+    live.detachLearning();
     // Digest-on-idle (#42): summarize the conversation into org memory
     // before the session is gone. Fail-soft — never blocks disposal
     // (#maybeDigestOnIdle audits its own failures).

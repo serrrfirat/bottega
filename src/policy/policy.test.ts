@@ -178,6 +178,7 @@ approvals:
     expect(parseOrgConfigYaml("tools: nope\n").ok).toBe(false);
     // approvals must be a mapping.
     expect(parseOrgConfigYaml("approvals: nope\n").ok).toBe(false);
+    expect(parseOrgConfigYaml("tools:\n\tbash: deny\n").learning.autoExtract).toBe(false);
   });
 
   test("empty input defaults to fail-closed policy", () => {
@@ -188,6 +189,17 @@ approvals:
     expect(p.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
     // Memory-context injection defaults (issue #42): enabled, 5 entries.
     expect(p.memory.injection).toEqual({ enabled: true, maxEntries: 5 });
+  });
+
+  test("learning.auto_extract defaults on, parses booleans, and fails closed", () => {
+    expect(parseOrgConfigYaml("").learning.autoExtract).toBe(true);
+    expect(parseOrgConfigYaml("learning:\n  auto_extract: false\n").learning.autoExtract).toBe(false);
+    expect(parseOrgConfigYaml("learning:\n  auto_extract: true\n").learning.autoExtract).toBe(true);
+
+    const invalid = parseOrgConfigYaml("learning:\n  auto_extract: sometimes\n");
+    expect(invalid.ok).toBe(true);
+    expect(invalid.learning.autoExtract).toBe(false);
+    expect(invalid.warnings).toContain("learning.auto_extract: invalid (true|false) — disabled");
   });
 
   test("memory.injection parses and invalid values warn, not fail", () => {

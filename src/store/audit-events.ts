@@ -26,6 +26,8 @@ export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 /** Memory saved (payload {scope, principal, id, content_hash}). */
 export const MEMORY_WRITE_EVENT = "memory.write";
+/** Automatic memory extraction completed (payload {scope, count}; actor = system). */
+export const MEMORY_AUTO_SAVED_EVENT = "memory.auto_saved";
 /** Observer read/post/failure (payload {scope, metadata, count}, {pulse_space, posted}, or {error}). */
 export const OBSERVER_READ_EVENT = "observer.read";
 /** Scheduler job created (payload {id, action, cron, space_id?}). */

@@ -166,6 +166,11 @@ export interface MemoryInjectionConfig {
   maxEntries: number;
 }
 
+export interface LearningConfig {
+  /** Automatic durable-fact extraction after human conversation bursts. Default true. */
+  autoExtract: boolean;
+}
+
 export interface PolicyConfig {
   /** Structural validity. False → every decision denies (fail closed). */
   ok: boolean;
@@ -187,6 +192,8 @@ export interface PolicyConfig {
   alwaysApprove: string[];
   /** Memory-context injection settings (issue #42); org floor only — the overlay cannot change them. */
   memory: { injection: MemoryInjectionConfig };
+  /** Automatic learning settings; org floor only. */
+  learning: LearningConfig;
 
   /** Space-agent driver (`agent.driver` in config.yml, issue #26). Default omp-sdk; acp is opt-in. */
   agentDriver: AgentDriverName;
@@ -223,6 +230,7 @@ export function defaultPolicy(): PolicyConfig {
     approvers: [],
     alwaysApprove: [],
     memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
+    learning: { autoExtract: true },
 
     agentDriver: DEFAULT_AGENT_DRIVER,
     responseMode: DEFAULT_RESPONSE_MODE,
@@ -383,6 +391,7 @@ function extensionIdList(value: unknown): string[] | undefined {
 
 function structuralError(policy: PolicyConfig, message: string): PolicyConfig {
   policy.ok = false;
+  policy.learning.autoExtract = false;
   policy.errors.push(message);
   return policy;
 }
@@ -511,6 +520,19 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
           policy.warnings.push("memory.injection.max_entries: invalid — using default");
         }
       }
+    } else if (name === "learning") {
+      const autoExtract = parseBoolean(scalarOrUndefined(entries.auto_extract));
+      if (autoExtract !== undefined) {
+        policy.learning.autoExtract = autoExtract;
+      } else if (entries.auto_extract !== undefined) {
+        // Extraction persists user data. Invalid configuration must disable
+        // it rather than silently retaining the enabled default.
+        policy.learning.autoExtract = false;
+        policy.warnings.push("learning.auto_extract: invalid (true|false) — disabled");
+      }
+      for (const key of Object.keys(entries)) {
+        if (key !== "auto_extract") policy.warnings.push(`learning.${key}: unknown key ignored`);
+      }
     } else if (name === "agent") {
       // Space-agent driver selection (issue #26). The flip is opt-in:
       // anything unrecognized keeps the safe omp-sdk default with a warning.
@@ -598,6 +620,7 @@ function clonePolicy(p: PolicyConfig): PolicyConfig {
     ...p,
     tools: { ...p.tools },
     memory: { injection: { ...p.memory.injection } },
+    learning: { ...p.learning },
     errors: [...p.errors],
     warnings: [...p.warnings],
   };
