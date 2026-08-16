@@ -13,8 +13,12 @@
  * EXECUTOR_GIT_TOKEN_FILE). It never enters the environment or the image:
  * git reads it through a generated GIT_ASKPASS helper, and the GitHub API
  * request reads the same file. A mode other than 0600 fails boot closed
- * (BOTTEGA_ALLOW_LOOSE_PAT=1 opts out, local dev only). The PAT value also
- * never reaches tests via env (asserted in executor.test.ts).
+ * (org setting allow_loose_pat opts out, local dev only). The PAT value
+ * also never reaches tests via env (asserted in executor.test.ts).
+ *
+ * Runtime knobs (issue #67): repo allowlist, git/api base URLs, workspaces
+ * dir, and allow_loose_pat live in the org settings blob (DB — source of
+ * truth); config/org.yml stays the default/fallback.
  *
  * Delivery approval contract: after the PR is opened the executor writes a
  * `work_item.delivery_pending` audit marker, then calls the `onDelivery`
@@ -142,7 +146,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     }
     if (!cfg.repoAllowlist.includes(repo)) {
       await deps.store.transitionWorkItem(item.id, "working", "blocked", {
-        evidence: `repo "${repo}" is not on the executor allowlist (config/org.yml repos or EXECUTOR_REPOS)`,
+        evidence: `repo "${repo}" is not on the executor allowlist (org settings repos, config/org.yml by default)`,
         by: "executor",
       });
       console.log(`[${item.id}] blocked: repo ${repo} not on the allowlist`);
@@ -321,11 +325,13 @@ async function openPullRequest(
 }
 
 /**
- * Repo allowlist (issue #47): `repos` + `git_base_url` from config/org.yml
- * (EXECUTOR_REPOS overrides). Parsed by the shared YAML-subset parser and
- * validated — a malformed org.yml is a loud boot error, never a silent
- * mis-parse (trailing comments, inline sequences, and odd indentation
- * previously produced wrong repo/git-base values).
+ * Repo allowlist file default (issue #47): `repos` + `git_base_url` from
+ * config/org.yml. The org settings blob (issue #67) overrides BOTH when set
+ * — the DB is the source of truth, the file is the default. Parsed by the
+ * shared YAML-subset parser and validated — a malformed org.yml is a loud
+ * boot error, never a silent mis-parse (trailing comments, inline
+ * sequences, and odd indentation previously produced wrong repo/git-base
+ * values).
  *
  * This list is an AUTHORIZATION FENCE, not a routing table: work items name
  * their own repo (derived from the conversation + org memory), and the
@@ -357,39 +363,41 @@ function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string }
       return r;
     });
   }
-  const envRepos = process.env.EXECUTOR_REPOS;
-  if (envRepos) {
-    repos = envRepos
-      .split(",")
-      .map((r) => r.trim())
-      .filter(Boolean);
-  }
   // Keep only well-formed owner/repo entries: anything else can never match
   // an item's repo and would only muddy the fence.
   return { repos: repos.filter((r) => /^[^/]+\/[^/]+$/.test(r)), gitBaseUrl };
 }
 
 function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
-  const { repos, gitBaseUrl } = loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
-  const workspacesDir = process.env.WORKSPACES_DIR ?? (existsSync("/workspaces") ? "/workspaces" : "data/workspaces");
+  // Issue #67: runtime knobs live in the org settings blob (DB is the
+  // source of truth); config/org.yml is the default/fallback. A malformed
+  // blob fails the executor boot closed (getOrgSettings throws).
+  const settings = deps.store.getOrgSettings();
+  const fileConfig = loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR);
+  const repos = settings?.repos ?? fileConfig.repos;
+  const gitBaseUrl = (settings?.gitBaseUrl ?? fileConfig.gitBaseUrl).replace(/\/+$/, "");
+  const apiBaseUrl = (settings?.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
+  const workspacesDir =
+    settings?.workspacesDir ?? (existsSync("/workspaces") ? "/workspaces" : "data/workspaces");
+  const allowLoosePat = settings?.allowLoosePat ?? false;
   const tokenFile = process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
   if (!existsSync(tokenFile)) {
     throw new Error(`git token file not found: ${tokenFile} (install the PAT there, mode 0600 — never env/image)`);
   }
   const tokenMode = statSync(tokenFile).mode & 0o777;
   if (tokenMode !== 0o600) {
-    if (process.env.BOTTEGA_ALLOW_LOOSE_PAT !== "1") {
+    if (!allowLoosePat) {
       throw new Error(
         `git token file ${tokenFile} must be mode 0600 (found ${tokenMode.toString(8)}); ` +
-          "set BOTTEGA_ALLOW_LOOSE_PAT=1 to override for local dev only",
+          "set org settings allow_loose_pat to override for local dev only",
       );
     }
-    console.log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — BOTTEGA_ALLOW_LOOSE_PAT set, continuing`);
+    console.log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — allow_loose_pat set, continuing`);
   }
   return {
     repoAllowlist: repos,
-    gitBaseUrl: gitBaseUrl.replace(/\/+$/, ""),
-    apiBaseUrl: (process.env.EXECUTOR_GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, ""),
+    gitBaseUrl,
+    apiBaseUrl,
     workspacesDir,
     transcriptDir: deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR,
     tokenFile,

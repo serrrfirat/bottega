@@ -61,10 +61,25 @@ describe(".env.example (issue #9 environment contract)", () => {
       "OMP_AUTH_BROKER_TOKEN",
       "NEARAI_JUDGE_API_KEY",
       "GITHUB_PAT",
-      "MEM0_BASE_URL",
+      "EXECUTOR_GIT_TOKEN_FILE",
       "OPENAI_API_KEY",
     ]) {
       expect(envExample).toContain(varName);
+    }
+  });
+
+  test("runtime knobs are settings, not env vars (issue #67)", () => {
+    // Issue #67 env pruning: knobs moved to the org settings blob
+    // (settings tool). They must not be documented as env assignments —
+    // .env carries secrets + deployment identity only.
+    for (const knob of [
+      "WORKSPACES_DIR=",
+      "EXECUTOR_REPOS=",
+      "EXECUTOR_GITHUB_API_URL=",
+      "BOTTEGA_ALLOW_LOOSE_PAT=",
+      "MEM0_BASE_URL=",
+    ]) {
+      expect(envExample).not.toContain(knob);
     }
   });
 

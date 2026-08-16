@@ -105,6 +105,9 @@ export const PROJECT_TOOL_NAMES = [
   "connect_extension",
   "memory.save",
   "memory.search",
+  // Settings tool (issue #67): rides the SDK custom-tools path like the
+  // memory tools — manifest tools must not shadow it.
+  "settings",
 ] as const;
 
 /**

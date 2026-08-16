@@ -274,8 +274,12 @@ export const SPACE_AGENT_TOOLS = [
   "connect_extension",
   "memory.save",
   "memory.search",
+  "memory.save",
+  "memory.search",
   "model_settings",
   "use_model",
+  // Settings tool (issue #67): get/set the durable org/space settings.
+  "settings",
 ] as const;
 
 /**

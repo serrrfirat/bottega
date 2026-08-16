@@ -430,7 +430,7 @@ describe("mem0 docker leg (skip-gated)", () => {
       if (!docker.success) {
         skip(`docker unavailable (${docker.stderr.toString().trim().slice(0, 120) || "no daemon"}). ` +
           `Manual checklist: install Docker, run the mem0 OSS server (see docs.mem0.ai/open-source/setup), ` +
-          `then set MEM0_BASE_URL and MEM0_API_KEY and re-run this leg.`);
+          `then set org settings memory_backend.base_url and MEM0_API_KEY, and re-run this leg.`);
         return;
       }
 
@@ -441,7 +441,7 @@ describe("mem0 docker leg (skip-gated)", () => {
         if (!pull.success) {
           skip(`could not pull ${IMAGE} (${pull.stderr.toString().trim().slice(0, 120)}). ` +
             `Manual checklist: pre-pull the image or run the server via docker compose from the mem0 repo, ` +
-            `set MEM0_BASE_URL/MEM0_API_KEY, and re-run this leg.`);
+            `set org settings memory_backend.base_url / MEM0_API_KEY, and re-run this leg.`);
           return;
         }
       }

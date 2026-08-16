@@ -40,7 +40,10 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
   test("executor reads the git PAT from the container path of the data volume", () => {
     const env = service("executor")["environment"] as Record<string, YamlNode>;
     expect(env["EXECUTOR_GIT_TOKEN_FILE"]).toBe("/app/data/secrets/github-pat");
-    expect(env["WORKSPACES_DIR"]).toBe("/workspaces");
+    // Issue #67: the workspaces dir is an org SETTING (settings.workspaces_dir),
+    // not an env var — unset, the executor resolves the container default
+    // /workspaces (the data volume mounted below).
+    expect(env["WORKSPACES_DIR"]).toBeUndefined();
     const volumes = service("executor")["volumes"] as string[];
     expect(volumes).toContain("data:/workspaces");
   });

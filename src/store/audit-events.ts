@@ -26,6 +26,8 @@ export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 /** Memory saved (payload {scope, principal, id, content_hash}). */
 export const MEMORY_WRITE_EVENT = "memory.write";
+/** Org/space settings changed (payload {scope, space?, actor, before, after}). */
+export const SETTINGS_CHANGED_EVENT = "settings.changed";
 /** Extension credential resolved through the scope ladder (payload {provider, scope, identity_key, credential_id, broker_credential_id}). */
 export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolved";
 /** Extension connected through the connect capability (payload {extension, scope, owner}). */

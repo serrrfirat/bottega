@@ -137,6 +137,9 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // the live session's model) — write tier like memory.save.
   model_settings: "write",
   use_model: "write",
+  // Settings tool (issue #67): mutates the durable org/space settings blob
+  // (write — prompts in non-yolo modes; reads go through the same gate).
+  settings: "write",
 };
 
 export interface MemoryInjectionConfig {

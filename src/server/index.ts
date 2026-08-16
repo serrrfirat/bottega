@@ -10,7 +10,10 @@ import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/con
 import createPolicyExtension from "../policy/extension";
 import { workItemsExtension } from "../tools/work-items";
 import { memoryToolsExtension } from "../tools/memory";
+import { memoryToolsExtension } from "../tools/memory";
 import { modelToolsExtension } from "../tools/model-settings";
+import { settingsToolsExtension } from "../tools/settings";
+import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
@@ -22,6 +25,7 @@ import { SlackApprovalRouter } from "./adapters/approval-router";
 import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -66,12 +70,21 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
 
   const store = createStore();
   const audit = createAudit(store);
+  // Issue #67: the org settings blob is the source of truth — the policy
+  // loader reads DB-first (config.yml is the default/fallback), the memory
+  // backend URL and model catalog come from settings, and the agent-dir
+  // models.yml is generated at boot (written only when settings carry
+  // model ids — otherwise the committed template stays the default).
+  // A malformed settings blob fails the boot closed (getOrgSettings
+  // throws; loadOrgPolicy fails the policy closed).
+  const orgSettings = store.getOrgSettings();
   const orgPolicy = loadOrgPolicy(store);
   // One memory provider for the whole process: shared by the agent
   // memory tools, the context-injection extension, and digest-on-idle (#42).
-  // Chosen from env (#43): MEM0_BASE_URL set → mem0 backend (compose ships
-  // it), else SQLite sharing the store's database handle.
-  const memoryProvider = resolveMemoryProvider(process.env, store.getDb());
+  // Selected from settings (#67): memory_backend.base_url set → mem0
+  // backend (compose ships it), else SQLite sharing the store's database
+  // handle.
+  const memoryProvider = resolveMemoryProvider(orgSettings, store.getDb());
   // Extension registry (issue #50): loads pinned spec snapshots from
   // config/extensions/ at boot. Per-org deployments resolve extensions from
   // these local files — never from the integrations.sh catalog at runtime.
@@ -85,6 +98,12 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
   mkdirSync(OMP_AGENT_DIR, { recursive: true });
+  // Boot-time generation (issue #67): the SDK reads models.yml from the
+  // agent dir; the DB settings are the source of truth. Written only when
+  // settings carry model ids — otherwise the mounted template stays.
+  if (orgSettings !== null) {
+    regenerateModelsConfig(orgSettings, join(OMP_AGENT_DIR, "models.yml"));
+  }
   // Wiring order matters: the policy gate (both drivers) needs the approval
   // router, the router needs the adapter, and the adapter's callbacks need
   // the service/router — all late-bound closures, so no message or action
@@ -198,15 +217,18 @@ export function main(opts: BottegaServerOpts = {}): BottegaServer {
             knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
           }),
           workItemsExtension(store, { orgPolicy }),
-          // Memory tools (issue #22, #43): provider chosen from env —
-          // MEM0_BASE_URL set → mem0 backend (compose ships it), else SQLite
-          // sharing the store's database handle. Every save is audited via
-          // the policy audit module.
+          // Memory tools (issue #22, #43): provider selected from the org
+          // settings (#67) — memory_backend.base_url set → mem0 backend
+          // (compose ships it), else SQLite sharing the store's database
+          // handle. Every save is audited via the policy audit module.
           memoryToolsExtension(memoryProvider, { audit }),
           // Model tools (issue #64): chat-driven per-space model settings
           // (persisted in spaces.settings, audited) + next-turn model role
           // switching through the live-session registry.
           modelToolsExtension(store, { audit, modelRoles }),
+          // Settings tool (issue #67): get/set the durable org/space
+          // settings — write-tier, every set audited `settings.changed`.
+          settingsToolsExtension(store, { audit }),
         ],
         // Turn-start memory injection (#42), gated by the org policy config.
         memoryContext: {

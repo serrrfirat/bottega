@@ -1,11 +1,12 @@
 /**
- * Memory provider selection tests (issue #43).
+ * Memory provider selection tests (issues #43, #67).
  *
- * resolveMemoryProvider reads ONLY the passed env record: MEM0_BASE_URL set
- * → mem0 backend (base URL + optional API key reach the client), unset →
- * SQLite fallback sharing the given store database. The mem0 branch is
- * proven against a Bun.serve stub (the same wire contract the client's own
- * tests use), so "right args" means an actual HTTP round-trip with the
+ * resolveMemoryProvider reads ONLY the passed settings object (plus the env
+ * record for the optional API key): memory_backend.base_url set → mem0
+ * backend (base URL + optional API key reach the client), unset → SQLite
+ * fallback sharing the given store database. The mem0 branch is proven
+ * against a Bun.serve stub (the same wire contract the client's own tests
+ * use), so "right args" means an actual HTTP round-trip with the
  * configured key.
  */
 import { describe, expect, test, afterAll } from "bun:test";
@@ -66,12 +67,13 @@ function createStub() {
 }
 
 describe("resolveMemoryProvider (issue #43)", () => {
-  test("MEM0_BASE_URL set → mem0 provider with the configured URL and API key", async () => {
+  test("memory_backend.base_url set → mem0 provider with the configured URL and API key", async () => {
     const stub = createStub();
     try {
       const provider = resolveMemoryProvider(
-        { MEM0_BASE_URL: stub.server.url.href, MEM0_API_KEY: "m0sk-test" },
+        { memoryBackend: { baseUrl: stub.server.url.href } },
         freshDb(),
+        { MEM0_API_KEY: "m0sk-test" },
       );
       const saved = await provider.save({ scope: "org", content: "selection test fact" });
       expect(saved.content).toBe("selection test fact");
@@ -90,9 +92,9 @@ describe("resolveMemoryProvider (issue #43)", () => {
     }
   });
 
-  test("MEM0_BASE_URL unset → SQLite provider sharing the store database", async () => {
+  test("memory_backend.base_url unset → SQLite provider sharing the store database", async () => {
     const db = freshDb();
-    const provider = resolveMemoryProvider({}, db);
+    const provider = resolveMemoryProvider(null, db);
     const saved = await provider.save({ scope: "org", content: "sqlite fallback fact" });
     expect(saved.id).toBeTruthy();
     const hits = await provider.search({ scope: "org", query: "sqlite fallback" });

@@ -153,13 +153,10 @@ services:
       # URL set with no token aborts at first credential resolution.
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
-      # Memory backend (issue #43): MEM0_BASE_URL defaults to the internal
-      # mem0 service so a deployment starts memory on mem0 out of the box;
-      # set it empty in .env (MEM0_BASE_URL=) to fall back to SQLite — the
-      # single-dash form passes the empty value through, the server treats
-      # it as unset. MEM0_API_KEY is optional (the OSS server only demands a
-      # key when its auth is enabled).
-      MEM0_BASE_URL: ${MEM0_BASE_URL-http://mem0:8000}
+      # Memory backend (issues #43, #67): the backend URL is an org SETTING
+      # (memory_backend.base_url, via the settings tool), not an env var —
+      # unset → SQLite memory. MEM0_API_KEY stays env (secret, optional:
+      # the OSS server only demands a key when its auth is enabled).
       MEM0_API_KEY: ${MEM0_API_KEY:-}
     volumes:
       # The app resolves its store/sessions/transcripts from the relative
@@ -201,8 +198,9 @@ services:
       # broker at request time (git auth via the PAT file, #11).
       OMP_AUTH_BROKER_URL: ${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}
       OMP_AUTH_BROKER_TOKEN: ${OMP_AUTH_BROKER_TOKEN:-}
-      # Workspaces + git credentials live on the data volume.
-      WORKSPACES_DIR: /workspaces
+      # Workspaces + git credentials live on the data volume. The workspaces
+      # dir is an org setting (settings.workspaces_dir, issue #67); unset it
+      # resolves to the container default /workspaces (mounted below).
       EXECUTOR_GIT_TOKEN_FILE: /app/data/secrets/github-pat
     volumes:
       - data:/app/data

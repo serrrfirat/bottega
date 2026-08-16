@@ -59,7 +59,7 @@ export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): 
         "The optional `repo` (\"owner/repo\") names the repository the task lives in — derive it from the " +
         "URL or the conversation (e.g. \"fix the flaky checkout in bottega\" → repo \"acme/bottega\"); " +
         "omit it when neither says, and the executor will block asking the requester. " +
-        "The executor only ever pushes to repos on the configured allowlist (config/org.yml or EXECUTOR_REPOS). " +
+        "The executor only ever pushes to repos on the allowlist (org settings repos, config/org.yml by default). " +
         "Requires human approval (exec-tier tool).",
       parameters: createSchema,
       approval: "exec",

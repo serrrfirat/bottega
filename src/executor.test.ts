@@ -183,18 +183,20 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
   const driver = new FakeDriver();
   const deliveries: Fixture["deliveries"] = [];
 
-  // Env contract: the token value never enters the environment — only the
-  // FILE path does. Save prior values so tests stay isolated.
+  // Env contract (issue #67): runtime knobs are SETTINGS, not env vars —
+  // the fixture seeds the org settings blob (DB wins over config/org.yml),
+  // and the PAT stays a FILE (only the file path is env). Save prior env
+  // values so tests stay isolated.
   const saved = {
-    workspaces: process.env.WORKSPACES_DIR,
     tokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
-    apiUrl: process.env.EXECUTOR_GITHUB_API_URL,
-    repos: process.env.EXECUTOR_REPOS,
   };
-  process.env.WORKSPACES_DIR = join(dir, "workspaces");
+  store.setOrgSettings({
+    workspaces_dir: join(dir, "workspaces"),
+    git_base_url: `file://${join(dir, "bare")}`,
+    api_base_url: emulatorBase,
+    repos: ["acme/sandbox", "acme/tooling"],
+  });
   process.env.EXECUTOR_GIT_TOKEN_FILE = tokenFile;
-  process.env.EXECUTOR_GITHUB_API_URL = emulatorBase;
-  delete process.env.EXECUTOR_REPOS;
 
   const fixture: Fixture = {
     dir,
@@ -215,11 +217,7 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
     cleanup() {
       http.stop(true);
       store.close();
-      process.env.WORKSPACES_DIR = saved.workspaces;
       process.env.EXECUTOR_GIT_TOKEN_FILE = saved.tokenFile;
-      process.env.EXECUTOR_GITHUB_API_URL = saved.apiUrl;
-      if (saved.repos === undefined) delete process.env.EXECUTOR_REPOS;
-      else process.env.EXECUTOR_REPOS = saved.repos;
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -496,7 +494,13 @@ describe("claim loop", () => {
   test("an empty allowlist boots fine and blocks every item until repos are configured", async () => {
     const fx = makeFixture();
     try {
-      // No repos key at all → allowlist []; EXECUTOR_REPOS is unset in the fixture.
+      // Settings repos=[] is a legal allowlist (empty → no pushes); the
+      // file's repos would only apply when the blob has no repos key.
+      fx.store.setOrgSettings({
+        workspaces_dir: join(fx.dir, "workspaces"),
+        api_base_url: fx.emulatorBase,
+        repos: [],
+      });
       writeFileSync(join(fx.orgConfigDir, "org.yml"), `git_base_url: "file://${join(fx.dir, "bare")}"\n`);
       const cfg = await prepareExecutor(makeDeps(fx));
       expect(cfg.repoAllowlist).toEqual([]);
@@ -524,6 +528,12 @@ describe("org config parsing (issue #33)", () => {
   test("trailing comments and quoted repo entries parse to the correct allowlist and git base", async () => {
     const fx = makeFixture();
     try {
+      // Settings without repos/git_base_url → config/org.yml is the
+      // fallback source (DB wins only when the keys are set).
+      fx.store.setOrgSettings({
+        workspaces_dir: join(fx.dir, "workspaces"),
+        api_base_url: fx.emulatorBase,
+      });
       // Shapes the old line-scanner silently mis-parsed (the comment would
       // have been glued to the repo string, breaking the owner/repo match).
       writeFileSync(
@@ -581,16 +591,20 @@ describe("credential hygiene", () => {
     }
   });
 
-  test("a loose PAT file mode fails closed unless BOTTEGA_ALLOW_LOOSE_PAT=1", async () => {
+  test("a loose PAT file mode fails closed unless settings allow_loose_pat is set", async () => {
     const fx = makeFixture();
     try {
       chmodSync(fx.tokenFile, 0o644);
       await expect(prepareExecutor(makeDeps(fx))).rejects.toThrow(/must be mode 0600/);
 
-      process.env.BOTTEGA_ALLOW_LOOSE_PAT = "1";
+      fx.store.setOrgSettings({
+        workspaces_dir: join(fx.dir, "workspaces"),
+        api_base_url: fx.emulatorBase,
+        repos: ["acme/sandbox", "acme/tooling"],
+        allow_loose_pat: true,
+      });
       await expect(prepareExecutor(makeDeps(fx))).resolves.toMatchObject({ tokenFile: fx.tokenFile });
     } finally {
-      delete process.env.BOTTEGA_ALLOW_LOOSE_PAT;
       fx.cleanup();
     }
   });

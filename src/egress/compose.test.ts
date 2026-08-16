@@ -119,12 +119,12 @@ describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
     expect(env["OPENAI_API_KEY"]).toBe("${OPENAI_API_KEY:-}");
   });
 
-  test("server defaults memory to the internal mem0 URL (SQLite fallback when unset)", () => {
+  test("server env no longer carries the memory backend URL (an org setting, issue #67)", () => {
     const env = serviceEnv("server");
-    // Single-dash interpolation: an EMPTY MEM0_BASE_URL in .env passes
-    // through (the server then treats it as unset -> SQLite); `:-` would
-    // re-apply the default and make the documented fallback unreachable.
-    expect(env["MEM0_BASE_URL"]).toBe("${MEM0_BASE_URL-http://mem0:8000}");
+    // The backend URL is a settings knob (memory_backend.base_url), not an
+    // env var: unset → SQLite memory. The optional API key stays env
+    // (secret; the OSS server only demands it when auth is enabled).
+    expect(env["MEM0_BASE_URL"]).toBeUndefined();
     expect(env["MEM0_API_KEY"]).toBe("${MEM0_API_KEY:-}");
   });
 });
