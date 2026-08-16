@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
-import type { AgentDriver, AgentSessionDriver, SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
+import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";

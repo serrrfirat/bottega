@@ -111,7 +111,8 @@ class FakeDriver implements AgentDriver {
   readonly created: Array<{ opts: CreateSessionOpts; session: FakeSession }> = [];
   /** When set, createSession parks until finishCreate() — proves receipt ordering (issue #119). */
   deferCreate = false;
-  private createGate?: { promise: Promise<void>; resolve: () => void };
+  /** Set while createSession is parked on the defer gate (issue #119). */
+  createGate?: { promise: Promise<void>; resolve: () => void };
 
   async createSession(opts: CreateSessionOpts): Promise<AgentSessionDriver> {
     const session = new FakeSession(opts.spaceId);
@@ -1887,6 +1888,10 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     expect(posts).toEqual([{ spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } }]);
     expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
 
+    // Cold-start runs microtask hops (attachment ingest #124, response-mode
+    // lookup) before createSession parks on the defer gate; wait for the
+    // gate instead of assuming the hop count, then release it.
+    while (driver.createGate === undefined) await Promise.resolve();
     driver.finishCreate();
     await inbound;
     expect(driver.last().prompts).toEqual([{ text: "hello", opts: undefined }]);

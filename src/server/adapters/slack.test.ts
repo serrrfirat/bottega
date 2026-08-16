@@ -429,8 +429,20 @@ describe("Slack file API roundtrips", () => {
   const BOT_TOKEN = "xoxb-file-test-token";
   const DOWNLOAD_BYTES = new TextEncoder().encode("attachment body");
 
-  function bootFilesApi() {
-    let baseUrl = "";
+  /**
+   * Extracts the file part's bytes from a multipart/form-data body; returns
+   * the raw body when the body is not multipart (defensive: raw uploads).
+   */
+  function extractMultipartPart(body: Uint8Array, boundary: string | null): Uint8Array {
+    if (!boundary) return body;
+    const text = new TextDecoder().decode(body);
+    const headerEnd = text.indexOf("\r\n\r\n");
+    const partEnd = text.indexOf(`\r\n--${boundary}`, headerEnd + 4);
+    if (headerEnd < 0 || partEnd < 0) return body;
+    return body.slice(headerEnd + 4, partEnd);
+  }
+
+  function bootFilesApi() {    let baseUrl = "";
     const state: {
       infoFile?: string;
       downloadAuth?: string | null;
@@ -472,7 +484,13 @@ describe("Slack file API roundtrips", () => {
           });
         }
         if (url.pathname === "/upload/F-UPLOAD") {
-          state.uploadedBytes = new Uint8Array(await request.arrayBuffer());
+          // files.uploadV2 posts the chunk as multipart/form-data to the
+          // upload URL (observed: 226-byte envelope for a 4-byte file), so
+          // extract the embedded file part; the bytes are the contract.
+          const raw = new Uint8Array(await request.arrayBuffer());
+          const contentType = request.headers.get("content-type") ?? "";
+          const boundary = contentType.match(/boundary=(.+)$/)?.[1];
+          state.uploadedBytes = extractMultipartPart(raw, boundary ?? null);
           return new Response("ok");
         }
         if (url.pathname === "/api/files.completeUploadExternal") {

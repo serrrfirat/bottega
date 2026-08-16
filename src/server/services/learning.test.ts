@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MemoryEntry, MemoryProvider, MemorySaveInput } from "../../memory/types";
 import { createAudit } from "../../policy/audit";
+import { defaultPolicy } from "../../policy/config";
 import { createStore, type Store } from "../../store/db";
 import { MEMORY_AUTO_SAVED_EVENT } from "../../store/audit-events";
 import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "../drivers/agent-driver";
@@ -68,6 +69,12 @@ class RecordingAdapter implements SlackAdapter {
   }
   async addReaction(): Promise<void> {}
   async removeReaction(): Promise<void> {}
+  async downloadFile(): Promise<{ name: string; mimeType: string; size: number; bytes: Uint8Array }> {
+    return { name: "file.bin", mimeType: "application/octet-stream", size: 0, bytes: new Uint8Array() };
+  }
+  async uploadFile(): Promise<string | undefined> {
+    return undefined;
+  }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
 }
@@ -219,6 +226,8 @@ describe("learning service", () => {
     const spaces = new SpaceService({
       store: h.store,
       adapter,
+      audit: createAudit(h.store),
+      orgPolicy: defaultPolicy(),
       driver: h.driver,
       learning: h.learning,
       onboardingChecks: () => [],

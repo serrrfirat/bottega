@@ -205,6 +205,8 @@ approvals:
     expect(invalid.ok).toBe(true);
     expect(invalid.learning.autoExtract).toBe(false);
     expect(invalid.warnings).toContain("learning.auto_extract: invalid (true|false) — disabled");
+  });
+
   test("objects.max_size_bytes defaults and parses a positive integer", () => {
     expect(defaultPolicy().objects.maxSizeBytes).toBe(DEFAULT_OBJECT_MAX_SIZE_BYTES);
     expect(parseOrgConfigYaml("").objects.maxSizeBytes).toBe(DEFAULT_OBJECT_MAX_SIZE_BYTES);

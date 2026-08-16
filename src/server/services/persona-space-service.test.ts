@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { SlackAdapter } from "../adapters/slack";
 import type { AgentDriver, AgentSessionDriver } from "../drivers/agent-driver";
 import { createStore } from "../../store/db";
+import { createAudit } from "../../policy/audit";
+import { defaultPolicy } from "../../policy/config";
 import { SLACK_FORMAT_DIRECTIVE, SpaceService } from "./space-service";
 
 const tempDirs: string[] = [];
@@ -32,6 +34,12 @@ function fakeAdapter(): SlackAdapter {
     async updateMessage(): Promise<void> {},
     async addReaction(): Promise<void> {},
     async removeReaction(): Promise<void> {},
+    async downloadFile(): Promise<{ name: string; mimeType: string; size: number; bytes: Uint8Array }> {
+      return { name: "file.bin", mimeType: "application/octet-stream", size: 0, bytes: new Uint8Array() };
+    },
+    async uploadFile(): Promise<string | undefined> {
+      return undefined;
+    },
     async start(): Promise<void> {},
     async stop(): Promise<void> {},
   };
@@ -60,6 +68,8 @@ async function personaService(): Promise<{
   const service = new SpaceService({
     store,
     adapter: fakeAdapter(),
+    audit: createAudit(store),
+    orgPolicy: defaultPolicy(),
     driver,
     personaDir: root,
     onboardingChecks: () => [],
