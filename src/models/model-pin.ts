@@ -12,14 +12,16 @@
  * "fast slot" is not ambiguous); every other value resolves to ONE bare
  * model id at creation so execution never re-interprets a fuzzy name.
  *
- * Near gateway probe (issue #194): the near provider is a models.yml
- * custom provider with a single declared model, but its gateway serves the
- * full catalog. listAvailableModels probes GET {baseUrl}/models (the near
- * baseUrl already ends in /v1; other openai-completions baseUrls get
- * /v1/models appended) with the provider's resolved key, bounded to 5s and
- * cached per build, and MERGES the gateway's ids into the near provider's
- * declared set. Any probe failure fails CLOSED: the declared set stands
- * and the catalog is never broken by a dead gateway.
+ * Custom gateway probe (issue #194, generalized): the near provider is a
+ * models.yml custom openai-completions provider with a single declared
+ * model, but its gateway serves the full catalog — the same holds for the
+ * openai and anthropic entries. listAvailableModels probes GET {baseUrl}/models
+ * (the configured baseUrls all end in /v1; other openai-completions
+ * baseUrls get /v1/models appended) for EVERY custom openai-completions
+ * provider, using each provider's resolved key, bounded to 5s and cached
+ * per build, and MERGES each gateway's ids into that provider's declared
+ * set. Any probe failure fails CLOSED: the declared set stands and the
+ * catalog is never broken by a dead gateway.
  *
  * Unqualified-resolution rule (issue #194): several providers serve the
  * same model name (deepseek-v4-flash exists on near, opencode-go,
@@ -47,14 +49,15 @@ export type ModelRoleRef = (typeof MODEL_ROLE_REFS)[number];
 const NEAR_PROVIDER = "near";
 
 /** Probe bound: a slow or dead gateway never hangs the catalog build. */
-const NEAR_PROBE_TIMEOUT_MS = 5_000;
+const GATEWAY_PROBE_TIMEOUT_MS = 5_000;
 
 /**
- * Per-build probe cache: one gateway probe per agent dir, shared by every
- * catalog build in this process. Successes and failures are cached alike —
- * a failed probe keeps the declared set for the whole build (fail closed).
+ * Per-build probe cache: one combined gateway-probe pass per agent dir,
+ * shared by every catalog build in this process. Successes and failures
+ * are cached alike — a failed probe keeps the declared set for the whole
+ * build (fail closed).
  */
-const nearProbeCache = new Map<string, Promise<ModelCatalogEntry[]>>();
+const gatewayProbeCache = new Map<string, Promise<ModelCatalogEntry[]>>();
 
 /** A resolved model pin: a role slot, or one concrete available model id. */
 export type ModelPin = { kind: "role"; role: ModelRoleRef } | { kind: "id"; modelId: string };
@@ -71,89 +74,108 @@ export interface ModelCatalogEntry {
 /**
  * The available model catalog for an agent dir: models.yml custom models +
  * the SDK's bundled provider catalog, filtered to models with configured
- * auth — the same registry the sessions resolve against — MERGED with the
- * near gateway's probed /v1/models list (issue #194), so near shows its
- * full set instead of the single declared model.
+ * auth — the same registry the sessions resolve against — MERGED with each
+ * custom openai-completions gateway's probed /v1/models list (issue #194,
+ * generalized to every such provider: near, openai, anthropic), so each
+ * gateway shows its full set instead of only the declared anchors.
  */
 export async function listAvailableModels(agentDir: string): Promise<ModelCatalogEntry[]> {
   const registry = new ModelRegistry(await discoverAuthStorage(agentDir), join(agentDir, "models.yml"));
   const declared = registry.getAvailable().map((model) => ({ id: model.id, name: model.name ?? model.id, provider: model.provider }));
-  const probed = await probeNearGatewayCached(agentDir, registry.authStorage);
-  return mergeNearProbedModels(declared, probed);
+  const probed = await probeGatewayCached(agentDir, registry.authStorage);
+  return mergeProbedModels(declared, probed);
 }
 
-/** The near provider's declared transport, read from the agent dir's models.yml. */
-function readNearProviderConfig(agentDir: string): { baseUrl?: string; api?: string } {
+/** A custom openai-completions gateway declared in the agent dir's models.yml. */
+interface CustomGatewayProvider {
+  provider: string;
+  baseUrl: string;
+}
+
+/**
+ * Every custom openai-completions provider (api + baseUrl) declared in the
+ * agent dir's models.yml — near, openai, anthropic, or any future gateway.
+ * Each is probed for its full model list (issue #194 generalized).
+ */
+function readCustomGatewayProviders(agentDir: string): CustomGatewayProvider[] {
   try {
     const parsed = parseYamlSubset(readFileSync(join(agentDir, "models.yml"), "utf8"));
     const providers = parsed.providers;
-    if (providers === undefined || typeof providers !== "object" || Array.isArray(providers)) return {};
-    const near = providers[NEAR_PROVIDER];
-    if (near === undefined || typeof near !== "object" || Array.isArray(near)) return {};
-    return {
-      baseUrl: typeof near.baseUrl === "string" ? near.baseUrl : undefined,
-      api: typeof near.api === "string" ? near.api : undefined,
-    };
+    if (providers === undefined || typeof providers !== "object" || Array.isArray(providers)) return [];
+    const gateways: CustomGatewayProvider[] = [];
+    for (const [name, cfg] of Object.entries(providers)) {
+      if (cfg === undefined || typeof cfg !== "object" || Array.isArray(cfg)) continue;
+      if (cfg.api !== "openai-completions" || typeof cfg.baseUrl !== "string" || cfg.baseUrl.trim() === "") continue;
+      gateways.push({ provider: name, baseUrl: cfg.baseUrl });
+    }
+    return gateways;
   } catch {
-    return {}; // unreadable models.yml → no probe, declared set stands
+    return []; // unreadable models.yml → no probes, declared set stands
   }
 }
 
 /**
- * The gateway /v1/models URL for a baseUrl: the near baseUrl already ends
- * in "/v1" ("https://cloud-api.near.ai/v1" → "/v1/models"); other
- * openai-completions baseUrls get the /v1 suffix appended.
+ * The gateway /v1/models URL for a baseUrl: the configured baseUrls already
+ * end in "/v1" ("https://cloud-api.near.ai/v1", "https://api.openai.com/v1",
+ * "https://api.anthropic.com/v1" → "/v1/models"); other openai-completions
+ * baseUrls get the /v1 suffix appended.
  */
-function nearModelsUrl(baseUrl: string): string {
+function gatewayModelsUrl(baseUrl: string): string {
   const base = baseUrl.replace(/\/+$/, "");
   return base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
 }
 
 /**
- * Probes the near gateway's model list with the provider's resolved key.
- * Fail closed on ANY error (timeout, non-2xx, malformed body, no key):
- * the caller keeps the declared set — the catalog is never broken by a
- * dead gateway.
+ * Probes every configured custom openai-completions gateway's model list
+ * with the provider's resolved key, in parallel, each bounded to 5s. Fail
+ * closed per provider on ANY error (timeout, non-2xx, malformed body, no
+ * key): the caller keeps the declared set — the catalog is never broken by
+ * a dead gateway.
  */
-async function probeNearGatewayModels(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
-  const { baseUrl, api } = readNearProviderConfig(agentDir);
-  if (api !== "openai-completions" || baseUrl === undefined) return [];
-  const key = await authStorage.getApiKey(NEAR_PROVIDER);
-  if (key === undefined) return []; // near not configured → nothing to probe
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), NEAR_PROBE_TIMEOUT_MS);
-  try {
-    const res = await fetch(nearModelsUrl(baseUrl), { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
-    if (!res.ok) return [];
-    const body = (await res.json()) as { data?: unknown };
-    if (typeof body !== "object" || body === null || !Array.isArray(body.data)) return [];
-    const models: ModelCatalogEntry[] = [];
-    for (const item of body.data) {
-      if (typeof item !== "object" || item === null) continue;
-      const id = (item as { id?: unknown }).id;
-      if (typeof id !== "string" || id.trim() === "") continue;
-      const name = (item as { name?: unknown }).name;
-      models.push({ id, name: typeof name === "string" && name !== "" ? name : id, provider: NEAR_PROVIDER });
-    }
-    return models;
-  } catch {
-    return []; // timeout / refused / malformed → declared set only
-  } finally {
-    clearTimeout(timer);
-  }
+async function probeGatewayModels(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
+  const gateways = readCustomGatewayProviders(agentDir);
+  if (gateways.length === 0) return [];
+  const perProvider = await Promise.all(
+    gateways.map(async ({ provider, baseUrl }) => {
+      const key = await authStorage.getApiKey(provider);
+      if (key === undefined) return []; // provider not configured → nothing to probe
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), GATEWAY_PROBE_TIMEOUT_MS);
+      try {
+        const res = await fetch(gatewayModelsUrl(baseUrl), { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
+        if (!res.ok) return [];
+        const body = (await res.json()) as { data?: unknown };
+        if (typeof body !== "object" || body === null || !Array.isArray(body.data)) return [];
+        const models: ModelCatalogEntry[] = [];
+        for (const item of body.data) {
+          if (typeof item !== "object" || item === null) continue;
+          const id = (item as { id?: unknown }).id;
+          if (typeof id !== "string" || id.trim() === "") continue;
+          const name = (item as { name?: unknown }).name;
+          models.push({ id, name: typeof name === "string" && name !== "" ? name : id, provider });
+        }
+        return models;
+      } catch {
+        return []; // timeout / refused / malformed → declared set only
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  return perProvider.flat();
 }
 
-/** Cached-per-build entry point: one gateway probe per agent dir per process. */
-function probeNearGatewayCached(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
-  const cached = nearProbeCache.get(agentDir);
+/** Cached-per-build entry point: one combined probe pass per agent dir per process. */
+function probeGatewayCached(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
+  const cached = gatewayProbeCache.get(agentDir);
   if (cached !== undefined) return cached;
-  const probing = probeNearGatewayModels(agentDir, authStorage).catch(() => [] as ModelCatalogEntry[]);
-  nearProbeCache.set(agentDir, probing);
+  const probing = probeGatewayModels(agentDir, authStorage).catch(() => [] as ModelCatalogEntry[]);
+  gatewayProbeCache.set(agentDir, probing);
   return probing;
 }
 
-/** Declared catalog first, then probed near models not already present (dedup by provider/id). */
-function mergeNearProbedModels(declared: ModelCatalogEntry[], probed: ModelCatalogEntry[]): ModelCatalogEntry[] {
+/** Declared catalog first, then probed gateway models not already present (dedup by provider/id). */
+function mergeProbedModels(declared: ModelCatalogEntry[], probed: ModelCatalogEntry[]): ModelCatalogEntry[] {
   if (probed.length === 0) return declared;
   const seen = new Set(declared.map((model) => `${model.provider}/${model.id}`));
   const merged = [...declared];

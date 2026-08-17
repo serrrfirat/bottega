@@ -5,15 +5,16 @@ import { join } from "node:path";
 import { listAvailableModels, resolveModelPin, type ModelCatalogEntry } from "./model-pin";
 
 /**
- * Issue #194: the near provider's catalog is probed from the gateway's
- * /v1/models and merged into listAvailableModels (hermetic — a stub
- * gateway stands in for cloud-api.near.ai), and the provider-unqualified
- * resolution rule prefers near (the working deepseek provider) over ties,
- * never opencode-go's #78-broken deepseek by default.
+ * Issue #194 (generalized): every custom openai-completions gateway
+ * declared in the agent dir's models.yml — near, openai, anthropic — is
+ * probed from its /v1/models and merged into listAvailableModels
+ * (hermetic — stub gateways stand in for the real hosts), and the
+ * provider-unqualified resolution rule prefers near (the working deepseek
+ * provider) over ties, never opencode-go's #78-broken deepseek by default.
  */
 
-/** A stub near gateway: random localhost port + a fetch handler, stopped after the suite. */
-interface NearGatewayStub {
+/** A stub gateway: random localhost port + a fetch handler, stopped after the suite. */
+interface GatewayStub {
   port: number;
   stop: () => void;
 }
@@ -26,8 +27,8 @@ function agentDir(modelsYml: string): string {
   return dir;
 }
 
-const stubs: NearGatewayStub[] = [];
-function stubNearGateway(handler: (req: Request) => Response | Promise<Response>): NearGatewayStub {
+const stubs: GatewayStub[] = [];
+function stubGateway(handler: (req: Request) => Response | Promise<Response>): GatewayStub {
   const server = Bun.serve({ port: 0, fetch: handler });
   const port = server.port;
   if (port === undefined) throw new Error("stub gateway did not bind a port");
@@ -40,6 +41,8 @@ afterAll(() => {
   for (const stub of stubs) stub.stop();
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+  delete process.env.BOTTEGA_TEST_OPENAI_API_KEY;
+  delete process.env.BOTTEGA_TEST_ANTHROPIC_API_KEY;
 });
 
 /** The declared near model every test agent dir ships (the data/omp-agent shape). */
@@ -74,7 +77,7 @@ describe("listAvailableModels near gateway probe (issue #194)", () => {
   test("a live gateway list merges with the declared set — declared first, deduped, cached per build", async () => {
     process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
     const requests: Array<{ url: string; auth: string | null }> = [];
-    const stub = stubNearGateway(async (req) => {
+    const stub = stubGateway(async (req) => {
       requests.push({ url: req.url, auth: req.headers.get("authorization") });
       return Response.json({ object: "list", data: GATEWAY_MODELS });
     });
@@ -103,7 +106,7 @@ describe("listAvailableModels near gateway probe (issue #194)", () => {
 
   test("a failing probe fails closed — the declared set stands, no partial catalog", async () => {
     process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
-    const stub = stubNearGateway(() => new Response("gateway exploded", { status: 500 }));
+    const stub = stubGateway(() => new Response("gateway exploded", { status: 500 }));
     const dir = agentDir(nearModelsYml(`http://127.0.0.1:${stub.port}/v1`, "BOTTEGA_TEST_NEAR_API_KEY"));
 
     const catalog = await listAvailableModels(dir);
@@ -116,6 +119,104 @@ describe("listAvailableModels near gateway probe (issue #194)", () => {
     const dir = agentDir("providers:\n  opencode-go:\n    apiKey: OPENCODE_API_KEY\n");
     const catalog = await listAvailableModels(dir);
     expect(nearEntries(catalog)).toHaveLength(0);
+  });
+
+  test("every custom openai-completions gateway is probed with its own key; gateway-only ids merge under their own provider", async () => {
+    process.env.BOTTEGA_TEST_OPENAI_API_KEY = "openai-stub-key";
+    process.env.BOTTEGA_TEST_ANTHROPIC_API_KEY = "anthropic-stub-key";
+    const requests: Array<{ url: string; auth: string | null }> = [];
+    const openaiStub = stubGateway(async (req) => {
+      requests.push({ url: req.url, auth: req.headers.get("authorization") });
+      return Response.json({
+        object: "list",
+        data: [
+          { id: "gpt-5.9-beta", name: "GPT 5.9 Beta" }, // not in the SDK's bundled openai catalog — probe-only
+          { id: "gpt-5-mini", name: "GPT 5 Mini" }, // the declared anchor — must dedupe
+        ],
+      });
+    });
+    const anthropicStub = stubGateway(async (req) => {
+      requests.push({ url: req.url, auth: req.headers.get("authorization") });
+      return Response.json({ object: "list", data: [{ id: "claude-sonnet-4-9", name: "Claude Sonnet 4.9" }] });
+    });
+    const dir = agentDir(`providers:
+  openai:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:${openaiStub.port}/v1"
+    apiKey: BOTTEGA_TEST_OPENAI_API_KEY
+    models:
+      - id: "gpt-5-mini"
+        name: "GPT-5 Mini"
+        contextWindow: 400000
+        maxTokens: 128000
+  anthropic:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:${anthropicStub.port}/v1"
+    apiKey: BOTTEGA_TEST_ANTHROPIC_API_KEY
+    models:
+      - id: "claude-sonnet-4-5"
+        name: "Claude Sonnet 4.5"
+        contextWindow: 200000
+        maxTokens: 64000
+`);
+
+    const catalog = await listAvailableModels(dir);
+    const openai = catalog.filter((m) => m.provider === "openai");
+    const anthropic = catalog.filter((m) => m.provider === "anthropic");
+
+    // The declared anchors keep their declared names (winning over the
+    // SDK's bundled entry for the same id)…
+    expect(openai).toContainEqual({ id: "gpt-5-mini", name: "GPT-5 Mini", provider: "openai" });
+    expect(anthropic).toContainEqual({ id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic" });
+    // …each anchor appears exactly once (declared + probed dedupe)…
+    expect(openai.filter((m) => m.id === "gpt-5-mini")).toHaveLength(1);
+    // …and the gateway-only ids merged under THEIR provider.
+    expect(openai).toContainEqual({ id: "gpt-5.9-beta", name: "GPT 5.9 Beta", provider: "openai" });
+    expect(anthropic).toContainEqual({ id: "claude-sonnet-4-9", name: "Claude Sonnet 4.9", provider: "anthropic" });
+
+    // Each probe hit its own gateway's /v1/models with its own resolved key.
+    expect(requests).toHaveLength(2);
+    const authByUrl = new Map(requests.map((r) => [r.url, r.auth]));
+    expect(authByUrl.get(`http://127.0.0.1:${openaiStub.port}/v1/models`)).toBe("Bearer openai-stub-key");
+    expect(authByUrl.get(`http://127.0.0.1:${anthropicStub.port}/v1/models`)).toBe("Bearer anthropic-stub-key");
+  });
+
+  test("a failing gateway probe fails closed PER provider — its gateway-only ids stay out, healthy gateways still merge", async () => {
+    process.env.BOTTEGA_TEST_OPENAI_API_KEY = "openai-stub-key";
+    process.env.BOTTEGA_TEST_ANTHROPIC_API_KEY = "anthropic-stub-key";
+    const openaiStub = stubGateway(() => new Response("gateway exploded", { status: 500 }));
+    const anthropicStub = stubGateway(async () => Response.json({ object: "list", data: [{ id: "claude-sonnet-4-9", name: "Claude Sonnet 4.9" }] }));
+    const dir = agentDir(`providers:
+  openai:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:${openaiStub.port}/v1"
+    apiKey: BOTTEGA_TEST_OPENAI_API_KEY
+    models:
+      - id: "gpt-5-mini"
+        name: "GPT-5 Mini"
+        contextWindow: 400000
+        maxTokens: 128000
+  anthropic:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:${anthropicStub.port}/v1"
+    apiKey: BOTTEGA_TEST_ANTHROPIC_API_KEY
+    models:
+      - id: "claude-sonnet-4-5"
+        name: "Claude Sonnet 4.5"
+        contextWindow: 200000
+        maxTokens: 64000
+`);
+
+    const catalog = await listAvailableModels(dir);
+    const openai = catalog.filter((m) => m.provider === "openai");
+    const anthropic = catalog.filter((m) => m.provider === "anthropic");
+
+    // The dead openai gateway leaked nothing — its gateway-only id is absent,
+    // while the declared anchor (and the SDK bundled set) still stands.
+    expect(openai).toContainEqual({ id: "gpt-5-mini", name: "GPT-5 Mini", provider: "openai" });
+    expect(openai.some((m) => m.id === "gpt-5.9-beta")).toBe(false);
+    // The healthy anthropic gateway still merged its live list.
+    expect(anthropic).toContainEqual({ id: "claude-sonnet-4-9", name: "Claude Sonnet 4.9", provider: "anthropic" });
   });
 });
 

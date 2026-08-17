@@ -10,11 +10,12 @@
  * left in place, so a deployment without model settings is unchanged.
  *
  * The generated file keeps the template's provider skeleton (opencode-go
- * primary, NEAR fallback) and lists the configured model ids
- * (models.default/fast/reasoning, deduped, order-stable) under the NEAR
- * provider — the catalog the SDK can hand to sessions. Role selection
- * (which id a session uses for default/fast/reasoning) is the session
- * driver's concern (issue #64 model_settings), not this file's.
+ * primary, NEAR fallback, plus the openai/anthropic custom gateways) and
+ * lists the configured model ids (models.default/fast/reasoning, deduped,
+ * order-stable) under the NEAR provider — the catalog the SDK can hand to
+ * sessions. Role selection (which id a session uses for default/fast/
+ * reasoning) is the session driver's concern (issue #64 model_settings),
+ * not this file's.
  */
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -86,6 +87,28 @@ providers:
     apiKey: NEAR_API_KEY
     models:
 ${modelLines}
+  # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Declared anchor +
+  # gateway probe (listAvailableModels) for the full live list.
+  openai:
+    api: openai-completions
+    baseUrl: "https://api.openai.com/v1"
+    apiKey: OPENAI_API_KEY
+    models:
+      - id: "gpt-5-mini"
+        name: "gpt-5-mini"
+        contextWindow: 400000
+        maxTokens: 128000
+  # Anthropic (Claude): OpenAI-compatible endpoint
+  # (docs.anthropic.com/en/api/openai-sdk). Same pattern as near/openai.
+  anthropic:
+    api: openai-completions
+    baseUrl: "https://api.anthropic.com/v1"
+    apiKey: ANTHROPIC_API_KEY
+    models:
+      - id: "claude-sonnet-4-5"
+        name: "claude-sonnet-4-5"
+        contextWindow: 200000
+        maxTokens: 64000
 `;
 }
 

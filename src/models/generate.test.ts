@@ -39,11 +39,19 @@ describe("renderModelsConfig (issue #67)", () => {
     expect(text).toContain("baseUrl: \"https://cloud-api.near.ai/v1\"");
     expect(text).toContain('id: "zai-org/GLM-5.1-FP8"');
     expect(text).toContain('id: "acme/chat"');
-    // Dedup: reasoning repeats default → listed once.
+    // The openai/anthropic gateway skeleton survives settings regeneration.
+    expect(text).toContain("baseUrl: \"https://api.openai.com/v1\"");
+    expect(text).toContain('apiKey: OPENAI_API_KEY');
+    expect(text).toContain('id: "gpt-5-mini"');
+    expect(text).toContain("baseUrl: \"https://api.anthropic.com/v1\"");
+    expect(text).toContain('apiKey: ANTHROPIC_API_KEY');
+    expect(text).toContain('id: "claude-sonnet-4-5"');
+    // Dedup: reasoning repeats default → listed once under near (the
+    // openai/anthropic anchors add their own id lines, which is expected).
     const yaml2 = renderModelsConfig({
       models: { default: "zai-org/GLM-5.1-FP8", reasoning: "zai-org/GLM-5.1-FP8" },
     }) as string;
-    expect(yaml2.match(/id: /g)?.length).toBe(1);
+    expect(yaml2.match(/id: "zai-org\/GLM-5\.1-FP8"/g)?.length).toBe(1);
   });
 });
 
