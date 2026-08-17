@@ -128,6 +128,15 @@ export interface AgentSessionDriver {
    */
   setModelRole?(role: ModelRole): Promise<ModelRoleSwitchResult>;
   /**
+   * Turn-start model hot-swap (issue #189): re-applies the "default" role
+   * against the CURRENT org/space settings so a settings change takes
+   * effect on the very next turn — no session restart. The caller (space
+   * service) invokes this BEFORE opening a fresh turn; drivers that cannot
+   * switch mid-session (ACP) omit it and the caller skips it. Best-effort:
+   * failures are logged and the turn proceeds on the current model.
+   */
+  reapplyDefaultModelRole?(): Promise<void>;
+  /**
    * The principal bound to the CURRENT turn (issue #152): the user whose
    * message started the in-flight turn. Bound when a fresh turn begins,
    * unchanged by steers/follow-ups, cleared when the turn ends. Undefined
@@ -483,6 +492,23 @@ export function opencodeToolNameMap(names: readonly string[]): Map<string, strin
 export function withOpencodeSafeName<TDef extends ToolDefinition>(def: TDef): TDef {
   const name = opencodeSafeToolName(def.name);
   return name === def.name ? def : { ...def, name, label: name };
+}
+
+/**
+ * Issue #183: the SDK's fresh prompt can throw two "prior run did not
+ * settle" failures — the immediate `AgentBusyError` (a run is streaming at
+ * prompt entry) and, after the SDK's internal 30s busy-wait, the
+ * "Timed out waiting for prior agent run to finish before prompting."
+ * error from turn-recovery. Both mean a ghost run outlived its turn and
+ * the session is wedged: the driver must recover (abort + retry), never
+ * treat them as a silent no-reply.
+ */
+export function isBusySettlementError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.name === "AgentBusyError" ||
+    /prior agent run to finish before prompting/.test(err.message)
+  );
 }
 
 /**
@@ -1027,6 +1053,37 @@ export class OmpSessionDriver implements AgentSessionDriver {
    * re-identify the running turn's credential lookups.
    */
   #turnPrincipal: string | undefined;
+  /**
+   * True while the driver's OWN fresh (opening) prompt is pending — the
+   * whole turn, all tool rounds included (issue #183). Steers/follow-ups
+   * are only legit mid-turn: when the session reports streaming but NO
+   * fresh turn of ours is pending, the streaming run is a ghost
+   * continuation that never settled (stream/panel path) — steering into it
+   * would queue the message into a dead run (silent no-reply), so the
+   * driver aborts the ghost and runs fresh instead.
+   */
+  #freshTurnPending = false;
+  /**
+   * The model role the `use_model` tool last applied (issue #189). A
+   * non-default role (fast/reasoning) granted by use_model wins for the
+   * turn it targets: the turn-start default re-apply is skipped ONCE so the
+   * switch actually runs, then re-evaluation resumes — the following turn
+   * start re-applies the settings default. `undefined`/`"default"` → no
+   * override in force. Set on the applied path of setModelRole (the
+   * executor's work-item pin rides the same seam and is preserved the same
+   * way).
+   */
+  #modelRoleOverride: ModelRole | undefined;
+  /**
+   * True while a turn-start model re-apply (issue #189) is in flight — the
+   * caller (space service) invokes {@link reapplyDefaultModelRole} before
+   * opening a fresh turn, and the seam flips this synchronously so a
+   * concurrent prompt steers into the opening turn instead of opening a
+   * second one (the driver's isStreaming() includes it for the same
+   * reason). Cleared in the seam's finally — the window is only the
+   * reapply's own awaits.
+   */
+  #turnReapplyPending = false;
 
   constructor(deps: {
     spaceId: string;
@@ -1097,33 +1154,108 @@ export class OmpSessionDriver implements AgentSessionDriver {
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     this.#silentTurn = opts?.silent ?? false;
     try {
-      if (this.#session.isStreaming) {
+      if (this.#session.isStreaming || this.#turnReapplyPending) {
         // Mid-turn: the running turn keeps its principal. The SDK's
         // isStreaming flips synchronously inside the prompt() call below,
         // so any prompt racing this one observes it and steers instead —
-        // only the message that OPENS a turn binds (issue #152).
-        if (opts?.streamingBehavior === "followUp") {
+        // only the message that OPENS a turn binds (issue #152). A fresh
+        // turn whose model re-apply is still running (issue #189: the
+        // service invokes reapplyDefaultModelRole() before prompt()) is
+        // equally in-flight — that seam flips `#turnReapplyPending`
+        // synchronously, so a racing prompt still steers into the opening
+        // turn instead of opening a second one.
+        //
+        // Issue #183: when the session reports streaming but NO fresh turn
+        // of ours is pending, the streaming run is a GHOST — a continuation
+        // (e.g. a queued steer drain after a stream/panel turn) that never
+        // settled. Steering into it would queue this message into a dead
+        // run: a silent no-reply. Force-settle the ghost (abort) and run
+        // this message as a FRESH turn instead — loud log, never silent.
+        if (!this.#freshTurnPending && this.#session.isStreaming) {
+          console.error(
+            `[agent-driver] session reports streaming with no fresh turn pending in ${this.#spaceId} — aborting the ghost run and starting a fresh turn (issue #183)`,
+          );
+          await this.#session.abort();
+        } else if (opts?.streamingBehavior === "followUp") {
           await this.#session.followUp(text);
+          return;
         } else {
           await this.#session.steer(text);
+          return;
         }
-      } else {
-        // Fresh turn: capture the inbound principal with the turn.
-        this.#turnPrincipal = opts?.principal;
-        try {
-          await this.#session.prompt(text);
-        } finally {
-          // The turn truly ends when the OPENING prompt resolves. The SDK's
-          // agent loop emits turn_end after EVERY tool round (willContinue
-          // true), so clearing here — never in the turn_end event handler —
-          // keeps the binding for later rounds of the same turn (issue
-          // #178): a continued or retried tool call must carry the turn's
-          // principal, not fall back to the bridge's "agent" default.
-          this.#turnPrincipal = undefined;
-        }
+      }
+      // Fresh turn: capture the inbound principal with the turn.
+      this.#turnPrincipal = opts?.principal;
+      this.#freshTurnPending = true;
+      try {
+        // Issue #183: the opening prompt must leave the session SETTLED —
+        // the busy-wait recovery + the post-turn settlement check below
+        // guarantee the next prompt never hits the SDK's busy timeout.
+        await this.#runFreshTurn(text);
+      } finally {
+        // The turn truly ends when the OPENING prompt resolves. The SDK's
+        // agent loop emits turn_end after EVERY tool round (willContinue
+        // true), so clearing here — never in the turn_end event handler —
+        // keeps the binding for later rounds of the same turn (issue
+        // #178): a continued or retried tool call must carry the turn's
+        // principal, not fall back to the bridge's "agent" default.
+        this.#turnPrincipal = undefined;
+        this.#freshTurnPending = false;
       }
     } finally {
       this.#silentTurn = false;
+    }
+  }
+
+  /**
+   * Runs a FRESH turn with a run-settlement guarantee (issue #183). The
+   * SDK's fresh prompt can throw `AgentBusyError` (a run is streaming at
+   * prompt entry) or, after the SDK's internal 30s busy-wait, the
+   * "Timed out waiting for prior agent run to finish before prompting."
+   * error — both mean a prior agent run (e.g. a ghost continuation from the
+   * stream/panel path) never settled, and the session would stay wedged for
+   * every later message. Recovery: log the reason loudly, abort the stale
+   * run (the SDK's abort force-settles it), and retry the turn ONCE. If the
+   * retry also fails busy, surface the reason through the driver error
+   * event (the presenter replaces the phrase with it) — never a silent
+   * no-reply. After the prompt resolves, a session that STILL reports
+   * streaming is a ghost run that outlived its turn: it is aborted too, so
+   * the next prompt never busy-waits.
+   */
+  async #runFreshTurn(text: string): Promise<void> {
+    try {
+      await this.#session.prompt(text);
+    } catch (err) {
+      if (!isBusySettlementError(err)) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[agent-driver] prior agent run did not settle before prompting in ${this.#spaceId}: ${reason} — aborting the stale run and retrying once`,
+      );
+      await this.#session.abort();
+      try {
+        await this.#session.prompt(text);
+      } catch (retryErr) {
+        // The session stayed wedged even after the forced settle: surface
+        // the reason loudly (the presenter shows it) and rethrow.
+        const retryReason = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        console.error(
+          `[agent-driver] session still busy after aborting the stale run in ${this.#spaceId}: ${retryReason}`,
+        );
+        this.#emitter.emit("error", {
+          spaceId: this.#spaceId,
+          message: `prior agent run did not settle: ${retryReason}`,
+        });
+        throw retryErr;
+      }
+    }
+    // A turn's run must ALWAYS settle: a session that still reports
+    // streaming after the opening prompt (or its retry) resolved is a ghost
+    // run that outlived its turn — abort it (issue #183).
+    if (this.#session.isStreaming) {
+      console.error(
+        `[agent-driver] agent run did not settle after the turn in ${this.#spaceId} — aborting the stale run`,
+      );
+      await this.#session.abort();
     }
   }
 
@@ -1132,12 +1264,72 @@ export class OmpSessionDriver implements AgentSessionDriver {
     return this.#turnPrincipal;
   }
 
+  /**
+   * Turn-start model hot-swap (issue #189): re-applies the space's
+   * "default" model role against the CURRENT org/space settings so a
+   * settings change takes effect on the very next turn — no session
+   * restart. The space service calls this BEFORE opening a fresh turn
+   * (never mid-turn: use_model switches must survive for their turn). The
+   * seam flips `#turnReapplyPending` synchronously so a concurrent prompt
+   * steers into the opening turn instead of opening a second one.
+   * Best-effort by design: any failure is logged and swallowed — a model
+   * re-apply must never turn a user's message into a silent no-reply (the
+   * turn proceeds on the session's current model).
+   */
+  async reapplyDefaultModelRole(): Promise<void> {
+    this.#turnReapplyPending = true;
+    try {
+      // A pending use_model switch (fast/reasoning) wins for THIS turn: the
+      // re-apply is skipped once so the switch actually runs; the following
+      // turn start re-evaluates default against the settings.
+      const override = this.#modelRoleOverride;
+      this.#modelRoleOverride = undefined;
+      if (override === undefined || override === "default") {
+        await this.#reapplyDefaultRoleAtTurnStart();
+      }
+    } finally {
+      this.#turnReapplyPending = false;
+    }
+  }
+
+  /**
+   * Resolves the "default" role against the CURRENT org/space settings (the
+   * getModelSettings seam) and applies it through the #64 setModel path when
+   * it differs from the session's active model/effort — no churn when
+   * unchanged. A default that cannot be applied (e.g. its id is not in the
+   * session's live catalog — a mid-run settings change to a model the
+   * boot-time models.yml does not carry) is logged and skipped.
+   */
+  async #reapplyDefaultRoleAtTurnStart(): Promise<void> {
+    try {
+      const settings = await this.#getModelSettings(this.#spaceId);
+      const target = resolveRoleTarget("default", settings);
+      if (!target.modelId && !target.thinkingLevel) return; // nothing configured
+      const current = this.#session.model;
+      const modelMatches =
+        target.modelId === undefined ||
+        (current !== undefined &&
+          (current.id === target.modelId || `${current.provider}/${current.id}` === target.modelId));
+      const levelMatches =
+        target.thinkingLevel === undefined || this.#session.thinkingLevel === target.thinkingLevel;
+      if (modelMatches && levelMatches) return; // already running the resolved default
+      await this.setModelRole("default");
+    } catch (err) {
+      console.error(
+        `[agent-driver] turn-start default model re-apply failed in ${this.#spaceId} — continuing with the current model: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   async abort(): Promise<void> {
     await this.#session.abort();
   }
 
   isStreaming(): boolean {
-    return this.#session.isStreaming;
+    // A fresh turn whose model re-apply is still running counts as busy
+    // (issue #189): the caller's stream-vs-fresh decision and racing
+    // prompts must steer into the opening turn, never open a second one.
+    return this.#session.isStreaming || this.#turnReapplyPending;
   }
 
   on(event: DriverEvent, cb: (data: unknown) => void): () => void {
@@ -1180,6 +1372,10 @@ export class OmpSessionDriver implements AgentSessionDriver {
     } else if (thinkingLevel !== undefined) {
       this.#session.setThinkingLevel(thinkingLevel);
     }
+    // The applied switch is the model the session now runs; a non-default
+    // role granted here (use_model / work-item pin) wins for the next turn
+    // start before the default re-apply resumes (issue #189).
+    this.#modelRoleOverride = role;
     return {
       applied: true,
       role,

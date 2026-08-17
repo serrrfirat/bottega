@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -554,6 +554,237 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
   });
 });
 
+describe("OmpSessionDriver turn-start model hot-swap (issue #189)", () => {
+  /**
+   * Stub SDK session with model state: `setModel`/`setThinkingLevel` update
+   * the active model/effort (what the driver's churn check reads), and the
+   * current model starts where the caller says (the session-creation
+   * resolution). Records every switch and prompt.
+   */
+  function statefulStubSession(initialModel: { id: string; provider: string } | null, models: Array<{ id: string; provider: string }>, initialLevel?: string) {
+    let activeModel = initialModel;
+    let activeLevel = initialLevel;
+    const setModelCalls: Array<{ modelId: string; thinkingLevel?: string; persist?: boolean }> = [];
+    const thinkingCalls: string[] = [];
+    const promptCalls: string[] = [];
+    const session = {
+      getAvailableModels: () =>
+        models.map((m) => ({ id: m.id, provider: m.provider, name: m.id, api: "openai-completions", baseUrl: "http://x", reasoning: true, input: ["text"] })),
+      get model() {
+        return activeModel;
+      },
+      get thinkingLevel() {
+        return activeLevel;
+      },
+      setModel: async (_model: { id: string; provider: string }, _role?: string, options?: { thinkingLevel?: string; persist?: boolean }) => {
+        activeModel = { id: _model.id, provider: _model.provider };
+        if (options?.thinkingLevel !== undefined) activeLevel = options.thinkingLevel;
+        setModelCalls.push({ modelId: _model.id, thinkingLevel: options?.thinkingLevel, persist: options?.persist });
+        return { switched: true };
+      },
+      setThinkingLevel: (level?: string) => {
+        activeLevel = level;
+        thinkingCalls.push(level ?? "");
+      },
+      subscribe: () => () => {},
+      beginDispose: () => {},
+      dispose: async () => {},
+      isStreaming: false,
+      prompt: async (text: string) => void promptCalls.push(text),
+      steer: async () => {},
+      followUp: async () => {},
+      abort: async () => {},
+    } as unknown as AgentSession;
+    return { session, setModelCalls, thinkingCalls, promptCalls };
+  }
+
+  function hotSwapDriver(settings: SpaceModelSettings, initialModel: { id: string; provider: string } | null, models: Array<{ id: string; provider: string }>, initialLevel?: string) {
+    const stub = statefulStubSession(initialModel, models, initialLevel);
+    const driver = new OmpSessionDriver({
+      spaceId: "slack:C1",
+      session: stub.session,
+      onOutput: () => {},
+      getModelSettings: async () => settings,
+    });
+    return { driver, ...stub };
+  }
+
+  test("changing the org default model applies it on the very next turn — no session restart", async () => {
+    const settings: SpaceModelSettings = { model: "model-a" };
+    const { driver, setModelCalls, promptCalls } = hotSwapDriver(
+      settings,
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }, { id: "model-b", provider: "opencode-go" }],
+    );
+    // The space service's fresh-turn sequence: re-apply, then open the turn.
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("hello");
+    // The session already runs the resolved default: no churn.
+    expect(setModelCalls).toEqual([]);
+    expect(promptCalls).toEqual(["hello"]);
+
+    // The org default changes while the space is live…
+    settings.model = "model-b";
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("hello again");
+    // …and the very next turn re-applies it (hot-swap, no restart).
+    expect(setModelCalls).toEqual([{ modelId: "model-b", thinkingLevel: undefined, persist: false }]);
+    expect(promptCalls).toEqual(["hello", "hello again"]);
+  });
+
+  test("unchanged settings → no re-application churn across turns", async () => {
+    const { driver, setModelCalls, thinkingCalls } = hotSwapDriver(
+      // Qualified id form: the churn check matches via `provider/id`.
+      { model: "opencode-go/model-a", reasoning_effort: "medium" },
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }],
+      "medium", // the session already runs the resolved default effort
+    );
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("one");
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("two");
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("three");
+    // The session already runs the resolved default model AND effort: the
+    // turn-start re-apply is a pure no-op every time.
+    expect(setModelCalls).toEqual([]);
+    expect(thinkingCalls).toEqual([]);
+  });
+
+  test("use_model (fast/reasoning) still wins for its turn; the next turn re-applies default", async () => {
+    const { driver, setModelCalls, promptCalls } = hotSwapDriver(
+      { model: "model-a", fast_model: "fast-model" },
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }, { id: "fast-model", provider: "opencode-go" }],
+    );
+    // Mid-turn the agent switches to fast via use_model (#64).
+    const result = await driver.setModelRole("fast");
+    expect(result.applied).toBe(true);
+
+    // The next turn runs FAST: the turn-start default re-apply is skipped
+    // once so the switch actually takes effect (no churn against it).
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("fast turn");
+    expect(setModelCalls).toEqual([{ modelId: "fast-model", thinkingLevel: "low", persist: false }]);
+
+    // The turn AFTER that re-evaluates against the settings and re-applies
+    // the default model.
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("back to default");
+    expect(setModelCalls).toEqual([
+      { modelId: "fast-model", thinkingLevel: "low", persist: false },
+      { modelId: "model-a", thinkingLevel: undefined, persist: false },
+    ]);
+    expect(promptCalls).toEqual(["fast turn", "back to default"]);
+  });
+
+  test("the first turn applies the settings default when the session-creation model differs", async () => {
+    // The session was created on the agent-dir pin model; the space's
+    // settings name a different default. The first turn hot-swaps it.
+    const { driver, setModelCalls } = hotSwapDriver(
+      { model: "model-a" },
+      { id: "pin-default", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }],
+    );
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("first turn");
+    expect(setModelCalls).toEqual([{ modelId: "model-a", thinkingLevel: undefined, persist: false }]);
+  });
+
+  test("an effort-only settings change re-applies the model at the new effort without churn after", async () => {
+    const settings: SpaceModelSettings = { model: "model-a", reasoning_effort: "high" };
+    const { driver, setModelCalls, thinkingCalls } = hotSwapDriver(
+      settings,
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }],
+    );
+    // Session runs model-a at the driver's default low effort; the space
+    // pins high. The turn start re-applies the default role (the #64 path
+    // carries the effort with the model) — one switch, no further churn.
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("high effort");
+    expect(setModelCalls).toEqual([{ modelId: "model-a", thinkingLevel: "high", persist: false }]);
+    expect(thinkingCalls).toEqual([]);
+    await driver.reapplyDefaultModelRole();
+    await driver.prompt("still high");
+    expect(setModelCalls).toEqual([{ modelId: "model-a", thinkingLevel: "high", persist: false }]); // unchanged → no re-application
+  });
+
+  test("a default the session cannot apply is logged and skipped — the turn still runs", async () => {
+    const { driver, setModelCalls, promptCalls } = hotSwapDriver(
+      { model: "ghost-model" },
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }],
+    );
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(driver.reapplyDefaultModelRole()).resolves.toBeUndefined();
+      await expect(driver.prompt("still answers")).resolves.toBeUndefined();
+      // No switch, no silent no-reply: the turn ran on the current model.
+      expect(setModelCalls).toEqual([]);
+      expect(promptCalls).toEqual(["still answers"]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("turn-start default model re-apply failed in slack:C1"),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("the seam marks the session in-flight while it runs — a concurrent message steers, never a second fresh turn", async () => {
+    let releaseSettings: ((settings: SpaceModelSettings) => void) | undefined;
+    const settingsPromise = new Promise<SpaceModelSettings>((resolve) => {
+      releaseSettings = resolve;
+    });
+    const stub = statefulStubSession(
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }, { id: "model-b", provider: "opencode-go" }],
+    );
+    const driver = new OmpSessionDriver({
+      spaceId: "slack:C1",
+      session: stub.session,
+      onOutput: () => {},
+      getModelSettings: async () => settingsPromise, // held: the reapply is in flight
+    });
+    const reapply = driver.reapplyDefaultModelRole();
+    // The reapply flips the driver's in-flight view SYNCHRONOUSLY, so the
+    // service's stream-vs-fresh decision (and any racing prompt) steers
+    // into the opening turn instead of opening a second one.
+    expect(driver.isStreaming()).toBe(true);
+    releaseSettings?.({ model: "model-b" });
+    await reapply;
+    expect(driver.isStreaming()).toBe(false);
+    expect(stub.setModelCalls).toEqual([{ modelId: "model-b", thinkingLevel: undefined, persist: false }]);
+  });
+
+  test("a failing settings read never blocks the turn — best-effort, logged", async () => {
+    const stub = statefulStubSession(
+      { id: "model-a", provider: "opencode-go" },
+      [{ id: "model-a", provider: "opencode-go" }],
+    );
+    const driver = new OmpSessionDriver({
+      spaceId: "slack:C1",
+      session: stub.session,
+      onOutput: () => {},
+      getModelSettings: async () => {
+        throw new Error("settings store unavailable");
+      },
+    });
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The seam swallows the settings-read failure: the service always
+      // proceeds to open the turn on the session's current model.
+      await expect(driver.reapplyDefaultModelRole()).resolves.toBeUndefined();
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("turn-start default model re-apply failed in slack:C1"),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
 describe("OmpSessionDriver error surfacing (issue #78)", () => {
   /** Stub SDK session exposing the subscribe listener for event injection. */
   function stubSession() {
@@ -884,6 +1115,150 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
     await opening;
     expect(driver.getTurnPrincipal()).toBeUndefined();
     store.close();
+  });
+});
+
+describe("OmpSessionDriver run settlement (issue #183)", () => {
+  /**
+   * Stub SDK session exposing the busy-wait failure the SDK throws when a
+   * prior agent run never settled: prompt() throws the SDK's
+   * "Timed out waiting for prior agent run to finish before prompting."
+   * error while the agent run is still "streaming", and the caller recovers
+   * by aborting. The stub records prompt/steer/abort calls and lets the
+   * test drive the streaming flag.
+   *
+   * - `failBusyTimes`: how many prompt() calls throw the busy error before
+   *   succeeding (the SDK's one-shot timeout; the driver aborts + retries).
+   * - `ghostAfterPrompt`: when true, a successful prompt leaves the session
+   *   STILL streaming (the run never settled — the driver must abort it).
+   */
+  function busyStubSession() {
+    let streaming = false;
+    let failBusyTimes = 0;
+    let ghostAfterPrompt = false;
+    const calls: Array<{ kind: "prompt" | "steer" | "followUp" | "abort"; text?: string }> = [];
+    const session = {
+      subscribe: () => () => {},
+      beginDispose: () => {},
+      dispose: async () => {},
+      get isStreaming() {
+        return streaming;
+      },
+      prompt: async (text: string) => {
+        calls.push({ kind: "prompt", text });
+        if (failBusyTimes > 0) {
+          failBusyTimes -= 1;
+          streaming = true; // a prior run is streaming — the SDK busy-waits then throws
+          throw new Error("Timed out waiting for prior agent run to finish before prompting.");
+        }
+        streaming = ghostAfterPrompt; // settled unless the test wants a ghost
+      },
+      steer: async (text: string) => {
+        calls.push({ kind: "steer", text });
+      },
+      followUp: async (text: string) => {
+        calls.push({ kind: "followUp", text });
+      },
+      abort: async () => {
+        calls.push({ kind: "abort" });
+        streaming = false;
+      },
+      getAvailableModels: () => [],
+    } as unknown as AgentSession;
+    return {
+      session,
+      calls,
+      setStreaming: (v: boolean) => {
+        streaming = v;
+      },
+      setFailBusy: (n: number) => {
+        failBusyTimes = n;
+      },
+      setGhostAfterPrompt: (v: boolean) => {
+        ghostAfterPrompt = v;
+      },
+    };
+  }
+
+  test("a fresh prompt that hits the SDK's busy-wait aborts the stale run and retries once — the turn still runs", async () => {
+    const { session, calls, setFailBusy } = busyStubSession();
+    const errors: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("error", (data) => errors.push(data));
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // The session reports idle, but the prior agent run never settled: the
+    // first fresh prompt throws the SDK's busy-wait timeout. The driver
+    // must recover — abort the stale run, retry once — never throw into the
+    // caller (which would be a silent no-reply for the user).
+    setFailBusy(1);
+    await expect(driver.prompt("second message", { principal: "U1" })).resolves.toBeUndefined();
+    expect(calls.filter((c) => c.kind === "abort")).toHaveLength(1);
+    expect(calls.filter((c) => c.kind === "prompt")).toHaveLength(2); // original + retry
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("prior agent run did not settle before prompting in slack:C1"),
+    );
+    // The retry RAN (no busy error surfaced, no silent no-reply).
+    expect(errors).toHaveLength(0);
+    expect(driver.getTurnPrincipal()).toBeUndefined(); // turn ended cleanly
+  });
+
+  test("a fresh prompt that stays busy even after the abort surfaces loudly via the error event", async () => {
+    const { session, calls, setFailBusy } = busyStubSession();
+    const errors: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("error", (data) => errors.push(data));
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    setFailBusy(2); // original AND the retry both hit the busy-wait
+    await expect(driver.prompt("second message", { principal: "U1" })).rejects.toThrow(
+      "Timed out waiting for prior agent run to finish before prompting.",
+    );
+    expect(calls.filter((c) => c.kind === "abort")).toHaveLength(1);
+    expect(calls.filter((c) => c.kind === "prompt")).toHaveLength(2);
+    // The reason surfaces through the driver error event (the presenter
+    // replaces the thinking phrase with it) — never a silent no-reply.
+    expect(errors).toEqual([
+      { spaceId: "slack:C1", message: expect.stringContaining("prior agent run did not settle") },
+    ]);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("session still busy after aborting"));
+  });
+
+  test("a turn that ends without settling its run is aborted loudly — the next prompt never hits the busy-wait", async () => {
+    const { session, calls, setGhostAfterPrompt } = busyStubSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // The prompt RESOLVES, but the session still reports streaming — a
+    // ghost run outlived its turn (the stream/panel path's queued
+    // continuation). The driver must abort it so the next prompt never
+    // busy-waits, and log the reason loudly.
+    setGhostAfterPrompt(true);
+    await driver.prompt("first message", { principal: "U1" });
+    expect(calls.filter((c) => c.kind === "abort")).toHaveLength(1);
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("agent run did not settle after the turn in slack:C1"),
+    );
+  });
+
+  test("steering into a ghost run (streaming, no fresh turn pending) aborts it and runs fresh — never a silent queue", async () => {
+    const { session, calls, setStreaming } = busyStubSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // A prior stream/panel turn left the session reporting streaming with
+    // NO fresh turn of ours pending: steering would queue into a dead run
+    // (silent no-reply). The driver force-settles the ghost and runs the
+    // message as a fresh turn.
+    setStreaming(true);
+    await driver.prompt("after the stream turn", { streamingBehavior: "steer", principal: "U1" });
+    expect(calls.filter((c) => c.kind === "abort")).toHaveLength(1);
+    expect(calls.filter((c) => c.kind === "steer")).toHaveLength(0); // never steered into the ghost
+    expect(calls.filter((c) => c.kind === "prompt")).toHaveLength(1); // ran fresh instead
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no fresh turn pending in slack:C1"),
+    );
+    expect(driver.getTurnPrincipal()).toBeUndefined(); // fresh turn ended cleanly
   });
 });
 

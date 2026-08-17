@@ -40,6 +40,8 @@ class FakeSession implements AgentSessionDriver {
   autoReply?: string;
   /** The principal of the current turn; mirrors the real drivers' binding (issue #152). */
   turnPrincipal: string | undefined;
+  /** reapplyDefaultModelRole invocations (issue #189): the service must call the seam before each fresh turn. */
+  reapplyCalls = 0;
 
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
@@ -47,6 +49,11 @@ class FakeSession implements AgentSessionDriver {
 
   constructor(spaceId = "slack:C1") {
     this.spaceId = spaceId;
+  }
+
+  /** Turn-start model hot-swap seam (issue #189): recorded, resolves immediately. */
+  async reapplyDefaultModelRole(): Promise<void> {
+    this.reapplyCalls += 1;
   }
 
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
@@ -603,6 +610,28 @@ describe("SpaceService session lifecycle", () => {
     expect(driver.created).toHaveLength(1);
     expect(driver.created[0].opts.spaceId).toBe("slack:C1");
     expect(driver.last().prompts).toEqual([{ text: "hello", opts: { principal: "U1" } }]);
+  });
+
+  test("a fresh turn re-applies the default model role before prompting; a steer does not (issue #189)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // Fresh turn: the service hot-swaps the default model (the driver's
+    // reapplyDefaultModelRole seam) BEFORE opening the prompt.
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    expect(session.reapplyCalls).toBe(1);
+    expect(session.prompts).toEqual([{ text: "first", opts: { principal: "U1" } }]);
+
+    // A message into a streaming turn is a STEER — the seam must NOT run
+    // again mid-turn (a use_model switch made during the turn would be
+    // clobbered by a re-apply before it ever ran).
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "second", ts: "2.1" }));
+    expect(session.reapplyCalls).toBe(1);
+    expect(session.prompts[1]!.opts?.streamingBehavior).toBe("steer");
   });
 
   test("live sessions register in the model-role registry and unregister on dispose (issue #64)", async () => {

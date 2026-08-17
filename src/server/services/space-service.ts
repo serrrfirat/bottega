@@ -328,6 +328,14 @@ export class SpaceService {
         // The principal travels WITH this turn: the driver binds it when the
         // fresh turn starts and drops it at turn_end (issue #152).
         presenter.setSteered(false);
+        // Issue #189: hot-swap the default model BEFORE the fresh turn opens
+        // — re-resolve the "default" role against the CURRENT settings and
+        // apply it when the session's active model differs (no churn when
+        // unchanged). The seam flips the driver's in-flight view
+        // synchronously, so a concurrent message steers into this opening
+        // turn instead of opening a second one. Best-effort: never blocks
+        // the turn on a model misconfiguration.
+        await live.session.reapplyDefaultModelRole?.();
         await live.session.prompt(turnText, { principal: msg.principal });
       }
     } catch (err) {
