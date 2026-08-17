@@ -56,6 +56,25 @@ rule below conflicts with a rule above, the user's explicit instructions win
   involved — that's what the emulate.dev tests are for.
 - Test through the caller, not the helper: a policy gate is covered by driving
   the extension wiring, not only the pure decision function.
+- **Definition of done: issue acceptance criteria land as caller-level
+  tests** (user-mandated, 2026-08-17, issue #174). A PR that closes a
+  feature issue must include the issue's acceptance criteria as tests at the
+  caller surface — inbound message / tool call / scheduler fire in,
+  observable effect out — in the highest hermetic tier that can express
+  them. Caller surface means driving `SpaceService.handleInboundMessage`,
+  the tool definition's `execute`, the scheduler tick, or the executor claim
+  loop — not the new private helper. Patterns to reuse:
+  `src/server/boot-wiring.test.ts` (real `main()` in a temp cwd),
+  `src/server/onboarding-boot.test.ts` (same shape, #116),
+  `src/executor.test.ts` (real store + real git + GitHub emulator), and the
+  fake-ACP fixture (`src/server/drivers/fixtures/fake-acp-server.ts`).
+  Criteria that genuinely need live infra (real Slack, real model) are never
+  silently skipped: they land as a skip-gated leg (`BOTTEGA_RUN_INTEGRATION=1`)
+  or a named canary journey, and the PR says which. Reviewer checklist line:
+  **does a test fail if the feature's headline flow breaks?** — the #149
+  question (unit tests around the delivery loop all passed while nothing
+  drove a work item to `done` through the real pipeline; `review`/`done`
+  shipped unreachable). Enforcement is review, not tooling.
 - **Chat-discovered bugs ship a hermetic regression test** (user-mandated,
   2026-08-17): a fix for a bug found in conversation must include a test that
   reproduces the exact failure (e.g. an unwired seam defaulting to a wrong
