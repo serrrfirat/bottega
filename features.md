@@ -438,6 +438,14 @@ the canary opens it via `conversations.open`).
 - **Slack only** — the org pulse observer now ships on Slack, with live
   scheduled-post verification kept as a manual deployment check. Telegram,
   Teams, and Meet remain roadmap (issue #13 is the Telegram adapter).
+- **No Slack-native thinking panel** — the Slack Agents feature
+  (`agent_view` + `assistant:write` in `slack-app-manifest.yml`) is
+  DISABLED (#184): it swallows DM visibility, rendering replies in the
+  app's agent surface instead of the DM channel. The app is a regular bot:
+  turns render as a normal message (thinking phrase + in-place edit) with
+  no panel, in DMs and channels alike. The #168 stream code stays with its
+  graceful fallback; re-enabling is a one-line manifest flip (uncomment
+  `agent_view` + restore `assistant:write`) plus an app reinstall.
 - **No mid-session model switches on ACP** — `use_model` (issue #64) works
   on the OMP driver; ACP sessions cannot switch models mid-session (the
   agent's own config governs) and the tool reports it as an error.
