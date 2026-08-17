@@ -133,7 +133,7 @@ function secondManifest(): ExtensionManifest {
     label: "Fixture History",
     tools: [
       {
-        ...base.tools[0]!,
+        ...base.tools![0],
         name: "history.current",
         description: "History for a city (fixture extension)",
       },

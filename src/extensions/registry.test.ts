@@ -63,7 +63,7 @@ describe("extension registry", () => {
   test("tool name collisions across extensions fail closed", () => {
     const registry = createExtensionRegistry();
     registry.register(fixtureManifest());
-    const collision = { ...cliManifest(), tools: [fixtureManifest().tools[0]] };
+    const collision = { ...cliManifest(), tools: [fixtureManifest().tools![0]] };
     expect(() => registry.register(collision)).toThrow(/already registered by extension "fixture.weather"/);
   });
 

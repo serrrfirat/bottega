@@ -5,13 +5,13 @@
  * audit. These tests pin the SDK surface and the failure mapping; the
  * runtime's own hermetic path lives in runtime.test.ts.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createAudit } from "../policy/audit";
@@ -23,6 +23,7 @@ import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_E
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "./runtime";
+import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
 /** Minimal structural view of an omptype schema's parse surface. */
 interface ParsableSchema {
@@ -428,5 +429,112 @@ describe("extension tool bridge", () => {
     expect((result.content[0] as { text: string }).text).toMatch(/no fixture\.weather credential is available/);
     // Nothing resolved: no boundary injection, no credential audit.
     expect(boundaryCalls).toHaveLength(0);
+  });
+});
+
+describe("extension tool bridge: tools-less manifests (issue #158)", () => {
+  const DISCOVER_ID = "discover.me";
+  const WIRE_TOOLS = [
+    { name: "search_issues", description: "Search", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+    { name: "delete_issue", description: "Delete", inputSchema: { type: "object", properties: {} } },
+  ];
+
+  beforeEach(() => {
+    // The discovery cache is process-global and keyed by manifest id +
+    // binding — hermetic tests must not observe a stale surface from an
+    // earlier test file in the same process.
+    resetToolSurfaceCache();
+  });
+
+  /** Transport serving tools/list (discovery) and tools/call (execution). */
+  function discoverableTransport(seen: { list: number; tool: string[] }) {
+    return (): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "discover-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(ListToolsRequestSchema, async () => {
+        seen.list += 1;
+        return { tools: WIRE_TOOLS };
+      });
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        seen.tool.push(request.params.name);
+        return { content: [{ type: "text", text: `ok ${request.params.name}` }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+  }
+
+  function toolsLessManifest(): ExtensionManifest {
+    return validateManifest({
+      id: DISCOVER_ID,
+      label: "Discover Me",
+      vendor: "example",
+      kind: "mcp",
+      mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
+      credentialSchema: { type: "api_key" },
+      domains: ["discover.me.test"],
+    });
+  }
+
+  test("definitions come from the resolved discovered surface: names, params, and conservative tiers", async () => {
+    const seen = { list: 0, tool: [] as string[] };
+    const manifest = toolsLessManifest();
+    const registry = createExtensionRegistry();
+    registry.register(manifest);
+    const store = createStore(":memory:");
+    await store.upsertExtensionCredential({
+      provider: DISCOVER_ID,
+      identityKey: "email:org@example.com",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 3,
+    });
+    // Boot step: resolve the surface once (discovery happens here).
+    const surfaces = await resolveExtensionSurfaces(registry.list(), {
+      mcpTransport: discoverableTransport(seen),
+    });
+    expect(seen.list).toBe(1);
+    const boundaryCalls: ExtensionCredential[] = [];
+    const runtime = createExtensionRuntime({
+      registry,
+      store,
+      audit: createAudit(store),
+      orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+      router: DenyRouter,
+      mcpTransport: discoverableTransport(seen),
+      surfaces,
+      boundary: {
+        async authorize(credential: ExtensionCredential) {
+          boundaryCalls.push(credential);
+        },
+      },
+    });
+    const definitions = extensionToolDefinitions(registry.list(), { runtime, surfaces });
+
+    // The agent sees the FULL discovered surface, never a subset.
+    expect(definitions.map((def) => def.name)).toEqual(["discover.me.search_issues", "discover.me.delete_issue"]);
+    expect(definitions[0]!.approval).toBe("read"); // read verb → read tier
+    expect(definitions[1]!.approval).toBe("exec"); // destructive verb → exec tier
+    const schema = definitions[0]!.parameters as unknown as ParsableSchema;
+    expect(schema.safeParse({ query: "repo:x" }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false); // query required
+
+    // Execution routes through the runtime: gate → ladder → boundary → the
+    // provider sees the WIRE name (providerName), not the namespaced name.
+    const result = await run(definitions[0]!, { query: "repo:x" });
+    expect(result.content).toEqual([{ type: "text", text: "ok search_issues" }]);
+    expect(seen.tool).toEqual(["search_issues"]);
+    expect(boundaryCalls).toHaveLength(1);
+    expect(boundaryCalls[0]!.provider).toBe(DISCOVER_ID);
+    // The pre-resolved surface was consumed — no second discovery.
+    expect(seen.list).toBe(1);
+  });
+
+  test("a tools-less manifest WITHOUT a resolved surface fails closed at the bridge", () => {
+    const registry = createExtensionRegistry();
+    registry.register(toolsLessManifest());
+    expect(() => extensionToolDefinitions(registry.list(), { runtime: stubRuntime })).toThrow(
+      /no pinned tools and no resolved tool surface/,
+    );
   });
 });

@@ -54,7 +54,7 @@ describe("extension manifest validation (fail closed)", () => {
     expect(manifest.id).toBe("fixture.weather");
     expect(manifest.kind).toBe("mcp");
     expect(manifest.mcp).toEqual({ serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" });
-    expect(manifest.tools[0].name).toBe("weather.current");
+    expect(manifest.tools![0].name).toBe("weather.current");
     expect(manifest.domains).toEqual(["fixture.weather.test"]);
   });
 
@@ -154,8 +154,8 @@ describe("extension manifest validation (fail closed)", () => {
 
   test("tool names must be unique, well-formed, and not reserved", () => {
     const duplicated = mutate(fixtureManifest(), ["tools"], [
-      fixtureManifest().tools[0],
-      { ...fixtureManifest().tools[0], description: "again" },
+      fixtureManifest().tools![0],
+      { ...fixtureManifest().tools![0], description: "again" },
     ]);
     expectInvalid(duplicated, "duplicate tool name");
 
@@ -182,12 +182,12 @@ describe("extension manifest validation (fail closed)", () => {
   test("providerName is optional, validated, and defaults to the manifest name (issue #148)", () => {
     // Absent → no providerName on the typed tool (falls back to name).
     const plain = validateManifest(fixtureManifest());
-    expect(plain.tools[0].providerName).toBeUndefined();
+    expect(plain.tools![0].providerName).toBeUndefined();
     // Valid providerName survives validation.
     const mapped = validateManifest(
       mutate(fixtureManifest(), ["tools", "0", "providerName"], "wire.name-tool_1"),
     );
-    expect(mapped.tools[0].providerName).toBe("wire.name-tool_1");
+    expect(mapped.tools![0].providerName).toBe("wire.name-tool_1");
     // Fail closed on malformed provider names.
     expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], ""), "providerName must be a non-empty string");
     expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], 42), "providerName must be a non-empty string");
@@ -234,5 +234,23 @@ describe("extension manifest validation (fail closed)", () => {
   test("an empty tools array is allowed (egress-only extension)", () => {
     const manifest = validateManifest({ ...fixtureManifest(), tools: [] });
     expect(manifest.tools).toEqual([]);
+  });
+
+  test("tools are OPTIONAL: a manifest without tools validates and stays tools-less (issue #158)", () => {
+    const withoutTools = JSON.parse(JSON.stringify(fixtureManifest())) as Record<string, unknown>;
+    delete withoutTools["tools"];
+    const mcp = validateManifest(withoutTools);
+    expect(mcp.tools).toBeUndefined();
+    expect(mcp.kind).toBe("mcp");
+    // Binding + credentialSchema are still required — the discoverable facts
+    // stay, the discoverable surface becomes optional.
+    expectInvalid(mutate(fixtureManifest(), ["credentialSchema"], undefined), "credentialSchema.type");
+    expectInvalid(mutate(fixtureManifest(), ["mcp"], undefined), "requires an mcp binding");
+
+    const cliWithoutTools = JSON.parse(JSON.stringify(cliManifest())) as Record<string, unknown>;
+    delete cliWithoutTools["tools"];
+    const cli = validateManifest(cliWithoutTools);
+    expect(cli.tools).toBeUndefined();
+    expect(cli.kind).toBe("cli");
   });
 });

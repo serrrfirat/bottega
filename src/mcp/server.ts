@@ -63,6 +63,7 @@ import type { Database } from "bun:sqlite";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
@@ -96,7 +97,8 @@ import {
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
 import { createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
-import type { ExtensionToolParam } from "../extensions/manifest";
+import type { ExtensionTool, ExtensionToolParam, McpBinding } from "../extensions/manifest";
+import { extensionToolSurface, toolOwnerExtensionId, type ExtensionSurfaces } from "../extensions/surface";
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
 
@@ -131,9 +133,22 @@ export interface McpExtensionsOptions {
   /** The #53 runtime every manifest tool executes through. */
   runtime: ExtensionRuntime;
   /** Registry whose manifest tools are advertised + resolved by tool name. */
-  registry: Pick<ExtensionRegistry, "list" | "extensionIdForTool">;
+  registry: Pick<ExtensionRegistry, "list">;
   /** The #52 connect capability (gate included). */
   connect: ConnectExtensionDeps;
+  /**
+   * Pre-resolved effective tool surfaces (issue #158): extensionId →
+   * pinned manifest tools or the discovered tools/list surface (see
+   * resolveExtensionSurfaces). Absent → tools-less manifests discover
+   * lazily through `mcpTransport` (cached, fail closed).
+   */
+  surfaces?: ExtensionSurfaces;
+  /**
+   * MCP transport seam for tools/list discovery of tools-less manifests
+   * (issue #158). Defaults to the production transport
+   * (src/extensions/runtime.ts); tests inject in-memory transports.
+   */
+  mcpTransport?: (binding: McpBinding) => Transport;
 }
 
 /** Flattens a parse failure into a single-line message for the client. */
@@ -411,16 +426,40 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     return { content: result.content };
   };
 
-  /** Registry manifest tools advertised on this surface (registration order). */
-  const advertisedExtensionTools = extensions
-    ? extensions.registry.list().flatMap(({ manifest }) =>
-        manifest.tools.map((tool) => ({
+  /**
+   * The advertised surface of every registered extension (registration
+   * order): pinned manifest tools, or the discovered tools/list surface for
+   * tools-less manifests (issue #158 — the agent sees the provider's real
+   * surface, never a stale subset). Discovery is cached; a failing
+   * discovery is a clear protocol error, never a silent empty list.
+   */
+  const advertisedExtensionTools = async (): Promise<
+    Array<{ name: string; description: string; inputSchema: unknown }>
+  > => {
+    if (!extensions) return [];
+    const out: Array<{ name: string; description: string; inputSchema: unknown }> = [];
+    for (const { manifest } of extensions.registry.list()) {
+      let surface: readonly ExtensionTool[];
+      try {
+        surface =
+          extensions.surfaces?.get(manifest.id) ??
+          (await extensionToolSurface(manifest, extensions.mcpTransport));
+      } catch (err) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `extension "${manifest.id}" tool surface unavailable: ${errorMessage(err)}`,
+        );
+      }
+      for (const tool of surface) {
+        out.push({
           name: tool.name,
           description: tool.description,
           inputSchema: extensionToolJsonSchema(tool.params),
-        })),
-      )
-    : [];
+        });
+      }
+    }
+    return out;
+  };
 
   const server = new Server({ name: "bottega", version: "0.1.0" }, { capabilities: { tools: {} } });
 
@@ -460,7 +499,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
                 `Extensions whose credential type is api_key require the api_key parameter.`,
               inputSchema: connectJsonSchema,
             },
-            ...advertisedExtensionTools,
+            ...(await advertisedExtensionTools()),
           ]
         : []),
     ],
@@ -473,7 +512,13 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     if (name === "session_search") return callSessionSearch(args);
     if (extensions) {
       if (name === CONNECT_EXTENSION_TOOL) return callConnect(args);
-      const extensionId = extensions.registry.extensionIdForTool(name);
+      // Issue #158: resolve the owner across the EFFECTIVE surface (pinned
+      // tools first, then discovered tools for tools-less manifests).
+      const extensionId = await toolOwnerExtensionId(
+        extensions.registry,
+        name,
+        extensions.mcpTransport,
+      );
       if (extensionId !== undefined) return callExtensionTool(extensionId, name, args);
     }
     throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);

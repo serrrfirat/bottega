@@ -194,8 +194,8 @@ export function createExtensionRegistry(snapshotsDir?: string): ExtensionRegistr
       throw new ExtensionRegistryError(`extension "${manifest.id}" is already registered`);
     }
     for (const existing of entries.values()) {
-      for (const tool of manifest.tools) {
-        if (existing.manifest.tools.some((other) => other.name === tool.name)) {
+      for (const tool of manifest.tools ?? []) {
+        if ((existing.manifest.tools ?? []).some((other) => other.name === tool.name)) {
           throw new ExtensionRegistryError(
             `tool name "${tool.name}" is already registered by extension "${existing.manifest.id}"`,
           );
@@ -220,7 +220,7 @@ export function createExtensionRegistry(snapshotsDir?: string): ExtensionRegistr
     toolNames: () => {
       const names: string[] = [];
       for (const entry of entries.values()) {
-        for (const tool of entry.manifest.tools) {
+        for (const tool of entry.manifest.tools ?? []) {
           if (!names.includes(tool.name)) names.push(tool.name);
         }
       }
@@ -228,7 +228,7 @@ export function createExtensionRegistry(snapshotsDir?: string): ExtensionRegistr
     },
     extensionIdForTool: (toolName: string) => {
       for (const entry of entries.values()) {
-        if (entry.manifest.tools.some((tool) => tool.name === toolName)) return entry.manifest.id;
+        if ((entry.manifest.tools ?? []).some((tool) => tool.name === toolName)) return entry.manifest.id;
       }
       return undefined;
     },

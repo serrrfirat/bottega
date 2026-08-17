@@ -47,7 +47,7 @@ function oauthManifest(): ExtensionManifest {
     id: "com.example.oauth",
     label: "Example OAuth",
     credentialSchema: { type: "oauth", scopes: ["read"] },
-    tools: [{ ...base.tools[0]!, name: "oauth.current" }],
+    tools: [{ ...base.tools![0], name: "oauth.current" }],
   };
 }
 

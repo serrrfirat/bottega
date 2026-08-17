@@ -58,6 +58,7 @@ import { memoryToolDefinitions } from "../../src/tools/memory";
 import type { ExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
+import { resolveExtensionSurfaces } from "../../src/extensions/surface";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
 import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps } from "../../src/extensions/connect";
 import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
@@ -710,6 +711,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
 
   // --- driver: real OMP SDK pointed at the stub ----------------------------
   const extensionRegistry = cfg.registry ?? createExtensionRegistry("config/extensions");
+  // Effective tool surfaces (issue #158): pinned manifest tools, or the
+  // provider's tools/list discovered surface for tools-less manifests —
+  // resolved once so the agent sees the provider's real surface.
+  const extensionSurfaces = await resolveExtensionSurfaces(extensionRegistry.list());
   // Connect capability (issue #52/#61): the caller's full deps, or the live
   // canary's convenience wiring (issue #79) — the harness's own
   // store/audit/registry with the production broker seam.
@@ -732,7 +737,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const extensionToolTier = (toolName: string) => {
     const extensionId = extensionRegistry.extensionIdForTool(toolName);
     if (extensionId === undefined) return undefined;
-    return extensionRegistry.resolve(extensionId)?.manifest.tools.find((tool) => tool.name === toolName)?.tier;
+    // Issue #158: consult the EFFECTIVE surface (pinned or discovered).
+    return (extensionSurfaces.get(extensionId) ?? []).find((tool) => tool.name === toolName)?.tier;
   };
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit.
@@ -743,6 +749,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     orgPolicy,
     router: approvalRouter,
     ...(cfg.mcpTransport !== undefined ? { mcpTransport: cfg.mcpTransport } : {}),
+    surfaces: extensionSurfaces,
   });
   // Memory/work-item tools ride the gated customTools path (issue #69):
   // restricted SDK sessions drop extension-registered tools, so the shared
@@ -756,7 +763,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     agentDir,
     customTools: [
       ...(cfg.customTools ?? []),
-      ...extensionToolDefinitions(extensionRegistry.list(), { runtime: extensionRuntime }),
+      ...extensionToolDefinitions(extensionRegistry.list(), {
+        runtime: extensionRuntime,
+        surfaces: extensionSurfaces,
+      }),
     ],
     // Policy gate on the custom-tools bridge (issue #69): the extension
     // seam is inert under restrictToolNames, so the gate wraps the gated

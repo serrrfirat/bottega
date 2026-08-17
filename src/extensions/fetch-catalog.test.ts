@@ -2,10 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CatalogError,
   DEFAULT_CATALOG_URL,
@@ -16,8 +12,7 @@ import {
   writeSnapshotDraft,
   type SnapshotDraft,
 } from "./fetch-catalog";
-import { parsePinnedSnapshot, SNAPSHOT_SCHEMA } from "./registry";
-import type { McpBinding } from "./manifest";
+import { createExtensionRegistry, parsePinnedSnapshot, SNAPSHOT_SCHEMA } from "./registry";
 
 const CATALOG = {
   version: 1,
@@ -127,7 +122,7 @@ describe("fetch-catalog helper (issue #54)", () => {
       const parsed = parsePinnedSnapshot(readFileSync(outPath, "utf8"));
       expect(parsed.extensionId).toBe("linear");
       expect(parsed.source.specId).toBe("linear");
-      expect(parsed.manifest.tools[0].name).toBe("linear.search_issues");
+      expect(parsed.manifest.tools![0].name).toBe("linear.search_issues");
       // A registry seeded from the pinned dir resolves the provider.
       expect(parsePinnedSnapshot(readFileSync(outPath, "utf8"))).toEqual(parsed);
     } finally {
@@ -197,7 +192,7 @@ describe("fetch-catalog helper (issue #54)", () => {
     }
   });
 
-  test("pinSnapshotDraft generates tools from tools/list when the draft has an mcp binding but no tools", async () => {
+  test("a tools-less mcp draft pins tools-less (no generation) — runtime discovery is the default (issue #158)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
     try {
       const draft = completedDraft({
@@ -209,35 +204,27 @@ describe("fetch-catalog helper (issue #54)", () => {
           mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
           credentialSchema: { type: "oauth", scopes: ["read", "write"] },
           domains: ["mcp.linear.app"],
-          // no tools — the generator must populate them (issue #157)
+          // no tools — the pin must NOT fabricate a surface; the runtime
+          // discovers it from the provider's tools/list (issue #158)
         },
       });
-      const mcpTransport = fakeToolsServer([
-        { name: "search_issues", description: "Search Linear issues", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-        { name: "create_issue", description: "Create an issue", inputSchema: { type: "object", properties: {} } },
-        { name: "delete_issue", description: "Delete an issue", inputSchema: { type: "object", properties: {} } },
-      ]);
-      const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch(), mcpTransport });
+      // A tools-less manifest pins tools-less: the pin path is pure
+      // configuration (there is no transport seam on it at all), and the
+      // runtime discovers the surface from the provider's tools/list.
+      const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch() });
       const parsed = parsePinnedSnapshot(readFileSync(outPath, "utf8"));
-      expect(parsed.manifest.tools.map((tool) => tool.name)).toEqual([
-        "linear.search_issues",
-        "linear.create_issue",
-        "linear.delete_issue",
-      ]);
-      expect(parsed.manifest.tools.map((tool) => tool.providerName)).toEqual([
-        "search_issues",
-        "create_issue",
-        "delete_issue",
-      ]);
-      // Conservative tiers: read heuristic → read; mutating → write; destructive → exec.
-      expect(parsed.manifest.tools.map((tool) => tool.tier)).toEqual(["read", "write", "exec"]);
-      expect(parsed.manifest.tools[0]!.params).toEqual([{ name: "query", type: "string" }]);
+      expect(parsed.manifest.tools).toBeUndefined();
+      expect(parsed.manifest.mcp).toEqual({ serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" });
+      // A registry seeded from the pinned dir resolves the tools-less
+      // manifest — the surface resolves at runtime, not at pin time.
+      const registry = createExtensionRegistry(dir);
+      expect(registry.resolve("linear")?.manifest.tools).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("the review gate holds: a generated community draft refuses to pin until reviewed", async () => {
+  test("the review gate holds on tools-less community drafts: unreviewed refuses to pin (issue #158)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
     try {
       const draft = completedDraft({
@@ -252,65 +239,23 @@ describe("fetch-catalog helper (issue #54)", () => {
           domains: ["mcp.linear.app"],
         },
       });
-      const mcpTransport = fakeToolsServer([
-        { name: "get_issue", description: "Get an issue", inputSchema: { type: "object", properties: {} } },
-      ]);
-      // Generation succeeds, but the pin still refuses: unreviewed community
-      // drafts never register — the generated tiers need the human review.
-      await expect(
-        pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch(), mcpTransport }),
-      ).rejects.toThrow(/requires explicit review/);
+      // The pin still refuses: unreviewed community drafts never register —
+      // the discovered conservative tiers need the human review.
+      await expect(pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch() })).rejects.toThrow(
+        /requires explicit review/,
+      );
       expect(readdirSync(dir)).toEqual([]);
 
       draft.source = { ...draft.source, reviewed: true };
-      const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch(), mcpTransport });
+      const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch() });
       const parsed = parsePinnedSnapshot(readFileSync(outPath, "utf8"));
       expect(parsed.source.reviewed).toBe(true);
-      expect(parsed.manifest.tools.map((tool) => tool.name)).toEqual(["linear.get_issue"]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("pinSnapshotDraft fails closed when tools/list is unreachable", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
-    try {
-      const draft = completedDraft({
-        manifest: {
-          id: "linear",
-          label: "Linear",
-          vendor: "Linear",
-          kind: "mcp",
-          mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
-          credentialSchema: { type: "api_key" },
-          domains: ["mcp.linear.app"],
-        },
-      });
-      await expect(
-        pinSnapshotDraft(draft, dir, {
-          fetchImpl: stubFetch(),
-          mcpTransport: () => {
-            throw new Error("connection refused");
-          },
-        }),
-      ).rejects.toThrow(/tools\/list failed/);
-      expect(readdirSync(dir)).toEqual([]);
+      expect(parsed.manifest.tools).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 });
-
-/** A fake MCP server whose tools/list returns the given wire tools. */
-function fakeToolsServer(tools: unknown[]): (binding: McpBinding) => Transport {
-  return () => {
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const server = new Server({ name: "fake-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-    void server.connect(serverTransport);
-    return clientTransport;
-  };
-}
 
 /**
  * Catalog doc: a valid linear entry (with url), a url-less entry (LISTABLE —

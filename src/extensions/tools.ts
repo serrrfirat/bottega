@@ -18,6 +18,7 @@ import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import type { ExtensionToolParam } from "./manifest";
 import type { ResolvedExtension } from "./registry";
 import type { ExtensionRuntime } from "./runtime";
+import type { ExtensionSurfaces } from "./surface";
 
 export interface ExtensionToolBridgeOptions {
   /** The runtime every tool executes through (issue #53). */
@@ -29,13 +30,24 @@ export interface ExtensionToolBridgeOptions {
    * adapter layer when it threads the inbound user.
    */
   getCaller?: (ctx: { sessionManager?: { getSessionFile(): string | null | undefined } }) => string | undefined;
+  /**
+   * Pre-resolved effective tool surfaces (issue #158): extensionId →
+   * pinned manifest tools or the discovered tools/list surface. Resolved
+   * once at boot by resolveExtensionSurfaces (src/extensions/surface.ts).
+   * A tools-less manifest WITHOUT a resolved surface is a fail-closed
+   * error here — the bridge never silently builds an empty toolset for a
+   * provider whose surface it could not resolve.
+   */
+  surfaces?: ExtensionSurfaces;
 }
 
 /**
  * SDK tool definitions for every tool of every registered extension.
  * Fail-closed: an extension without a binding for its kind cannot occur
- * (validateManifest rejects it), and any execution failure surfaces as a
- * tool error result, never a silent no-op.
+ * (validateManifest rejects it), any execution failure surfaces as a tool
+ * error result (never a silent no-op), and a tools-less manifest without a
+ * resolved surface (issue #158) throws a clear error instead of building
+ * zero definitions.
  */
 export function extensionToolDefinitions(
   extensions: ResolvedExtension[],
@@ -44,7 +56,17 @@ export function extensionToolDefinitions(
   const definitions: ToolDefinition[] = [];
   for (const resolved of extensions) {
     const { manifest } = resolved;
-    for (const tool of manifest.tools) {
+    // Issue #158: the effective surface is the pinned tools when present
+    // (the reviewed path wins — no discovery), else the pre-resolved
+    // discovered surface. Absent both → fail closed.
+    const surface = opts.surfaces?.get(manifest.id) ?? manifest.tools;
+    if (surface === undefined) {
+      throw new Error(
+        `extension "${manifest.id}" has no pinned tools and no resolved tool surface — ` +
+          "resolve the surface first (resolveExtensionSurfaces) or pin manifest tools",
+      );
+    }
+    for (const tool of surface) {
       definitions.push({
         name: tool.name,
         label: tool.name,

@@ -33,7 +33,8 @@ import { extensionSecretFileName } from "./boundary";
 import { createExtensionRegistry, readPinnedSnapshots } from "./registry";
 import { extensionToolDefinitions } from "./tools";
 import { createExtensionRuntime } from "./runtime";
-import type { McpBinding } from "./manifest";
+import { validateManifest, type McpBinding } from "./manifest";
+import { resolveExtensionSurfaces } from "./surface";
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
@@ -377,5 +378,95 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
       console.log(`[github hosted MCP leg #148] real search_issues call OK (${text.length} chars of issue data)`);
     },
     90_000,
+  );
+});
+
+/**
+ * GitHub hosted MCP tools-less discovery live leg (issue #158): a manifest
+ * WITHOUT tools (binding + credentialSchema + domains only) discovers its
+ * FULL tool surface from the hosted server's tools/list through the
+ * PRODUCTION path — the SDK client rides HTTP(S)_PROXY through the dev
+ * iron-proxy, whose secrets transform injects the boundary's secret file
+ * as the Authorization header for api.githubcopilot.com. This is the exact
+ * path the server boot uses (resolveExtensionSurfaces → bridge → runtime),
+ * so the leg proves the agent sees all N hosted tools with conservative
+ * tiers, never the old hand-authored 3-tool subset.
+ *
+ * Skip-gated like the other integration legs (BOTTEGA_RUN_INTEGRATION=1)
+ * with the dev stack running:
+ * `NODE_EXTRA_CA_CERTS=$PWD/certs/ca.crt BOTTEGA_RUN_INTEGRATION=1 bun test …`
+ * (the dev proxy MITMs TLS; the CA trust is the same requirement as the
+ * #145/#148 legs). Evidence is logged (count + names); the credential
+ * never leaves the proxy.
+ */
+describe("github hosted MCP live leg (skip-gated, issue #158 — tools-less discovery)", () => {
+  test(
+    "a tools-less github manifest discovers the FULL hosted surface with conservative tiers",
+    async () => {
+      const skip = (reason: string) => console.log(`[github hosted MCP leg #158] SKIP: ${reason}`);
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run (dev stack: NODE_EXTRA_CA_CERTS=$PWD/certs/ca.crt)");
+        return;
+      }
+      const repoRoot = resolve(import.meta.dir, "../..");
+      const mgmt = await fetch("http://127.0.0.1:9092/v1/reload", { method: "POST" }).catch(() => null);
+      if (!mgmt) {
+        skip("dev iron-proxy not reachable on 127.0.0.1:9092 — start the dev stack (bun run dev) first");
+        return;
+      }
+      const secretPath = join(repoRoot, "data/proxy-secrets", extensionSecretFileName("github"));
+      if (!existsSync(secretPath) || readFileSync(secretPath).length === 0) {
+        skip("data/proxy-secrets/github.secret is missing or empty — the boundary has not injected a credential yet");
+        return;
+      }
+
+      // The tools-less github manifest: binding + credentialSchema only.
+      // The tool surface comes from the hosted server's tools/list.
+      const registry = createExtensionRegistry();
+      registry.register(
+        validateManifest({
+          id: "github",
+          label: "GitHub",
+          vendor: "GitHub",
+          kind: "mcp",
+          mcp: { serverUrl: "https://api.githubcopilot.com/mcp/", transport: "streamable-http" },
+          credentialSchema: { type: "api_key" },
+          domains: ["api.githubcopilot.com"],
+        }),
+      );
+
+      // The production discovery path (server boot): the SDK client rides
+      // HTTP(S)_PROXY through iron-proxy, whose secrets transform injects
+      // the credential for api.githubcopilot.com.
+      const surfaces = await resolveExtensionSurfaces(registry.list());
+      const github = [...(surfaces.get("github") ?? [])];
+      const names = github.map((tool) => tool.name);
+      const byWire = new Map(github.map((tool) => [tool.providerName, tool]));
+      console.log(`[github hosted MCP leg #158] tools/list discovered ${github.length} tools`);
+
+      // The FULL surface — the old hand-authored 3-tool subset is gone.
+      expect(github.length).toBeGreaterThan(10);
+      // The mapped wire names (issue #148) are part of it.
+      for (const wire of ["search_issues", "issue_write", "add_issue_comment"]) {
+        expect(names).toContain(`github.${wire}`);
+        console.log(`[github hosted MCP leg #158] discovered: ${wire}`);
+      }
+      // Conservative tiers on the discovered surface (the #157 heuristic).
+      expect(byWire.get("search_issues")?.tier).toBe("read");
+      expect(byWire.get("issue_write")?.tier).toBe("write");
+      expect(byWire.get("add_issue_comment")?.tier).toBe("write");
+      // Every discovered tool is representable: namespaced manifest names,
+      // wire providerNames, and params derived from the server's inputSchema
+      // (a tool without inputSchema would have been skipped — never silent).
+      for (const tool of github) {
+        expect(tool.name.startsWith("github.")).toBe(true);
+        expect(typeof tool.providerName).toBe("string");
+        expect(Array.isArray(tool.params)).toBe(true);
+      }
+      console.log(
+        `[github hosted MCP leg #158] full surface OK (${github.length} tools, conservative tiers)`,
+      );
+    },
+    120_000,
   );
 });

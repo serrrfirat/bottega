@@ -30,6 +30,7 @@ import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { brokerSecretResolverFromEnv, createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { resolveExtensionSurfaces } from "../extensions/surface";
 import { extensionToolDefinitions } from "../extensions/tools";
 import {
   assertAgentDirModelAvailable,
@@ -147,11 +148,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // config/extensions/ at boot. Per-org deployments resolve extensions from
   // these local files — never from the integrations.sh catalog at runtime.
   const extensionRegistry = createExtensionRegistry("config/extensions");
+  // Effective tool surfaces (issue #158): pinned manifest tools, or the
+  // provider's tools/list discovered surface for tools-less manifests —
+  // resolved once at boot so the agent sees the provider's real surface
+  // (never a stale subset). Fail closed: an unreachable provider aborts the
+  // boot with a clear error, never a silent empty toolset.
+  const extensionSurfaces = await resolveExtensionSurfaces(extensionRegistry.list());
   /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */
   const extensionToolTier = (toolName: string) => {
     const extensionId = extensionRegistry.extensionIdForTool(toolName);
     if (extensionId === undefined) return undefined;
-    return extensionRegistry.resolve(extensionId)?.manifest.tools.find((tool) => tool.name === toolName)?.tier;
+    // Issue #158: consult the EFFECTIVE surface (pinned or discovered).
+    return (extensionSurfaces.get(extensionId) ?? []).find((tool) => tool.name === toolName)?.tier;
   };
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
@@ -259,6 +267,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       ...proxyBoundaryControlFromEnv(),
       resolveSecret: brokerSecretResolverFromEnv(),
     }),
+    surfaces: extensionSurfaces,
   });
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through
@@ -359,6 +368,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
             const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
             return spaceId ? spaceService.getTurnPrincipal(spaceId) : undefined;
           },
+          surfaces: extensionSurfaces,
         }),
         // Policy gate (issue #69): restricted SDK sessions never evaluate
         // inline extension factories (sdk.ts), so the policy extension's

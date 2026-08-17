@@ -18,7 +18,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore, type AuditRow, type Store, type ExtensionCredential } from "../store/db";
 import { sha256Hex } from "../tools/memory";
@@ -37,8 +37,10 @@ import {
 import type { CredentialBoundary } from "../extensions/boundary";
 import type { BrokerConnector } from "../extensions/connect";
 import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "../extensions/fixture";
-import type { ExtensionManifest, McpBinding } from "../extensions/manifest";
+import { validateManifest, type ExtensionManifest, type McpBinding } from "../extensions/manifest";
+import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
+import { resetToolSurfaceCache } from "../extensions/surface";
 import { createMemoryMcpServer } from "./server";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
@@ -465,11 +467,16 @@ describe("MCP server extension surface (in-process deps)", () => {
   }
 
   /** In-process server with injected runtime deps (real store + audit, fake boundary/broker/transport). */
-  async function makeInProcessHarness(opts: { policy?: PolicyConfig; defaultPrincipal?: string } = {}): Promise<InProcessHarness> {
+  async function makeInProcessHarness(opts: {
+    policy?: PolicyConfig;
+    defaultPrincipal?: string;
+    registry?: ExtensionRegistry;
+    mcpTransport?: (binding: McpBinding) => Transport;
+  } = {}): Promise<InProcessHarness> {
     const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
     const store = createStore(join(dir, "test.db"));
     const audit = createAudit(store);
-    const registry = createFixtureRegistry();
+    const registry = opts.registry ?? createFixtureRegistry();
     const policy = opts.policy ?? parseOrgConfigYaml(EXT_ALLOW);
     const boundary = makeBoundary();
     const brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
@@ -477,18 +484,20 @@ describe("MCP server extension surface (in-process deps)", () => {
       brokerCalls.push(input);
       return { identityKey: null, brokerCredentialId: 42 };
     };
-    const mcpTransport = (_binding: McpBinding): Transport => {
-      // Stub provider MCP server: returns the city echoed back (hermetic —
-      // the fixture's serverUrl is intentionally unreachable).
-      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-      const stub = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-      stub.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+    const mcpTransport =
+      opts.mcpTransport ??
+      ((_binding: McpBinding): Transport => {
+        // Stub provider MCP server: returns the city echoed back (hermetic —
+        // the fixture's serverUrl is intentionally unreachable).
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const stub = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        stub.setRequestHandler(CallToolRequestSchema, async (request) => {
+          const args = request.params.arguments as Record<string, unknown>;
+          return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+        });
+        void stub.connect(serverTransport);
+        return clientTransport;
       });
-      void stub.connect(serverTransport);
-      return clientTransport;
-    };
     const runtime = createExtensionRuntime({
       registry,
       store,
@@ -508,6 +517,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       extensions: {
         runtime,
         registry,
+        mcpTransport,
         connect: {
           registry,
           store,
@@ -534,6 +544,78 @@ describe("MCP server extension surface (in-process deps)", () => {
       },
     };
   }
+
+  test("a tools-less manifest is advertised + callable on the MCP surface via discovery (issue #158)", async () => {
+    const DISCOVER_ID = "discover.me";
+    // The discovery cache is process-global — reset so this hermetic test
+    // never observes a stale surface from another file's fixture.
+    resetToolSurfaceCache();
+    const wireTools = [
+      { name: "search_issues", description: "Search", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+      { name: "delete_issue", description: "Delete", inputSchema: { type: "object", properties: {} } },
+    ];
+    const seen = { list: 0, tool: [] as string[] };
+    const registry = createExtensionRegistry();
+    registry.register(
+      validateManifest({
+        id: DISCOVER_ID,
+        label: "Discover Me",
+        vendor: "example",
+        kind: "mcp",
+        mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
+        credentialSchema: { type: "api_key" },
+        domains: ["discover.me.test"],
+      }),
+    );
+    const h = await makeInProcessHarness({
+      registry,
+      mcpTransport: () => {
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const stub = new Server({ name: "discover-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        stub.setRequestHandler(ListToolsRequestSchema, async () => {
+          seen.list += 1;
+          return { tools: wireTools };
+        });
+        stub.setRequestHandler(CallToolRequestSchema, async (request) => {
+          seen.tool.push(request.params.name);
+          return { content: [{ type: "text", text: `ok ${request.params.name}` }] };
+        });
+        void stub.connect(serverTransport);
+        return clientTransport;
+      },
+    });
+    try {
+      await h.store.upsertExtensionCredential({
+        provider: DISCOVER_ID,
+        identityKey: "email:org@example.com",
+        owner: null,
+        scope: "org",
+        brokerCredentialId: 7,
+      });
+
+      // The ACP agent sees the FULL discovered surface (namespaced names),
+      // never an empty toolset.
+      const listed = await h.client.listTools();
+      const names = listed.tools.map((tool) => tool.name);
+      expect(names).toContain("discover.me.search_issues");
+      expect(names).toContain("discover.me.delete_issue");
+
+      // A call by the namespaced name resolves the owner across the
+      // discovered surface and executes through the runtime with the WIRE
+      // name (providerName).
+      const res = (await h.client.callTool({
+        name: "discover.me.search_issues",
+        arguments: { query: "repo:x" },
+      })) as ToolCallResult;
+      expect(res.isError).not.toBe(true);
+      expect(res.content[0]?.text ?? "").toBe("ok search_issues");
+      expect(seen.tool).toEqual(["search_issues"]);
+      expect(h.boundary.calls).toHaveLength(1);
+      expect(h.boundary.calls[0]!.provider).toBe(DISCOVER_ID);
+    } finally {
+      await h.cleanup();
+    }
+  });
 
   test("calls a fixture extension tool through the runtime: gate → ladder → boundary → audit", async () => {
     const h = await makeInProcessHarness();

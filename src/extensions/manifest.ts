@@ -75,6 +75,14 @@ export interface ExtensionTool {
  * The extension manifest. Discriminated on `kind`: an mcp extension MUST
  * carry an mcp binding, a cli extension MUST carry a cli binding — the type
  * system and validateManifest agree.
+ *
+ * `tools` is OPTIONAL (issue #158): absent → the runtime discovers the
+ * tool surface from the provider's tools/list at boot (conservative tiers,
+ * src/extensions/surface.ts); present (even `[]` — an egress-only
+ * extension) → the PINNED, reviewed surface wins and no discovery happens
+ * (backward compatible). `tools: []` and absent are distinct states: an
+ * empty array is a deliberate pinned "no tools" surface, absent means
+ * "discover".
  */
 export type ExtensionManifest =
   | {
@@ -85,7 +93,7 @@ export type ExtensionManifest =
       mcp: McpBinding;
       cli?: never;
       credentialSchema: CredentialSchema;
-      tools: ExtensionTool[];
+      tools?: ExtensionTool[];
       /** Egress allowlist entries (iron-proxy): hostnames, optional `*.` prefix. */
       domains: string[];
     }
@@ -97,7 +105,7 @@ export type ExtensionManifest =
       mcp?: never;
       cli: CliBinding;
       credentialSchema: CredentialSchema;
-      tools: ExtensionTool[];
+      tools?: ExtensionTool[];
       domains: string[];
     };
 
@@ -387,7 +395,11 @@ export function validateManifest(input: unknown): ExtensionManifest {
     throw new ExtensionValidationError("kind must be \"mcp\" or \"cli\"");
   }
   const credentialSchema = validateCredentialSchema(input["credentialSchema"]);
-  const tools = validateTools(input["tools"]);
+  // Tools are OPTIONAL (issue #158): absent → the runtime discovers the
+  // surface from the provider's tools/list; present (including `[]` — an
+  // egress-only extension) → the pinned surface wins. The typed manifest
+  // keeps the distinction: `tools` is absent only when the input omitted it.
+  const tools = input["tools"] === undefined ? undefined : validateTools(input["tools"]);
   const domains = validateDomains(input["domains"]);
   if (kind === "mcp") {
     if (input["cli"] !== undefined) {
@@ -403,7 +415,7 @@ export function validateManifest(input: unknown): ExtensionManifest {
       kind: "mcp",
       mcp: validateMcpBinding(input["mcp"]),
       credentialSchema,
-      tools,
+      ...(tools !== undefined ? { tools } : {}),
       domains,
     };
   }
@@ -420,7 +432,7 @@ export function validateManifest(input: unknown): ExtensionManifest {
     kind: "cli",
     cli: validateCliBinding(input["cli"]),
     credentialSchema,
-    tools,
+    ...(tools !== undefined ? { tools } : {}),
     domains,
   };
 }

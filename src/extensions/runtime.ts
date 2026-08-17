@@ -5,8 +5,11 @@
  * audited as `extension.call`.
  *
  * Sequence per call (fail closed at every step):
- *   1. resolve the manifest + tool from the registry (unknown → error audit,
- *      no execution);
+ *   1. resolve the manifest + effective tool surface (pinned manifest tools,
+ *      or the provider's tools/list discovered surface for tools-less
+ *      manifests — issue #158; an unreachable provider is a clear error
+ *      result, never a silent empty toolset; unknown → error audit, no
+ *      execution);
  *   2. POLICY GATE (`evaluatePolicyGate`, shared with the in-process policy
  *      extension and the ACP driver): denied calls never resolve a
  *      credential. The call carries the extensionId so the extension
@@ -42,15 +45,16 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
-import { loadSpacePolicy, orgCredentialsAllowed, type PolicyConfig, type Tier } from "../policy/config";
+import { loadSpacePolicy, orgCredentialsAllowed, type PolicyConfig } from "../policy/config";
 import { evaluatePolicyGate, type PolicyGateCall } from "../policy/gate";
 import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CALL_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
-import { CREDENTIAL_ENV_RE, type CliBinding, type McpBinding } from "./manifest";
+import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionTool, type McpBinding } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
+import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
 
 export type ExtensionCallDecision = "allow" | "deny" | "error";
 
@@ -105,19 +109,21 @@ export interface ExtensionRuntimeDeps {
    * iron-proxy boundary injects auth).
    */
   mcpTransport?: (binding: McpBinding) => Transport;
+  /**
+   * Pre-resolved effective tool surfaces (issue #158): extensionId →
+   * pinned manifest tools or the discovered tools/list surface, resolved
+   * once at boot by resolveExtensionSurfaces (src/extensions/surface.ts).
+   * Absent → the runtime discovers tools-less manifests lazily on first
+   * call through the transport seam, fail-closed (an unreachable provider
+   * is a clear error result, never a silent empty toolset).
+   */
+  surfaces?: ExtensionSurfaces;
 }
 
 export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRuntime {
   const makeTransport = deps.mcpTransport ?? defaultMcpTransport;
   const boundary = deps.boundary ?? createSecretFileBoundary();
   const knownExtensionIds = deps.registry.list().map((entry) => entry.manifest.id);
-
-  /** Manifest tier of an extension tool, resolved for the gate's tier stage (issue #53). */
-  const toolTierFor = (toolName: string): Tier | undefined => {
-    const extensionId = deps.registry.extensionIdForTool(toolName);
-    if (extensionId === undefined) return undefined;
-    return deps.registry.resolve(extensionId)?.manifest.tools.find((tool) => tool.name === toolName)?.tier;
-  };
 
   const loadPolicy = (spaceId: string | undefined) => loadSpacePolicy(deps.orgPolicy, deps.store, spaceId);
 
@@ -148,32 +154,56 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       const { extensionId, toolName, args, caller, spaceId } = call;
       const resolved = deps.registry.resolve(extensionId);
       const manifest = resolved?.manifest;
+      if (!manifest) {
+        await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
+        return { ok: false, error: `extension "${extensionId}" is not registered` };
+      }
+
+      // Issue #158: the effective tool surface — pinned manifest tools when
+      // present (the reviewed path wins, no discovery), else the discovered
+      // tools/list surface (pre-resolved at boot, or lazily through the
+      // transport seam). Fail closed: an unreachable provider or an invalid
+      // tools/list is a clear error result — never a silent empty toolset.
+      const preResolved = deps.surfaces?.get(manifest.id);
+      let surface: readonly ExtensionTool[];
+      if (preResolved !== undefined) {
+        surface = preResolved;
+      } else {
+        try {
+          surface = await extensionToolSurface(manifest, makeTransport);
+        } catch (err) {
+          await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
+          return {
+            ok: false,
+            error: `extension "${extensionId}" tool surface unavailable: ${errorMessage(err)}`,
+          };
+        }
+      }
+
       // Issue #148: the bridge forwards the provider's wire name
-      // (providerName ?? name). Resolve the manifest tool by either the
-      // manifest name (direct callers, the MCP surface) or the wire name —
-      // the manifest identity then drives the gate/audit/tier, and the
+      // (providerName ?? name). Resolve the tool by either the manifest
+      // name (direct callers, the MCP surface) or the wire name — the
+      // manifest identity then drives the gate/audit/tier, and the
       // provider call uses the wire name below.
       const tool =
-        manifest?.tools.find(
+        surface.find(
           (entry) => entry.name === toolName || (entry.providerName !== undefined && entry.providerName === toolName),
-        ) ?? manifest?.tools.find((entry) => entry.name === toolName);
-
-      if (!manifest || !tool) {
+        ) ?? surface.find((entry) => entry.name === toolName);
+      if (!tool) {
         await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
         return {
           ok: false,
-          error: !manifest
-            ? `extension "${extensionId}" is not registered`
-            : `tool "${toolName}" is not declared by extension "${extensionId}"`,
+          error: `tool "${toolName}" is not declared by extension "${extensionId}"`,
         };
       }
 
       // 1. POLICY GATE FIRST — a denied call never resolves a credential.
       // The extensionId rides the gate call so the extension allowlist
-      // (issue #56) decides before tier/approval; toolTier resolves the
-      // manifest tier for the tier stage (issue #53). The gate sees the
-      // MANIFEST name — policies are written against bottega's surface,
-      // not the provider's wire names (#148).
+      // (issue #56) decides before tier/approval; the gate's toolTier seam
+      // resolves the effective tier (pinned or discovered, issue #158) so
+      // an allowed extension crosses the tier stage as a known tool (issue
+      // #53). The gate sees the MANIFEST name — policies are written
+      // against bottega's surface, not the provider's wire names (#148).
       const gateCall: PolicyGateCall & { extensionId?: string } = {
         tool: tool.name,
         args,
@@ -188,7 +218,10 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           router: deps.router,
           timeoutMs: deps.timeoutMs,
           knownExtensionIds,
-          toolTier: toolTierFor,
+          // Per-call closure over THIS extension's resolved surface (the
+          // gate consults it only for calls carrying this extensionId).
+          toolTier: (name) =>
+            surface.find((entry) => entry.name === name || entry.providerName === name)?.tier,
         },
         gateCall,
       );

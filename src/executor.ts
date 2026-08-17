@@ -41,6 +41,7 @@ import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPi
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { createExtensionRegistry } from "./extensions/registry";
 import { createExtensionRuntime } from "./extensions/runtime";
+import { resolveExtensionSurfaces } from "./extensions/surface";
 import { extensionToolDefinitions } from "./extensions/tools";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -75,7 +76,12 @@ export interface ExtensionWorkerToolset {
 
 export interface ExecutorDeps {
   store: Store;
-  driver: AgentDriver;
+  /**
+   * Driver factory (lazy): constructed once per process over the extension
+   * worker toolset (which resolves tools-less manifest surfaces, issue
+   * #158) — so it may be async. Consumers await it.
+   */
+  driver: AgentDriver | Promise<AgentDriver>;
   /** Directory holding org.yml (repos + git base). Default "config". */
   orgConfigDir?: string;
   /** Claim-loop poll interval. Default 2000 ms. */
@@ -93,7 +99,12 @@ export interface ExecutorDeps {
    * Process-scoped extension worker tools. Production supplies a lazy,
    * memoized getter so the registry/runtime/provider are built once.
    */
-  getExtensionWorkerToolset?: () => ExtensionWorkerToolset;
+  /**
+   * Extension worker toolset provider; memoized per process. Accepts a
+   * sync or async value — the toolset is built over the registry (which
+   * may resolve a tools-less manifest's surface, issue #158).
+   */
+  getExtensionWorkerToolset?: () => ExtensionWorkerToolset | Promise<ExtensionWorkerToolset>;
   /** Headless extension-session timeout. Default: the 30-minute stale-run window. */
   extensionSessionTimeoutMs?: number;
   /**
@@ -115,22 +126,29 @@ const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
  * Builds the extension worker's process-scoped resources. The caller owns
  * memoization because the same definitions must configure the OMP driver
  * before the first restricted session is created.
+ *
+ * Issue #158: a tools-less manifest resolves its tool surface from the
+ * provider's tools/list here (cached, fail closed — an unreachable
+ * provider is a clear boot error, never a silent empty toolset); the
+ * runtime and bridge share the resolved surfaces.
  */
-export function createExtensionWorkerToolset(deps: {
+export async function createExtensionWorkerToolset(deps: {
   store: Store;
   audit: AuditModule;
   orgPolicy: PolicyConfig;
   extensionsDir?: string;
-}): ExtensionWorkerToolset {
+}): Promise<ExtensionWorkerToolset> {
   const registry = createExtensionRegistry(
     deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
   );
+  const surfaces = await resolveExtensionSurfaces(registry.list());
   const runtime = createExtensionRuntime({
     registry,
     store: deps.store,
     audit: deps.audit,
     orgPolicy: deps.orgPolicy,
     router: DenyRouter,
+    surfaces,
   });
   const memoryProvider = resolveMemoryProvider(deps.store.getOrgSettings(), deps.store.getDb());
   return {
@@ -138,6 +156,7 @@ export function createExtensionWorkerToolset(deps: {
     extensionTools: extensionToolDefinitions(registry.list(), {
       runtime,
       getCaller: () => "executor",
+      surfaces,
     }),
   };
 }
@@ -165,7 +184,7 @@ export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Pro
   // The production dependency is a lazy getter. Resolve it before the
   // model-registry guard because createOmpSdkDriver installs agentDir as
   // process-global state used by that guard.
-  void deps.driver;
+  await deps.driver;
   // Boot-time guard (issue #80), same fail-fast as the server: the driver
   // installed the agent dir as the process-global dir at construction, so
   // verify the registry resolves an available model from ITS catalog before
@@ -283,12 +302,12 @@ async function extensionWorkerPath(
   cfg: ExecutorConfig,
   item: WorkItem,
 ): Promise<void> {
-  const toolset = deps.getExtensionWorkerToolset?.();
+  const toolset = await deps.getExtensionWorkerToolset?.();
   if (!toolset) {
     throw new Error("extension worker tools are not configured");
   }
   const allowTools = [...toolset.memoryTools, ...toolset.extensionTools].map((tool) => tool.name);
-  const session = await deps.driver.createSession({
+  const session = await (await deps.driver).createSession({
     spaceId: item.space_id,
     transcriptDir: join(cfg.transcriptDir, item.id),
     allowTools,
@@ -437,7 +456,7 @@ async function runAgentSession(
   item: WorkItem,
   workspace: string,
 ): Promise<string> {
-  const session = await deps.driver.createSession({
+  const session = await (await deps.driver).createSession({
     spaceId: item.id,
     transcriptDir: cfg.transcriptDir,
     cwd: workspace,
@@ -695,35 +714,38 @@ if (import.meta.main) {
   // One registry/runtime/provider/toolset per executor process. The getter
   // defers construction until runExecutor resolves the driver, then shares
   // the exact same definitions with session routing.
-  let cachedWorkerToolset: ExtensionWorkerToolset | undefined;
-  const getExtensionWorkerToolset = (): ExtensionWorkerToolset => {
+  let cachedWorkerToolset: Promise<ExtensionWorkerToolset> | undefined;
+  const getExtensionWorkerToolset = (): Promise<ExtensionWorkerToolset> => {
     if (cachedWorkerToolset === undefined) {
       cachedWorkerToolset = createExtensionWorkerToolset({ store, audit, orgPolicy });
     }
     return cachedWorkerToolset;
   };
-  let driver: AgentDriver | undefined;
+  let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,
-    get driver() {
+    get driver(): AgentDriver | Promise<AgentDriver> {
       if (driver === undefined) {
-        const workerTools = getExtensionWorkerToolset();
-        // Pre-approved session: the work item's pickup approval IS the
-        // authorization for allowlisted exec-tier built-ins. Memory tools
-        // ride this driver gate. Extension definitions stay in customTools
-        // because createExtensionRuntime runs its own policy gate and must
-        // never be double-wrapped.
-        driver = createOmpSdkDriver({
-          agentDir: "data/omp-agent",
-          customTools: workerTools.extensionTools,
-          gate: {
-            orgPolicy,
-            audit,
-            router: DenyRouter,
-            store,
-            preApproved: true,
-            tools: workerTools.memoryTools,
-          },
+        // The driver getter is async-capable (the toolset resolves surfaces
+        // for tools-less manifests, issue #158); memoize the resolved value.
+        driver = getExtensionWorkerToolset().then((workerTools) => {
+          // Pre-approved session: the work item's pickup approval IS the
+          // authorization for allowlisted exec-tier built-ins. Memory tools
+          // ride this driver gate. Extension definitions stay in customTools
+          // because createExtensionRuntime runs its own policy gate and must
+          // never be double-wrapped.
+          return createOmpSdkDriver({
+            agentDir: "data/omp-agent",
+            customTools: workerTools.extensionTools,
+            gate: {
+              orgPolicy,
+              audit,
+              router: DenyRouter,
+              store,
+              preApproved: true,
+              tools: workerTools.memoryTools,
+            },
+          });
         });
       }
       return driver;

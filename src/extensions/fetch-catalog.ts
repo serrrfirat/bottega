@@ -7,8 +7,11 @@
  * module is the human step that PINS a new provider: fetch the catalog
  * record, print the snapshot draft (provenance + catalog-derived manifest
  * scaffold), then `--pin` the completed draft once a maintainer has filled
- * in the binding facts (mcp/cli, credentialSchema, tools) from vendor docs
- * and marked source.reviewed / source.vendorOfficial.
+ * in the binding facts (mcp/cli, credentialSchema) from vendor docs and
+ * marked source.reviewed / source.vendorOfficial. Manifest tools are
+ * OPTIONAL (issue #158): absent → the runtime discovers the provider's
+ * tools/list surface at boot with conservative tiers; present → the
+ * pinned-reviewed surface wins.
  *
  * The catalog record never carries an MCP/CLI binding, so the agent draft
  * flow (catalog_browser) instructs web-searching the vendor's OFFICIAL MCP
@@ -17,18 +20,20 @@
  *
  * Why the draft is never written directly: the catalog record carries only
  * id/slug/name/kind/domain/url — not the MCP endpoint, auth, or tool
- * surface. A scaffold manifest therefore fails validateManifest (fail
- * closed), so `--pin` refuses to leave a broken file in the live snapshots
- * dir; it validates with parsePinnedSnapshot before writing.
+ * surface. A scaffold manifest without its binding/credentialSchema
+ * therefore fails validateManifest (fail closed), so `--pin` refuses to
+ * leave a broken file in the live snapshots dir; it validates with
+ * parsePinnedSnapshot before writing.
  *
  * CLI:
  *   bun run src/extensions/fetch-catalog.ts <specId>            # print draft
  *   bun run src/extensions/fetch-catalog.ts <specId> --out DIR  # write draft to DIR
  *   bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json> [--out DIR]
- *                                    # populate manifest.tools from the provider's
+ *                                    # OPTIONALLY pin manifest.tools from the provider's
  *                                    # tools/list (issue #157); on a pinned manifest
  *                                    # this REFRESHES it — new tools land for review,
- *                                    # never silently
+ *                                    # never silently. Omit tools entirely to pin a
+ *                                    # tools-less manifest (runtime discovery, #158).
  *   bun run src/extensions/fetch-catalog.ts --pin <draft.json>  # validate + pin
  *
  * Env override: INTEGRATIONS_CATALOG_URL (mirrors the test seam; the
@@ -36,7 +41,6 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { generateManifestTools, refreshManifestTools } from "./generate-tools";
 import {
   parsePinnedSnapshot,
@@ -92,8 +96,10 @@ export interface FetchCatalogOptions {
 
 /**
  * A snapshot DRAFT: full provenance pinned now, plus the manifest scaffold
- * the catalog record supports. Binding/credentialSchema/tools are filled in
- * by a maintainer from vendor docs before `pinSnapshotDraft` accepts it.
+ * the catalog record supports. Binding/credentialSchema are filled in by a
+ * maintainer from vendor docs before `pinSnapshotDraft` accepts it; tools
+ * are OPTIONAL (issue #158) — absent → runtime discovery from the
+ * provider's tools/list.
  */
 export interface SnapshotDraft {
   schema: typeof SNAPSHOT_SCHEMA;
@@ -293,16 +299,18 @@ export function buildSnapshotDraft(entry: CatalogEntry, pinnedAt: string = new D
 }
 
 function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
-  if (
-    draft.manifest.mcp === undefined &&
-    draft.manifest.cli === undefined &&
-    draft.manifest.credentialSchema === undefined &&
-    draft.manifest.tools === undefined
-  ) {
+  // The binding and credentialSchema are the NOT-discoverable facts
+  // (issue #158): a draft without them cannot pin. Tools are OPTIONAL —
+  // absent tools discover at runtime from the provider's tools/list.
+  const needsBinding =
+    draft.manifest.kind === "mcp" ? draft.manifest.mcp === undefined : draft.manifest.cli === undefined;
+  if (needsBinding || draft.manifest.credentialSchema === undefined) {
     throw new ExtensionValidationError(
-      `draft for "${draft.extensionId}" is incomplete: add the binding and credentialSchema ` +
-        "from the vendor docs (see the catalog entry url) before pinning; manifest tools are " +
-        "generated from the provider's tools/list (fetch-catalog --generate-tools, issue #157)",
+      `draft for "${draft.extensionId}" is incomplete: add the ${draft.manifest.kind} binding and ` +
+        "credentialSchema from the vendor docs (see the catalog entry url) before pinning; manifest " +
+        "tools are OPTIONAL — a tools-less manifest discovers its surface at runtime from the " +
+        "provider's tools/list with conservative tiers (issue #158), or pin tools explicitly via " +
+        "fetch-catalog --generate-tools (issue #157)",
     );
   }
   return validateManifest(draft.manifest);
@@ -332,49 +340,25 @@ export function writeSnapshotDraft(draft: SnapshotDraft, outDir: string): string
 }
 
 /**
- * Options for the pin path: the catalog fetch seams plus the MCP transport
- * seam the manifest tool generator uses for tools/list discovery (issue
- * #157). Tests inject in-memory transports; production uses the real
- * streamable-http / stdio transports.
- */
-export interface PinDraftOptions extends FetchCatalogOptions {
-  mcpTransport?: (binding: McpBinding) => Transport;
-}
-
-/**
  * Pins a completed draft into the snapshots dir. Re-fetches the catalog to
  * confirm the spec still exists when the draft's source.catalog is the
  * integrations.sh catalog (provenance check); drafts sourced elsewhere
  * (e.g. the github-mcp-server vendor repo) skip the check — their catalog
  * is the human's responsibility. Returns the written path.
  *
- * Issue #157: a draft WITH an mcp binding but no tools gets its manifest
- * tools generated from the provider's tools/list before the pin — the
- * manifest is never pinned half-populated. Fail closed: an unreachable
- * provider or an invalid tools/list aborts the pin. The review gate is
- * unchanged: the generated draft still carries source.reviewed=false and
- * community drafts refuse to pin until a human reviews (and confirms the
- * conservative tiers).
+ * Issue #158: manifest tools are OPTIONAL — a draft without tools pins
+ * tools-less as-is (the runtime discovers the surface from the provider's
+ * tools/list at boot with conservative tiers). The `--generate-tools` CLI
+ * remains the explicit path for a PINNED, reviewed surface (issue #157).
+ * The review gate is unchanged: unreviewed community drafts refuse to pin.
  */
 export async function pinSnapshotDraft(
   draft: SnapshotDraft,
   outDir: string,
-  opts: PinDraftOptions = {},
+  opts: FetchCatalogOptions = {},
 ): Promise<string> {
   if (draft.source.catalog === DEFAULT_CATALOG_URL) {
     await fetchCatalogEntry(draft.source.specId, opts);
-  }
-  if (
-    draft.manifest.kind === "mcp" &&
-    draft.manifest.mcp !== undefined &&
-    (draft.manifest.tools === undefined || draft.manifest.tools.length === 0)
-  ) {
-    const generation = await generateManifestTools({
-      binding: draft.manifest.mcp,
-      extensionId: draft.extensionId,
-      mcpTransport: opts.mcpTransport,
-    });
-    draft = { ...draft, manifest: { ...draft.manifest, tools: generation.tools } };
   }
   return writeSnapshotDraft(draft, outDir);
 }
