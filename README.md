@@ -40,6 +40,8 @@ task calls for, never silently dropped.
   delivered as code (a PR), as actions in your connected tools (Linear,
   Attio, GitHub), or as an answer in the channel — one queue, one lifecycle,
   one audit trail for all of it.
+  For in-channel answers, the agent answers first and then completes the chat
+  work item with a summary.
 - **A shared teammate, not a private chatbot.** The whole channel talks to
   the same agent. Anyone can steer, interrupt, or approve — the agent
   belongs to the team, not to one person's DM.

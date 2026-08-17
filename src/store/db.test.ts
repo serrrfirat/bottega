@@ -790,7 +790,7 @@ describe("work items", () => {
     }
   });
 
-  test("extension delivery can complete from working while git still requires review (issue #128)", async () => {
+  test("chat and extension delivery can complete from working while git still requires review (issues #128, #202)", async () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1C-direct" });
 
@@ -806,6 +806,20 @@ describe("work items", () => {
       result: JSON.stringify({ url: "https://example.com/ticket/1", summary: "created ticket" }),
     });
     expect(completed.state).toBe("done");
+
+    const chat = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "answer in the channel",
+      delivery: "chat",
+    });
+    await s.claimNextWorkItem();
+    await s.transitionWorkItem(chat.id, "claimed", "working");
+    const chatCompleted = await s.transitionWorkItem(chat.id, "working", "done", {
+      result: JSON.stringify({ summary: "answered in the channel" }),
+    });
+    expect(chatCompleted.state).toBe("done");
+    expect(JSON.parse(chatCompleted.result!)).toEqual({ summary: "answered in the channel" });
 
     const git = await s.createWorkItem({
       space_id: space.id,

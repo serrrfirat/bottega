@@ -85,7 +85,7 @@ describe("tier resolution", () => {
     }
   });
   test("write-tier tools", () => {
-    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model", "object.create"]) {
+    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model", "object.create", "complete_work_item"]) {
       expect(resolveTier(t)).toBe("write");
       expect(isKnownTool(t)).toBe(true);
     }

@@ -371,10 +371,12 @@ function assertLegalTransition(
   delivery: WorkItemDelivery,
   opts?: TransitionOpts,
 ): void {
-  // Extension pickup authorizes headless completion (#128); git retains the
-  // working -> review -> done delivery-approval path. Chat has no worker yet.
-  const isDirectExtensionCompletion = delivery === "extension" && from === "working" && to === "done";
-  if (!ALLOWED_TRANSITIONS[from].includes(to) && !isDirectExtensionCompletion) {
+  // Extension pickup (#128) and an in-channel chat answer (#202) authorize
+  // direct completion. Git retains the working -> review -> done path because
+  // its PR deliverable still needs human review.
+  const isDirectNonGitCompletion =
+    (delivery === "extension" || delivery === "chat") && from === "working" && to === "done";
+  if (!ALLOWED_TRANSITIONS[from].includes(to) && !isDirectNonGitCompletion) {
     throw new Error(`illegal work item transition ${from} -> ${to}`);
   }
   if (to === "done") assertDoneResult(delivery, opts?.result);

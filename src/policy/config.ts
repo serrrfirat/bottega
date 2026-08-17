@@ -145,6 +145,7 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   task: "exec",
   create_work_item: "exec",
   work_item_cancel: "exec",
+  complete_work_item: "write",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

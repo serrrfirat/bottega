@@ -1,9 +1,9 @@
 /**
  * Work item tools (issue #10): the space agent's queue surface.
  *
- * Both tools are exec-tier: the OMP approval tier defaults to exec when
- * omitted, and the bottega policy gate (issue #6) resolves unknown tools to
- * exec — so every call crosses a human approval before it runs.
+ * Creation and cancellation are exec-tier: they cross human approval before
+ * running. Chat completion is write-tier because the visible answer already
+ * happened in-channel; the tool only records completion.
  *
  * Pickup is explicit: the agent creates a work item when asked (e.g.
  * "@agent handle this"). The tools are identical in every space; cancel
@@ -72,6 +72,10 @@ export const createWorkItemArgsSchema = z.object({
   reasoning_effort: z.enum(["off", "low", "medium", "high"]).optional(),
 });
 export const cancelWorkItemArgsSchema = z.object({ id: z.string() });
+export const completeWorkItemArgsSchema = z.object({
+  id: z.string(),
+  summary: z.string(),
+});
 
 /**
  * The work item tools as SDK {@link ToolDefinition}s (issue #69): one source
@@ -208,7 +212,51 @@ export function workItemToolDefinitions(
     },
   };
 
-  return [create, cancel];
+  const complete: ToolDefinition<typeof completeWorkItemArgsSchema> = {
+    name: "complete_work_item",
+    label: "Complete chat work item",
+    description:
+      "Deliver the answer in the channel first, then complete the chat work item with a one-paragraph summary. " +
+      "Git and extension work items are completed by the executor; never use this tool for them.",
+    parameters: completeWorkItemArgsSchema,
+    approval: "write",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!params.summary.trim()) return toolError("summary must not be empty");
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      if (!spaceId) return toolError("work items require a space session");
+      const item = await store.getWorkItem(params.id);
+      if (!item) return toolError(`work item not found: ${params.id}`);
+      if (item.space_id !== spaceId) return toolError("work item does not belong to this space");
+      if (item.delivery !== "chat") {
+        return toolError(
+          "complete_work_item only completes chat-delivered work items; git and extension items are completed by the executor",
+        );
+      }
+      if (item.state !== "open" && item.state !== "claimed" && item.state !== "working") {
+        return toolError(`work item cannot be completed from state ${item.state}`);
+      }
+
+      try {
+        if (item.state === "open") {
+          await store.transitionWorkItem(item.id, "open", "claimed", { by: actor });
+          await store.transitionWorkItem(item.id, "claimed", "working", { by: actor });
+        } else if (item.state === "claimed") {
+          await store.transitionWorkItem(item.id, "claimed", "working", { by: actor });
+        }
+        const done = await store.transitionWorkItem(item.id, "working", "done", {
+          by: actor,
+          result: JSON.stringify({ summary: params.summary }),
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ id: done.id, state: done.state }) }],
+        };
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+    },
+  };
+
+  return [create, cancel, complete];
 }
 
 export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): ExtensionFactory {

@@ -42,15 +42,21 @@ function resultText(res: Awaited<ReturnType<ToolDefinition["execute"]>>): string
 }
 
 describe("workItemsExtension registration", () => {
-  test("registers create_work_item and work_item_cancel", () => {
+  test("registers create, cancel, and chat completion tools with their approval tiers", () => {
     const tools = loadTools(freshStore());
-    expect(tools.map((t) => t.name).sort()).toEqual(["create_work_item", "work_item_cancel"]);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "complete_work_item",
+      "create_work_item",
+      "work_item_cancel",
+    ]);
     for (const t of tools) {
       expect(t.description.length).toBeGreaterThan(0);
       expect(t.label.length).toBeGreaterThan(0);
       expect(t.parameters).toBeDefined();
-      expect(t.approval).toBe("exec");
     }
+    expect(tools.find((t) => t.name === "create_work_item")?.approval).toBe("exec");
+    expect(tools.find((t) => t.name === "work_item_cancel")?.approval).toBe("exec");
+    expect(tools.find((t) => t.name === "complete_work_item")?.approval).toBe("write");
   });
 
   test("describes all delivery kinds without requiring a repo for non-git work (issue #128)", () => {
@@ -58,6 +64,13 @@ describe("workItemsExtension registration", () => {
     expect(createTool.description).toContain("connected extensions");
     expect(createTool.description).toContain("delivered in-channel");
     expect(createTool.description).toContain("do not need `repo`");
+  });
+
+  test("tells the agent to answer first and leaves non-chat completion to the executor", () => {
+    const completeTool = loadTools(freshStore()).find((t) => t.name === "complete_work_item")!;
+    expect(completeTool.description).toContain("Deliver the answer in the channel first");
+    expect(completeTool.description).toContain("one-paragraph summary");
+    expect(completeTool.description).toContain("completed by the executor");
   });
 });
 
@@ -509,6 +522,251 @@ describe("create_work_item model pin (issue #185)", () => {
     expect(item?.reasoning_effort).toBeNull();
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
     expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent" });
+  });
+});
+
+describe("complete_work_item", () => {
+  function completeTool(s: Store, actor = "agent"): ToolDefinition {
+    return loadTools(s, { actor }).find((t) => t.name === "complete_work_item")!;
+  }
+
+  test("completes an open chat item with a summary and audits every legal hop", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE1" });
+    const item = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "Answer in chat",
+      delivery: "chat",
+    });
+
+    const res = await completeTool(s, "U7").execute(
+      "tc-complete",
+      { id: item.id, summary: "Shared the answer with the channel." },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+
+    expect(res.isError).not.toBe(true);
+    expect(JSON.parse(resultText(res))).toEqual({ id: item.id, state: "done" });
+    const stored = await s.getWorkItem(item.id);
+    expect(stored?.state).toBe("done");
+    expect(JSON.parse(stored!.result!)).toEqual({ summary: "Shared the answer with the channel." });
+    const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
+    expect(rows.map((row) => JSON.parse(row.payload))).toEqual([
+      { from: "open", to: "claimed", by: "U7" },
+      { from: "claimed", to: "working", by: "U7" },
+      { from: "working", to: "done", by: "U7" },
+    ]);
+    expect(rows.map((row) => row.actor)).toEqual(["U7", "U7", "U7"]);
+  });
+
+  test("completes chat items already in claimed or working", async () => {
+    for (const initialState of ["claimed", "working"] as const) {
+      const s = freshStore();
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: `COMPLETE-${initialState}` });
+      const item = await s.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: `Chat item in ${initialState}`,
+        delivery: "chat",
+      });
+      await s.transitionWorkItem(item.id, "open", "claimed", { by: "setup" });
+      if (initialState === "working") {
+        await s.transitionWorkItem(item.id, "claimed", "working", { by: "setup" });
+      }
+      const before = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
+
+      const res = await completeTool(s).execute(
+        "tc-complete",
+        { id: item.id, summary: `Completed from ${initialState}.` },
+        undefined,
+        undefined,
+        ctxFor(space.id),
+      );
+
+      expect(res.isError).not.toBe(true);
+      const stored = await s.getWorkItem(item.id);
+      expect(stored?.state).toBe("done");
+      expect(JSON.parse(stored!.result!)).toEqual({ summary: `Completed from ${initialState}.` });
+      const after = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
+      expect(after.slice(before.length).map((row) => JSON.parse(row.payload))).toEqual(
+        initialState === "claimed"
+          ? [
+              { from: "claimed", to: "working", by: "agent" },
+              { from: "working", to: "done", by: "agent" },
+            ]
+          : [{ from: "working", to: "done", by: "agent" }],
+      );
+    }
+  });
+
+  test("rejects git and extension items because the executor completes them", async () => {
+    for (const delivery of ["git", "extension"] as const) {
+      const s = freshStore();
+      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: `COMPLETE-${delivery}` });
+      const item = await s.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: `${delivery} work`,
+        delivery,
+      });
+
+      const res = await completeTool(s).execute(
+        "tc-complete",
+        { id: item.id, summary: "Not allowed." },
+        undefined,
+        undefined,
+        ctxFor(space.id),
+      );
+
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toMatch(/only completes chat-delivered work items.*executor/);
+      expect((await s.getWorkItem(item.id))?.state).toBe("open");
+    }
+  });
+
+  test("rejects an empty or whitespace-only summary without changing the item", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-EMPTY" });
+    const item = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "Needs a real summary",
+      delivery: "chat",
+    });
+
+    for (const summary of ["", " \n "]) {
+      const res = await completeTool(s).execute(
+        "tc-complete",
+        { id: item.id, summary },
+        undefined,
+        undefined,
+        ctxFor(space.id),
+      );
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toMatch(/summary must not be empty/);
+    }
+    expect((await s.getWorkItem(item.id))?.state).toBe("open");
+  });
+
+  test("rejects an item from another space", async () => {
+    const s = freshStore();
+    const ownerSpace = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-OWNER" });
+    const foreignSpace = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-FOREIGN" });
+    const item = await s.createWorkItem({
+      space_id: ownerSpace.id,
+      requester: "U1",
+      description: "Private to the owner space",
+      delivery: "chat",
+    });
+
+    const res = await completeTool(s).execute(
+      "tc-complete",
+      { id: item.id, summary: "Must not cross spaces." },
+      undefined,
+      undefined,
+      ctxFor(foreignSpace.id),
+    );
+
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toMatch(/does not belong to this space/);
+    expect((await s.getWorkItem(item.id))?.state).toBe("open");
+  });
+
+  test("rejects completion outside a space session", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-NO-SESSION" });
+    const item = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "Requires a space session",
+      delivery: "chat",
+    });
+    const noSpaceCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
+
+    const res = await completeTool(s).execute(
+      "tc-complete",
+      { id: item.id, summary: "Must not complete." },
+      undefined,
+      undefined,
+      noSpaceCtx,
+    );
+
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toMatch(/require a space session/);
+    expect((await s.getWorkItem(item.id))?.state).toBe("open");
+  });
+
+  test("rejects an unknown item id", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-MISSING" });
+
+    const res = await completeTool(s).execute(
+      "tc-complete",
+      { id: "wi_missing", summary: "Nothing to complete." },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toMatch(/work item not found/);
+  });
+
+  test("rejects review, done, blocked, and aborted chat items", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "COMPLETE-STATES" });
+    const idsByState: Array<{ id: string; state: "review" | "done" | "blocked" | "aborted" }> = [];
+
+    for (const target of ["review", "done", "blocked"] as const) {
+      const item = await s.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: `Already ${target}`,
+        delivery: "chat",
+      });
+      await s.transitionWorkItem(item.id, "open", "claimed", { by: "setup" });
+      await s.transitionWorkItem(item.id, "claimed", "working", { by: "setup" });
+      if (target === "blocked") {
+        await s.transitionWorkItem(item.id, "working", "blocked", { by: "setup", evidence: "blocked" });
+      } else {
+        await s.transitionWorkItem(item.id, "working", "review", {
+          by: "setup",
+          approval: { approver: "U1" },
+        });
+        if (target === "done") {
+          await s.transitionWorkItem(item.id, "review", "done", {
+            by: "setup",
+            result: JSON.stringify({ summary: "Already completed." }),
+          });
+        }
+      }
+      idsByState.push({ id: item.id, state: target });
+    }
+
+    const aborted = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "Already aborted",
+      delivery: "chat",
+    });
+    await s.transitionWorkItem(aborted.id, "open", "aborted", { by: "setup" });
+    idsByState.push({ id: aborted.id, state: "aborted" });
+
+    for (const { id, state } of idsByState) {
+      const res = await completeTool(s).execute(
+        "tc-complete",
+        { id, summary: "Must not overwrite terminal state." },
+        undefined,
+        undefined,
+        ctxFor(space.id),
+      );
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toContain(`state ${state}`);
+      expect((await s.getWorkItem(id))?.state).toBe(state);
+    }
   });
 });
 
