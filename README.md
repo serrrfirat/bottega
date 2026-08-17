@@ -1,4 +1,4 @@
-# bottega
+# Bottega
 
 **An AI co-worker that lives in your Slack and picks up real work for your
 org.** Update the CRM, chase a follow-up, run the weekly ops chore, answer
