@@ -90,6 +90,7 @@ import {
   CONNECT_EXTENSION_TOOL,
   type ConnectExtensionDeps,
 } from "../extensions/connect";
+import { mintUploadLink, MINT_UPLOAD_LINK_TOOL, UploadLinkStore } from "../extensions/upload-link";
 import type { ExtensionRegistry } from "../extensions/registry";
 import type { ExtensionRuntime } from "../extensions/runtime";
 import type { ExtensionTool, ExtensionToolParam, McpBinding } from "../extensions/manifest";
@@ -146,6 +147,16 @@ export interface McpExtensionsOptions {
    * (src/extensions/runtime.ts); tests inject in-memory transports.
    */
   mcpTransport?: (binding: McpBinding) => Transport;
+  /**
+   * One-time upload link (issue #196): when wired, the server also
+   * advertises `connect_upload_link` — mints a single-use, expiring URL
+   * whose secret the server's browser endpoint stores DIRECTLY into the
+   * vault. The store must share the `upload_tokens` table with the server
+   * process's endpoint (both read the same SQLite file); the base URL
+   * points at that endpoint (BOTTEGA_UPLOAD_BASE_URL, set by the ACP
+   * driver). Absent → the mint tool is not advertised.
+   */
+  uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
 }
 
 /** Flattens a parse failure into a single-line message for the client. */
@@ -233,6 +244,21 @@ const connectJsonSchema = {
   additionalProperties: false,
 } as const;
 
+/** JSON Schema for `connect_upload_link` (mirrors the mint tool's params, issue #196). */
+const mintUploadLinkJsonSchema = {
+  type: "object",
+  properties: {
+    extension: { type: "string", description: "Extension id from the registry (e.g. the provider id)" },
+    scope: {
+      type: "string",
+      enum: ["org", "personal"],
+      description: "org = shared org account; personal = your own account",
+    },
+  },
+  required: ["extension", "scope"],
+  additionalProperties: false,
+} as const;
+
 /** Manifest tool params -> the JSON Schema advertised via tools/list. */
 function extensionToolJsonSchema(params: ExtensionToolParam[]) {
   const properties: Record<string, { type: string; description?: string }> = {};
@@ -266,6 +292,23 @@ function parseConnectArgs(input: unknown): { ok: true; extension: string; scope:
     return { ok: false, error: "api_key must be a string" };
   }
   return { ok: true, extension, scope, apiKey };
+}
+
+/** Hand-rolled validation of mint args (mirrors the tool's zod schema). */
+function parseMintUploadLinkArgs(input: unknown): { ok: true; extension: string; scope: "org" | "personal" } | { ok: false; error: string } {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return { ok: false, error: "arguments must be an object" };
+  }
+  const record = input as Record<string, unknown>;
+  const extension = record["extension"];
+  const scope = record["scope"];
+  if (typeof extension !== "string" || extension.trim() === "") {
+    return { ok: false, error: "extension must be a non-empty string" };
+  }
+  if (scope !== "org" && scope !== "personal") {
+    return { ok: false, error: 'scope must be "org" or "personal"' };
+  }
+  return { ok: true, extension, scope };
 }
 
 export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
@@ -401,6 +444,27 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   };
 
   /**
+   * The #196 one-time upload-link mint on the MCP surface. The token is
+   * written to the shared `upload_tokens` table; the URL points at the
+   * SERVER process's browser endpoint (BOTTEGA_UPLOAD_BASE_URL), which
+   * stores the pasted secret directly into the vault — never through the
+   * agent or a transcript.
+   */
+  const callMintUploadLink = async (callArgs: unknown) => {
+    if (!extensions?.uploadLink) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${MINT_UPLOAD_LINK_TOOL}`);
+    const parsed = parseMintUploadLinkArgs(callArgs);
+    if (!parsed.ok) {
+      throw new McpError(ErrorCode.InvalidParams, `${MINT_UPLOAD_LINK_TOOL}: invalid arguments: ${parsed.error}`);
+    }
+    const outcome = mintUploadLink(
+      { extension: parsed.extension, scope: parsed.scope, actor: opts.defaultPrincipal ?? "agent", spaceId: opts.spaceId ?? undefined },
+      { registry: extensions.connect.registry, store: extensions.uploadLink.store, baseUrl: extensions.uploadLink.baseUrl },
+    );
+    if (!outcome.ok) return { content: [{ type: "text", text: outcome.message }], isError: true };
+    return { content: [{ type: "text", text: outcome.url }] };
+  };
+
+  /**
    * A registered extension's manifest tool through the #53 runtime: policy
    * gate (extension allowlist + tier) → credential ladder → egress
    * boundary → audit, all server-side. The runtime audits every call
@@ -493,9 +557,22 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
                 `scope "org" connects the organization's shared account — privileged, requires a human approver ` +
                 `(denied in headless contexts without an approval channel). ` +
                 `scope "personal" connects the requesting user's own account — any user may do it. ` +
-                `Extensions whose credential type is api_key require the api_key parameter.`,
+                `Extensions whose credential type is api_key require the api_key parameter. ` +
+                `Never paste a live token here — use connect_upload_link instead.`,
               inputSchema: connectJsonSchema,
             },
+            ...(extensions.uploadLink
+              ? [
+                  {
+                    name: MINT_UPLOAD_LINK_TOOL,
+                    description:
+                      `Mints a single-use, expiring HTTPS link for an api_key-type extension. ` +
+                      `The user opens the link in a browser and pastes the secret there; the server stores it ` +
+                      `DIRECTLY into the vault — never through chat or a transcript.`,
+                    inputSchema: mintUploadLinkJsonSchema,
+                  },
+                ]
+              : []),
             ...(await advertisedExtensionTools()),
           ]
         : []),
@@ -509,6 +586,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     if (name === "session_search") return callSessionSearch(args);
     if (extensions) {
       if (name === CONNECT_EXTENSION_TOOL) return callConnect(args);
+      if (name === MINT_UPLOAD_LINK_TOOL) return callMintUploadLink(args);
       // Issue #158: resolve the owner across the EFFECTIVE surface (pinned
       // tools first, then discovered tools for tools-less manifests).
       const extensionId = await toolOwnerExtensionId(
@@ -588,6 +666,14 @@ export async function bootMemoryMcpServer(opts: {
     }
     policy = applySpaceOverlay(orgPolicy, space.policy_json);
   }
+  // Issue #196: when the server process exposed its upload endpoint URL
+  // (BOTTEGA_UPLOAD_BASE_URL — the ACP driver sets it), this child mints
+  // links into the SHARED upload_tokens table, consumable by that endpoint.
+  const uploadBaseUrl = process.env.BOTTEGA_UPLOAD_BASE_URL;
+  const uploadLink =
+    uploadBaseUrl && uploadBaseUrl.length > 0
+      ? { store: new UploadLinkStore(store), baseUrl: () => uploadBaseUrl }
+      : undefined;
   const server = createMemoryMcpServer({
     // The SAME memory backend the server and executor roots resolve
     // (issue #172): memory_backend.base_url set → mem0, else SQLite on the
@@ -615,6 +701,7 @@ export async function bootMemoryMcpServer(opts: {
           timeoutMs: orgPolicy.timeoutMinutes * 60_000,
         },
       },
+      ...(uploadLink !== undefined ? { uploadLink } : {}),
     },
   });
   return { runtime, policy, server };

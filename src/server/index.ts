@@ -25,6 +25,7 @@ import { recurringWorkAction } from "../scheduler/recurring-work";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
+import { startUploadLinkServer } from "../extensions/upload-link";
 import {
   refreshMissingExtensionSurfaces,
   type ExtensionSurfaces,
@@ -327,6 +328,26 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   deliveryActionHandler = async (a) => {
     await resolveDeliveryAction({ store, adapter, log: (line) => console.log(line) }, a);
   };
+  // One-time upload link (issue #196): an in-process HTTPS endpoint on
+  // 127.0.0.1 (loopback only — the same posture as issue #57's local dev)
+  // that stores an api_key secret DIRECTLY into the vault. The
+  // `connect_upload_link` mint tool (wired into sessions below) returns a
+  // single-use, expiring URL; the endpoint atomically consumes the token
+  // and runs the SAME connect path as the connect flow (gate → broker →
+  // registry upsert → audit). The value never goes through Slack, the
+  // agent, or a transcript. Started at boot (Bun.serve binds on creation),
+  // stopped in stop().
+  const uploadLink = startUploadLinkServer({
+    registry: extensionRegistry,
+    store,
+    audit,
+    broker: connectViaAuthBroker,
+    gate: {
+      loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+      router: approvalRouter,
+      timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+    },
+  });
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
   // by bootstrapRuntime above with the router just assigned (the #172
@@ -441,6 +462,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
                 // tools; the driver absolutizes the relative path because
                 // the spawned server runs with the agent session's cwd.
                 BOTTEGA_EXTENSIONS_DIR: "config/extensions",
+                // Issue #196: the ACP child's connect_upload_link mint
+                // shares the server's upload_tokens table and points at
+                // the SERVER process's upload endpoint.
+                BOTTEGA_UPLOAD_BASE_URL: uploadLink.baseUrl,
               },
             },
           ],
@@ -505,6 +530,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           audit,
           loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
           router: approvalRouter,
+          // Issue #196: the per-session mint tool shares the endpoint's
+          // token store, so links minted in any session are consumable by
+          // the upload endpoint started above.
+          uploadLink: { store: uploadLink.store, baseUrl: () => uploadLink.baseUrl },
         },
         // Per-space model settings (issue #64): the OMP session resolves
         // use_model roles against the space's settings column.
@@ -655,6 +684,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     },
     async stop() {
       if (memoryMaintenanceInterval) clearInterval(memoryMaintenanceInterval);
+      uploadLink.stop();
       deliveryPoller.stop();
       scheduler.stop();
       await spaceService.stop();

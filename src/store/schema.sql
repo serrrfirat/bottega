@@ -67,6 +67,27 @@ CREATE TABLE IF NOT EXISTS extension_credentials (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
 
+-- One-time upload tokens (issue #196): the no-secrets-in-chat path for
+-- api_key-type extensions. The agent mints a single-use, short-TTL link;
+-- the user opens it in a browser and pastes the secret, and the upload
+-- endpoint consumes THIS row (atomic DELETE) and stores the value directly
+-- into the vault via the same connect path. The token never carries the
+-- secret; expired/used tokens are simply gone (fail closed). Shared via the
+-- SQLite file so both the server process (endpoint) and per-session MCP
+-- child processes (mint tool) agree on the same links.
+CREATE TABLE IF NOT EXISTS upload_tokens (
+  id         TEXT PRIMARY KEY,      -- "ut_<uuid>"
+  token      TEXT NOT NULL UNIQUE,  -- opaque 128-bit random, single-use
+  extension  TEXT NOT NULL,         -- provider id, e.g. 'github'
+  scope      TEXT NOT NULL CHECK (scope IN ('org','personal')),
+  actor      TEXT NOT NULL,         -- principal the connect will run for
+  space_id   TEXT,
+  label      TEXT NOT NULL,         -- provider label, rendered in the form
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL       -- created + short TTL (issue #196)
+);
+CREATE INDEX IF NOT EXISTS idx_upload_tokens_actor ON upload_tokens(actor);
+
 -- Org settings singleton (issue #67): id=1 row holding the JSON settings
 -- blob (approvals, response_mode, memory.injection, extensions, repos,
 -- model defaults). DB-first policy: org DB settings override the

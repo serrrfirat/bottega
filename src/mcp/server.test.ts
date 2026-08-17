@@ -36,6 +36,7 @@ import {
 } from "../store/audit-events";
 import type { CredentialBoundary } from "../extensions/boundary";
 import type { BrokerConnector } from "../extensions/connect";
+import { UploadLinkStore } from "../extensions/upload-link";
 import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "../extensions/fixture";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "../extensions/manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
@@ -472,6 +473,8 @@ describe("MCP server extension surface (in-process deps)", () => {
     defaultPrincipal?: string;
     registry?: ExtensionRegistry;
     mcpTransport?: (binding: McpBinding) => Transport;
+    /** Issue #196: wire the one-time upload-link mint (shared store + fake base URL). */
+    uploadLink?: boolean;
   } = {}): Promise<InProcessHarness> {
     const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
     const store = createStore(join(dir, "test.db"));
@@ -525,6 +528,9 @@ describe("MCP server extension surface (in-process deps)", () => {
           broker,
           gate: { loadPolicy: () => Promise.resolve(policy), router: DenyRouter, timeoutMs: 1_000 },
         },
+        ...(opts.uploadLink
+          ? { uploadLink: { store: new UploadLinkStore(store), baseUrl: () => "http://127.0.0.1:9999" } }
+          : {}),
       },
     });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -777,6 +783,45 @@ describe("MCP server extension surface (in-process deps)", () => {
       await expect(
         h.client.callTool({ name: "connect_extension", arguments: { extension: 7, scope: "personal" } }),
       ).rejects.toThrow(/extension/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_upload_link is advertised + callable when the endpoint is wired (issue #196)", async () => {
+    const h = await makeInProcessHarness({ uploadLink: true });
+    try {
+      const { tools } = await h.client.listTools();
+      expect(tools.map((t) => t.name)).toContain("connect_upload_link");
+
+      const res = (await h.client.callTool({
+        name: "connect_upload_link",
+        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+      })) as ToolCallResult;
+      expect(res.isError).toBeUndefined();
+      const url = res.content[0]?.text ?? "";
+      expect(url.startsWith("http://127.0.0.1:9999/upload/")).toBe(true);
+
+      // The minted token is real: the SHARED store (the endpoint's) consumes it.
+      const token = url.slice("http://127.0.0.1:9999/upload/".length);
+      const consumed = h.store.consumeUploadToken(token);
+      expect(consumed.ok).toBe(true);
+      if (consumed.ok) expect(consumed.row.actor).toBe("U123");
+
+      // Bad args are protocol errors, not silent runs.
+      await expect(
+        h.client.callTool({ name: "connect_upload_link", arguments: { scope: "personal" } }),
+      ).rejects.toThrow(/extension/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_upload_link is absent when the endpoint is not wired", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      const { tools } = await h.client.listTools();
+      expect(tools.map((t) => t.name)).not.toContain("connect_upload_link");
     } finally {
       await h.cleanup();
     }

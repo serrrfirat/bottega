@@ -46,6 +46,7 @@ import { evaluatePolicyGate } from "../policy/gate";
 import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage, toolError } from "../tools/helpers";
+import { looksLikeObviousSecret } from "../tools/memory";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 
@@ -103,10 +104,21 @@ export type ConnectOutcome =
   | { ok: false; message: string };
 
 /**
- * The connect capability core: gate (org only) → broker flow → registry
- * upsert → audit + feedback. Fail closed: a denied gate, an unknown
- * extension, a broker failure, or a failed upsert all return an error and
- * write no registry row.
+ * The no-secrets-in-chat redirect (issue #196): a credential-shaped value
+ * pasted into the connect flow is refused with this pointer to the three
+ * safe paths — OAuth (no secret to handle), the org's connected vault (the
+ * #190 secret resolver at the egress boundary), or the one-time upload
+ * link ({@link MINT_UPLOAD_LINK_TOOL}).
+ */
+export const SECRET_PASTE_REDIRECT =
+  "pasted credentials are never stored or sent through chat — use OAuth, the org's connected vault, or ask for a one-time upload link instead";
+
+/**
+ * The connect capability core: paste guard (issue #196) → gate (org only)
+ * → broker flow → registry upsert → audit + feedback. Fail closed: a
+ * credential-shaped api_key, a denied gate, an unknown extension, a broker
+ * failure, or a failed upsert all return an error and write no registry
+ * row.
  */
 export async function connectExtension(
   input: { extension: string; scope: ConnectScope; actor: string; spaceId?: string; apiKey?: string },
@@ -119,6 +131,15 @@ export async function connectExtension(
   const manifest = resolved.manifest;
   const provider = manifest.id;
   const label = manifest.label;
+
+  // Paste guard (issue #196): refuse credential-shaped api_key values
+  // BEFORE anything runs — no gate request, no broker call, no audit row —
+  // so the value never reaches a transcript (mirrors #121's memory.save
+  // rejection). The safe path is the one-time upload link: the secret goes
+  // straight from the user's browser into the vault.
+  if (input.apiKey !== undefined && looksLikeObviousSecret(input.apiKey)) {
+    return { ok: false, message: SECRET_PASTE_REDIRECT };
+  }
 
   // Org-scope connects are privileged: they cross the shared policy gate as
   // an exec-tier tool call (deny → blocked, allow → ask-human). Personal
@@ -266,7 +287,12 @@ export interface ConnectToolDeps extends ConnectExtensionDeps {
 const CONNECT_PARAMS_SCHEMA = z.object({
   extension: z.string().describe("Extension id from the registry (e.g. the provider id)"),
   scope: z.enum(["org", "personal"]).describe("org = shared org account (needs approval); personal = your own account"),
-  api_key: z.string().optional().describe("API key for api_key-type extensions"),
+  api_key: z
+    .string()
+    .optional()
+    .describe(
+      "API key for api_key-type extensions — never paste a live token here (it would land in the transcript); use connect_upload_link instead",
+    ),
 });
 
 /**
@@ -284,7 +310,9 @@ export function connectExtensionToolDefinition(deps: ConnectToolDeps): ToolDefin
       `Connects an extension account for use in this space. ` +
       `scope "org" connects the organization's shared account — privileged, requires a human approver. ` +
       `scope "personal" connects the requesting user's own account — any user may do it. ` +
-      `Extensions whose credential type is api_key require the api_key parameter.`,
+      `Extensions whose credential type is api_key require the api_key parameter. ` +
+      `Never paste a live token here — pasted credentials are refused and land nowhere; ` +
+      `use connect_upload_link to mint a one-time browser upload instead.`,
     parameters: CONNECT_PARAMS_SCHEMA,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

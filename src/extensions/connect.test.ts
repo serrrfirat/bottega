@@ -18,6 +18,7 @@ import {
   CONNECT_EXTENSION_TOOL,
   connectExtensionToolDefinition,
   pickNewestBrokerEntry,
+  SECRET_PASTE_REDIRECT,
   type BrokerConnectResult,
   type ConnectExtensionDeps,
   type ConnectScope,
@@ -331,6 +332,51 @@ describe("connectExtension unknown extension", () => {
   });
 });
 
+describe("connectExtension paste guard (issue #196)", () => {
+  const CREDENTIAL_SHAPES = [
+    "github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
+    "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+    "AKIAIOSFODNN7EXAMPLE",
+    "near-abcdefghijklmnopqrstuvwxyz123456",
+  ];
+
+  test.each(CREDENTIAL_SHAPES)("a pasted %s-shaped api_key is refused with the redirect", async (apiKey) => {
+    const h = makeDeps();
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey });
+    expect(outcome).toMatchObject({ ok: false });
+    expect(outcome.ok === false ? outcome.message : "").toBe(SECRET_PASTE_REDIRECT);
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(0);
+  });
+
+  test("the refusal never leaks the pasted value", async () => {
+    const secret = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890";
+    const h = makeDeps();
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: secret });
+    expect(outcome.ok === false ? outcome.message : "").not.toContain(secret);
+  });
+
+  test("the refusal is immediate: no gate request, no broker call, no audit row", async () => {
+    const h = makeDeps({ policy: allowedPolicy() }); // even an allowed org policy
+    const outcome = await connect(h, "fixture.weather", "org", "UADA", {
+      apiKey: "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+    });
+    expect(outcome.ok).toBe(false);
+    expect(h.router.requests).toHaveLength(0);
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await h.store.listAudit({})).toHaveLength(0); // the value is nowhere
+  });
+
+  test("non-credential api keys still connect (the guard is narrow)", async () => {
+    const h = makeDeps();
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
+    expect(outcome.ok).toBe(true);
+    expect(h.broker.calls[0]!.apiKey).toBe("attio-secret-key");
+  });
+});
+
 describe("connectExtensionToolDefinition", () => {
   test("execute connects with the session principal and returns the confirmation", async () => {
     const h = makeDeps({ broker: new RecordingBroker({ identityKey: null, brokerCredentialId: 6 }) });
@@ -359,6 +405,26 @@ describe("connectExtensionToolDefinition", () => {
 
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("policy");
+  });
+
+  test("execute surfaces the paste-guard refusal as a tool error without the value", async () => {
+    const h = makeDeps();
+    const tool = connectExtensionToolDefinition({ ...h.deps, getPrincipal: () => "UADA" });
+    const secret = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890";
+
+    const result = await tool.execute(
+      "t1",
+      { extension: "fixture.weather", scope: "personal", api_key: secret },
+      undefined,
+      undefined,
+      { sessionManager: { getSessionFile: () => "slack:C1.jsonl" } } as never,
+    );
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toBe(SECRET_PASTE_REDIRECT);
+    expect(text).not.toContain(secret);
+    expect(h.broker.calls).toHaveLength(0);
   });
 });
 

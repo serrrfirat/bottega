@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
@@ -112,6 +112,24 @@ export type ExtensionCredential = {
   created_at: number;
 };
 
+/**
+ * One-time upload link row (issue #196): a single-use, short-TTL token the
+ * browser upload endpoint consumes to store an api_key secret DIRECTLY into
+ * the vault — the row is deleted on first consume, so an expired or replayed
+ * token is just gone (fail closed). Field names mirror the table columns.
+ */
+export type UploadToken = {
+  id: string;
+  token: string;
+  extension: string;
+  scope: CredentialScope;
+  actor: string;
+  space_id: string | null;
+  label: string;
+  created_at: number;
+  expires_at: number;
+};
+
 export type TransitionOpts = {
   /** {approver, at} entry appended to the approvals JSON array */
   approval?: { approver: string; at?: number };
@@ -206,6 +224,33 @@ export interface Store {
     brokerCredentialId: number;
   }): Promise<ExtensionCredential>;
   listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
+  /**
+   * Mints a one-time upload token (issue #196): an opaque single-use row the
+   * browser upload endpoint consumes. The token is the only credential the
+   * link carries — the secret itself goes straight to the vault on upload.
+   */
+  createUploadToken(input: {
+    extension: string;
+    scope: CredentialScope;
+    actor: string;
+    spaceId?: string | null;
+    label: string;
+    /** Absolute ms; created_at + the caller's TTL. */
+    expiresAt: number;
+  }): UploadToken;
+  /**
+   * Non-consuming read of a token row (the upload form renders the label);
+   * null when the token is unknown or already consumed.
+   */
+  getUploadToken(token: string): UploadToken | null;
+  /**
+   * Atomically consumes a token: deletes the row and returns it on the first
+   * call. Anything else — unknown, already-used, or expired — returns
+   * `{ok: false}` and deletes the row if it was expired (fail closed).
+   */
+  consumeUploadToken(token: string): { ok: true; row: UploadToken } | { ok: false };
+  /** Unexpired tokens for an actor — the mint path's per-actor rate limit. */
+  countActiveUploadTokens(actor: string): number;
   /**
    * Org settings singleton (issue #67): the validated settings blob, or
    * null when no row exists. Sync (bun:sqlite is synchronous, like getDb).
@@ -652,6 +697,67 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .all(provider) as ExtensionCredential[];
   }
 
+  function createUploadToken(input: {
+    extension: string;
+    scope: CredentialScope;
+    actor: string;
+    spaceId?: string | null;
+    label: string;
+    expiresAt: number;
+  }): UploadToken {
+    const extension = input.extension.trim();
+    const label = input.label.trim();
+    if (!extension || !label) throw new Error("upload token needs an extension and a label");
+    if (input.scope !== "org" && input.scope !== "personal") throw new Error("upload token scope must be org or personal");
+    if (!Number.isSafeInteger(input.expiresAt)) throw new Error("upload token expiresAt must be a safe integer");
+    // Sweep expired rows lazily so the table stays bounded by live links.
+    db.query("DELETE FROM upload_tokens WHERE expires_at <= ?").run(Date.now());
+    const token = randomBytes(18).toString("base64url"); // 144 bits, unguessable
+    return db
+      .query(
+        `INSERT INTO upload_tokens (id, token, extension, scope, actor, space_id, label, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING *`,
+      )
+      .get(
+        `ut_${randomUUID()}`,
+        token,
+        extension,
+        input.scope,
+        input.actor,
+        input.spaceId ?? null,
+        label,
+        Date.now(),
+        input.expiresAt,
+      ) as UploadToken;
+  }
+
+  function getUploadToken(token: string): UploadToken | null {
+    return (db.query("SELECT * FROM upload_tokens WHERE token = ?").get(token) as UploadToken | null) ?? null;
+  }
+
+  function consumeUploadToken(token: string): { ok: true; row: UploadToken } | { ok: false } {
+    const now = Date.now();
+    // Atomic single-use: only the first caller gets the row back; everyone
+    // else (replay) sees nothing.
+    const row = db
+      .query(
+        `DELETE FROM upload_tokens WHERE id = (SELECT id FROM upload_tokens WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
+      )
+      .get(token, now) as UploadToken | null;
+    if (row) return { ok: true, row };
+    // Fail closed: an expired row must not linger for a future replay.
+    db.query("DELETE FROM upload_tokens WHERE token = ?").run(token);
+    return { ok: false };
+  }
+
+  function countActiveUploadTokens(actor: string): number {
+    const row = db
+      .query("SELECT COUNT(*) AS n FROM upload_tokens WHERE actor = ? AND expires_at > ?")
+      .get(actor, Date.now()) as { n: number };
+    return row.n;
+  }
+
   async function createSchedulerJob(input: {
     action: string;
     cron: string;
@@ -823,6 +929,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     markStaleWorkItems,
     upsertExtensionCredential,
     listExtensionCredentials,
+    createUploadToken,
+    getUploadToken,
+    consumeUploadToken,
+    countActiveUploadTokens,
     getOrgSettings,
     setOrgSettings,
     createSchedulerJob,

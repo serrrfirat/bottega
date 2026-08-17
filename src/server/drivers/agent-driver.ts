@@ -24,6 +24,7 @@ import {
   connectViaAuthBroker,
   type BrokerConnector,
 } from "../../extensions/connect";
+import { mintUploadLinkToolDefinition, type UploadLinkStore } from "../../extensions/upload-link";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
 import { redact } from "../../policy/audit";
@@ -66,6 +67,14 @@ export interface ConnectExtensionDriverOpts {
   timeoutMs?: number;
   /** Broker seam; defaults to the production auth-broker connector. */
   broker?: BrokerConnector;
+  /**
+   * One-time upload link (issue #196): when wired, sessions also get the
+   * `connect_upload_link` mint tool — the store must be the one the upload
+   * endpoint shares (the server's), so links minted here are consumable by
+   * it. The minted secret lands DIRECTLY in the vault via the browser
+   * endpoint, never through chat or a CLI.
+   */
+  uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
 }
 
 /**
@@ -930,6 +939,8 @@ export function createOmpSdkDriver(
       // The connect tool (issue #52) rides the custom-tools path — restricted
       // sessions skip extension factories — and is built per session so the
       // actor is the session's principal (personal connects record the owner).
+      // The one-time upload-link mint (issue #196) rides the same path: it
+      // needs the same per-session principal + space mapping.
       const sessionCustomTools = opts.connectExtension
         ? [
             ...sessionCustomToolsBase,
@@ -946,6 +957,17 @@ export function createOmpSdkDriver(
               getPrincipal,
               spaceIdFromFile: sessionIdFromFilePath,
             }),
+            ...(opts.connectExtension.uploadLink
+              ? [
+                  mintUploadLinkToolDefinition({
+                    registry: opts.connectExtension.registry,
+                    store: opts.connectExtension.uploadLink.store,
+                    baseUrl: opts.connectExtension.uploadLink.baseUrl,
+                    getPrincipal,
+                    spaceIdFromFile: sessionIdFromFilePath,
+                  }),
+                ]
+              : []),
           ]
         : sessionCustomToolsBase;
       // Policy gate (issue #69): the driver wraps the caller's gated
