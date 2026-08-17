@@ -84,7 +84,7 @@ transforms:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
           rules:
-            - host: "api.github.com"
+            - host: "api.githubcopilot.com"
         - source:
             type: file
             path: "/data/proxy-secrets/linear.secret"

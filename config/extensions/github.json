@@ -14,8 +14,8 @@
     "vendor": "GitHub",
     "kind": "mcp",
     "mcp": {
-      "command": "github-mcp-server",
-      "transport": "stdio"
+      "serverUrl": "https://api.githubcopilot.com/mcp/",
+      "transport": "streamable-http"
     },
     "credentialSchema": {
       "type": "api_key"
@@ -53,6 +53,6 @@
         ]
       }
     ],
-    "domains": ["api.github.com"]
+    "domains": ["api.githubcopilot.com"]
   }
 }

@@ -230,9 +230,10 @@ export HTTP_PROXY="http://127.0.0.1:8080"
 export HTTPS_PROXY="http://127.0.0.1:8080"
 export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0"
 export NODE_EXTRA_CA_CERTS="$PWD/certs/ca.crt"
-# Go/spawned tools (e.g. the github-mcp-server stdio binary) don't read
-# NODE_EXTRA_CA_CERTS — they honor SSL_CERT_FILE. Without it their HTTPS
-# calls through the MITM proxy fail TLS verification (x509 unknown CA).
+# Go/spawned tools (e.g. the gh CLI) don't read NODE_EXTRA_CA_CERTS — they
+# honor SSL_CERT_FILE. Without it their HTTPS calls through the MITM proxy
+# fail TLS verification (x509 unknown CA). (The github extension needs no
+# local binary — it binds to GitHub's hosted MCP, issue #145.)
 export SSL_CERT_FILE="$PWD/certs/ca.crt"
 
 exec bun run ${1:+--watch} src/server/index.ts

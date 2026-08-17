@@ -63,7 +63,7 @@ describe("egress config generation", () => {
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
-    expect(EXTENSION_DOMAINS.sort()).toEqual(["api.github.com", "mcp.attio.com", "mcp.linear.app"]);
+    expect(EXTENSION_DOMAINS.sort()).toEqual(["api.githubcopilot.com", "mcp.attio.com", "mcp.linear.app"]);
   });
 
   test("the base allowlist permits Slack file downloads", () => {

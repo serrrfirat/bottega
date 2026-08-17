@@ -15,7 +15,10 @@
  *   3. the boundary writes data/proxy-secrets/github.secret (0600) and
  *      reloads the dev proxy (POST /v1/reload);
  *   4. the dev proxy injects `Authorization: Bearer <secret>` for
- *      api.github.com, so a credential-less GitHub API call SUCCEEDS.
+ *      api.githubcopilot.com, so a credential-less initialize to the HOSTED
+ *      GitHub MCP (https://api.githubcopilot.com/mcp/, issue #145 — the
+ *      github extension's streamable-http binding, no local binary)
+ *      AUTHENTICATES (non-401 with a JSON-RPC result).
  *
  * The vault is the REAL omp auth-broker server (`omp auth-broker serve`,
  * the same CLI the oh-my-pi/pi:dev compose image runs) started against the
@@ -23,15 +26,16 @@
  * repo not pullable here (scripts/e2e-smoke.sh skips the broker for the
  * same reason). The vault is seeded with the user's REAL GitHub credential
  * via the REAL connect path (`connectViaAuthBroker` -> broker upload) using
- * `gh auth token` from the keyring; the seed's broker_credential_id is
- * asserted to match the store row's, and the token is NEVER printed — the
- * leg only proves the API call's success (login, status).
+ * `gh auth token` from the keyring; the vault entry the store row
+ * references must exist and carry an api_key, and the token is NEVER
+ * printed — the leg only proves the API call's success (authenticated
+ * initialize).
  *
- * The provider MCP server (github-mcp-server, stdio) is not installed on
- * this host, so the runtime's documented `mcpTransport` seam substitutes an
- * in-process MCP server that performs the same GitHub API call through the
+ * The provider MCP server is HOSTED (api.githubcopilot.com — no local
+ * binary), so the runtime's documented `mcpTransport` seam substitutes an
+ * in-process MCP server that performs the same initialize call through the
  * dev proxy with NO credential — the proxy injection is what authenticates
- * it, exactly as it would for the real server's outbound calls.
+ * it, exactly as it does for the real hosted server's sessions.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -47,6 +51,7 @@ import {
   PROXY_SECRETS_DIR,
   proxyBoundaryControlFromEnv,
 } from "../../src/extensions/boundary";
+import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import { createExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
 import { connectViaAuthBroker } from "../../src/extensions/connect";
@@ -65,8 +70,8 @@ function skip(reason: string): void {
   console.log(`[auth-broker live leg] SKIP: ${reason}`);
 }
 
-/** Runs a credential-less GitHub API call through the REAL dev proxy in a fresh child (env at boot, like the dev server). */
-async function callGithubViaProxy(path: string): Promise<{ status: number; body: string }> {
+/** Runs a credential-less initialize against the HOSTED GitHub MCP through the REAL dev proxy in a fresh child (env at boot, like the dev server). */
+async function callHostedMcpViaProxy(): Promise<{ status: number; body: string }> {
   const childEnv: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HTTP_PROXY: PROXY_URL,
@@ -74,10 +79,8 @@ async function callGithubViaProxy(path: string): Promise<{ status: number; body:
     NO_PROXY: "localhost,127.0.0.1",
     NODE_EXTRA_CA_CERTS: `${REPO_ROOT}/certs/ca.crt`,
   };
-  const proc = Bun.spawn(
-    ["bun", "-e", `const r = await fetch(${JSON.stringify(`https://api.github.com${path}`)}); console.log(r.status); console.log(await r.text());`],
-    { env: childEnv, stdout: "pipe", stderr: "pipe" },
-  );
+  const script = `const r = await fetch(${JSON.stringify("https://api.githubcopilot.com/mcp/")}, { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "bottega-live-github", version: "1.0.0" } } }) }); console.log(r.status); console.log(await r.text());`;
+  const proc = Bun.spawn(["bun", "-e", script], { env: childEnv, stdout: "pipe", stderr: "pipe" });
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   const [statusLine, ...rest] = out.trim().split("\n");
   if (err.trim()) throw new Error(`github child stderr: ${err.trim()}`);
@@ -87,7 +90,6 @@ async function callGithubViaProxy(path: string): Promise<{ status: number; body:
 let store: Store;
 let brokerProc: ReturnType<typeof Bun.spawn> | null = null;
 let brokerToken: string | null = null;
-let seededBrokerId = 0;
 
 beforeAll(async () => {
   if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
@@ -154,10 +156,13 @@ beforeAll(async () => {
     }
   }
   // The broker CLI bootstraps its token (0600) at the agent-dir config
-  // root; that is the token the resolver must present.
-  const candidate = resolve(process.env.HOME ?? "/", ".omp", "auth-broker.token");
+  // root. This leg's broker (spawned below, or the harness-managed dev
+  // broker) runs against the REPO's data/.omp agent dir, so that token is
+  // authoritative; ~/.omp is only a fallback for brokers rooted at the
+  // default agent dir.
   const dockerCandidate = resolve(REPO_ROOT, "data/.omp/auth-broker.token");
-  const tokenFile = existsSync(candidate) ? candidate : existsSync(dockerCandidate) ? dockerCandidate : null;
+  const candidate = resolve(process.env.HOME ?? "/", ".omp", "auth-broker.token");
+  const tokenFile = existsSync(dockerCandidate) ? dockerCandidate : existsSync(candidate) ? candidate : null;
   if (!tokenFile) {
     skip("no broker token file found (~/.omp/auth-broker.token or data/.omp/auth-broker.token)");
     return;
@@ -167,14 +172,14 @@ beforeAll(async () => {
   process.env.OMP_AUTH_BROKER_TOKEN = brokerToken;
 
   // Seed the vault with the user's REAL keyring GitHub credential via the
-  // real connect path (idempotent: uploadCredential upserts per provider).
+  // real connect path (idempotent: the vault keeps ONE api_key row per
+  // provider — the upload upserts, so the resolver always finds it).
   const pat = Bun.spawnSync(["gh", "auth", "token"], { stdout: "pipe" }).stdout.toString().trim();
   if (!pat || pat.length < 20) {
     skip("`gh auth token` returned nothing usable");
     return;
   }
-  const seeded = await connectViaAuthBroker({ provider: "github", credentialType: "api_key", apiKey: pat });
-  seededBrokerId = seeded.brokerCredentialId;
+  await connectViaAuthBroker({ provider: "github", credentialType: "api_key", apiKey: pat });
 });
 
 afterAll(() => {
@@ -186,7 +191,7 @@ afterAll(() => {
 
 describe("auth-broker live leg (issue #143, skip-gated)", () => {
   test(
-    "a github extension call with the caller's personal credential resolves the vault secret, injects it via the dev proxy, and GitHub answers 200",
+    "a github extension call with the caller's personal credential resolves the vault secret, injects it via the dev proxy, and the hosted GitHub MCP authenticates",
     async () => {
       if (process.env.BOTTEGA_RUN_INTEGRATION !== "1" || !brokerToken) {
         skip("preconditions not met (see beforeAll)");
@@ -199,7 +204,29 @@ describe("auth-broker live leg (issue #143, skip-gated)", () => {
       const rows = await store.listExtensionCredentials("github");
       const personal = rows.find((row) => row.scope === "personal" && row.owner === CALLER);
       expect(personal).toBeDefined();
-      expect(seededBrokerId).toBe(personal!.broker_credential_id);
+      // The vault entry the STORE row references (broker_credential_id)
+      // must exist and carry an api_key secret — that is the entry the
+      // boundary's resolver fetches at call time, and the full-chain proof
+      // below exercises it (the resolved secret is injected by the dev
+      // proxy and the hosted MCP authenticates). The seed upload above
+      // upserts the vault's single github api_key row, so a re-running leg
+      // over a pre-existing vault must not assume the upload's id matches.
+      const snapshot = await new AuthBrokerClient({
+        url: BROKER_URL,
+        token: brokerToken ?? "",
+      }).fetchSnapshot();
+      if (snapshot.status !== 200) {
+        skip(`broker snapshot fetch failed (status ${snapshot.status})`);
+        return;
+      }
+      const referenced = snapshot.snapshot.credentials.find(
+        (entry) => entry.id === personal!.broker_credential_id && entry.provider === "github",
+      );
+      expect(referenced).toBeDefined();
+      expect(referenced!.credential.type).toBe("api_key");
+      if (referenced!.credential.type === "api_key") {
+        expect(referenced!.credential.key.length).toBeGreaterThan(20);
+      }
 
       const registry = createExtensionRegistry(resolve(REPO_ROOT, "config/extensions"));
       const runtime = createExtensionRuntime({
@@ -219,15 +246,16 @@ describe("auth-broker live leg (issue #143, skip-gated)", () => {
             { capabilities: { tools: {} } },
           );
           server.setRequestHandler(CallToolRequestSchema, async () => {
-            // Stand-in for the real github-mcp-server: performs the GitHub
-            // API call through the dev proxy with NO credential — the
-            // proxy injects the Authorization header (the boundary's
-            // secret file). /user is the crisp auth proof.
-            const { status, body } = await callGithubViaProxy("/user");
-            const parsed = JSON.parse(body) as { login?: string; message?: string };
-            const text = status === 200 && parsed.login
-              ? `github user: ${parsed.login} (authenticated via the dev proxy)`
-              : `github error ${status}: ${parsed.message ?? body.slice(0, 120)}`;
+            // Stand-in for the hosted github MCP server: performs the same
+            // initialize call through the dev proxy with NO credential —
+            // the proxy injects the Authorization header (the boundary's
+            // secret file). A JSON-RPC result with serverInfo is the crisp
+            // auth proof (an unauthenticated initialize is 401).
+            const { status, body } = await callHostedMcpViaProxy();
+            const text =
+              status !== 401 && body.includes("serverInfo")
+                ? "github hosted MCP: authenticated via the dev proxy"
+                : `github error ${status}: ${body.slice(0, 120)}`;
             return { content: [{ type: "text", text }] };
           });
           void server.connect(serverTransport);
@@ -249,7 +277,7 @@ describe("auth-broker live leg (issue #143, skip-gated)", () => {
       const text = result.ok
         ? result.content.map((block) => ("text" in block ? block.text : "")).join("")
         : result.error;
-      expect(text).toContain("github user: ");
+      expect(text).toContain("github hosted MCP: authenticated via the dev proxy");
       expect(text).not.toContain("gho_");
       expect(text).not.toContain("github_pat");
 
@@ -269,13 +297,13 @@ describe("auth-broker live leg (issue #143, skip-gated)", () => {
       expect(fresh[0].payload).toContain('"extension":"github"');
       expect(fresh[0].payload).toContain('"decision":"allow"');
 
-      // Independent direct proof: a credential-less /user call through the
-      // dev proxy succeeds (200) as the user's own account.
-      const direct = await callGithubViaProxy("/user");
-      expect(direct.status).toBe(200);
-      const parsed = JSON.parse(direct.body) as { login?: string };
-      expect(parsed.login).toBeTruthy();
-      console.log(`[auth-broker live leg] GitHub /user through the dev proxy: 200 as ${parsed.login}`);
+      // Independent direct proof: a credential-less initialize to the
+      // hosted GitHub MCP through the dev proxy authenticates (non-401
+      // with serverInfo) as the user's own credential.
+      const direct = await callHostedMcpViaProxy();
+      expect(direct.status).not.toBe(401);
+      expect(direct.body).toContain("serverInfo");
+      console.log(`[auth-broker live leg] hosted GitHub MCP initialize through the dev proxy: HTTP ${direct.status} (authenticated)`);
     },
     120_000,
   );

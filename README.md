@@ -263,8 +263,12 @@ image, or chat.
 
 2. **Extension credential (auth-broker vault)** — the GitHub extension's MCP
    tools (`github.search_issues`, `github.create_issue`, …) resolve their
-   credential from the auth-broker vault via the #51 ladder. Connect it with
-   the `connect` capability and choose the scope:
+   credential from the auth-broker vault via the #51 ladder. The extension
+   binds to GitHub's **hosted MCP server** (streamable-http at
+   `https://api.githubcopilot.com/mcp/`, issue #145) — no `github-mcp-server`
+   binary is installed anywhere; the egress allowlist + secrets transform
+   cover that host and the proxy injects the credential there. Connect it
+   with the `connect` capability and choose the scope:
 
    - `connect github as me` — **personal**: the credential binds to *your*
      Slack identity and resolves only for your calls (the ladder filters

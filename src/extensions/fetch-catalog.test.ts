@@ -182,7 +182,7 @@ describe("fetch-catalog helper (issue #54)", () => {
           reviewed: true,
         },
       });
-      draft.manifest = { ...draft.manifest, id: "github", domains: ["api.github.com"] };
+      draft.manifest = { ...draft.manifest, id: "github", domains: ["api.githubcopilot.com"] };
       draft.extensionId = "github";
       const fetchImpl = stubFetch(); // catalog has no github entry; must not be consulted
       const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl });

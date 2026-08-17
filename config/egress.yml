@@ -61,7 +61,7 @@ transforms:
         - "raw.githubusercontent.com"
         - "files.slack.com"
         - "mcp.attio.com"
-        - "api.github.com"
+        - "api.githubcopilot.com"
         - "mcp.linear.app"
 
   # 2. Judge: LLM policy gate. Fires on every request that passed the
@@ -123,7 +123,7 @@ transforms:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
           rules:
-            - host: "api.github.com"
+            - host: "api.githubcopilot.com"
         - source:
             type: file
             path: "/data/proxy-secrets/linear.secret"

@@ -285,8 +285,9 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
         return;
       }
 
-      // Extension host with an injection rule; NOT on the strict allowlist.
-      const INJECT_HOST = "api.github.com";
+      // Extension host with an injection rule; a host that IS on the strict
+      // allowlist (the allow-all proof is PERMISSIVE_HOST below).
+      const INJECT_HOST = "api.githubcopilot.com";
       // Host that is NOT on the strict allowlist at all — must still pass
       // under the dev allow-all config (the strict config 403s it).
       const PERMISSIVE_HOST = "bottega-permissive.test";
