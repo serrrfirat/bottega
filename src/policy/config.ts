@@ -56,6 +56,23 @@ export type Tier = "read" | "write" | "exec";
 export type PolicyAction = "allow" | "deny" | "prompt";
 export type Decision = "allow" | "deny" | "ask-human";
 
+/** The tier × policy action decision for one known tool (issue #26). */
+export interface ToolDecision {
+  decision: Decision;
+  reason: string;
+}
+
+/** The extension allowlist decision (issue #56), resolved before tier logic. */
+export interface ExtensionDecision {
+  decision: "allow" | "deny";
+  reason: string;
+}
+
+/** The full gate decision for one tool call, incl. the always-approve audit flag (issue #45). */
+export interface PolicyDecision extends ToolDecision {
+  autoApproved: boolean;
+}
+
 /** Space-agent driver selected by the org config (`agent.driver`, issue #26). */
 export type AgentDriverName = "acp" | "omp-sdk";
 const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
@@ -322,7 +339,7 @@ export function decideToolCall(input: {
   tier: Tier;
   action: PolicyAction;
   toolKnown: boolean;
-}): { decision: Decision; reason: string } {
+}): ToolDecision {
   if (input.action === "deny") return { decision: "deny", reason: "policy denies the tool" };
   if (!input.toolKnown) return { decision: "deny", reason: "tool is not in the known tool table" };
   if (input.action === "prompt") return { decision: "ask-human", reason: "policy requires a human prompt" };
@@ -340,7 +357,7 @@ export function decideToolCall(input: {
 export function decideExtensionCall(
   policy: PolicyConfig,
   extensionId: string,
-): { decision: "allow" | "deny"; reason: string } {
+): ExtensionDecision {
   if (policy.extensionsDeny.includes(extensionId)) {
     return {
       decision: "deny",
@@ -392,7 +409,7 @@ export function decidePolicyCall(
    * decides and extension tools deny as unknown (fail closed).
    */
   extensionTier?: Tier,
-): { decision: Decision; reason: string; autoApproved: boolean } {
+): PolicyDecision {
   if (!policy.ok) return { decision: "deny", reason: `policy invalid: ${policy.errors[0] ?? "parse error"}`, autoApproved: false };
   // Extension allowlist (issue #56): resolved BEFORE tier/approval — a
   // denied extension never reaches the approval ladder or credential

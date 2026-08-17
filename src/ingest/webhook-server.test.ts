@@ -10,6 +10,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { JsonValue } from "../memory/mem0";
 import { createAudit } from "../policy/audit";
 import { INGEST_WEBHOOK_DISPATCH_EVENT, INGEST_WEBHOOK_REJECTED_EVENT, WORK_ITEM_CREATED_EVENT } from "../store/audit-events";
 import { createStore, type Store } from "../store/db";
@@ -34,7 +35,7 @@ function freshStore(): Store {
 }
 
 /** A mention comment (issue #57): the canonical GitHub webhook shape. */
-function mentionBody(overrides: Record<string, unknown> = {}): string {
+function mentionBody(overrides: Record<string, JsonValue | undefined> = {}): string {
   return JSON.stringify({
     action: "created",
     comment: {
@@ -65,12 +66,12 @@ function post(
   opts: { path?: string; secret?: string; event?: string; contentLength?: number } = {},
 ): Promise<Response> {
   const path = opts.path ?? "/webhooks/github";
-  const headers: Record<string, string> = {
+  const headers = {
     "content-type": "application/json",
     "x-hub-signature-256": signature(rawBody, opts.secret ?? SECRET),
-    ...(opts.event !== undefined ? { "x-github-event": opts.event } : {}),
-    ...(opts.contentLength !== undefined ? { "content-length": String(opts.contentLength) } : {}),
-  };
+    ...(opts.event !== undefined ? { "x-github-event": opts.event } : undefined),
+    ...(opts.contentLength !== undefined ? { "content-length": String(opts.contentLength) } : undefined),
+  } satisfies Record<string, string>;
   return handleWebhookRequest(new Request(`http://127.0.0.1${path}`, { method: "POST", headers, body: rawBody }), deps());
 }
 
@@ -109,9 +110,10 @@ function freshHarness(): Harness {
   return harness;
 }
 
-async function auditPayloads(store: Store, eventType: string): Promise<Record<string, unknown>[]> {
+async function auditPayloads(store: Store, eventType: string): Promise<Record<string, JsonValue>[]> {
   const rows = await store.listAudit({ event_type: eventType });
-  return rows.map((row) => JSON.parse(row.payload) as Record<string, unknown>);
+  // SAFETY: audit payloads are written via JSON.stringify, so the parsed value is a JSON object.
+  return rows.map((row) => JSON.parse(row.payload) as Record<string, JsonValue>);
 }
 
 describe("webhook route — dispatch on a valid mention (issue #57)", () => {
@@ -127,6 +129,7 @@ describe("webhook route — dispatch on a valid mention (issue #57)", () => {
     const created = await h.store.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
     expect(JSON.parse(created[0]!.payload)).toEqual({ id: expect.any(String), requester: "ingest:github" });
     // …and the item row exists with the mention's evidence.
+    // SAFETY: WORK_ITEM_CREATED_EVENT rows carry the created item's id (see src/store/db.ts).
     const itemId = (JSON.parse(created[0]!.payload) as { id: string }).id;
     const item = await h.store.getWorkItem(itemId);
     expect(item).not.toBeNull();
@@ -212,6 +215,7 @@ describe("webhook route — dispatch on a valid mention (issue #57)", () => {
     expect(res.status).toBe(200);
     const created = await h.store.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
     expect(created).toHaveLength(1);
+    // SAFETY: WORK_ITEM_CREATED_EVENT rows carry the created item's id (see src/store/db.ts).
     const item = await h.store.getWorkItem((JSON.parse(created[0]!.payload) as { id: string }).id);
     expect(item!.description.length).toBeLessThan(MAX_COMMENT_BODY_CHARS + 64);
   });

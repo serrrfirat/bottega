@@ -3,6 +3,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { JsonValue } from "../../memory/mem0";
 import { githubMentionPayloadSchema } from "../dispatch";
 import { createGithubPoller } from "./poller";
 
@@ -18,7 +19,7 @@ function freshDir(): string {
   return dir;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: JsonValue, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
@@ -26,7 +27,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** One open issue mentioning the bot, updated 30s after the test baseline. */
-function mentionItem(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function mentionItem(overrides: Record<string, JsonValue> = {}) {
   return {
     html_url: "https://github.com/acme/bottega/issues/42",
     title: "Fix the flaky checkout",

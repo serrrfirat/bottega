@@ -448,7 +448,7 @@ export class SlackTurnPresenter {
   }
 
   /** Session error: surface it by replacing the phrase in place (or appending + closing the stream). */
-  onError(data: unknown): void {
+  onError(data: ErrorEvent): void {
     console.error(`[slack-turn-presenter] session error (${this.spaceId}):`, data);
     if (this.digesting) return;
     this.#turnDelivered = true;
@@ -459,8 +459,7 @@ export class SlackTurnPresenter {
     // An error is a visible outcome: it breaks the empty streak and re-arms phrases.
     this.#emptyTurnCount = 0;
     this.#churnActive = false;
-    const message = typeof data === "object" && data !== null && "message" in data ? data.message : undefined;
-    const base = typeof message === "string" ? message : "Something went wrong while thinking.";
+    const base = data.message ?? "Something went wrong while thinking.";
     // A setup-blocked failure (provider/session) appends the one-line
     // onboarding pointer (issue #116) — bounded by the per-space dedupe.
     this.#replaceOrPost(this.#nudgeText(base));
@@ -482,11 +481,10 @@ export class SlackTurnPresenter {
    * the stream with it as the closing block); then the receipt reaction
    * and latency audit resolve for streaming turns.
    */
-  onTurnEnd(data: unknown): void {
+  onTurnEnd(data: TurnEndEvent): void {
     if (this.digesting) return;
     if (!this.#turnDelivered) {
-      const cause = typeof data === "object" && data !== null && "error" in data ? data.error : undefined;
-      this.#countEmptyTurn(typeof cause === "string" && cause.trim() ? cause.trim() : undefined);
+      this.#countEmptyTurn(data.error?.trim() || undefined);
     }
     const finalText = this.#latestStreamedText();
     const finalized = this.finalizeTurn(finalText);
@@ -525,7 +523,7 @@ export class SlackTurnPresenter {
    * shows the latest reasoning snippet in place while the turn runs. The
    * streaming renderer ignores it (the panel renders steps, not phrases).
    */
-  onThinking(data: unknown): void {
+  onThinking(data: ThinkingEvent): void {
     if (this.digesting) return;
     this.renderThinking(data);
   }
@@ -609,11 +607,10 @@ export class SlackTurnPresenter {
   }
 
   /** A thinking chunk (issue #193); the phrase renderer shows it live as the 🧠 snippet. */
-  protected renderThinking(data: unknown): void {
-    const thinking =
-      data !== null && typeof data === "object" && "thinking" in data ? data.thinking : undefined;
-    if (typeof thinking !== "string" || !thinking.trim()) return;
-    this.#latestThinking = this.#tailSnippet(thinking.trim());
+  protected renderThinking(data: ThinkingEvent): void {
+    const thinking = data.thinking?.trim();
+    if (!thinking) return;
+    this.#latestThinking = this.#tailSnippet(thinking);
     this.#renderProgressNow();
   }
 
@@ -834,7 +831,7 @@ export class SlackTurnPresenter {
         event_type: MESSAGE_REPLIED_EVENT,
         payload: JSON.stringify({
           latency_ms: Date.now() - receivedAt,
-          ...(phraseMs !== undefined ? { phrase_ms: phraseMs } : {}),
+          ...(phraseMs !== undefined ? { phrase_ms: phraseMs } : undefined),
         }),
       })
       .catch((err) => {
@@ -1156,7 +1153,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
         id: step.taskId,
         title: step.title,
         status: step.status,
-        ...(step.output !== undefined ? { output: step.output } : {}),
+        ...(step.output !== undefined ? { output: step.output } : undefined),
       })
       .catch((err) => {
         // Any stream failure flips to the phrase path for the boot (issue #181).
@@ -1173,7 +1170,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
    * panel renders steps as cards and reply text as stream appends — a
    * reasoning snippet must not pollute the stream, so it renders nothing.
    */
-  protected renderThinking(_data: unknown): void {}
+  protected renderThinking(_data: ThinkingEvent): void {}
 
   /**
    * The panel owns the stream surface: the phrase renderer's elapsed tick

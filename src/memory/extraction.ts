@@ -183,8 +183,8 @@ export function createBurstBuffer(options: BurstBufferOptions): BurstBuffer {
     },
     flushDue,
     async drain() {
-      for (const spaceId of [...pending.keys()]) flushSpace(spaceId);
-      while (inFlight.size > 0) await Promise.all([...inFlight]);
+      for (const spaceId of pending.keys()) flushSpace(spaceId);
+      while (inFlight.size > 0) await Promise.all(inFlight);
     },
     close() {
       closed = true;

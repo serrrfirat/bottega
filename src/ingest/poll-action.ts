@@ -23,8 +23,8 @@ import type { Poller } from "./types";
 const ACTION_NAME = "ingest_poll";
 const PROVIDERS = ["github", "linear"] as const;
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 export interface IngestPollActionOpts {

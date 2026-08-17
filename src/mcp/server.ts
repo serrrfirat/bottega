@@ -110,6 +110,7 @@ import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "../server/bootstrap-runtime";
 import { seedBootSecretsFromVault } from "../server/boot-secrets";
+import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
 import { buildRegistry } from "../scheduler/actions";
 import { createIngestPollAction } from "../ingest/poll-action";
@@ -260,7 +261,7 @@ interface InternalToolBinding {
   name: string;
   description: string;
   /** JSON Schema advertised via tools/list — derived from the shared definition's parameters. */
-  inputSchema: Record<string, unknown>;
+  inputSchema: JsonObject;
   /** Gate → audit → validate → execute. Returns the MCP tool result. */
   run: (callArgs: CallToolRequest["params"]["arguments"]) => Promise<CallToolResult>;
 }
@@ -409,7 +410,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     tier: Tier,
     decision: Decision,
     reason: string,
-    args: unknown,
+    args: CallToolRequest["params"]["arguments"],
   ): Promise<number> =>
     opts.audit.appendAudit({
       space_id: opts.spaceId ?? null,
@@ -526,8 +527,8 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     // two methods are narrowed here (the same zod surface the memory tools
     // use, e.g. memorySaveArgsSchema).
     const parameters = definition.parameters as {
-      toJsonSchema(): Record<string, unknown>;
-      safeParse(input: unknown):
+      toJsonSchema(): JsonObject;
+      safeParse(input: CallToolRequest["params"]["arguments"]):
         | { success: true; data: unknown }
         | { success: false; error: { message: string; issues: Array<{ message: string; path: PropertyKey[] }> } };
     };
@@ -536,7 +537,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     // space id from the session file, exactly like the in-session tools).
     const ctx = {
       sessionManager: { getSessionFile: () => sessionFile },
-    } as unknown as ExtensionContext;
+    } as ExtensionContext;
     return {
       name,
       description: definition.description,
@@ -837,8 +838,11 @@ export async function bootMemoryMcpServer(opts: {
 } = {}): Promise<McpBoot> {
   // Issue #201: same boot-secret seed as the server/executor roots (#172
   // parity) — this MCP child's sessions resolve models from the same env
-  // names, so the provider keys must be seeded before any SDK use.
+  // names, so the provider keys must be seeded before any SDK use. Issue
+  // #208: then push the provider credentials into the proxy (the app
+  // process never holds them — the proxy injects at egress).
   await seedBootSecretsFromVault();
+  await syncProxyCredentialsFromEnv();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     // Env contract (see the file header): the ACP driver / tests pin the

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { JsonValue } from "../memory/mem0";
 import type { MemoryProvider } from "../memory/types";
 import { createAudit } from "../policy/audit";
 import { KNOWN_ACTIONS, buildRegistry } from "../scheduler/actions";
@@ -34,8 +35,9 @@ const unusedMemory: MemoryProvider = {
   search: async () => [],
 };
 
-function payload(row: AuditRow): Record<string, unknown> {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+function payload(row: AuditRow): Record<string, JsonValue> {
+  // SAFETY: audit payloads are written via JSON.stringify, so the parsed value is a JSON object.
+  return JSON.parse(row.payload) as Record<string, JsonValue>;
 }
 
 function mentionEvent(): IngestEvent {
@@ -152,6 +154,7 @@ describe("createIngestPollAction (issue #57)", () => {
       registry,
       memoryProvider: unusedMemory,
       postMessage: async () => "ts_1",
+      // SAFETY: no poller resolves a policy; the impossible return is never observed.
       loadPolicy: async () => undefined as never,
       log: (line: string) => logs.push(line),
     };
@@ -202,6 +205,7 @@ describe("createIngestPollAction (issue #57)", () => {
           posts.push(text);
           return "ts_1";
         },
+        // SAFETY: no poller resolves a policy; the impossible return is never observed.
         loadPolicy: async () => undefined as never,
         log: () => {},
       },
@@ -232,6 +236,7 @@ describe("createIngestPollAction (issue #57)", () => {
         audit,
         memoryProvider: unusedMemory,
         postMessage: async () => "ts_1",
+        // SAFETY: no poller resolves a policy; the impossible return is never observed.
         loadPolicy: async () => undefined as never,
         log: (line) => logs.push(line),
         now: () => FIRE_TIME,

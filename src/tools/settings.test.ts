@@ -52,7 +52,9 @@ function fakeAudit(): FakeAudit {
   const rows: AuditRow[] = [];
   const audit: Pick<AuditModule, "appendAudit"> = {
     appendAudit: async (entry) => {
-      const text = typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload);
+      // String payloads pass through; object payloads are JSON-serialized.
+      const parsed = z.string().safeParse(entry.payload);
+      const text = parsed.success ? parsed.data : JSON.stringify(entry.payload);
       rows.push({
         actor: entry.actor,
         event_type: entry.event_type,

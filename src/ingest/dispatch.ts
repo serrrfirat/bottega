@@ -62,21 +62,25 @@ export type GithubMentionPayload = z.infer<typeof githubMentionPayloadSchema>;
 
 const INGEST_PROVIDERS = ["github", "linear"] as const;
 
+/** The event envelope, parsed at the dispatcher boundary (fail-closed gate). */
+const ingestEnvelopeSchema = z.object({
+  provider: z.enum(INGEST_PROVIDERS, {
+    error: (issue) => `unknown provider: ${String(issue.input)}`,
+  }),
+  eventType: z.string().min(1, "eventType must be a non-empty string"),
+  occurredAt: z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
+    message: "occurredAt is not a parseable timestamp",
+  }),
+  payload: z.record(z.string(), z.unknown(), { error: "payload must be a JSON object" }),
+});
+
 type Validation = { ok: true } | { ok: false; reason: string };
 
 /** Envelope + known-payload validation. Fail closed: any doubt → rejected. */
 function validateEvent(event: IngestEvent): Validation {
-  if (!INGEST_PROVIDERS.includes(event.provider as (typeof INGEST_PROVIDERS)[number])) {
-    return { ok: false, reason: `unknown provider: ${String(event.provider)}` };
-  }
-  if (typeof event.eventType !== "string" || event.eventType.length === 0) {
-    return { ok: false, reason: "eventType must be a non-empty string" };
-  }
-  if (Number.isNaN(Date.parse(event.occurredAt))) {
-    return { ok: false, reason: `occurredAt is not a parseable timestamp: ${String(event.occurredAt)}` };
-  }
-  if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) {
-    return { ok: false, reason: "payload must be a JSON object" };
+  const envelope = ingestEnvelopeSchema.safeParse(event);
+  if (!envelope.success) {
+    return { ok: false, reason: envelope.error.issues[0]?.message ?? "invalid ingest envelope" };
   }
   if (event.provider === "github" && event.eventType === "mention") {
     const parsed = githubMentionPayloadSchema.safeParse(event.payload);
@@ -113,6 +117,9 @@ export async function dispatchIngestEvent(ctx: IngestDispatchContext, event: Ing
   }
 
   if (event.provider === "github" && event.eventType === "mention") {
+    // SAFETY: validateEvent ran githubMentionPayloadSchema.safeParse on this
+    // payload in the gate above and returned ok — the assertion is the
+    // validated narrow view of the event payload.
     const payload = event.payload as GithubMentionPayload;
     const item = await ctx.store.createWorkItem({
       space_id: ctx.spaceId,

@@ -7,7 +7,8 @@ import {
   INGEST_WEBHOOK_REJECTED_EVENT,
   WORK_ITEM_CREATED_EVENT,
 } from "../store/audit-events";
-import { createStore, type AuditRow, type Store } from "../store/db";
+import { createStore, type AuditRow, type Store, type WorkItem } from "../store/db";
+import type { JsonValue } from "../memory/mem0";
 import { dispatchIngestEvent, type IngestDispatchContext } from "./dispatch";
 import type { IngestEvent } from "./types";
 
@@ -23,8 +24,9 @@ function freshStore(): Store {
   return store;
 }
 
-function payload(row: AuditRow): Record<string, unknown> {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+function payload(row: AuditRow): Record<string, JsonValue> {
+  // SAFETY: audit payloads are written via JSON.stringify, so the parsed value is a JSON object.
+  return JSON.parse(row.payload) as Record<string, JsonValue>;
 }
 
 function validMentionEvent(): IngestEvent {
@@ -79,6 +81,8 @@ describe("dispatchIngestEvent (issue #57)", () => {
     // The store's existing creation path produced exactly one work item.
     const created = await audit.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
     expect(created).toHaveLength(1);
+    // SAFETY: WORK_ITEM_CREATED_EVENT rows are written by createWorkItem
+    // with the work item id as a string (see src/store/db.ts).
     const item = await store.getWorkItem(payload(created[0]!).id as string);
     expect(item).toMatchObject({
       space_id: spaceId,
@@ -128,6 +132,8 @@ describe("dispatchIngestEvent (issue #57)", () => {
   }> = [
     {
       label: "unknown provider",
+      // SAFETY: "gitlab" is deliberately outside the provider union to
+      // exercise the dispatcher's fail-closed reject path.
       event: { ...validMentionEvent(), provider: "gitlab" as never },
       reason: "unknown provider: gitlab",
     },
@@ -186,11 +192,13 @@ describe("dispatchIngestEvent (issue #57)", () => {
 
   test("a store failure propagates (validation is not the caller's problem to guess)", async () => {
     const { audit, ctx } = await setup("poll");
+    // SAFETY: the failing store stub overrides only createWorkItem — the
+    // one Store member the dispatch path touches before the throw.
     const store = {
-      async createWorkItem() {
+      async createWorkItem(_input: Parameters<Store["createWorkItem"]>[0]): Promise<WorkItem> {
         throw new Error("database unavailable");
       },
-    } as unknown as Store;
+    } as Store;
     const failing: IngestDispatchContext = { ...ctx, store };
 
     await expect(dispatchIngestEvent(failing, validMentionEvent())).rejects.toThrow("database unavailable");

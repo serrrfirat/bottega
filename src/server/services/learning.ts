@@ -10,8 +10,8 @@ export interface LearningLogger {
 }
 
 /** Normalize an arbitrary thrown value to the Error the logger contract accepts. */
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+function toError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
 }
 
 export interface LearningServiceDeps {
@@ -193,7 +193,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
     drain: () => buffer.drain(),
     close() {
       buffer.close();
-      for (const spaceId of [...observed.keys()]) detach(spaceId);
+      for (const spaceId of observed.keys()) detach(spaceId);
       principalBySpace.clear();
     },
   };

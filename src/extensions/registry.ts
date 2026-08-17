@@ -32,7 +32,6 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import {
-  ExtensionValidationError,
   validateManifest,
   type ExtensionManifest,
   type JsonValue,
@@ -75,7 +74,7 @@ export interface ExtensionRegistry {
    * Registers an extension. Throws {@link ExtensionRegistryError} on a
    * duplicate id or a tool name collision with an already-registered
    * extension (the session tool registry is keyed by tool name). Validation
-   * failures throw {@link ExtensionValidationError} (fail closed).
+   * failures throw the manifest validation error (fail closed).
    */
   register(manifest: ExtensionManifest, snapshot?: PinnedSnapshot): ResolvedExtension;
   /** All registered extensions, in registration order. */

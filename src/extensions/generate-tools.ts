@@ -307,7 +307,8 @@ function drainBoundedStderr(transport: Transport): void {
       // iterable at runtime even though its declared `Stream` type does not
       // carry the Symbol.asyncIterator typing.
       for await (const chunk of stderr as NodeJS.ReadableStream) {
-        const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+        // Stream chunks are string or Buffer; both decode to text via toString.
+        const text = chunk.toString();
         if (bytes < STDIO_STDERR_DIAGNOSTIC_BYTES) {
           prefix += text;
           bytes += text.length;

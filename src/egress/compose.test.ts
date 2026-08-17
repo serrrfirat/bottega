@@ -141,6 +141,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     const proxyVol = service("iron-proxy")["volumes"] as string[];
     expect(proxyVol).toContain("data:/data");
     for (const name of ["server", "executor"]) {
+      // SAFETY: the fixture declares volumes as a list of mount strings on every service.
       const vol = service(name)["volumes"] as string[];
       expect(vol).toContain("data:/app/data");
     }

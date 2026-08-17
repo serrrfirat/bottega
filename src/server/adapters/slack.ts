@@ -367,7 +367,9 @@ export function renderSlackText(markdown: string): string {
     // Standalone --- / *** / ___ rules → dropped (Slack shows the raw line).
     .replace(/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/gm, "");
   return converted.replace(
-    /\u0000(\d+)\u0000/g,
+    // The NUL-placeholder mask is intentional: code chunks are protected
+    // with \0 sentinels that cannot appear in user text.
+    /\0(\d+)\0/g,
     (_, index: string) => protectedChunks[Number(index)]!,
   );
 }
@@ -739,7 +741,7 @@ export function createSlackAdapter(opts: {
    * policy on `app.client`.
    */
   const streamClient = new WebClient(opts.botToken, {
-    ...(opts.clientOptions ?? {}),
+    ...opts.clientOptions,
     retryConfig: STREAM_RETRY_CONFIG,
     timeout: STREAM_CALL_TIMEOUT_MS,
   });

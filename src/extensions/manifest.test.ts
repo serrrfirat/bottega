@@ -40,9 +40,11 @@ function mutate(manifest: ExtensionManifest, path: string[], value: JsonValue | 
   let cursor: JsonObject = doc;
   for (const key of path.slice(0, -1)) {
     const next = cursor[key];
-    if (next === null || typeof next !== "object") {
+    if (!(next instanceof Object)) {
       throw new Error(`mutate: manifest path ${path.join(".")} has a non-mapping intermediate at "${key}"`);
     }
+    // SAFETY: the guard above established `next` is a non-null object
+    // (mapping or array — array indices are valid intermediate keys).
     cursor = next as JsonObject;
   }
   if (value === undefined) {
@@ -203,6 +205,7 @@ describe("extension manifest validation (fail closed)", () => {
   test("tool names must be unique, well-formed, and not reserved", () => {
     // JSON-roundtrip the tool objects: mutate's value domain is JSON (the
     // validator re-validates a serialized document).
+    // SAFETY: fixture tool objects are plain JSON — the roundtrip keeps them JSON-shaped.
     const tool = JSON.parse(JSON.stringify(fixtureManifest().tools![0])) as JsonObject;
     const duplicated = mutate(fixtureManifest(), ["tools"], [tool, { ...tool, description: "again" }]);
     expectInvalid(duplicated, "duplicate tool name");

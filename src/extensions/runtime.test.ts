@@ -18,7 +18,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { createAudit } from "../policy/audit";
+import { createAudit, type AuditModule } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
 import { createStore, type ExtensionCredential, type Store } from "../store/db";
@@ -866,14 +866,16 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
     const store = createStore(":memory:");
     stores.push(store);
     const failingAudit = {
-      appendAudit: async () => {
+      appendAudit: async (_entry: Parameters<AuditModule["appendAudit"]>[0]): Promise<number> => {
         throw new Error("sqlite: database is locked");
       },
     };
+    // SAFETY: the failing audit stub overrides only appendAudit — the one
+    // AuditModule member the runtime touches before the throw.
     const runtime = createExtensionRuntime({
       registry,
       store,
-      audit: failingAudit as unknown as ExtensionRuntimeDeps["audit"],
+      audit: failingAudit as ExtensionRuntimeDeps["audit"],
       orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
       router: DenyRouter,
       boundary: hBoundary(),

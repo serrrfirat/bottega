@@ -4,6 +4,13 @@
  * the extension registry's pinned snapshots (extension `domains` entries)
  * and the secrets transform for boundary credential injection (issue #53).
  *
+ * Issue #208 (proxy-only credentials) adds two blocks to the pipeline:
+ * the model-gateway static-key entries in the secrets transform (the
+ * providers' placeholder bearer swapped for the real key at egress,
+ * require: true — fail closed) and the `oauth_token` transform for the
+ * OAuth extensions (#198: linear/attio — the proxy holds the refresh
+ * token + client credentials and mints access tokens at egress).
+ *
  * Run `bun run src/egress/generate.ts` after adding or updating snapshots in
  * config/extensions/; the committed config/egress.yml (strict, deployment)
  * and config/egress.dev.yml (dev-permissive, issue #126) are the generated
@@ -58,6 +65,73 @@ export interface ExtensionEgressEntry {
   domains: string[];
 }
 
+/**
+ * The model-gateway static keys (issue #208): the providers config/omp/
+ * models.yml declares (near/opencode/openai/anthropic) talk to their
+ * gateways with a PLACEHOLDER bearer; the proxy injects the real key from
+ * the provider's secret file (`data/proxy-secrets/<provider>.secret`,
+ * seeded at boot by the proxy credential sync, src/extensions/proxy-seed).
+ * Each entry REQUIRES its secret file (`inject.require: true`) — a missing
+ * key fails the request closed (502) instead of letting the placeholder
+ * reach the gateway (the #208 fail-closed invariant).
+ */
+export interface ModelGatewayKey {
+  /** The provider id (the sync's vault provider / Keychain service suffix). */
+  provider: string;
+  /** The gateway host the proxy injects the key for. */
+  host: string;
+}
+
+/** The base model-gateway keys, shared by the strict and dev renderers. */
+export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
+  { provider: "near", host: "cloud-api.near.ai" },
+  // opencode-go's built-in gateway (the catalog entry for
+  // deepseek-v4-flash: https://opencode.ai/zen/go/v1).
+  { provider: "opencode", host: "opencode.ai" },
+  { provider: "openai", host: "api.openai.com" },
+  { provider: "anthropic", host: "api.anthropic.com" },
+] as const;
+
+/**
+ * One OAuth provider's `oauth_token` transform entry (issue #208): the
+ * proxy holds the provider's refresh token (+ client credentials) and
+ * mints the access token at egress, so the app never touches a live OAuth
+ * credential. The credential fields come from ONE JSON blob per provider
+ * (`data/proxy-secrets/<provider>-oauth.json`, seeded by the sync) via
+ * `json_key`. `require: true` — a missing/unmintable credential rejects
+ * the request (502) instead of forwarding it unauthenticated.
+ */
+export interface OAuthTokenEntry {
+  extensionId: string;
+  /** The extension's allowlisted domains; the proxy injects the minted bearer for these hosts. */
+  domains: string[];
+  /**
+   * The provider's OAuth2 token endpoint (RFC 8414 discovery, verified
+   * 2026-08-18): the proxy POSTs the refresh grant here AND stubs inbound
+   * requests to this host+path with a synthetic token, so the app's SDK
+   * can complete its own token dance against the proxy.
+   */
+  tokenEndpoint: string;
+}
+
+/**
+ * Verified token endpoints for the OAuth extensions (the #198 providers;
+ * RFC 8414 authorization-server metadata, fetched 2026-08-18):
+ *   linear — https://mcp.linear.app/.well-known/oauth-authorization-server
+ *   attio  — https://mcp.attio.com/.well-known/oauth-authorization-server
+ * An oauth-type extension without an endpoint here FAILS config generation
+ * (never a guessed URL — a wrong token endpoint would mint garbage).
+ */
+export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
+  linear: "https://mcp.linear.app/token",
+  attio: "https://app.attio.com/oidc/token",
+};
+
+/** The proxy-side OAuth credential blob for a provider (the `tokens` entry's json_key file). */
+export function oauthTokenBlobFileName(extensionId: string): string {
+  return `${extensionId}-oauth.json`;
+}
+
 /** Static blocks shared verbatim by the strict and dev renderers (dns, proxy, tls, management). */
 const EGRESS_STATIC_BLOCKS = `dns:
   listen: ":53"
@@ -75,7 +149,7 @@ proxy:
 
 tls:
   # MITM CA, generated once per deployment and never committed:
-  #   docker run --rm -v \$PWD/certs:/certs ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs
+  #   docker run --rm -v $PWD/certs:/certs ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs
   ca_cert: "/etc/iron-proxy/certs/ca.crt"
   ca_key: "/etc/iron-proxy/certs/ca.key"
 
@@ -110,28 +184,106 @@ ${hostLines}`;
     .join("\n");
 }
 
+/** The indented `- source:` entries for the model-gateway keys (issue #208). */
+function renderModelGatewayEntries(keys: readonly ModelGatewayKey[]): string {
+  return keys
+    .map(
+      (key) => `        - source:
+            type: file
+            path: "${PROXY_SECRETS_MOUNT_PATH}/${key.provider}.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "${key.host}"`,
+    )
+    .join("\n");
+}
+
 /**
  * Renders the `secrets` transform (iron-proxy v0.49.0 inject mode, issue
- * #53): one entry per extension, sourcing the credential from the
+ * #53 + #208): one entry per extension, sourcing the credential from the
  * extension's secret file (written by the runtime's boundary) and
- * injecting it as the Authorization header for the extension's domains.
- * The judge transform runs BEFORE secrets so the LLM judge sees no real
- * credentials (iron-proxy README's recommended ordering).
+ * injecting it as the Authorization header for the extension's domains,
+ * plus the model-gateway static-key entries (the providers' placeholders
+ * swapped for the real key at egress, REQUIRED — a missing key rejects
+ * the request closed). The judge transform runs BEFORE secrets so the LLM
+ * judge sees no real credentials (iron-proxy README's recommended
+ * ordering).
  */
 export function renderSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
-  return `  # 3. Secrets: boundary credential injection (issue #53). Extension calls
-  #    carry no credential — the runtime resolves the caller's credential
-  #    at call time and writes it to the extension's secret file on the
-  #    shared data volume (mode 0600, write-temp + rename); this transform
-  #    INJECTS it as the Authorization header for the extension's
-  #    allowlisted domains before egress. The file source re-reads on
-  #    config reload and on ttl expiry, so the credential rotates on a
-  #    running proxy. Judge runs BEFORE secrets so the LLM judge never sees
-  #    real credentials (iron-proxy README's recommended ordering).
+  const extensionEntries = renderSecretsEntries(extensions);
+  const gatewayEntries = renderModelGatewayEntries(MODEL_GATEWAY_KEYS);
+  const extensionBlock = extensions.length > 0 ? `${extensionEntries}\n` : "";
+  return `  # 3. Secrets: boundary credential injection (issue #53 + #208). Extension
+  #    calls carry no credential — the runtime resolves the caller's
+  #    credential at call time and writes it to the extension's secret file
+  #    on the shared data volume (mode 0600, write-temp + rename); this
+  #    transform INJECTS it as the Authorization header for the extension's
+  #    allowlisted domains before egress. The MODEL GATEWAY entries below
+  #    do the same for the providers config/omp/models.yml declares: the
+  #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
+  #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
+  #    (seeded at boot by src/extensions/proxy-seed). require: true — a
+  #    missing key rejects the request (502) instead of letting the
+  #    placeholder reach the gateway. File sources re-read on config reload
+  #    and on ttl expiry, so credentials rotate on a running proxy. Judge
+  #    runs BEFORE secrets so the LLM judge never sees real credentials
+  #    (iron-proxy README's recommended ordering).
   - name: secrets
     config:
       secrets:
-${renderSecretsEntries(extensions)}
+${extensionBlock}${gatewayEntries}
+`;
+}
+
+/**
+ * Renders the `oauth_token` transform (iron-proxy v0.49.0, issue #208):
+ * one refresh_token-grant entry per OAuth extension (#198 providers). The
+ * proxy holds the provider's refresh token + client credentials (from the
+ * sync's JSON blob) and mints the access token at egress; inbound requests
+ * to the configured token_endpoint are stubbed with a synthetic token so
+ * the app's SDK can complete its own OAuth dance against the proxy (the
+ * GCP stub pattern). require: true — an unmintable credential rejects the
+ * request (502), never an unauthenticated upstream call.
+ */
+export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
+  const tokenBlocks = entries
+    .map((entry) => {
+      const blobPath = `${PROXY_SECRETS_MOUNT_PATH}/${oauthTokenBlobFileName(entry.extensionId)}`;
+      const hostLines = entry.domains.map((domain) => `            - host: "${domain}"`).join("\n");
+      return `        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "${blobPath}"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "${blobPath}"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "${entry.tokenEndpoint}"
+          require: true
+          rules:
+${hostLines}`;
+    })
+    .join("\n");
+  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send
+  #    the placeholder bearer; this transform holds each provider's refresh
+  #    token + client credentials (the sync's JSON blob,
+  #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
+  #    tokens at egress, and stubs inbound requests to each configured
+  #    token_endpoint with a synthetic token so the SDK's own token dance
+  #    completes against the proxy. require: true — a missing/unmintable
+  #    credential rejects the request (502), never an unauthenticated
+  #    upstream call.
+  - name: oauth_token
+    config:
+      tokens:
+${tokenBlocks}
 `;
 }
 
@@ -143,9 +295,14 @@ ${renderSecretsEntries(extensions)}
 export function renderEgressConfig(
   domains: readonly string[],
   extensions: readonly ExtensionEgressEntry[] = [],
+  oauthTokens: readonly OAuthTokenEntry[] = [],
 ): string {
   const domainLines = domains.map((domain) => `        - "${domain}"`).join("\n");
-  const secretsTransform = extensions.length > 0 ? `${renderSecretsTransform(extensions)}\n` : "";
+  // The secrets transform is always emitted: the model-gateway static-key
+  // entries (issue #208) are base config — only the extension entries are
+  // optional.
+  const secretsTransform = `${renderSecretsTransform(extensions)}\n`;
+  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
   return `# iron-proxy egress policy for bottega (issue #8).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -205,27 +362,33 @@ ${domainLines}
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
-${secretsTransform}log:
+${secretsTransform}${oauthTransform}log:
   level: "info"
 `;
 }
 
 /**
- * Renders the dev-permissive secrets transform (issue #126): same
- * credential-injection entries as the strict config (issue #53), with a
- * dev-appropriate comment (no judge precedes it in the dev pipeline).
+ * Renders the dev-permissive secrets transform (issue #126 + #208): same
+ * credential-injection entries as the strict config (extension entries
+ * + the model-gateway static keys), with a dev-appropriate comment (no
+ * judge precedes it in the dev pipeline).
  */
 function renderDevSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
-  return `  # 2. Secrets: boundary credential injection (issue #53) — KEPT in the dev
-  #    config (the core requirement): extension calls carry no credential,
-  #    and this transform INJECTS it as the Authorization header for the
-  #    extension's allowlisted domains before egress. The file source
-  #    re-reads on config reload and on ttl expiry, so the credential
-  #    rotates on a running proxy.
+  const extensionEntries = renderSecretsEntries(extensions);
+  const gatewayEntries = renderModelGatewayEntries(MODEL_GATEWAY_KEYS);
+  const extensionBlock = extensions.length > 0 ? `${extensionEntries}\n` : "";
+  return `  # 2. Secrets: boundary credential injection (issue #53 + #208) — KEPT in
+  #    the dev config (the core requirement): extension calls carry no
+  #    credential, and this transform INJECTS it as the Authorization
+  #    header for the extension's allowlisted domains before egress; the
+  #    model-gateway entries swap the providers' placeholder bearer for the
+  #    real key (require: true — a missing key rejects the request). File
+  #    sources re-read on config reload and on ttl expiry, so credentials
+  #    rotate on a running proxy.
   - name: secrets
     config:
       secrets:
-${renderSecretsEntries(extensions)}
+${extensionBlock}${gatewayEntries}
 `;
 }
 
@@ -240,8 +403,15 @@ ${renderSecretsEntries(extensions)}
  * config/egress.yml remains the deployment contract, unchanged. Loaded by
  * scripts/dev.sh via docker-compose.dev.yml.
  */
-export function renderDevEgressConfig(extensions: readonly ExtensionEgressEntry[] = []): string {
-  const secretsTransform = extensions.length > 0 ? `${renderDevSecretsTransform(extensions)}\n` : "";
+export function renderDevEgressConfig(
+  extensions: readonly ExtensionEgressEntry[] = [],
+  oauthTokens: readonly OAuthTokenEntry[] = [],
+): string {
+  // The secrets transform is always emitted: the model-gateway static-key
+  // entries (issue #208) are base config — only the extension entries are
+  // optional.
+  const secretsTransform = `${renderDevSecretsTransform(extensions)}\n`;
+  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
   return `# iron-proxy egress policy for bottega — LOCAL DEV (permissive, issue #126).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -271,7 +441,7 @@ transforms:
       domains:
         - "*"
 
-${secretsTransform}log:
+${secretsTransform}${oauthTransform}log:
   level: "info"
 `;
 }
@@ -280,7 +450,10 @@ ${secretsTransform}log:
  * Reads pinned snapshots from `snapshotsDir`, merges their domains into the
  * allowlist and their credential-injection entries into the secrets
  * transform (issue #53), writes config/egress.yml, and returns the
- * rendered text. Defaults are the deployment paths; CLI:
+ * rendered text. OAuth extensions (#198 providers) move from file
+ * injection to the `oauth_token` transform (issue #208): their access
+ * tokens are minted by the proxy, so they get no `.secret` file entry.
+ * Defaults are the deployment paths; CLI:
  * `bun run src/egress/generate.ts`.
  */
 export function regenerateEgressConfig(
@@ -291,8 +464,27 @@ export function regenerateEgressConfig(
   // mergedEgressDomains prepends the base domains and dedupes, so the raw
   // per-snapshot domains pass through as-is (order-stable).
   const extensionDomains = snapshots.flatMap((s) => s.manifest.domains);
-  const extensionEntries = snapshots.map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
-  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
+  // OAuth extensions (#198) move to the oauth_token transform (issue
+  // #208): they get NO file-injection entry — the proxy mints their
+  // access token. api_key extensions keep the file-injection entry.
+  const oauthExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type === "oauth");
+  const apiKeyExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type !== "oauth");
+  const extensionEntries = apiKeyExtensions.map((s) => ({
+    extensionId: s.manifest.id,
+    domains: s.manifest.domains,
+  }));
+  const oauthEntries = oauthExtensions.map((s): OAuthTokenEntry => {
+    const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
+    if (tokenEndpoint === undefined) {
+      throw new Error(
+        `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
+          "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
+          "before regenerating",
+      );
+    }
+    return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
+  });
+  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }
@@ -310,8 +502,24 @@ export function regenerateDevEgressConfig(
   outPath: string = DEV_EGRESS_CONFIG_PATH,
 ): string {
   const snapshots = readPinnedSnapshots(snapshotsDir);
-  const extensionEntries = snapshots.map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
-  const yaml = renderDevEgressConfig(extensionEntries);
+  const oauthExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type === "oauth");
+  const apiKeyExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type !== "oauth");
+  const extensionEntries = apiKeyExtensions.map((s) => ({
+    extensionId: s.manifest.id,
+    domains: s.manifest.domains,
+  }));
+  const oauthEntries = oauthExtensions.map((s): OAuthTokenEntry => {
+    const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
+    if (tokenEndpoint === undefined) {
+      throw new Error(
+        `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
+          "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
+          "before regenerating",
+      );
+    }
+    return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
+  });
+  const yaml = renderDevEgressConfig(extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }

@@ -12,6 +12,8 @@
  * signature authenticates the sender, this module bounds + shapes what
  * the authenticated sender is allowed to inject.
  */
+import { z } from "zod";
+import { isRecord, type JsonValue } from "../../extensions/manifest";
 import type { GithubMentionPayload } from "../dispatch";
 import type { IngestEvent } from "../types";
 
@@ -32,17 +34,25 @@ export type GitHubMentionParse =
 /** The bot's GitHub login, @mentioned in comment bodies (overridable per deployment). */
 export const DEFAULT_BOT_LOGIN = "bottega";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
+/** The raw mention event fields, validated at the webhook boundary (issue #57). */
+const commentFieldsSchema = z.object({
+  body: z.string().min(1),
+  html_url: z.string().min(1),
+  created_at: z.string().optional(),
+});
+const targetFieldsSchema = z.object({
+  number: z.number().int().positive(),
+  html_url: z.string().min(1),
+  title: z.string().min(1),
+});
+const rawMentionEventSchema = z.object({
+  action: z.string().min(1),
+  comment: commentFieldsSchema,
+  sender: z.object({ login: z.string().min(1) }),
+  repository: z.object({ full_name: z.string().min(1), html_url: z.string().min(1) }),
+  issue: targetFieldsSchema.optional(),
+  pull_request: targetFieldsSchema.optional(),
+});
 
 /** Cuts the comment body to the cap, appending the truncation marker (bounding). */
 function boundBody(body: string): string {
@@ -70,7 +80,7 @@ function mentionsBot(body: string, botLogin: string): boolean {
  *   shared dispatcher consumes.
  */
 export function parseGitHubMentionEvent(
-  raw: unknown,
+  raw: JsonValue,
   opts: { botLogin?: string } = {},
 ): GitHubMentionParse {
   const botLogin = opts.botLogin ?? DEFAULT_BOT_LOGIN;
@@ -78,40 +88,18 @@ export function parseGitHubMentionEvent(
 
   // GitHub's configuration probe: {zen, hook_id}. A valid, non-actionable
   // delivery — acknowledge so the webhook registers, never dispatch.
-  if (typeof raw.zen === "string" && isFiniteNumber(raw.hook_id)) {
+  if (z.string().safeParse(raw.zen).success && z.number().finite().safeParse(raw.hook_id).success) {
     return { ok: true, actionable: false, reason: "ping" };
   }
 
-  const { action, comment, sender, repository, issue, pull_request } = raw;
-  if (
-    !isNonEmptyString(action) ||
-    !isRecord(comment) ||
-    !isRecord(sender) ||
-    !isRecord(repository)
-  ) {
-    return { ok: false, status: 422, reason: "missing_fields" };
-  }
-  if (
-    !isNonEmptyString(comment.body) ||
-    !isNonEmptyString(comment.html_url) ||
-    !isNonEmptyString(sender.login) ||
-    !isNonEmptyString(repository.full_name) ||
-    !isNonEmptyString(repository.html_url)
-  ) {
-    return { ok: false, status: 422, reason: "missing_fields" };
-  }
-  // The target: PR comments carry a top-level pull_request; issue comments
-  // (and PR comments delivered via the issue timeline) carry `issue`. Both
-  // have the number/html_url/title mention shape.
+  // The mention shape, validated at the boundary: any doubt → missing_fields
+  // (fail closed). The target is PR comments' top-level pull_request, or the
+  // issue timeline's `issue` — both carry the number/html_url/title shape.
+  const parsed = rawMentionEventSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, status: 422, reason: "missing_fields" };
+  const { action, comment, sender, repository, pull_request, issue } = parsed.data;
   const target = pull_request ?? issue;
-  if (
-    !isRecord(target) ||
-    !isFiniteNumber(target.number) ||
-    !isNonEmptyString(target.html_url) ||
-    !isNonEmptyString(target.title)
-  ) {
-    return { ok: false, status: 422, reason: "missing_fields" };
-  }
+  if (target === undefined) return { ok: false, status: 422, reason: "missing_fields" };
 
   if (action !== "created") {
     return { ok: true, actionable: false, reason: "unsupported_action" };
@@ -129,10 +117,7 @@ export function parseGitHubMentionEvent(
     url: target.html_url,
     body: boundBody(comment.body),
     author: sender.login,
-    updatedAt:
-      typeof comment.created_at === "string" && comment.created_at !== ""
-        ? comment.created_at
-        : new Date().toISOString(),
+    updatedAt: comment.created_at || new Date().toISOString(),
   };
   return { ok: true, actionable: true, payload };
 }

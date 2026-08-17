@@ -18,10 +18,12 @@
  * - every invocation audits its admin.* event.
  */
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { JsonValue } from "../memory/mem0";
 import { createStore } from "../store/db";
 import {
   ADMIN_CATALOG_BROWSER_EVENT,
@@ -32,7 +34,7 @@ import {
 import { decidePolicyCall, defaultPolicy, parseOrgConfigYaml, resolveTier } from "../policy/config";
 import { createAudit } from "../policy/audit";
 import type { AuditModule } from "../policy/audit";
-import type { ExtensionManifest, JsonObject } from "../extensions/manifest";
+import type { JsonObject } from "../extensions/manifest";
 import type { ResolvedExtension } from "../extensions/registry";
 import { createExtensionRegistry, parsePinnedSnapshot } from "../extensions/registry";
 import { resolveExtensionSurfaces } from "../extensions/surface";
@@ -65,7 +67,8 @@ function fakeAudit() {
   const audit: Pick<AuditModule, "appendAudit"> = {
     appendAudit: async (entry) => {
       // String payloads pass through; object payloads are JSON-serialized.
-      const text = typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload);
+      const parsed = z.string().safeParse(entry.payload);
+      const text = parsed.success ? parsed.data : JSON.stringify(entry.payload);
       rows.push({
         actor: entry.actor,
         event_type: entry.event_type,
@@ -171,8 +174,17 @@ const CATALOG = {
   ],
 };
 
-function stubFetch(catalog: unknown = CATALOG): typeof fetch {
-  return (async () => new Response(JSON.stringify(catalog), { status: 200 })) as unknown as typeof fetch;
+/** Catalog document the stub serves — malformed docs exercise the fail-closed paths. */
+interface StubCatalogDoc {
+  version: number;
+  data?: unknown[];
+}
+
+function stubFetch(catalog: StubCatalogDoc = CATALOG): typeof fetch {
+  // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+  // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
+  return (async (_input: string | URL | Request, _init?: RequestInit) =>
+    new Response(JSON.stringify(catalog), { status: 200 })) as typeof fetch;
 }
 
 /**
@@ -181,7 +193,7 @@ function stubFetch(catalog: unknown = CATALOG): typeof fetch {
  * scaffold produced by the `draft` action never carries a binding — the
  * pin tests use this to exercise the completed paths.
  */
-function writeCompletedDraft(draftsDir: string, overrides: Record<string, unknown> = {}): void {
+function writeCompletedDraft(draftsDir: string, overrides: Record<string, JsonValue> = {}): void {
   const draft = {
     schema: "bottega.extension-snapshot.v1",
     extensionId: "linear",
@@ -302,9 +314,7 @@ describe("catalog_browser (issue #73)", () => {
       const { audit, rows } = fakeAudit();
       const registry = createExtensionRegistry();
       for (const entry of [pinnedEntry("linear", "Linear", "linear.app"), pinnedEntry("attio", "Attio CRM", "mcp.attio.com")]) {
-        // fixture cast: the fake manifest is the draft subset, register accepts the validated union
-        const manifest = entry.manifest as unknown as ExtensionManifest;
-        registry.register(manifest, entry.snapshot);
+        registry.register(entry.manifest, entry.snapshot);
       }
       const tools = loadTools(store, {
         audit,
@@ -371,7 +381,7 @@ describe("catalog_browser (issue #73)", () => {
         kind: "mcp",
         name: `Spec ${i}`,
         domain: `spec${i}.example.com`,
-        ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : {}), // only spec0 has url
+        ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : undefined), // only spec0 has url
       }));
       // 5 truly unlistable records (missing name) — more than the 3-example cap.
       for (let i = 0; i < 5; i++) {
@@ -398,14 +408,17 @@ describe("catalog_browser (issue #73)", () => {
   test("unreachable or malformed catalog fails closed (error result, no guesses)", async () => {
     const { store, cleanup } = freshStore();
     try {
-      const tools = loadTools(store, { catalog: { fetchImpl: stubFetch({}) } });
+      const tools = loadTools(store, { catalog: { fetchImpl: stubFetch({ version: 1 }) } });
       const noData = await call(tools[0], { action: "list" });
       expect(noData.isError).toBe(true);
       expect(noData.text).toContain("no data array");
 
+      // SAFETY: the failing stub implements fetch's call contract
+      // (input, init?) => Promise<Response> — only the status differs.
       const failing = loadTools(store, {
         catalog: {
-          fetchImpl: (async () => new Response("boom", { status: 503 })) as unknown as typeof fetch,
+          fetchImpl: (async (_input: string | URL | Request, _init?: RequestInit) =>
+            new Response("boom", { status: 503 })) as typeof fetch,
         },
       });
       const unreachable = await call(failing[0], { action: "list" });
@@ -505,7 +518,7 @@ describe("catalog_browser pin (issue #195)", () => {
       const body = JSON.parse(res.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
-        summary: { id: string; binding: Record<string, unknown>; credential_schema: Record<string, unknown> };
+        summary: { id: string; binding: Record<string, JsonValue>; credential_schema: Record<string, JsonValue> };
         note: string;
       };
       expect(body.confirm_required).toBe(true);
@@ -694,7 +707,7 @@ describe("catalog_browser pin (issue #195)", () => {
       const refusedBody = JSON.parse(refused.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
-        summary: { id: string; binding: Record<string, unknown>; credential_schema: Record<string, unknown> };
+        summary: { id: string; binding: Record<string, JsonValue>; credential_schema: Record<string, JsonValue> };
       };
       expect(refusedBody.confirm_required).toBe(true);
       expect(refusedBody.hosted_variant).toBe(true);
@@ -867,7 +880,7 @@ describe("catalog_browser pin (issue #195)", () => {
         expect(existsSync(egressPath)).toBe(true);
         expect(existsSync(devEgressPath)).toBe(true);
         reloadCalls.push({
-          url: typeof input === "string" ? input : "url" in input ? input.url : input.toString(),
+          url: input instanceof Request ? input.url : input.toString(),
           method: init?.method,
           authorization: init?.headers?.["Authorization"],
         });

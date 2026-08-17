@@ -390,7 +390,7 @@ function validateTools(value: JsonValue): ExtensionTool[] {
     }
     const tier = rawEntry["tier"];
     if (tier !== "read" && tier !== "write" && tier !== "exec") {
-      fail(`tool "${name}" tier must be \"read\", \"write\", or \"exec\"`);
+      fail(`tool "${name}" tier must be "read", "write", or "exec"`);
     }
     const description = requiredString(rawEntry, "description");
     const params = validateParams(rawEntry["params"], name);
@@ -423,7 +423,7 @@ function validateParams(value: JsonValue, toolName: string): ExtensionToolParam[
     seenNames.add(name);
     const type = z.enum(["string", "number", "boolean"]).safeParse(rawEntry["type"]);
     if (!type.success) {
-      fail(`tool "${toolName}" param "${name}" type must be \"string\", \"number\", or \"boolean\"`);
+      fail(`tool "${toolName}" param "${name}" type must be "string", "number", or "boolean"`);
     }
     let description: string | undefined;
     if (rawEntry["description"] !== undefined) {
@@ -459,7 +459,7 @@ function validateDomains(value: JsonValue): string[] {
   for (const domain of parsed.data) {
     if (!DOMAIN_RE.test(domain)) {
       fail(
-        `domain "${domain}" must be a hostname or \"*.\"-prefixed wildcard (no scheme, port, or trailing dot)`,
+        `domain "${domain}" must be a hostname or "*."-prefixed wildcard (no scheme, port, or trailing dot)`,
       );
     }
   }

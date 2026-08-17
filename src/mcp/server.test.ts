@@ -26,6 +26,7 @@ import { createStore, type AuditRow, type Store, type ExtensionCredential } from
 import { sha256Hex } from "../tools/memory";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { type JsonValue } from "../memory/mem0";
+import type { JsonObject } from "../extensions/manifest";
 import type { MemoryProvider } from "../memory/types";
 import { createAudit, type AuditModule } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
@@ -904,9 +905,9 @@ describe("MCP server extension surface (in-process deps)", () => {
   // with the session definitions' schemas, policy-gated, audited.
   /** The SDK's advertised inputSchema shape (type: "object" + properties/required). */
   type AdvertisedInputSchema = {
-    [key: string]: unknown;
+    [key: string]: JsonValue | undefined;
     type: "object";
-    properties?: Record<string, object>;
+    properties?: Record<string, JsonObject>;
     required?: string[];
   };
 
@@ -915,7 +916,7 @@ describe("MCP server extension surface (in-process deps)", () => {
     // SAFETY: every internal tool definition is authored with the SDK's zod
     // surface (omptype); the ToolDefinition contract only promises the
     // wider TSchema, so toJsonSchema is narrowed here (same as the server).
-    const parameters = definition.parameters as { toJsonSchema(): Record<string, unknown> };
+    const parameters = definition.parameters as { toJsonSchema(): Record<string, JsonValue> };
     // SAFETY: every internal definition's parameters are a z.object, so the
     // wire document carries the SDK's advertised object shape.
     return parameters.toJsonSchema() as AdvertisedInputSchema;
@@ -978,6 +979,8 @@ describe("MCP server extension surface (in-process deps)", () => {
       // session space (created lazily).
       const res = await callTool(h.client, "create_work_item", { description: "handle the deploy" });
       expect(res.isError).not.toBe(true);
+      // SAFETY: the internal tool's result content is the SDK's JSON string
+      // with the work item's id and state (asserted below).
       const { id, state } = JSON.parse(res.content[0]!.text!) as { id: string; state: string };
       expect(id).toMatch(/^wi_/);
       expect(state).toBe("open");

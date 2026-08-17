@@ -937,6 +937,7 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
     expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);
   });
 
+  // SAFETY: "mention" is the exact ResponseMode literal this test path exercises.
   const mentionOpts: MessageHandlerOptions = {
     responseModeFor: async () => "mention" as ResponseMode,
     botUserId: () => "U0BOT",

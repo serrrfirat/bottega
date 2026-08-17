@@ -361,9 +361,9 @@ describe("create_work_item", () => {
   test("fails without a space session and on an empty description", async () => {
     const s = freshStore();
     const [createTool] = loadTools(s);
+    // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
+    // is the SDK's "no session" signal and the fail-closed path under test.
     const noCtx = {
-      // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
-      // is the SDK's "no session" signal and the fail-closed path under test.
       sessionManager: { getSessionFile: (): string | undefined => undefined },
     } as ExtensionContext;
     const res = await createTool.execute("tc1", { description: "x" }, undefined, undefined, noCtx);
@@ -694,9 +694,9 @@ describe("complete_work_item", () => {
       description: "Requires a space session",
       delivery: "chat",
     });
+    // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
+    // is the SDK's "no session" signal and the fail-closed path under test.
     const noSpaceCtx = {
-      // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
-      // is the SDK's "no session" signal and the fail-closed path under test.
       sessionManager: { getSessionFile: (): string | undefined => undefined },
     } as ExtensionContext;
 
