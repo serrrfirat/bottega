@@ -106,7 +106,7 @@ function reflectionRows(store: Store): Array<{ id: string; content: string; meta
 describe("reflectionAction (issue #93)", () => {
   test("honors both the per-space opt-in and the always response-mode gate", async () => {
     const disabledStore = freshStore();
-    const disabledSpace = await createSpace(disabledStore, "DISABLED", "proactive: [");
+    const disabledSpace = await createSpace(disabledStore, "DISABLED", '{"proactive": [');
     await reflectionAction.run({ space: disabledSpace }, context(disabledStore));
     expect(reflectionRows(disabledStore)).toHaveLength(0);
 
@@ -114,7 +114,7 @@ describe("reflectionAction (issue #93)", () => {
     const mentionSpace = await createSpace(
       mentionStore,
       "MENTION",
-      ["proactive:", "  reflection: true"].join("\n"),
+      JSON.stringify({ proactive: { reflection: true } }),
     );
     await reflectionAction.run({ space: mentionSpace }, context(mentionStore, { responseMode: "request-only" }));
     expect(reflectionRows(mentionStore)).toHaveLength(0);
@@ -122,7 +122,7 @@ describe("reflectionAction (issue #93)", () => {
 
   test("derives factual finished, blocked, error, and volume entries with audited metadata", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "ACTIVE", ["proactive:", "  reflection: true"].join("\n"));
+    const space = await createSpace(store, "ACTIVE", JSON.stringify({ proactive: { reflection: true } }));
     insertWorkItem(store, {
       id: "wi_finished",
       space,
@@ -228,7 +228,7 @@ describe("reflectionAction (issue #93)", () => {
 
   test("writes nothing when the current UTC day has no derivable activity", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "EMPTY", ["proactive:", "  reflection: true"].join("\n"));
+    const space = await createSpace(store, "EMPTY", JSON.stringify({ proactive: { reflection: true } }));
     insertWorkItem(store, {
       id: "wi_old_done",
       space,
@@ -253,7 +253,7 @@ describe("reflectionAction (issue #93)", () => {
 
   test("audits a failure and never throws past the runner", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "FAIL", ["proactive:", "  reflection: true"].join("\n"));
+    const space = await createSpace(store, "FAIL", JSON.stringify({ proactive: { reflection: true } }));
     await store.appendAudit({
       ts: DAY_START + 1_000,
       space_id: space,

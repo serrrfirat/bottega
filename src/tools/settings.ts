@@ -23,10 +23,12 @@
  * - `space`: get/set the per-space policy overlay (spaces.policy_json) —
  *   the knobs the overlay supports: response_mode (clamped to the org
  *   floor's strictness at read), extensions.allow (ids to REMOVE from the
- *   org floor allowlist), extensions.deny (ids to ADD), and
- *   extensions.org_credentials (clamped like response_mode). Per-space
- *   MODEL knobs live in the model_settings tool (issue #64) — the smallest
- *   split with that tool, no duplicate surface.
+ *   org floor allowlist), extensions.deny (ids to ADD),
+ *   extensions.org_credentials (clamped like response_mode), and
+ *   proactive.standup / proactive.reflection (the scheduler's per-space
+ *   opt-in, issue #150). Per-space MODEL knobs live in the model_settings
+ *   tool (issue #64) — the smallest split with that tool, no duplicate
+ *   surface.
  *
  * Get (no `set`): returns the stored blob (or null) plus the EFFECTIVE
  * policy for the scope (file floor + DB + overlay), so the agent sees what
@@ -74,6 +76,12 @@ export const settingsSetSchema = z.object({
       org_credentials: z.enum(["allow", "deny"]).optional(),
     })
     .optional(),
+  proactive: z
+    .object({
+      standup: z.boolean().optional(),
+      reflection: z.boolean().optional(),
+    })
+    .optional(),
   repos: z.array(z.string()).optional(),
   models: z
     .object({
@@ -110,7 +118,7 @@ export const settingsArgsSchema = z.object({
 });
 
 /** The overlay keys the space scope may set (issue #67; mirrors applySpaceOverlay). */
-const SPACE_SETTABLE_KEYS = ["response_mode", "extensions"] as const;
+const SPACE_SETTABLE_KEYS = ["response_mode", "extensions", "proactive"] as const;
 
 /** Effective-policy view for the agent: the governing knobs, not the stored blob. */
 function policyView(policy: PolicyConfig): Record<string, unknown> {
@@ -244,8 +252,9 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
       "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url, onboarding.space_id " +
       "(the space that receives the boot-time onboarding guide). Space scope knobs " +
-      "(the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
-      "allowlist), extensions.deny (ids to ADD), extensions.org_credentials. Omit `set` to read: " +
+      "the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
+      "allowlist), extensions.deny (ids to ADD), extensions.org_credentials, " +
+      "proactive.standup / proactive.reflection (the scheduler's per-space opt-in). Omit `set` to read: " +
       "returns the stored settings plus the effective policy. Per-space model knobs live in the " +
       "model_settings tool.",
     parameters: settingsArgsSchema,
@@ -254,6 +263,9 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       try {
         if (params.set !== undefined && Object.keys(params.set).length === 0) {
           return toolError("settings set requires at least one field");
+        }
+        if (params.scope !== "space" && params.set?.proactive !== undefined) {
+          return toolError('proactive is a space-scope knob — set it with scope: "space"');
         }
         if (params.scope === "space") {
           return await handleSpace(store, opts, actor, params);
@@ -362,6 +374,12 @@ async function handleSpace(
       ? (merged["extensions"] as Record<string, unknown>)
       : {};
     merged["extensions"] = { ...existing, ...params.set.extensions };
+  }
+  if (params.set.proactive !== undefined) {
+    const existing = typeof merged["proactive"] === "object" && merged["proactive"] !== null
+      ? (merged["proactive"] as Record<string, unknown>)
+      : {};
+    merged["proactive"] = { ...existing, ...params.set.proactive };
   }
   const updated = await store.updatePolicy(spaceId, JSON.stringify(merged));
   const updatedEffective = await loadSpacePolicy(loadOrgPolicy(store), store, spaceId);

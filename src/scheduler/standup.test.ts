@@ -107,8 +107,8 @@ function memoryRows(store: Store): Array<{ id: string; content: string; metadata
 describe("standupDigestAction (issue #92)", () => {
   test("fails closed when the per-space opt-in is disabled or malformed", async () => {
     for (const [channel, policy] of [
-      ["DISABLED", ["proactive:", "  standup: false"].join("\n")],
-      ["MALFORMED", "proactive: ["],
+      ["DISABLED", JSON.stringify({ proactive: { standup: false } })],
+      ["MALFORMED", '{"proactive": ['],
     ] as const) {
       const store = freshStore();
       const space = await createSpace(store, channel, policy);
@@ -123,7 +123,7 @@ describe("standupDigestAction (issue #92)", () => {
 
   test("does not post or save unless the effective response mode is always", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "MODE", ["proactive:", "  standup: true"].join("\n"));
+    const space = await createSpace(store, "MODE", JSON.stringify({ proactive: { standup: true } }));
     const { ctx, posted } = context(store, { responseMode: "mention" });
 
     await standupDigestAction.run({ space }, ctx);
@@ -134,8 +134,8 @@ describe("standupDigestAction (issue #92)", () => {
 
   test("posts yesterday/open/blocked store facts, saves audited memory, and keeps only 20 digests", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "ACTIVE", ["proactive:", "  standup: true"].join("\n"));
-    const otherSpace = await createSpace(store, "OTHER", ["proactive:", "  standup: true"].join("\n"));
+    const space = await createSpace(store, "ACTIVE", JSON.stringify({ proactive: { standup: true } }));
+    const otherSpace = await createSpace(store, "OTHER", JSON.stringify({ proactive: { standup: true } }));
     insertWorkItem(store, {
       id: "wi_done_yesterday",
       space,
@@ -228,7 +228,7 @@ describe("standupDigestAction (issue #92)", () => {
 
   test("audits a failure and never throws past the runner", async () => {
     const store = freshStore();
-    const space = await createSpace(store, "FAIL", ["proactive:", "  standup: true"].join("\n"));
+    const space = await createSpace(store, "FAIL", JSON.stringify({ proactive: { standup: true } }));
     const failingMemory: MemoryProvider = {
       async save() {
         throw new Error("memory backend unavailable");

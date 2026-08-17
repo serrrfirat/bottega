@@ -7,7 +7,8 @@
  * - fail-closed sets (invalid knob → error result, NOTHING written);
  * - every successful set audits `settings.changed` with before/after;
  * - DB-first precedence: a settings blob overrides the config file floor;
- * - policy gating: write-tier + explicit deny denies.
+ * - policy gating: write-tier + explicit deny denies;
+ * - space-scope proactive knobs set/read/merge (issue #150).
  */
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
@@ -208,6 +209,19 @@ describe("org scope (issue #67)", () => {
     }
   });
 
+  test("org scope rejects the space-only proactive knob (fail closed, nothing written)", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store);
+      const res = await call(tool, { scope: "org", set: { proactive: { standup: true } } });
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("proactive");
+      expect(store.getOrgSettings()).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
   test("every successful set audits settings.changed with before/after", async () => {
     const { store, cleanup } = freshStore();
     try {
@@ -301,6 +315,42 @@ describe("space scope (issue #67)", () => {
     }
   });
 
+  test("proactive standup/reflection knobs set, read, and merge in the overlay (issue #150)", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const { audit, rows } = fakeAudit();
+      const [tool] = loadTools(store, { audit });
+      const res = await call(tool, {
+        scope: "space",
+        space: "slack:C1",
+        set: { proactive: { standup: true } },
+      });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as { overlay: { proactive: { standup: boolean } } };
+      expect(body.overlay.proactive).toEqual({ standup: true });
+
+      // Partial merge: setting reflection keeps standup.
+      const res2 = await call(tool, {
+        scope: "space",
+        space: "slack:C1",
+        set: { proactive: { reflection: true } },
+      });
+      const body2 = JSON.parse(res2.text) as {
+        overlay: { proactive: { standup: boolean; reflection: boolean } };
+      };
+      expect(body2.overlay.proactive).toEqual({ standup: true, reflection: true });
+
+      expect(rows).toHaveLength(2);
+      expect(rows[0].payload["scope"]).toBe("space");
+      expect(rows[0].payload["after"]).toEqual({ proactive: { standup: true } });
+      expect(rows[1].payload["before"]).toEqual({ proactive: { standup: true } });
+      expect(rows[1].payload["after"]).toEqual({ proactive: { standup: true, reflection: true } });
+    } finally {
+      cleanup();
+    }
+  });
+
   test("space scope rejects org-only knobs (fail closed, nothing written)", async () => {
     const { store, cleanup } = freshStore();
     try {
@@ -344,5 +394,7 @@ describe("settings schemas (issue #67)", () => {
       models: { effort: "high" },
     });
     expect(ok.success).toBe(true);
+    const badProactive = settingsSetSchema.safeParse({ proactive: { standup: "yes" } });
+    expect(badProactive.success).toBe(false);
   });
 });
