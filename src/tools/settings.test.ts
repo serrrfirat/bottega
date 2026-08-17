@@ -10,7 +10,7 @@
  * - policy gating: write-tier + explicit deny denies;
  * - space-scope proactive knobs set/read/merge (issue #150).
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,7 +51,7 @@ function fakeAudit(): { audit: Pick<AuditModule, "appendAudit">; rows: AuditRow[
 /** Approver gate: every org write is approved by a human (the legit path). */
 function approveGate(store: ReturnType<typeof createStore>): NonNullable<SettingsToolsExtensionOpts["gate"]> {
   return {
-    loadPolicy: async () => loadOrgPolicy(store),
+    loadPolicy: async () => loadOrgPolicy(store, orgFloorDir),
     router: { request: async () => ({ approved: true, approver: "U-APPROVER" }) },
   };
 }
@@ -59,7 +59,7 @@ function approveGate(store: ReturnType<typeof createStore>): NonNullable<Setting
 /** Denying router: org writes are never approved (the escalation path). */
 function denyGate(store: ReturnType<typeof createStore>): NonNullable<SettingsToolsExtensionOpts["gate"]> {
   return {
-    loadPolicy: async () => loadOrgPolicy(store),
+    loadPolicy: async () => loadOrgPolicy(store, orgFloorDir),
     router: { request: async () => ({ approved: false }) },
   };
 }
@@ -94,6 +94,28 @@ function freshStore(): { store: ReturnType<typeof createStore>; dir: string; cle
     },
   };
 }
+
+/**
+ * Hermetic org floor for the approver-gate tests (issue #151). The CI
+ * checkout has no repo-root config.yml — it is a gitignored
+ * deployment-local override — so `loadOrgPolicy(store)` would resolve the
+ * fail-closed default floor (unknownAction: deny) and deny every org write
+ * before the approval router is reached. Each gate loads this known floor
+ * (`unknown: allow` — the dev override the tests were written against), so
+ * settings_org_write routes ask-human through the router exactly as the
+ * tests intend, regardless of the ambient working directory.
+ */
+const ORG_FLOOR_YAML = "tools:\n  unknown: allow\nresponse_mode: always\n";
+let orgFloorDir: string;
+
+beforeAll(() => {
+  orgFloorDir = mkdtempSync(join(tmpdir(), "bottega-org-floor-"));
+  writeFileSync(join(orgFloorDir, "config.yml"), ORG_FLOOR_YAML);
+});
+
+afterAll(() => {
+  rmSync(orgFloorDir, { recursive: true, force: true });
+});
 
 describe("settings tool registration + gating (issue #67)", () => {
   test("registers the settings tool as write-tier", () => {
