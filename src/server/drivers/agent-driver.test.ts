@@ -434,6 +434,137 @@ describe("omp sdk agent driver", () => {
   });
 });
 
+describe("session default model resolution (issue #199)", () => {
+  /**
+   * Agent dir with BOTH deepseek providers declared (the live shape): near
+   * serves deepseek-ai/DeepSeek-V4-Flash + the GLM; opencode-go serves the
+   * same-named bare deepseek-v4-flash (#78-broken). The near gateway probe
+   * targets a dead loopback port so it fails fast and the declared set
+   * stands — hermetic, no network.
+   */
+  function dualDeepseekAgentDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-model-"));
+    writeFileSync(
+      join(dir, "models.yml"),
+      `providers:
+  near:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:1"
+    apiKey: BOTTEGA_TEST_NEAR_API_KEY
+    models:
+      - id: "zai-org/GLM-5.1-FP8"
+        name: "GLM 5.1 FP8"
+        contextWindow: 128000
+        maxTokens: 8192
+      - id: "deepseek-ai/DeepSeek-V4-Flash"
+        name: "DeepSeek V4 Flash"
+        contextWindow: 128000
+        maxTokens: 8192
+  opencode-go:
+    api: openai-completions
+    baseUrl: "https://opencode.example/v1"
+    apiKey: OPENCODE_API_KEY
+    models:
+      - id: "deepseek-v4-flash"
+        name: "DeepSeek V4 Flash (2x usage)"
+        contextWindow: 128000
+        maxTokens: 8192
+`,
+    );
+    return dir;
+  }
+
+  function capturedOptionsDriver(agentDir: string) {
+    let receivedOptions: CreateAgentSessionOptions | undefined;
+    const driver = createOmpSdkDriver({
+      agentDir,
+      createSession: async (options) => {
+        receivedOptions = options;
+        throw new Error("factory stub: no real session");
+      },
+    });
+    return { driver, options: () => receivedOptions };
+  }
+
+  test("an unqualified settings default resolves to NEAR's model in the session options — never opencode-go's (#199)", async () => {
+    process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
+    process.env.OPENCODE_API_KEY = "stub-key";
+    const dir = dualDeepseekAgentDir();
+    try {
+      const { driver, options } = capturedOptionsDriver(dir);
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+          getModelSettings: async () => ({ model: "deepseek-v4-flash" }),
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      // The raw settings value NEVER reaches the SDK: the session options
+      // carry the provider-qualified id the resolver picked (near's working
+      // deepseek), so the SDK registry cannot drift to opencode-go's
+      // #78-broken same-named model.
+      expect(options()?.modelPattern).toEqual(["near/deepseek-ai/DeepSeek-V4-Flash"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+      delete process.env.OPENCODE_API_KEY;
+    }
+  });
+
+  test("an explicit provider qualifier still wins the session default (#199)", async () => {
+    process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
+    process.env.OPENCODE_API_KEY = "stub-key";
+    const dir = dualDeepseekAgentDir();
+    try {
+      const { driver, options } = capturedOptionsDriver(dir);
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+          getModelSettings: async () => ({ model: "opencode-go/deepseek-v4-flash" }),
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      // Explicit intent beats the near preference: the session options name
+      // opencode-go's model outright.
+      expect(options()?.modelPattern).toEqual(["opencode-go/deepseek-v4-flash"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+      delete process.env.OPENCODE_API_KEY;
+    }
+  });
+
+  test("an unresolvable settings default fails closed — loud log, no model pin, agent-dir default", async () => {
+    process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
+    process.env.OPENCODE_API_KEY = "stub-key";
+    const dir = dualDeepseekAgentDir();
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { driver, options } = capturedOptionsDriver(dir);
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+          getModelSettings: async () => ({ model: "no-such-model-xyz" }),
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      // No resolved pin: the SDK starts the session on its own default.
+      expect(options()?.modelPattern).toBeUndefined();
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("default model 'no-such-model-xyz' is unresolvable"),
+      );
+    } finally {
+      logSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+      delete process.env.OPENCODE_API_KEY;
+    }
+  });
+});
+
 describe("resolveRoleTarget (issue #64)", () => {
   const settings: SpaceModelSettings = {
     model: "deepseek-v4-flash",
@@ -525,9 +656,11 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
 
   test("default role applies the space model; a missing model id fails closed", async () => {
     // Model not in the session's available set → the switch throws rather
-    // than silently keeping the old model.
+    // than silently keeping the old model. Since #199 the settings value is
+    // routed through the provider-aware resolver first, so the failure is
+    // the resolver's fail-closed "matches no available model" error.
     const { driver, stub } = sessionWithSettings("slack:C1", { model: "ghost-model" });
-    await expect(driver.setModelRole("default")).rejects.toThrow(/ghost-model.*not available/);
+    await expect(driver.setModelRole("default")).rejects.toThrow(/ghost-model.*matches no available model/);
     expect(stub.calls).toEqual([]);
   });
 
@@ -630,6 +763,39 @@ describe("OmpSessionDriver turn-start model hot-swap (issue #189)", () => {
     // …and the very next turn re-applies it (hot-swap, no restart).
     expect(setModelCalls).toEqual([{ modelId: "model-b", thinkingLevel: undefined, persist: false }]);
     expect(promptCalls).toEqual(["hello", "hello again"]);
+  });
+
+  test("an unqualified settings default hot-swaps to NEAR's model — never opencode-go's same-named one (#199)", async () => {
+    // The session is stuck on opencode-go's #78-broken deepseek; the org
+    // default is the unqualified "deepseek-v4-flash" both providers serve.
+    // The turn-start re-apply must route the raw value through the
+    // provider-aware resolver and land on near's working deepseek.
+    const { driver, setModelCalls } = hotSwapDriver(
+      { model: "deepseek-v4-flash" },
+      { id: "deepseek-v4-flash", provider: "opencode-go" },
+      [
+        { id: "deepseek-v4-flash", provider: "opencode-go" },
+        { id: "deepseek-ai/DeepSeek-V4-Flash", provider: "near" },
+      ],
+    );
+    await driver.reapplyDefaultModelRole();
+    expect(setModelCalls).toEqual([{ modelId: "deepseek-ai/DeepSeek-V4-Flash", thinkingLevel: undefined, persist: false }]);
+  });
+
+  test("a session already on near's model sees NO churn for the same unqualified default (#199)", async () => {
+    // The churn check compares against the RESOLVED id (near's
+    // deepseek-ai/DeepSeek-V4-Flash) — the raw "deepseek-v4-flash" can
+    // never match a near id and must not force a no-op switch every turn.
+    const { driver, setModelCalls } = hotSwapDriver(
+      { model: "deepseek-v4-flash" },
+      { id: "deepseek-ai/DeepSeek-V4-Flash", provider: "near" },
+      [
+        { id: "deepseek-v4-flash", provider: "opencode-go" },
+        { id: "deepseek-ai/DeepSeek-V4-Flash", provider: "near" },
+      ],
+    );
+    await driver.reapplyDefaultModelRole();
+    expect(setModelCalls).toEqual([]);
   });
 
   test("unchanged settings → no re-application churn across turns", async () => {
