@@ -242,7 +242,13 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
   };
 }
 
-function defaultMcpTransport(binding: McpBinding): Transport {
+/**
+ * The production MCP transport for a binding (issue #53): streamable-http
+ * for remote official servers, stdio for preinstalled servers. Shared by
+ * the runtime's call path and the manifest tool generator's tools/list
+ * discovery (issue #157); tests inject in-memory transports instead.
+ */
+export function defaultMcpTransport(binding: McpBinding): Transport {
   if (binding.transport === "streamable-http") {
     // No client credential: iron-proxy injects the Authorization header for
     // the extension's allowlisted domains at the boundary (issue #53).

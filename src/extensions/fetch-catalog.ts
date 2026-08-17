@@ -24,13 +24,20 @@
  * CLI:
  *   bun run src/extensions/fetch-catalog.ts <specId>            # print draft
  *   bun run src/extensions/fetch-catalog.ts <specId> --out DIR  # write draft to DIR
+ *   bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json> [--out DIR]
+ *                                    # populate manifest.tools from the provider's
+ *                                    # tools/list (issue #157); on a pinned manifest
+ *                                    # this REFRESHES it — new tools land for review,
+ *                                    # never silently
  *   bun run src/extensions/fetch-catalog.ts --pin <draft.json>  # validate + pin
  *
  * Env override: INTEGRATIONS_CATALOG_URL (mirrors the test seam; the
  * registry's own tests use a stub fetch).
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { generateManifestTools, refreshManifestTools } from "./generate-tools";
 import {
   parsePinnedSnapshot,
   SNAPSHOT_SCHEMA,
@@ -293,8 +300,9 @@ function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
     draft.manifest.tools === undefined
   ) {
     throw new ExtensionValidationError(
-      `draft for "${draft.extensionId}" is incomplete: add the binding, credentialSchema, and tools ` +
-        "from the vendor docs (see the catalog entry url) before pinning",
+      `draft for "${draft.extensionId}" is incomplete: add the binding and credentialSchema ` +
+        "from the vendor docs (see the catalog entry url) before pinning; manifest tools are " +
+        "generated from the provider's tools/list (fetch-catalog --generate-tools, issue #157)",
     );
   }
   return validateManifest(draft.manifest);
@@ -324,25 +332,55 @@ export function writeSnapshotDraft(draft: SnapshotDraft, outDir: string): string
 }
 
 /**
+ * Options for the pin path: the catalog fetch seams plus the MCP transport
+ * seam the manifest tool generator uses for tools/list discovery (issue
+ * #157). Tests inject in-memory transports; production uses the real
+ * streamable-http / stdio transports.
+ */
+export interface PinDraftOptions extends FetchCatalogOptions {
+  mcpTransport?: (binding: McpBinding) => Transport;
+}
+
+/**
  * Pins a completed draft into the snapshots dir. Re-fetches the catalog to
  * confirm the spec still exists when the draft's source.catalog is the
  * integrations.sh catalog (provenance check); drafts sourced elsewhere
  * (e.g. the github-mcp-server vendor repo) skip the check — their catalog
  * is the human's responsibility. Returns the written path.
+ *
+ * Issue #157: a draft WITH an mcp binding but no tools gets its manifest
+ * tools generated from the provider's tools/list before the pin — the
+ * manifest is never pinned half-populated. Fail closed: an unreachable
+ * provider or an invalid tools/list aborts the pin. The review gate is
+ * unchanged: the generated draft still carries source.reviewed=false and
+ * community drafts refuse to pin until a human reviews (and confirms the
+ * conservative tiers).
  */
 export async function pinSnapshotDraft(
   draft: SnapshotDraft,
   outDir: string,
-  opts: FetchCatalogOptions = {},
+  opts: PinDraftOptions = {},
 ): Promise<string> {
   if (draft.source.catalog === DEFAULT_CATALOG_URL) {
     await fetchCatalogEntry(draft.source.specId, opts);
+  }
+  if (
+    draft.manifest.kind === "mcp" &&
+    draft.manifest.mcp !== undefined &&
+    (draft.manifest.tools === undefined || draft.manifest.tools.length === 0)
+  ) {
+    const generation = await generateManifestTools({
+      binding: draft.manifest.mcp,
+      extensionId: draft.extensionId,
+      mcpTransport: opts.mcpTransport,
+    });
+    draft = { ...draft, manifest: { ...draft.manifest, tools: generation.tools } };
   }
   return writeSnapshotDraft(draft, outDir);
 }
 
 if (import.meta.main) {
-  const [first, second, third] = process.argv.slice(2);
+  const [first, second, third, fourth] = process.argv.slice(2);
   if (first === "--pin") {
     if (!second) {
       console.error("usage: bun run src/extensions/fetch-catalog.ts --pin <draft.json>");
@@ -351,6 +389,71 @@ if (import.meta.main) {
     const draft = JSON.parse(readFileSync(resolve(second), "utf8")) as SnapshotDraft;
     pinSnapshotDraft(draft, "config/extensions")
       .then((path) => console.log(`pinned ${path}`))
+      .catch((err: Error) => {
+        console.error(err.message);
+        process.exit(1);
+      });
+  } else if (first === "--generate-tools") {
+    if (!second) {
+      console.error("usage: bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json> [--out DIR]");
+      process.exit(1);
+    }
+    const filePath = resolve(second);
+    const doc = JSON.parse(readFileSync(filePath, "utf8")) as SnapshotDraft;
+    if (doc.manifest.kind !== "mcp" || doc.manifest.mcp === undefined) {
+      console.error(
+        `cannot generate tools from "${second}": it has no mcp binding — tools/list discovery requires a ` +
+          "streamable-http or stdio binding (fill the binding first)",
+      );
+      process.exit(1);
+    }
+    generateManifestTools({ binding: doc.manifest.mcp, extensionId: doc.extensionId })
+      .then((generation) => {
+        const existing = doc.manifest.tools ?? [];
+        const refreshed =
+          existing.length === 0
+            ? { tools: generation.tools, added: generation.tools }
+            : refreshManifestTools(existing, generation.tools);
+        // Newly generated (or refreshed) tools are NEVER reviewed: the
+        // human confirms the conservative tiers before pinning.
+        const updated: SnapshotDraft = {
+          ...doc,
+          source: { ...doc.source, reviewed: false },
+          manifest: { ...doc.manifest, tools: refreshed.tools },
+        };
+        const isDraft = filePath.endsWith(".draft.json");
+        const outDir =
+          third === "--out"
+            ? resolve(fourth ?? ".")
+            : isDraft
+              ? dirname(filePath)
+              : resolve("config/extensions", "drafts");
+        mkdirSync(outDir, { recursive: true });
+        const outPath = resolve(outDir, `${doc.extensionId}.draft.json`);
+        writeFileSync(outPath, JSON.stringify(updated, null, 2) + "\n");
+        console.log(
+          `tools/list: ${generation.tools.length} tools, ${generation.skipped.length} skipped`,
+        );
+        for (const entry of generation.skipped) {
+          console.log(`  skipped: ${entry.tool} — ${entry.reason}`);
+        }
+        if (existing.length > 0) {
+          if (refreshed.added.length === 0) {
+            console.log("  refresh: no new tools — tool surface unchanged");
+          } else {
+            for (const tool of refreshed.added) {
+              console.log(`  added: ${tool.name} (tier ${tool.tier})`);
+            }
+          }
+        } else {
+          for (const tool of refreshed.added) {
+            console.log(`  generated: ${tool.name} (tier ${tool.tier})`);
+          }
+        }
+        console.log(
+          `written to ${outPath} (source.reviewed: false — review the tiers, then pin via --pin)`,
+        );
+      })
       .catch((err: Error) => {
         console.error(err.message);
         process.exit(1);

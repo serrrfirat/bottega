@@ -21,8 +21,11 @@
  * are never installed or pinned by this tool; catalog entries carry no
  * MCP/CLI binding, so the draft result surfaces that and tells the agent to
  * web-search the vendor's OFFICIAL MCP server (issue #146) before a
- * maintainer completes the binding facts and pins through the fetch-catalog
- * flow (which enforces the review gate). The drafts dir sits OUTSIDE the
+ * maintainer completes the binding facts; manifest tools are then GENERATED
+ * from the provider's own tools/list (fetch-catalog --generate-tools, issue
+ * #157 — conservative tiers, never hand-authored) and the draft pins
+ * through the fetch-catalog flow (which enforces the review gate). The
+ * drafts dir sits OUTSIDE the
  * registry's scan (readPinnedSnapshots reads only top-level *.json), so a
  * draft can never fail the boot.
  *
@@ -501,10 +504,12 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
       "\"linear\") and writes an UNREVIEWED draft snapshot (source.reviewed: false) to " +
       "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this tool. " +
       "Catalog entries carry no MCP/CLI binding, so when drafting one, web-search the vendor's " +
-      "OFFICIAL MCP server (serverUrl + transport + credentialSchema + tools from the vendor's " +
-      "published MCP spec; vendor-official URLs only — never guess or use community URLs), complete " +
-      "the draft keeping source.reviewed: false, and pin through the fetch-catalog flow after human " +
-      "review. Write-tier: prompts for approval in non-yolo modes (admin-gated like the settings tool).",
+      "OFFICIAL MCP server (serverUrl + transport + credentialSchema from the vendor's published " +
+      "MCP spec; vendor-official URLs only — never guess or use community URLs), generate " +
+      "manifest.tools from the provider's tools/list via fetch-catalog --generate-tools " +
+      "(conservative tiers, issue #157), complete the draft keeping source.reviewed: false, and " +
+      "pin through the fetch-catalog flow after human review. Write-tier: prompts for approval in " +
+      "non-yolo modes (admin-gated like the settings tool).",
     parameters: catalogBrowserArgsSchema,
     approval: "write",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
@@ -539,13 +544,16 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   note: bindingMissing
                     ? "DRAFT — not installed. This catalog entry has NO MCP/CLI binding: research the " +
                       "vendor's OFFICIAL MCP server via web_search before completing the draft — " +
-                      "serverUrl + transport + credentialSchema + tools from the vendor's published MCP " +
-                      "spec; vendor-official URLs only, do NOT guess or use community URLs. Complete the " +
-                      "draft, keep source.reviewed: false (human review gates the pin), then pin via the " +
-                      "fetch-catalog flow (--pin)."
-                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema, " +
-                      "tools) from the vendor docs, mark source.reviewed, and pin via the fetch-catalog " +
-                      "flow (--pin) to install.",
+                      "serverUrl + transport + credentialSchema from the vendor's published MCP " +
+                      "spec; vendor-official URLs only, do NOT guess or use community URLs. After " +
+                      "filling the binding, run `bun run src/extensions/fetch-catalog.ts " +
+                      "--generate-tools <draft.json>` to populate manifest.tools from the provider's " +
+                      "tools/list (conservative tiers, issue #157). Keep source.reviewed: false (human " +
+                      "review gates the pin), then pin via the fetch-catalog flow (--pin)."
+                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema) " +
+                      "from the vendor docs, generate tools from the provider's tools/list " +
+                      "(fetch-catalog --generate-tools), mark source.reviewed, and pin via the " +
+                      "fetch-catalog flow (--pin) to install.",
                   draft,
                 }),
               },

@@ -165,7 +165,8 @@ function isCredentialEnvKey(name: string): boolean {
   return CREDENTIAL_ENV_RE.test(name);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+/** Canonical record guard for untrusted manifest-shaped input (shared with the tool generator, issue #157). */
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
