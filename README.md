@@ -39,7 +39,7 @@ task calls for, never silently dropped.
 - **A shared teammate, not a private chatbot.** The whole channel talks to
   the same agent. Anyone can steer, interrupt, or approve — the agent
   belongs to the team, not to one person's DM.
-- **Work that's tracked, not vibes.** Asking for work creates a work item
+- **Work that's tracked and accountable.** Asking for work creates a work item
   with a lifecycle: picked up, executed, delivered, or blocked with
   evidence — never silently dropped.
 - **A different hat per team.** Each space can give the agent a department
@@ -51,7 +51,7 @@ task calls for, never silently dropped.
 - **Your tools, one safe pipe.** Connect GitHub, Linear, or Attio from chat
   (`connect github as me`). Credentials live in a vault and are injected at
   the network edge — they never touch the agent, the chat, or the logs.
-- **Rules, not hope.** Every action crosses a policy gate you configure.
+- **Policies, enforced.** Every action crosses a policy gate you configure.
   Risky actions post an Approve/Deny button in the channel and wait for a
   human. Anything unknown or misconfigured is denied by default.
 - **It shows up on its own — when invited.** Opt-in standups, daily
