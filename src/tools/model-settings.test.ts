@@ -252,19 +252,26 @@ describe("model catalog surface (issue #192)", () => {
       ok: true,
       pin: { kind: "id", modelId: "zai-org/GLM-5.1-FP8" },
     });
-    // "the near deepseek" → resolves (not ambiguous); without the provider
-    // the same name is ambiguous across near and opencode-go and fails
-    // closed listing both — the provider term is what picks the right one.
+    // "the near deepseek" → resolves to near's deepseek.
     expect(resolveModelPin("near deepseek", catalogFixture)).toEqual({
       ok: true,
       pin: { kind: "id", modelId: "deepseek-v4-flash" },
     });
-    const ambiguous = resolveModelPin("deepseek v4", catalogFixture);
-    expect(ambiguous.ok).toBe(false);
-    if (!ambiguous.ok) {
-      expect(ambiguous.error).toContain("ambiguous");
-      expect(ambiguous.error).toContain("near/deepseek-v4-flash");
-      expect(ambiguous.error).toContain("opencode-go/deepseek-v4-flash");
+    // The provider-UNQUALIFIED "deepseek v4" also resolves — near wins the
+    // tie (issue #194): near is the WORKING provider, so an unqualified
+    // deepseek name must never land on opencode-go's #78-broken model by
+    // default. A tie without near still fails closed as ambiguous.
+    expect(resolveModelPin("deepseek v4", catalogFixture)).toEqual({
+      ok: true,
+      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+    });
+    const stillAmbiguous = resolveModelPin("deepseek v4", [
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "opencode-zen" },
+    ]);
+    expect(stillAmbiguous.ok).toBe(false);
+    if (!stillAmbiguous.ok) {
+      expect(stillAmbiguous.error).toContain("ambiguous");
     }
   });
 });

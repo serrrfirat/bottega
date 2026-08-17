@@ -11,9 +11,30 @@
  * verbatim (they resolve against the space's settings at execution — the
  * "fast slot" is not ambiguous); every other value resolves to ONE bare
  * model id at creation so execution never re-interprets a fuzzy name.
+ *
+ * Near gateway probe (issue #194): the near provider is a models.yml
+ * custom provider with a single declared model, but its gateway serves the
+ * full catalog. listAvailableModels probes GET {baseUrl}/models (the near
+ * baseUrl already ends in /v1; other openai-completions baseUrls get
+ * /v1/models appended) with the provider's resolved key, bounded to 5s and
+ * cached per build, and MERGES the gateway's ids into the near provider's
+ * declared set. Any probe failure fails CLOSED: the declared set stands
+ * and the catalog is never broken by a dead gateway.
+ *
+ * Unqualified-resolution rule (issue #194): several providers serve the
+ * same model name (deepseek-v4-flash exists on near, opencode-go,
+ * opencode-zen), but only near's deepseek is WORKING — opencode-go's is
+ * #78-broken and must never win a tie by default. When a provider-
+ * unqualified value ties at the best match and near is one of the tied
+ * providers, near wins deterministically. A provider-qualified value
+ * ("opencode-go/deepseek-v4-flash") still wins outright — explicit intent
+ * beats the preference. Ties without a single near candidate fail closed
+ * as ambiguous, listing the candidates.
  */
-import { ModelRegistry, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
+import { ModelRegistry, discoverAuthStorage, type AuthStorage } from "@oh-my-pi/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseYamlSubset } from "../yaml-subset";
 
 /** The deployment agent dir both the server and the executor default to. */
 export const DEFAULT_MODEL_CATALOG_DIR = "data/omp-agent";
@@ -21,6 +42,19 @@ export const DEFAULT_MODEL_CATALOG_DIR = "data/omp-agent";
 /** Model role refs a pin may name directly (issue #185). */
 export const MODEL_ROLE_REFS = ["fast", "reasoning"] as const;
 export type ModelRoleRef = (typeof MODEL_ROLE_REFS)[number];
+
+/** The near gateway provider id (models.yml): the WORKING deepseek provider (issue #194). */
+const NEAR_PROVIDER = "near";
+
+/** Probe bound: a slow or dead gateway never hangs the catalog build. */
+const NEAR_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Per-build probe cache: one gateway probe per agent dir, shared by every
+ * catalog build in this process. Successes and failures are cached alike —
+ * a failed probe keeps the declared set for the whole build (fail closed).
+ */
+const nearProbeCache = new Map<string, Promise<ModelCatalogEntry[]>>();
 
 /** A resolved model pin: a role slot, or one concrete available model id. */
 export type ModelPin = { kind: "role"; role: ModelRoleRef } | { kind: "id"; modelId: string };
@@ -37,22 +71,119 @@ export interface ModelCatalogEntry {
 /**
  * The available model catalog for an agent dir: models.yml custom models +
  * the SDK's bundled provider catalog, filtered to models with configured
- * auth — the same registry the sessions resolve against.
+ * auth — the same registry the sessions resolve against — MERGED with the
+ * near gateway's probed /v1/models list (issue #194), so near shows its
+ * full set instead of the single declared model.
  */
 export async function listAvailableModels(agentDir: string): Promise<ModelCatalogEntry[]> {
   const registry = new ModelRegistry(await discoverAuthStorage(agentDir), join(agentDir, "models.yml"));
-  return registry.getAvailable().map((model) => ({ id: model.id, name: model.name ?? model.id, provider: model.provider }));
+  const declared = registry.getAvailable().map((model) => ({ id: model.id, name: model.name ?? model.id, provider: model.provider }));
+  const probed = await probeNearGatewayCached(agentDir, registry.authStorage);
+  return mergeNearProbedModels(declared, probed);
+}
+
+/** The near provider's declared transport, read from the agent dir's models.yml. */
+function readNearProviderConfig(agentDir: string): { baseUrl?: string; api?: string } {
+  try {
+    const parsed = parseYamlSubset(readFileSync(join(agentDir, "models.yml"), "utf8"));
+    const providers = parsed.providers;
+    if (providers === undefined || typeof providers !== "object" || Array.isArray(providers)) return {};
+    const near = providers[NEAR_PROVIDER];
+    if (near === undefined || typeof near !== "object" || Array.isArray(near)) return {};
+    return {
+      baseUrl: typeof near.baseUrl === "string" ? near.baseUrl : undefined,
+      api: typeof near.api === "string" ? near.api : undefined,
+    };
+  } catch {
+    return {}; // unreadable models.yml → no probe, declared set stands
+  }
+}
+
+/**
+ * The gateway /v1/models URL for a baseUrl: the near baseUrl already ends
+ * in "/v1" ("https://cloud-api.near.ai/v1" → "/v1/models"); other
+ * openai-completions baseUrls get the /v1 suffix appended.
+ */
+function nearModelsUrl(baseUrl: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  return base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
+}
+
+/**
+ * Probes the near gateway's model list with the provider's resolved key.
+ * Fail closed on ANY error (timeout, non-2xx, malformed body, no key):
+ * the caller keeps the declared set — the catalog is never broken by a
+ * dead gateway.
+ */
+async function probeNearGatewayModels(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
+  const { baseUrl, api } = readNearProviderConfig(agentDir);
+  if (api !== "openai-completions" || baseUrl === undefined) return [];
+  const key = await authStorage.getApiKey(NEAR_PROVIDER);
+  if (key === undefined) return []; // near not configured → nothing to probe
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NEAR_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(nearModelsUrl(baseUrl), { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { data?: unknown };
+    if (typeof body !== "object" || body === null || !Array.isArray(body.data)) return [];
+    const models: ModelCatalogEntry[] = [];
+    for (const item of body.data) {
+      if (typeof item !== "object" || item === null) continue;
+      const id = (item as { id?: unknown }).id;
+      if (typeof id !== "string" || id.trim() === "") continue;
+      const name = (item as { name?: unknown }).name;
+      models.push({ id, name: typeof name === "string" && name !== "" ? name : id, provider: NEAR_PROVIDER });
+    }
+    return models;
+  } catch {
+    return []; // timeout / refused / malformed → declared set only
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Cached-per-build entry point: one gateway probe per agent dir per process. */
+function probeNearGatewayCached(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
+  const cached = nearProbeCache.get(agentDir);
+  if (cached !== undefined) return cached;
+  const probing = probeNearGatewayModels(agentDir, authStorage).catch(() => [] as ModelCatalogEntry[]);
+  nearProbeCache.set(agentDir, probing);
+  return probing;
+}
+
+/** Declared catalog first, then probed near models not already present (dedup by provider/id). */
+function mergeNearProbedModels(declared: ModelCatalogEntry[], probed: ModelCatalogEntry[]): ModelCatalogEntry[] {
+  if (probed.length === 0) return declared;
+  const seen = new Set(declared.map((model) => `${model.provider}/${model.id}`));
+  const merged = [...declared];
+  for (const model of probed) {
+    const key = `${model.provider}/${model.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(model);
+  }
+  return merged;
 }
 
 /**
  * Resolves a create_work_item `model` value, fail closed:
  * - "fast"/"reasoning" (case-insensitive) → the role ref, stored verbatim;
- * - an exact available model id or "provider/id" → that model's bare id;
+ * - an exact "provider/id" → that model's bare id (explicit intent wins,
+ *   even over the near preference — the user named the provider);
  * - a friendly name → the unique best available-model match, matched
  *   case-insensitively by substring over id, name, and "provider/id"
  *   (token-wise so "deepseek v4" hits deepseek-v4-flash);
+ * - near preference (issue #194): when several providers tie at the best
+ *   match and near is one of them, near wins — near's deepseek is the
+ *   WORKING one, opencode-go's is #78-broken, and an unqualified value
+ *   must never land on a broken model by default. An exact bare id at a
+ *   non-near provider is treated as a strong (tie-able) match, not an
+ *   automatic win, so the unqualified "deepseek-v4-flash" can be won by
+ *   near's deepseek-ai/DeepSeek-V4-Flash (which matches the same name);
  * - no match → error listing the available candidates; ambiguous matches
- *   (several models tie at the best score) → error listing those.
+ *   (several models tie at the best score without a single near winner)
+ *   → error listing those.
  * Never guesses: an unresolvable or ambiguous name is an error the agent
  * can clarify, and no work item is created.
  */
@@ -67,17 +198,21 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
     haystack: `${model.id} ${model.name} ${model.provider}/${model.id}`.toLowerCase(),
   }));
 
-  // Exact id / provider-id equality wins outright.
-  const exact = entries.find((e) => e.model.id.toLowerCase() === q || `${e.model.provider}/${e.model.id}`.toLowerCase() === q);
-  if (exact) return { ok: true, pin: { kind: "id", modelId: exact.model.id } };
+  // A provider-qualified id ("opencode-go/deepseek-v4-flash") names ONE
+  // entry — explicit intent, resolved outright.
+  const qualified = entries.find((e) => `${e.model.provider}/${e.model.id}`.toLowerCase() === q);
+  if (qualified) return { ok: true, pin: { kind: "id", modelId: qualified.model.id } };
 
-  // Score every model: 1 = the whole query is a substring; 2 = every
+  // Score every model: 0 = the exact bare id, served by near (the working
+  // provider — an exact id it serves is unambiguous intent); 1 = the exact
+  // bare id elsewhere, or the whole query is a substring; 2 = every
   // whitespace-separated token is; 3 = at least one token is.
   const tokens = q.split(/\s+/).filter(Boolean);
   const scored: Array<{ entry: (typeof entries)[number]; score: number }> = [];
   for (const entry of entries) {
     let score = Infinity;
-    if (entry.haystack.includes(q)) score = 1;
+    if (entry.model.id.toLowerCase() === q) score = entry.model.provider === NEAR_PROVIDER ? 0 : 1;
+    else if (entry.haystack.includes(q)) score = 1;
     else if (tokens.length > 0 && tokens.every((token) => entry.haystack.includes(token))) score = 2;
     else if (tokens.some((token) => entry.haystack.includes(token))) score = 3;
     if (score < Infinity) scored.push({ entry, score });
@@ -96,6 +231,13 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
   const best = scored[0]!.score;
   const bestMatches = scored.filter((s) => s.score === best);
   if (bestMatches.length > 1) {
+    // Near preference: several providers tie at the best match — near wins
+    // when it is the unique near candidate (working deepseek; #78-broken
+    // opencode-go deepseek never wins an unqualified tie by default).
+    const near = bestMatches.filter((s) => s.entry.model.provider === NEAR_PROVIDER);
+    if (near.length === 1) {
+      return { ok: true, pin: { kind: "id", modelId: near[0]!.entry.model.id } };
+    }
     return {
       ok: false,
       error: `model '${query}' is ambiguous — matches ${formatModelCandidates(bestMatches.map((s) => s.entry.model))}; be more specific`,
