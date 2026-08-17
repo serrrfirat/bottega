@@ -17,11 +17,12 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore } from "../store/db";
 import { SETTINGS_CHANGED_EVENT } from "../store/audit-events";
-import { decidePolicyCall, defaultPolicy, resolveTier } from "../policy/config";
+import { decidePolicyCall, defaultPolicy, loadOrgPolicy, resolveTier } from "../policy/config";
 import type { AuditModule } from "../policy/audit";
-import { settingsToolsExtension, settingsArgsSchema, settingsSetSchema } from "./settings";
+import { settingsToolsExtension, settingsArgsSchema, settingsSetSchema, type SettingsToolsExtensionOpts } from "./settings";
 
-const noopCtx = {} as unknown as ExtensionContext;
+/** Session-file ctx so the execute path can derive a space id (issue #151). */
+const sessionCtx = { sessionManager: { getSessionFile: () => join("/tmp/sessions", "slack:C1.jsonl") } } as unknown as ExtensionContext;
 
 interface AuditRow {
   actor: string;
@@ -47,9 +48,25 @@ function fakeAudit(): { audit: Pick<AuditModule, "appendAudit">; rows: AuditRow[
   return { audit, rows };
 }
 
+/** Approver gate: every org write is approved by a human (the legit path). */
+function approveGate(store: ReturnType<typeof createStore>): NonNullable<SettingsToolsExtensionOpts["gate"]> {
+  return {
+    loadPolicy: async () => loadOrgPolicy(store),
+    router: { request: async () => ({ approved: true, approver: "U-APPROVER" }) },
+  };
+}
+
+/** Denying router: org writes are never approved (the escalation path). */
+function denyGate(store: ReturnType<typeof createStore>): NonNullable<SettingsToolsExtensionOpts["gate"]> {
+  return {
+    loadPolicy: async () => loadOrgPolicy(store),
+    router: { request: async () => ({ approved: false }) },
+  };
+}
+
 function loadTools(
   store: ReturnType<typeof createStore>,
-  opts?: { audit?: Pick<AuditModule, "appendAudit">; actor?: string },
+  opts?: SettingsToolsExtensionOpts,
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
@@ -61,7 +78,7 @@ async function call(
   tool: ToolDefinition,
   params: unknown,
 ): Promise<{ text: string; isError: boolean }> {
-  const res = await tool.execute("call-1", params, undefined, undefined, noopCtx);
+  const res = await tool.execute("call-1", params, undefined, undefined, sessionCtx);
   return { text: (res.content[0] as { text: string }).text, isError: res.isError ?? false };
 }
 
@@ -122,7 +139,7 @@ describe("org scope (issue #67)", () => {
   test("set merges partially over the current blob and get round-trips", async () => {
     const { store, cleanup } = freshStore();
     try {
-      const [tool] = loadTools(store);
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       const set1 = await call(tool, {
         scope: "org",
         set: { response_mode: "mention", approvals: { timeout_minutes: 12 } },
@@ -160,7 +177,7 @@ describe("org scope (issue #67)", () => {
   test("onboarding.space_id sets, round-trips, and merges (issue #116)", async () => {
     const { store, cleanup } = freshStore();
     try {
-      const [tool] = loadTools(store);
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       const res = await call(tool, { scope: "org", set: { onboarding: { space_id: "slack:C123" } } });
       expect(res.isError).toBe(false);
       const body = JSON.parse(res.text) as { settings: { onboarding: { space_id: string } } };
@@ -183,7 +200,7 @@ describe("org scope (issue #67)", () => {
   test("invalid set fails closed and writes nothing", async () => {
     const { store, cleanup } = freshStore();
     try {
-      const [tool] = loadTools(store);
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       await call(tool, { scope: "org", set: { response_mode: "mention" } });
       const bad = await call(tool, { scope: "org", set: { approvals: { timeout_minutes: 0 } } });
       expect(bad.isError).toBe(true);
@@ -226,16 +243,21 @@ describe("org scope (issue #67)", () => {
     const { store, cleanup } = freshStore();
     try {
       const { audit, rows } = fakeAudit();
-      const [tool] = loadTools(store, { audit, actor: "U1" });
+      const [tool] = loadTools(store, { audit, actor: "U1", gate: approveGate(store) });
       await call(tool, { scope: "org", set: { response_mode: "mention" } });
       await call(tool, { scope: "org", set: { response_mode: "request-only" } });
-      expect(rows).toHaveLength(2);
-      expect(rows[0].event_type).toBe(SETTINGS_CHANGED_EVENT);
-      expect(rows[0].actor).toBe("U1");
-      expect(rows[0].payload["before"]).toEqual({});
-      expect(rows[0].payload["after"]).toEqual({ response_mode: "mention" });
-      expect(rows[1].payload["before"]).toEqual({ response_mode: "mention" });
-      expect(rows[1].payload["after"]).toEqual({ response_mode: "request-only" });
+      // The approver gate adds policy.decision + approval.* rows; the
+      // settings.changed trail is the tool's own audit contract.
+      const changed = rows.filter((r) => r.event_type === SETTINGS_CHANGED_EVENT);
+      expect(changed).toHaveLength(2);
+      expect(changed[0].event_type).toBe(SETTINGS_CHANGED_EVENT);
+      expect(changed[0].actor).toBe("U1");
+      expect(changed[0].payload["before"]).toEqual({});
+      expect(changed[0].payload["after"]).toEqual({ response_mode: "mention" });
+      expect(changed[1].payload["before"]).toEqual({ response_mode: "mention" });
+      expect(changed[1].payload["after"]).toEqual({ response_mode: "request-only" });
+      // Both writes crossed the approval router (approved by a human).
+      expect(rows.filter((r) => r.event_type === "approval.resolved" && r.payload["approved"] === true)).toHaveLength(2);
     } finally {
       cleanup();
     }
@@ -247,9 +269,9 @@ describe("org scope (issue #67)", () => {
     try {
       const configDir = join(dir, "config");
       mkdirSync(configDir, { recursive: true });
-      writeFileSync(join(configDir, "config.yml"), "response_mode: always\n");
+      writeFileSync(join(configDir, "config.yml"), "response_mode: always\ntools:\n  unknown: allow\n");
       process.env.BOTTEGA_CONFIG_DIR = configDir;
-      const [tool] = loadTools(store);
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       await call(tool, { scope: "org", set: { response_mode: "request-only" } });
       const got = await call(tool, { scope: "org" });
       const body = JSON.parse(got.text) as { policy: { response_mode: string } };
@@ -257,6 +279,62 @@ describe("org scope (issue #67)", () => {
     } finally {
       if (savedDir === undefined) delete process.env.BOTTEGA_CONFIG_DIR;
       else process.env.BOTTEGA_CONFIG_DIR = savedDir;
+      cleanup();
+    }
+  });
+
+  test("issue #151: org-scope writes are approver-gated — a denying router blocks the escalation, nothing written", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const { audit, rows } = fakeAudit();
+      const [tool] = loadTools(store, { audit, gate: denyGate(store) });
+      // The issue's escalation: write always_approve: ["bash"] via org
+      // settings — exec-tier access the floor never approved.
+      const res = await call(tool, { scope: "org", set: { approvals: { always_approve: ["bash"] } } });
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("approval denied");
+      expect(store.getOrgSettings()).toBeNull(); // nothing written
+      // The write crossed the approval router: requested and denied, under
+      // the synthetic exec-tier tool name.
+      expect(
+        rows.some((r) => r.event_type === "approval.requested" && r.payload["tool"] === "settings_org_write"),
+      ).toBe(true);
+      expect(rows.some((r) => r.event_type === "approval.resolved" && r.payload["approved"] === false)).toBe(true);
+
+      // Clearing the extension deny list via org settings is equally gated.
+      const res2 = await call(tool, { scope: "org", set: { extensions: { deny: [] } } });
+      expect(res2.isError).toBe(true);
+      expect(res2.text).toContain("approval denied");
+      expect(store.getOrgSettings()).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("issue #151: org-scope writes without a wired approval gate fail closed", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store); // no gate → org writes must not exist
+      const res = await call(tool, { scope: "org", set: { response_mode: "mention" } });
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("not enabled");
+      expect(store.getOrgSettings()).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("issue #151: an approved org write lands and the response surfaces the effective policy", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
+      const res = await call(tool, { scope: "org", set: { response_mode: "mention" } });
+      expect(res.isError).toBe(false);
+      expect(store.getOrgSettings()?.responseMode).toBe("mention");
+      const body = JSON.parse(res.text) as { policy: { always_approve: string[] } };
+      // The policy view includes the tightened knobs (issue #151).
+      expect(body.policy.always_approve).toEqual([]);
+    } finally {
       cleanup();
     }
   });

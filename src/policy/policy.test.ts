@@ -969,7 +969,7 @@ extensions:
     expect(p.alwaysApprove).toEqual([]);
     expect(p.responseMode).toBe("request-only");
     expect(p.memory.injection).toEqual({ enabled: false, maxEntries: 3 });
-    expect(p.extensionsAllow).toEqual([]);
+    expect(p.extensionsAllow).toEqual(["linear"]); // issue #151: an empty DB allow cannot lift the floor allowlist
     expect(p.extensionsDeny).toEqual(["attio"]);
     expect(p.orgCredentials).toBe("deny");
     expect(p.objects.maxSizeBytes).toBe(4096);
@@ -1043,7 +1043,9 @@ extensions:
     writeConfig("extensions:\n  allow:\n    - linear\n");
     store.setOrgSettings({ extensions: { allow: ["linear", "github"] } });
     const org = loadOrgPolicy(store, dir);
-    expect(org.extensionsAllow).toEqual(["linear", "github"]); // DB replaces the file list
+    // Issue #151 clamp: github is not in the file floor, so the DB cannot
+    // add it to the allowlist (tighten-only) — the floor is the ceiling.
+    expect(org.extensionsAllow).toEqual(["linear"]);
     const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "DBF3" });
     // Overlay removes github from the DB allowlist and adds attio to deny.
     await store.updatePolicy(space.id, JSON.stringify({ extensions: { allow: ["github"], deny: ["attio"] } }));
@@ -1052,5 +1054,71 @@ extensions:
     expect(eff.extensionsDeny).toEqual(["attio"]);
     expect(decideExtensionCall(eff, "linear").decision).toBe("allow");
     expect(decideExtensionCall(eff, "github").decision).toBe("deny"); // removed by the overlay
+  });
+
+  test("issue #151 clamp: always_approve cannot widen beyond the file floor; removals apply", () => {
+    writeConfig("approvals:\n  always_approve:\n    - bash\n");
+    const s = createStore(join(dir, "clamp-always.db"));
+    try {
+      // task is not in the file floor — adding it would auto-approve an
+      // exec tool the floor never approved; the write is stored but the
+      // effective list clamps to the floor with a warning.
+      s.setOrgSettings({ approvals: { always_approve: ["bash", "task"] } });
+      const p = loadOrgPolicy(s, dir);
+      expect(p.ok).toBe(true);
+      expect(p.alwaysApprove).toEqual(["bash"]);
+      expect(p.warnings.join(" ")).toContain("always_approve");
+      // Removals still apply: the DB can take entries away (tightens).
+      s.setOrgSettings({ approvals: { always_approve: [] } });
+      expect(loadOrgPolicy(s, dir).alwaysApprove).toEqual([]);
+      // The issue's escalation, at the policy level: a floor that approves
+      // bash but lists NOTHING in always_approve + a DB write adding bash →
+      // bash stays out of the list and still routes ask-human.
+      writeConfig("tools:\n  bash: allow\n");
+      s.setOrgSettings({ approvals: { always_approve: ["bash"] } });
+      const escalated = loadOrgPolicy(s, dir);
+      expect(escalated.alwaysApprove).toEqual([]);
+      expect(decidePolicyCall(escalated, "bash", false).decision).toBe("ask-human");
+      expect(decidePolicyCall(escalated, "bash", false).autoApproved).toBe(false);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("issue #151 clamp: extensions.allow cannot widen beyond the file floor", () => {
+    writeConfig("extensions:\n  allow:\n    - linear\n");
+    const s = createStore(join(dir, "clamp-allow.db"));
+    try {
+      // github beyond the floor is clamped (warning); removals apply.
+      s.setOrgSettings({ extensions: { allow: ["linear", "github"] } });
+      const p = loadOrgPolicy(s, dir);
+      expect(p.ok).toBe(true);
+      expect(p.extensionsAllow).toEqual(["linear"]);
+      expect(p.warnings.join(" ")).toContain("github");
+      // An empty list cannot lift the restriction.
+      s.setOrgSettings({ extensions: { allow: [] } });
+      expect(loadOrgPolicy(s, dir).extensionsAllow).toEqual(["linear"]);
+      // From an unrestricted floor, any non-empty DB list restricts (tightens).
+      writeConfig("");
+      s.setOrgSettings({ extensions: { allow: ["linear"] } });
+      expect(loadOrgPolicy(s, dir).extensionsAllow).toEqual(["linear"]);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("issue #151 clamp: extensions.deny only adds; org_credentials cannot loosen", () => {
+    writeConfig("extensions:\n  deny:\n    - attio\n  org_credentials: deny\n");
+    const s = createStore(join(dir, "clamp-ext.db"));
+    try {
+      s.setOrgSettings({ extensions: { deny: ["linear"], org_credentials: "allow" } });
+      const p = loadOrgPolicy(s, dir);
+      expect(p.ok).toBe(true);
+      expect(p.extensionsDeny).toEqual(["attio", "linear"]); // union with the floor
+      expect(p.orgCredentials).toBe("deny"); // allow cannot loosen the floor's deny
+      expect(p.warnings.join(" ")).toContain("org_credentials");
+    } finally {
+      s.close();
+    }
   });
 });

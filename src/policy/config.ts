@@ -147,6 +147,13 @@ const TIER_BY_TOOL: Record<string, Tier> = {
   // Settings tool (issue #67): mutates the durable org/space settings blob
   // (write — prompts in non-yolo modes; reads go through the same gate).
   settings: "write",
+  // Synthetic exec-tier tool for the settings tool's inner approver gate
+  // (issue #151): org-scope settings writes cross this name through the
+  // shared decision table, so they route ask-human through the approval
+  // router like every exec-tier tool — an org write without a human
+  // approver is impossible. Only reachable from settings.ts; never a
+  // user-visible tool.
+  settings_org_write: "exec",
   // Admin tools (issue #73): setup/onboarding surfaces, admin-gated like
   // the settings tool (write — prompts in non-yolo modes, so org-settings
   // access is the gate). deploy_info is read-only identity info, open to
@@ -778,13 +785,39 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
  * reach this function: the store helpers throw and loadOrgPolicy fails the
  * policy closed. `repos`/`models` are validated in the blob but consumed
  * outside PolicyConfig (Part B) and are not merged here.
+ *
+ * Issue #151 clamp: `approvals.always_approve` and `extensions.*` are
+ * TIGHTEN-ONLY relative to the file floor — the DB can never loosen them,
+ * because loosening those knobs escalates to exec-tier tools (auto-approve
+ * more exec tools, widen the extension allowlist, clear the deny list, or
+ * re-enable org credentials). always_approve may only REMOVE entries
+ * (intersection with the floor); extensions.allow may only shrink a
+ * non-empty floor list (or introduce a restriction from an unrestricted
+ * floor); extensions.deny may only ADD entries (union); org_credentials
+ * clamps like the overlay. A loosening write is stored in the blob but its
+ * loosening part is dropped from the effective policy with a warning, so
+ * the floor is the hard ceiling — the settings tool surfaces the clamped
+ * effective policy at read.
  */
 export function applyOrgSettings(file: PolicyConfig, settings: OrgSettings): PolicyConfig {
   const out = clonePolicy(file);
   const approvals = settings.approvals;
   if (approvals) {
     if (approvals.timeoutMinutes !== undefined) out.timeoutMinutes = approvals.timeoutMinutes;
-    if (approvals.alwaysApprove !== undefined) out.alwaysApprove = [...approvals.alwaysApprove];
+    // always_approve (issue #151): the DB may only remove entries from the
+    // file floor's list — adding entries would auto-approve exec tools the
+    // floor never approved. Entries outside the floor are dropped with a
+    // warning; removals apply (fewer auto-approvals always tightens).
+    if (approvals.alwaysApprove !== undefined) {
+      const db = [...approvals.alwaysApprove];
+      const added = db.filter((tool) => !file.alwaysApprove.includes(tool));
+      if (added.length > 0) {
+        out.warnings.push(
+          `org_settings approvals.always_approve: ${added.join(", ")} not in the file floor — ignored (tighten-only)`,
+        );
+      }
+      out.alwaysApprove = file.alwaysApprove.filter((tool) => db.includes(tool));
+    }
   }
   if (settings.responseMode !== undefined) out.responseMode = settings.responseMode;
   const memory = settings.memoryInjection;
@@ -794,9 +827,46 @@ export function applyOrgSettings(file: PolicyConfig, settings: OrgSettings): Pol
   }
   const extensions = settings.extensions;
   if (extensions) {
-    if (extensions.allow !== undefined) out.extensionsAllow = [...extensions.allow];
-    if (extensions.deny !== undefined) out.extensionsDeny = [...extensions.deny];
-    if (extensions.orgCredentials !== undefined) out.orgCredentials = extensions.orgCredentials;
+    // extensions.allow (issue #151): from an unrestricted floor any
+    // non-empty DB list restricts (tightens); from a restricted floor the
+    // DB may only shrink the list — an empty list (lifting the restriction)
+    // or ids outside the floor are clamped back to the floor with a
+    // warning, and only the floor-members of the DB list survive.
+    if (extensions.allow !== undefined) {
+      const db = [...extensions.allow];
+      if (file.extensionsAllow.length === 0) {
+        out.extensionsAllow = db;
+      } else if (db.length === 0) {
+        out.extensionsAllow = [...file.extensionsAllow];
+        out.warnings.push(
+          "org_settings extensions.allow: an empty list cannot lift the file floor allowlist (tighten-only)",
+        );
+      } else {
+        const added = db.filter((id) => !file.extensionsAllow.includes(id));
+        if (added.length > 0) {
+          out.warnings.push(
+            `org_settings extensions.allow: ${added.join(", ")} not in the file floor — ignored (tighten-only)`,
+          );
+        }
+        out.extensionsAllow = db.filter((id) => file.extensionsAllow.includes(id));
+      }
+    }
+    // extensions.deny (issue #151): the DB may only ADD ids — a union with
+    // the floor; deny always tightens, never a warning.
+    if (extensions.deny !== undefined) {
+      out.extensionsDeny = [...new Set([...file.extensionsDeny, ...extensions.deny])];
+    }
+    // extensions.org_credentials (issue #151): clamp like the overlay —
+    // the stricter of the floor and the DB wins; allow cannot loosen deny.
+    if (extensions.orgCredentials !== undefined) {
+      const clamped = stricterOrgCredentials(file.orgCredentials, extensions.orgCredentials);
+      if (clamped !== extensions.orgCredentials) {
+        out.warnings.push(
+          "org_settings extensions.org_credentials: 'allow' cannot loosen the file floor 'deny' (tighten-only)",
+        );
+      }
+      out.orgCredentials = clamped;
+    }
   }
   return out;
 }

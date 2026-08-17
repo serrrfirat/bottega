@@ -279,7 +279,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
     ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
     ...modelToolsDefinitions(store, { audit, modelRoles }),
-    ...settingsToolDefinitions(store, { audit }),
+    ...settingsToolDefinitions(store, {
+      audit,
+      // Org-scope writes cross the approval router (issue #151): the same
+      // exec-tier ask-human flow as every other privileged mutation — the
+      // Slack-backed router posts an approve/deny prompt, and without this
+      // gate the tool fails closed (org writes rejected).
+      gate: {
+        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+        router: approvalRouter,
+      },
+    }),
     // Admin tools (issue #73): catalog browser, stack health, deploy info,
     // first-run wizard — gated like the settings tool (write tier →
     // org-settings access via approval); deploy_info is read-tier (anyone).

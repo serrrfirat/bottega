@@ -40,14 +40,44 @@ import type { Store } from "../store/db";
 import { type OrgSettings, type OrgSettingsInput } from "../store/org-settings";
 import { SETTINGS_CHANGED_EVENT } from "../store/audit-events";
 import { loadOrgPolicy, loadSpacePolicy, type PolicyConfig } from "../policy/config";
+import type { ApprovalRouter } from "../policy/approval-router";
+import { evaluatePolicyGate } from "../policy/gate";
+import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
+
+/**
+ * Synthetic exec-tier tool name for the org-write approver gate (issue
+ * #151): org-scope `set` calls cross the shared decision table under this
+ * name (TIER_BY_TOOL → exec), so they route ask-human through the approval
+ * router like every exec-tier tool. Never a user-visible tool.
+ */
+export const SETTINGS_ORG_WRITE_TOOL = "settings_org_write";
 
 export interface SettingsToolsExtensionOpts {
   /** Audit module; every successful set appends a `settings.changed` row. */
   audit?: Pick<AuditModule, "appendAudit">;
   /** Actor recorded on audit rows; defaults to "agent". */
   actor?: string;
+  /**
+   * Policy gate for org-scope writes (issue #151): every org-scope `set`
+   * call crosses the shared decision table as an exec-tier call
+   * (SETTINGS_ORG_WRITE_TOOL) and routes ask-human through the approval
+   * router — the same approver flow as exec-tier tools, so an org write
+   * that loosens the policy floor (always_approve, extensions) can never
+   * land without a human approver. The gate audits
+   * policy.decision/approval.requested/approval.resolved via `audit`.
+   * Absent → org-scope writes fail closed (rejected); the approval seam
+   * must be wired before org writes exist.
+   */
+  gate?: {
+    loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
+    router: ApprovalRouter;
+    /** Ask-human timeout in ms; defaults to the policy's approvals.timeout_minutes. */
+    timeoutMs?: number;
+    /** Executor-session scope (issue #11); see decidePolicyCall. */
+    preApproved?: boolean;
+  };
 }
 
 /** Org-scope settable knobs — snake_case, mirrors the stored blob (OrgSettingsInput). */
@@ -125,6 +155,7 @@ function policyView(policy: PolicyConfig): Record<string, unknown> {
   return {
     ok: policy.ok,
     timeout_minutes: policy.timeoutMinutes,
+    always_approve: policy.alwaysApprove,
     response_mode: policy.responseMode,
     memory_injection: { enabled: policy.memory.injection.enabled, max_entries: policy.memory.injection.maxEntries },
     extensions: {
@@ -247,6 +278,9 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
     description:
       "Reads or changes the durable org/per-space settings (the DB, not config files — the DB is the " +
       "source of truth; config files are defaults). Write-tier: prompts for approval in non-yolo modes. " +
+      "ORG-scope writes additionally require a human approver (routed through the approval flow like " +
+      "exec-tier tools); the effective policy clamps always_approve and extensions to tighten-only " +
+      "relative to the config-file floor. " +
       "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
@@ -259,7 +293,7 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "model_settings tool.",
     parameters: settingsArgsSchema,
     approval: "write",
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
         if (params.set !== undefined && Object.keys(params.set).length === 0) {
           return toolError("settings set requires at least one field");
@@ -267,10 +301,11 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
         if (params.scope !== "space" && params.set?.proactive !== undefined) {
           return toolError('proactive is a space-scope knob — set it with scope: "space"');
         }
+        const spaceId = sessionIdFromFilePath(ctx?.sessionManager?.getSessionFile());
         if (params.scope === "space") {
           return await handleSpace(store, opts, actor, params);
         }
-        return await handleOrg(store, opts, actor, params);
+        return await handleOrg(store, opts, actor, params, spaceId);
       } catch (err) {
         return toolError(errorMessage(err));
       }
@@ -290,6 +325,7 @@ async function handleOrg(
   opts: SettingsToolsExtensionOpts,
   actor: string,
   params: z.infer<typeof settingsArgsSchema>,
+  spaceId: string | undefined,
 ): Promise<AgentToolResult> {
   const current = store.getOrgSettings();
   const orgPolicy = loadOrgPolicy(store);
@@ -307,10 +343,38 @@ async function handleOrg(
       ],
     };
   }
+  // Org-scope writes are approver-gated (issue #151): they cross the
+  // shared decision table as an exec-tier call (SETTINGS_ORG_WRITE_TOOL),
+  // so ask-human routes through the approval router — the same flow as
+  // every exec-tier tool. An org write that loosens the policy floor
+  // (always_approve, extensions) can never land without a human approver.
+  // Fail closed: no gate (or no audit seam) → org writes are rejected, the
+  // approval router never bypassed.
+  if (!opts.gate || !opts.audit) {
+    return toolError("org-scope settings writes are not enabled in this deployment (approval gate not wired)");
+  }
+  const outcome = await evaluatePolicyGate(
+    {
+      loadPolicy: opts.gate.loadPolicy,
+      // The gate only uses appendAudit; the settings.changed audit below
+      // writes through the same module.
+      audit: opts.audit as AuditModule,
+      router: opts.gate.router,
+      timeoutMs: opts.gate.timeoutMs,
+      preApproved: opts.gate.preApproved,
+    },
+    {
+      tool: SETTINGS_ORG_WRITE_TOOL,
+      args: { scope: "org", set: params.set },
+      spaceId,
+      actor,
+    },
+  );
+  if (!outcome.allowed) return toolError(outcome.blockReason);
   const before = current !== null ? orgSettingsToInput(current) : {};
   const merged = mergeSettingsInput(before, params.set);
   const after = store.setOrgSettings(merged);
-  await opts.audit?.appendAudit({
+  await opts.audit.appendAudit({
     actor,
     event_type: SETTINGS_CHANGED_EVENT,
     payload: { scope: "org", actor, before, after: orgSettingsToInput(after) },
