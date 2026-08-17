@@ -4,6 +4,8 @@ import { WebClient } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 import {
   APPROVE_ACTION_ID,
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
   DENY_ACTION_ID,
   buildAppendTaskArgs,
   buildAppendTextArgs,
@@ -299,6 +301,24 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
 
     expect(received.map((a) => a.actionId)).toEqual([DENY_ACTION_ID]);
     expect(received[0].value).toBe("req-2");
+  });
+
+  test("delivers delivery-approval clicks to onAction (issue #149)", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (a) => { received.push(a); });
+
+    await deliver({
+      ...approveBody,
+      actions: [{ type: "button", action_id: DELIVERY_APPROVE_ACTION_ID, value: "wi_1" }],
+    });
+    await deliver({
+      ...approveBody,
+      actions: [{ type: "button", action_id: DELIVERY_DENY_ACTION_ID, value: "wi_2" }],
+    });
+
+    expect(received.map((a) => a.actionId)).toEqual([DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID]);
+    expect(received[0].value).toBe("wi_1");
+    expect(received[1].value).toBe("wi_2");
   });
 
   test("unrelated action ids do not reach onAction", async () => {

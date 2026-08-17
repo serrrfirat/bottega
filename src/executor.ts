@@ -125,13 +125,26 @@ export interface ExecutorDeps {
   /**
    * Delivery approval seam: called with the opened PR, resolves the human
    * decision. `null` → delivery denied (item blocked). Absent → the
-   * executor logs the pending request and waits indefinitely.
+   * default hook ({@link waitForDeliveryApproval}): polls the audit trail
+   * for the server's `delivery.resolved` marker and resolves with the
+   * recorded decision. Headless/executor-only runs with no server to
+   * resolve fail closed — the wait times out (the stale-run window) and
+   * denies, so the item lands in `blocked` instead of hanging at `working`
+   * forever.
    */
   onDelivery?: (item: WorkItem, delivery: DeliveryInfo) => Promise<DeliveryApproval | null>;
+  /**
+   * Delivery-approval wait poll interval (issue #149): how often the
+   * default onDelivery wait re-reads the audit trail for the server's
+   * `delivery.resolved` marker. Default 2000 ms.
+   */
+  deliveryPollIntervalMs?: number;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_STALE_AFTER_MS = 30 * 60 * 1000;
+/** Delivery-approval wait poll interval (issue #149): the default onDelivery re-reads the audit trail this often. */
+const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000;
 const DEFAULT_TRANSCRIPT_DIR = "data/transcripts";
 const DEFAULT_ORG_CONFIG_DIR = "config";
 const BASE_BRANCH = "main";
@@ -642,6 +655,84 @@ async function runAgentSession(
   return summary.trim();
 }
 
+export interface DeliveryWaitOpts {
+  /**
+   * How long the wait holds before denying (headless fallback). Default:
+   * the stale-run window ({@link DEFAULT_STALE_AFTER_MS}) — the same bound
+   * stale recovery uses, so a run with no server to resolve the request
+   * fails closed in-process instead of hanging at `working`.
+   */
+  timeoutMs?: number;
+  /** Poll interval for the server's `delivery.resolved` marker. Default 2000 ms. */
+  pollIntervalMs?: number;
+  /** Observability seam; defaults to console.log. */
+  log?: (line: string) => void;
+}
+
+/** Shape of a `delivery.resolved` audit payload (issue #149). */
+interface DeliveryResolutionPayload {
+  id?: string;
+  approved?: boolean;
+  approver?: string;
+}
+
+function parseDeliveryResolution(raw: string): DeliveryResolutionPayload | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as DeliveryResolutionPayload) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The executor container's default onDelivery (issue #149): the server
+ * cannot reach into this process, so the audit trail is the channel. The
+ * server's delivery router records the human's decision as
+ * `delivery.resolved` ({id, approved, approver}); this wait polls for that
+ * row and resolves with the recorded decision — approved → {approver},
+ * denied → null (the executor then blocks the item with evidence). The
+ * FIRST recorded decision wins (listAudit returns rows in ts order).
+ *
+ * Headless/executor-only runs (no server to resolve) fail closed on the
+ * timeout: null → the item lands in `blocked`, never a silent hang at
+ * `working`.
+ */
+export async function waitForDeliveryApproval(
+  store: Pick<Store, "listAudit">,
+  item: WorkItem,
+  delivery: DeliveryInfo,
+  opts: DeliveryWaitOpts = {},
+): Promise<DeliveryApproval | null> {
+  const log = opts.log ?? ((line: string) => console.log(line));
+  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_DELIVERY_POLL_INTERVAL_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_STALE_AFTER_MS;
+  const deadline = Date.now() + timeoutMs;
+  log(`[${item.id}] delivery approval pending for ${delivery.prUrl} — waiting for the space's decision`);
+  for (;;) {
+    const rows = await store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+    for (const row of rows) {
+      const payload = parseDeliveryResolution(row.payload);
+      if (payload === null || payload.id !== item.id) continue;
+      // First recorded decision wins.
+      if (payload.approved === true && typeof payload.approver === "string") {
+        log(`[${item.id}] delivery approved by <@${payload.approver}>`);
+        return { approver: payload.approver };
+      }
+      log(`[${item.id}] delivery denied — blocking`);
+      return null;
+    }
+    if (Date.now() >= deadline) {
+      log(
+        `[${item.id}] delivery approval unresolved after ${timeoutMs}ms (no server resolution) — ` +
+          "denying (headless fallback)",
+      );
+      return null;
+    }
+    await Bun.sleep(pollIntervalMs);
+  }
+}
+
 /** Push the branch (PAT via the askpass file), open the PR, request delivery approval. */
 async function deliver(
   deps: ExecutorDeps,
@@ -668,14 +759,11 @@ async function deliver(
   });
   const requestApproval =
     deps.onDelivery ??
-    ((_item, delivery) => {
-      console.log(
-        `[${_item.id}] delivery approval pending for ${delivery.prUrl} — ` +
-          "server onDelivery hook not wired (follow-up; see src/server TODO)",
-      );
-      const { promise } = Promise.withResolvers<DeliveryApproval | null>();
-      return promise;
-    });
+    ((_item, delivery) =>
+      waitForDeliveryApproval(deps.store, _item, delivery, {
+        pollIntervalMs: deps.deliveryPollIntervalMs,
+        log: (line) => console.log(line),
+      }));
   const approval = await requestApproval(item, { prUrl, summary });
   if (!approval) {
     await deps.store.transitionWorkItem(item.id, "working", "blocked", {

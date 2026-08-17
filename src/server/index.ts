@@ -44,7 +44,14 @@ import {
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
-import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
+import { resolveDeliveryAction } from "./adapters/delivery-router";
+import {
+  createSlackAdapter,
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+} from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
@@ -164,6 +171,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // router is late-bound (the Slack-backed router is constructed below,
   // after the adapter); the runtime reads it per call.
   let approvalRouter: ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
+  // Delivery-approval clicks (issue #149) resolve the executor's delivery
+  // seam; late-bound like approvalRouter — assigned after the adapter and
+  // store are available, before main() returns.
+  let deliveryActionHandler: (a: SlackAction) => Promise<void>;
   const wiring = await bootstrapRuntime({
     router: () => approvalRouter,
     ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
@@ -243,7 +254,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     appToken,
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
-    onAction: (a) => approvalRouter.handleAction(a),
+    onAction: (a) => {
+      // Delivery buttons (issue #149) resolve the executor's delivery seam;
+      // every other interactive click is an exec-tier approval (issue #44).
+      if (a.actionId === DELIVERY_APPROVE_ACTION_ID || a.actionId === DELIVERY_DENY_ACTION_ID) {
+        return deliveryActionHandler(a);
+      }
+      return approvalRouter.handleAction(a);
+    },
     responseModeFor,
   });
   // Boot-time onboarding guide (issue #116): proactive Slack-side setup.
@@ -288,6 +306,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
   });
+  // Delivery resolution (issue #149): a block-action click on the poller's
+  // prompt records the human's decision as delivery.resolved — the audit
+  // row the executor's onDelivery wait reads — and rewrites the prompt with
+  // the outcome.
+  deliveryActionHandler = async (a) => {
+    await resolveDeliveryAction({ store, adapter, log: (line) => console.log(line) }, a);
+  };
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
   // by bootstrapRuntime above with the router just assigned (the #172
@@ -576,13 +601,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
   });
-  // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
-  // in its own container and cannot post to Slack. When a work item's PR is
-  // opened it writes a work_item.delivery_pending audit marker; this poller
-  // watches that trail, posts the PR + approval request to the space
-  // channel, and records delivery.requested (dedupe across restarts). The
-  // button round-trip that resolves the seam (working -> review -> done) is
-  // a later adapter issue.
+  // Executor's delivery seam (issue #11 follow-up, #12, round trip #149):
+  // the executor runs in its own container and cannot post to Slack. When a
+  // work item's PR is opened it writes a work_item.delivery_pending audit
+  // marker; this poller watches that trail, posts the PR + an interactive
+  // approve/deny prompt to the space channel, and records
+  // delivery.requested (dedupe across restarts). A button click resolves
+  // the seam (delivery.resolved via deliveryActionHandler above) and the
+  // executor's onDelivery wait completes working -> review -> done.
   const deliveryPoller = startDeliveryPoller({
     store,
     adapter,

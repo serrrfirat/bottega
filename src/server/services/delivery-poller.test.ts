@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditRow, ListAuditOpts, Store } from "../../store/db";
 import { createStore } from "../../store/db";
-import type { SlackAdapter } from "../adapters/slack";
+import { buildDeliveryBlocks } from "../adapters/delivery-router";
+import { DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID, type SlackAdapter } from "../adapters/slack";
 import { DEFAULT_POLL_INTERVAL_MS, pollPendingDeliveries, startDeliveryPoller } from "./delivery-poller";
 
 // --- Fakes ------------------------------------------------------------------
@@ -54,15 +55,15 @@ class FakeStore implements Pick<Store, "listAudit" | "appendAudit"> {
 }
 
 class FakeAdapter implements Pick<SlackAdapter, "postMessage"> {
-  posted: Array<{ spaceId: string; text: string }> = [];
+  posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
   failNext = false;
 
-  async postMessage(spaceId: string, text: string): Promise<string | undefined> {
+  async postMessage(spaceId: string, text: string, opts?: { blocks?: unknown[] }): Promise<string | undefined> {
     if (this.failNext) {
       this.failNext = false;
       throw new Error("postMessage failed (fake)");
     }
-    this.posted.push({ spaceId, text });
+    this.posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : {}) });
     return undefined;
   }
 }
@@ -81,9 +82,26 @@ describe("pollPendingDeliveries (issue #12)", () => {
     const posted = await pollPendingDeliveries(store, adapter);
 
     expect(posted).toBe(1);
+    // The announcement is an INTERACTIVE prompt (issue #149): approve/deny
+    // buttons carrying the work item id — the key the delivery router
+    // resolves on when a human clicks.
     expect(adapter.posted).toEqual([
-      { spaceId: SPACE, text: `PR ready: ${PR_URL} — approve to finish` },
+      {
+        spaceId: SPACE,
+        text: `PR ready: ${PR_URL} — approve to finish`,
+        blocks: buildDeliveryBlocks(PR_URL, "implemented it", "wi_1"),
+      },
     ]);
+    const blocks = adapter.posted[0].blocks as Array<{
+      type: string;
+      elements?: Array<{ action_id?: string; value?: string }>;
+    }>;
+    const actions = blocks.find((b) => b.type === "actions");
+    expect(actions?.elements?.map((e) => e.action_id).sort()).toEqual([
+      DELIVERY_APPROVE_ACTION_ID,
+      DELIVERY_DENY_ACTION_ID,
+    ]);
+    expect(actions?.elements?.every((e) => e.value === "wi_1")).toBe(true);
     const requested = store.rows.filter((r) => r.event_type === DELIVERY_REQUESTED_EVENT);
     expect(requested).toHaveLength(1);
     expect(requested[0].actor).toBe("server");
@@ -304,7 +322,11 @@ describe("pollPendingDeliveries against the real store (issue #29)", () => {
 
       expect(posted).toBe(1);
       expect(adapter.posted).toEqual([
-        { spaceId: SPACE, text: `PR ready: ${PR_URL} — approve to finish` },
+        {
+          spaceId: SPACE,
+          text: `PR ready: ${PR_URL} — approve to finish`,
+          blocks: buildDeliveryBlocks(PR_URL, "implemented it", "wi_1"),
+        },
       ]);
       const requested = await store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
       expect(requested).toHaveLength(1);

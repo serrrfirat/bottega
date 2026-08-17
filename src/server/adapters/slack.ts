@@ -56,6 +56,14 @@ export interface SlackStreamTask {
 /** Approval button action ids (issue #44); the buttons and the router's action handler share these. */
 export const APPROVE_ACTION_ID = "bottega_approve";
 export const DENY_ACTION_ID = "bottega_deny";
+/**
+ * Delivery-approval button action ids (issue #149); the poller's buttons
+ * and the server's delivery resolver share these. Distinct from the
+ * exec-tier approval ids: the button value carries a WORK ITEM id, not a
+ * policy-approval request id, so the two routers never collide.
+ */
+export const DELIVERY_APPROVE_ACTION_ID = "bottega_delivery_approve";
+export const DELIVERY_DENY_ACTION_ID = "bottega_delivery_deny";
 
 /**
  * A normalized interactive-component event (issue #44): a block-action
@@ -541,17 +549,19 @@ export function registerMessageHandler(
 }
 
 /**
- * Routes block-action clicks (`bottega_approve` / `bottega_deny`, issue
- * #44) to `onAction`. Unparseable payloads are dropped and logged, never
- * thrown. Exported so the inbound wiring is testable hermetically through
- * the real Bolt router (`App.processEvent`, issue #29); the adapter
- * installs it on its app when `onAction` is provided.
+ * Routes block-action clicks (exec-tier `bottega_approve` / `bottega_deny`
+ * issue #44, and delivery `bottega_delivery_approve` /
+ * `bottega_delivery_deny` issue #149) to `onAction`. Unparseable payloads
+ * are dropped and logged, never thrown. Exported so the inbound wiring is
+ * testable hermetically through the real Bolt router (`App.processEvent`,
+ * issue #29); the adapter installs it on its app when `onAction` is
+ * provided.
  */
 export function registerActionHandler(
   app: Pick<App, "action">,
   onAction: (a: SlackAction) => Promise<void>,
 ): void {
-  app.action(/^bottega_(approve|deny)$/, async ({ action, body, ack, logger }) => {
+  app.action(/^bottega_(approve|deny|delivery_approve|delivery_deny)$/, async ({ action, body, ack, logger }) => {
     // Ack first: Slack retries unacked interactive payloads.
     await ack();
     const normalized = normalizeActionEvent(action, body);

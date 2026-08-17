@@ -20,6 +20,8 @@ import { createStore, type SpaceModelSettings, type Store, type WorkItem, type W
 import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
+  DELIVERY_REQUESTED_EVENT,
+  DELIVERY_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
@@ -28,11 +30,20 @@ import {
   EXECUTOR_TOOLS,
   prepareExecutor,
   runExecutor,
+  waitForDeliveryApproval,
   type DeliveryApproval,
   type DeliveryInfo,
   type ExecutorDeps,
   type ExtensionWorkerToolset,
 } from "./executor";
+import { resolveDeliveryAction } from "./server/adapters/delivery-router";
+import { pollPendingDeliveries } from "./server/services/delivery-poller";
+import {
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+} from "./server/adapters/slack";
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { defaultPolicy } from "./policy/config";
@@ -1138,6 +1149,186 @@ describe("credential hygiene", () => {
         allow_loose_pat: true,
       });
       await expect(prepareExecutor(makeDeps(fx))).resolves.toMatchObject({ tokenFile: fx.tokenFile });
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+describe("delivery approval round trip (issue #149)", () => {
+  /** Server-side fakes: the poller's message surface + the resolver's rewrite surface. */
+  function serverFakes(): {
+    adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
+    posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }>;
+    updated: Array<{ spaceId: string; ts: string; text: string }>;
+  } {
+    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    return {
+      posted,
+      updated,
+      adapter: {
+        async postMessage(spaceId, text, opts) {
+          posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : {}) });
+          return "1.000001";
+        },
+        async updateMessage(spaceId, ts, text) {
+          updated.push({ spaceId, ts, text });
+        },
+      },
+    };
+  }
+
+  function click(itemId: string, actionId: string): SlackAction {
+    return { actionId, value: itemId, spaceId: "slack:C1", principal: "U_HUMAN", messageTs: "1.000001" };
+  }
+
+  /** Polls the audit trail for an event whose payload names the item. */
+  async function waitForMarker(store: Store, itemId: string, eventType: string, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const rows = await store.listAudit({ event_type: eventType });
+      if (rows.some((row) => (JSON.parse(row.payload) as { id?: string }).id === itemId)) return;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${eventType} of ${itemId}`);
+      await Bun.sleep(10);
+    }
+  }
+
+  test("a git-delivered item reaches done via the Slack approval (poller post → click → onDelivery wait → review → done)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      // The executor container runs with NO injected hook — the default
+      // onDelivery wait is the real production wiring (issue #149).
+      const deps = makeDeps(fx, { onDelivery: undefined, deliveryPollIntervalMs: 10 });
+      const ac = new AbortController();
+      const run = runExecutor(deps, ac.signal);
+      try {
+        // The PR lands and the delivery_pending marker appears.
+        await waitForMarker(fx.store, item.id, DELIVERY_PENDING_EVENT);
+
+        // Server side: the poller posts the interactive prompt.
+        const { adapter } = serverFakes();
+        const posted = await pollPendingDeliveries(fx.store, adapter);
+        expect(posted).toBe(1);
+
+        // A human clicks Approve; the server records delivery.resolved.
+        const handled = await resolveDeliveryAction(
+          { store: fx.store, adapter },
+          click(item.id, DELIVERY_APPROVE_ACTION_ID),
+        );
+        expect(handled).toBe(true);
+
+        const done = await waitForState(fx.store, item.id, "done");
+        const result = JSON.parse(done.result!) as { pr_url: string; summary: string };
+        expect(result.pr_url).toContain(`/acme/sandbox/pull/1`);
+        expect(JSON.parse(done.approvals)).toEqual([{ approver: "U_HUMAN", at: expect.any(Number) }]);
+
+        // The documented path: working → review → done, by the executor.
+        const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+        expect(transitions.map((row) => JSON.parse(row.payload))).toEqual(
+          expect.arrayContaining([
+            { from: "working", to: "review", by: "executor" },
+            { from: "review", to: "done", by: "executor" },
+          ]),
+        );
+
+        // The whole decision is on the trail: announced → resolved.
+        const requested = await fx.store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+        expect(requested).toHaveLength(1);
+        const resolved = await fx.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+        expect(resolved).toHaveLength(1);
+        expect(JSON.parse(resolved[0].payload)).toEqual({ id: item.id, approved: true, approver: "U_HUMAN" });
+      } finally {
+        ac.abort();
+        await run;
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a denied delivery blocks the item with evidence (poller post → click deny → blocked)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      const deps = makeDeps(fx, { onDelivery: undefined, deliveryPollIntervalMs: 10 });
+      const ac = new AbortController();
+      const run = runExecutor(deps, ac.signal);
+      try {
+        await waitForMarker(fx.store, item.id, DELIVERY_PENDING_EVENT);
+
+        const { adapter } = serverFakes();
+        expect(await pollPendingDeliveries(fx.store, adapter)).toBe(1);
+
+        const handled = await resolveDeliveryAction(
+          { store: fx.store, adapter },
+          click(item.id, DELIVERY_DENY_ACTION_ID),
+        );
+        expect(handled).toBe(true);
+
+        const blocked = await waitForState(fx.store, item.id, "blocked");
+        expect(JSON.parse(blocked.evidence)[0].url).toContain("approval denied");
+        expect(JSON.parse(blocked.approvals)).toEqual([]);
+
+        // The decision is recorded: denied, by the clicking human.
+        const resolved = await fx.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+        expect(JSON.parse(resolved[0].payload)).toEqual({ id: item.id, approved: false, approver: "U_HUMAN" });
+        // Deny never enters review/done.
+        const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+        expect(transitions.map((row) => JSON.parse(row.payload))).not.toEqual(
+          expect.arrayContaining([
+            { from: "working", to: "review", by: "executor" },
+            { from: "review", to: "done", by: "executor" },
+          ]),
+        );
+      } finally {
+        ac.abort();
+        await run;
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("headless fallback: no server resolution times out and denies (item would land in blocked)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      const start = Date.now();
+      const approval = await waitForDeliveryApproval(
+        fx.store,
+        item,
+        { prUrl: "https://github.com/acme/sandbox/pull/1", summary: "implemented it" },
+        { timeoutMs: 60, pollIntervalMs: 5 },
+      );
+
+      expect(approval).toBeNull(); // deny → the executor blocks the item
+      expect(Date.now() - start).toBeGreaterThanOrEqual(60);
     } finally {
       fx.cleanup();
     }
