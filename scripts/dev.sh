@@ -169,18 +169,40 @@ echo "iron-proxy: ready (dev egress config loaded, management API answering)"
 #    for dependents). Missing image / unreadable token fail loudly below,
 #    never silently: the boundary must NOT run extension calls
 #    unauthenticated.
+# Run a command with a hard deadline (portable: macOS has no coreutils
+# `timeout`; same helper as scripts/e2e-smoke.sh). Returns 1 on any
+# non-zero exit or deadline kill — a compose-up hang must never block
+# the boot.
+deadline() { # <seconds> <cmd...>
+  local secs="$1"; shift
+  "$@" &
+  local pid=$! killer
+  ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
+  killer=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  kill "$killer" 2>/dev/null
+  wait "$killer" 2>/dev/null
+  return $(( rc == 0 ? 0 : 1 ))
+}
+
 echo "auth-broker: starting (${COMPOSE_DEV[*]} up -d auth-broker)..."
 if curl -fsS -o /dev/null -m 2 http://127.0.0.1:8765/v1/healthz 2>/dev/null; then
   echo "auth-broker: already running on 127.0.0.1:8765 (reusing)"
-elif "${COMPOSE_DEV[@]}" up -d auth-broker; then
+elif docker image inspect oh-my-pi/pi:dev >/dev/null 2>&1 && deadline 60 "${COMPOSE_DEV[@]}" up -d auth-broker; then
   echo "auth-broker: compose service started"
 else
   # The oh-my-pi/pi:dev image is a private Docker Hub repo — it is NOT
-  # pullable on machines without access. Fall back to the LOCAL omp CLI
-  # (same binary the image runs; verified end-to-end in #143's live leg):
-  # bootstrap the token exactly like entrypoints/broker.sh, then serve.
-  # NOTE: the CLI resolves PI_CONFIG_DIR as HOME-relative (path.join), so
-  # an absolute dir would double-prefix and 401 every snapshot fetch.
+  # pullable on machines without access, and `compose up` HANGS on the
+  # pull (observed 233s+, blocking the live boot) instead of failing
+  # fast. Check image presence FIRST with a non-pulling inspect: absent
+  # -> skip compose entirely (no pull attempt). The compose up itself is
+  # deadline-bounded above, so a daemon stall can never block the boot
+  # either. Fall back to the LOCAL omp CLI (same binary the image runs;
+  # verified end-to-end in #143's live leg): bootstrap the token exactly
+  # like entrypoints/broker.sh, then serve. NOTE: the CLI resolves
+  # PI_CONFIG_DIR as HOME-relative (path.join), so an absolute dir would
+  # double-prefix and 401 every snapshot fetch.
   echo "auth-broker: docker image (oh-my-pi/pi:dev) unavailable — falling back to the local omp CLI" >&2
   mkdir -p data/.omp
   if [[ ! -f data/.omp/auth-broker.token ]]; then
