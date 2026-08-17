@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { App, type Logger } from "@slack/bolt";
+import { App, LogLevel } from "@slack/bolt";
 import { WebClient } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 import {
@@ -35,6 +35,9 @@ import {
   type SlackMessage,
 } from "./slack";
 
+/** Arbitrary JSON values (Slack event bodies are parsed JSON of unknown shape). */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 describe("space id derivation", () => {
   test("channel id maps to slack:<channel_id>", () => {
     expect(spaceIdFromChannel("C123ABC")).toBe("slack:C123ABC");
@@ -65,12 +68,20 @@ describe("isDmChannel", () => {
 });
 
 describe("isBotMessage (pure bot-message predicate)", () => {
-  test("true when bot_id is present", () => {
+  test("true when bot_id is present and the identity is unknown (fail closed)", () => {
     expect(isBotMessage({ bot_id: "B999", user: "U123" })).toBe(true);
   });
 
   test("true for the bot_message subtype", () => {
     expect(isBotMessage({ subtype: "bot_message", user: "U123" })).toBe(true);
+  });
+
+  test("true for the adapter's own bot user id (its own replies)", () => {
+    expect(isBotMessage({ bot_id: "B999", user: "U0BOT" }, "U0BOT")).toBe(true);
+  });
+
+  test("false for a real user's API-posted message carrying bot_id (issue #204)", () => {
+    expect(isBotMessage({ bot_id: "B999", user: "U0B9QUPCTJ5" }, "U0BQCUUHYMB")).toBe(false);
   });
 
   test("false for a plain user message", () => {
@@ -179,6 +190,18 @@ describe("normalizeMessage", () => {
     expect(normalizeMessage({ ...channelEvent, subtype: "bot_message" })).toBeNull();
   });
 
+  test("delivers a real user's API-posted message carrying bot_id (canary as_user, issue #204)", () => {
+    // Slack stamps `bot_id` on any chat.postMessage from the app — including
+    // the QA canary's `as_user: true` posts; the human's `user` id is what
+    // makes it a user message, not a bot's.
+    expect(
+      normalizeMessage(
+        { ...channelEvent, channel: "C0BQFD757NZ", user: "U0B9QUPCTJ5", bot_id: "B0BQNN4CLAY", text: "canary ping" },
+        "U0BQCUUHYMB",
+      ),
+    ).toEqual({ spaceId: "slack:C0BQFD757NZ", principal: "U0B9QUPCTJ5", text: "canary ping", ts: "1723700000.000100" });
+  });
+
   test("drops messages missing required fields", () => {
     expect(normalizeMessage({ ...channelEvent, text: undefined })).toBeNull();
     expect(normalizeMessage({ type: "message", channel: "C123ABC" })).toBeNull();
@@ -238,10 +261,7 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
   // App.processEvent routes a block_actions body to the registered "action"
   // listener with no socket connection and no Slack API calls (the
   // authorize hook is an injected local double).
-  function bootApp(onAction: (a: SlackAction) => Promise<void>): {
-    logged: string[];
-    deliver: (body: Record<string, unknown>) => Promise<void>;
-  } {
+  function bootApp(onAction: (a: SlackAction) => Promise<void>) {
     const logged: string[] = [];
     const app = new App({
       appToken: "xapp-test-token",
@@ -253,15 +273,15 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
         debug: () => {},
         warn: () => {},
         error: () => {},
-        getLevel: () => 0,
+        getLevel: () => LogLevel.INFO,
         setLevel: () => {},
         setName: () => {},
-      } as unknown as Logger,
+      },
     });
     registerActionHandler(app, onAction);
     return {
       logged,
-      async deliver(body) {
+      async deliver(body: Record<string, JsonValue>) {
         await app.processEvent({ body, ack: async () => {} });
       },
     };
@@ -515,14 +535,14 @@ describe("createSlackAdapter", () => {
       botToken: "xoxb-test-token",
       onMessage: async () => {},
     });
-    expect(typeof adapter.postMessage).toBe("function");
-    expect(typeof adapter.updateMessage).toBe("function");
-    expect(typeof adapter.addReaction).toBe("function");
-    expect(typeof adapter.removeReaction).toBe("function");
-    expect(typeof adapter.downloadFile).toBe("function");
-    expect(typeof adapter.uploadFile).toBe("function");
-    expect(typeof adapter.start).toBe("function");
-    expect(typeof adapter.stop).toBe("function");
+    expect(adapter.postMessage).toEqual(expect.any(Function));
+    expect(adapter.updateMessage).toEqual(expect.any(Function));
+    expect(adapter.addReaction).toEqual(expect.any(Function));
+    expect(adapter.removeReaction).toEqual(expect.any(Function));
+    expect(adapter.downloadFile).toEqual(expect.any(Function));
+    expect(adapter.uploadFile).toEqual(expect.any(Function));
+    expect(adapter.start).toEqual(expect.any(Function));
+    expect(adapter.stop).toEqual(expect.any(Function));
   });
 });
 
@@ -668,6 +688,16 @@ describe("Slack file API roundtrips", () => {
   const BOT_TOKEN = "xoxb-file-test-token";
   const DOWNLOAD_BYTES = new TextEncoder().encode("attachment body");
 
+  /** What the file-API stub observed across the roundtrips. */
+  interface FileApiState {
+    infoFile?: string;
+    downloadAuth?: string | null;
+    uploadFilename?: string;
+    uploadLength?: string;
+    uploadChannel?: string;
+    uploadedBytes?: Uint8Array;
+  }
+
   /**
    * Extracts the file part's bytes from a multipart/form-data body; returns
    * the raw body when the body is not multipart (defensive: raw uploads).
@@ -682,14 +712,7 @@ describe("Slack file API roundtrips", () => {
   }
 
   function bootFilesApi() {    let baseUrl = "";
-    const state: {
-      infoFile?: string;
-      downloadAuth?: string | null;
-      uploadFilename?: string;
-      uploadLength?: string;
-      uploadChannel?: string;
-      uploadedBytes?: Uint8Array;
-    } = {};
+    const state: FileApiState = {};
     const server = Bun.serve({
       port: 0,
       async fetch(request) {
@@ -800,10 +823,7 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
   function bootApp(
     onMessage: (m: SlackMessage) => Promise<void>,
     handlerOpts: MessageHandlerOptions = {},
-  ): {
-    logged: string[];
-    deliver: (event: Record<string, unknown>) => Promise<void>;
-  } {
+  ) {
     const logged: string[] = [];
     const app = new App({
       appToken: "xapp-test-token",
@@ -817,15 +837,15 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
         debug: () => {},
         warn: () => {},
         error: () => {},
-        getLevel: () => 0,
+        getLevel: () => LogLevel.INFO,
         setLevel: () => {},
         setName: () => {},
-      } as unknown as Logger,
+      },
     });
     registerMessageHandler(app, onMessage, handlerOpts);
     return {
       logged,
-      async deliver(event) {
+      async deliver(event: Record<string, JsonValue>) {
         await app.processEvent({ body: { type: "event_callback", event }, ack: async () => {} });
       },
     };
@@ -864,6 +884,54 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
     const { deliver, logged } = bootApp(async (m) => { received.push(m); });
 
     await expect(deliver({ type: "message", channel: "C123" })).resolves.toBeUndefined();
+
+    expect(received).toHaveLength(0);
+    expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);
+  });
+
+  test("delivers the QA canary's as_user post: bot_id stamped by Slack, human user id (issue #204)", async () => {
+    // The exact live shape from the canary's #bottega-qa channel: the real
+    // user (firat.sertgoz, U0B9QUPCTJ5) posts via chat.postMessage
+    // as_user and Slack stamps the app's bot_id on the event anyway. The
+    // adapter must NOT drop it — a real user's post is not bot-authored.
+    const received: SlackMessage[] = [];
+    const { deliver, logged } = bootApp(async (m) => { received.push(m); }, {
+      botUserId: () => "U0BQCUUHYMB",
+    });
+
+    await deliver({
+      type: "message",
+      channel: "C0BQFD757NZ",
+      user: "U0B9QUPCTJ5",
+      ts: "1786899338.572099",
+      bot_id: "B0BQNN4CLAY",
+      text: "canary msw1nnws-am4 (channel #bottega-qa): ping — reply with anything",
+    });
+
+    expect(received).toEqual([{
+      spaceId: "slack:C0BQFD757NZ",
+      principal: "U0B9QUPCTJ5",
+      text: "canary msw1nnws-am4 (channel #bottega-qa): ping — reply with anything",
+      ts: "1786899338.572099",
+    }]);
+    expect(logged.some((l) => l.includes("dropping message event"))).toBe(false);
+  });
+
+  test("still drops the bot's own reply events (loop protection)", async () => {
+    const received: SlackMessage[] = [];
+    const { deliver, logged } = bootApp(async (m) => { received.push(m); }, {
+      botUserId: () => "U0BQCUUHYMB",
+    });
+
+    await deliver({
+      type: "message",
+      channel: "C0BQFD757NZ",
+      user: "U0BQCUUHYMB",
+      ts: "1786899338.600000",
+      bot_id: "B0BQNN4CLAY",
+      subtype: "bot_message",
+      text: "ok",
+    });
 
     expect(received).toHaveLength(0);
     expect(logged.some((l) => l.includes("dropping message event"))).toBe(true);

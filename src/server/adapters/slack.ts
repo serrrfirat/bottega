@@ -1,17 +1,22 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
 import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type FilesInfoResponse } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
+import { z } from "zod";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
 // a call-time property read, so patching the exports object is effective).
 // Without this, Socket Mode connections die with "Failed to send ping".
 import undici from "undici";
 
-if (typeof (undici as { ping?: unknown }).ping !== "function") {
-  (undici as unknown as { ping: (ws: WebSocket, data?: Uint8Array) => void }).ping = (
-    ws,
-    data,
-  ) => {
+// SAFETY: the undici default export is the module namespace object, and Bun's
+// shim omits the `ping` export socket-mode reads via CJS require; the
+// assertion only widens the namespace with the optional property patched below.
+const undiciModule = undici as { ping?: (ws: WebSocket, data?: Uint8Array) => void };
+if (undiciModule.ping === undefined) {
+  undiciModule.ping = (ws, data) => {
+    // SAFETY: socket-mode's keepalive calls ping(this.websocket, ...) with its
+    // `ws` WebSocket instance, which owns ping(); the cast exposes that method
+    // on the DOM WebSocket type used here.
     (ws as WebSocket & { ping?: (d?: Uint8Array) => void }).ping?.(data);
   };
 }
@@ -169,9 +174,22 @@ export function isDmChannel(channelId: string): boolean {
 /**
  * Pure bot-message predicate. Bot-authored messages carry a `bot_id`, and
  * Slack's own bot messages use the `bot_message` subtype.
+ *
+ * `bot_id` alone does NOT mean bot-authored: Slack stamps `bot_id` on ANY
+ * message posted through the app's Web API — including a real user's
+ * `chat.postMessage` with `as_user: true` (the QA canary's exact inbound
+ * shape, issue #204). The event then carries the human's `user` id next to
+ * the app's `bot_id`. Only the adapter's OWN bot posts (user id resolved
+ * at start()) are bot-authored. When the bot identity is unknown (start()
+ * not resolved) fail closed and drop rather than risk an echo loop.
  */
-export function isBotMessage(event: Record<string, unknown>): boolean {
-  return event.bot_id !== undefined || event.subtype === "bot_message";
+export function isBotMessage(
+  event: Record<string, string | undefined>,
+  botUserId?: string,
+): boolean {
+  if (event.subtype === "bot_message") return true;
+  if (event.bot_id === undefined) return false;
+  return event.user === botUserId || botUserId === undefined;
 }
 
 /**
@@ -191,54 +209,104 @@ export function isMentionedMessage(
   return text.includes(`<@${botUserId}`);
 }
 
+/** Raw Bolt `message` event — the fields this adapter reads; runtime-validated before use. */
+interface RawSlackMessageEvent {
+  type?: unknown;
+  channel?: unknown;
+  user?: unknown;
+  ts?: unknown;
+  text?: unknown;
+  subtype?: unknown;
+  bot_id?: unknown;
+  thread_ts?: unknown;
+  files?: unknown;
+}
+
+const slackMessageFileSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  mimetype: z.string(),
+  size: z.number(),
+});
+
+/** The `{ files: [{ files: [{ id }] }] }` completion shape files.uploadV2 returns. */
+const slackUploadResultSchema = z.object({
+  files: z.array(z.object({ files: z.array(z.object({ id: z.string() })) })),
+});
+
+const slackMessageEventSchema = z.object({
+  channel: z.string(),
+  user: z.string(),
+  ts: z.string(),
+  text: z.string().optional(),
+  subtype: z.string().optional(),
+  bot_id: z.string().optional(),
+  files: z.array(z.unknown()).optional(),
+});
+
 /**
  * Normalizes a raw Slack message event into a {@link SlackMessage}.
  *
  * Returns `null` for anything unparseable (missing channel/user/ts and
  * neither text nor files, non-object payloads, bot messages) instead of
  * throwing — the caller drops and logs those.
+ *
+ * `botUserId` is the adapter's own bot user id (resolved at start()); a
+ * real user's API-posted message carries `bot_id` but a human `user`, so
+ * bot-authored is decided against this id (issue #204).
  */
-export function normalizeMessage(event: unknown): SlackMessage | null {
-  if (typeof event !== "object" || event === null) return null;
-  const raw = event as Record<string, unknown>;
-  if (isBotMessage(raw)) return null;
-  const { channel, user, text, ts } = raw;
-  const hasFiles = Array.isArray(raw.files) && raw.files.length > 0;
-  const files: NonNullable<SlackMessage["files"]> = [];
-  if (Array.isArray(raw.files)) {
-    for (const file of raw.files) {
-      if (typeof file !== "object" || file === null) continue;
-      if (
-        !("id" in file) ||
-        typeof file.id !== "string" ||
-        !("name" in file) ||
-        typeof file.name !== "string" ||
-        !("mimetype" in file) ||
-        typeof file.mimetype !== "string" ||
-        !("size" in file) ||
-        typeof file.size !== "number"
-      ) {
-        continue;
-      }
-      files.push({ id: file.id, name: file.name, mimeType: file.mimetype, size: file.size });
+export function normalizeMessage(
+  event: RawSlackMessageEvent | null | string | number | undefined,
+  botUserId?: string,
+): SlackMessage | null {
+  const parsed = slackMessageEventSchema.safeParse(event);
+  if (!parsed.success) return null;
+  const { channel, user, text, ts, subtype, bot_id, files } = parsed.data;
+  if (isBotMessage({ bot_id, subtype, user }, botUserId)) return null;
+  const normalizedFiles: NonNullable<SlackMessage["files"]> = [];
+  if (files !== undefined) {
+    for (const file of files) {
+      const parsedFile = slackMessageFileSchema.safeParse(file);
+      if (!parsedFile.success) continue;
+      const { id, name, mimetype, size } = parsedFile.data;
+      normalizedFiles.push({ id, name, mimeType: mimetype, size });
     }
   }
-  if (
-    typeof channel !== "string" ||
-    typeof user !== "string" ||
-    typeof ts !== "string" ||
-    (typeof text !== "string" && !hasFiles)
-  ) {
-    return null;
-  }
+  if (text === undefined && !(files !== undefined && files.length > 0)) return null;
   return {
     spaceId: spaceIdFromChannel(channel),
     principal: user,
-    text: typeof text === "string" ? text : "",
+    text: text ?? "",
     ts,
-    ...(files.length > 0 ? { files } : {}),
+    ...(normalizedFiles.length > 0 ? { files: normalizedFiles } : undefined),
   };
 }
+
+/** Raw Bolt block-action element — the clicked button; runtime-validated before use. */
+interface RawSlackActionElement {
+  type?: unknown;
+  action_id?: unknown;
+  value?: unknown;
+}
+
+/** Raw Bolt block_actions payload — the click context; runtime-validated before use. */
+interface RawSlackActionBody {
+  type?: unknown;
+  channel?: { id?: unknown };
+  user?: { id?: unknown };
+  message?: { ts?: unknown };
+}
+
+const slackActionElementSchema = z.object({
+  action_id: z.string(),
+  value: z.string(),
+});
+
+const slackActionBodySchema = z.object({
+  channel: z.object({ id: z.string() }),
+  user: z.object({ id: z.string() }),
+  message: z.object({ ts: z.string() }),
+});
 
 /**
  * Normalizes a Bolt block-action payload into a {@link SlackAction}.
@@ -248,24 +316,20 @@ export function normalizeMessage(event: unknown): SlackMessage | null {
  * Returns `null` for anything unparseable instead of throwing — the caller
  * drops and logs those.
  */
-export function normalizeActionEvent(action: unknown, body: unknown): SlackAction | null {
-  if (typeof action !== "object" || action === null) return null;
-  if (typeof body !== "object" || body === null) return null;
-  const a = action as Record<string, unknown>;
-  const b = body as Record<string, unknown>;
-  const channel = b.channel as Record<string, unknown> | undefined;
-  const user = b.user as Record<string, unknown> | undefined;
-  const message = b.message as Record<string, unknown> | undefined;
-  if (typeof a.action_id !== "string" || typeof a.value !== "string") return null;
-  if (typeof channel?.id !== "string" || typeof user?.id !== "string" || typeof message?.ts !== "string") {
-    return null;
-  }
+export function normalizeActionEvent(
+  action: RawSlackActionElement | null,
+  body: RawSlackActionBody | null,
+): SlackAction | null {
+  const element = slackActionElementSchema.safeParse(action);
+  if (!element.success) return null;
+  const context = slackActionBodySchema.safeParse(body);
+  if (!context.success) return null;
   return {
-    actionId: a.action_id,
-    value: a.value,
-    spaceId: spaceIdFromChannel(channel.id),
-    principal: user.id,
-    messageTs: message.ts,
+    actionId: element.data.action_id,
+    value: element.data.value,
+    spaceId: spaceIdFromChannel(context.data.channel.id),
+    principal: context.data.user.id,
+    messageTs: context.data.message.ts,
   };
 }
 
@@ -317,13 +381,14 @@ export function buildPostMessageArgs(
   spaceId: string,
   text: string,
   opts?: { threadTs?: string; blocks?: unknown[] },
-): { channel: string; text: string; thread_ts?: string; blocks?: unknown[] } {
-  return {
+) {
+  const args = {
     channel: channelFromSpaceId(spaceId),
     text: renderSlackText(text),
-    ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : {}),
-    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : {}),
-  };
+    ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : undefined),
+    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
+  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[] };
+  return args;
 }
 
 /**
@@ -335,7 +400,7 @@ export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
   text: string,
-): { channel: string; ts: string; text: string } {
+) {
   return { channel: channelFromSpaceId(spaceId), ts, text: renderSlackText(text) };
 }
 
@@ -400,16 +465,22 @@ export function buildStartStreamArgs(
   spaceId: string,
   opts: { threadTs: string; openingText: string },
   teamId?: string,
-): { channel: string; thread_ts: string; recipient_team_id?: string; chunks: StreamMarkdownChunk[] } {
+) {
   const channel = channelFromSpaceId(spaceId);
-  return {
+  const args = {
     channel,
     thread_ts: opts.threadTs,
     // Channels (C/G) require the team id; DMs reject it. The presenter
     // decides the thread ts; the adapter owns the Slack-side requirement.
-    ...(isDmChannel(channel) ? {} : teamId !== undefined ? { recipient_team_id: teamId } : {}),
+    ...(isDmChannel(channel) ? undefined : teamId !== undefined ? { recipient_team_id: teamId } : undefined),
     chunks: [markdownChunk(opts.openingText)],
+  } satisfies {
+    channel: string;
+    thread_ts: string;
+    recipient_team_id?: string;
+    chunks: StreamMarkdownChunk[];
   };
+  return args;
 }
 
 /** Maps adapter arguments onto a `chat.appendStream` markdown_text append. */
@@ -417,7 +488,7 @@ export function buildAppendTextArgs(
   spaceId: string,
   ts: string,
   text: string,
-): { channel: string; ts: string; chunks: StreamMarkdownChunk[] } {
+) {
   return { channel: channelFromSpaceId(spaceId), ts, chunks: [markdownChunk(text)] };
 }
 
@@ -426,7 +497,7 @@ export function buildAppendTaskArgs(
   spaceId: string,
   ts: string,
   task: SlackStreamTask,
-): { channel: string; ts: string; chunks: StreamTaskUpdateChunk[] } {
+) {
   return { channel: channelFromSpaceId(spaceId), ts, chunks: [taskUpdateChunk(task)] };
 }
 
@@ -440,26 +511,41 @@ export function buildStopStreamArgs(
   spaceId: string,
   ts: string,
   text?: string,
-): { channel: string; ts: string; blocks?: Array<{ type: "section"; text: { type: "mrkdwn"; text: string } }> } {
-  return {
+) {
+  const args = {
     channel: channelFromSpaceId(spaceId),
     ts,
     ...(text !== undefined
       ? { blocks: [{ type: "section" as const, text: { type: "mrkdwn" as const, text: renderSlackText(text) } }] }
-      : {}),
+      : undefined),
+  } satisfies {
+    channel: string;
+    ts: string;
+    blocks?: Array<{ type: "section"; text: { type: "mrkdwn"; text: string } }>;
   };
+  return args;
 }
+
+/** The `{ ok: false, error, needed?, provided? }` PlatformError payload when a thrown value carries one. */
+const slackApiErrorSchema = z.object({
+  data: z.object({
+    error: z.string(),
+    needed: z.string().optional(),
+    provided: z.string().optional(),
+  }),
+});
+
+/** A thrown value this adapter can classify: the PlatformError payload, an Error, or nothing. */
+type SlackApiError = z.infer<typeof slackApiErrorSchema> | Error | undefined;
 
 /**
  * The `error` code on a @slack/web-api PlatformError payload
  * (`{ ok: false, error: "…", needed?, provided? }`), when the thrown value
  * carries one. Runtime-narrowed: unknown shapes read as undefined.
  */
-function streamErrorCode(err: unknown): string | undefined {
-  if (err === null || typeof err !== "object" || !("data" in err)) return undefined;
-  const data = err.data;
-  if (data === null || typeof data !== "object" || !("error" in data)) return undefined;
-  return typeof data.error === "string" ? data.error : undefined;
+function streamErrorCode(err: SlackApiError): string | undefined {
+  if (err instanceof Error || err === undefined) return undefined;
+  return err.data.error;
 }
 
 /**
@@ -472,7 +558,7 @@ function streamErrorCode(err: unknown): string | undefined {
  * the first real stream call still fails fast (no-retry client) and flips
  * the per-boot cache.
  */
-export function isStreamingCapabilityError(err: unknown): boolean {
+export function isStreamingCapabilityError(err: SlackApiError): boolean {
   const code = streamErrorCode(err);
   return code === "missing_required_scope" || code === "not_allowed_token_type" || code === "invalid_auth";
 }
@@ -494,14 +580,18 @@ export async function probeStreamingSupport(client: WebClient, teamId: string | 
     await client.chat.startStream({
       channel: "C00000000", // deliberately invalid: never opens a visible stream
       thread_ts: "1.000000",
-      ...(teamId !== undefined ? { recipient_team_id: teamId } : {}),
+      ...(teamId !== undefined ? { recipient_team_id: teamId } : undefined),
       chunks: [{ type: "markdown_text", text: "streaming capability probe" }],
     });
     // Unreachable with an invalid channel; fail open regardless.
     return { supported: true };
   } catch (err) {
-    return isStreamingCapabilityError(err)
-      ? { supported: false, error: streamErrorCode(err) }
+    // Decode the thrown value at this boundary: the PlatformError payload,
+    // an Error, or nothing — everything else is unclassifiable (supported).
+    const parsed = slackApiErrorSchema.safeParse(err);
+    const apiError: SlackApiError = parsed.success ? parsed.data : err instanceof Error ? err : undefined;
+    return isStreamingCapabilityError(apiError)
+      ? { supported: false, error: streamErrorCode(apiError) }
       : { supported: true };
   }
 }
@@ -531,7 +621,7 @@ export function registerMessageHandler(
   opts: MessageHandlerOptions = {},
 ): void {
   app.event("message", async ({ event, logger }) => {
-    const message = normalizeMessage(event);
+    const message = normalizeMessage(event, opts.botUserId?.());
     if (!message) {
       logger.info("slack: dropping message event (unparseable or bot-authored)");
       return;
@@ -688,6 +778,9 @@ export function createSlackAdapter(opts: {
     async postMessage(spaceId, text, postOpts) {
       // blocks are built by the approval router as plain JSON; chat.postMessage
       // wants Slack's Block[] union — the shape is checked by the builder.
+      // SAFETY: buildPostMessageArgs returns only chat.postMessage fields the
+      // builder checked against its args contract; widening to the full SDK
+      // args type only adds options this adapter leaves unset.
       const args = buildPostMessageArgs(spaceId, text, postOpts) as ChatPostMessageArguments;
       const res = await app.client.chat.postMessage(args);
       return res.ts;
@@ -704,10 +797,10 @@ export function createSlackAdapter(opts: {
       }
       const file = info.file;
       if (
-        typeof file?.name !== "string" ||
-        typeof file.mimetype !== "string" ||
-        typeof file.size !== "number" ||
-        typeof file.url_private_download !== "string"
+        file?.name === undefined ||
+        file.mimetype === undefined ||
+        file.size === undefined ||
+        file.url_private_download === undefined
       ) {
         throw new Error(`slack: files.info returned incomplete metadata for file ${fileId}`);
       }
@@ -745,19 +838,12 @@ export function createSlackAdapter(opts: {
         filename: name,
         file: Buffer.from(content),
       });
-      if (!("files" in result) || !Array.isArray(result.files)) return undefined;
-      const completion = result.files[0];
-      if (
-        typeof completion !== "object" ||
-        completion === null ||
-        !("files" in completion) ||
-        !Array.isArray(completion.files)
-      ) {
-        return undefined;
-      }
-      const file = completion.files[0];
-      if (typeof file !== "object" || file === null || !("id" in file)) return undefined;
-      return typeof file.id === "string" ? file.id : undefined;
+      // uploadV2's WebAPICallResult is untyped past `ok`; decode the nested
+      // completion shape here so the returned file id is a validated string.
+      const parsed = slackUploadResultSchema.safeParse(result);
+      if (!parsed.success) return undefined;
+      const file = parsed.data.files[0]?.files[0];
+      return file?.id;
     },
     async addReaction(spaceId, ts, name) {
       await app.client.reactions.add({
@@ -782,6 +868,9 @@ export function createSlackAdapter(opts: {
         throw new Error("slack: chat streaming unsupported in this workspace (cached from an earlier failure)");
       }
       try {
+        // SAFETY: buildStartStreamArgs emits only chat.startStream fields the
+        // builder checked against its args contract; widening to the SDK args
+        // type adds only options this adapter leaves unset.
         const args = buildStartStreamArgs(spaceId, streamOpts, teamId) as ChatStartStreamArguments;
         const res = await streamClient.chat.startStream(args);
         return res.ts;
@@ -801,6 +890,9 @@ export function createSlackAdapter(opts: {
     },
     async appendText(spaceId, ts, text) {
       try {
+        // SAFETY: buildAppendTextArgs emits only chat.appendStream fields the
+        // builder checked against its args contract; widening to the SDK args
+        // type adds only options this adapter leaves unset.
         await streamClient.chat.appendStream(
           buildAppendTextArgs(spaceId, ts, text) as ChatAppendStreamArguments,
         );
@@ -815,6 +907,9 @@ export function createSlackAdapter(opts: {
     },
     async appendTask(spaceId, ts, task) {
       try {
+        // SAFETY: buildAppendTaskArgs emits only chat.appendStream fields the
+        // builder checked against its args contract; widening to the SDK args
+        // type adds only options this adapter leaves unset.
         await streamClient.chat.appendStream(
           buildAppendTaskArgs(spaceId, ts, task) as ChatAppendStreamArguments,
         );
@@ -829,6 +924,9 @@ export function createSlackAdapter(opts: {
     },
     async stopStream(spaceId, ts, text) {
       try {
+        // SAFETY: buildStopStreamArgs emits only chat.stopStream fields the
+        // builder checked against its args contract; widening to the SDK args
+        // type adds only options this adapter leaves unset.
         await streamClient.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
       } catch (err) {
         streamingCapable = false;
@@ -849,8 +947,8 @@ export function createSlackAdapter(opts: {
       // streaming cache, degrading to phrase+edit).
       try {
         const auth = await app.client.auth.test();
-        if (auth.ok && typeof auth.user_id === "string") botUserId = auth.user_id;
-        if (auth.ok && typeof auth.team_id === "string") teamId = auth.team_id;
+        if (auth.ok && auth.user_id !== undefined) botUserId = auth.user_id;
+        if (auth.ok && auth.team_id !== undefined) teamId = auth.team_id;
       } catch (err) {
         console.error("[slack] failed to resolve bot user id (mention filtering disabled):", err);
       }
