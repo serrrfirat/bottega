@@ -1119,7 +1119,10 @@ describe("first_run_wizard (issue #73)", () => {
       const byName = new Map(body.checks.map((c) => [c.name, c]));
       expect(byName.get("slack_tokens")!.ok).toBe(false);
       expect(byName.get("slack_tokens")!.fix).toContain("slack-app-manifest.yml");
+      // Issue #201: the fixes point at the vault provisioning path too.
+      expect(byName.get("slack_tokens")!.fix).toContain("connect_upload_link");
       expect(byName.get("model_key")!.ok).toBe(false);
+      expect(byName.get("model_key")!.fix).toContain("auth-broker vault");
       expect(byName.get("broker_token")!.ok).toBe(false);
       expect(byName.get("broker_token")!.fix).toContain("auth-broker");
       expect(byName.get("git_pat")!.ok).toBe(false);

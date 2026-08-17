@@ -183,18 +183,39 @@ Copy `.env.example` to `.env` and fill in:
 
 | Variable | What it is | How to get it |
 | --- | --- | --- |
-| `SLACK_APP_TOKEN` | App-level token | Slack app dashboard (step 1.3) |
-| `SLACK_BOT_TOKEN` | Bot user OAuth token | Slack app dashboard (step 1.2) |
-| `OPENCODE_API_KEY` | Primary model key (#37) | Referenced by `config/omp/models.yml` (`providers.opencode-go.apiKey`); resolved by the SDK inside the server, never in agent env. Local dev: Keychain service `bottega-opencode` |
-| `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
+| `SLACK_APP_TOKEN` | App-level token | Slack app dashboard (step 1.3). Vault-backed (#201): the boot seeds it from the auth-broker vault (row provider `slack-app`; provision with `connect_upload_link slack-app`) — .env is the fallback |
+| `SLACK_BOT_TOKEN` | Bot user OAuth token | Slack app dashboard (step 1.2). Vault-backed (#201): row provider `slack-bot` (`connect_upload_link slack-bot`) — .env is the fallback |
+| `OPENCODE_API_KEY` | Primary model key (#37) | Referenced by `config/omp/models.yml` (`providers.opencode-go.apiKey`); resolved by the SDK inside the server, never in agent env. Vault-backed (#201): row provider `opencode` (`connect_upload_link opencode`) — .env or the macOS Keychain (service `bottega-opencode`) are the fallbacks |
+| `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env. Vault-backed (#201): row provider `near` (`connect_upload_link near`) — .env or the Keychain (service `bottega-near`) are the fallbacks |
+| `OPENAI_API_KEY` | OpenAI model key + mem0 embedder/extractor key (#43) | Referenced by `config/omp/models.yml` (`providers.openai.apiKey`) and needed by the mem0 service when the memory backend is up. Vault-backed (#201): row provider `openai` (`connect_upload_link openai`) — .env is the fallback |
+| `ANTHROPIC_API_KEY` | Anthropic (Claude) model key | Referenced by `config/omp/models.yml` (`providers.anthropic.apiKey`). Vault-backed (#201): row provider `anthropic` (`connect_upload_link anthropic`) — .env is the fallback |
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose. Local dev: exported by dev.sh (`http://127.0.0.1:8765`) from the broker it starts (#143) |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3). Local dev: read by dev.sh from `data/.omp/auth-broker.token` (#143) |
 | `OP_CONNECT_TOKEN` | 1Password Connect access token (optional, #190) | Only when the org settings blob selects `secrets_backend: {type: 1password-connect, ...}` — the extension credential boundary then resolves static credentials (API keys/PATs) from the org's Connect server. The Connect server URL + the `"provider:identityKey" → {vault, item, field}` mapping are settings-tool knobs; only this token is env. Omit for the default omp-broker backend |
 | `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key (deployment only) | Referenced by the STRICT `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied in deployment. NOT needed for local dev: the dev config (`config/egress.dev.yml`) has no judge transform (issue #126) |
 | `IRON_MANAGEMENT_API_KEY` | iron-proxy management API token (#123) | The extension credential boundary's `POST /v1/reload` bearer token (`config/egress.yml` → `management.api_key_env`); set a strong value to enable immediate credential rotation. Local dev: generated per machine by dev.sh (`data/proxy-mgmt-token`, 0600) |
-| `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack ships a self-hosted mem0 service; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
 | `GITHUB_PAT` | Git credential | Install into the volume file, see step 3; never in env |
 | `BOTTEGA_IMAGE_TAG` | Image tag to run | `local` by default; pin a build sha for rollback (step 5) |
+
+**Boot secrets are vault-backed (issue #201).** At every boot the server
+seeds the Slack tokens + provider keys from the auth-broker vault before
+the SDK constructs providers, with precedence **vault → env → Keychain
+(local dev, opt-in) → fail closed**. The models.yml `apiKey` references
+stay by env name (the SDK is unchanged); only the source of truth moves —
+the rows above are the .env fallback for the same secrets.
+
+Provision a boot secret into the vault with the same one-time upload link
+as extensions (never a secret through chat): ask the agent for
+`connect_upload_link <provider-id>` and paste the value into the browser
+form; the endpoint stores it as the provider's `api_key` row in the vault.
+The provider ids are the table's vault rows: `slack-app`, `slack-bot`,
+`opencode`, `near`, `openai`, `anthropic`. The value applies at the next
+boot (rotation = re-upload the row and restart). The Keychain leg is only
+for bare local runs without dev.sh: set `BOTTEGA_KEYCHAIN_SEED=1` and store
+`security add-generic-password -s bottega-<provider> -a "$(whoami)" -w '<key>'`
+(dev.sh already loads `bottega-near` / `bottega-opencode` itself). Fail
+closed stays: a secret missing from the vault, env, and Keychain refuses to
+boot with the existing guard messages.
 
 `.env` carries secrets + deployment identity only (issue #67). Runtime knobs
 (approval timeouts, response mode, memory injection, extensions policy, repo

@@ -7,6 +7,7 @@ import { sessionSearchToolDefinitions } from "../memory/session-search";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
+import { seedBootSecretsFromVault } from "./boot-secrets";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
@@ -171,6 +172,13 @@ export interface BottegaServerOpts {
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
+  // Issue #201: seed the boot secrets (Slack tokens + provider keys) from
+  // the auth-broker vault BEFORE the SDK constructs providers and before
+  // the Slack guard below — precedence vault → env → Keychain (local dev)
+  // → fail closed (this guard + the #80 model-key guard stay the last
+  // word). The executor and MCP roots make the same call first (#172
+  // parity: every root resolves the same secret source).
+  await seedBootSecretsFromVault();
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {

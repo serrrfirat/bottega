@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
-import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT } from "../store/audit-events";
+import { BOOT_SECRETS } from "../server/boot-secrets";
 import { createStore, type Store } from "../store/db";
 import { CONNECT_EXTENSION_TOOL, type BrokerConnectResult } from "./connect";
 import { fixtureManifest } from "./fixture";
@@ -293,6 +294,102 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
       expect((await postSecret(url, "b")).status).toBe(404);
       expect((await postSecret(url, "c")).status).toBe(404);
       expect((await postSecret(url, "d")).status).toBe(429);
+    } finally {
+      endpoint.stop();
+    }
+  });
+});
+
+describe("boot-secret provisioning via the upload link (issue #201)", () => {
+  test("boot secrets mint by their vault provider id without a registry entry", () => {
+    const store = new UploadLinkStore(freshStore(), { maxOutstandingPerActor: BOOT_SECRETS.length });
+    for (const id of ["slack-app", "slack-bot", "opencode", "near", "openai", "anthropic"]) {
+      const outcome = mintUploadLink(
+        { extension: id, scope: "org", actor: "UADA" },
+        { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9" },
+      );
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) expect(outcome.url).toContain(`http://127.0.0.1:9/upload/`);
+    }
+  });
+
+  test("a boot-secret upload stores the api_key row in the vault — no registry row", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "near",
+        scope: "personal",
+        actor: "UADA",
+        label: "NEAR AI Cloud key",
+      });
+      expect(minted.ok).toBe(true);
+      const url = `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`;
+
+      const secret = "near-vault-key";
+      const upload = await postSecret(url, secret);
+      expect(upload.status).toBe(200);
+      expect(await upload.text()).toContain("Saved to the vault");
+
+      // The broker saw the value under the boot secret's provider identity…
+      expect(h.broker.calls).toEqual([{ provider: "near", credentialType: "api_key", apiKey: secret }]);
+      // …and NO extension registry row exists (boot secrets have no manifest).
+      expect(await rowsFor(h.store, "near")).toHaveLength(0);
+      const audit = await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT });
+      expect(audit).toHaveLength(1);
+      expect(JSON.parse(audit[0]!.payload)).toEqual({ secret: "near", scope: "personal", owner: "UADA" });
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("an org-scope boot-secret upload crosses the policy gate", async () => {
+    const router = new RecordingRouter({ approved: true });
+    const h = makeDeps({ policy: allowedPolicy(), router });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "openai",
+        scope: "org",
+        actor: "UADA",
+        spaceId: "slack:C1",
+        label: "OpenAI key",
+      });
+      expect(minted.ok).toBe(true);
+      const url = `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`;
+
+      const upload = await postSecret(url, "sk-openai-vault");
+      expect(upload.status).toBe(200);
+
+      expect(h.router.requests).toHaveLength(1);
+      expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
+      expect(h.router.requests[0]!.spaceId).toBe("slack:C1");
+      expect(h.broker.calls).toEqual([{ provider: "openai", credentialType: "api_key", apiKey: "sk-openai-vault" }]);
+      const audit = await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT });
+      expect(JSON.parse(audit[0]!.payload)).toEqual({ secret: "openai", scope: "org", owner: null });
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("a denied org gate stores nothing (fail closed)", async () => {
+    const router = new RecordingRouter({ approved: false });
+    const h = makeDeps({ policy: allowedPolicy(), router });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "slack-app",
+        scope: "org",
+        actor: "UADA",
+        label: "Slack app-level token",
+      });
+      expect(minted.ok).toBe(true);
+      const url = `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`;
+
+      const upload = await postSecret(url, "xapp-denied");
+      expect(upload.status).toBe(400);
+      expect(h.broker.calls).toHaveLength(0);
+      expect(await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT })).toHaveLength(0);
     } finally {
       endpoint.stop();
     }

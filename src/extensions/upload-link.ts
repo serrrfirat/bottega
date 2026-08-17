@@ -21,7 +21,12 @@
  *              fail closed) and stores the value through the EXACT same
  *              connect path as {@link connectExtension}: policy gate →
  *              broker upload → registry upsert → audit. The value never
- *              passes through Slack, the agent, or a transcript.
+ *              passes through Slack, the agent, or a transcript. Boot
+ *              secrets (issue #201 — Slack tokens + provider keys) mint by
+ *              their vault provider id and store through the same gate →
+ *              broker → audit path minus the registry row: there is no
+ *              extension manifest; the vault row is the record the
+ *              boot-time seed reads.
  *
  * The token store is the SQLite store's `upload_tokens` table (shared by
  * the server process — which hosts the endpoint — and the per-session MCP
@@ -32,7 +37,8 @@ import { z, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage, toolError } from "../tools/helpers";
 import type { Store, UploadToken } from "../store/db";
 import type { ExtensionRegistry } from "./registry";
-import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "./connect";
+import { connectExtension, storeBootSecret, type ConnectExtensionDeps, type ConnectScope } from "./connect";
+import { bootSecretForProvider } from "../server/boot-secrets";
 
 /** The mint tool's name (exec-tier surface, issue #196). */
 export const MINT_UPLOAD_LINK_TOOL = "connect_upload_link";
@@ -163,11 +169,17 @@ export function mintUploadLink(
   deps: MintUploadLinkDeps,
 ): MintUploadLinkOutcome {
   const resolved = deps.registry.resolve(input.extension);
-  if (!resolved) {
+  // Issue #201: boot secrets (Slack tokens + provider keys) have no
+  // extension manifest — the mint resolves them by their stable vault
+  // provider identity (`slack-app`, `slack-bot`, `opencode`, `near`,
+  // `openai`, `anthropic`) and the endpoint stores the api_key row the
+  // boot-time seed reads.
+  const boot = resolved === undefined ? bootSecretForProvider(input.extension) : undefined;
+  if (resolved === undefined && boot === undefined) {
     return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
   }
-  const label = resolved.manifest.label;
-  if (resolved.manifest.credentialSchema.type !== "api_key") {
+  const label = boot?.label ?? resolved!.manifest.label;
+  if (boot === undefined && resolved!.manifest.credentialSchema.type !== "api_key") {
     return {
       ok: false,
       message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
@@ -214,7 +226,10 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
       `Mints a single-use, expiring HTTPS link for an api_key-type extension. ` +
       `The user opens the link in a browser and pastes the secret there; the server stores it DIRECTLY ` +
       `into the vault — never through chat, this tool, or a transcript. OAuth extensions have no secret ` +
-      `to upload and should be connected directly.`,
+      `to upload and should be connected directly. ` +
+      `Boot secrets (issue #201) mint the same way by their provider id: the Slack tokens ` +
+      `(slack-app / slack-bot) and the model provider keys (opencode / near / openai / anthropic) ` +
+      `— the value lands in the vault row the server boot seeds from.`,
     parameters: MINT_UPLOAD_LINK_PARAMS_SCHEMA,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -323,19 +338,34 @@ async function handleUpload(
     return new Response("no secret provided — paste the key into the field", { status: 400 });
   }
   try {
-    // The SAME path as the connect flow: gate (org) → broker upload →
-    // registry upsert → audit. The endpoint never sees the secret's value
-    // anywhere else; the vault is its only destination.
-    const outcome = await connectExtension(
-      {
-        extension: consumed.row.extension,
-        scope: consumed.row.scope,
-        actor: consumed.row.actor,
-        spaceId: consumed.row.space_id ?? undefined,
-        apiKey: secret,
-      },
-      deps,
-    );
+    // Issue #201: boot secrets (Slack tokens + provider keys) store
+    // straight into the vault as the provider's api_key row — the row the
+    // boot-time seed reads — with the same gate (org) → broker → audit
+    // posture as the connect path, minus the registry row (there is no
+    // extension). Everything else runs the SAME connect path as the
+    // connect flow: gate (org) → broker upload → registry upsert → audit.
+    const boot = bootSecretForProvider(consumed.row.extension);
+    const outcome = boot
+      ? await storeBootSecret(
+          {
+            secret: boot,
+            value: secret,
+            scope: consumed.row.scope,
+            actor: consumed.row.actor,
+            spaceId: consumed.row.space_id ?? undefined,
+          },
+          deps,
+        )
+      : await connectExtension(
+          {
+            extension: consumed.row.extension,
+            scope: consumed.row.scope,
+            actor: consumed.row.actor,
+            spaceId: consumed.row.space_id ?? undefined,
+            apiKey: secret,
+          },
+          deps,
+        );
     if (!outcome.ok) return new Response(outcome.message, { status: 400 });
   } catch (err) {
     return new Response(`saving the secret failed: ${errorMessage(err)}`, { status: 500 });

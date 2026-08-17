@@ -44,7 +44,8 @@ import type { AuditModule } from "../policy/audit";
 import type { PolicyConfig } from "../policy/config";
 import { evaluatePolicyGate } from "../policy/gate";
 import type { ExtensionCredential, Store } from "../store/db";
-import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT } from "../store/audit-events";
+import type { BootSecret } from "../server/boot-secrets";
 import { errorMessage, toolError } from "../tools/helpers";
 import { looksLikeObviousSecret } from "../tools/memory";
 import type { McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
@@ -265,6 +266,60 @@ export function apiKeyIdentityKey(provider: string, scope: ConnectScope, owner: 
  */
 export function oauthIdentityKey(provider: string, scope: ConnectScope, owner: string | null): string {
   return scope === "org" ? `oauth:${provider}` : `oauth:${owner ?? "unknown"}`;
+}
+
+/**
+ * Boot-secret provisioning (issue #201): stores a boot secret (Slack
+ * token / provider key) into the vault as the provider's api_key row — the
+ * row the boot-time seed (src/server/boot-secrets.ts) reads. Same posture
+ * as {@link connectExtension}: org-scope stores cross the policy gate, the
+ * value goes broker → audit and never through chat, a transcript, or a
+ * registry row (boot secrets have no extension manifest — the vault row is
+ * the whole record).
+ */
+export async function storeBootSecret(
+  input: { secret: BootSecret; value: string; scope: ConnectScope; actor: string; spaceId?: string },
+  deps: Pick<ConnectExtensionDeps, "broker" | "audit" | "gate">,
+): Promise<ConnectOutcome> {
+  // Org-scope provisioning is privileged: the same exec-tier gate as every
+  // org connect (the mint tool itself is already exec-tier; this is the
+  // #196 double-gate posture — mint approves the link, POST approves the
+  // store). Personal stores are unprivileged, like the connect flow.
+  if (input.scope === "org") {
+    const outcome = await evaluatePolicyGate(
+      {
+        loadPolicy: deps.gate.loadPolicy,
+        audit: deps.audit,
+        router: deps.gate.router,
+        timeoutMs: deps.gate.timeoutMs,
+        preApproved: deps.gate.preApproved,
+      },
+      {
+        tool: CONNECT_EXTENSION_TOOL,
+        args: { extension: input.secret.vaultProvider, scope: input.scope },
+        spaceId: input.spaceId,
+        actor: input.actor,
+      },
+    );
+    if (!outcome.allowed) return { ok: false, message: outcome.blockReason };
+  }
+  try {
+    await deps.broker({ provider: input.secret.vaultProvider, credentialType: "api_key", apiKey: input.value });
+  } catch (err) {
+    return { ok: false, message: `storing ${input.secret.label} failed: ${errorMessage(err)}` };
+  }
+  const owner = input.scope === "personal" ? input.actor : null;
+  await deps.audit.appendAudit({
+    space_id: input.spaceId ?? null,
+    actor: input.actor,
+    event_type: SECRET_PROVISIONED_EVENT,
+    payload: { secret: input.secret.vaultProvider, scope: input.scope, owner },
+  });
+  return {
+    ok: true,
+    credential: null,
+    message: `${input.secret.label} stored in the vault — the server reads it at the next boot`,
+  };
 }
 
 /** Newest broker snapshot entry (broker row ids increase monotonically). */

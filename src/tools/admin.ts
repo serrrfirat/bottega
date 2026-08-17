@@ -541,7 +541,7 @@ export function runWizardChecks(
           name: "slack_tokens",
           ok: false,
           detail: `SLACK_APP_TOKEN set: ${slackApp !== null}, SLACK_BOT_TOKEN set: ${slackBot !== null}`,
-          fix: "create the Slack app from slack-app-manifest.yml and fill both tokens in .env",
+          fix: "create the Slack app from slack-app-manifest.yml, then provision the tokens into the auth-broker vault (connect_upload_link: slack-app / slack-bot) or set them in .env",
         },
     modelKey
       ? { name: "model_key", ok: true, detail: "a model key is resolvable (OPENCODE_API_KEY or NEAR_API_KEY)", fix: "none" }
@@ -551,7 +551,7 @@ export function runWizardChecks(
           detail: "neither OPENCODE_API_KEY nor NEAR_API_KEY is set (or they are placeholders)",
           fix: placeholderFix(
             "OPENCODE_API_KEY or NEAR_API_KEY",
-            "the macOS Keychain (service: bottega-opencode / bottega-near) loads it for local dev",
+            "the auth-broker vault seeds it at boot (connect_upload_link: opencode / near), or the macOS Keychain (service: bottega-opencode / bottega-near) loads it for local dev",
           ),
         },
     brokerToken

@@ -99,6 +99,7 @@ import { extensionToolSurface, toolOwnerExtensionId, type ExtensionSurfaces } fr
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "../server/bootstrap-runtime";
+import { seedBootSecretsFromVault } from "../server/boot-secrets";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
 
 export interface MemoryMcpServerOptions {
@@ -645,6 +646,10 @@ export async function bootMemoryMcpServer(opts: {
    */
   boundary?: SecretFileBoundaryOpts;
 } = {}): Promise<McpBoot> {
+  // Issue #201: same boot-secret seed as the server/executor roots (#172
+  // parity) — this MCP child's sessions resolve models from the same env
+  // names, so the provider keys must be seeded before any SDK use.
+  await seedBootSecretsFromVault();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     // Env contract (see the file header): the ACP driver / tests pin the

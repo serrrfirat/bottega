@@ -72,6 +72,14 @@ export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolve
 /** Extension connected through the connect capability (payload {extension, scope, owner}). */
 export const EXTENSION_CONNECTED_EVENT = "extension.connected";
 /**
+ * Boot secret provisioned into the vault (issue #201): payload {secret,
+ * scope, owner}. Written by the connect_upload_link endpoint when a boot
+ * secret (Slack token / provider key) is stored as the provider's api_key
+ * row — the row the boot-time seed reads. There is no extension/registry
+ * row for boot secrets; the vault row is the whole record.
+ */
+export const SECRET_PROVISIONED_EVENT = "secret.provisioned";
+/**
  * Extension tool call executed through the runtime (issue #53) — payload
  * {extension, tool, actor, credential_id, decision}; decision is
  * "allow" | "deny" | "error" (credential_id null unless the ladder resolved
