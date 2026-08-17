@@ -1,9 +1,11 @@
 # bottega
 
-**An AI co-worker that lives in your Slack.** Talk to it like a teammate —
-it turns conversation into real, tracked work, remembers what your team
-teaches it, follows the rules you set, and leaves a receipt for everything
-it does.
+**An AI co-worker that lives in your Slack and picks up real work for your
+org.** Ship a fix, update a ticket, chase a follow-up, run the weekly ops
+chore, answer the question nobody has time to dig into — ask in the channel,
+and it turns the conversation into tracked, delivered work. It remembers what
+your team teaches it, follows the rules you set, and leaves a receipt for
+everything it does.
 
 Self-hosted, per-org: your data, your models, your infrastructure. One
 `docker compose` stack, no public ports.
@@ -13,23 +15,35 @@ Self-hosted, per-org: your data, your models, your infrastructure. One
 > **you:** the checkout flow is flaky again, I think it's the retry logic
 > **bottega:** I see three retry paths in `acme/shop`. The backoff in
 > `payment-client` looks wrong — want me to take it?
-> **you:** @bottega take this
+> **you:** @bottega take this, and move the Linear ticket when the PR is up
 > **bottega:** *[Approve / Deny]* — create work item: fix retry backoff in acme/shop
 > **you:** *clicks Approve*
-> **bottega:** PR ready: github.com/acme/shop/pull/482 — approve to finish.
+> **bottega:** PR ready: github.com/acme/shop/pull/482 — Linear SHOP-291
+> moved to In Review. Approve to finish.
 
-The conversation stays in the channel where the team already works. The
-work happens in an isolated workspace, gated by your policies, and comes
-back as a pull request.
+That's one kind of task. The same co-worker updates records in your
+connected tools, answers questions from your org's own knowledge, posts the
+standup digest, and runs recurring operational chores on a schedule. The
+conversation stays in the channel where the team already works; the work
+happens in an isolated workspace, gated by your policies, and comes back as
+whatever the task calls for — a pull request, an updated ticket, or an
+answer in the thread.
 
 ## What you get
 
-- **A shared space, not a private chatbot.** The whole channel talks to the
-  same agent. Anyone can steer, interrupt, or approve — the agent belongs to
-  the team, not to one person's DM.
+- **A colleague for the whole org, not a coding tool.** Work items can be
+  delivered as code (a PR), as actions in your connected tools (Linear,
+  Attio, GitHub), or as an answer in the channel — one queue, one lifecycle,
+  one audit trail for all of it.
+- **A shared teammate, not a private chatbot.** The whole channel talks to
+  the same agent. Anyone can steer, interrupt, or approve — the agent
+  belongs to the team, not to one person's DM.
 - **Work that's tracked, not vibes.** Asking for work creates a work item
-  with a lifecycle: picked up, implemented in an isolated workspace,
-  delivered as a PR, or blocked with evidence — never silently dropped.
+  with a lifecycle: picked up, executed, delivered, or blocked with
+  evidence — never silently dropped.
+- **A different hat per team.** Each space can give the agent a department
+  persona — the support channel's co-worker and the platform channel's
+  co-worker carry different instructions and different tools.
 - **A memory your org owns.** It learns your repos, conventions, and
   decisions — per person or org-wide — and uses them in every later
   conversation. Point it at your docs and it ingests them too.
@@ -40,8 +54,9 @@ back as a pull request.
   Risky actions post an Approve/Deny button in the channel and wait for a
   human. Anything unknown or misconfigured is denied by default.
 - **It shows up on its own — when invited.** Opt-in standups, daily
-  reflections, a weekly org pulse, and recurring scheduled work. Quiet by
-  default; spaces choose what they want.
+  reflections, a weekly org pulse, and recurring scheduled work — the
+  repeating chores a team usually forgets. Quiet by default; spaces choose
+  what they want.
 - **A receipt for everything.** Every decision, approval, and tool call
   lands in an append-only audit trail that can't be edited or deleted.
 - **Pick your model per task.** Fast model for quick things, reasoning
