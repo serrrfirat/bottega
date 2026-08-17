@@ -29,9 +29,11 @@
  * dropped (mirrors the catalog listing's #117 diagnostics).
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { z } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage } from "../tools/helpers";
-import { EXTENSION_ID_RE, isRecord, type ExtensionTool, type ExtensionToolParam, type ExtensionToolTier, type McpBinding } from "./manifest";
+import { EXTENSION_ID_RE, isRecord, type ExtensionTool, type ExtensionToolParam, type ExtensionToolTier, type JsonObject, type JsonValue, type McpBinding } from "./manifest";
 import { defaultMcpTransport } from "./runtime";
 
 /**
@@ -42,7 +44,7 @@ import { defaultMcpTransport } from "./runtime";
 export interface ProviderTool {
   name: string;
   description?: string;
-  inputSchema?: unknown;
+  inputSchema?: JsonValue;
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
@@ -61,7 +63,7 @@ export interface ToolRefresh {
 }
 
 /** Confidence-bounded read-only verbs (verb-first tool names). */
-const READ_VERBS: Record<string, true> = {
+const READ_VERBS = {
   get: true,
   list: true,
   search: true,
@@ -82,10 +84,10 @@ const READ_VERBS: Record<string, true> = {
   exists: true,
   export: true,
   download: true,
-};
+} as const satisfies Record<string, true>;
 
 /** Clearly destructive verbs (irreversible or large blast radius → exec). */
-const DESTRUCTIVE_VERBS: Record<string, true> = {
+const DESTRUCTIVE_VERBS = {
   delete: true,
   remove: true,
   drop: true,
@@ -102,7 +104,7 @@ const DESTRUCTIVE_VERBS: Record<string, true> = {
   suspend: true,
   cancel: true,
   reset: true,
-};
+} as const satisfies Record<string, true>;
 
 /**
  * Conservative default tier: the server's own hints win, then a
@@ -119,8 +121,8 @@ export function classifyTier(
   if (annotations?.destructiveHint === true) return "exec";
   if (annotations?.readOnlyHint === true) return "read";
   const firstToken = toolName.toLowerCase().split(/[._-]/)[0] ?? "";
-  if (DESTRUCTIVE_VERBS[firstToken] === true) return "exec";
-  if (READ_VERBS[firstToken] === true) return "read";
+  if (Object.hasOwn(DESTRUCTIVE_VERBS, firstToken)) return "exec";
+  if (Object.hasOwn(READ_VERBS, firstToken)) return "read";
   return "write";
 }
 
@@ -132,11 +134,11 @@ export function classifyTier(
  * param absent from the schema's `required` list is explicitly optional
  * (the manifest defaults to required).
  */
-export function paramsFromInputSchema(schema: unknown): ExtensionToolParam[] {
-  if (!isRecord(schema) || !isRecord(schema["properties"])) return [];
+export function paramsFromInputSchema(schema: JsonObject): ExtensionToolParam[] {
+  if (!isRecord(schema["properties"])) return [];
   const requiredNames = new Set(
     Array.isArray(schema["required"])
-      ? (schema["required"] as unknown[]).filter((entry): entry is string => typeof entry === "string")
+      ? schema["required"].filter((entry): entry is string => z.string().safeParse(entry).success)
       : [],
   );
   const params: ExtensionToolParam[] = [];
@@ -151,18 +153,25 @@ export function paramsFromInputSchema(schema: unknown): ExtensionToolParam[] {
           : jsonType === "boolean"
             ? "boolean"
             : "string";
-    const description =
-      typeof raw["description"] === "string" && raw["description"].trim() !== ""
-        ? raw["description"].trim()
-        : undefined;
-    params.push({
-      name,
-      type,
-      ...(description !== undefined ? { description } : {}),
-      ...(requiredNames.has(name) ? {} : { required: false }),
-    });
+    const parsedDescription = z.string().min(1).safeParse(raw["description"]);
+    const param: ExtensionToolParam = { name, type };
+    if (parsedDescription.success && parsedDescription.data.trim() !== "") {
+      param.description = parsedDescription.data.trim();
+    }
+    if (!requiredNames.has(name)) param.required = false;
+    params.push(param);
   }
   return params;
+}
+
+/**
+ * Narrow an MCP inputSchema (already SDK-validated on the wire) to the
+ * record contract the param generator reads. A non-record schema yields an
+ * empty surface, so the tool is still surfaced with no params rather than
+ * dropped.
+ */
+function inputSchemaSurface(inputSchema: JsonValue): JsonObject {
+  return isRecord(inputSchema) ? inputSchema : {};
 }
 
 /**
@@ -174,7 +183,9 @@ export function toolsFromMcpList(list: readonly ProviderTool[], extensionId: str
   const tools: ExtensionTool[] = [];
   const skipped: ToolsListGeneration["skipped"] = [];
   for (const wire of list) {
-    const wireName = typeof wire.name === "string" ? wire.name : "";
+    // wire.name is a declared string (the SDK validates it on the wire);
+    // the empty-string case still routes to the "<unnamed>" skip below.
+    const wireName = wire.name;
     if (wireName.trim() === "" || !EXTENSION_ID_RE.test(wireName)) {
       skipped.push({
         tool: wireName.trim() === "" ? "<unnamed>" : wireName,
@@ -191,15 +202,18 @@ export function toolsFromMcpList(list: readonly ProviderTool[], extensionId: str
       continue;
     }
     const description =
-      typeof wire.description === "string" && wire.description.trim() !== ""
+      wire.description !== undefined && wire.description.trim() !== ""
         ? wire.description.trim()
         : `${wireName} (no description from the MCP server — confirm with the vendor docs)`;
+    // SAFETY: the SDK validates inputSchema against ListToolsResultSchema on
+    // the wire; a malformed schema fails the whole list, so a present value
+    // is a JSON object (absent → the generator emits no params).
     tools.push({
       name: `${extensionId}.${wireName}`,
       providerName: wireName,
       tier: classifyTier(wireName, wire.annotations),
       description,
-      params: paramsFromInputSchema(wire.inputSchema),
+      params: paramsFromInputSchema(inputSchemaSurface(wire.inputSchema as JsonValue)),
     });
   }
   return { tools, skipped };
@@ -209,25 +223,52 @@ export function toolsFromMcpList(list: readonly ProviderTool[], extensionId: str
 const MAX_TOOLS_LIST_PAGES = 10;
 
 /**
+ * Wall-clock bound on ONE discovery request (initialize or tools/list).
+ * Issue #205: without a bound the SDK's default 60s request timeout lets a
+ * dead stdio server hang every boot, every session cold-start, and every
+ * lazy per-call resolution — turns died mid-thinking. A local stdio server
+ * initializes in milliseconds; 10s is generous for a hosted endpoint.
+ */
+export const MCP_DISCOVERY_TIMEOUT_MS = 10_000;
+
+/**
  * Calls the provider's MCP server through the transport seam and returns
  * every tool (following nextCursor pagination). Fail closed: an
  * unreachable provider, a malformed tools/list, or runaway pagination
- * throws a clear error — no tools are ever fabricated.
+ * throws a clear error — no tools are ever fabricated. Every request is
+ * bounded by {@link MCP_DISCOVERY_TIMEOUT_MS} (overridable for hermetic
+ * tests) so a dead server fails fast instead of hanging the caller.
  */
 export async function listProviderTools(
   binding: McpBinding,
   mcpTransport: (binding: McpBinding) => Transport = defaultMcpTransport,
+  opts: { timeoutMs?: number } = {},
 ): Promise<ProviderTool[]> {
+  const timeoutMs = opts.timeoutMs ?? MCP_DISCOVERY_TIMEOUT_MS;
   const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
   try {
-    await client.connect(mcpTransport(binding));
+    const transport = mcpTransport(binding);
+    // Contain a misbehaving stdio server's stderr (issue #205): the boot log
+    // must never carry a child's exec noise, and an unbounded pipe would
+    // stall the child on backpressure. Drain up to a bounded prefix for
+    // diagnostics, then detach.
+    drainBoundedStderr(transport);
+    await client.connect(transport, { timeout: timeoutMs });
     const tools: ProviderTool[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < MAX_TOOLS_LIST_PAGES; page++) {
       // The SDK validates every response against ListToolsResultSchema
       // before resolving; a malformed response throws here.
-      const result = await client.listTools(cursor === undefined ? undefined : { cursor });
-      tools.push(...result.tools);
+      const result = await client.listTools(cursor === undefined ? undefined : { cursor }, { timeout: timeoutMs });
+      tools.push(
+        ...result.tools.map((tool) => ({
+          ...tool,
+          // The SDK validated the response against ListToolsResultSchema
+          // (JSON by the MCP wire contract); the round-trip yields the
+          // JSON domain ProviderTool.inputSchema declares.
+          inputSchema: JSON.parse(JSON.stringify(tool.inputSchema)),
+        })),
+      );
       cursor = result.nextCursor;
       if (cursor === undefined) break;
     }
@@ -241,6 +282,46 @@ export async function listProviderTools(
   } finally {
     await client.close();
   }
+}
+
+/** How much of a stdio server's stderr to surface as diagnostics. */
+const STDIO_STDERR_DIAGNOSTIC_BYTES = 2048;
+
+/**
+ * Reads (and bounds) a stdio transport's stderr so a misbehaving child's
+ * noise never floods the server log and backpressure never deadlocks the
+ * child. The first {@link STDIO_STDERR_DIAGNOSTIC_BYTES} are surfaced as a
+ * single bounded diagnostic line; the rest is dropped. Non-stdio transports
+ * expose no stderr stream and are untouched.
+ */
+function drainBoundedStderr(transport: Transport): void {
+  if (!(transport instanceof StdioClientTransport)) return;
+  const stderr = transport.stderr;
+  if (stderr === null) return;
+  void (async () => {
+    let bytes = 0;
+    let prefix = "";
+    try {
+      // SAFETY: StdioClientTransport.stderr is a Node Readable when stderr
+      // is "pipe" (the SDK's ctor builds a PassThrough) — Readable is async
+      // iterable at runtime even though its declared `Stream` type does not
+      // carry the Symbol.asyncIterator typing.
+      for await (const chunk of stderr as NodeJS.ReadableStream) {
+        const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+        if (bytes < STDIO_STDERR_DIAGNOSTIC_BYTES) {
+          prefix += text;
+          bytes += text.length;
+          if (bytes >= STDIO_STDERR_DIAGNOSTIC_BYTES) break;
+        }
+      }
+    } catch {
+      // The stream closed or errored with the child; nothing to log.
+    }
+    const trimmed = prefix.trim();
+    if (trimmed.length > 0) {
+      console.error(`[extensions] stdio server stderr (bounded): ${trimmed.slice(0, STDIO_STDERR_DIAGNOSTIC_BYTES)}`);
+    }
+  })();
 }
 
 /**

@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
@@ -28,7 +29,7 @@ import {
 } from "../store/audit-events";
 import { createSecretFileBoundary, extensionSecretFileName, PROXY_SECRETS_DIR, type CredentialBoundary } from "./boundary";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "./fixture";
-import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
+import { validateManifest, type ExtensionManifest, type JsonObject, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
 import type { McpOAuthTokenStore } from "./mcp-oauth";
@@ -84,7 +85,7 @@ function makeHarness(opts: {
   policy?: PolicyConfig;
   manifests?: ExtensionManifest[];
   boundary?: CredentialBoundary;
-  mcpTransport?: (binding: McpBinding, authProvider?: unknown) => Transport;
+  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
   onToolStep?: ExtensionRuntimeDeps["onToolStep"];
   router?: ExtensionRuntimeDeps["router"];
   mcpOAuthTokenStore?: McpOAuthTokenStore;
@@ -93,8 +94,11 @@ function makeHarness(opts: {
   for (const manifest of opts.manifests ?? []) registry.register(manifest);
   const store = createStore(":memory:");
   stores.push(store);
+  // SAFETY: makeBoundary() always returns the calls-tracking variant, and
+  // every harness in this suite uses it (or a tracking boundary via opts).
   const boundary = (opts.boundary ?? makeBoundary()) as CredentialBoundary & { calls: ExtensionCredential[] };
-  const transports = { bindings: [] as McpBinding[] };
+  const bindings: McpBinding[] = [];
+  const transports = { bindings };
   const mcpTransport =
     opts.mcpTransport ??
     ((binding: McpBinding) => {
@@ -102,8 +106,7 @@ function makeHarness(opts: {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+        return { content: [{ type: "text", text: `sunny in ${String(request.params.arguments?.["city"] ?? "")}` }] };
       });
       void server.connect(serverTransport);
       return clientTransport;
@@ -116,9 +119,9 @@ function makeHarness(opts: {
     router: opts.router ?? DenyRouter,
     boundary,
     mcpTransport,
-    ...(opts.onToolStep !== undefined ? { onToolStep: opts.onToolStep } : {}),
-    ...(opts.mcpOAuthTokenStore !== undefined ? { mcpOAuthTokenStore: opts.mcpOAuthTokenStore } : {}),
   };
+  if (opts.onToolStep !== undefined) deps.onToolStep = opts.onToolStep;
+  if (opts.mcpOAuthTokenStore !== undefined) deps.mcpOAuthTokenStore = opts.mcpOAuthTokenStore;
   return { runtime: createExtensionRuntime(deps), store, boundary, transports, mcpTransport };
 }
 
@@ -127,7 +130,9 @@ async function callRows(store: Store, eventType: string) {
 }
 
 function parse(row: { payload: string }) {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+  // SAFETY: audit payload columns are written by the runtime as
+  // JSON.stringify of a plain object (event-specific shapes).
+  return JSON.parse(row.payload) as JsonObject;
 }
 
 describe("extension runtime: gate first (denied calls never resolve a credential)", () => {
@@ -531,13 +536,15 @@ describe("extension runtime: ladder (org / me / auto) and boundary", () => {
   });
 
   test("extension tool args pass through to the provider verbatim", async () => {
-    const seen: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const seen: Array<{ name: string; args: JsonObject }> = [];
     const harness = makeHarness({
       mcpTransport: () => {
         const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
         const server = new Server({ name: "capture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
         server.setRequestHandler(CallToolRequestSchema, async (request) => {
-          seen.push({ name: request.params.name, args: request.params.arguments as Record<string, unknown> });
+          // SAFETY: the harness always invokes with JSON tool args, which
+          // the SDK validated on the way in.
+          seen.push({ name: request.params.name, args: request.params.arguments as JsonObject });
           return { content: [{ type: "text", text: "ok" }] };
         });
         void server.connect(serverTransport);
@@ -670,6 +677,8 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
   }
 
   test("full path: lazy discovery → gate with the DISCOVERED tier → ladder → boundary → provider call by wire name", async () => {
+    // SAFETY: the recorder starts empty; only wire tool names are pushed
+    // and `list` counts tools/list calls, which the assertions below read.
     const calls = { list: 0, tool: [] as string[] };
     const h = makeHarness({
       policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
@@ -713,6 +722,8 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
   });
 
   test("an extension denied per-space blocks EVERY discovered tool before any credential work", async () => {
+    // SAFETY: the recorder starts empty; only wire tool names are pushed
+    // and `list` counts tools/list calls, which the assertions below read.
     const calls = { list: 0, tool: [] as string[] };
     const h = makeHarness({
       policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
@@ -745,6 +756,8 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
   });
 
   test("a per-space tool deny gates ONE discovered tool; sibling discovered tools still run", async () => {
+    // SAFETY: the recorder starts empty; only wire tool names are pushed
+    // and `list` counts tools/list calls, which the assertions below read.
     const calls = { list: 0, tool: [] as string[] };
     const h = makeHarness({
       policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
@@ -781,6 +794,8 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
   });
 
   test("a pinned-tools manifest wins: the transport only ever sees the CALL, never tools/list", async () => {
+    // SAFETY: the recorder starts empty; only wire tool names are pushed
+    // and `list` counts tools/list calls, which the assertions below read.
     const calls = { list: 0, tool: [] as string[] };
     const pinned = validateManifest({
       id: "pinned.provider",
@@ -840,7 +855,45 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
     expect(h.boundary.calls).toHaveLength(0);
   });
 
+  test("an audit write failure still returns an error result — execute never rejects (issue #205)", async () => {
+    // Issue #205 crash class: an unhandled rejection exits the process with
+    // code 1. The lazy surface path fails (provider unreachable) AND the
+    // audit write ALSO fails (store hiccup) — execute must still resolve
+    // with a handled error result. Old code rethrew out of the catch block,
+    // rejecting the caller's promise (unhandled when the turn abandoned it).
+    resetToolSurfaceCache();
+    const registry = createExtensionRegistryFor([toolsLessManifest()]);
+    const store = createStore(":memory:");
+    stores.push(store);
+    const failingAudit = {
+      appendAudit: async () => {
+        throw new Error("sqlite: database is locked");
+      },
+    };
+    const runtime = createExtensionRuntime({
+      registry,
+      store,
+      audit: failingAudit as unknown as ExtensionRuntimeDeps["audit"],
+      orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+      router: DenyRouter,
+      boundary: hBoundary(),
+      mcpTransport: () => {
+        throw new Error("connection refused");
+      },
+    });
+    const result = await runtime.execute({
+      extensionId: DISCOVER_ID,
+      toolName: "search_issues",
+      args: {},
+      caller: "UADA",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("tool surface unavailable");
+  });
+
   test("boot-resolved surfaces: the runtime consumes the pre-resolved map without re-discovering", async () => {
+    // SAFETY: the recorder starts empty; only wire tool names are pushed
+    // and `list` counts tools/list calls, which the assertions below read.
     const calls = { list: 0, tool: [] as string[] };
     const registry = createExtensionRegistryFor([toolsLessManifest()]);
     const surfaces = await resolveExtensionSurfaces(registry.list(), { mcpTransport: discoverableTransport(calls) });
@@ -923,17 +976,16 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
 
   test("OAuth MCP bindings receive the vault-backed runtime OAuth provider; api_key bindings receive none", async () => {
     const store = tokenStore({ access: "access-1", refresh: "refresh-1", expires: Date.now() + 60_000 });
-    const captured: Array<{ binding: McpBinding; authProvider?: unknown }> = [];
+    const captured: Array<{ binding: McpBinding; authProvider?: OAuthClientProvider }> = [];
     const h = makeHarness({
       manifests: [oauthManifest()],
       mcpOAuthTokenStore: store,
-      mcpTransport: (binding: McpBinding, authProvider?: unknown) => {
+      mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => {
         captured.push({ binding, authProvider });
         const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
         const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
         server.setRequestHandler(CallToolRequestSchema, async (request) => {
-          const args = request.params.arguments as Record<string, unknown>;
-          return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+          return { content: [{ type: "text", text: `sunny in ${String(request.params.arguments?.["city"] ?? "")}` }] };
         });
         void server.connect(serverTransport);
         return clientTransport;
@@ -957,16 +1009,16 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     expect(h.boundary.calls).toHaveLength(1);
     // The provider is vault-backed: tokens() loads the registry row's vault
     // credential (the seam's scripted row) and exposes it to the SDK.
-    const provider = captured[0]!.authProvider as { tokens(): Promise<unknown> };
+    const provider = captured[0]!.authProvider!;
     await expect(provider.tokens()).resolves.toMatchObject({ access_token: "access-1", refresh_token: "refresh-1" });
     expect(store.loads).toEqual([`${OAUTH_ID}:7`]);
     expect(store.saves).toHaveLength(0);
   });
 
   test("api_key bindings attach no OAuth provider (auth stays at the iron-proxy boundary)", async () => {
-    const captured: Array<{ binding: McpBinding; authProvider?: unknown }> = [];
+    const captured: Array<{ binding: McpBinding; authProvider?: OAuthClientProvider }> = [];
     const h = makeHarness({
-      mcpTransport: (binding: McpBinding, authProvider?: unknown) => {
+      mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => {
         captured.push({ binding, authProvider });
         const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
         const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -996,11 +1048,11 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     // covered hermetically in mcp-oauth.test.ts). Here we assert the
     // provider is built and reads the vault (null → no tokens to send).
     const store = tokenStore(null);
-    const captured: Array<{ authProvider?: unknown }> = [];
+    const captured: Array<{ authProvider?: OAuthClientProvider }> = [];
     const h = makeHarness({
       manifests: [oauthManifest()],
       mcpOAuthTokenStore: store,
-      mcpTransport: (_binding: McpBinding, authProvider?: unknown) => {
+      mcpTransport: (_binding: McpBinding, authProvider?: OAuthClientProvider) => {
         captured.push({ authProvider });
         const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
         const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -1019,7 +1071,7 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     });
 
     expect(result.ok).toBe(true); // the transport seam is a fake — auth is the SDK's job
-    const provider = captured[0]!.authProvider as { tokens(): Promise<unknown> };
+    const provider = captured[0]!.authProvider!;
     await expect(provider.tokens()).resolves.toBeUndefined();
   });
 });

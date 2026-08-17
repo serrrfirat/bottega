@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ExtensionRegistryError,
   SNAPSHOT_SCHEMA,
   createExtensionRegistry,
   parsePinnedSnapshot,
@@ -132,7 +131,8 @@ describe("pinned snapshots", () => {
 
   test("rejects non-JSON and unknown schema markers (fail closed)", () => {
     expect(() => parsePinnedSnapshot("not json")).toThrow(/not valid JSON/);
-    const doc = JSON.parse(snapshotJson(snapshotFor())) as Record<string, unknown>;
+    // SAFETY: snapshotFor() serializes a PinnedSnapshot whose JSON carries the `schema` key; the test then corrupts it.
+    const doc = JSON.parse(snapshotJson(snapshotFor())) as { schema: string };
     doc["schema"] = "something-else";
     expect(() => parsePinnedSnapshot(JSON.stringify(doc))).toThrow(/schema must be/);
   });
@@ -144,8 +144,9 @@ describe("pinned snapshots", () => {
 
   test("rejects a malformed manifest inside the snapshot", () => {
     const snapshot = snapshotFor();
-    const doc = JSON.parse(snapshotJson(snapshot)) as Record<string, unknown>;
-    (doc["manifest"] as Record<string, unknown>)["kind"] = "http";
+    // SAFETY: the fixture snapshot's JSON always carries `manifest.kind` (validateManifest requires it); the test then corrupts it.
+    const doc = JSON.parse(snapshotJson(snapshot)) as { manifest: { kind: string } };
+    doc.manifest.kind = "http";
     expect(() => parsePinnedSnapshot(JSON.stringify(doc))).toThrow(/extension manifest invalid/);
   });
 
@@ -163,7 +164,7 @@ describe("pinned snapshots", () => {
     expect(parsePinnedSnapshot(snapshotJson(snapshot)).source.reviewed).toBe(true);
   });
 
-  test("readPinnedSnapshots loads all snapshot files sorted and fails on any malformed file", () => {
+  test("readPinnedSnapshots loads all snapshot files sorted and skips malformed files (issue #205)", () => {
     const dir = mkdtempSync(join(tmpdir(), "ext-snapshots-"));
     try {
       writeFileSync(join(dir, "b.json"), snapshotJson(snapshotFor()));
@@ -173,8 +174,32 @@ describe("pinned snapshots", () => {
       expect(snapshots.map((s) => s.extensionId)).toEqual([FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_ID]);
       expect(snapshots[0].pinnedAt).toBe("2026-01-01T00:00:00.000Z");
 
-      writeFileSync(join(dir, "c.json"), "{ broken");
-      expect(() => readPinnedSnapshots(dir)).toThrow(ExtensionRegistryError);
+      // Issue #205: a malformed snapshot (e.g. a parked draft whose stdio
+      // command is now rejected) is a loud per-file SKIP — the boot and the
+      // extensions around it must survive; only the bad file registers
+      // nothing. A broken JSON document and a validation-rejected manifest
+      // (bare "npx" stdio command) both skip; the valid file still loads.
+      const errorSpy = { calls: 0 };
+      const origError = console.error;
+      console.error = (...args: unknown[]) => {
+        errorSpy.calls += 1;
+        origError(...args);
+      };
+      try {
+        writeFileSync(join(dir, "c.json"), "{ broken");
+        writeFileSync(
+          join(dir, "d.json"),
+          JSON.stringify({
+            ...JSON.parse(snapshotJson(snapshotFor())),
+            manifest: { ...fixtureManifest(), mcp: { command: "npx", transport: "stdio" } },
+          }),
+        );
+        const loaded = readPinnedSnapshots(dir);
+        expect(loaded.map((s) => s.extensionId)).toEqual([FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_ID]);
+        expect(errorSpy.calls).toBeGreaterThanOrEqual(2);
+      } finally {
+        console.error = origError;
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

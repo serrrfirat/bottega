@@ -11,6 +11,7 @@
  * Validation is fail-closed: malformed manifests are rejected with
  * {@link ExtensionValidationError} and never partially registered.
  */
+import { z } from "zod";
 import { BUILTIN_TOOLS, HIDDEN_TOOLS } from "@oh-my-pi/pi-coding-agent";
 
 export type ExtensionKind = "mcp" | "cli";
@@ -173,146 +174,229 @@ function isCredentialEnvKey(name: string): boolean {
   return CREDENTIAL_ENV_RE.test(name);
 }
 
+/** Any value a JSON document can hold — untrusted manifest-shaped input (catalog response, snapshot record). */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+/** Untrusted manifest-shaped object. */
+export type JsonObject = { [key: string]: JsonValue };
+
 /** Canonical record guard for untrusted manifest-shaped input (shared with the tool generator, issue #157). */
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+export function isRecord(value: JsonValue): value is JsonObject {
+  // A record is a non-array object. Object.prototype.toString distinguishes
+  // plain objects from arrays, null, and primitives without a `typeof` check.
+  return Object.prototype.toString.call(value) === "[object Object]";
 }
 
-function requiredString(record: Record<string, unknown>, field: string): string {
-  const value = record[field];
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new ExtensionValidationError(`${field} must be a non-empty string`);
+/** Throws the manifest's canonical fail-closed validation error. */
+function fail(message: string): never {
+  throw new ExtensionValidationError(message);
+}
+
+function requiredString(record: JsonObject, field: string): string {
+  const parsed = z.string().safeParse(record[field]);
+  if (!parsed.success || parsed.data.trim() === "") {
+    fail(`${field} must be a non-empty string`);
   }
-  return value;
+  return parsed.data;
 }
 
-function optionalStringArray(record: Record<string, unknown>, field: string): string[] | undefined {
+function optionalStringArray(record: JsonObject, field: string): string[] | undefined {
   const value = record[field];
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
-    throw new ExtensionValidationError(`${field} must be an array of non-empty strings`);
+  const parsed = z.array(z.string()).safeParse(value);
+  if (!parsed.success || parsed.data.some((entry) => entry.trim() === "")) {
+    fail(`${field} must be an array of non-empty strings`);
   }
-  return value as string[];
+  return parsed.data;
 }
 
-function validateCredentialSchema(value: unknown): CredentialSchema {
+/** The field's string value, or null when absent or blank (mirrors the binding's presence checks). */
+function optionalNonEmptyString(value: JsonValue): string | null {
+  const parsed = z.string().safeParse(value);
+  if (!parsed.success || parsed.data.trim() === "") return null;
+  return parsed.data;
+}
+
+function validateCredentialSchema(value: JsonValue): CredentialSchema {
   if (!isRecord(value) || (value["type"] !== "oauth" && value["type"] !== "api_key")) {
-    throw new ExtensionValidationError("credentialSchema.type must be \"oauth\" or \"api_key\"");
+    fail("credentialSchema.type must be \"oauth\" or \"api_key\"");
   }
   const scopes = optionalStringArray(value, "scopes");
   if (scopes !== undefined && value["type"] === "api_key") {
-    throw new ExtensionValidationError("credentialSchema.scopes only applies to oauth credentials");
+    fail("credentialSchema.scopes only applies to oauth credentials");
   }
   return value["type"] === "oauth"
-    ? { type: "oauth", ...(scopes !== undefined ? { scopes } : {}) }
+    ? { type: "oauth", ...(scopes !== undefined ? { scopes } : undefined) }
     : { type: "api_key" };
 }
 
-function validateMcpBinding(value: unknown): McpBinding {
+function validateMcpBinding(value: JsonValue): McpBinding {
   if (!isRecord(value)) {
-    throw new ExtensionValidationError("mcp binding must be an object");
+    fail("mcp binding must be an object");
   }
-  const serverUrl = value["serverUrl"];
-  const command = value["command"];
-  const hasServerUrl = typeof serverUrl === "string" && serverUrl.trim() !== "";
-  const hasCommand = typeof command === "string" && command.trim() !== "";
+  const serverUrl = optionalNonEmptyString(value["serverUrl"]);
+  const command = optionalNonEmptyString(value["command"]);
+  const hasServerUrl = serverUrl !== null;
+  const hasCommand = command !== null;
   if (hasServerUrl === hasCommand) {
-    throw new ExtensionValidationError("mcp binding requires exactly one of serverUrl or command");
+    fail("mcp binding requires exactly one of serverUrl or command");
   }
   const transport = value["transport"];
   if (transport !== "streamable-http" && transport !== "stdio") {
-    throw new ExtensionValidationError("mcp.transport must be \"streamable-http\" or \"stdio\"");
+    fail("mcp.transport must be \"streamable-http\" or \"stdio\"");
   }
-  if (hasServerUrl) {
+  if (serverUrl !== null) {
     if (transport !== "streamable-http") {
-      throw new ExtensionValidationError("mcp serverUrl bindings must use transport \"streamable-http\"");
+      fail("mcp serverUrl bindings must use transport \"streamable-http\"");
     }
     let parsed: URL;
     try {
-      parsed = new URL(serverUrl as string);
+      parsed = new URL(serverUrl);
     } catch {
-      throw new ExtensionValidationError("mcp.serverUrl must be a valid URL");
+      fail("mcp.serverUrl must be a valid URL");
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new ExtensionValidationError("mcp.serverUrl must be an http(s) URL");
+      fail("mcp.serverUrl must be an http(s) URL");
     }
-    return { serverUrl: serverUrl as string, transport: "streamable-http" };
+    return { serverUrl, transport: "streamable-http" };
   }
   if (transport !== "stdio") {
-    throw new ExtensionValidationError("mcp command bindings must use transport \"stdio\"");
+    fail("mcp command bindings must use transport \"stdio\"");
   }
-  return { command: command as string, transport: "stdio" };
+  // SAFETY: hasServerUrl is false here, so the exactly-one check above
+  // guarantees hasCommand — command is a non-empty string at this point.
+  const stdioCommand = command as string;
+  if (isBareInteractiveCommand(stdioCommand)) {
+    // Issue #205: a bare interactive runner/shell has no MCP server to run.
+    // Spawning it drops the client into an stdin shell/REPL, so the MCP
+    // JSON-RPC bytes are EXECUTED as shell commands (`sh: line 1:
+    // method:initialize: command not found` every boot) and the handshake
+    // never completes (60s timeout). The manifest carries no args — the
+    // command must exec the actual server binary directly.
+    fail(
+      `mcp.command "${stdioCommand}" is an interactive package runner/shell that cannot serve ` +
+        "MCP over stdio without a target; pin the actual server binary as the command",
+    );
+  }
+  return { command: stdioCommand, transport: "stdio" };
 }
 
-function validateCliBinding(value: unknown): CliBinding {
+/**
+ * Commands that, spawned with NO args, fall back to an interactive stdin
+ * shell/REPL (or a package prompt) instead of speaking MCP — the exact
+ * malformed-exec hazard of issue #205 (MCP JSON-RPC executed as shell
+ * commands). Matched by basename so absolute paths (`/usr/local/bin/npx`)
+ * are covered too. A real server binary (e.g. `linear-mcp`) is never in
+ * this set; a runner with explicit args is not representable in the
+ * manifest (McpBinding has no args), so the bare form is rejected.
+ */
+const BARE_INTERACTIVE_COMMANDS = new Set([
+  "npx",
+  "bunx",
+  "npm",
+  "pnpm",
+  "yarn",
+  "node",
+  "bun",
+  "deno",
+  "python",
+  "python3",
+  "ruby",
+  "perl",
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+]);
+
+function isBareInteractiveCommand(command: string): boolean {
+  const base = command.trim().split(/[\\/]/).at(-1) ?? "";
+  return BARE_INTERACTIVE_COMMANDS.has(base);
+}
+
+function validateCliBinding(value: JsonValue): CliBinding {
   if (!isRecord(value)) {
-    throw new ExtensionValidationError("cli binding must be an object");
+    fail("cli binding must be an object");
   }
   const command = requiredString(value, "command");
   const args = optionalStringArray(value, "args");
-  const env = value["env"];
-  if (env !== undefined) {
-    if (!isRecord(env) || Object.values(env).some((entry) => typeof entry !== "string")) {
-      throw new ExtensionValidationError("cli.env must be a string-to-string mapping");
+  let env: Record<string, string> | undefined;
+  if (value["env"] !== undefined) {
+    const rawEnv = value["env"];
+    if (!isRecord(rawEnv)) {
+      fail("cli.env must be a string-to-string mapping");
     }
+    const parsedEnv = z.record(z.string(), z.string()).safeParse(rawEnv);
+    if (!parsedEnv.success) {
+      fail("cli.env must be a string-to-string mapping");
+    }
+    env = parsedEnv.data;
     const credentialKey = Object.keys(env).find(isCredentialEnvKey);
     if (credentialKey !== undefined) {
-      throw new ExtensionValidationError(
+      fail(
         `cli.env key "${credentialKey}" looks like a credential — CLIs never receive credentials via env (iron-proxy boundary only)`,
       );
     }
   }
   return {
     command,
-    ...(args !== undefined ? { args } : {}),
-    ...(env !== undefined ? { env: env as Record<string, string> } : {}),
+    ...(args !== undefined ? { args } : undefined),
+    ...(env !== undefined ? { env } : undefined),
   };
 }
 
-function validateTools(value: unknown): ExtensionTool[] {
+function validateTools(value: JsonValue): ExtensionTool[] {
   if (!Array.isArray(value)) {
-    throw new ExtensionValidationError("tools must be an array");
+    fail("tools must be an array");
   }
   const tools: ExtensionTool[] = [];
   const seenNames = new Set<string>();
-  for (const entry of value) {
-    if (!isRecord(entry)) {
-      throw new ExtensionValidationError("each tool must be an object");
+  for (const rawEntry of value) {
+    if (!isRecord(rawEntry)) {
+      fail("each tool must be an object");
     }
-    const name = requiredString(entry, "name");
+    const name = requiredString(rawEntry, "name");
     if (!NAME_RE.test(name)) {
-      throw new ExtensionValidationError(`tool name "${name}" must match ${NAME_RE.source}`);
+      fail(`tool name "${name}" must match ${NAME_RE.source}`);
     }
     if (RESERVED_TOOL_NAMES.includes(name)) {
-      throw new ExtensionValidationError(`tool name "${name}" is reserved by the runtime`);
+      fail(`tool name "${name}" is reserved by the runtime`);
     }
     if (seenNames.has(name)) {
-      throw new ExtensionValidationError(`duplicate tool name "${name}"`);
+      fail(`duplicate tool name "${name}"`);
     }
     seenNames.add(name);
     // providerName (issue #148): the provider's wire tool name, absent →
     // fall back to the manifest name. Same identifier charset as the
     // manifest name, fail closed on anything else.
-    const providerName = entry["providerName"];
-    if (providerName !== undefined) {
-      if (typeof providerName !== "string" || providerName.trim() === "") {
-        throw new ExtensionValidationError(`tool "${name}" providerName must be a non-empty string`);
+    let providerName: string | undefined;
+    if (rawEntry["providerName"] !== undefined) {
+      const parsed = z.string().safeParse(rawEntry["providerName"]);
+      if (!parsed.success || parsed.data.trim() === "") {
+        fail(`tool "${name}" providerName must be a non-empty string`);
       }
-      if (!NAME_RE.test(providerName)) {
-        throw new ExtensionValidationError(
-          `tool "${name}" providerName "${providerName}" must match ${NAME_RE.source}`,
-        );
+      if (!NAME_RE.test(parsed.data)) {
+        fail(`tool "${name}" providerName "${parsed.data}" must match ${NAME_RE.source}`);
       }
+      providerName = parsed.data;
     }
-    const tier = entry["tier"];
+    const tier = rawEntry["tier"];
     if (tier !== "read" && tier !== "write" && tier !== "exec") {
-      throw new ExtensionValidationError(`tool "${name}" tier must be \"read\", \"write\", or \"exec\"`);
+      fail(`tool "${name}" tier must be \"read\", \"write\", or \"exec\"`);
     }
-    const description = requiredString(entry, "description");
-    const params = validateParams(entry["params"], name);
+    const description = requiredString(rawEntry, "description");
+    const params = validateParams(rawEntry["params"], name);
     tools.push({
       name,
-      ...(providerName !== undefined ? { providerName } : {}),
+      ...(providerName !== undefined ? { providerName } : undefined),
       tier,
       description,
       params,
@@ -321,58 +405,65 @@ function validateTools(value: unknown): ExtensionTool[] {
   return tools;
 }
 
-function validateParams(value: unknown, toolName: string): ExtensionToolParam[] {
+function validateParams(value: JsonValue, toolName: string): ExtensionToolParam[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
-    throw new ExtensionValidationError(`tool "${toolName}" params must be an array`);
+    fail(`tool "${toolName}" params must be an array`);
   }
   const params: ExtensionToolParam[] = [];
   const seenNames = new Set<string>();
-  for (const entry of value) {
-    if (!isRecord(entry)) {
-      throw new ExtensionValidationError(`tool "${toolName}" params entries must be objects`);
+  for (const rawEntry of value) {
+    if (!isRecord(rawEntry)) {
+      fail(`tool "${toolName}" params entries must be objects`);
     }
-    const name = requiredString(entry, "name");
+    const name = requiredString(rawEntry, "name");
     if (seenNames.has(name)) {
-      throw new ExtensionValidationError(`tool "${toolName}" has duplicate param "${name}"`);
+      fail(`tool "${toolName}" has duplicate param "${name}"`);
     }
     seenNames.add(name);
-    const type = entry["type"];
-    if (type !== "string" && type !== "number" && type !== "boolean") {
-      throw new ExtensionValidationError(
-        `tool "${toolName}" param "${name}" type must be \"string\", \"number\", or \"boolean\"`,
-      );
+    const type = z.enum(["string", "number", "boolean"]).safeParse(rawEntry["type"]);
+    if (!type.success) {
+      fail(`tool "${toolName}" param "${name}" type must be \"string\", \"number\", or \"boolean\"`);
     }
-    const description = entry["description"];
-    if (description !== undefined && (typeof description !== "string" || description.trim() === "")) {
-      throw new ExtensionValidationError(`tool "${toolName}" param "${name}" description must be a non-empty string`);
+    let description: string | undefined;
+    if (rawEntry["description"] !== undefined) {
+      const parsed = z.string().safeParse(rawEntry["description"]);
+      if (!parsed.success || parsed.data.trim() === "") {
+        fail(`tool "${toolName}" param "${name}" description must be a non-empty string`);
+      }
+      description = parsed.data;
     }
-    const required = entry["required"];
-    if (required !== undefined && typeof required !== "boolean") {
-      throw new ExtensionValidationError(`tool "${toolName}" param "${name}" required must be a boolean`);
+    let required: boolean | undefined;
+    if (rawEntry["required"] !== undefined) {
+      const parsed = z.boolean().safeParse(rawEntry["required"]);
+      if (!parsed.success) {
+        fail(`tool "${toolName}" param "${name}" required must be a boolean`);
+      }
+      required = parsed.data;
     }
     params.push({
       name,
-      type,
-      ...(description !== undefined ? { description } : {}),
-      ...(required !== undefined ? { required } : {}),
+      type: type.data,
+      ...(description !== undefined ? { description } : undefined),
+      ...(required !== undefined ? { required } : undefined),
     });
   }
   return params;
 }
 
-function validateDomains(value: unknown): string[] {
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
-    throw new ExtensionValidationError("domains must be an array of non-empty strings");
+function validateDomains(value: JsonValue): string[] {
+  const parsed = z.array(z.string()).safeParse(value);
+  if (!parsed.success || parsed.data.some((entry) => entry.trim() === "")) {
+    fail("domains must be an array of non-empty strings");
   }
-  for (const domain of value as string[]) {
+  for (const domain of parsed.data) {
     if (!DOMAIN_RE.test(domain)) {
-      throw new ExtensionValidationError(
+      fail(
         `domain "${domain}" must be a hostname or \"*.\"-prefixed wildcard (no scheme, port, or trailing dot)`,
       );
     }
   }
-  return [...(value as string[])];
+  return parsed.data;
 }
 
 /**
@@ -380,19 +471,19 @@ function validateDomains(value: unknown): string[] {
  * returns a typed manifest. Throws {@link ExtensionValidationError} on the
  * first problem — malformed manifests fail closed, never partially register.
  */
-export function validateManifest(input: unknown): ExtensionManifest {
+export function validateManifest(input: JsonValue): ExtensionManifest {
   if (!isRecord(input)) {
-    throw new ExtensionValidationError("manifest must be an object");
+    fail("manifest must be an object");
   }
   const id = requiredString(input, "id");
   if (!NAME_RE.test(id)) {
-    throw new ExtensionValidationError(`id "${id}" must match ${NAME_RE.source}`);
+    fail(`id "${id}" must match ${NAME_RE.source}`);
   }
   const label = requiredString(input, "label");
   const vendor = requiredString(input, "vendor");
   const kind = input["kind"];
   if (kind !== "mcp" && kind !== "cli") {
-    throw new ExtensionValidationError("kind must be \"mcp\" or \"cli\"");
+    fail("kind must be \"mcp\" or \"cli\"");
   }
   const credentialSchema = validateCredentialSchema(input["credentialSchema"]);
   // Tools are OPTIONAL (issue #158): absent → the runtime discovers the
@@ -403,10 +494,10 @@ export function validateManifest(input: unknown): ExtensionManifest {
   const domains = validateDomains(input["domains"]);
   if (kind === "mcp") {
     if (input["cli"] !== undefined) {
-      throw new ExtensionValidationError("an mcp extension must not declare a cli binding");
+      fail("an mcp extension must not declare a cli binding");
     }
     if (input["mcp"] === undefined) {
-      throw new ExtensionValidationError("an mcp extension requires an mcp binding");
+      fail("an mcp extension requires an mcp binding");
     }
     return {
       id,
@@ -415,15 +506,15 @@ export function validateManifest(input: unknown): ExtensionManifest {
       kind: "mcp",
       mcp: validateMcpBinding(input["mcp"]),
       credentialSchema,
-      ...(tools !== undefined ? { tools } : {}),
+      ...(tools !== undefined ? { tools } : undefined),
       domains,
     };
   }
   if (input["mcp"] !== undefined) {
-    throw new ExtensionValidationError("a cli extension must not declare an mcp binding");
+    fail("a cli extension must not declare an mcp binding");
   }
   if (input["cli"] === undefined) {
-    throw new ExtensionValidationError("a cli extension requires a cli binding");
+    fail("a cli extension requires a cli binding");
   }
   return {
     id,
@@ -432,7 +523,7 @@ export function validateManifest(input: unknown): ExtensionManifest {
     kind: "cli",
     cli: validateCliBinding(input["cli"]),
     credentialSchema,
-    ...(tools !== undefined ? { tools } : {}),
+    ...(tools !== undefined ? { tools } : undefined),
     domains,
   };
 }

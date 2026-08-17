@@ -30,10 +30,12 @@
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 import {
   ExtensionValidationError,
   validateManifest,
   type ExtensionManifest,
+  type JsonValue,
 } from "./manifest";
 
 export const SNAPSHOT_SCHEMA = "bottega.extension-snapshot.v1";
@@ -94,6 +96,47 @@ export class ExtensionRegistryError extends Error {
   }
 }
 
+/** A string field that must survive trimming; the value itself is kept untrimmed. */
+const NON_EMPTY_STRING = z.string().refine((value) => value.trim().length > 0);
+
+/** Boundary contract for the pinned snapshot JSON document (registry rejects anything else). */
+const PINNED_SNAPSHOT_SCHEMA = z.object({
+  schema: z.literal(SNAPSHOT_SCHEMA),
+  extensionId: NON_EMPTY_STRING,
+  pinnedAt: NON_EMPTY_STRING,
+  source: z.object({
+    catalog: NON_EMPTY_STRING,
+    specId: NON_EMPTY_STRING,
+    vendorOfficial: z.boolean(),
+    reviewed: z.boolean(),
+  }),
+  // The manifest is derived/validated separately: validateManifest carries
+  // its own fail-closed contract and error messages.
+  manifest: z.unknown(),
+});
+
+/** Re-derives the registry's fail-closed messages from the first schema issue. */
+function snapshotParseErrorMessage(error: z.ZodError<unknown>): string {
+  const issue = error.issues[0];
+  const path = issue?.path ?? [];
+  if (path.length === 0) return "pinned snapshot must be an object";
+  const field = path[0];
+  if (field === "schema") return `pinned snapshot schema must be "${SNAPSHOT_SCHEMA}"`;
+  if (field === "extensionId") return "pinned snapshot extensionId must be a non-empty string";
+  if (field === "pinnedAt") return "pinned snapshot pinnedAt must be a non-empty string";
+  if (field === "source") {
+    const sub = path[1];
+    if (sub === "catalog" || sub === "specId") {
+      return `pinned snapshot source.${sub} must be a non-empty string`;
+    }
+    if (sub === "vendorOfficial" || sub === "reviewed") {
+      return `pinned snapshot source.${sub} must be a boolean`;
+    }
+    return "pinned snapshot source must be an object";
+  }
+  return "pinned snapshot is not valid";
+}
+
 /**
  * Parses and validates one pinned snapshot document. Malformed documents
  * (wrong schema marker, manifest/id mismatch, unreviewed community entry)
@@ -106,43 +149,20 @@ export function parsePinnedSnapshot(text: string): PinnedSnapshot {
   } catch {
     throw new ExtensionRegistryError("pinned snapshot is not valid JSON");
   }
-  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
-    throw new ExtensionRegistryError("pinned snapshot must be an object");
+  const parsed = PINNED_SNAPSHOT_SCHEMA.safeParse(doc);
+  if (!parsed.success) {
+    throw new ExtensionRegistryError(snapshotParseErrorMessage(parsed.error));
   }
-  const record = doc as Record<string, unknown>;
-  if (record["schema"] !== SNAPSHOT_SCHEMA) {
-    throw new ExtensionRegistryError(`pinned snapshot schema must be "${SNAPSHOT_SCHEMA}"`);
-  }
-  const extensionId = record["extensionId"];
-  if (typeof extensionId !== "string" || extensionId.trim() === "") {
-    throw new ExtensionRegistryError("pinned snapshot extensionId must be a non-empty string");
-  }
-  const pinnedAt = record["pinnedAt"];
-  if (typeof pinnedAt !== "string" || pinnedAt.trim() === "") {
-    throw new ExtensionRegistryError("pinned snapshot pinnedAt must be a non-empty string");
-  }
-  const source = record["source"];
-  if (typeof source !== "object" || source === null || Array.isArray(source)) {
-    throw new ExtensionRegistryError("pinned snapshot source must be an object");
-  }
-  const sourceRecord = source as Record<string, unknown>;
-  for (const field of ["catalog", "specId"]) {
-    const value = sourceRecord[field];
-    if (typeof value !== "string" || value.trim() === "") {
-      throw new ExtensionRegistryError(`pinned snapshot source.${field} must be a non-empty string`);
-    }
-  }
-  for (const field of ["vendorOfficial", "reviewed"]) {
-    if (typeof sourceRecord[field] !== "boolean") {
-      throw new ExtensionRegistryError(`pinned snapshot source.${field} must be a boolean`);
-    }
-  }
-  if (sourceRecord["vendorOfficial"] === false && sourceRecord["reviewed"] === false) {
+  const { extensionId, pinnedAt, source } = parsed.data;
+  if (source.vendorOfficial === false && source.reviewed === false) {
     throw new ExtensionRegistryError(
       `community snapshot for "${extensionId}" requires explicit review (source.reviewed: true)`,
     );
   }
-  const manifest = validateManifest(record["manifest"]);
+  // SAFETY: the snapshot document is JSON.parse'd file content, so its
+  // manifest field is JSON-shaped by construction; validateManifest fails
+  // closed on anything it can't accept.
+  const manifest = validateManifest(parsed.data.manifest as JsonValue);
   if (manifest.id !== extensionId) {
     throw new ExtensionRegistryError(
       `pinned snapshot extensionId "${extensionId}" does not match manifest.id "${manifest.id}"`,
@@ -152,12 +172,7 @@ export function parsePinnedSnapshot(text: string): PinnedSnapshot {
     schema: SNAPSHOT_SCHEMA,
     extensionId,
     pinnedAt,
-    source: {
-      catalog: sourceRecord["catalog"] as string,
-      specId: sourceRecord["specId"] as string,
-      vendorOfficial: sourceRecord["vendorOfficial"] as boolean,
-      reviewed: sourceRecord["reviewed"] as boolean,
-    },
+    source,
     manifest,
   };
 }
@@ -165,19 +180,38 @@ export function parsePinnedSnapshot(text: string): PinnedSnapshot {
 /**
  * Reads every `*.json` snapshot in `dir` (sorted by filename for
  * deterministic registration order). A missing directory yields no
- * snapshots; any malformed file fails the whole load (fail closed).
+ * snapshots. A malformed file is SKIPPED with a loud error (issue #205:
+ * one broken snapshot — e.g. a parked draft whose stdio command is
+ * rejected — must never kill the boot or the extensions around it); the
+ * rest of the directory still loads. Fail-closed stays per-extension: a
+ * skipped file registers nothing, and parsePinnedSnapshot (the pin/admin
+ * paths) still throws on malformed documents.
  */
 export function readPinnedSnapshots(dir: string): PinnedSnapshot[] {
   let files: string[];
   try {
     files = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
   } catch (err) {
-    if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
+    // SAFETY: readdirSync throws Error instances; Node fs errors carry a `code` property.
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") {
       return [];
     }
     throw err;
   }
-  return files.map((name) => parsePinnedSnapshot(readFileSync(join(dir, name), "utf8")));
+  const snapshots: PinnedSnapshot[] = [];
+  for (const name of files) {
+    try {
+      snapshots.push(parsePinnedSnapshot(readFileSync(join(dir, name), "utf8")));
+    } catch (err) {
+      // A malformed snapshot is a loud per-file skip, never a boot failure:
+      // the file is user/park work the registry cannot load (issue #205).
+      console.error(
+        `[extensions] skipping malformed snapshot ${join(dir, name)}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return snapshots;
 }
 
 /**
@@ -202,7 +236,8 @@ export function createExtensionRegistry(snapshotsDir?: string): ExtensionRegistr
         }
       }
     }
-    const resolved: ResolvedExtension = { manifest, ...(snapshot !== undefined ? { snapshot } : {}) };
+    const resolved: ResolvedExtension = { manifest };
+    if (snapshot !== undefined) resolved.snapshot = snapshot;
     entries.set(manifest.id, resolved);
     return resolved;
   }

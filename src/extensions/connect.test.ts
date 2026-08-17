@@ -64,7 +64,10 @@ function stdioOAuthManifest(): ExtensionManifest {
     label: "Example Stdio OAuth",
     vendor: "bottega-fixtures",
     kind: "mcp",
-    mcp: { command: "npx", transport: "stdio" },
+    // Issue #205: a stdio command must be the actual server binary — bare
+    // package runners/shells are rejected by the validator. This fixture
+    // never spawns (connect is config-only), so any binary name suffices.
+    mcp: { command: "stdio-oauth-server", transport: "stdio" },
     credentialSchema: { type: "oauth", scopes: ["read"] },
     tools: [{ name: "stdio-oauth.current", tier: "read", description: "Stdio OAuth tool", params: [] }],
     domains: ["127.0.0.1"],
@@ -275,6 +278,7 @@ describe("connectExtension broker seam", () => {
 
   test("hosted OAuth connects fail closed when the generic flow is not wired", async () => {
     const h = makeDeps();
+    // SAFETY: the harness deps expose mcpOAuth when wired; deleting it simulates the unwired deployment.
     delete (h.deps as { mcpOAuth?: unknown }).mcpOAuth;
 
     const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
@@ -322,6 +326,7 @@ describe("connectExtension broker seam", () => {
 
   test("a broker failure fails the connect without writing anything", async () => {
     const failing = { connect: async () => Promise.reject(new Error("broker unreachable")) };
+    // SAFETY: makeDeps' broker slot is only exercised via its connect method here; the rejecting double covers that one path.
     const h = makeDeps({ broker: failing as never });
 
     const outcome = await connect(h, "fixture.weather", "personal", "UADA");
@@ -430,7 +435,7 @@ describe("connectExtension unknown extension", () => {
 });
 
 describe("connectExtension paste guard (issue #196)", () => {
-  const CREDENTIAL_SHAPES = [
+  const SECRET_PASTE_SAMPLES = [
     "github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
     "ghp_abcdefghijklmnopqrstuvwxyz123456",
     "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
@@ -439,7 +444,7 @@ describe("connectExtension paste guard (issue #196)", () => {
     "near-abcdefghijklmnopqrstuvwxyz123456",
   ];
 
-  test.each(CREDENTIAL_SHAPES)("a pasted %s-shaped api_key is refused with the redirect", async (apiKey) => {
+  test.each(SECRET_PASTE_SAMPLES)("a pasted %s-shaped api_key is refused with the redirect", async (apiKey) => {
     const h = makeDeps();
     const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey });
     expect(outcome).toMatchObject({ ok: false });
@@ -483,10 +488,12 @@ describe("connectExtensionToolDefinition", () => {
       spaceIdFromFile: (file) => (file === "slack:C1.jsonl" ? "slack:C1" : undefined),
     });
 
+    // SAFETY: the connect tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
     const result = await tool.execute("t1", { extension: "fixture.weather", scope: "personal", api_key: undefined }, undefined, undefined, {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
     } as never);
 
+    // SAFETY: the tool replies with a single text content block; the confirmation text is asserted verbatim.
     expect((result.content[0] as { text: string }).text).toBe("Fixture Weather connected as @UADA");
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows.find((r) => r.scope === "personal")!.owner).toBe("UADA");
@@ -496,11 +503,13 @@ describe("connectExtensionToolDefinition", () => {
     const h = makeDeps(); // default policy denies connect_extension
     const tool = connectExtensionToolDefinition({ ...h.deps, getPrincipal: () => "UADA" });
 
+    // SAFETY: the connect tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
     const result = await tool.execute("t1", { extension: "fixture.weather", scope: "org", api_key: undefined }, undefined, undefined, {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
     } as never);
 
     expect(result.isError).toBe(true);
+    // SAFETY: the tool replies with a single text content block; the denial text is asserted below.
     expect((result.content[0] as { text: string }).text).toContain("policy");
   });
 
@@ -514,10 +523,12 @@ describe("connectExtensionToolDefinition", () => {
       { extension: "fixture.weather", scope: "personal", api_key: secret },
       undefined,
       undefined,
+      // SAFETY: the connect tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
       { sessionManager: { getSessionFile: () => "slack:C1.jsonl" } } as never,
     );
 
     expect(result.isError).toBe(true);
+    // SAFETY: the tool replies with a single text content block; the paste-guard text is asserted below.
     const text = (result.content[0] as { text: string }).text;
     expect(text).toBe(SECRET_PASTE_REDIRECT);
     expect(text).not.toContain(secret);

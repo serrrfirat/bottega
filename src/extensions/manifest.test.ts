@@ -5,6 +5,8 @@ import {
   RESERVED_TOOL_NAMES,
   validateManifest,
   type ExtensionManifest,
+  type JsonObject,
+  type JsonValue,
 } from "./manifest";
 import { fixtureManifest } from "./fixture";
 
@@ -28,29 +30,54 @@ function cliManifest(): ExtensionManifest {
   };
 }
 
-function mutate(manifest: ExtensionManifest, path: string[], value: unknown): Record<string, unknown> {
-  const doc = JSON.parse(JSON.stringify(manifest)) as Record<string, unknown>;
-  let cursor: Record<string, unknown> = doc;
+function mutate(manifest: ExtensionManifest, path: string[], value: JsonValue | undefined): JsonObject {
+  // SAFETY: JSON.parse of the manifest's own serialization is a JSON document
+  // (JsonObject); the validator re-validates the result, so the helper only
+  // needs the JSON domain, not manifest precision.
+  const doc = JSON.parse(JSON.stringify(manifest)) as JsonObject;
+  // Walk every intermediate key (including ARRAY indices — the tools path is
+  // ["tools", "0", "name"]). Any non-object intermediate is a broken path.
+  let cursor: JsonObject = doc;
   for (const key of path.slice(0, -1)) {
-    cursor = cursor[key] as Record<string, unknown>;
+    const next = cursor[key];
+    if (next === null || typeof next !== "object") {
+      throw new Error(`mutate: manifest path ${path.join(".")} has a non-mapping intermediate at "${key}"`);
+    }
+    cursor = next as JsonObject;
   }
-  cursor[path[path.length - 1]] = value;
+  if (value === undefined) {
+    // An omitted key: the validator reads absent and undefined identically
+    // (input[key] === undefined), so delete preserves the test's intent.
+    delete cursor[path[path.length - 1]];
+  } else {
+    cursor[path[path.length - 1]] = value;
+  }
   return doc;
 }
 
-function expectInvalid(doc: unknown, messagePart: string): void {
+function asJsonDoc<T>(doc: T): JsonObject {
+  // SAFETY: serializing any manifest-shaped value (typed manifest, spread
+  // override, or already-JSON value) yields a JSON document; the validator
+  // re-validates the result, so the JSON domain is exact — same boundary
+  // the mutate helper applies.
+  return JSON.parse(JSON.stringify(doc)) as JsonObject;
+}
+
+function expectInvalid<T>(doc: T, messagePart: string): void {
   try {
-    validateManifest(doc);
+    validateManifest(asJsonDoc(doc));
     expect.unreachable(`expected validation failure: ${messagePart}`);
   } catch (err) {
     expect(err).toBeInstanceOf(ExtensionValidationError);
+    // SAFETY: validateManifest only ever throws ExtensionValidationError; the
+    // instanceof assertion above already established the runtime type.
     expect((err as Error).message).toContain(messagePart);
   }
 }
 
 describe("extension manifest validation (fail closed)", () => {
   test("accepts the fixture mcp manifest", () => {
-    const manifest = validateManifest(fixtureManifest());
+    const manifest = validateManifest(asJsonDoc(fixtureManifest()));
     expect(manifest.id).toBe("fixture.weather");
     expect(manifest.kind).toBe("mcp");
     expect(manifest.mcp).toEqual({ serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" });
@@ -59,7 +86,7 @@ describe("extension manifest validation (fail closed)", () => {
   });
 
   test("accepts a cli manifest with args, env, and oauth scopes", () => {
-    const manifest = validateManifest(cliManifest());
+    const manifest = validateManifest(asJsonDoc(cliManifest()));
     expect(manifest.kind).toBe("cli");
     expect(manifest.cli).toEqual({
       command: "/usr/bin/example",
@@ -126,6 +153,27 @@ describe("extension manifest validation (fail closed)", () => {
     );
   });
 
+  test("stdio binding rejects an interactive package runner/shell with no target (issue #205)", () => {
+    // Issue #205: spawning a bare runner/shell drops the MCP client into an
+    // stdin shell/REPL — the MCP JSON-RPC bytes are EXECUTED as shell
+    // commands (`sh: line 1: method:initialize: command not found`) and the
+    // handshake never completes. The manifest carries no args, so the
+    // command must be the actual server binary.
+    for (const command of ["npx", "/usr/local/bin/npx", "bunx", "node", "bun", "deno", "sh", "bash", "python3"]) {
+      expectInvalid(
+        { ...fixtureManifest(), mcp: { command, transport: "stdio" } },
+        "interactive package runner/shell",
+      );
+    }
+    // A real server binary (or a runner WITH a target — not representable
+    // here) is a valid stdio command; only the bare interactive form is
+    // rejected.
+    expect(validateManifest(asJsonDoc({ ...fixtureManifest(), mcp: { command: "linear-mcp", transport: "stdio" } })))
+      .toBeDefined();
+    expect(validateManifest(asJsonDoc({ ...fixtureManifest(), mcp: { command: "/usr/local/bin/mcp-server", transport: "stdio" } })))
+      .toBeDefined();
+  });
+
   test("mcp serverUrl must be an http(s) URL", () => {
     expectInvalid(
       { ...fixtureManifest(), mcp: { serverUrl: "ftp://x", transport: "streamable-http" } },
@@ -153,10 +201,10 @@ describe("extension manifest validation (fail closed)", () => {
   });
 
   test("tool names must be unique, well-formed, and not reserved", () => {
-    const duplicated = mutate(fixtureManifest(), ["tools"], [
-      fixtureManifest().tools![0],
-      { ...fixtureManifest().tools![0], description: "again" },
-    ]);
+    // JSON-roundtrip the tool objects: mutate's value domain is JSON (the
+    // validator re-validates a serialized document).
+    const tool = JSON.parse(JSON.stringify(fixtureManifest().tools![0])) as JsonObject;
+    const duplicated = mutate(fixtureManifest(), ["tools"], [tool, { ...tool, description: "again" }]);
     expectInvalid(duplicated, "duplicate tool name");
 
     expectInvalid(mutate(fixtureManifest(), ["tools", "0", "name"], "read"), "reserved by the runtime");
@@ -181,7 +229,7 @@ describe("extension manifest validation (fail closed)", () => {
 
   test("providerName is optional, validated, and defaults to the manifest name (issue #148)", () => {
     // Absent → no providerName on the typed tool (falls back to name).
-    const plain = validateManifest(fixtureManifest());
+    const plain = validateManifest(asJsonDoc(fixtureManifest()));
     expect(plain.tools![0].providerName).toBeUndefined();
     // Valid providerName survives validation.
     const mapped = validateManifest(
@@ -222,22 +270,23 @@ describe("extension manifest validation (fail closed)", () => {
   });
 
   test("an empty domains array is accepted (no egress allowance)", () => {
-    const manifest = validateManifest({ ...fixtureManifest(), domains: [] });
+    const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), domains: [] }));
     expect(manifest.domains).toEqual([]);
   });
 
   test("wildcard domains with a leading *. are accepted", () => {
-    const manifest = validateManifest({ ...fixtureManifest(), domains: ["*.fixture.weather.test"] });
+    const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), domains: ["*.fixture.weather.test"] }));
     expect(manifest.domains).toEqual(["*.fixture.weather.test"]);
   });
 
   test("an empty tools array is allowed (egress-only extension)", () => {
-    const manifest = validateManifest({ ...fixtureManifest(), tools: [] });
+    const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), tools: [] }));
     expect(manifest.tools).toEqual([]);
   });
 
   test("tools are OPTIONAL: a manifest without tools validates and stays tools-less (issue #158)", () => {
-    const withoutTools = JSON.parse(JSON.stringify(fixtureManifest())) as Record<string, unknown>;
+    // SAFETY: JSON.parse of the manifest's own serialization is a JSON document (JsonObject).
+    const withoutTools = JSON.parse(JSON.stringify(fixtureManifest())) as JsonObject;
     delete withoutTools["tools"];
     const mcp = validateManifest(withoutTools);
     expect(mcp.tools).toBeUndefined();
@@ -247,7 +296,8 @@ describe("extension manifest validation (fail closed)", () => {
     expectInvalid(mutate(fixtureManifest(), ["credentialSchema"], undefined), "credentialSchema.type");
     expectInvalid(mutate(fixtureManifest(), ["mcp"], undefined), "requires an mcp binding");
 
-    const cliWithoutTools = JSON.parse(JSON.stringify(cliManifest())) as Record<string, unknown>;
+    // SAFETY: JSON.parse of the manifest's own serialization is a JSON document (JsonObject).
+    const cliWithoutTools = JSON.parse(JSON.stringify(cliManifest())) as JsonObject;
     delete cliWithoutTools["tools"];
     const cli = validateManifest(cliWithoutTools);
     expect(cli.tools).toBeUndefined();

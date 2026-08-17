@@ -57,7 +57,7 @@ import { evaluatePolicyGate, summarizeArgs, type PolicyGateCall } from "../polic
 import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CALL_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
-import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionTool, type McpBinding } from "./manifest";
+import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionTool, type JsonObject, type McpBinding } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
@@ -82,7 +82,8 @@ export interface ExtensionRuntimeCall {
    * the gate/audit/tier surface.
    */
   toolName: string;
-  args: Record<string, unknown>;
+  /** Tool arguments as JSON (the agent's raw call args). */
+  args: JsonObject;
   /** Actor recorded on audit rows and used for personal-scope ladder lookups. */
   caller: string;
   spaceId?: string;
@@ -159,26 +160,38 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
   const loadPolicy = (spaceId: string | undefined) => loadSpacePolicy(deps.orgPolicy, deps.store, spaceId);
 
   /** Audit row for every call; credential_id is null unless the ladder resolved one. */
-  const auditCall = (input: {
+  const auditCall = async (input: {
     extensionId: string;
     toolName: string;
     actor: string;
     spaceId?: string;
     credentialId: string | null;
     decision: ExtensionCallDecision;
-  }): Promise<number> =>
-    deps.audit.appendAudit({
-      space_id: input.spaceId ?? null,
-      actor: input.actor,
-      event_type: EXTENSION_CALL_EVENT,
-      payload: {
-        extension: input.extensionId,
-        tool: input.toolName,
+  }): Promise<number | null> => {
+    try {
+      return await deps.audit.appendAudit({
+        space_id: input.spaceId ?? null,
         actor: input.actor,
-        credential_id: input.credentialId,
-        decision: input.decision,
-      },
-    });
+        event_type: EXTENSION_CALL_EVENT,
+        payload: {
+          extension: input.extensionId,
+          tool: input.toolName,
+          actor: input.actor,
+          credential_id: input.credentialId,
+          decision: input.decision,
+        },
+      });
+    } catch (err) {
+      // Issue #205: the audit write must never turn a handled tool error
+      // into a REJECTION (an unhandled rejection exits the process with
+      // code 1). The audit is evidence, not the call's fate — log and
+      // continue so the caller still gets its error result.
+      console.error(
+        `[extensions] audit write failed for ${input.extensionId}.${input.toolName}: ${errorMessage(err)}`,
+      );
+      return null;
+    }
+  };
 
   return {
     async execute(call) {
@@ -415,7 +428,11 @@ export function defaultMcpTransport(binding: McpBinding, authProvider?: OAuthCli
       authProvider !== undefined ? { authProvider } : undefined,
     );
   }
-  return new StdioClientTransport({ command: binding.command });
+  // stderr: "pipe" (issue #205): the discovery/call paths drain a bounded
+  // prefix, so a misbehaving stdio server's exec noise (e.g. a shell
+  // interpreting the MCP JSON-RPC) never reaches the server log and the
+  // child cannot deadlock on an unwritten stderr buffer.
+  return new StdioClientTransport({ command: binding.command, stderr: "pipe" });
 }
 
 /**
@@ -428,7 +445,7 @@ async function callMcpTool(
   makeTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
   binding: McpBinding,
   toolName: string,
-  params: Record<string, unknown>,
+  params: JsonObject,
   authProvider?: OAuthClientProvider,
 ): Promise<ExtensionRuntimeResult> {
   const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
@@ -437,6 +454,8 @@ async function callMcpTool(
     // The SDK's declared return is a union with an experimental task-based
     // branch; passing CallToolResultSchema pins the runtime shape, so the
     // cast is the documented contract (guarded below).
+    // SAFETY: CallToolResultSchema.parse pins the SDK's callTool return to
+    // the plain call-result shape; the guard below rejects the task branch.
     const result = (await client.callTool({ name: toolName, arguments: params }, CallToolResultSchema)) as CallToolResult;
     // Task-based (experimental) results carry toolResult, not content; the
     // runtime only forwards plain call results.
@@ -486,13 +505,13 @@ async function callMcpTool(
 async function callCliTool(
   binding: CliBinding,
   toolName: string,
-  params: Record<string, unknown>,
+  params: JsonObject,
 ): Promise<ExtensionRuntimeResult> {
   const flagArgs: string[] = [];
   for (const [name, value] of Object.entries(params)) {
-    if (typeof value === "boolean") {
-      if (value) flagArgs.push(`--${name}`);
-    } else {
+    if (value === true) {
+      flagArgs.push(`--${name}`);
+    } else if (value !== false) {
       flagArgs.push(`--${name}`, String(value));
     }
   }
@@ -518,7 +537,7 @@ async function callCliTool(
  * a spawned CLI through the environment — the iron-proxy boundary is the
  * only auth path (see {@link callCliTool}).
  */
-export function credentialSafeEnv(): Record<string, string> {
+export function credentialSafeEnv() {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (value !== undefined && !CREDENTIAL_ENV_RE.test(name)) env[name] = value;

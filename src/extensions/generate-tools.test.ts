@@ -8,11 +8,12 @@
 import { describe, expect, test } from "bun:test";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   classifyTier,
   generateManifestTools,
+  listProviderTools,
   refreshManifestTools,
   toolsFromMcpList,
 } from "./generate-tools";
@@ -29,6 +30,23 @@ function fakeToolsServer(tools: unknown[]): (binding: McpBinding) => Transport {
     void server.connect(serverTransport);
     return clientTransport;
   };
+}
+
+/**
+ * A transport that starts and accepts writes but NEVER responds: the shape
+ * of a dead stdio server (e.g. bare `npx` — a process exists, the MCP
+ * handshake is never answered). Without the discovery bound the SDK's
+ * 60s default request timeout would hang the caller.
+ */
+class SilentTransport implements Transport {
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: JSONRPCMessage) => void;
+  async start(): Promise<void> {}
+  async send(_message: JSONRPCMessage): Promise<void> {}
+  async close(): Promise<void> {
+    this.onclose?.();
+  }
 }
 
 describe("classifyTier (issue #157 conservative default tiers)", () => {
@@ -191,6 +209,9 @@ describe("generateManifestTools: fake tools/list over the in-memory transport se
     const broken = (): Transport => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "broken-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      // SAFETY: the handler's declared result type would reject this malformed
+      // payload, which is the point — the SDK's ListToolsResultSchema must fail
+      // it so tools/list fails closed instead of returning garbage.
       server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: "nope" }) as never);
       void server.connect(serverTransport);
       return clientTransport;
@@ -198,6 +219,20 @@ describe("generateManifestTools: fake tools/list over the in-memory transport se
     await expect(
       generateManifestTools({ binding: BINDING, extensionId: "fake", mcpTransport: broken }),
     ).rejects.toThrow(/tools\/list failed/);
+  });
+
+  test("a server that never responds fails the discovery within the bound (issue #205)", async () => {
+    // Issue #205: a dead stdio server must fail FAST (bounded, fail-closed),
+    // never hang the boot or a turn for the SDK's 60s default timeout. The
+    // 150ms bound is the test's clock: old code (no bound) hangs until the
+    // runner's timeout; new code rejects at ~150ms with a clear error.
+    const start = Date.now();
+    await expect(
+      listProviderTools({ command: "dead-server", transport: "stdio" }, () => new SilentTransport(), {
+        timeoutMs: 150,
+      }),
+    ).rejects.toThrow(/tools\/list failed/);
+    expect(Date.now() - start).toBeLessThan(5_000);
   });
 });
 
