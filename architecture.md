@@ -353,9 +353,12 @@ heavy layer) is in [features.md](features.md#extensions--the-registry).
    `reviewed: true` before they register. The catalog fetch itself
    (integrations.sh) is a later issue; it only writes these files.
 3. **Vault binding & policy** — `credentialSchema` declares what the vault
-   must hold (oauth scopes / api_key); `src/server/index.ts` wires the
-   auth-broker secret resolver into the boundary (issues #54/#143). Tool
-   `tier` declarations feed both the SDK approval tier and the policy gate.
+   must hold (oauth scopes / api_key); `bootstrapRuntime`
+   (`src/server/bootstrap-runtime.ts`) wires the deployment's configured
+   secret resolver into the boundary (omp-broker by default, issues
+   #54/#143; 1Password Connect when the settings blob selects it, issue
+   #190). Tool `tier` declarations feed both the SDK approval tier and the
+   policy gate.
 4. **Wiring** — registry tools become SDK definitions (`tools.ts`) that ride
    the custom-tools path into the space agent's restricted toolset; mcp
    tools call the provider's official MCP server (streamable-http or stdio),
@@ -367,18 +370,22 @@ heavy layer) is in [features.md](features.md#extensions--the-registry).
    the safety spine: **policy gate first** (the extension allowlist +
    manifest tier, shared with the in-process policy extension) → **credential
    ladder** (`credentials.ts`, org/me/auto scopes over the store's registry
-   rows) → **egress boundary** (`boundary.ts`: `brokerSecretResolverFromEnv`
-   fetches the resolved vault row over
-   `OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN`; the secret is written to
-   the extension's shared-volume file, mode 0600, and iron-proxy's
+   rows) → **egress boundary** (`boundary.ts`: the deployment's configured
+   secret resolver — issue #190 — fetches the resolved credential's secret
+   payload: the `omp-broker` backend over `OMP_AUTH_BROKER_URL`/
+   `OMP_AUTH_BROKER_TOKEN` by default, or a 1Password Connect server when
+   the settings blob's `secrets_backend` says so, resolving the
+   `"provider:identityKey" → {vault, item, field}` mapping over the
+   Connect REST API with `OP_CONNECT_TOKEN`; the secret is written to the
+   extension's shared-volume file, mode 0600, and iron-proxy's
    `secrets` transform injects it as the `Authorization` header for the
    extension's allowlisted domains) → provider call → audit. The client
    call itself carries no credential, so nothing reaches agent env,
    transcripts, or audit. Every call writes `extension.call`
    `{extension, tool, actor, credential_id, decision}`; denied calls never
-   resolve a credential. Missing broker configuration, a missing vault row,
-   an unsupported credential shape, or a failed proxy reload stops the call
-   before it can run unauthenticated.
+   resolve a credential. Missing backend configuration, a missing vault
+   row / mapping, an unsupported credential shape, or a failed proxy
+   reload stops the call before it can run unauthenticated.
 6. **Agent-agnostic surface** (`src/mcp/server.ts`, issue #61) — the bottega
    MCP server (attached to every ACP session via `mcpServers`, #26)
    advertises `connect_extension` + each registered extension's manifest

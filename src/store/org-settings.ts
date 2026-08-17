@@ -20,6 +20,7 @@
  * the executor's repo allowlist).
  */
 import { EXTENSION_ID_RE } from "../extensions/manifest";
+import type { CredentialType } from "../extensions/manifest";
 import { isKnownTool } from "../policy/config";
 import type { OrgCredentialsMode, ResponseMode } from "../policy/config";
 
@@ -47,6 +48,38 @@ export interface OrgModelsSettings {
   fast?: string;
   reasoning?: string;
   effort?: string;
+}
+
+/**
+ * One 1Password location a credential's secret is served from (issue #190):
+ * `secrets_backend.mapping["<provider>:<identityKey>"]` points the
+ * credential row's provider + identity key at a Connect vault/item/field.
+ * The field's value is the secret payload; `field` matches the Connect
+ * item field by id OR label. `type` declares the credential kind the
+ * stored secret represents (default `api_key`; oauth refresh stays with
+ * the omp-broker backend).
+ */
+export interface SecretsBackendMappingEntry {
+  vault: string;
+  item: string;
+  field: string;
+  type?: CredentialType;
+}
+
+/**
+ * The org's secret-vault backend selection (issue #190), consumed by the
+ * extension credential boundary at boot. `connect_url` + `mapping` are
+ * only consumed when `type` is `1password-connect` (they are carried but
+ * inert under `omp-broker`, so an org can switch back without first
+ * deleting them); the Connect access token itself is a secret and stays in
+ * env/.env (`OP_CONNECT_TOKEN`), never in the blob.
+ */
+export interface OrgSecretsBackendSettings {
+  type: "omp-broker" | "1password-connect";
+  /** 1password-connect: the Connect server base URL (e.g. http://op-connect:8080). */
+  connectUrl?: string;
+  /** 1password-connect: "provider:identityKey" → the 1Password vault/item/field. */
+  mapping?: Record<string, SecretsBackendMappingEntry>;
 }
 
 export interface OrgSettings {
@@ -78,6 +111,8 @@ export interface OrgSettings {
    * (the in-conversation nudge still applies).
    */
   onboarding?: { spaceId?: string };
+  /** Secret-vault backend for the extension credential boundary (issue #190). */
+  secretsBackend?: OrgSecretsBackendSettings;
 }
 
 /** Raw snake_case blob shape accepted by setOrgSettings (mirrors config.yml keys). */
@@ -112,6 +147,12 @@ export interface OrgSettingsInput {
   memory_backend?: { base_url?: string };
   /** Proactive onboarding (issue #116): space id for the boot-time guide. */
   onboarding?: { space_id?: string };
+  /** Secret-vault backend for the extension credential boundary (issue #190). */
+  secrets_backend?: {
+    type: string;
+    connect_url?: string;
+    mapping?: Record<string, { vault: string; item: string; field: string; type?: string }>;
+  };
 }
 
 /** Thrown by the store helpers when the settings blob is malformed (fail closed). */
@@ -169,6 +210,35 @@ function repoList(value: unknown): string[] | undefined {
     repos.push(raw);
   }
   return [...new Set(repos)];
+}
+
+/**
+ * Validates `secrets_backend.mapping` (issue #190): a flat
+ * `"provider:identityKey" → {vault, item, field[, type]}` map. Every entry
+ * must be a well-formed 1Password location; `type` is optional and must be
+ * a known credential kind. Returns undefined when malformed (fail closed).
+ */
+function parseSecretsBackendMapping(value: unknown): Record<string, SecretsBackendMappingEntry> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const out: Record<string, SecretsBackendMappingEntry> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (key.trim() === "") return undefined;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+    const entry = raw as Record<string, unknown>;
+    const vault = entry["vault"];
+    const item = entry["item"];
+    const field = entry["field"];
+    if (typeof vault !== "string" || vault.trim() === "") return undefined;
+    if (typeof item !== "string" || item.trim() === "") return undefined;
+    if (typeof field !== "string" || field.trim() === "") return undefined;
+    let type: CredentialType | undefined;
+    if (entry["type"] !== undefined) {
+      if (entry["type"] !== "api_key" && entry["type"] !== "oauth") return undefined;
+      type = entry["type"];
+    }
+    out[key] = { vault: vault.trim(), item: item.trim(), field: field.trim(), ...(type !== undefined ? { type } : {}) };
+  }
+  return out;
 }
 
 /**
@@ -414,6 +484,58 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         }
       }
       if (!sectionOk) out.onboarding = undefined;
+    } else if (name === "secrets_backend") {
+      // Secret-vault backend for the extension credential boundary (issue
+      // #190). Unknown types, a 1password-connect backend missing its
+      // connect_url/mapping, or a malformed mapping all fail the whole
+      // blob closed — a deployment must never silently keep the default
+      // backend after configuring one that cannot work.
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        fail("secrets_backend must be an object");
+        continue;
+      }
+      const backend = value as Record<string, unknown>;
+      const rawType = backend["type"];
+      if (rawType !== "omp-broker" && rawType !== "1password-connect") {
+        fail("secrets_backend.type must be one of: omp-broker, 1password-connect");
+        continue;
+      }
+      const parsed: OrgSecretsBackendSettings = { type: rawType };
+      let sectionOk = true;
+      for (const [key, raw] of Object.entries(backend)) {
+        if (key === "type") {
+          continue;
+        } else if (key === "connect_url") {
+          if (typeof raw !== "string" || raw.trim() === "") {
+            sectionOk = false;
+            fail("secrets_backend.connect_url must be a non-empty string (the Connect server base URL)");
+          } else {
+            parsed.connectUrl = raw.trim();
+          }
+        } else if (key === "mapping") {
+          const mapping = parseSecretsBackendMapping(raw);
+          if (mapping === undefined) {
+            sectionOk = false;
+            fail('secrets_backend.mapping must map "provider:identityKey" to {vault, item, field[, type]}');
+          } else {
+            parsed.mapping = mapping;
+          }
+        } else {
+          sectionOk = false;
+          fail(`secrets_backend.${key}: unknown key`);
+        }
+      }
+      if (rawType === "1password-connect") {
+        if (parsed.connectUrl === undefined) {
+          sectionOk = false;
+          fail("secrets_backend.connect_url is required for type 1password-connect");
+        }
+        if (parsed.mapping === undefined) {
+          sectionOk = false;
+          fail("secrets_backend.mapping is required for type 1password-connect");
+        }
+      }
+      if (sectionOk) out.secretsBackend = parsed;
     } else {
       fail(`unknown key '${name}'`);
     }

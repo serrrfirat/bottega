@@ -189,6 +189,7 @@ Copy `.env.example` to `.env` and fill in:
 | `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
 | `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose. Local dev: exported by dev.sh (`http://127.0.0.1:8765`) from the broker it starts (#143) |
 | `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3). Local dev: read by dev.sh from `data/.omp/auth-broker.token` (#143) |
+| `OP_CONNECT_TOKEN` | 1Password Connect access token (optional, #190) | Only when the org settings blob selects `secrets_backend: {type: 1password-connect, ...}` — the extension credential boundary then resolves static credentials (API keys/PATs) from the org's Connect server. The Connect server URL + the `"provider:identityKey" → {vault, item, field}` mapping are settings-tool knobs; only this token is env. Omit for the default omp-broker backend |
 | `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key (deployment only) | Referenced by the STRICT `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied in deployment. NOT needed for local dev: the dev config (`config/egress.dev.yml`) has no judge transform (issue #126) |
 | `IRON_MANAGEMENT_API_KEY` | iron-proxy management API token (#123) | The extension credential boundary's `POST /v1/reload` bearer token (`config/egress.yml` → `management.api_key_env`); set a strong value to enable immediate credential rotation. Local dev: generated per machine by dev.sh (`data/proxy-mgmt-token`, 0600) |
 | `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack ships a self-hosted mem0 service; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
@@ -198,8 +199,15 @@ Copy `.env.example` to `.env` and fill in:
 `.env` carries secrets + deployment identity only (issue #67). Runtime knobs
 (approval timeouts, response mode, memory injection, extensions policy, repo
 allowlist, model defaults, workspaces dir, git/api base URLs, memory backend
-URL) live in the org settings blob in the DB, editable via the `settings`
-tool (see [features.md](features.md#settings-issue-67)), not in `.env`.
+URL, and — issue #190 — the secret-vault backend `secrets_backend`:
+`omp-broker` default, or a 1Password Connect server via `type`,
+`connect_url`, and a `"provider:identityKey" → {vault, item, field}`
+mapping) live in the org settings blob in the DB, editable via the
+`settings` tool (see [features.md](features.md#settings-issue-67)), not in
+`.env`. The Connect token stays in `.env` (`OP_CONNECT_TOKEN`); the
+omp-broker backend keeps resolving from the OMP auth-broker vault, and the
+OAuth lifecycle (token refresh) remains with it — 1Password serves static
+credentials (API keys / PATs).
 
 Memory backend (issues #43, #67): unset `memory_backend.base_url` (the
 default) runs the SQLite memory fallback. To use the self-hosted mem0

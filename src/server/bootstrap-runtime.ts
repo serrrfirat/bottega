@@ -28,8 +28,10 @@
  *     supplier is accepted because the server's Slack router is
  *     constructed mid-boot (the adapter precedes it) and the runtime reads
  *     the router per call.
- *   - boundary: proxy-control / secrets-dir overrides; the broker secret
- *     resolver is ALWAYS wired here, never a parameter.
+ *   - boundary: proxy-control / secrets-dir overrides; the secret resolver
+ *     is ALWAYS wired here from the deployment's configured backend
+ *     (issue #190: omp-broker default, 1password-connect from the settings
+ *     blob) — never a parameter a root can omit.
  *   - tool subset: each root builds its own tool definitions from the
  *     returned pieces (server session toolset, executor worker toolset,
  *     MCP advertised surface) — that assembly lives in the roots, not
@@ -41,9 +43,9 @@ import { createAudit, type AuditModule } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadOrgPolicy, type PolicyConfig } from "../policy/config";
 import {
-  brokerSecretResolverFromEnv,
   createSecretFileBoundary,
   proxyBoundaryControlFromEnv,
+  secretResolverFromSettings,
   type CredentialBoundary,
   type SecretFileBoundaryOpts,
 } from "../extensions/boundary";
@@ -63,9 +65,11 @@ export interface BootstrapRuntimeDeps {
    */
   router: ApprovalRouter | (() => ApprovalRouter);
   /**
-   * Egress-boundary overrides (proxy control + secrets dir). The broker
-   * secret resolver is ALWAYS wired by bootstrapRuntime — a root can never
-   * opt out of it, which is the #172 boundary parity invariant.
+   * Egress-boundary overrides (proxy control + secrets dir). The secret
+   * resolver is ALWAYS wired by bootstrapRuntime from the deployment's
+   * configured backend (issue #190) — a root can never opt out of it,
+   * which is the #172 boundary parity invariant. Pass `resolver` (or the
+   * legacy `resolveSecret`) here to override the configured default.
    */
   boundary?: SecretFileBoundaryOpts;
   /** Extension snapshots dir; defaults to BOTTEGA_EXTENSIONS_DIR or "config/extensions". */
@@ -88,7 +92,7 @@ export interface BootstrapRuntime {
   memoryProvider: ResolvedMemoryProvider;
   /** Effective tool surfaces resolved at boot (issue #166: failing providers are skipped, not fatal). */
   surfaces: ExtensionSurfaces;
-  /** The credential boundary wired into the runtime — always carries the broker secret resolver (#172). */
+  /** The credential boundary wired into the runtime — always carries the configured secret resolver (#172/#190). */
   boundary: CredentialBoundary;
 }
 
@@ -112,15 +116,22 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     registry.list(),
     deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {},
   );
-  // Credential boundary (issues #53/#123): the resolver is ALWAYS the
-  // broker secret resolver (#54 wiring, shipped with #143) — the #172
-  // parity invariant the MCP and executor roots historically violated.
-  // Proxy control + secrets dir come from the environment / overrides.
-  const boundary = createSecretFileBoundary({
+  // Credential boundary (issues #53/#123/#190): the resolver is the
+  // deployment's configured secrets backend (issue #190) — omp-broker by
+  // default (the #54/#143 behavior, byte-identical), 1password-connect
+  // when the settings blob's secrets_backend says so. A root can still
+  // override via deps.boundary (resolver or resolveSecret); the #172
+  // boundary parity invariant is that the DEFAULT carries a real resolver,
+  // never the unwired error. Proxy control + secrets dir come from the
+  // environment / overrides.
+  const boundaryOpts: SecretFileBoundaryOpts = {
     ...proxyBoundaryControlFromEnv(),
-    resolveSecret: brokerSecretResolverFromEnv(),
     ...deps.boundary,
-  });
+  };
+  if (boundaryOpts.resolver === undefined && boundaryOpts.resolveSecret === undefined) {
+    boundaryOpts.resolver = secretResolverFromSettings(store.getOrgSettings());
+  }
+  const boundary = createSecretFileBoundary(boundaryOpts);
   // The runtime's router is a per-call dependency: resolve the supplier at
   // construction when a plain object was given, otherwise forward per call
   // so the server's mid-boot router assignment is observed live.

@@ -316,14 +316,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
   // by bootstrapRuntime above with the router just assigned (the #172
-  // shared chain). Its boundary ALWAYS carries the broker secret resolver
-  // (#54 wiring, shipped with #143): the resolver fetches the resolved
-  // credential's secret payload from the auth-broker vault
-  // (OMP_AUTH_BROKER_URL/TOKEN — set by scripts/dev.sh locally, by
-  // docker-compose.yml in deployment) and fails closed when the broker is
-  // not configured. With BOTTEGA_PROXY_CONTROL_URL + token in the
-  // environment (issue #123), authorize writes the secret file AND reloads
-  // the proxy; unset (hermetic tests) stays write-only.
+  // shared chain). Its boundary ALWAYS carries the deployment's configured
+  // secret resolver (issue #190): the omp-broker backend by default
+  // (#54/#143 — the resolver fetches the resolved credential's secret
+  // payload from the auth-broker vault, OMP_AUTH_BROKER_URL/TOKEN, set by
+  // scripts/dev.sh locally / docker-compose.yml in deployment, failing
+  // closed when the broker is not configured), or a 1Password Connect
+  // backend when the org settings blob's secrets_backend says so (its
+  // token comes from OP_CONNECT_TOKEN in .env). With
+  // BOTTEGA_PROXY_CONTROL_URL + token in the environment (issue #123),
+  // authorize writes the secret file AND reloads the proxy; unset
+  // (hermetic tests) stays write-only.
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through
   // it. Created here (before both) because the two share it.

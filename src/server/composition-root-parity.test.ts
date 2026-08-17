@@ -262,6 +262,48 @@ describe("composition-root parity (issue #172)", () => {
     }
   });
 
+  test("secrets_backend: 1password-connect wires the Connect resolver into every root's boundary (issue #190)", async () => {
+    // Stub Connect server: serves one item field; every root's boundary
+    // must resolve the SAME secret from it (the org's configured backend).
+    const seen: Array<{ path: string; auth: string | null }> = [];
+    const connect = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        const url = new URL(req.url);
+        seen.push({ path: url.pathname, auth: req.headers.get("authorization") });
+        return new Response(
+          JSON.stringify({ id: "i", title: "t", category: "LOGIN", fields: [{ id: "f", label: "f", value: "parity-secret" }] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    const beforeToken = process.env.OP_CONNECT_TOKEN;
+    process.env.OP_CONNECT_TOKEN = "parity-connect-token";
+    try {
+      const { server, executor, mcp } = await captureWirings({
+        secrets_backend: {
+          type: "1password-connect",
+          connect_url: `http://127.0.0.1:${connect.port}`,
+          mapping: { "github:ik": { vault: "v", item: "i", field: "f" } },
+        },
+      });
+      // authorize() resolves from the stub and writes the secret file —
+      // proving the configured backend (not the broker default) was wired.
+      await server.boundary.authorize(credential);
+      await executor.runtime.boundary.authorize(credential);
+      await mcp.runtime.boundary.authorize(credential);
+      expect(seen).toHaveLength(3);
+      for (const request of seen) {
+        expect(request.path).toBe("/v1/vaults/v/items/i");
+        expect(request.auth).toBe("Bearer parity-connect-token");
+      }
+    } finally {
+      connect.stop(true);
+      if (beforeToken === undefined) delete process.env.OP_CONNECT_TOKEN;
+      else process.env.OP_CONNECT_TOKEN = beforeToken;
+    }
+  });
+
   test("all three roots load the same org-policy source from the same settings (DB-first over the config.yml floor)", async () => {
     const { server, executor, mcp } = await captureWirings({
       response_mode: "mention",

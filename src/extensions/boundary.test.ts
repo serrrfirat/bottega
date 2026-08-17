@@ -9,8 +9,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { brokerSecretResolverFromEnv, createSecretFileBoundary, extensionSecretFileName, proxyBoundaryControlFromEnv } from "./boundary";
+import { brokerSecretResolverFromEnv, createSecretFileBoundary, extensionSecretFileName, onePasswordConnectResolver, proxyBoundaryControlFromEnv, secretResolverFromSettings, type SecretResolverRef } from "./boundary";
 import type { ExtensionCredential } from "../store/db";
+import type { OrgSecretsBackendSettings, OrgSettings } from "../store/org-settings";
 
 describe("proxyBoundaryControlFromEnv (issue #123)", () => {
   test("both vars set -> the boundary reloads the proxy", () => {
@@ -307,6 +308,272 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
       expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
     } finally {
       broker.stop();
+      mgmt.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("secretResolverFromSettings (issue #190 backend selection)", () => {
+  /** A schema-valid empty settings blob (getOrgSettings with no row). */
+  const EMPTY_SETTINGS: OrgSettings = { ok: true, errors: [], warnings: [] };
+
+  const REF = {
+    provider: "github",
+    identityKey: "api-key:dev",
+    scope: "personal",
+    owner: "U0B9QUPCTJ5",
+    brokerCredentialId: 42,
+  } satisfies SecretResolverRef;
+
+  function snapshotResponse(entries: unknown[]): string {
+    return JSON.stringify({
+      generation: 1,
+      generatedAt: Date.now(),
+      serverNowMs: Date.now(),
+      refresher: { enabled: false, intervalMs: 60000, skewMs: 0, nextSweepInMs: 0 },
+      credentials: entries,
+    });
+  }
+
+  function fakeBroker(entries: unknown[]): { url: string; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (new URL(req.url).pathname !== "/v1/snapshot") return new Response("not found", { status: 404 });
+        return new Response(snapshotResponse(entries), { headers: { "content-type": "application/json" } });
+      },
+    });
+    return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+  }
+
+  test("no secrets_backend in the settings -> the omp-broker resolver (the byte-identical default)", async () => {
+    const broker = fakeBroker([
+      { id: 42, provider: "github", credential: { type: "api_key", key: "github_pat_test" }, identityKey: "api-key:dev", rotatesInMs: null },
+    ]);
+    try {
+      const resolver = secretResolverFromSettings(EMPTY_SETTINGS, {
+        OMP_AUTH_BROKER_URL: broker.url,
+        OMP_AUTH_BROKER_TOKEN: "broker-token",
+      });
+      await expect(resolver.resolve(REF)).resolves.toEqual({ type: "api_key", secret: "github_pat_test" });
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("an explicit omp-broker backend resolves from the broker vault", async () => {
+    const broker = fakeBroker([
+      { id: 42, provider: "github", credential: { type: "oauth", refresh: "__remote__", access: "oauth-access-token", expires: 9999999999 }, identityKey: "api-key:dev", rotatesInMs: null },
+    ]);
+    try {
+      const resolver = secretResolverFromSettings(
+        { ...EMPTY_SETTINGS, secretsBackend: { type: "omp-broker" } },
+        { OMP_AUTH_BROKER_URL: broker.url, OMP_AUTH_BROKER_TOKEN: "broker-token" },
+      );
+      await expect(resolver.resolve(REF)).resolves.toEqual({ type: "oauth", secret: "oauth-access-token" });
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("an unknown backend type fails closed at selection (never falls back silently)", () => {
+    expect(() =>
+      secretResolverFromSettings({ ...EMPTY_SETTINGS, secretsBackend: { type: "infisical" as never } }),
+    ).toThrow(/unknown secrets_backend type "infisical"/);
+  });
+
+  test("the omp-broker resolver fails closed without a broker credential id", async () => {
+    const resolver = secretResolverFromSettings(EMPTY_SETTINGS, {
+      OMP_AUTH_BROKER_URL: "http://127.0.0.1:8765",
+      OMP_AUTH_BROKER_TOKEN: "bt",
+    });
+    await expect(
+      resolver.resolve({ provider: "github", identityKey: "api-key:dev", scope: "org", owner: null }),
+    ).rejects.toThrow(/broker credential id/);
+  });
+});
+
+describe("onePasswordConnectResolver (issue #190)", () => {
+  /** Stub Connect server: serves the given item fields for any vault/item. */
+  function stubConnect(
+    response: (path: string) => Response,
+  ): { url: string; seen: Array<{ path: string; auth: string | null }>; stop: () => void } {
+    const seen: Array<{ path: string; auth: string | null }> = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        const url = new URL(req.url);
+        seen.push({ path: url.pathname, auth: req.headers.get("authorization") });
+        return response(url.pathname);
+      },
+    });
+    return { url: `http://127.0.0.1:${server.port}`, seen, stop: () => server.stop(true) };
+  }
+
+  function itemResponse(fields: Array<{ id?: string; label?: string; value?: string }>): Response {
+    return new Response(JSON.stringify({ id: "item-1", title: "t", category: "LOGIN", fields }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  function backend(url: string, mapping: OrgSecretsBackendSettings["mapping"]): OrgSecretsBackendSettings {
+    return { type: "1password-connect", connectUrl: url, mapping };
+  }
+
+  const MAPPING: NonNullable<OrgSecretsBackendSettings["mapping"]> = {
+    "github:api-key:dev": { vault: "vault-1", item: "item-1", field: "credential" },
+  };
+
+  const REF = { provider: "github", identityKey: "api-key:dev", scope: "org", owner: null } satisfies SecretResolverRef;
+
+  test("resolves a mapped api_key from the Connect item (field id), bearer token sent", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "credential", label: "credential", value: "github_pat_123" }]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).resolves.toEqual({ type: "api_key", secret: "github_pat_123" });
+      expect(connect.seen).toEqual([
+        { path: "/v1/vaults/vault-1/items/item-1", auth: "Bearer connect-token" },
+      ]);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("matches a field by label when the configured id differs", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "abc123", label: "credential", value: "pat-by-label" }]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).resolves.toEqual({ type: "api_key", secret: "pat-by-label" });
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("returns the mapping-declared credential type (oauth static)", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "credential", label: "credential", value: "static-oauth" }]));
+    try {
+      const resolver = onePasswordConnectResolver(
+        backend(connect.url, { ...MAPPING, "github:api-key:dev": { vault: "vault-1", item: "item-1", field: "credential", type: "oauth" } }),
+        { OP_CONNECT_TOKEN: "connect-token" },
+      );
+      await expect(resolver.resolve(REF)).resolves.toEqual({ type: "oauth", secret: "static-oauth" });
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("an unmapped provider:identityKey fails closed with the missing key", async () => {
+    const connect = stubConnect(() => itemResponse([]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(
+        resolver.resolve({ ...REF, identityKey: "api-key:other" }),
+      ).rejects.toThrow(/no 1Password mapping for "github:api-key:other"/);
+      expect(connect.seen).toEqual([]); // never a fetch without a mapping
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a missing OP_CONNECT_TOKEN fails closed lazily (the resolver is wired at boot)", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "credential", value: "x" }]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), {});
+      await expect(resolver.resolve(REF)).rejects.toThrow(/OP_CONNECT_TOKEN/);
+      expect(connect.seen).toEqual([]); // no fetch without the token
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a missing connect_url fails closed (config validation, defense in depth)", async () => {
+    const resolver = onePasswordConnectResolver({ type: "1password-connect", mapping: MAPPING }, { OP_CONNECT_TOKEN: "t" });
+    await expect(resolver.resolve(REF)).rejects.toThrow(/secrets_backend.connect_url/);
+  });
+
+  test("a 401 from the Connect server fails the extension call closed", async () => {
+    const connect = stubConnect(() => new Response("unauthorized", { status: 401 }));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "wrong-token" });
+      await expect(resolver.resolve(REF)).rejects.toThrow(/item fetch failed \(401\)/);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a missing item (404) fails the extension call closed", async () => {
+    const connect = stubConnect(() => new Response("not found", { status: 404 }));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).rejects.toThrow(/item fetch failed \(404\)/);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a missing field fails closed", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "other", label: "other", value: "x" }]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).rejects.toThrow(/has no field "credential"/);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a field without a value fails closed (never an empty credential)", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "credential", label: "credential" }]));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).rejects.toThrow(/has no value/);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("a malformed Connect item fails closed", async () => {
+    const connect = stubConnect(() => new Response("not-json", { status: 200 }));
+    try {
+      const resolver = onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" });
+      await expect(resolver.resolve(REF)).rejects.toThrow(/malformed item/);
+    } finally {
+      connect.stop();
+    }
+  });
+
+  test("the Connect resolver feeds the boundary end to end (secret file + reload)", async () => {
+    const connect = stubConnect(() => itemResponse([{ id: "credential", label: "credential", value: "github_pat_123" }]));
+    const seen: Array<{ path: string; auth: string | null }> = [];
+    const mgmt = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
+        return new Response("ok");
+      },
+    });
+    const dir = mkdtempSync(join(tmpdir(), "boundary-connect-"));
+    const credential = {
+      id: "ec_connect",
+      provider: "github",
+      identity_key: "api-key:dev",
+      owner: null,
+      scope: "org",
+      broker_credential_id: 1,
+      created_at: 0,
+    } satisfies ExtensionCredential;
+    try {
+      const boundary = createSecretFileBoundary({
+        secretsDir: dir,
+        resolver: onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" }),
+        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
+        proxyControlToken: "dev-mgmt-token",
+      });
+      await boundary.authorize(credential);
+      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("github_pat_123");
+      expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
+    } finally {
+      connect.stop();
       mgmt.stop(true);
       rmSync(dir, { recursive: true, force: true });
     }

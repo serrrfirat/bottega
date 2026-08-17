@@ -219,6 +219,65 @@ describe("org scope (issue #67)", () => {
     }
   });
 
+  test("secrets_backend sets, round-trips, and merges (issue #190)", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
+      const res = await call(tool, {
+        scope: "org",
+        set: {
+          secrets_backend: {
+            type: "1password-connect",
+            connect_url: "http://op-connect:8080",
+            mapping: { "github:api-key:github": { vault: "vault-1", item: "item-1", field: "credential" } },
+          },
+        },
+      });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as {
+        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, unknown> } };
+      };
+      expect(body.settings.secrets_backend.type).toBe("1password-connect");
+      expect(body.settings.secrets_backend.connect_url).toBe("http://op-connect:8080");
+      expect(store.getOrgSettings()?.secretsBackend?.mapping?.["github:api-key:github"]?.field).toBe("credential");
+
+      // A partial set keeps the backend; switching type back to omp-broker
+      // is allowed with the (now inert) Connect keys still present.
+      await call(tool, { scope: "org", set: { secrets_backend: { type: "omp-broker" } } });
+      const got = await call(tool, { scope: "org" });
+      const read = JSON.parse(got.text) as {
+        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, unknown> } };
+      };
+      expect(read.settings.secrets_backend.type).toBe("omp-broker");
+      expect(read.settings.secrets_backend.connect_url).toBe("http://op-connect:8080");
+      expect(store.getOrgSettings()?.secretsBackend?.type).toBe("omp-broker");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a 1password-connect backend missing connect_url or mapping fails closed and writes nothing", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
+      const missingUrl = await call(tool, {
+        scope: "org",
+        set: { secrets_backend: { type: "1password-connect", mapping: {} } },
+      });
+      expect(missingUrl.isError).toBe(true);
+      expect(missingUrl.text).toContain("secrets_backend.connect_url is required");
+      const missingMapping = await call(tool, {
+        scope: "org",
+        set: { secrets_backend: { type: "1password-connect", connect_url: "http://op-connect:8080" } },
+      });
+      expect(missingMapping.isError).toBe(true);
+      expect(missingMapping.text).toContain("secrets_backend.mapping is required");
+      expect(store.getOrgSettings()).toBeNull(); // nothing written
+    } finally {
+      cleanup();
+    }
+  });
+
   test("invalid set fails closed and writes nothing", async () => {
     const { store, cleanup } = freshStore();
     try {
@@ -496,5 +555,26 @@ describe("settings schemas (issue #67)", () => {
     expect(ok.success).toBe(true);
     const badProactive = settingsSetSchema.safeParse({ proactive: { standup: "yes" } });
     expect(badProactive.success).toBe(false);
+  });
+
+  test("secrets_backend schema accepts a well-formed Connect backend and rejects malformed ones (issue #190)", () => {
+    const ok = settingsSetSchema.safeParse({
+      secrets_backend: {
+        type: "1password-connect",
+        connect_url: "http://op-connect:8080",
+        mapping: {
+          "github:api-key:github": { vault: "vault-1", item: "item-1", field: "credential", type: "api_key" },
+        },
+      },
+    });
+    expect(ok.success).toBe(true);
+    const ompBroker = settingsSetSchema.safeParse({ secrets_backend: { type: "omp-broker" } });
+    expect(ompBroker.success).toBe(true);
+    const badType = settingsSetSchema.safeParse({ secrets_backend: { type: "infisical" } });
+    expect(badType.success).toBe(false);
+    const badEntry = settingsSetSchema.safeParse({
+      secrets_backend: { type: "1password-connect", connect_url: "http://x", mapping: { k: { vault: "v" } } },
+    });
+    expect(badEntry.success).toBe(false);
   });
 });

@@ -16,7 +16,10 @@
  *   extensions allow/deny/org_credentials, repo allowlist, model defaults
  *   (default/fast/reasoning + effort), workspaces dir, git/api base URLs,
  *   loose-PAT dev override, memory backend URL, onboarding space id
- *   (issue #116: the space that receives the boot-time onboarding guide).
+ *   (issue #116: the space that receives the boot-time onboarding guide),
+ *   secrets_backend (issue #190: the credential vault backend — omp-broker
+ *   default, or a 1Password Connect server; the Connect token stays in
+ *   .env).
  *   Set merges partially over
  *   the current blob; validation is fail-closed (setOrgSettings throws on
  *   invalid input and writes nothing).
@@ -135,6 +138,23 @@ export const settingsSetSchema = z.object({
       space_id: z.string().optional(),
     })
     .optional(),
+  secrets_backend: z
+    .object({
+      type: z.enum(["omp-broker", "1password-connect"]),
+      connect_url: z.string().optional(),
+      mapping: z
+        .record(
+          z.string(),
+          z.object({
+            vault: z.string().min(1),
+            item: z.string().min(1),
+            field: z.string().min(1),
+            type: z.enum(["api_key", "oauth"]).optional(),
+          }),
+        )
+        .optional(),
+    })
+    .optional(),
 });
 export type SettingsSetInput = z.infer<typeof settingsSetSchema>;
 
@@ -204,6 +224,9 @@ function mergeSettingsInput(base: OrgSettingsInput, partial: SettingsSetInput): 
   if (partial.onboarding !== undefined) {
     out.onboarding = { ...base.onboarding, ...partial.onboarding };
   }
+  if (partial.secrets_backend !== undefined) {
+    out.secrets_backend = { ...base.secrets_backend, ...partial.secrets_backend };
+  }
   return out;
 }
 
@@ -257,6 +280,13 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   if (settings.onboarding?.spaceId !== undefined) {
     input.onboarding = { space_id: settings.onboarding.spaceId };
   }
+  if (settings.secretsBackend !== undefined) {
+    input.secrets_backend = {
+      type: settings.secretsBackend.type,
+      ...(settings.secretsBackend.connectUrl !== undefined ? { connect_url: settings.secretsBackend.connectUrl } : {}),
+      ...(settings.secretsBackend.mapping !== undefined ? { mapping: settings.secretsBackend.mapping } : {}),
+    };
+  }
   return input;
 }
 
@@ -285,7 +315,10 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
       "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url, onboarding.space_id " +
-      "(the space that receives the boot-time onboarding guide). Space scope knobs " +
+      "(the space that receives the boot-time onboarding guide), secrets_backend (the credential " +
+      "vault backend: type omp-broker [default] or 1password-connect with connect_url + a mapping " +
+      "of \"provider:identityKey\" to {vault, item, field}; the Connect token itself stays in .env " +
+      "as OP_CONNECT_TOKEN — secrets never enter settings). Space scope knobs " +
       "the policy overlay): response_mode, extensions.allow (ids to REMOVE from the org floor " +
       "allowlist), extensions.deny (ids to ADD), extensions.org_credentials, " +
       "proactive.standup / proactive.reflection (the scheduler's per-space opt-in). Omit `set` to read: " +

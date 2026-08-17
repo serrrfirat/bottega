@@ -27,7 +27,9 @@ import { join } from "node:path";
 // The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
 // transitive auth package, same 17.x release train) — no new dependency.
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
-import type { ExtensionCredential } from "../store/db";
+import type { CredentialScope, ExtensionCredential } from "../store/db";
+import type { CredentialType } from "./manifest";
+import type { OrgSecretsBackendSettings, OrgSettings } from "../store/org-settings";
 import { errorMessage } from "../tools/helpers";
 
 /** The server-side secrets directory (shared with iron-proxy via the data volume). */
@@ -62,10 +64,53 @@ export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
- * The broker secret resolver (the boundary's fetch half, issue #54 wiring
- * shipped with #143): given the ladder's resolved registry credential,
- * returns the SECRET PAYLOAD from the OMP auth-broker vault so the
- * boundary can write the extension's secret file (iron-proxy injects it).
+ * The credential reference a secret resolver resolves (issue #190) —
+ * metadata only, the same fields the ladder's registry row carries; the
+ * secret payload never enters it.
+ */
+export interface SecretResolverRef {
+  provider: string;
+  identityKey: string;
+  scope: CredentialScope;
+  owner: string | null;
+  /** The OMP auth-broker vault row id — omp-broker backend only. */
+  brokerCredentialId?: number;
+}
+
+/** What a resolver returns: the credential kind + the secret payload itself. */
+export type SecretResolution = { type: CredentialType; secret: string };
+
+/**
+ * The pluggable secret resolver (issue #190): the boundary's fetch half.
+ * An implementation resolves a credential reference to its secret payload
+ * from the deployment's configured vault backend; the boundary writes that
+ * payload to the extension's secret file and iron-proxy injects it. Fail
+ * closed: an unknown backend or a resolution failure throws — the
+ * extension call errors, it never runs with a wrong or missing credential.
+ * The secret is only ever returned to the boundary — it never reaches the
+ * agent env, transcripts, or audit.
+ */
+export interface SecretResolver {
+  resolve(ref: SecretResolverRef): Promise<SecretResolution>;
+}
+
+/** Adapts a registry row to the resolver's reference shape. */
+function toSecretResolverRef(credential: ExtensionCredential): SecretResolverRef {
+  return {
+    provider: credential.provider,
+    identityKey: credential.identity_key,
+    scope: credential.scope,
+    owner: credential.owner,
+    brokerCredentialId: credential.broker_credential_id,
+  };
+}
+
+/**
+ * The omp-broker secret resolution core (the boundary's fetch half, issue
+ * #54 wiring shipped with #143): given the ladder's resolved registry
+ * credential, returns the SECRET PAYLOAD (+ its kind) from the OMP
+ * auth-broker vault so the boundary can write the extension's secret file
+ * (iron-proxy injects it).
  *
  * Env contract (set by scripts/dev.sh locally, by docker-compose.yml in
  * deployment): `OMP_AUTH_BROKER_URL` (broker base, e.g.
@@ -82,41 +127,174 @@ export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env
  * returned to the boundary — it never reaches the caller, transcripts, or
  * audit.
  */
+async function resolveBrokerSecret(env: NodeJS.ProcessEnv, ref: SecretResolverRef): Promise<SecretResolution> {
+  const brokerUrl = env.OMP_AUTH_BROKER_URL;
+  const brokerToken = env.OMP_AUTH_BROKER_TOKEN;
+  if (!brokerUrl || !brokerToken) {
+    throw new Error(
+      "extension credential boundary: broker secret resolution is not configured — set OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN " +
+        "(local dev: `bun run dev` starts the auth-broker vault and exports both; deployment: copy the token from the data volume " +
+        "`docker compose exec auth-broker cat /data/.omp/auth-broker.token` into .env)",
+    );
+  }
+  if (ref.brokerCredentialId === undefined) {
+    throw new Error(
+      `extension credential boundary: the omp-broker resolver needs the registry row's broker credential id for "${ref.provider}" — none was recorded`,
+    );
+  }
+  // A fresh client per call: rotation of the broker token applies to the
+  // next extension call without a server restart, and the snapshot is
+  // always current (the broker is the canonical writer).
+  const client = new AuthBrokerClient({ url: brokerUrl, token: brokerToken });
+  const result = await client.fetchSnapshot();
+  if (result.status !== 200) {
+    throw new Error(`extension credential boundary: broker snapshot fetch failed (status ${result.status})`);
+  }
+  const entry = result.snapshot.credentials.find(
+    (candidate) => candidate.id === ref.brokerCredentialId && candidate.provider === ref.provider,
+  );
+  if (!entry) {
+    throw new Error(
+      `extension credential boundary: the broker has no "${ref.provider}" vault row ${ref.brokerCredentialId} — re-run connect ${ref.provider} as me|org`,
+    );
+  }
+  if (entry.credential.type === "api_key") return { type: "api_key", secret: entry.credential.key };
+  if (entry.credential.type === "oauth") return { type: "oauth", secret: entry.credential.access };
+  throw new Error(
+    `extension credential boundary: unsupported vault credential type "${entry.credential["type"]}" for ${ref.provider}`,
+  );
+}
+
+/**
+ * The original broker resolver signature (issue #54 wiring, #143): returns
+ * just the secret payload for a registry credential. Behavior is
+ * byte-identical to the omp-broker {@link SecretResolver} backend — this is
+ * the thin legacy wrapper.
+ */
 export function brokerSecretResolverFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): (credential: ExtensionCredential) => Promise<string> {
-  return async (credential: ExtensionCredential): Promise<string> => {
-    const brokerUrl = env.OMP_AUTH_BROKER_URL;
-    const brokerToken = env.OMP_AUTH_BROKER_TOKEN;
-    if (!brokerUrl || !brokerToken) {
-      throw new Error(
-        "extension credential boundary: broker secret resolution is not configured — set OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN " +
-          "(local dev: `bun run dev` starts the auth-broker vault and exports both; deployment: copy the token from the data volume " +
-          "`docker compose exec auth-broker cat /data/.omp/auth-broker.token` into .env)",
+  return async (credential: ExtensionCredential): Promise<string> =>
+    (await resolveBrokerSecret(env, toSecretResolverRef(credential))).secret;
+}
+
+/**
+ * The `omp-broker` {@link SecretResolver} backend (issue #190): the
+ * deployment default, backed by the OMP auth-broker vault — the current
+ * resolver, behavior unchanged. The OAuth lifecycle (token refresh) lives
+ * here; see {@link resolveBrokerSecret} for the env contract + fail-closed
+ * rules.
+ */
+export function ompBrokerResolverFromEnv(env: NodeJS.ProcessEnv = process.env): SecretResolver {
+  return { resolve: (ref) => resolveBrokerSecret(env, ref) };
+}
+
+/**
+ * The `1password-connect` {@link SecretResolver} backend (issue #190):
+ * resolves static credentials (API keys / PATs) from an org's 1Password
+ * Connect server.
+ *
+ * Mapping (the org's config, in the settings blob): `secrets_backend` maps
+ * `"<provider>:<identityKey>"` (the credential row's provider + identity
+ * key — the same readable identity the connect flow records) to the
+ * 1Password location `{vault, item, field}`. The field value is the
+ * secret; `field` matches the Connect item field by id OR label. The
+ * entry's optional `type` declares the credential kind (default `api_key`;
+ * the boundary only consumes the payload, oauth refresh stays with the
+ * omp-broker backend).
+ *
+ * The Connect access token is a SECRET: it lives in env/.env as
+ * `OP_CONNECT_TOKEN` (the standard Connect env var), read lazily at
+ * resolve time like the broker token — the server boots without it and
+ * fails closed on the first extension call. The Connect REST API is a
+ * plain `fetch` client (no new dependency).
+ *
+ * Fail closed: missing mapping → throws (never a wrong credential);
+ * missing token → throws before any fetch; a non-2xx item fetch (bad
+ * token / missing vault/item) → throws; a field without a value → throws.
+ */
+export function onePasswordConnectResolver(
+  backend: OrgSecretsBackendSettings,
+  env: NodeJS.ProcessEnv = process.env,
+): SecretResolver {
+  return {
+    async resolve(ref: SecretResolverRef): Promise<SecretResolution> {
+      const connectUrl = backend.connectUrl;
+      if (connectUrl === undefined || connectUrl === "") {
+        throw new Error(
+          "extension credential boundary: 1password-connect needs secrets_backend.connect_url (the Connect server base URL)",
+        );
+      }
+      const mapping = backend.mapping ?? {};
+      const key = `${ref.provider}:${ref.identityKey}`;
+      const entry = mapping[key];
+      if (!entry) {
+        throw new Error(
+          `extension credential boundary: no 1Password mapping for "${key}" — add secrets_backend.mapping["${key}"] = {vault, item, field}`,
+        );
+      }
+      const token = env.OP_CONNECT_TOKEN;
+      if (!token) {
+        throw new Error(
+          "extension credential boundary: 1Password Connect token is not configured — set OP_CONNECT_TOKEN in .env (the Connect server's access token)",
+        );
+      }
+      let res: Response;
+      try {
+        res = await fetch(`${connectUrl}/v1/vaults/${entry.vault}/items/${entry.item}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch (err) {
+        throw new Error(`extension credential boundary: 1Password Connect fetch failed: ${errorMessage(err)}`);
+      }
+      if (!res.ok) {
+        throw new Error(
+          `extension credential boundary: 1Password Connect item fetch failed (${res.status}) — check connect_url, OP_CONNECT_TOKEN, and the vault/item ids`,
+        );
+      }
+      let item: { fields?: Array<{ id?: string; label?: string; value?: string }> };
+      try {
+        item = (await res.json()) as typeof item;
+      } catch (err) {
+        throw new Error(`extension credential boundary: 1Password Connect returned a malformed item: ${errorMessage(err)}`);
+      }
+      const field = (item.fields ?? []).find(
+        (candidate) => candidate.id === entry.field || candidate.label === entry.field,
       );
-    }
-    // A fresh client per call: rotation of the broker token applies to the
-    // next extension call without a server restart, and the snapshot is
-    // always current (the broker is the canonical writer).
-    const client = new AuthBrokerClient({ url: brokerUrl, token: brokerToken });
-    const result = await client.fetchSnapshot();
-    if (result.status !== 200) {
-      throw new Error(`extension credential boundary: broker snapshot fetch failed (status ${result.status})`);
-    }
-    const entry = result.snapshot.credentials.find(
-      (candidate) => candidate.id === credential.broker_credential_id && candidate.provider === credential.provider,
-    );
-    if (!entry) {
-      throw new Error(
-        `extension credential boundary: the broker has no "${credential.provider}" vault row ${credential.broker_credential_id} — re-run connect ${credential.provider} as me|org`,
-      );
-    }
-    if (entry.credential.type === "api_key") return entry.credential.key;
-    if (entry.credential.type === "oauth") return entry.credential.access;
-    throw new Error(
-      `extension credential boundary: unsupported vault credential type "${entry.credential["type"]}" for ${credential.provider}`,
-    );
+      if (!field) {
+        throw new Error(
+          `extension credential boundary: 1Password item ${entry.item} has no field "${entry.field}" (matched by id or label)`,
+        );
+      }
+      const secret = field.value;
+      if (secret === undefined || secret === "") {
+        throw new Error(
+          `extension credential boundary: 1Password field "${entry.field}" has no value — the Connect token needs read access to it`,
+        );
+      }
+      return { type: entry.type ?? "api_key", secret };
+    },
   };
+}
+
+/**
+ * Picks the deployment's {@link SecretResolver} at boot (issue #190) from
+ * the org settings blob's `secrets_backend` knob. Unset (or explicitly
+ * `omp-broker`) → the omp-broker backend, behavior byte-identical to the
+ * pre-#190 boundary. `1password-connect` → the Connect backend, configured
+ * from the blob (connect_url + mapping); its token stays in env.
+ * Unknown types are unreachable through the settings validator
+ * (parseOrgSettingsJson rejects them) but fail closed here anyway — a
+ * resolver must never silently fall back to the default.
+ */
+export function secretResolverFromSettings(
+  settings: OrgSettings | null,
+  env: NodeJS.ProcessEnv = process.env,
+): SecretResolver {
+  const backend = settings?.secretsBackend;
+  if (backend === undefined || backend.type === "omp-broker") return ompBrokerResolverFromEnv(env);
+  if (backend.type === "1password-connect") return onePasswordConnectResolver(backend, env);
+  throw new Error(`extension credential boundary: unknown secrets_backend type "${backend["type"]}"`);
 }
 
 /**
@@ -130,6 +308,13 @@ export interface CredentialBoundary {
 }
 
 export interface SecretFileBoundaryOpts {
+  /**
+   * Pluggable secret resolver (issue #190): resolves the credential's
+   * secret payload from the deployment's configured backend (omp-broker
+   * default, 1password-connect). Preferred over `resolveSecret` when both
+   * are given — this is the canonical form the composition root wires.
+   */
+  resolver?: SecretResolver;
   /**
    * Fetches the secret payload for the resolved credential from the auth
    * broker (account-pool-scoped, issue #51). The broker client lands with
@@ -152,13 +337,15 @@ export interface SecretFileBoundaryOpts {
  */
 export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): CredentialBoundary {
   const secretsDir = opts.secretsDir ?? process.env.BOTTEGA_PROXY_SECRETS_DIR ?? PROXY_SECRETS_DIR;
-  const resolveSecret =
-    opts.resolveSecret ??
-    (() => {
-      throw new Error(
-        "extension credential boundary: no broker secret resolver wired (issue #54) — the call would run unauthenticated, failing closed",
-      );
-    });
+  const resolveSecret = opts.resolver
+    ? async (credential: ExtensionCredential): Promise<string> =>
+        (await opts.resolver!.resolve(toSecretResolverRef(credential))).secret
+    : opts.resolveSecret ??
+      (() => {
+        throw new Error(
+          "extension credential boundary: no broker secret resolver wired (issue #54) — the call would run unauthenticated, failing closed",
+        );
+      });
   return {
     async authorize(credential) {
       const secret = await resolveSecret(credential);
