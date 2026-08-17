@@ -56,6 +56,7 @@ import { SpaceService } from "./services/space-service";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { SecretFileBoundaryOpts } from "../extensions/boundary";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -155,6 +156,15 @@ export interface BottegaServerOpts {
    * the other two roots under the same settings.
    */
   onRuntimeWiring?: (wiring: BootstrapRuntime) => void;
+  /**
+   * Egress-boundary override (issue #191): proxy-control / secrets-dir
+   * overrides threaded into the shared chain's credential boundary (see
+   * {@link BootstrapRuntimeDeps.boundary}). The composition-root parity
+   * test pins an absolute temp secrets dir so its authorize() probes never
+   * touch the live data/proxy-secrets. Unset → the deployment defaults
+   * (the configured resolver, env proxy control, the live secrets dir).
+   */
+  boundary?: SecretFileBoundaryOpts;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -178,6 +188,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const wiring = await bootstrapRuntime({
     router: () => approvalRouter,
     ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
   });
   const {
     store,

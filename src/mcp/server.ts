@@ -97,6 +97,7 @@ import { extensionToolSurface, toolOwnerExtensionId, type ExtensionSurfaces } fr
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "../server/bootstrap-runtime";
+import type { SecretFileBoundaryOpts } from "../extensions/boundary";
 
 export interface MemoryMcpServerOptions {
   provider: MemoryProvider;
@@ -556,6 +557,14 @@ export async function bootMemoryMcpServer(opts: {
   defaultPrincipal?: string;
   sessionDir?: string;
   mcpTransport?: (binding: McpBinding) => Transport;
+  /**
+   * Egress-boundary override (issue #191): proxy-control / secrets-dir
+   * overrides threaded into the shared chain's credential boundary (see
+   * {@link BootstrapRuntimeDeps.boundary}). The composition-root parity
+   * test pins an absolute temp secrets dir so its authorize() probes never
+   * touch the live data/proxy-secrets. Unset → the deployment defaults.
+   */
+  boundary?: SecretFileBoundaryOpts;
 } = {}): Promise<McpBoot> {
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
@@ -565,6 +574,7 @@ export async function bootMemoryMcpServer(opts: {
     ...(opts.configDir !== undefined ? { configDir: opts.configDir } : {}),
     ...(opts.extensionsDir !== undefined ? { extensionsDir: opts.extensionsDir } : {}),
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
   });
   const { store, audit, orgPolicy } = runtime;
   // Per-session space: apply the space's overlay so the session's policy

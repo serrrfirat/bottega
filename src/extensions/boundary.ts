@@ -23,7 +23,7 @@
  * volume at /data on the proxy side).
  */
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 // The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
 // transitive auth package, same 17.x release train) — no new dependency.
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
@@ -348,6 +348,18 @@ export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): Cre
       });
   return {
     async authorize(credential) {
+      // Test isolation (issue #191): the composition-root parity suite
+      // (#172/#190) clobbered the LIVE data/proxy-secrets/github.secret by
+      // authorizing with the relative default after its temp-dir boots
+      // restored the repo cwd — the write landed in the production dir.
+      // Under the test runner (bun test sets NODE_ENV=test) the boundary
+      // must never write the live default: fail the test loudly BEFORE any
+      // file system write instead of clobbering the real credential.
+      if (process.env.NODE_ENV === "test" && resolve(secretsDir) === resolve(PROXY_SECRETS_DIR)) {
+        throw new Error(
+          "extension credential boundary: refusing the live default secrets dir under test — pass an explicit temp secretsDir (issue #191)",
+        );
+      }
       const secret = await resolveSecret(credential);
       const fileName = extensionSecretFileName(credential.provider);
       mkdirSync(secretsDir, { recursive: true });

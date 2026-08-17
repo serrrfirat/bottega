@@ -55,6 +55,7 @@ import {
   type ModelRole,
 } from "./server/drivers/agent-driver";
 import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
+import type { SecretFileBoundaryOpts } from "./extensions/boundary";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "./extensions/manifest";
@@ -193,10 +194,19 @@ export async function bootExecutorRuntime(opts: {
   agentDir?: string;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (binding: McpBinding) => Transport;
+  /**
+   * Egress-boundary override (issue #191): proxy-control / secrets-dir
+   * overrides threaded into the shared chain's credential boundary (see
+   * {@link BootstrapRuntimeDeps.boundary}). The composition-root parity
+   * test pins an absolute temp secrets dir so its authorize() probes never
+   * touch the live data/proxy-secrets. Unset → the deployment defaults.
+   */
+  boundary?: SecretFileBoundaryOpts;
 } = {}): Promise<ExecutorBoot> {
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
   });
   const { store, audit, orgPolicy } = runtime;
   const agentDir = opts.agentDir ?? "data/omp-agent";

@@ -173,7 +173,11 @@ async function captureWirings(settings: Record<string, unknown>): Promise<RootWi
   const envs: CaptureEnv[] = [];
   const originalCwd = process.cwd();
   try {
-    // Server root: a real main() with the wiring seam.
+    // Server root: a real main() with the wiring seam. The boundary gets
+    // an explicit ABSOLUTE temp secrets dir (issue #191): the boots chdir
+    // into their temp root, but authorize() runs AFTER cleanup restored
+    // the repo cwd — the relative default "data/proxy-secrets" would
+    // resolve to the LIVE production dir and clobber github.secret.
     const serverEnv = tempEnv(originalCwd);
     envs.push(serverEnv);
     seedSettings(settings);
@@ -181,6 +185,7 @@ async function captureWirings(settings: Record<string, unknown>): Promise<RootWi
     const serverBoot = await main({
       agentDir: join(serverEnv.dir, "agent"),
       surfaceTransport: closedTransport,
+      boundary: { secretsDir: join(serverEnv.dir, "data", "proxy-secrets") },
       onRuntimeWiring: (wiring) => {
         server = wiring;
       },
@@ -195,13 +200,17 @@ async function captureWirings(settings: Record<string, unknown>): Promise<RootWi
     const executor = await bootExecutorRuntime({
       agentDir: join(executorEnv.dir, "agent"),
       mcpTransport: closedTransport,
+      boundary: { secretsDir: join(executorEnv.dir, "data", "proxy-secrets") },
     });
 
     // MCP root: the real boot function (shared chain + policy overlay + server).
     const mcpEnv = tempEnv(originalCwd);
     envs.push(mcpEnv);
     seedSettings(settings);
-    const mcp = await bootMemoryMcpServer({ mcpTransport: closedTransport });
+    const mcp = await bootMemoryMcpServer({
+      mcpTransport: closedTransport,
+      boundary: { secretsDir: join(mcpEnv.dir, "data", "proxy-secrets") },
+    });
 
     return { server, executor, mcp };
   } finally {

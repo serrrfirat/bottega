@@ -139,6 +139,23 @@ describe("createSecretFileBoundary reload half (issue #123, dev token contract)"
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("the live default secrets dir is refused under the test runner (issue #191)", async () => {
+    // The boundary's default PROXY_SECRETS_DIR is the LIVE production dir.
+    // The parity suite (#172/#190) clobbered data/proxy-secrets/github.secret
+    // by authorizing without an explicit temp secretsDir; the guard must
+    // fail the test loudly BEFORE any file system write. The default
+    // resolves to the live path from this file's cwd (the repo root).
+    const before = process.env.BOTTEGA_PROXY_SECRETS_DIR;
+    delete process.env.BOTTEGA_PROXY_SECRETS_DIR;
+    try {
+      const boundary = createSecretFileBoundary({ resolveSecret: async () => "s" });
+      await expect(boundary.authorize(CREDENTIAL)).rejects.toThrow(/refusing the live default secrets dir/);
+    } finally {
+      if (before === undefined) delete process.env.BOTTEGA_PROXY_SECRETS_DIR;
+      else process.env.BOTTEGA_PROXY_SECRETS_DIR = before;
+    }
+  });
 });
 
 describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
