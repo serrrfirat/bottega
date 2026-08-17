@@ -1,8 +1,8 @@
 # bottega
 
 **An AI co-worker that lives in your Slack and picks up real work for your
-org.** Ship a fix, update a ticket, chase a follow-up, run the weekly ops
-chore, answer the question nobody has time to dig into — ask in the channel,
+org.** Update the CRM, chase a follow-up, run the weekly ops chore, answer
+the question nobody has time to dig into, ship a fix — ask in the channel,
 and it turns the conversation into tracked, delivered work. It remembers what
 your team teaches it, follows the rules you set, and leaves a receipt for
 everything it does.
@@ -12,22 +12,23 @@ Self-hosted, per-org: your data, your models, your infrastructure. One
 
 ## What working with it looks like
 
-> **you:** the checkout flow is flaky again, I think it's the retry logic
-> **bottega:** I see three retry paths in `acme/shop`. The backoff in
-> `payment-client` looks wrong — want me to take it?
-> **you:** @bottega take this, and move the Linear ticket when the PR is up
-> **bottega:** *[Approve / Deny]* — create work item: fix retry backoff in acme/shop
+> **you:** we just signed Meridian — can someone get them set up?
+> **bottega:** I can take it: mark the Meridian deal as Closed Won in
+> Attio and create the onboarding tickets in Linear from our standard
+> checklist. Want me to?
+> **you:** @bottega yes, take it
+> **bottega:** *[Approve / Deny]* — create work item: Meridian onboarding
+> (Attio + Linear)
 > **you:** *clicks Approve*
-> **bottega:** PR ready: github.com/acme/shop/pull/482 — Linear SHOP-291
-> moved to In Review. Approve to finish.
+> **bottega:** Done — Attio deal moved to Closed Won, 6 onboarding tickets
+> created in Linear: linear.app/acme/project/meridian-onboarding.
 
-That's one kind of task. The same co-worker updates records in your
-connected tools, answers questions from your org's own knowledge, posts the
-standup digest, and runs recurring operational chores on a schedule. The
-conversation stays in the channel where the team already works; the work
-happens in an isolated workspace, gated by your policies, and comes back as
-whatever the task calls for — a pull request, an updated ticket, or an
-answer in the thread.
+Next door, the platform channel asks the same co-worker to fix a flaky
+retry path and gets back a pull request. Support asks it a question and
+gets an answer sourced from the org's own docs and decisions. Ops has it
+running the weekly chores on a schedule. Every ask, in any channel, becomes
+a tracked work item — gated by your policies, delivered as whatever the
+task calls for, never silently dropped.
 
 ## What you get
 
