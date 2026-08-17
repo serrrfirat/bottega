@@ -44,9 +44,10 @@ import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
+import { redact } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
-import { loadSpacePolicy, orgCredentialsAllowed, type PolicyConfig } from "../policy/config";
-import { evaluatePolicyGate, type PolicyGateCall } from "../policy/gate";
+import { loadSpacePolicy, orgCredentialsAllowed, resolveTier, type PolicyConfig } from "../policy/config";
+import { evaluatePolicyGate, summarizeArgs, type PolicyGateCall } from "../policy/gate";
 import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CALL_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
@@ -55,6 +56,12 @@ import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
 import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
+import {
+  emitToolStep,
+  nextToolStepId,
+  toolStepTitle,
+  type ToolStepSink,
+} from "../server/services/slack-turn-presenter";
 
 export type ExtensionCallDecision = "allow" | "deny" | "error";
 
@@ -118,6 +125,15 @@ export interface ExtensionRuntimeDeps {
    * is a clear error result, never a silent empty toolset).
    */
   surfaces?: ExtensionSurfaces;
+  /**
+   * Thinking-step sink (issue #168): every gated extension tool call emits
+   * one task_update — in_progress "tool — allowed (tier)" on start (or
+   * "waiting for approval" while the approval router waits), complete on
+   * resolution, a terminal denied card on denial. Titles and the args
+   * code-card pass the same redaction as audit payloads. Headless callers
+   * omit it.
+   */
+  onToolStep?: ToolStepSink;
 }
 
 export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRuntime {
@@ -211,6 +227,10 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         actor: caller,
         extensionId,
       };
+      const sink = deps.onToolStep;
+      const tier = tool.tier ?? resolveTier(tool.name);
+      const stepArgs = sink !== undefined ? redact(summarizeArgs(args)) : undefined;
+      const taskId = nextToolStepId();
       const outcome = await evaluatePolicyGate(
         {
           loadPolicy,
@@ -222,12 +242,53 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           // gate consults it only for calls carrying this extensionId).
           toolTier: (name) =>
             surface.find((entry) => entry.name === name || entry.providerName === name)?.tier,
+          // Issue #168: render "waiting for approval" while the router
+          // waits — the resolution (approved/denied) shares this taskId.
+          onAskHuman:
+            sink !== undefined
+              ? () => {
+                  emitToolStep(sink, {
+                    spaceId,
+                    taskId,
+                    title: toolStepTitle(tool.name, "waiting for approval"),
+                    status: "in_progress",
+                    output: stepArgs,
+                  });
+                }
+              : undefined,
         },
         gateCall,
       );
       if (!outcome.allowed) {
         await auditCall({ extensionId, toolName: tool.name, actor: caller, spaceId, credentialId: null, decision: "deny" });
+        // Terminal deny card: a waiting-for-approval card (ask-human) is
+        // resolved here; a straight deny renders one deny step.
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(tool.name, `denied (${tier})`),
+          status: "complete",
+          output: stepArgs,
+        });
         return { ok: false, error: outcome.blockReason };
+      }
+      if (outcome.decision === "ask-human") {
+        // The waiting card (onAskHuman above) resolves as "approved".
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(tool.name, `approved (${tier})`),
+          status: "complete",
+          output: stepArgs,
+        });
+      } else {
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(tool.name, `allowed (${tier})`),
+          status: "in_progress",
+          output: stepArgs,
+        });
       }
 
       // 2. Credential ladder over the store's registry rows. Personal
@@ -249,6 +310,17 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       if (resolution.kind !== "credential") {
         // "ask" is a blocking signal too: the runtime never guesses an account.
         await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
+        // The card documents the attempt: check it off so the thinking
+        // panel never shows a stuck spinner (the error rides the reply).
+        if (outcome.decision !== "ask-human") {
+          emitToolStep(sink, {
+            spaceId,
+            taskId,
+            title: toolStepTitle(tool.name, `allowed (${tier})`),
+            status: "complete",
+            output: stepArgs,
+          });
+        }
         return { ok: false, error: resolution.kind === "ask" ? resolution.reason : resolution.message };
       }
       const credential = resolution.credential;
@@ -260,15 +332,36 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       // extension's allowlisted domains). Failures (boundary write, proxy
       // reload, transport, provider) are tool errors, never silent no-ops —
       // the allow decision is already on the trail. The provider sees the
-      // WIRE name (providerName ?? manifest name, issue #148).
+      // WIRE name (providerName ?? manifest name, issue #148). The step
+      // checks off either way — the card documents the attempt, so the
+      // thinking panel never shows a stuck spinner.
       const wireName = tool.providerName ?? tool.name;
       try {
         await boundary.authorize(credential);
-        if (manifest.kind === "mcp") {
-          return await callMcpTool(makeTransport, manifest.mcp, wireName, args);
+        const result =
+          manifest.kind === "mcp"
+            ? await callMcpTool(makeTransport, manifest.mcp, wireName, args)
+            : await callCliTool(manifest.cli, wireName, args);
+        if (outcome.decision !== "ask-human") {
+          emitToolStep(sink, {
+            spaceId,
+            taskId,
+            title: toolStepTitle(tool.name, `allowed (${tier})`),
+            status: "complete",
+            output: stepArgs,
+          });
         }
-        return await callCliTool(manifest.cli, wireName, args);
+        return result;
       } catch (err) {
+        if (outcome.decision !== "ask-human") {
+          emitToolStep(sink, {
+            spaceId,
+            taskId,
+            title: toolStepTitle(tool.name, `allowed (${tier})`),
+            status: "complete",
+            output: stepArgs,
+          });
+        }
         return { ok: false, error: `extension tool "${tool.name}" failed: ${errorMessage(err)}` };
       }
     },

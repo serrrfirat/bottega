@@ -303,6 +303,13 @@ describe("acp driver", () => {
       },
       async addReaction() {},
       async removeReaction() {},
+      async startStream() {
+        throw new Error("not used");
+      },
+      async appendText() {},
+      async appendTask() {},
+      async stopStream() {},
+      streamingSupported: () => false,
       async start() {},
       async stop() {},
     };

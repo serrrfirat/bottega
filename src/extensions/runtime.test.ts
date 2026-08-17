@@ -84,6 +84,8 @@ function makeHarness(opts: {
   manifests?: ExtensionManifest[];
   boundary?: CredentialBoundary;
   mcpTransport?: (binding: McpBinding) => Transport;
+  onToolStep?: ExtensionRuntimeDeps["onToolStep"];
+  router?: ExtensionRuntimeDeps["router"];
 } = {}): RuntimeHarness {
   const registry = createFixtureRegistry();
   for (const manifest of opts.manifests ?? []) registry.register(manifest);
@@ -109,9 +111,10 @@ function makeHarness(opts: {
     store,
     audit: createAudit(store),
     orgPolicy: opts.policy ?? parseOrgConfigYaml("tools:\n  unknown: allow\n"),
-    router: DenyRouter,
+    router: opts.router ?? DenyRouter,
     boundary,
     mcpTransport,
+    ...(opts.onToolStep !== undefined ? { onToolStep: opts.onToolStep } : {}),
   };
   return { runtime: createExtensionRuntime(deps), store, boundary, transports, mcpTransport };
 }
@@ -206,6 +209,118 @@ describe("extension runtime: gate first (denied calls never resolve a credential
     expect(parse(calls[1]!)).toMatchObject({ extension: FIXTURE_EXTENSION_ID, tool: "weather.history", decision: "error" });
     expect(await callRows(h.store, EXTENSION_CREDENTIAL_RESOLVED_EVENT)).toHaveLength(0);
     expect(h.boundary.calls).toHaveLength(0);
+  });
+});
+
+describe("extension runtime: thinking-step emission (issue #168)", () => {
+  /** Collects the steps the sink received for one call. */
+  function stepHarness(opts: Parameters<typeof makeHarness>[0] = {}) {
+    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string }> = [];
+    const h = makeHarness({ ...opts, onToolStep: (step) => steps.push(step) });
+    return { h, steps };
+  }
+
+  test("an allowed call emits in_progress then complete with one shared task id", async () => {
+    const { h, steps } = stepHarness();
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(true);
+
+    expect(steps).toHaveLength(2);
+    expect(steps[0]).toMatchObject({
+      spaceId: "slack:C1",
+      status: "in_progress",
+      title: `${FIXTURE_EXTENSION_TOOL} — allowed (read)`,
+    });
+    expect(steps[1]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: `${FIXTURE_EXTENSION_TOOL} — allowed (read)` });
+    expect(steps[0]!.taskId).toBe(steps[1]!.taskId); // one card, checked off
+  });
+
+  test("a denied call emits a single terminal deny step", async () => {
+    const { h, steps } = stepHarness({ policy: parseOrgConfigYaml("extensions:\n  deny:\n    - fixture.weather\n") });
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(false);
+
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: `${FIXTURE_EXTENSION_TOOL} — denied (read)` });
+  });
+
+  test("a missing credential still checks the card off (no stuck spinner)", async () => {
+    const { h, steps } = stepHarness();
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(false);
+
+    // The ladder blocked the call, but the in_progress card resolved to
+    // complete — the panel never shows a spinner for a finished attempt.
+    expect(steps).toHaveLength(2);
+    expect(steps[0]!.status).toBe("in_progress");
+    expect(steps[1]!.status).toBe("complete");
+    expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
+  });
+
+  test("an ask-human call emits waiting for approval, then approved, on one shared card", async () => {
+    const { h, steps } = stepHarness({
+      policy: parseOrgConfigYaml("tools:\n  weather.current: prompt\n"),
+      router: { request: async () => ({ approved: true, approver: "U1" }) },
+    });
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(true);
+
+    // waiting-for-approval (in_progress, via the gate's onAskHuman hook)
+    // then approved (complete) — the SAME card, one id.
+    expect(steps).toHaveLength(2);
+    expect(steps[0]).toMatchObject({ spaceId: "slack:C1", status: "in_progress", title: `${FIXTURE_EXTENSION_TOOL} — waiting for approval` });
+    expect(steps[1]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: `${FIXTURE_EXTENSION_TOOL} — approved (read)` });
+    expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
+  });
+
+  test("secret-shaped args are redacted in the step output, never raw", async () => {
+    const { h, steps } = stepHarness();
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon", api_key: "sk-ant-api03-0123456789abcdef", token: "xoxb-1234567890-abcdef" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(true);
+
+    const joined = steps.map((s) => s.output ?? "").join(" ");
+    expect(joined).not.toContain("sk-ant-api03-0123456789abcdef");
+    expect(joined).not.toContain("xoxb-1234567890-abcdef");
+    expect(joined).toContain("[REDACTED]");
   });
 });
 

@@ -1,15 +1,36 @@
 import { createHash } from "node:crypto";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { ADMIN_ONBOARDING_NUDGE_EVENT, DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
-import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
+import { channelFromSpaceId, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
-import { onboardingGuideText, runWizardChecks, type WizardCheck } from "../../tools/admin";
+import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
+import {
+  createPhraseRotation,
+  SlackTurnPresenter,
+  StreamTurnPresenter,
+  type ToolStepEvent,
+  type TurnPresenterDeps,
+} from "./slack-turn-presenter";
+
+// Turn-rendering constants and helpers moved to the SlackTurnPresenter
+// (issue #153/#168); re-exported here so existing callers (tests, e2e
+// canary) keep importing them from space-service.
+export {
+  THINKING_PHRASES,
+  EMPTY_TURN_LIMIT,
+  STREAM_UPDATE_INTERVAL_MS,
+  EMPTY_RESPONSE_FALLBACK,
+  CHURN_MESSAGE,
+  emptyResponseFallback,
+  churnMessageText,
+} from "./slack-turn-presenter";
+export type { ToolStepEvent, ToolStepSink } from "./slack-turn-presenter";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -122,99 +143,12 @@ export const REQUEST_ONLY_DIRECTIVE =
 export const SLACK_FORMAT_DIRECTIVE =
   "Format replies for Slack, not Markdown: *bold*, _italic_, ~strike~, `inline code`, • bullets, <url|label> links; never **, # headings, md tables, or [label](url); keep @mentions and :emoji: as-is.";
 
-/**
- * Rotating status phrases posted on message receipt (issue #119) and updated
- * in place by the real reply (or error text) when the turn completes (issue
- * #40). Since #60, every posting path is retry-safe: while a phrase is
- * pending for the space, the next rotating phrase UPDATES it in place
- * instead of posting a second message, so an OMP auto-retry loop never
- * stacks phrases. A turn that ends with neither message nor error leaves the
- * phrase as-is.
- */
-/** Rotating status phrases posted on turn_start; exported so tests (e2e #66) can assert the in-place replacement. */
-export const THINKING_PHRASES = [
-  "Thinking…",
-  "On it — thinking…",
-  "Give me a second…",
-  "Working on it…",
-  "Let me think…",
-];
-
-/**
- * Consecutive empty completions that trip the churn guard (issue #60): beyond
- * this many, one visible churn message replaces the phrase and phrases stay
- * off until a non-empty turn. Root cause: reasoning-only output (content
- * empty when the token budget is consumed by reasoning) or a stale gateway
- * route — either way OMP auto-retries and every retry re-fires turn_start.
- */
-export const EMPTY_TURN_LIMIT = 3;
-
-/**
- * Streaming phrase-update cadence (issue #120): Slack rate-limits
- * `chat.update` (~50/min tier), so a dense streamed turn coalesces its
- * in-place phrase updates to at most one per 400ms — smooth enough to read
- * as streaming, while a 429 (fail-soft below) merely skips an interim
- * update instead of stalling the turn. The turn's FINAL reply text is
- * always delivered — flushed on turn_end with bounded retries on a 429 —
- * while interim updates may be skipped. Batching applies ONLY to the
- * streaming (steer) path; non-streaming replies update exactly as before.
- * Hardcoded default (no org setting).
- */
-export const STREAM_UPDATE_INTERVAL_MS = 400;
-
-/**
- * Bounded retries for the FINAL streaming update (issue #120): after this
- * many consecutive final-flush failures (e.g. a hard 429), the update is
- * dropped with a log rather than hammering Slack forever. Interim updates
- * never retry on their own — they wait for the turn-end flush.
- */
-const STREAM_FINAL_RETRY_LIMIT = 3;
-
-/** Shown on a `message` event whose text is empty/whitespace (issue #60). */
-export const EMPTY_RESPONSE_FALLBACK = "Hmm — I got an empty response, retrying…";
-
-/** Surfaced once after {@link EMPTY_TURN_LIMIT} consecutive empty turns (issue #60). */
-export const CHURN_MESSAGE = "I keep getting empty responses — check the model key?";
-
-/**
- * {@link EMPTY_RESPONSE_FALLBACK} carrying the real provider/session cause
- * (issue #78): when the empty completion is a swallowed provider error (e.g.
- * the replay-ordering 400), the fallback names the cause instead of guessing.
- * Fail closed: no cause → the exact legacy phrase.
- */
-export function emptyResponseFallback(cause: string | undefined): string {
-  return cause && cause.trim() ? `Hmm — I got an empty response: ${cause.trim()} — retrying…` : EMPTY_RESPONSE_FALLBACK;
-}
-
-/**
- * {@link CHURN_MESSAGE} carrying the real provider/session cause (issue #78):
- * the cause supersedes the "check the model key?" guess when one exists.
- * Fail closed: no cause → the exact legacy phrase.
- */
-export function churnMessageText(cause: string | undefined): string {
-  return cause && cause.trim() ? `I keep getting empty responses — ${cause.trim()}` : CHURN_MESSAGE;
-}
-
 interface LiveSession {
   spaceId: string;
   session: AgentSessionDriver;
   idleTimer: ReturnType<typeof setTimeout>;
   detachLearning: () => void;
   disposing: boolean;
-}
-
-/** State of one coalesced streaming phrase update (issue #120). */
-interface PendingStreamUpdate {
-  /** The pending thinking-phrase ts the update rewrites in place. */
-  ts: string;
-  /** Latest streamed text; older text is dropped (coalescing). */
-  text: string;
-  /** The turn has ended: this text is the final reply and must land. */
-  final: boolean;
-  /** Failed final-delivery attempts; bounded so a hard 429 cannot loop forever. */
-  retries: number;
-  /** The cadence timer, or null when none is armed. */
-  timer: ReturnType<typeof setTimeout> | null;
 }
 
 /**
@@ -242,74 +176,16 @@ export class SpaceService {
   readonly #personaDir: string | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
-  /** ts of the latest inbound message per space; agent replies thread under it. */
-  readonly #lastInboundTs = new Map<string, string>();
   /**
-   * ts of the in-place thinking phrase per space; consumed when the reply lands.
-   * NOTE: the ts is only known after postMessage resolves — the posting guard
-   * below covers the in-flight window so a second phrase can never be posted.
+   * One turn presenter per space (issue #153/#168): owns the thinking
+   * phrase, the receipt reactions, the stream coalescing, the latency
+   * audit, the churn guard, and the threading rule — everything visible
+   * that this class used to hold in ~15 per-space maps. Created lazily on
+   * the first inbound message (or tool step), disposed with the session.
+   * The streaming renderer is selected when the adapter reports streaming
+   * support; it degrades to the phrase renderer on the first failure.
    */
-  readonly #pendingThinkingTs = new Map<string, string>();
-  /**
-   * Spaces whose phrase postMessage is still in flight (ts not yet known).
-   * A turn_start during this window skips posting — the in-flight post
-   * becomes the space's one phrase (issue #60: stacking is impossible).
-   */
-  readonly #phrasePosting = new Set<string>();
-  /**
-   * Consecutive empty completions per space (churn guard, #60). Reset by any
-   * non-empty message or error; a new inbound message does not reset it, so
-   * phrases stay off until a turn actually produces text.
-   */
-  readonly #emptyTurnCount = new Map<string, number>();
-  /** Spaces whose churn message is already surfaced; phrases stay off (#60). */
-  readonly #churnActive = new Set<string>();
-  /** Spaces whose current turn already delivered a message or an error (#60). */
-  readonly #turnDelivered = new Set<string>();
-  /**
-   * Spaces whose current turn is a streaming (steer) turn (issue #120): their
-   * in-place phrase updates coalesce on {@link STREAM_UPDATE_INTERVAL_MS} and
-   * the turn's final text always lands. Set when handleInboundMessage steers;
-   * cleared on turn_end/error/dispose and when a non-streaming turn starts.
-   */
-  readonly #streamingTurns = new Set<string>();
-  /**
-   * Pending coalesced streaming update per space (issue #120): the latest
-   * streamed text for the pending phrase ts, pushed on the cadence timer and
-   * always pushed (final) when the turn ends. Retained on a 429 so the next
-   * attempt retries; never thrown into the turn path.
-   */
-  readonly #streamUpdate = new Map<string, PendingStreamUpdate>();
-  /** Spaces mid-digest turn: their output must not reach the channel (#42). */
-  readonly #digesting = new Set<string>();
-  /**
-   * Date.now() of the latest inbound message per space — the receipt→reply
-   * latency base (issue #119). Set on the inbound path, consumed (and
-   * deleted) when the reply or an error lands.
-   */
-  readonly #receivedAt = new Map<string, number>();
-  /**
-   * Phrase-posting latency ms per space (receipt → phrase postMessage
-   * resolved), carried on the reply audit row (issue #119). Absent when no
-   * phrase was posted (churn-active space).
-   */
-  readonly #phrasePostedMs = new Map<string, number>();
-  /**
-   * Inbound message tss per space that still carry the receipt reaction
-   * (issue #119). Added at receipt; cleared (and the reactions removed)
-   * when a visible outcome — reply text or error — lands. A set because a
-   * steered message acks its own reaction while an earlier one is pending.
-   */
-  readonly #pendingReactions = new Map<string, Set<string>>();
-  /**
-   * Per-space onboarding-nudge dedupe (issue #116): space id → the
-   * failing-check snapshot the space was last nudged for. A broken setup
-   * nudges once until the missing set CHANGES; the record clears when the
-   * checks pass, so a later regression nudges fresh. Never per message.
-   */
-  readonly #nudged = new Map<string, string>();
-  /** Rotates THINKING_PHRASES one step per turn. */
-  #phraseIndex = 0;
+  readonly #presenters = new Map<string, SlackTurnPresenter>();
 
   constructor(deps: SpaceServiceDeps) {
     this.#store = deps.store;
@@ -328,6 +204,44 @@ export class SpaceService {
     this.#learning = deps.learning;
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
     this.#personaDir = deps.personaDir;
+  }
+
+  /**
+   * The space's turn presenter, created lazily. The streaming renderer is
+   * the default when the adapter supports chat streaming (issue #168);
+   * otherwise (or after the first stream failure flips the adapter's
+   * per-boot cache) the phrase renderer carries the space. All presenters
+   * share ONE phrase rotation (the pre-#153 single-class counter).
+   */
+  readonly #phraseRotation = createPhraseRotation();
+
+  #presenterFor(spaceId: string): SlackTurnPresenter {
+    const existing = this.#presenters.get(spaceId);
+    if (existing) return existing;
+    const deps: TurnPresenterDeps = {
+      spaceId,
+      adapter: this.#adapter,
+      store: this.#store,
+      onboardingChecks: this.#onboardingChecks,
+      phraseRotation: this.#phraseRotation,
+    };
+    const presenter = this.#adapter.streamingSupported()
+      ? new StreamTurnPresenter(deps)
+      : new SlackTurnPresenter(deps);
+    this.#presenters.set(spaceId, presenter);
+    return presenter;
+  }
+
+  /**
+   * Step-source bridge (issue #168): the driver's withPolicyGate wrapper
+   * and the extension runtime emit gated tool-call steps through this; the
+   * space's presenter renders them as thinking-step cards. Unknown spaces
+   * and headless calls are dropped — a step can only follow an inbound
+   * message, so a presenter exists by then.
+   */
+  routeToolStep(step: ToolStepEvent): void {
+    if (step.spaceId === undefined) return;
+    this.#presenters.get(step.spaceId)?.onToolStep(step);
   }
 
   /**
@@ -379,31 +293,30 @@ export class SpaceService {
         });
         return;
       }
-      // Receipt responsiveness (issue #119): the thinking phrase, the
-      // reaction ack, and the receipt audit all happen NOW — before the
-      // session cold-start below — so a slow createSession is never silent.
-      // Each is fire-and-forget: the turn path never blocks on Slack
-      // latency or a missing reactions:write scope.
-      this.#lastInboundTs.set(msg.spaceId, msg.ts);
-      this.#postThinkingPhrase(msg.spaceId);
-      this.#addReceiptReaction(msg);
-      this.#auditReceipt(msg);
+      // Receipt responsiveness (issue #119/#168): the thinking phrase (or
+      // the stream opening), the reaction ack, and the receipt audit all
+      // happen NOW — before the session cold-start below — so a slow
+      // createSession is never silent. Each is fire-and-forget: the turn
+      // path never blocks on Slack latency or a missing reactions:write
+      // scope. The space's turn presenter owns all of it.
+      this.#presenterFor(msg.spaceId).onInbound(msg);
       const turnText = await this.#ingestAttachments(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
       this.#learning?.recordInput(msg);
+      const presenter = this.#presenterFor(msg.spaceId);
       if (live.session.isStreaming()) {
         // Streaming turn (issue #120): phrase updates coalesce on the cadence.
         // The steer inherits the RUNNING turn's principal (issue #152) — the
         // driver only binds on a fresh turn — so user B steering into user
         // A's turn never re-identifies A's in-flight extension calls.
-        this.#streamingTurns.add(msg.spaceId);
+        presenter.setSteered(true);
         await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
       } else {
         // Non-streaming turn: replies update in place immediately, unbatched.
         // The principal travels WITH this turn: the driver binds it when the
         // fresh turn starts and drops it at turn_end (issue #152).
-        this.#streamingTurns.delete(msg.spaceId);
+        presenter.setSteered(false);
         await live.session.prompt(turnText, { principal: msg.principal });
       }
     } catch (err) {
@@ -478,12 +391,12 @@ export class SpaceService {
    * Failures inside connectExtension are outcomes — posted, never thrown.
    */
   async #handleConnectIntent(msg: SlackMessage, intent: ConnectIntent, deps: ConnectExtensionDeps): Promise<void> {
-    this.#lastInboundTs.set(msg.spaceId, msg.ts);
+    this.#presenterFor(msg.spaceId).onConnectIntent(msg);
     const outcome = await connectExtension(
       { extension: intent.extension, scope: intent.scope, actor: msg.principal, spaceId: msg.spaceId },
       deps,
     );
-    await this.#adapter.postMessage(msg.spaceId, outcome.message, this.#replyOpts(msg.spaceId));
+    await this.#adapter.postMessage(msg.spaceId, outcome.message, this.#presenterFor(msg.spaceId).replyOpts());
   }
 
   /** Returns null when the space's session is mid-dispose (message must be dropped). */
@@ -533,10 +446,10 @@ export class SpaceService {
       // (issue #152).
       getPrincipal: () => this.getTurnPrincipal(spaceId),
     });
-    session.on("turn_start", () => this.#postThinkingPhrase(spaceId));
-    session.on("message", (data) => this.#onSessionMessage(spaceId, data));
-    session.on("error", (data) => this.#onSessionError(spaceId, data));
-    session.on("turn_end", (data) => this.#onTurnEnd(spaceId, data));
+    session.on("turn_start", () => this.#presenterFor(spaceId).onTurnStart());
+    session.on("message", (data) => this.#presenterFor(spaceId).onMessage(data));
+    session.on("error", (data) => this.#presenterFor(spaceId).onError(data));
+    session.on("turn_end", (data) => this.#presenterFor(spaceId).onTurnEnd(data));
     const detachLearning = this.#learning?.attachSession(spaceId, session) ?? (() => {});
     const live: LiveSession = {
       spaceId,
@@ -571,422 +484,14 @@ export class SpaceService {
     } finally {
       // Session-scoped inbound state: no event can fire after dispose
       // resolves (both drivers unsubscribe/kill), and the next inbound
-      // re-sets the threading map.
-      this.#lastInboundTs.delete(spaceId);
-      this.#pendingThinkingTs.delete(spaceId);
-      this.#phrasePosting.delete(spaceId);
-      this.#emptyTurnCount.delete(spaceId);
-      this.#churnActive.delete(spaceId);
-      this.#turnDelivered.delete(spaceId);
-      this.#receivedAt.delete(spaceId);
-      this.#phrasePostedMs.delete(spaceId);
-      this.#pendingReactions.delete(spaceId);
-      this.#cancelStreamUpdate(spaceId);
-      this.#streamingTurns.delete(spaceId);
+      // re-creates the presenter. The presenter owns all turn-rendering
+      // state (phrase, reactions, latency, churn, stream) — dispose resets
+      // it wholesale.
+      this.#presenters.get(spaceId)?.dispose();
+      this.#presenters.delete(spaceId);
       this.#sessions.delete(spaceId);
       this.#modelRoles?.delete(spaceId);
     }
-  }
-
-  /**
-   * Posts (or rotates) the space's one thinking phrase (issues #40/#60/#119).
-   * Called on message receipt — BEFORE the session cold-start, so a slow
-   * createSession is never silent — and on turn_start, which updates the
-   * receipt phrase in place. Retry-safe (#60): OMP auto-retries empty
-   * completions and each attempt fires turn_start, so a pending phrase is
-   * UPDATED with the next rotating phrase instead of stacking a second
-   * message — one message max per space at any time. A call while a phrase
-   * post is still in flight (ts unknown yet) skips posting entirely. Digest
-   * turns are invisible to the channel (their output is memory, #42). After
-   * the churn guard has fired (#60), phrases stay off until a turn produces
-   * text or an error — no new posts, not just no updates. Captures the
-   * phrase-posting latency (receipt → post resolved) for the reply audit
-   * row (issue #119).
-   */
-  #postThinkingPhrase(spaceId: string): void {
-    if (this.#digesting.has(spaceId)) return;
-    this.#turnDelivered.delete(spaceId);
-    if (this.#churnActive.has(spaceId)) return;
-    const pendingTs = this.#pendingThinkingTs.get(spaceId);
-    if (pendingTs !== undefined) {
-      // A retry (or second turn) while the phrase is up: replace in place.
-      // A stale coalesced streaming text must not overwrite the rotation (#120).
-      this.#cancelStreamUpdate(spaceId);
-      void this.#adapter.updateMessage(spaceId, pendingTs, this.#nextPhrase()).catch((err) => {
-        console.error(`[space-service] failed to update thinking phrase in ${spaceId}:`, err);
-      });
-      return;
-    }
-    if (this.#phrasePosting.has(spaceId)) return; // in flight — it becomes the phrase
-    this.#phrasePosting.add(spaceId);
-    void this.#adapter
-      .postMessage(spaceId, this.#nextPhrase(), this.#replyOpts(spaceId))
-      .then((ts) => {
-        if (ts !== undefined) {
-          this.#pendingThinkingTs.set(spaceId, ts);
-          const receivedAt = this.#receivedAt.get(spaceId);
-          if (receivedAt !== undefined) this.#phrasePostedMs.set(spaceId, Date.now() - receivedAt);
-        }
-      })
-      .catch((err) => {
-        console.error(`[space-service] failed to post thinking phrase to ${spaceId}:`, err);
-      })
-      .finally(() => {
-        this.#phrasePosting.delete(spaceId);
-      });
-  }
-
-  /** Next rotating phrase; advances the shared rotation index. */
-  #nextPhrase(): string {
-    const phrase = THINKING_PHRASES[this.#phraseIndex % THINKING_PHRASES.length];
-    this.#phraseIndex += 1;
-    return phrase;
-  }
-
-  /**
-   * Receipt ack (issue #119): adds the 👀 reaction to the inbound message
-   * and remembers its ts so the reply can remove it. Fail-soft — a missing
-   * `reactions:write` scope is logged by the caller's catch, never thrown
-   * into the turn path.
-   */
-  #addReceiptReaction(msg: SlackMessage): void {
-    let pending = this.#pendingReactions.get(msg.spaceId);
-    if (!pending) {
-      pending = new Set();
-      this.#pendingReactions.set(msg.spaceId, pending);
-    }
-    pending.add(msg.ts);
-    void this.#adapter.addReaction(msg.spaceId, msg.ts).catch((err) => {
-      console.error(`[space-service] failed to add receipt reaction in ${msg.spaceId}:`, err);
-    });
-  }
-
-  /**
-   * Removes every pending receipt reaction for the space once a visible
-   * outcome — reply text or error — lands (issue #119). Idempotent: the
-   * pending set is cleared first, so a second call (e.g. turn_end after the
-   * message handler) is a no-op.
-   */
-  #clearReactions(spaceId: string): void {
-    const pending = this.#pendingReactions.get(spaceId);
-    if (!pending) return;
-    this.#pendingReactions.delete(spaceId);
-    for (const ts of pending) {
-      void this.#adapter.removeReaction(spaceId, ts).catch((err) => {
-        console.error(`[space-service] failed to remove receipt reaction in ${spaceId}:`, err);
-      });
-    }
-  }
-
-  /**
-   * Records the message.in audit row at receipt and starts the reply-latency
-   * clock (issue #119). Payload carries only the Slack ts — never message
-   * text, which can hold secrets. Fire-and-forget.
-   */
-  #auditReceipt(msg: SlackMessage): void {
-    this.#receivedAt.set(msg.spaceId, Date.now());
-    void this.#store
-      .appendAudit({
-        space_id: msg.spaceId,
-        actor: msg.principal,
-        event_type: MESSAGE_RECEIVED_EVENT,
-        payload: JSON.stringify({ ts: msg.ts }),
-      })
-      .catch((err) => {
-        console.error(`[space-service] message.in audit write failed for ${msg.spaceId}:`, err);
-      });
-  }
-
-  /**
-   * Records the message.reply audit row with receipt→reply latency (issue
-   * #119). Called when a real reply or an error lands; empty completions and
-   * churn messages are retry bookkeeping and write no row. Idempotent: the
-   * latency base is consumed on the first call. Fire-and-forget.
-   */
-  #auditReply(spaceId: string): void {
-    const receivedAt = this.#receivedAt.get(spaceId);
-    if (receivedAt === undefined) return; // no receipt recorded for this space
-    const phraseMs = this.#phrasePostedMs.get(spaceId);
-    this.#receivedAt.delete(spaceId);
-    this.#phrasePostedMs.delete(spaceId);
-    void this.#store
-      .appendAudit({
-        space_id: spaceId,
-        actor: "system",
-        event_type: MESSAGE_REPLIED_EVENT,
-        payload: JSON.stringify({
-          latency_ms: Date.now() - receivedAt,
-          ...(phraseMs !== undefined ? { phrase_ms: phraseMs } : {}),
-        }),
-      })
-      .catch((err) => {
-        console.error(`[space-service] message.reply audit write failed for ${spaceId}:`, err);
-      });
-  }
-
-  /** Complete reply text: replace the thinking phrase in place (or post fresh). */
-  #onSessionMessage(spaceId: string, data: unknown): void {
-    if (this.#digesting.has(spaceId)) return;
-    const text = (data as { text?: unknown }).text;
-    if (typeof text !== "string") return;
-    this.#turnDelivered.add(spaceId);
-    if (!text.trim()) {
-      // Empty completion (#60): replace the phrase with a visible fallback so
-      // the retry loop is never silent, and count it for the churn guard. The
-      // pending ts is deliberately kept: a retry's turn_start then replaces
-      // the phrase in place instead of stacking a new message.
-      // A swallowed provider error (issue #78) rides the event payload: the
-      // fallback carries the cause instead of the generic phrase.
-      const cause = (data as { error?: unknown } | null)?.error;
-      this.#countEmptyTurn(spaceId, typeof cause === "string" && cause.trim() ? cause.trim() : undefined);
-      if (!this.#churnActive.has(spaceId)) {
-        // A coalesced streaming text must not overwrite the fallback (#120).
-        this.#cancelStreamUpdate(spaceId);
-        const pendingTs = this.#pendingThinkingTs.get(spaceId);
-        if (pendingTs !== undefined) {
-          const fallback = emptyResponseFallback(
-            typeof cause === "string" && cause.trim() ? cause.trim() : undefined,
-          );
-          void this.#adapter.updateMessage(spaceId, pendingTs, fallback).catch((err) => {
-            console.error(`[space-service] failed to update empty-response phrase in ${spaceId}:`, err);
-          });
-        }
-      }
-      return;
-    }
-    // Real text: the empty streak is over, phrases re-arm.
-    this.#emptyTurnCount.delete(spaceId);
-    this.#churnActive.delete(spaceId);
-    if (this.#streamingTurns.has(spaceId)) {
-      // Streaming turn (#120): coalesce in-place updates on the cadence; the
-      // turn's final text is flushed by turn_end (final-delivery guarantee).
-      this.#scheduleStreamUpdate(spaceId, text);
-      return;
-    }
-    this.#replaceOrPost(spaceId, text);
-    // The reply landed: the receipt reaction comes off and the reply
-    // latency is audited (issue #119).
-    this.#clearReactions(spaceId);
-    this.#auditReply(spaceId);
-  }
-
-  /** Session error: surface it by replacing the thinking phrase in place. */
-  #onSessionError(spaceId: string, data: unknown): void {
-    console.error(`[space-service] session error (${spaceId}):`, data);
-    if (this.#digesting.has(spaceId)) return;
-    this.#turnDelivered.add(spaceId);
-    // An error supersedes any coalesced streaming text (#120): cancel the
-    // pending update so its timer can never overwrite the error surface.
-    this.#cancelStreamUpdate(spaceId);
-    this.#streamingTurns.delete(spaceId);
-    // An error is a visible outcome: it breaks the empty streak and re-arms phrases.
-    this.#emptyTurnCount.delete(spaceId);
-    this.#churnActive.delete(spaceId);
-    const message = (data as { message?: unknown }).message;
-    const base = typeof message === "string" ? message : "Something went wrong while thinking.";
-    // A setup-blocked failure (provider/session) appends the one-line
-    // onboarding pointer (issue #116) — bounded by the per-space dedupe.
-    this.#replaceOrPost(spaceId, this.#nudgeText(spaceId, base));
-    // An error is a visible outcome: the receipt reaction comes off and
-    // the reply latency is audited (issue #119).
-    this.#clearReactions(spaceId);
-    this.#auditReply(spaceId);
-  }
-
-  /**
-   * Turn ended without a delivered message or error (#60): an empty
-   * completion. Both drivers filter empty text before the "message" event
-   * (`if (text) deliver`), so the retry loop arrives here as silent
-   * turn_start/turn_end pairs — this is what must trip the churn guard.
-   * A swallowed provider error (issue #78) rides the turn_end payload; the
-   * churn message then carries the cause.
-   */
-  #onTurnEnd(spaceId: string, data: unknown): void {
-    if (this.#digesting.has(spaceId)) return;
-    // Streaming turns (#120): the turn's FINAL reply text always lands —
-    // flush any coalesced pending update immediately (bounded retries on
-    // 429); interim updates may have been skipped by the cadence.
-    this.#finalizeStreamUpdate(spaceId);
-    // A streaming turn's final text landed (or is flushing): the receipt
-    // reaction comes off and the reply latency is audited (issue #119).
-    if (this.#streamingTurns.has(spaceId)) {
-      this.#clearReactions(spaceId);
-      this.#auditReply(spaceId);
-    }
-    this.#streamingTurns.delete(spaceId);
-    if (this.#turnDelivered.has(spaceId)) return;
-    const cause = (data as { error?: unknown } | null)?.error;
-    this.#countEmptyTurn(spaceId, typeof cause === "string" && cause.trim() ? cause.trim() : undefined);
-  }
-
-  /**
-   * Counts one empty completion for the space; beyond {@link EMPTY_TURN_LIMIT}
-   * consecutive empties, surfaces the churn message exactly once (in place
-   * of the pending phrase, or fresh) and silences phrases until a non-empty
-   * turn — fail visible, not silent (#60). The message carries the real
-   * provider/session cause when one exists (issue #78); unknown cause keeps
-   * the legacy phrase. The churn boundary is the missing-model-key path of
-   * the onboarding nudge (issue #116): when the shared checks fail, the
-   * one-line pointer is appended here.
-   */
-  #countEmptyTurn(spaceId: string, cause?: string): void {
-    const count = (this.#emptyTurnCount.get(spaceId) ?? 0) + 1;
-    this.#emptyTurnCount.set(spaceId, count);
-    if (count <= EMPTY_TURN_LIMIT || this.#churnActive.has(spaceId)) return;
-    this.#churnActive.add(spaceId);
-    this.#replaceOrPost(spaceId, this.#nudgeText(spaceId, churnMessageText(cause)));
-  }
-
-  /**
-   * Appends the one-line onboarding pointer (issue #116) when setup is
-   * incomplete: names the failing checks and points at `first_run_wizard`.
-   * Deduped per space on the failing-check snapshot — a broken setup nudges
-   * once until the missing set changes, and the record clears once the
-   * checks pass. Fail closed: a check failure (e.g. malformed settings)
-   * suppresses the nudge, never the turn output.
-   */
-  #nudgeText(spaceId: string, baseText: string): string {
-    let failing: WizardCheck[];
-    try {
-      failing = this.#onboardingChecks().filter((c) => !c.ok);
-    } catch (err) {
-      console.error(`[space-service] onboarding checks failed for ${spaceId}:`, err);
-      return baseText;
-    }
-    if (failing.length === 0) {
-      this.#nudged.delete(spaceId);
-      return baseText;
-    }
-    const snapshot = failing
-      .map((c) => c.name)
-      .sort()
-      .join(",");
-    if (this.#nudged.get(spaceId) === snapshot) return baseText;
-    this.#nudged.set(spaceId, snapshot);
-    void this.#store
-      .appendAudit({
-        space_id: spaceId,
-        actor: "system",
-        event_type: ADMIN_ONBOARDING_NUDGE_EVENT,
-        payload: JSON.stringify({ checks: failing.map((c) => ({ name: c.name, ok: c.ok })) }),
-      })
-      .catch((err) => {
-        console.error(`[space-service] onboarding nudge audit write failed for ${spaceId}:`, err);
-      });
-    return `${baseText}\n${onboardingGuideText(failing)}`;
-  }
-
-  /**
-   * Replaces the pending thinking phrase in place when one exists; otherwise
-   * posts fresh (edge: the reply landed before the phrase ts was captured).
-   * The pending ts is cleared either way so a reply updates exactly once.
-   */
-  #replaceOrPost(spaceId: string, text: string): void {
-    const pendingTs = this.#pendingThinkingTs.get(spaceId);
-    if (pendingTs !== undefined) {
-      this.#pendingThinkingTs.delete(spaceId);
-      void this.#adapter.updateMessage(spaceId, pendingTs, text).catch((err) => {
-        console.error(`[space-service] failed to update reply in ${spaceId}:`, err);
-      });
-      return;
-    }
-    void this.#adapter.postMessage(spaceId, text, this.#replyOpts(spaceId)).catch((err) => {
-      console.error(`[space-service] failed to post reply to ${spaceId}:`, err);
-    });
-  }
-
-  /**
-   * Streaming path (issue #120): coalesce an in-place phrase update — the
-   * latest streamed text replaces any pending one, and a cadence timer pushes
-   * it to Slack at most once per {@link STREAM_UPDATE_INTERVAL_MS}. No pending
-   * phrase ts (edge: the reply raced the phrase post) falls back to the direct
-   * path so the text is never lost.
-   */
-  #scheduleStreamUpdate(spaceId: string, text: string): void {
-    const pendingTs = this.#pendingThinkingTs.get(spaceId);
-    if (pendingTs === undefined) {
-      this.#replaceOrPost(spaceId, text);
-      return;
-    }
-    const existing = this.#streamUpdate.get(spaceId);
-    if (existing) {
-      existing.text = text; // latest text wins; the armed timer stays
-      return;
-    }
-    const entry: PendingStreamUpdate = { ts: pendingTs, text, final: false, retries: 0, timer: null };
-    this.#streamUpdate.set(spaceId, entry);
-    this.#armStreamTimer(spaceId, entry);
-  }
-
-  /** Arms the cadence timer for a pending stream update if none is running. */
-  #armStreamTimer(spaceId: string, entry: PendingStreamUpdate): void {
-    if (entry.timer !== null) return;
-    entry.timer = setTimeout(() => {
-      entry.timer = null;
-      void this.#flushStreamUpdate(spaceId);
-    }, STREAM_UPDATE_INTERVAL_MS);
-    entry.timer.unref?.();
-  }
-
-  /**
-   * Sends the pending coalesced text now. Fail-soft (issue #120): a 429 (or
-   * any error) is logged and the update is KEPT for the next attempt — never
-   * thrown into the turn path. Interim failures wait for the turn-end flush;
-   * final failures re-arm the timer, bounded by {@link STREAM_FINAL_RETRY_LIMIT}.
-   */
-  async #flushStreamUpdate(spaceId: string): Promise<void> {
-    const entry = this.#streamUpdate.get(spaceId);
-    if (!entry) return;
-    this.#streamUpdate.delete(spaceId);
-    if (entry.timer !== null) {
-      clearTimeout(entry.timer);
-      entry.timer = null;
-    }
-    try {
-      await this.#adapter.updateMessage(spaceId, entry.ts, entry.text);
-    } catch (err) {
-      console.error(
-        `[space-service] streaming phrase update failed in ${spaceId} (${err instanceof Error ? err.message : String(err)}); keeping for the next attempt`,
-      );
-      if (entry.final && entry.retries >= STREAM_FINAL_RETRY_LIMIT) return; // logged; give up
-      const kept: PendingStreamUpdate = { ...entry, retries: entry.retries + 1, timer: null };
-      this.#streamUpdate.set(spaceId, kept);
-      if (entry.final) this.#armStreamTimer(spaceId, kept); // retry the final until it lands
-    }
-  }
-
-  /**
-   * Turn ended: any pending coalesced update carries the FINAL reply text —
-   * flush it immediately so it always lands, with bounded retries on a 429.
-   */
-  #finalizeStreamUpdate(spaceId: string): void {
-    const entry = this.#streamUpdate.get(spaceId);
-    if (!entry) return;
-    entry.final = true;
-    entry.retries = 0;
-    if (entry.timer !== null) {
-      clearTimeout(entry.timer);
-      entry.timer = null;
-    }
-    void this.#flushStreamUpdate(spaceId);
-  }
-
-  /** Cancels any pending coalesced update (superseded text must not overwrite). */
-  #cancelStreamUpdate(spaceId: string): void {
-    const entry = this.#streamUpdate.get(spaceId);
-    if (!entry) return;
-    if (entry.timer !== null) clearTimeout(entry.timer);
-    this.#streamUpdate.delete(spaceId);
-  }
-
-  /**
-   * DMs read naturally as a plain message — no thread. Team channels (C/G)
-   * keep replies threaded under the latest inbound message.
-   */
-  #replyOpts(spaceId: string): { threadTs?: string } | undefined {
-    if (isDmChannel(channelFromSpaceId(spaceId))) return undefined;
-    const threadTs = this.#lastInboundTs.get(spaceId);
-    return threadTs === undefined ? undefined : { threadTs };
   }
 
   /**
@@ -1006,7 +511,7 @@ export class SpaceService {
       // in the transcript, so the next idle digest covers them).
       if (live.session.isStreaming()) return;
       const marker = await this.#newestDigestUntil(provider, spaceId);
-      const lastTs = this.#lastInboundTs.get(spaceId);
+      const lastTs = this.#presenterFor(spaceId).latestInboundTs();
       if (!lastTs || (marker !== null && Number(lastTs) <= Number(marker))) return;
       const summary = await this.#runDigestTurn(live, marker);
       if (!summary) {
@@ -1042,10 +547,11 @@ export class SpaceService {
    */
   async #runDigestTurn(live: LiveSession, marker: string | null): Promise<string> {
     const spaceId = live.spaceId;
-    this.#digesting.add(spaceId);
+    const presenter = this.#presenterFor(spaceId);
+    presenter.beginDigest();
     let captured = "";
     const offMessage = live.session.on("message", (data) => {
-      const text = (data as { text?: unknown } | null)?.text;
+      const text = typeof data === "object" && data !== null && "text" in data ? data.text : undefined;
       if (typeof text === "string" && text.trim()) captured = text;
     });
     try {
@@ -1055,7 +561,7 @@ export class SpaceService {
       await withTimeout(live.session.prompt(instruction, { silent: true }), this.#digestTimeoutMs);
     } finally {
       offMessage();
-      this.#digesting.delete(spaceId);
+      presenter.endDigest();
     }
     return captured.trim();
   }

@@ -75,6 +75,15 @@ class RecordingAdapter implements SlackAdapter {
   async uploadFile(): Promise<string | undefined> {
     return undefined;
   }
+  async startStream(): Promise<string | undefined> {
+    throw new Error("not used");
+  }
+  async appendText(): Promise<void> {}
+  async appendTask(): Promise<void> {}
+  async stopStream(): Promise<void> {}
+  streamingSupported(): boolean {
+    return false;
+  }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
 }

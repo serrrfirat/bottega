@@ -29,6 +29,7 @@ import {
   sessionIdFromFilePath,
   SPACE_AGENT_TOOLS,
   spaceAgentToolNames,
+  withPolicyGate,
 } from "./agent-driver";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 
@@ -1082,6 +1083,89 @@ describe("opencode tool-name transform (issue #78)", () => {
       expect(decisions.find((row) => row.tool === "memory.save")?.decision).toBe("allow");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("withPolicyGate thinking-step emission (issue #168)", () => {
+  interface StepSinkCall {
+    spaceId?: string;
+    taskId: string;
+    title: string;
+    status: "in_progress" | "complete";
+    output?: string;
+  }
+
+  function gatedReadTool(opts: {
+    orgYaml?: string;
+    sink?: (step: StepSinkCall) => void;
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "gate-steps-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const steps: StepSinkCall[] = [];
+    const sink = opts.sink ?? ((step) => steps.push(step));
+    const orgPolicy = parseOrgConfigYaml(opts.orgYaml ?? "tools:\n  read: allow\n");
+    const tool = withPolicyGate(
+      {
+        name: "read",
+        label: "Read file",
+        description: "Reads a file",
+        parameters: z.object({ path: z.string() }),
+        async execute(_toolCallId: string, _params: unknown, _signal: unknown, _onUpdate: unknown, _ctx: unknown) {
+          return { content: [{ type: "text", text: "file contents" }] };
+        },
+      },
+      {
+        orgPolicy,
+        audit,
+        router: DenyRouter,
+        store,
+        onToolStep: sink,
+      },
+    );
+    const cleanup = () => {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    };
+    const ctx = { sessionManager: { getSessionFile: () => join(dir, "sessions", "slack:C1.jsonl") } } as never;
+    return { tool, steps, ctx, cleanup };
+  }
+
+  test("an allowed call emits in_progress then complete on one shared card", async () => {
+    const { tool, steps, ctx, cleanup } = gatedReadTool();
+    try {
+      const result = await tool.execute("c1", { path: "/x" }, undefined, undefined, ctx);
+      expect(result).toEqual({ content: [{ type: "text", text: "file contents" }] });
+      expect(steps).toHaveLength(2);
+      expect(steps[0]).toMatchObject({ spaceId: "slack:C1", status: "in_progress", title: "read — allowed (read)" });
+      expect(steps[1]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: "read — allowed (read)" });
+      expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a denied call emits a single terminal deny step", async () => {
+    const { tool, steps, ctx, cleanup } = gatedReadTool({ orgYaml: "tools:\n  read: deny\n" });
+    try {
+      await expect(tool.execute("c1", { path: "/x" }, undefined, undefined, ctx)).rejects.toThrow("denies");
+      expect(steps).toHaveLength(1);
+      expect(steps[0]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: "read — denied (read)" });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("secret-shaped args are redacted in the step output, never raw", async () => {
+    const { tool, steps, ctx, cleanup } = gatedReadTool();
+    try {
+      await tool.execute("c1", { path: "/x", api_key: "sk-ant-api03-0123456789abcdef" }, undefined, undefined, ctx);
+      const joined = steps.map((s) => s.output ?? "").join(" ");
+      expect(joined).not.toContain("sk-ant-api03-0123456789abcdef");
+      expect(joined).toContain("[REDACTED]");
+    } finally {
+      cleanup();
     }
   });
 });

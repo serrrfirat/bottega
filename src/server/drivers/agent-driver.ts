@@ -26,12 +26,14 @@ import {
 } from "../../extensions/connect";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
+import { redact } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import type { PolicyConfig } from "../../policy/config";
-import { loadSpacePolicy } from "../../policy/config";
-import { evaluatePolicyGate, type PolicyGateOutcome } from "../../policy/gate";
+import { loadSpacePolicy, resolveTier } from "../../policy/config";
+import { evaluatePolicyGate, summarizeArgs, type PolicyGateOutcome } from "../../policy/gate";
 import type { PolicyExtensionDeps } from "../../policy/extension";
 import type { Store } from "../../store/db";
+import { emitToolStep, nextToolStepId, toolStepTitle } from "../services/slack-turn-presenter";
 
 /**
  * Driver-level memory-context wiring (issue #42): org memories flagged
@@ -491,14 +493,26 @@ export function withOpencodeSafeName<TDef extends ToolDefinition>(def: TDef): TD
  * gate's block reason, which the SDK surfaces to the model as a blocked
  * tool result (the same shape the policy extension's `{block: true}`
  * produced). Fail closed: any gate error denies the call.
+ *
+ * Every gated call emits one thinking step (issue #168) when the deps carry
+ * an `onToolStep` sink: in_progress "tool — allowed (tier)" on start,
+ * complete on resolution; "tool — waiting for approval" while the approval
+ * router is pending (the gate's onAskHuman hook); a terminal "tool —
+ * denied (tier)" card on denial. Titles and the args code-card pass the
+ * SAME redaction as audit payloads — secret-shaped values render
+ * `[REDACTED]`, never raw.
  */
 export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: PolicyExtensionDeps): TDef {
   const execute = def.execute;
   const actor = deps.actor ?? "agent";
+  const sink = deps.onToolStep;
   return {
     ...def,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      const tier = deps.toolTier?.(def.name) ?? resolveTier(def.name);
+      const stepArgs = sink !== undefined ? redact(summarizeArgs(params)) : undefined;
+      const taskId = nextToolStepId();
       let outcome: PolicyGateOutcome;
       try {
         outcome = await evaluatePolicyGate(
@@ -510,6 +524,20 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
             preApproved: deps.preApproved,
             knownExtensionIds: deps.knownExtensionIds,
             toolTier: deps.toolTier,
+            // Issue #168: render "waiting for approval" while the router
+            // waits — the resolution (approved/denied) shares this taskId.
+            onAskHuman:
+              sink !== undefined
+                ? () => {
+                    emitToolStep(sink, {
+                      spaceId,
+                      taskId,
+                      title: toolStepTitle(def.name, "waiting for approval"),
+                      status: "in_progress",
+                      output: stepArgs,
+                    });
+                  }
+                : undefined,
           },
           {
             tool: def.name,
@@ -526,8 +554,62 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
       }
       // A deliberate deny surfaces as a blocked tool result to the model,
       // the same shape the policy extension's `{block: true}` produced.
-      if (!outcome.allowed) throw new Error(outcome.blockReason);
-      return execute.call(def, toolCallId, params, signal, onUpdate, ctx);
+      if (!outcome.allowed) {
+        // Terminal deny card: a waiting-for-approval card (ask-human) is
+        // resolved here; a straight deny renders one deny step.
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(def.name, `denied (${tier})`),
+          status: "complete",
+          output: stepArgs,
+        });
+        throw new Error(outcome.blockReason);
+      }
+      if (outcome.decision === "ask-human") {
+        // The waiting card (onAskHuman above) resolves as "approved".
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(def.name, `approved (${tier})`),
+          status: "complete",
+          output: stepArgs,
+        });
+      } else {
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          title: toolStepTitle(def.name, `allowed (${tier})`),
+          status: "in_progress",
+          output: stepArgs,
+        });
+      }
+      try {
+        const result = await execute.call(def, toolCallId, params, signal, onUpdate, ctx);
+        // The call RAN: check the card off (success or failure — the step
+        // documents the attempt, so the panel never shows a stuck spinner).
+        if (outcome.decision !== "ask-human") {
+          emitToolStep(sink, {
+            spaceId,
+            taskId,
+            title: toolStepTitle(def.name, `allowed (${tier})`),
+            status: "complete",
+            output: stepArgs,
+          });
+        }
+        return result;
+      } catch (err) {
+        if (outcome.decision !== "ask-human") {
+          emitToolStep(sink, {
+            spaceId,
+            taskId,
+            title: toolStepTitle(def.name, `allowed (${tier})`),
+            status: "complete",
+            output: stepArgs,
+          });
+        }
+        throw err;
+      }
     },
   } as TDef;
 }

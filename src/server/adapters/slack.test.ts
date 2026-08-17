@@ -4,12 +4,17 @@ import type { ResponseMode } from "../../policy/config";
 import {
   APPROVE_ACTION_ID,
   DENY_ACTION_ID,
+  buildAppendTaskArgs,
+  buildAppendTextArgs,
   buildPostMessageArgs,
+  buildStartStreamArgs,
+  buildStopStreamArgs,
   buildUpdateMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
   isBotMessage,
   isDmChannel,
+  markdownChunk,
   normalizeActionEvent,
   isMentionedMessage,
   normalizeMessage,
@@ -17,6 +22,8 @@ import {
   registerMessageHandler,
   renderSlackText,
   spaceIdFromChannel,
+  STREAM_TASK_OUTPUT_MAX,
+  taskUpdateChunk,
   type SlackAction,
   type MessageHandlerOptions,
   type SlackMessage,
@@ -404,6 +411,76 @@ describe("renderSlackText (Markdown → Slack mrkdwn, issue #84)", () => {
 
   test("plain text with no markup passes through", () => {
     expect(renderSlackText("hello world")).toBe("hello world");
+  });
+});
+
+describe("stream arg builders (issue #168)", () => {
+  test("buildStartStreamArgs: channels carry the required recipient_team_id; DMs omit it", () => {
+    expect(buildStartStreamArgs("slack:C123ABC", { threadTs: "1.1", openingText: "Thinking…" }, "T123")).toEqual({
+      channel: "C123ABC",
+      thread_ts: "1.1",
+      recipient_team_id: "T123",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+    expect(buildStartStreamArgs("slack:D123ABC", { threadTs: "1.1", openingText: "Thinking…" }, "T123")).toEqual({
+      channel: "D123ABC",
+      thread_ts: "1.1",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+  });
+
+  test("buildStartStreamArgs: no team id yet → channels omit recipient_team_id (startStream fails once, then falls back)", () => {
+    expect(buildStartStreamArgs("slack:C123ABC", { threadTs: "1.1", openingText: "x" }, undefined)).toEqual({
+      channel: "C123ABC",
+      thread_ts: "1.1",
+      chunks: [{ type: "markdown_text", text: "x" }],
+    });
+  });
+
+  test("markdownChunk renders Slack mrkdwn, taskUpdateChunk keeps the flat task_update shape", () => {
+    expect(markdownChunk("see [docs](https://x.dev)")).toEqual({
+      type: "markdown_text",
+      text: "see <https://x.dev|docs>",
+    });
+    expect(taskUpdateChunk({ id: "step-1", title: "bash — allowed (exec)", status: "in_progress", output: '{"command":"ls"}' })).toEqual({
+      type: "task_update",
+      id: "step-1",
+      title: "bash — allowed (exec)",
+      status: "in_progress",
+      output: '{"command":"ls"}',
+    });
+    expect(taskUpdateChunk({ id: "step-2", title: "x", status: "complete" })).toEqual({
+      type: "task_update",
+      id: "step-2",
+      title: "x",
+      status: "complete",
+    });
+  });
+
+  test("task_update output is capped at 256 chars so a long args card never 400s the stream", () => {
+    const long = "x".repeat(500);
+    const chunk = taskUpdateChunk({ id: "s", title: "t", status: "in_progress", output: long });
+    expect(chunk.output).toHaveLength(STREAM_TASK_OUTPUT_MAX);
+    expect(chunk.output).toBe("x".repeat(STREAM_TASK_OUTPUT_MAX));
+  });
+
+  test("buildAppendTextArgs / buildAppendTaskArgs / buildStopStreamArgs map to appendStream/stopStream arguments", () => {
+    expect(buildAppendTextArgs("slack:C1", "ts-1", "more")).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      chunks: [{ type: "markdown_text", text: "more" }],
+    });
+    expect(buildAppendTaskArgs("slack:C1", "ts-1", { id: "s", title: "t", status: "complete" })).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      chunks: [{ type: "task_update", id: "s", title: "t", status: "complete" }],
+    });
+    expect(buildStopStreamArgs("slack:C1", "ts-1", "final reply")).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: "final reply" } }],
+    });
+    expect(buildStopStreamArgs("slack:C1", "ts-1")).toEqual({ channel: "C1", ts: "ts-1" });
   });
 });
 

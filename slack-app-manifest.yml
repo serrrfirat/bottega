@@ -17,6 +17,16 @@ features:
   app_home:
     home_tab_enabled: false
     messages_tab_enabled: true
+  # Agents feature (issue #168): enables the Slack-native thinking-steps
+  # panel — chat.startStream / chat.appendStream (task_update chunks) /
+  # chat.stopStream. The "AGENT" badge and the assistant:write scope are
+  # auto-added by Slack when the feature is on; the scope is declared
+  # explicitly below because the manifest is the declarative source of
+  # truth at app creation. agent_view (not the legacy assistant_view) is
+  # the only option for new apps; enabling it is additive — channel
+  # replying, socket mode, and approval buttons are untouched.
+  agent_view:
+    agent_description: "Team agents that live in your chat: pick up work items, implement them, open PRs — and show each step as it happens."
   bot_user:
     display_name: Bottega
     always_online: true
@@ -25,6 +35,11 @@ oauth_config:
     bot:
       # Posting agent replies and delivery announcements to channels.
       - chat:write
+      # Agents feature (issue #168): enables chat.startStream/appendStream/
+      # stopStream — the native thinking-steps panel. Auto-added by Slack
+      # when the feature is on; declared here because the manifest is the
+      # declarative source of truth.
+      - assistant:write
       # Receiving @mentions of the bot.
       - app_mentions:read
       # Receiving messages in public channels, private channels, and DMs.

@@ -1,5 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import type { ChatPostMessageArguments, FilesInfoResponse } from "@slack/web-api";
+import type { ChatAppendStreamArguments, ChatPostMessageArguments, ChatStartStreamArguments, ChatStopStreamArguments, FilesInfoResponse } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
@@ -35,6 +35,22 @@ export interface SlackMessage {
   text: string;
   ts: string;
   files?: Array<{ id: string; name: string; mimeType: string; size: number }>;
+}
+
+/**
+ * One thinking-step card for the native thinking panel (issue #168).
+ * Mirrors the `task_update` chunk the Slack API accepts TODAY (flat
+ * `id`/`title`/`status` shape — the nested `task: { task_id, ... }` form
+ * from the early 2025 docs is gone). Slack types stay inside the adapter;
+ * the presenter only sees this normalized shape. Statuses: `in_progress`
+ * opens a card, `complete` checks it off.
+ */
+export interface SlackStreamTask {
+  id: string;
+  title: string;
+  status: "in_progress" | "complete";
+  /** Rendered as the card's code block; must stay under Slack's 256-char task chunk cap. */
+  output?: string;
 }
 
 /** Approval button action ids (issue #44); the buttons and the router's action handler share these. */
@@ -83,6 +99,40 @@ export interface SlackAdapter {
   addReaction(spaceId: string, ts: string, name?: string): Promise<void>;
   /** Removes the reaction from the message at `ts` once the reply lands (issue #119). */
   removeReaction(spaceId: string, ts: string, name?: string): Promise<void>;
+  /**
+   * Opens a streaming message (chat.startStream, issue #168) — the
+   * Slack-native thinking panel. `openingText` streams as the first
+   * markdown_text chunk (the thinking phrase becomes the stream opening).
+   * Slack streams are ALWAYS threaded replies (`thread_ts` required), so
+   * the caller supplies the inbound message ts — channels thread under it
+   * as today, DMs become threaded only while streaming is active. Resolves
+   * with the stream's message ts once the stream opens. Throws when the
+   * workspace/app lacks the Agents feature (or the call fails); the
+   * failure is remembered for the boot so callers fall back to the
+   * phrase+edit path without retrying per message.
+   */
+  startStream(
+    spaceId: string,
+    opts: { threadTs: string; openingText: string },
+  ): Promise<string | undefined>;
+  /** Appends a markdown_text chunk to the stream at `ts` (chat.appendStream). */
+  appendText(spaceId: string, ts: string, text: string): Promise<void>;
+  /** Appends one thinking-step card to the stream at `ts` (chat.appendStream task_update). */
+  appendTask(spaceId: string, ts: string, task: SlackStreamTask): Promise<void>;
+  /**
+   * Finalizes the stream at `ts` (chat.stopStream). `text` — the turn's
+   * final reply — renders as the final mrkdwn section block below the
+   * thinking panel; omit it to finalize with what was already streamed.
+   */
+  stopStream(spaceId: string, ts: string, text?: string): Promise<void>;
+  /**
+   * Whether the workspace/app supports chat streaming (issue #168).
+   * Feature-detected once per boot: true until the first startStream
+   * failure flips it false for the rest of the process. Callers check it
+   * BEFORE opening a stream so an unsupported workspace never pays the
+   * failed call more than once.
+   */
+  streamingSupported(): boolean;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -281,6 +331,104 @@ export function buildUpdateMessageArgs(
   return { channel: channelFromSpaceId(spaceId), ts, text: renderSlackText(text) };
 }
 
+/**
+ * Slack caps task_update / plan_update chunk text at 256 characters
+ * (docs.slack.dev/reference/methods/chat.startStream); longer output is
+ * truncated so a redacted args card never 400s the whole stream.
+ */
+export const STREAM_TASK_OUTPUT_MAX = 256;
+
+/** The markdown_text chunk: streamed reply text (issue #168). */
+export interface StreamMarkdownChunk {
+  type: "markdown_text";
+  text: string;
+}
+
+/** The task_update chunk: one thinking-step card (issue #168). */
+export interface StreamTaskUpdateChunk {
+  type: "task_update";
+  id: string;
+  title: string;
+  status: "in_progress" | "complete";
+  output?: string;
+}
+
+export type StreamChunk = StreamMarkdownChunk | StreamTaskUpdateChunk;
+
+/** The markdown_text chunk: streamed reply text (issue #168). */
+export function markdownChunk(text: string): StreamMarkdownChunk {
+  return { type: "markdown_text", text: renderSlackText(text) };
+}
+
+/** The task_update chunk: one thinking-step card (issue #168). */
+export function taskUpdateChunk(task: SlackStreamTask): StreamTaskUpdateChunk {
+  const output = task.output === undefined ? undefined : task.output.slice(0, STREAM_TASK_OUTPUT_MAX);
+  return output === undefined
+    ? { type: "task_update", id: task.id, title: task.title, status: task.status }
+    : { type: "task_update", id: task.id, title: task.title, status: task.status, output };
+}
+
+/**
+ * Maps adapter arguments onto `chat.startStream` arguments (issue #168).
+ * Pure so the outbound rendering is testable without a live Slack
+ * connection. Streams are always threaded replies; `recipient_team_id` is
+ * required when streaming outside a DM (channels) — supplied by the real
+ * adapter from auth.test, absent for DMs.
+ */
+export function buildStartStreamArgs(
+  spaceId: string,
+  opts: { threadTs: string; openingText: string },
+  teamId?: string,
+): { channel: string; thread_ts: string; recipient_team_id?: string; chunks: StreamMarkdownChunk[] } {
+  const channel = channelFromSpaceId(spaceId);
+  return {
+    channel,
+    thread_ts: opts.threadTs,
+    // Channels (C/G) require the team id; DMs reject it. The presenter
+    // decides the thread ts; the adapter owns the Slack-side requirement.
+    ...(isDmChannel(channel) ? {} : teamId !== undefined ? { recipient_team_id: teamId } : {}),
+    chunks: [markdownChunk(opts.openingText)],
+  };
+}
+
+/** Maps adapter arguments onto a `chat.appendStream` markdown_text append. */
+export function buildAppendTextArgs(
+  spaceId: string,
+  ts: string,
+  text: string,
+): { channel: string; ts: string; chunks: StreamMarkdownChunk[] } {
+  return { channel: channelFromSpaceId(spaceId), ts, chunks: [markdownChunk(text)] };
+}
+
+/** Maps adapter arguments onto a `chat.appendStream` task_update append. */
+export function buildAppendTaskArgs(
+  spaceId: string,
+  ts: string,
+  task: SlackStreamTask,
+): { channel: string; ts: string; chunks: StreamTaskUpdateChunk[] } {
+  return { channel: channelFromSpaceId(spaceId), ts, chunks: [taskUpdateChunk(task)] };
+}
+
+/**
+ * Maps adapter arguments onto `chat.stopStream` arguments (issue #168).
+ * The turn's final reply renders as the final mrkdwn section block below
+ * the thinking panel; omitted → the stream finalizes with what was already
+ * appended.
+ */
+export function buildStopStreamArgs(
+  spaceId: string,
+  ts: string,
+  text?: string,
+): { channel: string; ts: string; blocks?: Array<{ type: "section"; text: { type: "mrkdwn"; text: string } }> } {
+  return {
+    channel: channelFromSpaceId(spaceId),
+    ts,
+    ...(text !== undefined
+      ? { blocks: [{ type: "section" as const, text: { type: "mrkdwn" as const, text: renderSlackText(text) } }] }
+      : {}),
+  };
+}
+
 export interface MessageHandlerOptions {
   /**
    * Per-space response mode (issue #55); defaults to `always` (today's
@@ -391,6 +539,21 @@ export function createSlackAdapter(opts: {
   // `<@U0XXX>` in channel text and no event can arrive before the socket
   // connects.
   let botUserId: string | undefined;
+  /**
+   * Team id from auth.test (issue #168): required by chat.startStream when
+   * streaming to channels (`recipient_team_id`); absent until start() and
+   * never needed for DMs.
+   */
+  let teamId: string | undefined;
+  /**
+   * Per-boot streaming capability cache (issue #168): assumed true until
+   * the first startStream failure flips it false for the rest of the
+   * process — a workspace without the Agents feature is detected once,
+   * never probed per message. Fail closed: any failure (missing feature,
+   * missing recipient_team_id, rate limit) degrades to the phrase+edit
+   * path rather than silently dropping replies.
+   */
+  let streamingCapable = true;
 
   registerMessageHandler(app, opts.onMessage, {
     responseModeFor: opts.responseModeFor,
@@ -489,14 +652,53 @@ export function createSlackAdapter(opts: {
         timestamp: ts,
       });
     },
+    async startStream(spaceId, streamOpts) {
+      // Feature-detect once per boot: a known-unsupported workspace never
+      // pays another failed call (the first failure flipped the flag).
+      if (!streamingCapable) {
+        throw new Error("slack: chat streaming unsupported in this workspace (cached from an earlier failure)");
+      }
+      try {
+        const args = buildStartStreamArgs(spaceId, streamOpts, teamId) as ChatStartStreamArguments;
+        const res = await app.client.chat.startStream(args);
+        return res.ts;
+      } catch (err) {
+        // Fail closed + cached: any stream failure degrades the workspace
+        // to the phrase+edit path for the rest of the boot. The caller
+        // falls back immediately, so no reply is dropped.
+        streamingCapable = false;
+        console.error(
+          `[slack] chat.startStream failed (${err instanceof Error ? err.message : String(err)}) — ` +
+            "disabling streaming for this boot; falling back to phrase+edit",
+        );
+        throw err;
+      }
+    },
+    async appendText(spaceId, ts, text) {
+      await app.client.chat.appendStream(
+        buildAppendTextArgs(spaceId, ts, text) as ChatAppendStreamArguments,
+      );
+    },
+    async appendTask(spaceId, ts, task) {
+      await app.client.chat.appendStream(
+        buildAppendTaskArgs(spaceId, ts, task) as ChatAppendStreamArguments,
+      );
+    },
+    async stopStream(spaceId, ts, text) {
+      await app.client.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
+    },
+    streamingSupported: () => streamingCapable,
     start: async () => {
-      // The bot's user id (issue #55): auth.test needs only the bot token
-      // and is always allowed. A failed lookup leaves the id unset — mention
-      // mode then passes everything rather than dropping messages it cannot
-      // judge.
+      // The bot's user id (issue #55) and team id (issue #168): auth.test
+      // needs only the bot token and is always allowed. A failed lookup
+      // leaves both unset — mention mode then passes everything rather
+      // than dropping messages it cannot judge, and channel streams omit
+      // recipient_team_id (startStream then fails once and flips the
+      // streaming cache, degrading to phrase+edit).
       try {
         const auth = await app.client.auth.test();
         if (auth.ok && typeof auth.user_id === "string") botUserId = auth.user_id;
+        if (auth.ok && typeof auth.team_id === "string") teamId = auth.team_id;
       } catch (err) {
         console.error("[slack] failed to resolve bot user id (mention filtering disabled):", err);
       }
