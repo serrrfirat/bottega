@@ -2,7 +2,7 @@
 
 How bottega works under the hood. For user-facing capabilities see
 [features.md](features.md); for setup and development see
-[README.md](README.md).
+[setup.md](setup.md).
 
 ## The model: three primitives
 

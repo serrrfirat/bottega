@@ -184,7 +184,7 @@ double local.
   `@emulators/slack` — see `src/executor.test.ts` for the pattern) — never
   real external services.
 - Real-infra verification (live Slack app, real PAT/PR round-trip, live
-  provider keys) is a **manual checklist** in the README / `scripts/smoke.sh`.
+  provider keys) is a **manual checklist** in `setup.md` / `scripts/smoke.sh`.
   Never report it as passing without running it.
 
 ## Scheduled live-Slack canary (issue #175)
@@ -249,6 +249,8 @@ skips in CI is worse than none. On failure it posts the per-journey report
 
 - GitHub issues are the spec (epic #1 = architecture + decisions; sub-issues
   = scoped work). Do not silently change scope: update the issue first.
-- README = architecture + deployment + known limitations.
+- Docs map: README = product front door; features.md = capabilities +
+  limitations; architecture.md = internals; setup.md = development,
+  deployment, and operations.
 - `config/omp/`, `config/egress.yml`, `docker-compose.yml`, `.env.example` are
   deployment contract; keep them in sync with code.

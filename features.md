@@ -9,7 +9,7 @@ audit trail for everything it does.
 This document is the product view: what you, your team, and your agents can
 do, and why it matters. For how it works under the hood, see
 [architecture.md](architecture.md); for setup and development, see
-[README.md](README.md).
+[setup.md](setup.md).
 
 ## At a glance
 
@@ -89,7 +89,7 @@ connect intent seam.
 Backend (issues #43, #67): the default (unset `memory_backend.base_url`)
 runs the SQLite memory fallback. To use the self-hosted mem0 service, set
 the knob (e.g. `http://mem0:8000` inside compose) via the `settings` tool
-and give mem0 an LLM key (`OPENAI_API_KEY`, see README); the switch applies
+and give mem0 an LLM key (`OPENAI_API_KEY`, see [setup.md](setup.md)); the switch applies
 on the next server start. `MEM0_API_KEY` stays an optional env secret for
 mem0 auth.
 
@@ -380,7 +380,7 @@ Both policies live in AGENTS.md → "Scheduled live-Slack canary (issue
    canary posts as them, so their messages are indistinguishable from a
    real user's.
 2. **Install the app** (`slack-app-manifest.yml` already declares the bot
-   scopes + the QA user scopes below) and install it to the workspace, so
+  scopes + the QA user scopes below) and install it to the workspace, so
    the bot and the test user share it.
 3. **User-scoped token for the QA user** — create the app's user token
    with the user's OAuth grant:
