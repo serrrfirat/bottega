@@ -238,6 +238,27 @@ settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the switch
 applies on the next server start. `MEM0_API_KEY` stays an optional env
 secret for mem0 auth.
 
+### Public ingress for browser legs (issues #196, #198)
+
+The connect flows have two browser legs served by in-process listeners on
+127.0.0.1 (never exposed directly): the OAuth callback (`/oauth/callback`)
+and the one-time upload-link form (`/upload/<token>`). In deployment both
+ride the SAME public base — set `BOTTEGA_OAUTH_CALLBACK_BASE_URL` (e.g.
+`https://bottega.example.com`) to the browser-facing URL of the reverse
+proxy / tunnel in front of the server. When set, the connect mints return
+`<base>/upload/<token>` and `<base>/oauth/callback` URLs, so a browser on a
+remote host reaches them through the ingress instead of 404ing on a
+loopback URL. Unset → local-dev posture: the mints return the loopback URL
+(`http://127.0.0.1:<port>`), which only works when the browser runs on the
+server's own host.
+
+Static tunnels need a stable local target: pin `BOTTEGA_CALLBACK_PORT`
+(default 0 = ephemeral) so the tunnel's forwarding survives restarts. ONE
+listener serves every browser leg — `/upload/*`, `/oauth/callback`, and
+the webhook route — so the tunnel forwards to that single port and both
+connect flows work through it. Local dev with `bun run dev` needs nothing
+set.
+
 ### 3. First boot
 
 ```bash

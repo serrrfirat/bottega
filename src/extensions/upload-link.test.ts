@@ -7,7 +7,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
@@ -24,6 +24,7 @@ import {
   mintUploadLinkToolDefinition,
   startUploadLinkServer,
   UploadLinkStore,
+  uploadLinkPublicBase,
   type UploadLinkEndpointDeps,
 } from "./upload-link";
 
@@ -460,6 +461,123 @@ describe("upload link minting (issue #196)", () => {
       if (consumed.ok) {
         expect(consumed.row.actor).toBe("UADA");
         expect(consumed.row.space_id).toBe("slack:C1");
+      }
+    } finally {
+      endpoint.stop();
+    }
+  });
+});
+
+describe("upload link public base + stable port (issue #196)", () => {
+  test("uploadLinkPublicBase reads the #198 public-base env (absent/empty → undefined)", () => {
+    const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    try {
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      expect(uploadLinkPublicBase()).toBeUndefined();
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "";
+      expect(uploadLinkPublicBase()).toBeUndefined();
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
+      expect(uploadLinkPublicBase()).toBe("https://upload.example.com");
+    } finally {
+      if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
+    }
+  });
+
+  test("the mint returns the public base URL when configured, else the loopback fallback", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      // The exact wiring expression server/index.ts uses: the deployment's
+      // public base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set, else the
+      // in-process loopback URL.
+      const baseUrl = () => uploadLinkPublicBase() ?? endpoint.baseUrl;
+      const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      try {
+        delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+        const local = mintUploadLink(
+          { extension: "fixture.weather", scope: "personal", actor: "UADA" },
+          { registry: registry(), store: endpoint.store, baseUrl },
+        );
+        expect(local.ok).toBe(true);
+        if (local.ok) expect(local.url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+
+        process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
+        const remote = mintUploadLink(
+          { extension: "fixture.weather", scope: "personal", actor: "UADA" },
+          { registry: registry(), store: endpoint.store, baseUrl },
+        );
+        expect(remote.ok).toBe(true);
+        if (remote.ok) {
+          expect(remote.url.startsWith("https://upload.example.com/upload/")).toBe(true);
+          // The public prefix changes only the browser-facing base: the
+          // token is the same single-use token the loopback endpoint burns.
+          const token = remote.url.slice("https://upload.example.com/upload/".length);
+          expect(endpoint.store.consume(token).ok).toBe(true);
+        }
+      } finally {
+        if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+        else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
+      }
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("BOTTEGA_CALLBACK_PORT pins the listener; absent → ephemeral", () => {
+    const saved = process.env.BOTTEGA_CALLBACK_PORT;
+    const h = makeDeps();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "18765";
+      const pinned = startUploadLinkServer(h.deps);
+      try {
+        expect(pinned.baseUrl).toBe("http://127.0.0.1:18765");
+      } finally {
+        pinned.stop();
+      }
+      delete process.env.BOTTEGA_CALLBACK_PORT;
+      const ephemeral = startUploadLinkServer(h.deps);
+      try {
+        expect(ephemeral.baseUrl.startsWith("http://127.0.0.1:")).toBe(true);
+        expect(ephemeral.baseUrl).not.toBe("http://127.0.0.1:18765");
+      } finally {
+        ephemeral.stop();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = saved;
+    }
+  });
+
+  test("an invalid BOTTEGA_CALLBACK_PORT fails closed at bind time", () => {
+    const saved = process.env.BOTTEGA_CALLBACK_PORT;
+    const h = makeDeps();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "not-a-port";
+      expect(() => startUploadLinkServer(h.deps)).toThrow(/BOTTEGA_CALLBACK_PORT/);
+    } finally {
+      if (saved === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = saved;
+    }
+  });
+
+  test("the endpoint binds loopback only — never a non-loopback interface", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      expect(endpoint.baseUrl.startsWith("http://127.0.0.1:")).toBe(true);
+      // Probe the first non-loopback IPv4 address, when one exists: the
+      // form must refuse there while the loopback URL serves — the tunnel /
+      // proxy terminates at the host and forwards; the listener itself
+      // never exposes the form to the network.
+      const lan = Object.values(networkInterfaces())
+        .flat()
+        .find((iface) => iface !== undefined && !iface.internal && iface.family === "IPv4");
+      if (lan !== undefined) {
+        const port = endpoint.baseUrl.slice("http://127.0.0.1:".length);
+        const probe = `http://${lan.address}:${port}/upload/nope`;
+        await expect(fetch(probe, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
+        expect((await fetch(`${endpoint.baseUrl}/upload/nope`)).status).toBe(404);
       }
     } finally {
       endpoint.stop();

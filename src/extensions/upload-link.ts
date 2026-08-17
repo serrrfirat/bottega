@@ -39,6 +39,7 @@ import type { Store, UploadToken } from "../store/db";
 import type { ExtensionRegistry } from "./registry";
 import { connectExtension, storeBootSecret, type ConnectExtensionDeps, type ConnectScope } from "./connect";
 import { bootSecretForProvider } from "../server/boot-secrets";
+import { callbackPort } from "./oauth-callback";
 
 /** The mint tool's name (exec-tier surface, issue #196). */
 export const MINT_UPLOAD_LINK_TOOL = "connect_upload_link";
@@ -78,6 +79,12 @@ export interface UploadLinkStoreOpts {
   maxAttemptsPerIp?: number;
   /** Per-IP attempt window in ms (default {@link UPLOAD_LINK_ATTEMPTS_WINDOW_MS}). */
   attemptsWindowMs?: number;
+  /**
+   * Local bind port override (default: `BOTTEGA_CALLBACK_PORT` when set,
+   * else 0 = ephemeral). A stable port lets a static tunnel / reverse
+   * proxy forward to this listener across restarts (issue #196 follow-up).
+   */
+  port?: number;
 }
 
 /** The store slice the link path needs (full {@link Store} satisfies it). */
@@ -302,10 +309,16 @@ export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
   store: UploadLinkStoreSlice & Pick<Store, "upsertExtensionCredential">;
 };
 
+/** The upload-link surface's route handler + store, without a listener —
+ * so the boot can mount it onto the SHARED inbound surface (the OAuth
+ * callback server), keeping ONE stable port for every browser leg. */
+export interface UploadLinkMount {
+  store: UploadLinkStore;
+  fetch(req: Request): Response | Promise<Response>;
+}
+
 /**
- * Starts the in-process upload endpoint (issue #196): Bun.serve on
- * 127.0.0.1 (loopback only — the same posture as issue #57's local dev),
- * ephemeral port.
+ * Builds the upload-link surface (issue #196): the route handler for
  *
  *   GET  /upload/<token>  → the form (no secret, no scripts)
  *   POST /upload/<token>  → consume the token (single-use/TTL/rate-limited,
@@ -313,14 +326,17 @@ export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
  *                           {@link connectExtension} — gate → broker →
  *                           registry upsert → audit.
  *
- * The returned handle's store is the one the mint tool must share.
+ * plus its token store (the one the mint tool must share). No listener: the
+ * standalone {@link startUploadLinkServer} wraps it, and the boot mounts it
+ * onto the OAuth callback's inbound surface — one Bun.serve on
+ * BOTTEGA_CALLBACK_PORT serves /upload/*, /oauth/callback, and the #57
+ * webhook route.
  */
-export function startUploadLinkServer(deps: UploadLinkEndpointDeps, opts: UploadLinkStoreOpts = {}): UploadLinkServerHandle {
+export function mountUploadLink(deps: UploadLinkEndpointDeps, opts: UploadLinkStoreOpts = {}): UploadLinkMount {
   const store = new UploadLinkStore(deps.store, opts);
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(req) {
+  return {
+    store,
+    fetch(req) {
       const url = new URL(req.url);
       const match = /^\/upload\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
       if (!match) return new Response("not found", { status: 404 });
@@ -329,10 +345,28 @@ export function startUploadLinkServer(deps: UploadLinkEndpointDeps, opts: Upload
       if (req.method === "POST") return handleUpload(req, token, store, deps);
       return new Response("method not allowed", { status: 405 });
     },
+  };
+}
+
+/**
+ * Starts the in-process upload endpoint (issue #196): Bun.serve on
+ * 127.0.0.1 (loopback only — the same posture as issue #57's local dev),
+ * ephemeral port unless BOTTEGA_CALLBACK_PORT is set. Standalone form of
+ * {@link mountUploadLink} — the boot instead mounts onto the shared
+ * inbound surface (one listener for every browser leg).
+ *
+ * The returned handle's store is the one the mint tool must share.
+ */
+export function startUploadLinkServer(deps: UploadLinkEndpointDeps, opts: UploadLinkStoreOpts = {}): UploadLinkServerHandle {
+  const mount = mountUploadLink(deps, opts);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: opts.port ?? callbackPort(),
+    fetch: (req) => mount.fetch(req),
   });
   const port = server.port;
   if (port === undefined) throw new Error("upload link server did not bind a port");
-  return { store, baseUrl: `http://127.0.0.1:${port}`, stop: () => server.stop(true) };
+  return { store: mount.store, baseUrl: `http://127.0.0.1:${port}`, stop: () => server.stop(true) };
 }
 
 async function handleUpload(

@@ -27,9 +27,9 @@ import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
-import { startUploadLinkServer } from "../extensions/upload-link";
+import { mountUploadLink, uploadLinkPublicBase } from "../extensions/upload-link";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
-import { startOAuthCallbackServer } from "../extensions/oauth-callback";
+import { callbackPort, startOAuthCallbackServer } from "../extensions/oauth-callback";
 import {
   refreshMissingExtensionSurfaces,
   type ExtensionSurfaces,
@@ -342,16 +342,28 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   deliveryActionHandler = async (a) => {
     await resolveDeliveryAction({ store, adapter, log: (line) => console.log(line) }, a);
   };
-  // One-time upload link (issue #196): an in-process HTTPS endpoint on
+  // One-time upload link (issue #196): an in-process browser endpoint on
   // 127.0.0.1 (loopback only — the same posture as issue #57's local dev)
   // that stores an api_key secret DIRECTLY into the vault. The
   // `connect_upload_link` mint tool (wired into sessions below) returns a
   // single-use, expiring URL; the endpoint atomically consumes the token
   // and runs the SAME connect path as the connect flow (gate → broker →
   // registry upsert → audit). The value never goes through Slack, the
-  // agent, or a transcript. Started at boot (Bun.serve binds on creation),
-  // stopped in stop().
-  const uploadLink = startUploadLinkServer({
+  // agent, or a transcript.
+  // Issue #196: the mint's URL is the deployment's PUBLIC base when one is
+  // configured (BOTTEGA_OAUTH_CALLBACK_BASE_URL — ONE public base shared
+  // with the #198 OAuth callback: the same reverse proxy / tunnel serves
+  // both /upload/* and /oauth/callback), else the loopback URL of the
+  // in-process listener below. The listener itself stays 127.0.0.1-only —
+  // the tunnel terminates at the host and forwards to it.
+  const uploadPublicBase = uploadLinkPublicBase();
+  // The stable local port for the in-process browser-leg listener
+  // (BOTTEGA_CALLBACK_PORT, 0 = ephemeral): a static tunnel cannot forward
+  // to a port that changes per boot. ONE listener serves every browser
+  // leg — /upload/*, /oauth/callback, and the #57 webhook route — so the
+  // tunnel's target port survives restarts.
+  const stablePort = callbackPort();
+  const uploadMount = mountUploadLink({
     registry: extensionRegistry,
     store,
     audit,
@@ -362,17 +374,19 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       timeoutMs: orgPolicy.timeoutMinutes * 60_000,
     },
   });
-  // Generic MCP OAuth callback (issue #198): an in-process HTTPS endpoint
-  // on 127.0.0.1 (loopback only — the same posture as the upload-link
-  // server above) that completes the browser leg of hosted-OAuth-MCP
-  // connects: it receives the authorization code redirect, exchanges it
-  // through the MCP SDK's OAuth client, stores the token in the vault via
-  // the existing broker upload path, and records the registry row (scope
-  // me/org) + audit — zero broker provider registration. The connect mint
-  // (connect_extension on the hosted OAuth path) points the authorization
-  // URL's redirect_uri at this endpoint's PUBLIC base
+  // Generic MCP OAuth callback (issue #198): completes the browser leg of
+  // hosted-OAuth-MCP connects: it receives the authorization code redirect,
+  // exchanges it through the MCP SDK's OAuth client, stores the token in
+  // the vault via the existing broker upload path, and records the registry
+  // row (scope me/org) + audit — zero broker provider registration. The
+  // connect mint (connect_extension on the hosted OAuth path) points the
+  // authorization URL's redirect_uri at this surface's PUBLIC base
   // (BOTTEGA_OAUTH_CALLBACK_BASE_URL in deployment, else the loopback
-  // URL). Started at boot (Bun.serve binds on creation), stopped in stop().
+  // URL). The upload-link mount (#196) and the webhook route (#57) join
+  // the SAME Bun.serve: ONE listener on BOTTEGA_CALLBACK_PORT serves every
+  // inbound path, and the tunnel forwards the public base to that single
+  // port. Started at boot (Bun.serve binds on creation), stopped in
+  // stop().
   const ingestWebhooks =
     onboardingSpaceId !== undefined
       ? {
@@ -398,8 +412,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const oauthCallback = startOAuthCallbackServer({
     store,
     audit,
+    port: stablePort,
+    // Issue #196: the one-time upload form (/upload/<token>) rides the SAME
+    // listener as the callback + webhook route — one stable port, one
+    // tunnel target, one public base for every browser leg.
+    uploadLink: uploadMount,
     // Issue #57: the ingest webhook route (/webhooks/<extension>) joins the
-    // OAuth callback's inbound HTTP surface — ONE public ingress serves both
+    // OAuth callback's inbound HTTP surface — ONE public ingress serves all
     // paths (ngrok in dev compose; nginx + TLS in production). The dispatch
     // targets the org channel (onboarding.space_id, the org settings blob);
     // WITHOUT a configured org channel the leg is NOT mounted — /webhooks/*
@@ -410,12 +429,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // the space-service connect path and the per-session connect tool. The
   // callback base is the loopback URL by default (local dev — the browser
   // runs on the same host as the server, the issue #57 posture);
-  // deployments override it with BOTTEGA_OAUTH_CALLBACK_BASE_URL.
+  // deployments override it with BOTTEGA_OAUTH_CALLBACK_BASE_URL — the
+  // redirect_uri a mint registers with the provider is hit MINUTES later,
+  // so it must be the PUBLIC base in deployment, never a loopback URL.
   const mcpOAuthConnector = createMcpOAuthConnector({
     registry: extensionRegistry,
     store,
     audit,
-    callbackBaseUrl: () => oauthCallback.baseUrl,
+    callbackBaseUrl: () => uploadPublicBase ?? oauthCallback.baseUrl,
   });
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
@@ -533,13 +554,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
                 BOTTEGA_EXTENSIONS_DIR: "config/extensions",
                 // Issue #196: the ACP child's connect_upload_link mint
                 // shares the server's upload_tokens table and points at
-                // the SERVER process's upload endpoint.
-                BOTTEGA_UPLOAD_BASE_URL: uploadLink.baseUrl,
+                // the SERVER process's upload endpoint — the deployment's
+                // PUBLIC base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set
+                // (a browser on a remote host reaches the form through the
+                // ingress), else the loopback URL.
+                BOTTEGA_UPLOAD_BASE_URL: uploadPublicBase ?? oauthCallback.baseUrl,
                 // Issue #198: same for hosted OAuth MCPs — the child's
                 // connect mint shares the server's oauth_flows table and
                 // points the authorization redirect at the SERVER's OAuth
-                // callback endpoint.
-                BOTTEGA_OAUTH_CALLBACK_BASE_URL: oauthCallback.baseUrl,
+                // callback endpoint (the same PUBLIC base — one ingress
+                // serves both legs on one stable port).
+                BOTTEGA_OAUTH_CALLBACK_BASE_URL: uploadPublicBase ?? oauthCallback.baseUrl,
               },
             },
           ],
@@ -609,9 +634,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // upload path — no broker provider registration).
           mcpOAuth: mcpOAuthConnector,
           // Issue #196: the per-session mint tool shares the endpoint's
-          // token store, so links minted in any session are consumable by
-          // the upload endpoint started above.
-          uploadLink: { store: uploadLink.store, baseUrl: () => uploadLink.baseUrl },
+          // token store (the upload mount's), so links minted in any
+          // session are consumable by the shared listener started above;
+          // the mint URL is the deployment's public base when configured
+          // (BOTTEGA_OAUTH_CALLBACK_BASE_URL), else the loopback URL.
+          uploadLink: { store: uploadMount.store, baseUrl: () => uploadPublicBase ?? oauthCallback.baseUrl },
         },
         // Per-space model settings (issue #64): the OMP session resolves
         // use_model roles against the space's settings column.
@@ -766,7 +793,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     },
     async stop() {
       if (memoryMaintenanceInterval) clearInterval(memoryMaintenanceInterval);
-      uploadLink.stop();
+      // The upload-link leg has no listener of its own — it mounts onto the
+      // callback's shared surface, stopped here.
       oauthCallback.stop();
       deliveryPoller.stop();
       scheduler.stop();
