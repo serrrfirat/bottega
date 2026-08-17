@@ -170,7 +170,24 @@ echo "iron-proxy: ready (dev egress config loaded, management API answering)"
 #    never silently: the boundary must NOT run extension calls
 #    unauthenticated.
 echo "auth-broker: starting (${COMPOSE_DEV[*]} up -d auth-broker)..."
-"${COMPOSE_DEV[@]}" up -d auth-broker
+if curl -fsS -o /dev/null -m 2 http://127.0.0.1:8765/v1/healthz 2>/dev/null; then
+  echo "auth-broker: already running on 127.0.0.1:8765 (reusing)"
+elif "${COMPOSE_DEV[@]}" up -d auth-broker; then
+  echo "auth-broker: compose service started"
+else
+  # The oh-my-pi/pi:dev image is a private Docker Hub repo — it is NOT
+  # pullable on machines without access. Fall back to the LOCAL omp CLI
+  # (same binary the image runs; verified end-to-end in #143's live leg):
+  # bootstrap the token exactly like entrypoints/broker.sh, then serve.
+  echo "auth-broker: docker image (oh-my-pi/pi:dev) unavailable — falling back to the local omp CLI" >&2
+  mkdir -p data/.omp
+  if [[ ! -f data/.omp/auth-broker.token ]]; then
+    openssl rand -hex 32 > data/.omp/auth-broker.token && chmod 600 data/.omp/auth-broker.token
+  fi
+  PI_CONFIG_DIR="$PWD/data/.omp" OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)" \
+    nohup omp auth-broker serve --bind=0.0.0.0:8765 >> data/auth-broker.log 2>&1 &
+  echo "auth-broker: local omp CLI broker starting (log: data/auth-broker.log)"
+fi
 echo "auth-broker: waiting for the vault token (data/.omp/auth-broker.token) + /v1/healthz on 127.0.0.1:8765..."
 BROKER_READY=0
 for _ in $(seq 1 30); do
