@@ -204,26 +204,36 @@ interface FakeDownloadedFile {
   bytes: Uint8Array;
 }
 
+interface FakeStreamCall {
+  spaceId: string;
+  opts: { threadTs: string; openingText: string };
+}
+
 function fakeAdapter(
   opts: {
     deferPost?: boolean;
     failUpdateCalls?: number;
     failReactions?: boolean;
     downloads?: Record<string, FakeDownloadedFile | Error>;
+    streaming?: boolean;
   } = {},
 ): {
   adapter: SlackAdapter;
   posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
+  streams: FakeStreamCall[];
+  stops: Array<{ spaceId: string; ts: string; text?: string }>;
   downloadedFileIds: string[];
   uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }>;
   releasePost: () => void;
 } {
-  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {} } = opts;
+  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
+  const streams: FakeStreamCall[] = [];
+  const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
   const downloadedFileIds: string[] = [];
   const uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }> = [];
   let releasePost = () => {};
@@ -265,13 +275,16 @@ function fakeAdapter(
     async removeReaction(spaceId, ts) {
       reactions.push({ kind: "remove", spaceId, ts });
     },
-    async startStream() {
-      throw new Error("not used");
+    async startStream(spaceId, streamOpts) {
+      streams.push({ spaceId, opts: streamOpts });
+      return `stream-${streams.length}`;
     },
     async appendText() {},
     async appendTask() {},
-    async stopStream() {},
-    streamingSupported: () => false,
+    async stopStream(spaceId, ts, text) {
+      stops.push({ spaceId, ts, text });
+    },
+    streamingSupported: () => streaming,
     async start() {},
     async stop() {},
   };
@@ -280,6 +293,8 @@ function fakeAdapter(
     posts,
     updates,
     reactions,
+    streams,
+    stops,
     downloadedFileIds,
     uploads,
     releasePost: () => releasePost(),
@@ -816,6 +831,45 @@ describe("SpaceService output routing", () => {
       { spaceId: "slack:C1", ts: "ts-2", text: "Working on it…" },
       { spaceId: "slack:C1", ts: "ts-2", text: "channel answer" },
     ]);
+  });
+
+  test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
+    const { adapter, posts, updates, streams, stops } = fakeAdapter({ streaming: true });
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+    try {
+      await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+      const dm = driver.last();
+      dm.emit("turn_start", { spaceId: "slack:D1" });
+      await Promise.resolve();
+      dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
+      await Promise.resolve();
+      dm.emit("turn_end", { spaceId: "slack:D1" });
+      await Promise.resolve();
+
+      await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
+      const channel = driver.last();
+      channel.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
+      await Promise.resolve();
+      channel.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // DM: one plain message, phrase replaced in place — no stream call
+      // and no thread_ts anywhere on the DM surface (issue #180).
+      expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
+      expect(streams[0].opts.threadTs).toBe("9.9");
+      expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts === undefined)).toBe(true);
+      expect(updates).toContainEqual({ spaceId: "slack:D1", ts: "ts-1", text: "dm answer" });
+      // Channel: the panel opened (threaded under the inbound ts) and
+      // closed with the final reply as the stopStream block.
+      expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
+    } finally {
+      await service.stop();
+    }
   });
 
   test("a session error replaces the thinking phrase with the error text", async () => {

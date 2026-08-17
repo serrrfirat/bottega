@@ -20,10 +20,12 @@
  *    card (in_progress → complete / denied / waiting-for-approval); interim
  *    reply text appends as `markdown_text` chunks on the same coalescing
  *    cadence; `turn_end` calls `chat.stopStream` with the final reply as
- *    the closing block. Falls back to the phrase renderer — permanently,
- *    per boot — the moment the workspace/app lacks the Agents feature or a
- *    stream call fails (feature-detect once, never per message; a failed
- *    stream never drops the reply).
+ *    the closing block. CHANNELS only: DMs (slack:D*) always use the
+ *    phrase renderer (issue #180), because the panel is a threaded reply.
+ *    Falls back to the phrase renderer — permanently, per boot — the
+ *    moment the workspace/app lacks the Agents feature or a stream call
+ *    fails (feature-detect once, never per message; a failed stream never
+ *    drops the reply).
  *
  * Step source (issue #168): every gated tool call — the driver's
  * `withPolicyGate` wrapper and the extension runtime — emits
@@ -830,10 +832,11 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
 
   /**
    * Opens the stream with the thinking phrase as the opening chunk. Slack
-   * streams are ALWAYS threaded replies, so the inbound message ts threads
-   * the stream even in DMs (the fallback path keeps today's top-level DM
-   * posts). A failed open falls back to the phrase post — the reply path
-   * never depends on streaming.
+   * streams are ALWAYS threaded replies, so SpaceService never routes DMs
+   * here (issue #180): the plain phrase+edit path owns DM spaces, and this
+   * renderer only ever sees channel spaces (or a fallback, which keeps
+   * top-level posts). A failed open falls back to the phrase post — the
+   * reply path never depends on streaming.
    */
   protected async openTurn(openingText: string): Promise<string | undefined> {
     if (!this.#streamMode || !this.adapter.streamingSupported()) return super.openTurn(openingText);

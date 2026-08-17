@@ -5,7 +5,7 @@ import type { Store } from "../../store/db";
 import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
-import { channelFromSpaceId, type SlackAdapter, type SlackMessage } from "../adapters/slack";
+import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
@@ -184,6 +184,8 @@ export class SpaceService {
    * the first inbound message (or tool step), disposed with the session.
    * The streaming renderer is selected when the adapter reports streaming
    * support; it degrades to the phrase renderer on the first failure.
+   * DMs (slack:D*) ALWAYS get the phrase renderer (issue #180): the
+   * stream panel opens a threaded reply, which DMs must never see.
    */
   readonly #presenters = new Map<string, SlackTurnPresenter>();
 
@@ -208,9 +210,11 @@ export class SpaceService {
 
   /**
    * The space's turn presenter, created lazily. The streaming renderer is
-   * the default when the adapter supports chat streaming (issue #168);
-   * otherwise (or after the first stream failure flips the adapter's
-   * per-boot cache) the phrase renderer carries the space. All presenters
+   * the default for CHANNELS when the adapter supports chat streaming
+   * (issue #168); otherwise (or after the first stream failure flips the
+   * adapter's per-boot cache) the phrase renderer carries the space. DMs
+   * (slack:D*) always use the phrase renderer (issue #180): a DM reads as
+   * one plain message — no thread, no thinking panel. All presenters
    * share ONE phrase rotation (the pre-#153 single-class counter).
    */
   readonly #phraseRotation = createPhraseRotation();
@@ -225,7 +229,13 @@ export class SpaceService {
       onboardingChecks: this.#onboardingChecks,
       phraseRotation: this.#phraseRotation,
     };
-    const presenter = this.#adapter.streamingSupported()
+    // DMs must read as one plain message (issue #180): the stream panel
+    // opens a threaded reply (chat.startStream carries thread_ts), which
+    // is exactly what DM replies must never be. Channels keep the
+    // thinking panel when streaming is supported; the fallback path
+    // (no streaming support, or a failed stream) is unchanged.
+    const isDm = isDmChannel(channelFromSpaceId(spaceId));
+    const presenter = !isDm && this.#adapter.streamingSupported()
       ? new StreamTurnPresenter(deps)
       : new SlackTurnPresenter(deps);
     this.#presenters.set(spaceId, presenter);
