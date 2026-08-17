@@ -177,15 +177,6 @@ function writeCompletedDraft(draftsDir: string, overrides: Record<string, unknow
   writeFileSync(join(draftsDir, "linear.draft.json"), JSON.stringify(draft, null, 2) + "\n");
 }
 
-/** Fake broker seam: records the vault row the OAuth flow would. */
-async function fakeBroker(input: { provider: string; credentialType: string; apiKey?: string }): Promise<{
-  identityKey: string | null;
-  brokerCredentialId: number;
-}> {
-  void input;
-  return { identityKey: "email:ada@example.com", brokerCredentialId: 5 };
-}
-
 /** A personal-scope connect never crosses the policy gate — this seam is never invoked. */
 function minimalConnectGate(): ConnectExtensionDeps["gate"] {
   return {
@@ -631,7 +622,7 @@ describe("catalog_browser pin (issue #195)", () => {
     }
   });
 
-  test("full chat flow: draft → confirm → pin → connect as me (hosted OAuth, temp dirs)", async () => {
+  test("full chat flow: draft → confirm → pin → start connect as me (hosted OAuth, temp dirs)", async () => {
     const { store, dir, cleanup } = freshStore();
     try {
       const draftsDir = join(dir, "drafts");
@@ -716,26 +707,54 @@ describe("catalog_browser pin (issue #195)", () => {
       expect(egress).toContain('"notion.com"');
       expect(existsSync(devEgressPath)).toBe(true);
 
-      // 4. connect as me against the temp snapshots dir (the OAuth flow's vault row)
+      // 4. connect as me against the temp snapshots dir. Hosted OAuth starts
+      // the browser flow; the callback records the credential after consent.
+      const oauthStarts: Array<{
+        extension: string;
+        provider: string;
+        label: string;
+        scope: string;
+        actor: string;
+        spaceId?: string;
+      }> = [];
       const outcome = await connectExtension(
         { extension: "notion", scope: "personal", actor: "UADA" },
         {
           registry: createExtensionRegistry(snapshotsDir),
           store,
           audit: createAudit(store),
-          broker: fakeBroker,
+          broker: async () => {
+            throw new Error("hosted OAuth must not use the broker login path");
+          },
+          mcpOAuth: {
+            start: async (input) => {
+              oauthStarts.push(input);
+              return {
+                ok: true,
+                authorizationUrl: "https://auth.example/authorize?state=notion-test",
+                message: "Open this link to authorize Notion",
+              };
+            },
+          },
           gate: minimalConnectGate(),
         },
       );
-      expect(outcome.ok).toBe(true);
-      if (outcome.ok) {
-        expect(outcome.message).toBe("Notion connected as @UADA");
-        const rows = await store.listExtensionCredentials("notion");
-        expect(rows).toHaveLength(1);
-        expect(rows[0]!.owner).toBe("UADA");
-        expect(rows[0]!.scope).toBe("personal");
-        expect(rows[0]!.identity_key).toBe("email:ada@example.com");
-      }
+      expect(outcome).toEqual({
+        ok: true,
+        credential: null,
+        message: "Open this link to authorize Notion",
+      });
+      expect(oauthStarts).toEqual([
+        {
+          extension: "notion",
+          provider: "notion",
+          label: "Notion",
+          scope: "personal",
+          actor: "UADA",
+          spaceId: undefined,
+        },
+      ]);
+      expect(await store.listExtensionCredentials("notion")).toHaveLength(0);
     } finally {
       cleanup();
     }
