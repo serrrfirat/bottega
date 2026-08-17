@@ -98,6 +98,7 @@ function tempEnv(restoreCwd: string): CaptureEnv {
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     modelKey: process.env.OPENCODE_API_KEY,
     nearKey: process.env.NEAR_API_KEY,
+    callbackPort: process.env.BOTTEGA_CALLBACK_PORT,
   };
   process.chdir(dir);
   // Deployment config the boots read: the server needs the KB config, the
@@ -112,6 +113,11 @@ function tempEnv(restoreCwd: string): CaptureEnv {
   writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
   process.env.SLACK_APP_TOKEN = "xapp-1-test";
   process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  // The browser-leg listener (startOAuthCallbackServer) must never inherit
+  // the live .env's BOTTEGA_CALLBACK_PORT — the harness dev server holds
+  // it, so booting against it is EADDRINUSE. Pin 0 (ephemeral, the #209
+  // default) like every other setup knob this fixture scrubs.
+  process.env.BOTTEGA_CALLBACK_PORT = "0";
   delete process.env.BOTTEGA_CONFIG_DIR;
   delete process.env.BOTTEGA_DB_PATH;
   delete process.env.BOTTEGA_EXTENSIONS_DIR;
@@ -153,6 +159,7 @@ function tempEnv(restoreCwd: string): CaptureEnv {
       restore("gitTokenFile", "EXECUTOR_GIT_TOKEN_FILE");
       restore("modelKey", "OPENCODE_API_KEY");
       restore("nearKey", "NEAR_API_KEY");
+      restore("callbackPort", "BOTTEGA_CALLBACK_PORT");
       rmSync(dir, { recursive: true, force: true });
     },
   };

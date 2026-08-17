@@ -193,6 +193,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
       snapshotTtl: process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS,
       configDir: process.env.BOTTEGA_CONFIG_DIR,
       dbPath: process.env.BOTTEGA_DB_PATH,
+      callbackPort: process.env.BOTTEGA_CALLBACK_PORT,
     };
     process.chdir(dir);
     mkdirSync(join(dir, "config"));
@@ -201,6 +202,11 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
     process.env.OMP_AUTH_BROKER_TOKEN = "test-broker-token";
     // Force a fresh snapshot fetch — never a cached one from another test.
     process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS = "0";
+    // The browser-leg listener (startOAuthCallbackServer) must never inherit
+    // the live .env's BOTTEGA_CALLBACK_PORT — the harness dev server holds
+    // it, so booting against it is EADDRINUSE. Pin 0 (ephemeral, the #209
+    // default) like every other setup knob this fixture scrubs.
+    process.env.BOTTEGA_CALLBACK_PORT = "0";
     delete process.env.SLACK_APP_TOKEN;
     delete process.env.SLACK_BOT_TOKEN;
     delete process.env.OPENCODE_API_KEY;
@@ -238,6 +244,8 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
         else process.env.BOTTEGA_CONFIG_DIR = saved.configDir;
         if (saved.dbPath === undefined) delete process.env.BOTTEGA_DB_PATH;
         else process.env.BOTTEGA_DB_PATH = saved.dbPath;
+        if (saved.callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+        else process.env.BOTTEGA_CALLBACK_PORT = saved.callbackPort;
         rmSync(dir, { recursive: true, force: true });
       },
     };

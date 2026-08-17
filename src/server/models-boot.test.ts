@@ -22,12 +22,18 @@ function tempEnv() {
     app: process.env.SLACK_APP_TOKEN,
     bot: process.env.SLACK_BOT_TOKEN,
     configDir: process.env.BOTTEGA_CONFIG_DIR,
+    callbackPort: process.env.BOTTEGA_CALLBACK_PORT,
   };
   process.chdir(dir);
   mkdirSync(join(dir, "config"));
   writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
   process.env.SLACK_APP_TOKEN = "xapp-1-test";
   process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  // The browser-leg listener (startOAuthCallbackServer) must never inherit
+  // the live .env's BOTTEGA_CALLBACK_PORT — the harness dev server holds
+  // it, so booting against it is EADDRINUSE. Pin 0 (ephemeral, the #209
+  // default) like every other setup knob this fixture scrubs.
+  process.env.BOTTEGA_CALLBACK_PORT = "0";
   delete process.env.BOTTEGA_CONFIG_DIR;
   return {
     dir,
@@ -39,6 +45,8 @@ function tempEnv() {
       else process.env.SLACK_BOT_TOKEN = saved.bot;
       if (saved.configDir === undefined) delete process.env.BOTTEGA_CONFIG_DIR;
       else process.env.BOTTEGA_CONFIG_DIR = saved.configDir;
+      if (saved.callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = saved.callbackPort;
       rmSync(dir, { recursive: true, force: true });
     },
   };

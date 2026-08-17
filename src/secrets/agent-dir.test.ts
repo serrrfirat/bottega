@@ -11,16 +11,26 @@ describe("agent dir wiring (issue #9)", () => {
     rmSync(OMP_AGENT_DIR, { recursive: true, force: true });
     process.env.SLACK_APP_TOKEN = "xapp-test-token";
     process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
+    // Never inherit the live .env's BOTTEGA_CALLBACK_PORT — the harness dev
+    // server holds it, so a boot against it is EADDRINUSE. Pin 0 (ephemeral,
+    // the #209 default) and restore the prior value after.
+    const savedPort = process.env.BOTTEGA_CALLBACK_PORT;
+    process.env.BOTTEGA_CALLBACK_PORT = "0";
     let receivedAgentDir: string | undefined;
-    const server = await main({
-      createDriver: (agentDir) => {
-        receivedAgentDir = agentDir;
-        return createOmpSdkDriver({ agentDir, extensions: [] });
-      },
-    });
-    expect(statSync(OMP_AGENT_DIR).isDirectory()).toBe(true);
-    expect(receivedAgentDir).toBe(OMP_AGENT_DIR);
-    await server.stop();
+    try {
+      const server = await main({
+        createDriver: (agentDir) => {
+          receivedAgentDir = agentDir;
+          return createOmpSdkDriver({ agentDir, extensions: [] });
+        },
+      });
+      expect(statSync(OMP_AGENT_DIR).isDirectory()).toBe(true);
+      expect(receivedAgentDir).toBe(OMP_AGENT_DIR);
+      await server.stop();
+    } finally {
+      if (savedPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = savedPort;
+    }
     mkdirSync(OMP_AGENT_DIR, { recursive: true }); // leave a clean tree behind
   });
 
