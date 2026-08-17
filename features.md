@@ -314,7 +314,7 @@ compose topology still routes everything through the strict proxy; this
 permissiveness is dev-only (`config/egress.dev.yml` is mounted only by
 docker-compose.dev.yml).
 
-## Live-Slack QA canary (issue #79)
+## Live-Slack QA canary (issues #79 + #175)
 
 The product-surface smoke test: it boots the REAL stack (production Socket
 Mode adapter + the real model via the deployment catalog,
@@ -323,15 +323,53 @@ AS a QA user — real messages in, real bot replies out, with per-journey
 pass/fail and Slack permalinks.
 
 ```bash
-bun run canary --live-slack     # or LIVE_SLACK=1
+bun run canary --live-slack            # local/QA run (or LIVE_SLACK=1)
+bun run canary --live-slack --ci       # CI-strict (the scheduled workflow)
 ```
 
 Journeys: chat reply (DM + the `bottega-qa` channel, created when
 missing), memory save/search (a fact is stored and searched back), work
-item creation (always-approve policy path), and the connect intent seam.
-Skip-gated: without `--live-slack`/`LIVE_SLACK=1`, in CI, or with missing
-tokens it prints a clear skip message and exits 0. Generous per-journey
-timeouts (120s) — it waits for a real model and a real workspace.
+item creation (always-approve policy path), the connect intent seam,
+**scheduled standup** (the real scheduler fires a job due ~1 minute out in
+the opted-in space and posts the digest — the journey that would have
+caught #150), **extension call** (the fixture extension's tool through the
+real runtime spine: policy gate → credential ladder → boundary → MCP →
+audit), and **model role switch** (`use_model fast` — chat → model tool
+call → live session switch → `model.switched` audit row). The delivery
+approval round-trip journey lands once #149 ships.
+
+Skip-gated locally (issue #79): without `--live-slack`/`LIVE_SLACK=1`, in
+ad-hoc CI, or with missing tokens it prints a clear skip message and exits
+0. CI-strict (`--ci`/`CANARY_CI=1`, the scheduled workflow): missing
+tokens or model key FAIL the job — a canary that silently skips in CI is
+worse than none. Generous per-journey timeouts (120s+; the standup waits
+for the minute boundary) — it waits for a real model and a real workspace.
+
+### Scheduled in CI + the release gate (issue #175)
+
+`.github/workflows/canary.yml` runs the canary weekly (Monday 06:00 UTC;
+`workflow_dispatch` for manual runs) against the dedicated QA workspace
+with repository secrets:
+
+| Secret | Required | Notes |
+| --- | --- | --- |
+| `SLACK_APP_TOKEN` | yes | Socket Mode app token (xapp) |
+| `SLACK_BOT_TOKEN` | yes | bot user token (xoxb) |
+| `SLACK_QA_USER_TOKEN` | yes | QA user token (xoxp) |
+| `SLACK_QA_USER_ID` | no | skips the users.list name lookup |
+| `SLACK_QA_CHANNEL` | no | defaults to `bottega-qa` |
+| `NEAR_API_KEY` | one of | the model key (preferred — the NEAR gateway accepts the agent's dotted tool names, issue #71) |
+| `CANARY_MODEL_REF` | one of | overrides the model ref entirely |
+
+On failure the workflow posts the per-journey report + permalinks + the
+Actions run URL to the QA channel itself, and the CI status fails.
+
+**The scheduled canary is a release gate, not a merge gate** (live infra
+can flake): a red scheduled run blocks the next deploy until a human
+triages it. **One journey per major feature, added as features land** —
+when a feature ships, it gets a canary journey in the priority order above.
+Both policies live in AGENTS.md → "Scheduled live-Slack canary (issue
+#175)".
 
 ### QA user + tokens
 

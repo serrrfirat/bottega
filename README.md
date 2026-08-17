@@ -248,6 +248,27 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 > only with the `executor` profile enabled, as above. Drop `--profile
 > executor` to run without it.
 
+### Scheduled live-Slack canary (issue #175)
+
+The live-Slack QA canary (issue #79 — the only true "does the product
+work" check: real Socket Mode, real model, real workspace) runs on a
+schedule in CI (`.github/workflows/canary.yml`, weekly Monday 06:00 UTC)
+against the dedicated QA workspace. Configure these **GitHub Actions
+repository secrets** (see features.md → "Live-Slack QA canary" for the QA
+user + token setup):
+
+- `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN` — required.
+- `SLACK_QA_USER_ID`, `SLACK_QA_CHANNEL` — optional (defaults: users.list
+  lookup, `bottega-qa`).
+- `NEAR_API_KEY` (preferred) or `CANARY_MODEL_REF` — the model key/ref.
+
+The job runs CI-strict (`--ci`): missing secrets fail the run loudly
+instead of skipping, and a failure posts the per-journey report +
+permalinks + the run URL to the QA channel. **The scheduled canary is a
+release gate, not a merge gate**: a red scheduled run blocks the next
+deploy until triaged (AGENTS.md → "Scheduled live-Slack canary (issue
+#175)").
+
 ### GitHub credentials: the two token paths
 
 There are exactly two credential paths, and they never overlap. The server

@@ -21,6 +21,7 @@
 # Usage:
 #   bun run canary            # chat + memory + work-item journeys (real model, emulated Slack)
 #   bun run canary --live-slack   # the QA canary against a real Slack workspace (#79)
+#   bun run canary --live-slack --ci   # CI-strict: missing secrets FAIL instead of skipping (#175)
 #   CANARY_FULL=1 bun run canary   # + executor end-to-end (slow)
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -187,6 +187,33 @@ double local.
   provider keys) is a **manual checklist** in the README / `scripts/smoke.sh`.
   Never report it as passing without running it.
 
+## Scheduled live-Slack canary (issue #175)
+
+`.github/workflows/canary.yml` runs the live-Slack canary
+(`tests/e2e/canary.ts`, issue #79) weekly against the dedicated QA
+workspace — real Socket Mode, real model, real Slack — with repository
+secrets (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN`,
+`NEAR_API_KEY`/`CANARY_MODEL_REF`; see features.md → "Live-Slack QA
+canary" for the full list). It runs CI-strict (`--ci`): missing
+credentials FAIL the job instead of skipping — a canary that silently
+skips in CI is worse than none. On failure it posts the per-journey report
++ permalinks + the run URL to the QA channel.
+
+- **Release gate, not a merge gate.** The scheduled canary is live infra
+  and can flake, so it never gates merges; a red scheduled run BLOCKS the
+  next deploy until a human triages it (the QA channel post + the CI
+  status are the notification). Fix the regression or explicitly waive the
+  run before deploying.
+- **One journey per major feature, as features land.** When a shipped
+  feature lands, it gets a canary journey (chat reply, memory, work-item,
+  connect intent, scheduled standup, extension call, model role switch;
+  delivery approval once #149 lands). A journey asserts the human-visible
+  round-trip with deterministic store/audit evidence, never a fabricated
+  pass. Missing tokens locally → skip-and-exit-0 stays correct; in CI →
+  fail.
+- Never run the live leg in ad-hoc CI without `--ci` (it stays skip-gated
+  there); never report a live journey as passing without running it.
+
 ## Code discipline
 
 - **Ponytail**: minimal code, no speculative abstractions, no unused config,

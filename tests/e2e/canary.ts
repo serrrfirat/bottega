@@ -1,21 +1,30 @@
 /**
- * Live-Slack QA canary (issue #79): the product-surface smoke test against a
- * REAL Slack workspace.
+ * Live-Slack QA canary (issues #79 + #175): the product-surface smoke test
+ * against a REAL Slack workspace.
  *
- *   bun run canary --live-slack      # or LIVE_SLACK=1
+ *   bun run canary --live-slack      # or LIVE_SLACK=1 (local/QA runs)
+ *   bun run canary --live-slack --ci # CI-strict (the scheduled workflow)
  *
  * Boots the real stack (production Socket Mode adapter + the #71 real-model
  * mode: the deployment model catalog config/omp/models.yml, keys from
  * env/Keychain) and drives product journeys AS the QA user over the real
  * API: chat replies, memory save/search, work-item creation (always-
- * approve), and the connect intent seam. Per-journey pass/fail with
- * captured Slack message permalinks.
+ * approve), the connect intent seam, the scheduled standup digest (issue
+ * #175 — a real scheduler run posts it; the journey that would have caught
+ * #150), the fixture extension tool call through the real extension
+ * runtime (policy gate → credential ladder → boundary → MCP → audit), and
+ * the use_model fast round-trip (chat → model tool call → live session
+ * switch → model.switched audit row). Per-journey pass/fail with captured
+ * Slack message permalinks.
  *
- * Skip-gated, NEVER in CI:
+ * Skip-gated locally (issue #79), CI-strict in the scheduled job (#175):
  *   - without --live-slack / LIVE_SLACK=1 → skip with usage
- *   - in CI → skip (this leg exists for manual/QA runs only)
- *   - missing tokens (env or macOS Keychain) → skip with a setup pointer
- *   - no model key (NEAR_API_KEY / OPENCODE_API_KEY) → skip with a pointer
+ *   - in CI without --ci → skip (the live leg never runs in ad-hoc CI)
+ *   - missing tokens (env or macOS Keychain) → skip locally with a setup
+ *     pointer; FAIL in CI-strict mode (a canary that silently skips in CI
+ *     is worse than none, #175)
+ *   - no model key (NEAR_API_KEY / OPENCODE_API_KEY) → skip locally with a
+ *     pointer; FAIL in CI-strict mode
  *
  * Tokens (env first, Keychain second):
  *   SLACK_APP_TOKEN      (service bottega-slack-app)   — Socket Mode app token
@@ -32,21 +41,45 @@
  * absent. CANARY_MODEL_REF overrides the model ref entirely.
  *
  * Keychain install: security add-generic-password -s bottega-slack-qa -a "$(whoami)" -w '<xoxp token>'
- * Full QA setup: features.md → "Live-Slack QA canary".
+ * Full QA setup: features.md → "Live-Slack QA canary"; CI + release-gate
+ * policy: AGENTS.md → "Scheduled live-Slack canary (issue #175)".
  */
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
-import { WORK_ITEM_CREATED_EVENT } from "../../src/store/audit-events";
+import {
+  EXTENSION_CALL_EVENT,
+  MODEL_SWITCHED_EVENT,
+  WORK_ITEM_CREATED_EVENT,
+} from "../../src/store/audit-events";
 import { errorMessage } from "../../src/tools/helpers";
+import { loadSpacePolicy } from "../../src/policy/config";
+import { buildRegistry } from "../../src/scheduler/actions";
+import { startScheduler, type Scheduler } from "../../src/scheduler/runner";
+import { standupDigestAction } from "../../src/scheduler/standup";
+import { createSecretFileBoundary, type CredentialBoundary } from "../../src/extensions/boundary";
+import {
+  createFixtureRegistry,
+  FIXTURE_EXTENSION_ID,
+  FIXTURE_EXTENSION_TOOL,
+} from "../../src/extensions/fixture";
+import type { McpBinding } from "../../src/extensions/manifest";
 import type { LiveSlackTokens, SlackApiMessage } from "./slack-live";
 
-/** Org policy for the canary (issue #79): memory tools allowed, work-item
- * creation on the documented always-approve path (approver: "policy"). */
+/** Org policy for the canary (issues #79/#175): memory tools allowed,
+ * work-item creation on the documented always-approve path (approver:
+ * "policy"), and the fixture extension's read-tier tool allowed so the
+ * extension journey crosses the policy gate (the fixture extension itself
+ * is registered by the canary's own registry — see runLiveLeg). */
 const CANARY_ORG_CONFIG = [
   "tools:",
   "  memory.save: allow",
   "  memory.search: allow",
   "  create_work_item: allow",
+  `  ${FIXTURE_EXTENSION_TOOL}: allow`,
   "approvals:",
   "  always_approve:",
   "    - create_work_item",
@@ -149,6 +182,63 @@ export function keychainGet(service: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Cron for the standup journey's job (issue #175): fires once at the
+ * minute boundary ~1 minute out, so the scheduler run is observable within
+ * the journey timeout and the job never re-fires during the leg (the next
+ * occurrence of `M * * * *` is the next hour).
+ */
+export function standupCronFor(afterMs: number): string {
+  const minute = new Date(afterMs + 60_000).getUTCMinutes();
+  return `${minute} * * * *`;
+}
+
+/**
+ * The canary's fixture extension MCP transport (issue #175): a scripted
+ * in-process server, so the extension journey exercises the REAL runtime
+ * spine (policy gate → credential ladder → boundary write → MCP call →
+ * audit) deterministically without a network provider. Mirrors the
+ * hermetic transport seam (extensions.test.ts); the provider surface is
+ * the only scripted piece.
+ */
+export function canaryFixtureMcpTransport(_binding: McpBinding): Transport {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = new Server(
+    { name: "bottega-canary-fixture", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: FIXTURE_EXTENSION_TOOL,
+        description: "Current weather for a city (canary fixture provider)",
+        inputSchema: {
+          type: "object",
+          properties: { city: { type: "string" } },
+          required: ["city"],
+        },
+      },
+    ],
+  }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const args = (request.params.arguments ?? {}) as { city?: string };
+    return { content: [{ type: "text", text: `sunny in ${args.city ?? "unknown"}` }] };
+  });
+  void server.connect(serverTransport);
+  return clientTransport;
+}
+
+/**
+ * The canary's credential boundary (issue #175): the real write-only
+ * boundary (secret file, mode 0600, atomic rename) with a fixed resolver —
+ * the fixture provider has no vault row, and there is no proxy control URL
+ * in the canary's in-process topology, so the injection write is what the
+ * journey exercises.
+ */
+export function canaryFixtureBoundary(): CredentialBoundary {
+  return createSecretFileBoundary({ resolveSecret: async () => "canary-fixture-secret" });
 }
 
 /** Polls `fn` until it returns a truthy value; throws on timeout. */
@@ -354,20 +444,220 @@ async function journeyConnect(h: Harness, channelId: string): Promise<JourneyRes
   }
 }
 
+/**
+ * The scheduled-standup journey (issue #175): opt the space in
+ * (proactive.standup via the JSON policy overlay — the exact shape #150
+ * fixed), create a standup_digest job due ~1 minute out, and assert the
+ * scheduler fires it and the bot posts the digest. This is the journey
+ * that would have caught #150 on day one: with #150 reverted, the JSON
+ * overlay fails closed (the old parser threw on "{"), no digest is posted,
+ * and the journey times out into a fail. The scheduler itself is booted by
+ * runLiveLeg with the real runner + standup action (server wiring).
+ */
+async function journeyStandup(h: Harness, channelId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  let jobId: string | undefined;
+  try {
+    // Opt the space in deterministically (the settings tool would need a
+    // model turn + approval; the scheduler reads spaces.policy_json, and
+    // the opt-in shape is the #150 contract being exercised).
+    const space = await h.store.getSpace(spaceId);
+    if (!space) throw new Error(`space not found: ${spaceId}`);
+    const overlay = JSON.parse(space.policy_json || "{}") as Record<string, unknown>;
+    const proactive = (typeof overlay.proactive === "object" && overlay.proactive !== null && !Array.isArray(overlay.proactive)
+      ? overlay.proactive
+      : {}) as Record<string, unknown>;
+    overlay.proactive = { ...proactive, standup: true };
+    await h.store.updatePolicy(spaceId, JSON.stringify(overlay));
+
+    // Create the standup job due at the next minute boundary (~1 min out).
+    const job = await h.store.createSchedulerJob({
+      action: "standup_digest",
+      cron: standupCronFor(Date.now()),
+      params: { space: spaceId },
+      spaceId,
+      createdBy: live.qaUserId,
+    });
+    jobId = job.id;
+    const afterTs = String(Date.now() / 1000);
+    const digest = await waitFor(
+      async () => {
+        const history = await live.history(channelId);
+        return history.find(
+          (m) => isBotMessage(h, m) && m.text.includes("Standup for") && parseFloat(m.ts) > parseFloat(afterTs),
+        );
+      },
+      150_000,
+      "the scheduled standup digest in the channel",
+    );
+    const permalink = await live.permalink(channelId, digest.ts);
+    return {
+      name: "scheduled-standup",
+      status: "pass",
+      details: [
+        `job ${job.id} (cron "${job.cron}") fired; digest posted: "${snippet(digest.text)}"`,
+        "space opted in via the JSON proactive overlay (the #150 shape)",
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "scheduled-standup", status: "fail", details: [errorMessage(err)] };
+  } finally {
+    if (jobId !== undefined) {
+      try {
+        await h.store.deleteSchedulerJob(jobId);
+      } catch {
+        // Cleanup never masks the journey result.
+      }
+    }
+  }
+}
+
+/**
+ * The extension-call journey (issue #175): the QA user asks for the
+ * fixture extension's tool, the model calls it, and the REAL runtime
+ * executes it through the policy gate → credential ladder → boundary
+ * write → MCP call → audit. The deterministic proof is the
+ * extension.call audit row (tool + decision "allow"); the reply is the
+ * human-visible half.
+ */
+async function journeyExtension(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    // Seed the org credential the ladder resolves (deterministic setup —
+    // the fixture provider has no connect flow; the runtime's own audit
+    // rows prove the ladder + boundary ran).
+    await h.store.upsertExtensionCredential({
+      provider: FIXTURE_EXTENSION_ID,
+      identityKey: "canary-fixture",
+      owner: null,
+      scope: "org",
+      brokerCredentialId: 0,
+    });
+    const city = `canary-${runId}`;
+    const before = (await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CALL_EVENT })).length;
+    // Name-agnostic on purpose: the driver flattens dotted tool names for
+    // the model-facing toolset (issue #78), so the prompt points at the
+    // fixture extension without naming a tool the model would not find.
+    const { reply } = await postAndWait(
+      h,
+      channelId,
+      `call the weather fixture extension tool for the city ${city} and tell me the forecast`,
+      { label: "extension call" },
+    );
+    const rows = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CALL_EVENT });
+        return rows.length > before ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "an extension tool call audit row",
+    );
+    const row = rows[rows.length - 1]!;
+    const payload = JSON.parse(row.payload) as { tool?: string; decision?: string };
+    if (payload.tool !== FIXTURE_EXTENSION_TOOL) {
+      throw new Error(`extension.call audited tool "${payload.tool ?? "<missing>"}", expected ${FIXTURE_EXTENSION_TOOL}`);
+    }
+    if (payload.decision !== "allow") {
+      throw new Error(`extension.call decision "${payload.decision ?? "<missing>"}", expected allow`);
+    }
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "extension-call",
+      status: "pass",
+      details: [
+        `fixture tool ${FIXTURE_EXTENSION_TOOL} executed through the real runtime (decision: ${payload.decision})`,
+        `reply: "${snippet(reply.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "extension-call", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The model-role-switch journey (issue #175): the QA user asks for the
+ * fast model, the model calls use_model, the live session switches (the
+ * OMP driver's per-session hook), and the switch is audited. The
+ * deterministic proof is the model.switched audit row with role "fast".
+ */
+async function journeyModelRole(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const before = (await h.store.listAudit({ space: spaceId, event_type: MODEL_SWITCHED_EVENT })).length;
+    const { reply } = await postAndWait(
+      h,
+      channelId,
+      `use the fast model for this: reply with the canary run id ${runId}`,
+      { label: "model role switch" },
+    );
+    const rows = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: MODEL_SWITCHED_EVENT });
+        return rows.length > before ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "a model.switched audit row",
+    );
+    const row = rows[rows.length - 1]!;
+    const payload = JSON.parse(row.payload) as { role?: string };
+    if (payload.role !== "fast") {
+      throw new Error(`model.switched audited role "${payload.role ?? "<missing>"}", expected fast`);
+    }
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "model-role-switch",
+      status: "pass",
+      details: [
+        `use_model fast applied to the live session and audited (role: ${payload.role})`,
+        `reply: "${snippet(reply.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "model-role-switch", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
 /** The live leg: boots the real stack and runs every journey. */
 export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult> {
   const journeys: JourneyResult[] = [];
   let harness: Harness | undefined;
+  let scheduler: Scheduler | undefined;
   try {
     harness = await bootHarness({
       realSlack: true,
       realModel: true,
       slackTokens: tokens,
       orgConfigYaml: CANARY_ORG_CONFIG,
+      // The extension journey (issue #175) uses the canary's own fixture
+      // registry + scripted MCP provider so the REAL runtime spine runs
+      // deterministically (no network provider, no connect flow).
+      registry: createFixtureRegistry(),
+      mcpTransport: canaryFixtureMcpTransport,
+      extensionBoundary: canaryFixtureBoundary(),
       // Real-model digests on dispose: keep the idle window well past the run.
       idleTimeoutMs: 5 * 60_000,
       liveConnect: {},
     });
+    // The standup journey needs the REAL scheduler (issue #175): boot the
+    // durable runner with the standup action over the harness's live store
+    // and adapter — the server's wiring (src/server/index.ts), minus the
+    // actions the canary does not drive.
+    scheduler = startScheduler({
+      store: harness.store,
+      audit: harness.audit,
+      registry: buildRegistry([standupDigestAction]),
+      memoryProvider: harness.memory,
+      postMessage: (spaceId, text) => harness!.adapter.postMessage(spaceId, text),
+      loadPolicy: (spaceId) => loadSpacePolicy(harness!.orgPolicy, harness!.store, spaceId),
+      log: (line) => console.log(line),
+    });
+    scheduler.start();
     const live = harness.liveSlack!;
     const runId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffff).toString(36)}`;
     const channelName = tokens.channelName ?? "bottega-qa";
@@ -401,6 +691,13 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     journeys.push(await journeyMemory(harness, live.dmChannelId, runId));
     journeys.push(await journeyWorkItem(harness, live.dmChannelId, runId));
     journeys.push(await journeyConnect(harness, live.dmChannelId));
+    // Issue #175 journeys: the standup needs the QA channel space (run
+    // after the channel chat journey created it); extension + model-role
+    // ride the DM like memory/work-item.
+    const standupChannel = channel ? channel.id : live.dmChannelId;
+    journeys.push(await journeyStandup(harness, standupChannel));
+    journeys.push(await journeyExtension(harness, live.dmChannelId, runId));
+    journeys.push(await journeyModelRole(harness, live.dmChannelId, runId));
 
     const failed = journeys.filter((j) => j.status === "fail");
     const attempted = journeys.filter((j) => j.status !== "skip");
@@ -420,6 +717,7 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
       journeys,
     };
   } finally {
+    scheduler?.stop();
     try {
       await harness?.cleanup();
     } catch {
@@ -433,6 +731,10 @@ export async function runCanary(
   argv: string[],
   deps: TokenDeps,
 ): Promise<CanaryResult> {
+  // CI-strict mode (issue #175): the scheduled workflow passes --ci (or
+  // CANARY_CI=1) so missing credentials FAIL the job instead of skipping —
+  // a canary that silently skips in CI is worse than none.
+  const ciStrict = argv.includes("--ci") || deps.env.CANARY_CI === "1";
   if (!argv.includes("--live-slack") && deps.env.LIVE_SLACK !== "1") {
     return {
       status: "skipped",
@@ -440,15 +742,26 @@ export async function runCanary(
       journeys: [],
     };
   }
-  if (deps.env.CI === "true" || deps.env.CI === "1") {
+  const inCI = deps.env.CI === "true" || deps.env.CI === "1";
+  if (inCI && !ciStrict) {
     return {
       status: "skipped",
-      message: "live-slack canary skipped — the live leg NEVER runs in CI (issue #79)",
+      message: "live-slack canary skipped — the live leg NEVER runs in ad-hoc CI (issue #79); " +
+        "the scheduled workflow (issue #175) runs it with --ci",
       journeys: [],
     };
   }
   const resolved = resolveLiveTokens(deps);
   if (resolved.tokens === undefined) {
+    if (ciStrict) {
+      return {
+        status: "failed",
+        message:
+          `live-slack canary FAILED in CI-strict mode — missing required secrets: ${resolved.missing.join(", ")} ` +
+          "(set them as GitHub Actions repository secrets; features.md → “Live-Slack QA canary”, issue #175)",
+        journeys: [],
+      };
+    }
     return {
       status: "skipped",
       message:
@@ -461,6 +774,16 @@ export async function runCanary(
   // its gateway accepts the space agent's dotted tool names; the
   // opencode-go gateway rejects them (live finding, issue #71).
   if (resolveModelKey(deps) === null) {
+    if (ciStrict) {
+      return {
+        status: "failed",
+        message:
+          "live-slack canary FAILED in CI-strict mode — no model key " +
+          "(set NEAR_API_KEY or CANARY_MODEL_REF as a GitHub Actions repository secret; prefer NEAR — " +
+          "the opencode-go gateway rejects the agent's dotted tool names, issue #71; issue #175)",
+        journeys: [],
+      };
+    }
     return {
       status: "skipped",
       message:
