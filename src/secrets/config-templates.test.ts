@@ -14,37 +14,43 @@ function readConfig(name: string): string {
 describe("config/omp templates (issue #9 secrets & models)", () => {
   test("config.yml enables secret obfuscation and leaves approval gating to the policy extension", () => {
     const config = parseYamlSubset(readConfig("config.yml"));
+    // SAFETY: config.yml's `secrets` key is a mapping (its `enabled` scalar is asserted below); YAML mappings parse to YamlNode objects.
     const secrets = config["secrets"] as Record<string, YamlNode>;
-    expect(secrets["enabled"] as string).toBe("true");
+    expect(secrets["enabled"]).toBe("true");
     // The policy extension (issue #6) owns tool-call gating — OMP's own
     // approval mode must not be configured.
     expect(config["approvalMode"]).toBeUndefined();
   });
 
   test("secrets.yml is a YAML array of obfuscate-mode placeholders", () => {
+    // SAFETY: secrets.yml is a top-level YAML sequence of mappings (this test iterates its entries); sequence items parse to YamlNode objects.
     const entries = parseYamlSequence(readConfig("secrets.yml")) as Record<string, YamlNode>[];
     expect(entries.length).toBeGreaterThan(0);
     for (const entry of entries) {
-      expect(["plain", "regex"]).toContain(entry["type"] as string);
-      expect(["obfuscate", "replace"]).toContain(entry["mode"] as string);
-      expect(entry["mode"] as string).toBe("obfuscate");
-      expect(typeof entry["content"]).toBe("string");
-      expect(typeof entry["friendlyName"]).toBe("string");
+      // SAFETY: secrets.yml placeholder entries are scalar-only per the template contract (type "plain"|"regex", mode "obfuscate"|"replace", string content).
+      const { type, mode, content } = entry as { type: string; mode: string; content: string };
+      expect(["plain", "regex"]).toContain(type);
+      expect(["obfuscate", "replace"]).toContain(mode);
+      expect(mode).toBe("obfuscate");
+      expect(content).toEqual(expect.any(String));
+      expect(entry["friendlyName"]).toEqual(expect.any(String));
       // Templates must never ship real credentials.
-      expect(entry["content"] as string).toMatch(/^replace-with-/);
+      expect(content).toMatch(/^replace-with-/);
     }
   });
 
   test("models.yml declares the NEAR.ai provider over the OpenAI-compatible API", () => {
     const models = parseYamlSubset(readConfig("models.yml"));
+    // SAFETY: models.yml's `providers` key is a mapping of provider id → config per the file contract.
     const providers = models["providers"] as Record<string, YamlNode>;
+    // SAFETY: the `near` provider entry is a mapping (its scalars are asserted below) per models.yml's contract.
     const near = providers["near"] as Record<string, YamlNode>;
-    expect(near["api"] as string).toBe("openai-completions");
+    expect(near["api"]).toBe("openai-completions");
     // Live NEAR AI Cloud gateway (issue #36); api.near.ai was retired.
-    expect(near["baseUrl"] as string).toBe("https://cloud-api.near.ai/v1");
+    expect(near["baseUrl"]).toBe("https://cloud-api.near.ai/v1");
     // apiKey is an env-var reference, resolved by the SDK at runtime — the
     // key value itself never appears in the template.
-    expect(near["apiKey"] as string).toBe("NEAR_API_KEY");
+    expect(near["apiKey"]).toBe("NEAR_API_KEY");
   });
 });
 

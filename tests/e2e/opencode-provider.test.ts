@@ -27,6 +27,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 import { discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveModelFromSettings, pickDefaultAvailableModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -69,9 +70,15 @@ interface AgentDirConfig {
   modelRoles?: { [role: string]: string };
 }
 
+/** The agent-dir config.yml shape this file reads: disabledProviders + modelRoles. */
+const agentDirConfigSchema = z.object({
+  disabledProviders: z.union([z.string(), z.array(z.string())]).optional(),
+  modelRoles: z.record(z.string(), z.string()).optional(),
+});
+
 function readAgentDirConfig(path: string): AgentDirConfig | null {
   try {
-    return parseYamlSubset(readFileSync(path, "utf8")) as unknown as AgentDirConfig;
+    return agentDirConfigSchema.parse(parseYamlSubset(readFileSync(path, "utf8")));
   } catch {
     return null;
   }
@@ -80,8 +87,26 @@ function readAgentDirConfig(path: string): AgentDirConfig | null {
 /** The pin must name an opencode-go model — anything else is a drift/band-aid. */
 function pinTargetsOpencode(cfg: AgentDirConfig | null): boolean {
   const pin = cfg?.modelRoles?.default;
-  return typeof pin === "string" && pin.startsWith("opencode-go/");
+  return pin !== undefined && pin.startsWith("opencode-go/");
 }
+
+/**
+ * The gateway /responses body shape this leg asserts on: an optional
+ * `output` array of items carrying `type`, a flat `text`, and/or nested
+ * `content` blocks. Every field is optional so the filters below behave
+ * exactly like the pre-parse code (missing fields just fail to match).
+ */
+const responsesBodySchema = z.object({
+  output: z
+    .array(
+      z.object({
+        type: z.string().optional(),
+        text: z.string().optional(),
+        content: z.array(z.object({ type: z.string().optional(), text: z.string().optional() })).optional(),
+      }),
+    )
+    .optional(),
+});
 
 /** One gateway probe per file: the flat-tool request the fix asserts succeeds. */
 let probeStatus: Promise<number | "unreachable"> | undefined;
@@ -248,10 +273,14 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       expect(pickDefaultAvailableModel(available)?.id).toBe("kimi-k2.7-code");
       // The resolution path the session uses (config.yml modelRoles.default)
       // must land on the pinned model.
-      const settings = {
+      const settings: Pick<Settings, "getModelRole"> = {
         getModelRole: (role: string) => (role === "default" ? "opencode-go/deepseek-v4-flash" : undefined),
-      } as unknown as Settings;
-      const resolved = resolveModelFromSettings({ settings, availableModels: available });
+      };
+      // SAFETY: resolveModelFromSettings reads model roles only through
+      // settings.getModelRole (see SDK model-resolver.ts); the stub
+      // implements that method with the Settings contract, and no other
+      // Settings member is touched on this resolution path.
+      const resolved = resolveModelFromSettings({ settings: settings as Settings, availableModels: available });
       expect(resolved?.provider).toBe("opencode-go");
       expect(resolved?.id).toBe("deepseek-v4-flash");
       expect(resolved?.baseUrl).toBe("https://opencode.ai/zen/go/v1");
@@ -301,10 +330,10 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
     // a completed, non-empty response.
     const flat = await probe(makeTools((name) => name.replace(/[^a-zA-Z0-9_-]+/g, "_")));
     expect(flat.status).toBe(200);
-    const parsed = JSON.parse(flat.text) as { output?: Array<{ type: string; text?: string }> };
+    const parsed = responsesBodySchema.parse(JSON.parse(flat.text));
     const text = (parsed.output ?? [])
       .filter((item) => item.type === "message")
-      .flatMap((item) => (item as { content?: Array<{ text?: string }> }).content ?? [])
+      .flatMap((item) => item.content ?? [])
       .map((block) => block.text ?? "")
       .join("");
     expect(text.trim().length).toBeGreaterThan(0);
@@ -337,10 +366,14 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);
       await registry.refresh();
       const available = registry.getAvailable();
-      const settings = {
+      const settings: Pick<Settings, "getModelRole"> = {
         getModelRole: (role: string) => (role === "default" ? "opencode-go/deepseek-v4-flash" : undefined),
-      } as unknown as Settings;
-      const resolved = resolveModelFromSettings({ settings, availableModels: available });
+      };
+      // SAFETY: resolveModelFromSettings reads model roles only through
+      // settings.getModelRole (see SDK model-resolver.ts); the stub
+      // implements that method with the Settings contract, and no other
+      // Settings member is touched on this resolution path.
+      const resolved = resolveModelFromSettings({ settings: settings as Settings, availableModels: available });
       expect(resolved?.provider).toBe("opencode-go");
       expect(resolved?.id).toBe("deepseek-v4-flash");
       if (!resolved) throw new Error("resolveModelFromSettings returned no model for the pinned role");
@@ -362,9 +395,7 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
           }),
         });
         expect(res.status).toBe(200);
-        const body = (await res.json()) as {
-          output?: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>;
-        };
+        const body = responsesBodySchema.parse(await res.json());
         const text = (body.output ?? [])
           .filter((item) => item.type === "message")
           .flatMap((item) => item.content ?? [])
@@ -425,7 +456,7 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       ]),
     });
     expect(ok.status).toBe(200);
-    const body = (await ok.json()) as { output?: Array<{ type: string; content?: Array<{ text?: string }> }> };
+    const body = responsesBodySchema.parse(await ok.json());
     const text = (body.output ?? [])
       .filter((item) => item.type === "message")
       .flatMap((item) => item.content ?? [])

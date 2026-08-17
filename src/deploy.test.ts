@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { service, services } from "./compose-test-utils";
+import { service, serviceEnv, services } from "./compose-test-utils";
 import { parseYamlSubset } from "./yaml-subset";
 import type { YamlNode } from "./yaml-subset";
 
@@ -17,13 +17,25 @@ function readRoot(name: string): string {
   return readFileSync(resolve(ROOT, name), "utf8");
 }
 
+// The compose file and Slack manifest are hand-authored; every key these
+// tests read is asserted below, so narrowing a node to its rendered shape is
+// sound — a shape change surfaces as a failing assertion, never a silent skip.
+function asRecord(node: YamlNode): Record<string, YamlNode> {
+  // SAFETY: every key this suite reads is a block mapping in the hand-authored fixtures.
+  return node as Record<string, YamlNode>;
+}
+function asStringArray(node: YamlNode): string[] {
+  // SAFETY: the entrypoint/volumes/bot-scope keys are block sequences of scalar strings in the fixtures.
+  return node as string[];
+}
+
 describe("docker-compose.yml deploy wiring (issue #12)", () => {
   test("server and executor build from the repo root into a pinned image tag", () => {
     for (const name of ["server", "executor"]) {
       const svc = service(name);
-      expect((svc["build"] as Record<string, YamlNode>)["context"]).toBe(".");
+      expect(asRecord(svc["build"])["context"]).toBe(".");
       expect(svc["image"]).toBe("bottega:${BOTTEGA_IMAGE_TAG:-local}");
-      expect(svc["entrypoint"] as string[]).toEqual([
+      expect(asStringArray(svc["entrypoint"])).toEqual([
         "bun",
         "run",
         name === "server" ? "src/server/index.ts" : "src/executor.ts",
@@ -38,13 +50,13 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
   });
 
   test("executor reads the git PAT from the container path of the data volume", () => {
-    const env = service("executor")["environment"] as Record<string, YamlNode>;
+    const env = serviceEnv("executor");
     expect(env["EXECUTOR_GIT_TOKEN_FILE"]).toBe("/app/data/secrets/github-pat");
     // Issue #67: the workspaces dir is an org SETTING (settings.workspaces_dir),
     // not an env var — unset, the executor resolves the container default
     // /workspaces (the data volume mounted below).
     expect(env["WORKSPACES_DIR"]).toBeUndefined();
-    const volumes = service("executor")["volumes"] as string[];
+    const volumes = asStringArray(service("executor")["volumes"]);
     expect(volumes).toContain("data:/workspaces");
   });
 });
@@ -53,23 +65,23 @@ describe("slack-app-manifest.yml (issue #12)", () => {
   const manifest = parseYamlSubset(readRoot("slack-app-manifest.yml"));
 
   test("enables Socket Mode (no public ingress needed)", () => {
-    const settings = manifest["settings"] as Record<string, YamlNode>;
+    const settings = asRecord(manifest["settings"]);
     expect(settings["socket_mode_enabled"]).toBe("true");
   });
 
   test("grants the bot scopes the adapter needs (issue #4 prerequisites)", () => {
-    const oauth = manifest["oauth_config"] as Record<string, YamlNode>;
-    const scopes = oauth["scopes"] as Record<string, YamlNode>;
-    const bot = scopes["bot"] as string[];
+    const oauth = asRecord(manifest["oauth_config"]);
+    const scopes = asRecord(oauth["scopes"]);
+    const bot = asStringArray(scopes["bot"]);
     for (const scope of ["chat:write", "app_mentions:read", "channels:history", "groups:history", "im:history"]) {
       expect(bot).toContain(scope);
     }
   });
 
   test("subscribes to the events the server handles", () => {
-    const settings = manifest["settings"] as Record<string, YamlNode>;
-    const subs = settings["event_subscriptions"] as Record<string, YamlNode>;
-    const events = subs["bot_events"] as string[];
+    const settings = asRecord(manifest["settings"]);
+    const subs = asRecord(settings["event_subscriptions"]);
+    const events = asStringArray(subs["bot_events"]);
     for (const event of ["message.channels", "message.groups", "app_mention"]) {
       expect(events).toContain(event);
     }

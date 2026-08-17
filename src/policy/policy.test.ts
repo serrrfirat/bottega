@@ -637,14 +637,28 @@ describe("policy extension wiring", () => {
 
   type ToolCallHandler = ExtensionHandler<ToolCallEvent, ToolCallEventResult>;
 
+  /** Fields on policy decision/approval audit payloads that these tests read. */
+  interface PolicyAuditPayload {
+    tool?: string;
+    tier?: string;
+    decision?: string;
+    approved?: boolean;
+    approver?: string;
+    reason?: string;
+    args?: string;
+  }
+
   function fakePi() {
     const handlers = new Map<string, ToolCallHandler>();
     // Test double: only the tool_call overload the extension registers.
+    // SAFETY: createPolicyExtension registers tool handlers through pi.on only;
+    // the double implements exactly that surface and the extension never reads
+    // the rest of ExtensionAPI during registration.
     const pi = {
       on(event: "tool_call", handler: ToolCallHandler): void {
         handlers.set(event, handler);
       },
-    } as unknown as ExtensionAPI;
+    } as ExtensionAPI;
     return { handlers, pi };
   }
 
@@ -672,17 +686,22 @@ describe("policy extension wiring", () => {
     return handlers;
   }
 
-  function toolCallEvent(toolName: string, input: Record<string, unknown>): ToolCallEvent {
+  function toolCallEvent(toolName: string, input: Record<string, string>): ToolCallEvent {
     // Test double: toolName/input unions can't be composed statically.
+    // SAFETY: the literal carries the type/toolCallId/toolName/input fields the
+    // extension reads; the per-toolName input narrowing cannot be composed
+    // statically from a string tool name.
     return { type: "tool_call", toolCallId: "tc1", toolName, input } as ToolCallEvent;
   }
 
   function call(
     handlers: Map<string, ToolCallHandler>,
     toolName: string,
-    input: Record<string, unknown> = {},
+    input: Record<string, string> = {},
     spaceId: string = space.id,
   ): Promise<ToolCallEventResult | void> {
+    // SAFETY: the extension reads only sessionManager.getSessionFile() on this
+    // path; the double provides it and nothing else is touched.
     const ctx = { sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) } } as ExtensionContext;
     const handler = handlers.get("tool_call")!;
     return Promise.resolve(handler(toolCallEvent(toolName, input), ctx));
@@ -690,7 +709,7 @@ describe("policy extension wiring", () => {
 
   /** Asserts the gate returned a block result and returns it for further assertions. */
   function blocked(res: ToolCallEventResult | void): ToolCallEventResult {
-    if (typeof res === "object" && res !== null) {
+    if (res !== undefined && res !== null) {
       expect(res.block).toBe(true);
       return res;
     }
@@ -699,7 +718,9 @@ describe("policy extension wiring", () => {
 
   async function lastAudit(eventType: string) {
     const rows = await audit.listAudit({ event_type: eventType });
-    return JSON.parse(rows.at(-1)!.payload) as Record<string, unknown>;
+    // SAFETY: policy decision/approval payloads are flat JSON objects with the
+    // tool/tier/decision/approved/approver/reason/args fields these tests read.
+    return JSON.parse(rows.at(-1)!.payload) as PolicyAuditPayload;
   }
 
   test("allow decision lets the tool run and writes a policy.decision row", async () => {
@@ -854,6 +875,9 @@ describe("policy extension wiring", () => {
 
   test("missing session file falls back to the org policy", async () => {
     const handlers = makeExtension("tools:\n  read: allow\n");
+    // SAFETY: the extension reads only sessionManager.getSessionFile() on this
+    // path; the double provides it (returning undefined here) and nothing else
+    // is touched.
     const ctx = { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext;
     const res = await handlers.get("tool_call")!(toolCallEvent("read", { path: "x" }), ctx);
     expect(res).toBeUndefined();

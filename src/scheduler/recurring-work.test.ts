@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { MemoryProvider } from "../memory/types";
 import { createAudit, type AuditModule } from "../policy/audit";
 import { SCHEDULER_ERROR_EVENT, WORK_ITEM_CREATED_EVENT } from "../store/audit-events";
-import { createStore, type AuditRow, type Store, type WorkItem } from "../store/db";
+import { createStore, type AuditRow, type CreatedWorkItemAuditPayload, type Store, type WorkItem } from "../store/db";
 import { KNOWN_ACTIONS } from "./actions";
 import { recurringWorkAction } from "./recurring-work";
 import { createSchedulerJobArgsSchema } from "./scheduler-tools";
@@ -49,24 +49,26 @@ function context(store: Store, audit: AuditModule, logs: string[] = []): Schedul
   };
 }
 
-function payload(row: AuditRow): Record<string, unknown> {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+function payload(row: AuditRow): CreatedWorkItemAuditPayload {
+  // SAFETY: WORK_ITEM_CREATED_EVENT rows are written by createWorkItem with
+  // exactly this payload shape (see src/store/db.ts).
+  return JSON.parse(row.payload) as CreatedWorkItemAuditPayload;
 }
 
-function fakeContext(options: { createError?: Error } = {}): {
-  ctx: SchedulerActionContext;
-  createCalls: Array<Parameters<Store["createWorkItem"]>[0]>;
-  audits: AuditInput[];
-} {
+function fakeContext(options: { createError?: Error } = {}) {
   const createCalls: Array<Parameters<Store["createWorkItem"]>[0]> = [];
   const audits: AuditInput[] = [];
+  // SAFETY: the fake implements only createWorkItem — the only Store method
+  // recurringWorkAction exercises through ctx.store.
   const store = {
     async createWorkItem(input: Parameters<Store["createWorkItem"]>[0]) {
       createCalls.push(input);
       if (options.createError) throw options.createError;
+      // SAFETY: the action reads only the created item's id (and the tests
+      // assert nothing else about the returned row).
       return { id: "wi_fake" } as WorkItem;
     },
-  } as unknown as Store;
+  } as Store;
   const audit: AuditModule = {
     async appendAudit(entry) {
       audits.push(entry);
@@ -108,7 +110,7 @@ describe("recurringWorkAction", () => {
     expect(rows[0]?.actor).toBe("U_OPS");
     const created = payload(rows[0]!);
     expect(created.requester).toBe("U_OPS");
-    const item = await store.getWorkItem(created.id as string);
+    const item = await store.getWorkItem(created.id);
     expect(item).toMatchObject({
       space_id: space.id,
       requester: "U_OPS",
@@ -192,7 +194,7 @@ describe("recurringWorkAction", () => {
     const ids = rows.map((row) => payload(row).id);
     expect(new Set(ids).size).toBe(2);
     for (const id of ids) {
-      expect(await store.getWorkItem(id as string)).toMatchObject({
+      expect(await store.getWorkItem(id)).toMatchObject({
         delivery: "extension",
         description: "Sync CRM contacts",
         requester: "scheduler",

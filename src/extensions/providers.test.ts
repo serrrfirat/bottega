@@ -26,6 +26,7 @@
  * bridge still forwards them on every call.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -60,15 +61,18 @@ const WIRE_SURFACE = {
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
-function wireInputSchema(wire: string): { type: "object"; properties: Record<string, unknown>; required?: string[] } {
-  return {
-    type: "object",
+function wireInputSchema(wire: string) {
+  const schema = {
+    type: "object" as const,
     properties: {
       query: { type: "string" },
       title: { type: "string" },
     },
-    ...(wire.includes("search") ? { required: ["query"] } : {}),
   };
+  if (wire.includes("search")) {
+    return { ...schema, required: ["query"] };
+  }
+  return schema;
 }
 
 /**
@@ -91,7 +95,7 @@ function stubMcpTransport(provider: (typeof PROVIDERS)[number], seen?: { tool: s
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       seen?.tool.push(request.params.name);
-      const args = request.params.arguments as Record<string, unknown>;
+      const args = request.params.arguments ?? {};
       return {
         content: [{ type: "text", text: `stub ${request.params.name} query=${String(args["query"])}` }],
       };
@@ -111,10 +115,28 @@ function stubTransports(seen?: { tool: string[] }) {
   };
 }
 
-function run(def: ToolDefinition, params: Record<string, unknown>) {
-  return def.execute("1", params, undefined, undefined, {
+/** JSON-compatible tool call arguments (the execute boundary contract). */
+type ToolCallArgs =
+  | string
+  | number
+  | boolean
+  | null
+  | ToolCallArgs[]
+  | { [key: string]: ToolCallArgs };
+
+/** The context surface the tool bridge reads from an ExtensionContext. */
+interface ToolRunContext {
+  sessionManager: { getSessionFile(): string | null | undefined };
+}
+
+function run(def: ToolDefinition, params: ToolCallArgs) {
+  const ctx: ToolRunContext = {
     sessionManager: { getSessionFile: () => null },
-  } as unknown as ExtensionContext);
+  };
+  // SAFETY: the extension bridge resolves the space id only via
+  // ctx.sessionManager.getSessionFile() (see src/extensions/tools.ts);
+  // ToolRunContext is exactly that surface, so the stub is sound.
+  return def.execute("1", params, undefined, undefined, ctx as ExtensionContext);
 }
 
 /**
@@ -147,8 +169,8 @@ function makeRuntime(
     orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
     router: DenyRouter,
     boundary: { async authorize() {} },
-    ...(mcpTransport !== undefined ? { mcpTransport } : {}),
-    ...(surfaces !== undefined ? { surfaces } : {}),
+    ...(mcpTransport !== undefined ? { mcpTransport } : undefined),
+    ...(surfaces !== undefined ? { surfaces } : undefined),
   });
   return { registry, runtime };
 }
@@ -218,6 +240,8 @@ describe("issue #54 pinned providers", () => {
   });
 
   test("linear executes end-to-end through the tool bridge against a stub transport (discovered surface)", async () => {
+    // SAFETY: the stub records wire tool names — every push is
+    // request.params.name, a string per the MCP schema.
     const seen = { tool: [] as string[] };
     const mcpTransport = stubTransports(seen);
     const { registry, runtime } = makeRuntime(mcpTransport);
@@ -396,11 +420,16 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
         proxy: "http://127.0.0.1:8080",
         headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
       };
-      const rpc = (id: number, method: string, params?: Record<string, unknown>) =>
-        JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) });
-      const parseResult = (body: string): { result?: unknown; error?: unknown } => {
+      const rpc = (id: number, method: string, params?: ToolCallArgs) =>
+        JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : undefined) });
+      /** JSON-RPC response envelope: exactly one of result/error, both opaque. */
+      const jsonRpcEnvelopeSchema = z.object({
+        result: z.unknown().optional(),
+        error: z.unknown().optional(),
+      });
+      const parseResult = (body: string) => {
         const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
-        const parsed = JSON.parse((dataLine ?? body).replace(/^data: /, ""));
+        const parsed = jsonRpcEnvelopeSchema.parse(JSON.parse((dataLine ?? body).replace(/^data: /, "")));
         if (parsed.error !== undefined) return { error: parsed.error };
         return { result: parsed.result };
       };
@@ -419,8 +448,8 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
       expect(init.error).toBeUndefined();
       const sessionId = initRes.headers.get("mcp-session-id");
       const sessionHeaders = {
-        ...(base.headers as Record<string, string>),
-        ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+        ...base.headers,
+        ...(sessionId ? { "mcp-session-id": sessionId } : undefined),
       };
       await fetch("https://api.githubcopilot.com/mcp/", {
         ...base,
@@ -436,6 +465,9 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
         body: rpc(2, "tools/list"),
       });
       expect(listRes.status).not.toBe(401);
+      // SAFETY: the JSON-RPC result envelope is pinned by parseResult; when
+      // tools/list succeeds, `result` is an object whose tools field is an
+      // array of { name } entries — asserted by the expectations below.
       const list = parseResult(await listRes.text()) as {
         result?: { tools: Array<{ name: string }> };
         error?: unknown;
@@ -460,6 +492,9 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
         }),
       });
       expect(callRes.status).not.toBe(401);
+      // SAFETY: the JSON-RPC result envelope is pinned by parseResult; a
+      // successful tools/call returns result with isError and a content
+      // array of { type, text? } blocks — asserted below.
       const call = parseResult(await callRes.text()) as {
         result?: { isError?: boolean; content?: Array<{ type: string; text?: string }> };
         error?: unknown;
@@ -566,7 +601,7 @@ describe("github hosted MCP live leg (skip-gated, issue #158 — tools-less disc
       // (a tool without inputSchema would have been skipped — never silent).
       for (const tool of github) {
         expect(tool.name.startsWith("github.")).toBe(true);
-        expect(typeof tool.providerName).toBe("string");
+        expect(tool.providerName).toEqual(expect.any(String));
         expect(Array.isArray(tool.params)).toBe(true);
       }
       console.log(

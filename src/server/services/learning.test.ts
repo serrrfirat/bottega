@@ -12,8 +12,11 @@ import type { SlackAdapter } from "../adapters/slack";
 import { createLearningService, type LearningLogger, type LearningService } from "./learning";
 import { SpaceService } from "./space-service";
 
+/** Payloads FakeSession actually emits to listeners: turn framing or a message text. */
+type SessionEventData = { spaceId: string } | { spaceId: string; text: string };
+
 class FakeSession implements AgentSessionDriver {
-  readonly listeners = new Map<string, Set<(data: unknown) => void>>();
+  readonly listeners = new Map<string, Set<(data: SessionEventData) => void>>();
   readonly prompts: string[] = [];
   disposed = false;
   streaming = false;
@@ -42,7 +45,7 @@ class FakeSession implements AgentSessionDriver {
 
   async abort(): Promise<void> {}
   isStreaming(): boolean { return this.streaming; }
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: unknown) => void): () => void {
+  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: SessionEventData) => void): () => void {
     let listeners = this.listeners.get(event);
     if (!listeners) {
       listeners = new Set();
@@ -53,7 +56,7 @@ class FakeSession implements AgentSessionDriver {
   }
   async dispose(): Promise<void> { this.disposed = true; }
 
-  private emit(event: string, data: unknown): void {
+  private emit(event: string, data: SessionEventData): void {
     for (const listener of this.listeners.get(event) ?? []) listener(data);
   }
 }
@@ -130,7 +133,7 @@ class RecordingMemory implements MemoryProvider {
 
 class RecordingLogger implements LearningLogger {
   readonly errors: Array<{ message: string; error?: unknown }> = [];
-  error(message: string, error?: unknown): void { this.errors.push({ message, error }); }
+  error(message: string, cause?: unknown): void { this.errors.push({ message, error: cause }); }
 }
 
 interface Harness {

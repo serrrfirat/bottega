@@ -28,9 +28,18 @@ afterAll(() => {
   for (const db of dbs) db.close();
 });
 
+/** The mem0 wire request body the stub reads; fields the client sends per the mem0 OSS contract. */
+interface StubRequestBody {
+  messages?: Array<{ content: string }>;
+  user_id?: string | null;
+  agent_id?: string | null;
+  metadata?: unknown;
+  query?: string;
+}
+
 /** Minimal mem0 OSS wire stub: records requests, answers /memories + /search. */
 function createStub() {
-  const requests: { path: string; apiKey: string | null; body: Record<string, unknown> }[] = [];
+  const requests: { path: string; apiKey: string | null; body: StubRequestBody }[] = [];
   let seq = 0;
   const server: Server<undefined> = Bun.serve({
     port: 0,
@@ -38,13 +47,15 @@ function createStub() {
       const url = new URL(req.url);
       const apiKey = req.headers.get("x-api-key");
       if (url.pathname === "/memories" && req.method === "POST") {
-        const body = (await req.json()) as Record<string, unknown>;
+        // SAFETY: mem0 /memories POST bodies are JSON objects carrying the fields below; a malformed payload fails the assertions, not here.
+        const body = (await req.json()) as StubRequestBody;
         requests.push({ path: url.pathname, apiKey, body });
         const id = `mem-${++seq}`;
         return Response.json({
           results: [
             {
               id,
+              // SAFETY: the mem0 client always sends a non-empty messages array on /memories POSTs (the wire contract this stub answers).
               memory: String((body.messages as { content: string }[])[0].content),
               event: "ADD",
               user_id: body.user_id ?? null,
@@ -56,7 +67,8 @@ function createStub() {
         });
       }
       if (url.pathname === "/search" && req.method === "POST") {
-        const body = (await req.json()) as Record<string, unknown>;
+        // SAFETY: mem0 /search POST bodies are JSON objects; the stub only records them for assertion.
+        const body = (await req.json()) as StubRequestBody;
         requests.push({ path: url.pathname, apiKey, body });
         return Response.json({ results: [] });
       }

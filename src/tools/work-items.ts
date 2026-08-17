@@ -170,8 +170,8 @@ export function workItemToolDefinitions(
               text: JSON.stringify({
                 id: item.id,
                 state: item.state,
-                ...(model !== undefined ? { model } : {}),
-                ...(params.reasoning_effort !== undefined ? { reasoning_effort: params.reasoning_effort } : {}),
+                ...(model !== undefined ? { model } : undefined),
+                ...(params.reasoning_effort !== undefined ? { reasoning_effort: params.reasoning_effort } : undefined),
               }),
             },
           ],

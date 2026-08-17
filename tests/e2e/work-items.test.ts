@@ -57,24 +57,25 @@ const PAT = "github_pat_e2e_journey_secret_456";
  * proxied because it exists only after bootHarness returns — bind it right
  * after boot, before any session runs.
  */
-function workItemCustomTools(orgConfigYaml: string): {
-  customTools: ToolDefinition[];
-  bindStore(store: Store): void;
-} {
+function workItemCustomTools(orgConfigYaml: string) {
   const orgPolicy = parseOrgConfigYaml(orgConfigYaml);
   let storeRef: Store | null = null;
+  // SAFETY: the Proxy target is never read directly — every property access is forwarded to the bound store by the get handler.
   const storeProxy = new Proxy({} as Store, {
     get: (_target, prop: PropertyKey) => {
       if (storeRef === null) throw new Error("work item tools used before the harness store was bound");
-      return (storeRef as unknown as Record<PropertyKey, unknown>)[prop];
+      // SAFETY: the handler forwards reads for any property key to the bound store; keyof Store is its sound index type.
+      return storeRef[prop as keyof Store];
     },
   }) as Store;
   const defs: ToolDefinition[] = [];
+  // SAFETY: the extension factory only calls pi.registerTool, so a double exposing just that member satisfies the executed path.
   workItemsExtension(storeProxy, { orgPolicy })({
     registerTool: (t: ToolDefinition) => void defs.push(t),
-  } as unknown as ExtensionAPI);
+  } as ExtensionAPI);
   return {
-    customTools: defs.map((def) => ({ ...def, __isToolDefinition: true }) as unknown as ToolDefinition),
+    // SAFETY: __isToolDefinition is a runtime marker; the spread preserves the def's shape, so the result stays a ToolDefinition.
+    customTools: defs.map((def) => ({ ...def, __isToolDefinition: true }) as ToolDefinition),
     bindStore(store: Store) {
       storeRef = store;
     },
@@ -228,7 +229,7 @@ function startExecutor(
   gate: DeliveryGate,
   itemId: string,
   state: WorkItemState,
-): { done: Promise<WorkItem>; stop(): Promise<void> } {
+) {
   const ac = new AbortController();
   const poller = startDeliveryPoller({ store: harness.store, adapter: harness.adapter, intervalMs: 20 });
   poller.start();
@@ -303,6 +304,7 @@ async function findOpenItem(harness: Harness, spaceId: string, timeoutMs = 30_00
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await harness.store.listAudit({ space: spaceId, event_type: "work_item.created" });
+    // SAFETY: the executor writes the work item id into the created-marker payload.
     const ids = rows.map((r) => (JSON.parse(r.payload) as { id: string }).id);
     for (const id of ids) {
       const item = await harness.store.getWorkItem(id);
@@ -373,6 +375,7 @@ describe("journey 2: work items + approvals + executor", () => {
       expect(item.repo).toBe("acme/sandbox");
       // The canonical URL was appended to the description and recorded as evidence.
       expect(item.description).toContain("https://github.com/acme/sandbox/issues/42");
+      // SAFETY: evidence is a JSON array of {kind, url} records written by the executor and tools.
       const createdEvidence = JSON.parse(item.evidence) as Array<{ kind: string; url: string }>;
       expect(createdEvidence).toHaveLength(1);
       expect(createdEvidence[0]).toMatchObject({ kind: "issue_url", url: "https://github.com/acme/sandbox/issues/42" });
@@ -405,11 +408,13 @@ describe("journey 2: work items + approvals + executor", () => {
         });
 
         const doneItem = await done;
+        // SAFETY: the executor's done result carries the PR url and summary of the completed delivery.
         const result = JSON.parse(doneItem.result!) as { pr_url: string; summary: string };
         expect(result.pr_url).toContain("/acme/sandbox/pull/1");
         expect(result.summary).toBe("implemented the requested change");
         // Obligations (real store): review required an approval, done requires pr_url.
         expect(JSON.parse(doneItem.approvals)).toEqual([{ approver: human, at: expect.any(Number) }]);
+        // SAFETY: evidence is a JSON array of {kind, url} records written by the executor and tools.
         const evidence = JSON.parse(doneItem.evidence) as Array<{ kind: string; url: string }>;
         expect(evidence.map((e) => e.kind)).toContain("issue_url");
         expect(evidence.map((e) => e.url)).toContain("PR opened: " + result.pr_url);
@@ -443,9 +448,11 @@ describe("journey 2: work items + approvals + executor", () => {
         // Bolt action router.
         const prompt = harness.messages(dm).find((m) => m.text.startsWith("Delivery approval required"));
         expect(prompt).toBeDefined();
+        // SAFETY: the emulator's stored message exposes the approval blocks the router attached.
         const storedPrompt = harness.slack.store.messages.all().find((m) => m.ts === prompt!.ts) as
           | { blocks?: unknown }
           | undefined;
+        // SAFETY: approval blocks are arrays of element-bearing blocks; the button value is the work item id.
         const values = ((storedPrompt?.blocks ?? []) as Array<{ elements?: Array<{ value?: string }> }>)
           .flatMap((b) => b.elements ?? [])
           .map((e) => e.value);
@@ -453,6 +460,7 @@ describe("journey 2: work items + approvals + executor", () => {
 
         // GitHub emulator: PR exists with bottega/<id> head against main by the
         // PAT's user (Bearer auth from the FILE).
+        // SAFETY: the emulator's PR endpoint returns the pull-request object with head/base refs and the opener.
         const pr = await fetch(`${gh.baseUrl}/repos/acme/sandbox/pulls/1`, {
           headers: { Authorization: `Bearer ${PAT}` },
         }).then((r) => r.json() as Promise<{ head: { ref: string }; base: { ref: string }; user: { login: string } }>);
@@ -547,11 +555,13 @@ describe("journey 2: work items + approvals + executor", () => {
 
       const blocked = await runUntil(harness, gate, item.id, "blocked");
 
+      // SAFETY: evidence is a JSON array of {kind, url} records written by the executor and tools.
       const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
       expect(evidence[0].url).toBe("repo not specified — ask the requester");
       // Fail closed before any git work: no delivery request, no PR, no gate.
       expect(gate.pendingCount).toBe(0);
       expect(await harness.store.listAudit({ event_type: DELIVERY_PENDING_EVENT })).toHaveLength(0);
+      // SAFETY: the emulator's pulls list endpoint returns a JSON array of pull objects.
       const pulls = await fetch(`${gh.baseUrl}/repos/acme/sandbox/pulls`, {
         headers: { Authorization: `Bearer ${PAT}` },
       }).then((r) => r.json() as Promise<unknown[]>);

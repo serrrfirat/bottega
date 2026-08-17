@@ -17,6 +17,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
+import type { OrgSettings } from "../../store/org-settings";
 import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
 import { redact } from "../../policy/audit";
 import type { SlackAdapter, SlackMessage, SlackStreamTask } from "../adapters/slack";
@@ -67,6 +68,7 @@ function recordingAdapter(
   let tsSeq = 0;
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, replyOpts) {
+      // SAFETY: the presenter passes only { threadTs } as post options (blocks are the approval router's job), so recording just that field covers every posted message.
       posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string } | undefined });
       tsSeq += 1;
       return `post-${tsSeq}`;
@@ -110,15 +112,16 @@ function recordingAdapter(
   return { adapter, streams, texts, tasks, stops, posts, updates, reactions };
 }
 
-function recordingStore(): { store: Store; audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }> } {
+function recordingStore() {
   const audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }> = [];
+  // SAFETY: the presenter only calls appendAudit (and the tests getOrgSettings); a double exposing those two members satisfies the executed surface.
   const store = {
     appendAudit: async (entry: { space_id: string | null; actor: string; event_type: string; payload: string }) => {
       audit.push(entry);
       return audit.length;
     },
-    getOrgSettings: () => null,
-  } as unknown as Store;
+    getOrgSettings: (): OrgSettings | null => null,
+  } as Store;
   return { store, audit };
 }
 
@@ -464,7 +467,7 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     const replied = audit.find((row) => row.event_type === MESSAGE_REPLIED_EVENT);
     expect(replied).toMatchObject({ space_id: "slack:C1" });
     const latency = JSON.parse(replied!.payload);
-    expect(typeof latency.latency_ms).toBe("number");
+    expect(latency.latency_ms).toEqual(expect.any(Number));
     expect(latency.latency_ms).toBeGreaterThanOrEqual(0);
 
     // Turn two: the stream re-opens under the new inbound ts, rotating the

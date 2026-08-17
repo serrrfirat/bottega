@@ -11,6 +11,7 @@ import { errorMessage } from "../tools/helpers";
 import { sha256Hex } from "../tools/memory";
 import { proactiveEnabled } from "./proactive-config";
 import type { SchedulerAction } from "./types";
+import { z } from "zod";
 
 const DAY_MS = 86_400_000;
 
@@ -28,26 +29,59 @@ type ReflectionEntry = {
   content: string;
 };
 
-function objectPayload(payload: string): Record<string, unknown> | null {
+/** Audit payload schemas: the shapes our own audit calls write (see store/audit-events). */
+const jsonValueSchema = z.json();
+const transitionPayloadSchema = z.object({
+  to: z.string(),
+  id: z.string().optional().catch(undefined),
+});
+const failedPayloadSchema = z.object({
+  id: z.string().optional().catch(undefined),
+  error: z.string().optional().catch(undefined),
+});
+const digestFailedPayloadSchema = z.object({
+  reason: z.string().optional(),
+});
+const extensionCallPayloadSchema = z.object({
+  decision: z.enum(["deny", "error"]),
+  extension: z.string().catch("unknown extension"),
+  tool: z.string().catch("unknown tool"),
+});
+const evidenceEntrySchema = z.object({
+  url: z.string().optional().catch(undefined),
+  text: z.string().optional(),
+});
+
+/** Parses an audit payload JSON string against an event schema; null when invalid/mismatched. */
+function parsePayload<T>(payload: string, schema: z.ZodType<T>): T | null {
   try {
-    const value: unknown = JSON.parse(payload);
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-    return value as Record<string, unknown>;
+    const result = schema.safeParse(JSON.parse(payload));
+    return result.success ? result.data : null;
   } catch {
     return null;
   }
 }
 
+/** The work_items row the reflection query selects (state filtered to done/blocked by SQL). */
+const workItemRowSchema = z.object({
+  id: z.string(),
+  state: z.enum(["done", "blocked"]),
+  description: z.string(),
+  requester: z.string(),
+  evidence: z.string(),
+  pr_url: z.string().nullable(),
+});
+
 function evidenceSummary(encoded: string): string[] {
   try {
-    const value: unknown = JSON.parse(encoded);
-    if (!Array.isArray(value)) return [];
+    const parsed = jsonValueSchema.safeParse(JSON.parse(encoded));
+    if (!parsed.success || !Array.isArray(parsed.data)) return [];
     const summaries: string[] = [];
-    for (const entry of value) {
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-      const evidence = entry as Record<string, unknown>;
-      const detail = typeof evidence.url === "string" ? evidence.url : evidence.text;
-      if (typeof detail === "string" && detail.trim()) summaries.push(detail.trim());
+    for (const raw of parsed.data) {
+      const entry = evidenceEntrySchema.safeParse(raw);
+      if (!entry.success) continue;
+      const detail = entry.data.url !== undefined ? entry.data.url : entry.data.text;
+      if (detail !== undefined && detail.trim()) summaries.push(detail.trim());
     }
     return summaries;
   } catch {
@@ -62,9 +96,9 @@ function finishedReflection(items: ReflectionWorkItem[], auditRows: AuditRow[]):
   const knownIds = new Set(items.map((item) => item.id));
   for (const row of auditRows) {
     if (row.event_type !== WORK_ITEM_TRANSITION_EVENT) continue;
-    const payload = objectPayload(row.payload);
-    if (payload?.to !== "done") continue;
-    const id = typeof payload.id === "string" ? payload.id : null;
+    const payload = parsePayload(row.payload, transitionPayloadSchema);
+    if (payload === null || payload.to !== "done") continue;
+    const id = payload.id;
     if (id && !knownIds.has(id)) {
       knownIds.add(id);
       parts.push(`${id} reached done (audit ${row.id})`);
@@ -84,9 +118,9 @@ function blockedReflection(items: ReflectionWorkItem[], auditRows: AuditRow[]): 
     });
   for (const row of auditRows) {
     if (row.event_type !== WORK_ITEM_FAILED_EVENT) continue;
-    const payload = objectPayload(row.payload);
-    const id = typeof payload?.id === "string" ? payload.id : `audit ${row.id}`;
-    const reason = typeof payload?.error === "string" ? payload.error : "failure recorded";
+    const payload = parsePayload(row.payload, failedPayloadSchema);
+    const id = payload?.id ?? `audit ${row.id}`;
+    const reason = payload?.error ?? "failure recorded";
     parts.push(`${id} failed: ${reason}`);
   }
   return parts.length > 0 ? { topic: "blocked", content: `Blocked or failed today: ${parts.join("; ")}.` } : null;
@@ -96,9 +130,10 @@ function errorReflection(auditRows: AuditRow[]): ReflectionEntry | null {
   const signals: string[] = [];
   const digestFailures = auditRows.filter((row) => row.event_type === DIGEST_FAILED_EVENT);
   if (digestFailures.length > 0) {
-    const reasons = digestFailures
-      .map((row) => objectPayload(row.payload)?.reason)
-      .filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
+    const reasons = digestFailures.flatMap((row) => {
+      const reason = parsePayload(row.payload, digestFailedPayloadSchema)?.reason;
+      return reason !== undefined && reason.length > 0 ? [reason] : [];
+    });
     signals.push(`${digestFailures.length} digest.failed${reasons.length > 0 ? ` (${reasons.join(", ")})` : ""}`);
   }
   const droppedMessages = auditRows.filter((row) => row.event_type === MESSAGE_DROPPED_EVENT);
@@ -107,11 +142,9 @@ function errorReflection(auditRows: AuditRow[]): ReflectionEntry | null {
   const extensionFailures: string[] = [];
   for (const row of auditRows) {
     if (row.event_type !== EXTENSION_CALL_EVENT) continue;
-    const payload = objectPayload(row.payload);
-    if (payload?.decision !== "deny" && payload?.decision !== "error") continue;
-    const extension = typeof payload.extension === "string" ? payload.extension : "unknown extension";
-    const tool = typeof payload.tool === "string" ? payload.tool : "unknown tool";
-    extensionFailures.push(`${payload.decision} ${extension}/${tool}`);
+    const payload = parsePayload(row.payload, extensionCallPayloadSchema);
+    if (payload === null) continue;
+    extensionFailures.push(`${payload.decision} ${payload.extension}/${payload.tool}`);
   }
   if (extensionFailures.length > 0) {
     signals.push(`${extensionFailures.length} extension.call (${extensionFailures.join(", ")})`);
@@ -155,7 +188,8 @@ export const reflectionAction: SchedulerAction = {
            WHERE space_id = ? AND updated_at >= ? AND state IN ('done', 'blocked')
            ORDER BY updated_at, id`,
         )
-        .all(spaceId, since) as ReflectionWorkItem[];
+        .all(spaceId, since)
+        .map((row) => workItemRowSchema.parse(row));
 
       const entries = [
         finishedReflection(items, auditRows),

@@ -38,6 +38,9 @@ export const standupDigestAction: SchedulerAction = {
       const now = ctx.now();
       const currentDayStart = Math.floor(now / DAY_MS) * DAY_MS;
       const previousDayStart = currentDayStart - DAY_MS;
+      // SAFETY: the SELECT above projects exactly the DigestRow columns
+      // (id, state, description, requester, pr_url) in order; sqlite maps
+      // each row to that shape.
       const rows = ctx.store
         .getDb()
         .query(

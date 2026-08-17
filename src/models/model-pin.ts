@@ -36,6 +36,7 @@
 import { ModelRegistry, discoverAuthStorage, type AuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 import { parseYamlSubset } from "../yaml-subset";
 
 /** The deployment agent dir both the server and the executor default to. */
@@ -97,16 +98,25 @@ interface CustomGatewayProvider {
  * agent dir's models.yml — near, openai, anthropic, or any future gateway.
  * Each is probed for its full model list (issue #194 generalized).
  */
+/** models.yml providers block: a name → provider config mapping. */
+const gatewayProvidersSchema = z.record(z.string(), z.unknown());
+/** One provider entry: {api, baseUrl}; non-openai-completions entries are skipped. */
+const gatewayProviderEntrySchema = z.object({
+  api: z.string(),
+  baseUrl: z.string(),
+});
+
 function readCustomGatewayProviders(agentDir: string): CustomGatewayProvider[] {
   try {
     const parsed = parseYamlSubset(readFileSync(join(agentDir, "models.yml"), "utf8"));
-    const providers = parsed.providers;
-    if (providers === undefined || typeof providers !== "object" || Array.isArray(providers)) return [];
+    const providers = gatewayProvidersSchema.safeParse(parsed.providers);
+    if (!providers.success) return [];
     const gateways: CustomGatewayProvider[] = [];
-    for (const [name, cfg] of Object.entries(providers)) {
-      if (cfg === undefined || typeof cfg !== "object" || Array.isArray(cfg)) continue;
-      if (cfg.api !== "openai-completions" || typeof cfg.baseUrl !== "string" || cfg.baseUrl.trim() === "") continue;
-      gateways.push({ provider: name, baseUrl: cfg.baseUrl });
+    for (const [name, cfg] of Object.entries(providers.data)) {
+      const entry = gatewayProviderEntrySchema.safeParse(cfg);
+      if (!entry.success) continue;
+      if (entry.data.api !== "openai-completions" || entry.data.baseUrl.trim() === "") continue;
+      gateways.push({ provider: name, baseUrl: entry.data.baseUrl });
     }
     return gateways;
   } catch {
@@ -132,6 +142,14 @@ function gatewayModelsUrl(baseUrl: string): string {
  * key): the caller keeps the declared set — the catalog is never broken by
  * a dead gateway.
  */
+/** The gateway /v1/models response: a `data` array of model entries. */
+const gatewayModelListSchema = z.object({ data: z.array(z.unknown()) });
+/** One model entry: {id, name?}; ids with only whitespace are rejected. */
+const gatewayModelEntrySchema = z.object({
+  id: z.string().refine((id) => id.trim() !== ""),
+  name: z.string().optional(),
+});
+
 async function probeGatewayModels(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
   const gateways = readCustomGatewayProviders(agentDir);
   if (gateways.length === 0) return [];
@@ -144,15 +162,14 @@ async function probeGatewayModels(agentDir: string, authStorage: AuthStorage): P
       try {
         const res = await fetch(gatewayModelsUrl(baseUrl), { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
         if (!res.ok) return [];
-        const body = (await res.json()) as { data?: unknown };
-        if (typeof body !== "object" || body === null || !Array.isArray(body.data)) return [];
+        const body = gatewayModelListSchema.safeParse(await res.json());
+        if (!body.success) return [];
         const models: ModelCatalogEntry[] = [];
-        for (const item of body.data) {
-          if (typeof item !== "object" || item === null) continue;
-          const id = (item as { id?: unknown }).id;
-          if (typeof id !== "string" || id.trim() === "") continue;
-          const name = (item as { name?: unknown }).name;
-          models.push({ id, name: typeof name === "string" && name !== "" ? name : id, provider });
+        for (const item of body.data.data) {
+          const entry = gatewayModelEntrySchema.safeParse(item);
+          if (!entry.success) continue;
+          const name = entry.data.name;
+          models.push({ id: entry.data.id, name: name !== undefined && name !== "" ? name : entry.data.id, provider });
         }
         return models;
       } catch {
@@ -169,7 +186,7 @@ async function probeGatewayModels(agentDir: string, authStorage: AuthStorage): P
 function probeGatewayCached(agentDir: string, authStorage: AuthStorage): Promise<ModelCatalogEntry[]> {
   const cached = gatewayProbeCache.get(agentDir);
   if (cached !== undefined) return cached;
-  const probing = probeGatewayModels(agentDir, authStorage).catch(() => [] as ModelCatalogEntry[]);
+  const probing = probeGatewayModels(agentDir, authStorage).catch(() => []);
   gatewayProbeCache.set(agentDir, probing);
   return probing;
 }

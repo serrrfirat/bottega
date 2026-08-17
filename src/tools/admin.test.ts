@@ -32,7 +32,7 @@ import {
 import { decidePolicyCall, defaultPolicy, parseOrgConfigYaml, resolveTier } from "../policy/config";
 import { createAudit } from "../policy/audit";
 import type { AuditModule } from "../policy/audit";
-import type { ExtensionManifest } from "../extensions/manifest";
+import type { ExtensionManifest, JsonObject } from "../extensions/manifest";
 import type { ResolvedExtension } from "../extensions/registry";
 import { createExtensionRegistry, parsePinnedSnapshot } from "../extensions/registry";
 import { resolveExtensionSurfaces } from "../extensions/surface";
@@ -42,24 +42,29 @@ import {
   adminToolsExtension,
   onboardingGuideText,
   runWizardChecks,
+  type AdminToolDefinition,
   type HealthProbeSeams,
   type ServiceStatus,
   type WizardCheck,
 } from "./admin";
 
-const noopCtx = {} as unknown as ExtensionContext;
+// SAFETY: the admin tools never touch the extension context; an empty stub
+// stands in for the real session context.
+const noopCtx = {} as ExtensionContext;
 
 interface AuditRow {
   actor: string;
   event_type: string;
   space_id?: string | null;
-  payload: Record<string, unknown>;
+  /** Parsed audit payload: the admin.* events carry flat JSON objects. */
+  payload: JsonObject;
 }
 
-function fakeAudit(): { audit: Pick<AuditModule, "appendAudit">; rows: AuditRow[] } {
+function fakeAudit() {
   const rows: AuditRow[] = [];
   const audit: Pick<AuditModule, "appendAudit"> = {
     appendAudit: async (entry) => {
+      // String payloads pass through; object payloads are JSON-serialized.
       const text = typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload);
       rows.push({
         actor: entry.actor,
@@ -78,16 +83,23 @@ function loadTools(
   opts: Parameters<typeof adminToolDefinitions>[1] = {},
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
-  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
+  // SAFETY: the extension factory only ever calls registerTool; the rest of
+  // the ExtensionAPI surface is inert for registration.
+  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as ExtensionAPI;
   adminToolsExtension(store, opts)(pi);
   return tools;
 }
 
+/** The parsed-args union the four admin tools accept (from their schemas). */
+type AdminToolArgs = Parameters<AdminToolDefinition["execute"]>[1];
+
 async function call(
   tool: ToolDefinition,
-  params: unknown,
+  params: AdminToolArgs,
 ): Promise<{ text: string; isError: boolean }> {
   const res = await tool.execute("call-1", params, undefined, undefined, noopCtx);
+  // SAFETY: every admin tool returns its report as a single text content
+  // block (the SDK tool-result contract), so content[0] is that block.
   return { text: (res.content[0] as { text: string }).text, isError: res.isError ?? false };
 }
 
@@ -97,7 +109,7 @@ function findTool(tools: ToolDefinition[], name: string): ToolDefinition {
   return tool;
 }
 
-function freshStore(): { store: ReturnType<typeof createStore>; dir: string; cleanup(): void } {
+function freshStore() {
   const dir = mkdtempSync(join(tmpdir(), "bottega-admin-"));
   const store = createStore(join(dir, "test.db"));
   return {
@@ -112,15 +124,28 @@ function freshStore(): { store: ReturnType<typeof createStore>; dir: string; cle
 
 /** A minimal fake pinned extension (read-only by the tool). */
 function pinnedEntry(id: string, label: string, domain: string, reviewed = true): ResolvedExtension {
+  const manifest = {
+    id,
+    label,
+    vendor: label,
+    kind: "mcp" as const,
+    mcp: { serverUrl: `https://mcp.${domain}/mcp`, transport: "streamable-http" as const },
+    credentialSchema: { type: "oauth" as const, scopes: [] },
+    domains: [domain],
+    tools: [],
+  };
+  // SAFETY: the fixture carries every required field of the mcp manifest
+  // variant plus a complete snapshot, so the assertion is structural only.
   return {
-    manifest: { id, label, vendor: label, kind: "mcp", domains: [domain], tools: [] },
+    manifest,
     snapshot: {
-      schema: "bottega.extension-snapshot.v1",
+      schema: "bottega.extension-snapshot.v1" as const,
       extensionId: id,
       pinnedAt: "2026-08-16T00:00:00.000Z",
       source: { catalog: "https://integrations.sh/api.json", specId: id, vendorOfficial: true, reviewed },
+      manifest,
     },
-  } as unknown as ResolvedExtension;
+  } as ResolvedExtension;
 }
 
 const CATALOG = {

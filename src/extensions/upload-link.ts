@@ -52,6 +52,23 @@ export const UPLOAD_LINK_MAX_ATTEMPTS_PER_IP = 10;
 /** Attempt window for the per-IP rate limit. */
 export const UPLOAD_LINK_ATTEMPTS_WINDOW_MS = 15 * 60_000;
 
+/**
+ * The upload endpoint's PUBLIC base URL (issue #196): the browser-facing
+ * base of the deployment's ONE public ingress — the SAME env the #198 OAuth
+ * callback surface reads (BOTTEGA_OAUTH_CALLBACK_BASE_URL), because the
+ * same reverse proxy / tunnel serves both `/upload/<token>` and
+ * `/oauth/callback`. When a deployment sets it, the mint returns
+ * `<base>/upload/<token>` — a browser on a remote host (or behind the MITM
+ * proxy) reaches the form through the ingress; the in-process listener
+ * itself stays 127.0.0.1-only. Unset or empty → undefined: the mint falls
+ * back to the loopback URL of the in-process endpoint (local dev, the
+ * issue #57 posture).
+ */
+export function uploadLinkPublicBase(): string | undefined {
+  const base = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+  return base !== undefined && base.length > 0 ? base : undefined;
+}
+
 export interface UploadLinkStoreOpts {
   /** Token lifetime in ms (default {@link UPLOAD_LINK_TTL_MS}). */
   ttlMs?: number;
@@ -228,7 +245,8 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
       `into the vault — never through chat, this tool, or a transcript. OAuth extensions have no secret ` +
       `to upload and should be connected directly. ` +
       `Boot secrets (issue #201) mint the same way by their provider id: the Slack tokens ` +
-      `(slack-app / slack-bot) and the model provider keys (opencode / near / openai / anthropic) ` +
+      `(slack-app / slack-bot), the model provider keys (opencode / near / openai / anthropic), ` +
+      `and the GitHub webhook shared secret (github-webhook — issue #57) ` +
       `— the value lands in the vault row the server boot seeds from.`,
     parameters: MINT_UPLOAD_LINK_PARAMS_SCHEMA,
     approval: "exec",

@@ -19,6 +19,7 @@
  *                   history — exactly the "human at the product surface"
  *                   shape the canary exists to exercise
  */
+import type { JsonObject } from "../../src/extensions/manifest";
 
 /** Tokens + identity the live leg needs; resolved by the canary from env/Keychain. */
 export interface LiveSlackTokens {
@@ -66,9 +67,9 @@ interface SlackChannelRow {
 export class SlackApiClient {
   constructor(readonly token: string) {}
 
-  async call<T extends Record<string, unknown> = Record<string, unknown>>(
+  async call<T = JsonObject>(
     method: string,
-    body: Record<string, unknown> = {},
+    body: JsonObject = {},
   ): Promise<T> {
     const res = await fetch(`https://slack.com/api/${method}`, {
       method: "POST",
@@ -79,6 +80,8 @@ export class SlackApiClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`slack api ${method}: HTTP ${res.status}`);
+    // SAFETY: Slack Web API responses are JSON with a top-level ok/error
+    // envelope; T is the caller's declared body shape for the method.
     const data = (await res.json()) as T & { ok: boolean; error?: string };
     if (!data.ok) throw new Error(`slack api ${method}: ${data.error ?? "unknown error"}`);
     return data;
@@ -184,10 +187,13 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
   const historyMirror = new Map<string, SlackApiMessage[]>();
 
   const findUser = (field: string, value: string): SlackUserRow | undefined => {
+    // SAFETY: the harness only queries known user row fields (id, name,
+    // real_name); an unknown field simply matches nothing.
     const key = field as keyof SlackUserRow;
     return usersCache.find((u) => u[key] === value);
   };
   const findChannel = (field: string, value: string): SlackChannelRow | undefined => {
+    // SAFETY: the harness only queries known channel row fields (id, name).
     const key = field as keyof SlackChannelRow;
     return channelsCache.find((c) => c[key] === value);
   };
@@ -199,7 +205,10 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
       ["qa", qaUserId],
     ] as const) {
       try {
-        await bot.call("conversations.invite", { channel: channelId, users: user });
+        // SAFETY: bootLiveSlack already resolved qaUserId (the !qaUserId
+        // throw above); both loop values are non-empty member ids at invite
+        // time, so the union narrows to string.
+        await bot.call("conversations.invite", { channel: channelId, users: user as string });
         invited[label] = true;
       } catch {
         // already a member or no channels:manage — reported, never fatal.
@@ -223,7 +232,7 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
               channel_id: channelId,
               user: m.user ?? m.bot_id ?? "",
               text: m.text,
-              ...(m.thread_ts !== undefined ? { thread_ts: m.thread_ts } : {}),
+              ...(m.thread_ts !== undefined ? { thread_ts: m.thread_ts } : undefined),
             })),
           ),
       },

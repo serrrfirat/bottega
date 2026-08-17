@@ -39,6 +39,7 @@
  * Env override: INTEGRATIONS_CATALOG_URL (mirrors the test seam; the
  * registry's own tests use a stub fetch).
  */
+import { z } from "zod";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { generateManifestTools, refreshManifestTools } from "./generate-tools";
@@ -48,6 +49,7 @@ import {
   type PinnedSnapshot,
   type SnapshotSource,
 } from "./registry";
+import { errorMessage } from "../tools/helpers";
 import {
   ExtensionValidationError,
   validateManifest,
@@ -55,6 +57,7 @@ import {
   type CredentialSchema,
   type ExtensionKind,
   type ExtensionTool,
+  type JsonObject,
   type McpBinding,
 } from "./manifest";
 
@@ -130,7 +133,7 @@ export interface SnapshotDraft {
  * lookup and the browser's list). Throws {@link CatalogError} on any
  * unreachable/malformed catalog — never guesses.
  */
-async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<Record<string, unknown>[]> {
+async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<JsonObject[]> {
   const catalogUrl = opts.catalogUrl ?? process.env.INTEGRATIONS_CATALOG_URL ?? DEFAULT_CATALOG_URL;
   const fetchImpl = opts.fetchImpl ?? fetch;
   let body: string;
@@ -142,18 +145,37 @@ async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<Record<string
     body = await response.text();
   } catch (err) {
     if (err instanceof CatalogError) throw err;
-    throw new CatalogError(`GET ${catalogUrl} failed: ${(err as Error).message}`);
+    throw new CatalogError(`GET ${catalogUrl} failed: ${errorMessage(err)}`);
   }
   let doc: { data?: unknown };
   try {
-    doc = JSON.parse(body) as { data?: unknown };
+    // JSON.parse returns `any`; the only shape trusted here is a document
+    // carrying an optional `data` field — checked below, fail closed.
+    doc = JSON.parse(body);
   } catch {
     throw new CatalogError(`catalog at ${catalogUrl} is not valid JSON`);
   }
   if (!Array.isArray(doc.data)) {
     throw new CatalogError(`catalog at ${catalogUrl} has no data array`);
   }
-  return doc.data as Record<string, unknown>[];
+  // SAFETY: Array.isArray(doc.data) passed above, and the document came from
+  // JSON.parse — every element is a JSON object.
+  return doc.data as JsonObject[];
+}
+
+/** The record field's string value, or null when it isn't one. */
+function optionalString(value: JsonObject[string]): string | null {
+  const parsed = z.string().safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Non-empty string field, failing closed with the catalog's canonical error. */
+function requireString(record: JsonObject, field: string, specId: string): string {
+  const value = optionalString(record[field]);
+  if (value === null || value.trim() === "") {
+    throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
+  }
+  return value;
 }
 
 /**
@@ -161,21 +183,23 @@ async function fetchCatalogDoc(opts: FetchCatalogOptions): Promise<Record<string
  * including `url` — an explicitly requested or pinned entry must have
  * complete provenance. Throws {@link CatalogError} on malformed records.
  */
-function parseCatalogRecord(record: Record<string, unknown>): CatalogEntry {
-  const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
-  for (const field of ["id", "slug", "name", "kind", "domain", "url"] as const) {
-    if (typeof record[field] !== "string" || record[field].trim() === "") {
-      throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
-    }
-  }
+function parseCatalogRecord(record: JsonObject): CatalogEntry {
+  const specId = optionalString(record["slug"]) ?? String(record["id"] ?? "?");
+  const id = requireString(record, "id", specId);
+  const slug = requireString(record, "slug", specId);
+  const name = requireString(record, "name", specId);
+  const kind = requireString(record, "kind", specId);
+  const domain = requireString(record, "domain", specId);
+  const url = requireString(record, "url", specId);
+  const description = optionalString(record["description"]);
   return {
-    id: record["id"] as string,
-    slug: record["slug"] as string,
-    name: record["name"] as string,
-    kind: record["kind"] as string,
-    domain: record["domain"] as string,
-    url: record["url"] as string,
-    ...(typeof record["description"] === "string" ? { description: record["description"] } : {}),
+    id,
+    slug,
+    name,
+    kind,
+    domain,
+    url,
+    ...(description !== null ? { description } : undefined),
   };
 }
 
@@ -186,23 +210,23 @@ function parseCatalogRecord(record: Record<string, unknown>): CatalogEntry {
  * fabricated. Truly unlistable records (missing a renderable field) throw
  * {@link CatalogError}.
  */
-function parseListableRecord(record: Record<string, unknown>): CatalogEntry {
-  const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
-  for (const field of ["id", "slug", "name", "kind", "domain"] as const) {
-    if (typeof record[field] !== "string" || record[field].trim() === "") {
-      throw new CatalogError(`entry "${specId}" is missing a non-empty "${field}"`);
-    }
-  }
+function parseListableRecord(record: JsonObject): CatalogEntry {
+  const specId = optionalString(record["slug"]) ?? String(record["id"] ?? "?");
+  const id = requireString(record, "id", specId);
+  const slug = requireString(record, "slug", specId);
+  const name = requireString(record, "name", specId);
+  const kind = requireString(record, "kind", specId);
+  const domain = requireString(record, "domain", specId);
+  const url = optionalString(record["url"]);
+  const description = optionalString(record["description"]);
   return {
-    id: record["id"] as string,
-    slug: record["slug"] as string,
-    name: record["name"] as string,
-    kind: record["kind"] as string,
-    domain: record["domain"] as string,
-    ...(typeof record["url"] === "string" && record["url"].trim() !== ""
-      ? { url: record["url"] as string }
-      : {}),
-    ...(typeof record["description"] === "string" ? { description: record["description"] } : {}),
+    id,
+    slug,
+    name,
+    kind,
+    domain,
+    ...(url !== null && url.trim() !== "" ? { url } : undefined),
+    ...(description !== null ? { description } : undefined),
   };
 }
 
@@ -249,7 +273,7 @@ export async function listCatalogEntries(
       entries.push(parseListableRecord(record));
     } catch (err) {
       if (err instanceof CatalogError) {
-        const specId = typeof record["slug"] === "string" ? record["slug"] : String(record["id"] ?? "?");
+        const specId = optionalString(record["slug"]) ?? String(record["id"] ?? "?");
         skipped.push({ specId, reason: err.message });
         continue;
       }
@@ -313,7 +337,7 @@ function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
         "fetch-catalog --generate-tools (issue #157)",
     );
   }
-  return validateManifest(draft.manifest);
+  return validateManifest(JSON.parse(JSON.stringify(draft.manifest)));
 }
 
 /**
@@ -370,6 +394,8 @@ if (import.meta.main) {
       console.error("usage: bun run src/extensions/fetch-catalog.ts --pin <draft.json>");
       process.exit(1);
     }
+    // SAFETY: --pin reads a draft written by the draft/pin flow or hand-edited
+    // to that shape; malformed drafts fail closed inside pinSnapshotDraft.
     const draft = JSON.parse(readFileSync(resolve(second), "utf8")) as SnapshotDraft;
     pinSnapshotDraft(draft, "config/extensions")
       .then((path) => console.log(`pinned ${path}`))
@@ -383,6 +409,8 @@ if (import.meta.main) {
       process.exit(1);
     }
     const filePath = resolve(second);
+    // SAFETY: --generate-tools reads a draft written by the draft/pin flow
+    // (SnapshotDraft shape); the binding/kind fields are checked below.
     const doc = JSON.parse(readFileSync(filePath, "utf8")) as SnapshotDraft;
     if (doc.manifest.kind !== "mcp" || doc.manifest.mcp === undefined) {
       console.error(

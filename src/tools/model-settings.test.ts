@@ -36,7 +36,8 @@ function loadTools(
   opts: { modelRoles?: SessionModelRoleRegistry; listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]> } = {},
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
-  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
+  // SAFETY: the extension factory only calls pi.registerTool, so a double exposing just that member satisfies the executed path.
+  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as ExtensionAPI;
   modelToolsExtension(store, {
     audit: createAudit(store),
     modelRoles: opts.modelRoles,
@@ -46,12 +47,14 @@ function loadTools(
 }
 
 function ctxFor(spaceId: string): ExtensionContext {
+  // SAFETY: the tools only read ctx.sessionManager.getSessionFile(); a fake with just that member exercises the executed path.
   return {
-    sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
-  } as unknown as ExtensionContext;
+    sessionManager: { getSessionFile: (): string | undefined => join("/tmp/sessions", `${spaceId}.jsonl`) },
+  } as ExtensionContext;
 }
 
 function resultText(res: Awaited<ReturnType<ToolDefinition["execute"]>>): string {
+  // SAFETY: every tool in this suite returns a single text content block.
   return (res.content[0] as { text: string }).text;
 }
 
@@ -194,7 +197,8 @@ describe("model_settings", () => {
 
   test("fails without a space session", async () => {
     const tool = loadTools(freshStore()).find((t) => t.name === "model_settings")!;
-    const noCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
+    // SAFETY: the tool only reads ctx.sessionManager.getSessionFile(); null here means "no session file".
+    const noCtx = { sessionManager: { getSessionFile: (): string | undefined | null => null } } as ExtensionContext;
     const res = await tool.execute("tc1", {}, undefined, undefined, noCtx);
     expect(res.isError).toBe(true);
     expect(resultText(res)).toMatch(/space session/);
@@ -327,8 +331,14 @@ describe("use_model", () => {
     const registry = new SessionModelRoleRegistry();
     // A session WITHOUT the optional setModelRole hook: the registry is what
     // the ACP driver would be if it omitted the hook entirely.
-    const plain = { prompt: async () => {} };
-    registry.set(space.id, plain as never);
+    const plain: AgentSessionDriver = {
+      prompt: async () => {},
+      abort: async () => {},
+      isStreaming: () => false,
+      on: () => () => {},
+      dispose: async () => {},
+    };
+    registry.set(space.id, plain);
     const tool = loadTools(s, { modelRoles: registry }).find((t) => t.name === "use_model")!;
     const res = await tool.execute("tc1", { role: "default" }, undefined, undefined, ctxFor(space.id));
     expect(res.isError).toBe(true);
@@ -337,7 +347,8 @@ describe("use_model", () => {
 
   test("fails without a space session", async () => {
     const tool = loadTools(freshStore(), { modelRoles: new SessionModelRoleRegistry() }).find((t) => t.name === "use_model")!;
-    const noCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
+    // SAFETY: the tool only reads ctx.sessionManager.getSessionFile(); null here means "no session file".
+    const noCtx = { sessionManager: { getSessionFile: (): string | undefined | null => null } } as ExtensionContext;
     const res = await tool.execute("tc1", { role: "fast" }, undefined, undefined, noCtx);
     expect(res.isError).toBe(true);
     expect(resultText(res)).toMatch(/space session/);

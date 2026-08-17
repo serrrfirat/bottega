@@ -29,7 +29,8 @@ import { join, resolve } from "node:path";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "../extensions/manifest";
 import { resetToolSurfaceCache } from "../extensions/surface";
-import { createStore, type ExtensionCredential, type Store } from "../store/db";
+import { createStore, type ExtensionCredential } from "../store/db";
+import type { OrgSettingsInput } from "../store/org-settings";
 import type { PolicyConfig } from "../policy/config";
 import { bootExecutorRuntime, type ExecutorBoot } from "../executor";
 import { bootMemoryMcpServer, type McpBoot } from "../mcp/server";
@@ -162,14 +163,14 @@ function tempEnv(restoreCwd: string): CaptureEnv {
  * of truth, issue #67): the root's bootstrapRuntime opens the same file
  * and reads these settings at boot.
  */
-function seedSettings(settings: Record<string, unknown>): void {
+function seedSettings(settings: OrgSettingsInput): void {
   const store = createStore("data/bottega.db");
-  store.setOrgSettings(settings as Parameters<Store["setOrgSettings"]>[0]);
+  store.setOrgSettings(settings);
   store.close();
 }
 
 /** Boots all three roots in their own temp cwd with the same settings. */
-async function captureWirings(settings: Record<string, unknown>): Promise<RootWirings> {
+async function captureWirings(settings: OrgSettingsInput): Promise<RootWirings> {
   const envs: CaptureEnv[] = [];
   const originalCwd = process.cwd();
   try {

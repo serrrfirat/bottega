@@ -13,11 +13,11 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionContext, SessionManager, ToolDefinition, zod } from "@oh-my-pi/pi-coding-agent";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
-import { createStore, type ExtensionCredential, type Store } from "../store/db";
+import { createStore, type ExtensionCredential } from "../store/db";
 import { extensionToolDefinitions } from "./tools";
 import { createFixtureRegistry, fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
@@ -25,16 +25,20 @@ import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "./runtime";
 import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
-/** Minimal structural view of an omptype schema's parse surface. */
-interface ParsableSchema {
-  safeParse(value: unknown): { success: boolean };
-}
+/** Parse surface the extension tools' parameters expose (omptype zod-like schemas). */
+type ParsableSchema = zod.ZodLikeSchema<unknown>;
+
+/** Tool-call arguments the tests exercise definitions with (flat scalar fields). */
+type CallArgs = Record<string, string | number | boolean>;
 
 /** Full ToolDefinition execute signature; tests call with a fake context. */
-function run(def: ToolDefinition, params: Record<string, unknown>) {
+function run(def: ToolDefinition, params: CallArgs) {
+  const fakeSessionManager = { getSessionFile: () => undefined } satisfies Pick<SessionManager, "getSessionFile">;
+  // SAFETY: the bridge's execute only reads ctx.sessionManager.getSessionFile()
+  // (the session-id seam); the remaining ExtensionContext members are never touched.
   return def.execute("1", params, undefined, undefined, {
-    sessionManager: { getSessionFile: () => null },
-  } as unknown as ExtensionContext);
+    sessionManager: fakeSessionManager,
+  } as ExtensionContext);
 }
 
 const stubRuntime: ExtensionRuntime = {
@@ -49,7 +53,7 @@ const stubRuntime: ExtensionRuntime = {
 function makeRuntime(
   manifests: ExtensionManifest[],
   opts: { mcpTransport?: (binding: McpBinding) => Transport; policy?: PolicyConfig } = {},
-): { runtime: ExtensionRuntime; store: Store; boundaryCalls: ExtensionCredential[] } {
+) {
   const registry = createExtensionRegistry();
   for (const manifest of manifests) registry.register(manifest);
   const store = createStore(":memory:");
@@ -92,7 +96,9 @@ describe("extension tool bridge", () => {
     expect(definition.description).toContain("Current weather for a city");
     expect(definition.approval).toBe("read");
 
-    const schema = definition.parameters as unknown as ParsableSchema;
+    // SAFETY: extensionToolDefinitions builds parameters via paramsToZodSchema()
+    // (a z.object schema), so the TSchema-typed field is an omptype ZodLikeSchema.
+    const schema = definition.parameters as ParsableSchema;
     expect(schema.safeParse({ city: "Lisbon" }).success).toBe(true);
     expect(schema.safeParse({}).success).toBe(false); // city is required
   });
@@ -142,6 +148,7 @@ describe("extension tool bridge", () => {
     const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
     const result = await run(definition, {});
     expect(result.isError).toBe(true);
+    // SAFETY: toolError() wraps the message in a { type: "text", text } content block; content[0] is that block.
     expect((result.content[0] as { text: string }).text).toContain("exited 1");
   });
 
@@ -252,8 +259,7 @@ describe("extension tool bridge", () => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return { content: [{ type: "text", text: `sunny in ${args["city"]}` }] };
+        return { content: [{ type: "text", text: `sunny in ${request.params.arguments?.["city"]}` }] };
       });
       void server.connect(serverTransport);
       return clientTransport;
@@ -336,6 +342,7 @@ describe("extension tool bridge", () => {
     const definitions = extensionToolDefinitions(createFixtureRegistry().list(), { runtime });
     const result = await run(definitions[0], { city: "Lisbon" });
     expect(result.isError).toBe(true);
+    // SAFETY: toolError() wraps the message in a { type: "text", text } content block; content[0] is that block.
     expect((result.content[0] as { text: string }).text).toContain("connection refused");
   });
 
@@ -347,6 +354,7 @@ describe("extension tool bridge", () => {
     // The runtime's policy denies the tool before any credential work.
     const result = await run(definitions[0], { city: "Lisbon" });
     expect(result.isError).toBe(true);
+    // SAFETY: toolError() wraps the message in a { type: "text", text } content block; content[0] is that block.
     expect((result.content[0] as { text: string }).text).toContain("policy:");
   });
 
@@ -369,8 +377,7 @@ describe("extension tool bridge", () => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return { content: [{ type: "text", text: `sunny in ${args["city"]}` }] };
+        return { content: [{ type: "text", text: `sunny in ${request.params.arguments?.["city"]}` }] };
       });
       void server.connect(serverTransport);
       return clientTransport;
@@ -398,9 +405,11 @@ describe("extension tool bridge", () => {
         getCaller: (ctx) => (ctx.sessionManager?.getSessionFile() === "slack:C1.jsonl" ? "UADA" : undefined),
       },
     );
+    // SAFETY: the bridge's execute only reads ctx.sessionManager.getSessionFile()
+    // (the session-id seam); the remaining ExtensionContext members are never touched.
     const result = await definition.execute("1", { city: "Lisbon" }, undefined, undefined, {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
-    } as unknown as ExtensionContext);
+    } as ExtensionContext);
     expect(result.isError).not.toBe(true);
     expect(result.content).toEqual([{ type: "text", text: "sunny in Lisbon" }]);
     // The boundary saw ADA's row — the personal credential resolved.
@@ -426,6 +435,7 @@ describe("extension tool bridge", () => {
     const [definition] = extensionToolDefinitions([{ manifest: fixtureManifest() }], { runtime });
     const result = await run(definition, { city: "Lisbon" });
     expect(result.isError).toBe(true);
+    // SAFETY: toolError() wraps the message in a { type: "text", text } content block; content[0] is that block.
     expect((result.content[0] as { text: string }).text).toMatch(/no fixture\.weather credential is available/);
     // Nothing resolved: no boundary injection, no credential audit.
     expect(boundaryCalls).toHaveLength(0);
@@ -477,6 +487,7 @@ describe("extension tool bridge: tools-less manifests (issue #158)", () => {
   }
 
   test("definitions come from the resolved discovered surface: names, params, and conservative tiers", async () => {
+    // SAFETY: the array starts empty and is only ever appended tool-name strings (def.name) later in this test.
     const seen = { list: 0, tool: [] as string[] };
     const manifest = toolsLessManifest();
     const registry = createExtensionRegistry();
@@ -515,7 +526,9 @@ describe("extension tool bridge: tools-less manifests (issue #158)", () => {
     expect(definitions.map((def) => def.name)).toEqual(["discover.me.search_issues", "discover.me.delete_issue"]);
     expect(definitions[0]!.approval).toBe("read"); // read verb → read tier
     expect(definitions[1]!.approval).toBe("exec"); // destructive verb → exec tier
-    const schema = definitions[0]!.parameters as unknown as ParsableSchema;
+    // SAFETY: tools-less definitions also build parameters via paramsToZodSchema()
+    // (a z.object schema), so the TSchema-typed field is an omptype ZodLikeSchema.
+    const schema = definitions[0]!.parameters as ParsableSchema;
     expect(schema.safeParse({ query: "repo:x" }).success).toBe(true);
     expect(schema.safeParse({}).success).toBe(false); // query required
 

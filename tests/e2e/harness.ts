@@ -38,7 +38,7 @@
  * runs in CI and is skip-gated on tokens; the QA canary runner
  * (tests/e2e/canary.ts) owns that gate.
  */
-import { App, type Logger } from "@slack/bolt";
+import { App, LogLevel, type Logger } from "@slack/bolt";
 import { createServer } from "@emulators/core";
 import slackPlugin, { getSlackStore, seedFromConfig } from "@emulators/slack";
 import type { SlackStore } from "@emulators/slack";
@@ -66,7 +66,7 @@ import type { McpOAuthConnector } from "../../src/extensions/mcp-oauth";
 import type { UploadLinkStore } from "../../src/extensions/upload-link";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
-import type { McpBinding } from "../../src/extensions/manifest";
+import type { JsonObject, McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver } from "../../src/server/drivers/agent-driver";
@@ -99,7 +99,8 @@ export const STUB_MODEL_REF = `${STUB_PROVIDER}/${STUB_MODEL_ID}`;
 /** One scripted tool call the model stub returns. */
 export interface StubToolCall {
   name: string;
-  args: Record<string, unknown>;
+  /** Tool arguments as JSON (nested objects/arrays included) — the wire shape the stub serializes. */
+  args: JsonObject;
 }
 
 /** One scripted model turn: a plain text reply or one or more tool calls. */
@@ -154,6 +155,9 @@ function createModelStub(): ModelStub {
       if (req.method !== "POST" || url.pathname !== "/v1/chat/completions") {
         return new Response("not found", { status: 404 });
       }
+      // SAFETY: the stub reads only optional fields (model/stream/messages/
+      // stream_options) with fallbacks for absent ones; a non-object JSON
+      // body still yields undefined fields, matching the pre-check behavior.
       const body = (await req.json()) as {
         model?: string;
         stream?: boolean;
@@ -167,6 +171,8 @@ function createModelStub(): ModelStub {
       });
       while (waiters.length > 0) waiters.shift()!();
 
+      // SAFETY: the queue is only ever pushed StubTurn values (respond/push
+      // above), and the length check guarantees the shifted element exists.
       const turn = turns.length > 0 ? (turns.shift() as StubTurn) : DEFAULT_TURN;
       // Realistic model latency: the space service posts a thinking phrase
       // at turn_start and replaces it when the reply lands — an instant
@@ -214,13 +220,35 @@ function createModelStub(): ModelStub {
   };
 }
 
-function sseChunk(payload: unknown): string {
+/** One tool-call delta inside an SSE chunk (the stub's streaming wire shape). */
+interface SseToolCallDelta {
+  index: number;
+  id?: string;
+  type?: string;
+  function: { name: string; arguments: string };
+}
+
+/** The delta object of one SSE choice (fields present per stream position). */
+interface SseChoiceDelta {
+  role?: string;
+  content?: string;
+  tool_calls?: SseToolCallDelta[];
+}
+
+/** One choice in an SSE chat.completion.chunk the stub streams. */
+interface SseChoice {
+  index: number;
+  delta: SseChoiceDelta;
+  finish_reason: string | null;
+}
+
+function sseChunk(choices: SseChoice[]): string {
   const base = {
     id: "chatcmpl-e2e",
     object: "chat.completion.chunk",
     created: 1,
     model: STUB_MODEL_ID,
-    choices: payload,
+    choices,
   };
   return `data: ${JSON.stringify(base)}\n\n`;
 }
@@ -283,7 +311,7 @@ function streamingSseBody(turn: StubTurn, includeUsage: boolean): string {
   return chunks.join("");
 }
 
-function jsonBody(turn: StubTurn): Record<string, unknown> {
+function jsonBody(turn: StubTurn) {
   if (turn.type === "tool_calls") {
     return {
       id: "chatcmpl-e2e",
@@ -347,6 +375,12 @@ export interface EmulatorMessage {
   thread_ts?: string;
 }
 
+/** An inbound message mirrored into the emulator store (issue #179). */
+export interface MirrorMessage extends EmulatorMessage {
+  type?: string;
+  reactions?: unknown[];
+}
+
 /**
  * The Slack boundary both modes expose: the emulator handle (live store)
  * and the live handle (cached API mirror) implement this shape, so harness
@@ -367,7 +401,7 @@ export interface SlackHandle {
        * the row `reactions.add` answers message_not_found. The live mirror
        * is read-only and omits this.
        */
-      insert?(row: EmulatorMessage & { type?: string; reactions?: unknown[] }): unknown;
+      insert?(row: MirrorMessage): MirrorMessage;
     };
     users: { findOneBy(field: string, value: string): { user_id?: string } | undefined };
     channels: { findOneBy(field: string, value: string): { channel_id?: string } | undefined };
@@ -432,15 +466,18 @@ function bootSlackEmulator(): SlackEmulatorHandle {
   };
 }
 
-const QUIET_LOGGER = {
+const QUIET_LOGGER: Logger = {
   info: () => {},
   debug: () => {},
   warn: () => {},
   error: () => {},
-  getLevel: () => 0,
+  // The most verbose level keeps every Bolt log call a no-op (all methods
+  // above swallow their input); the app never sets logLevel, so getLevel's
+  // value is never compared.
+  getLevel: () => LogLevel.DEBUG,
   setLevel: () => {},
   setName: () => {},
-} as unknown as Logger;
+};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -577,7 +614,7 @@ export interface Harness {
   configDir: string;
   transcriptDir: string;
   /** Inbound Slack message through the real Bolt router (#29 seam). */
-  deliverMessage(channelId: string, text: string, extra?: Record<string, unknown>): Promise<void>;
+  deliverMessage(channelId: string, text: string, extra?: Record<string, string>): Promise<void>;
   /** Inbound block-action click through the real Bolt router (#44 seam). */
   deliverAction(action: {
     actionId: string;
@@ -704,6 +741,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const slack: SlackHandle = realSlack
     ? await bootLiveSlack(cfg.slackTokens!)
     : bootSlackEmulator();
+  // SAFETY: in realSlack mode the slack handle IS the live handle (the
+  // boot branch above constructs it via bootLiveSlack); the emulator branch
+  // leaves liveSlack undefined.
   const liveSlack = realSlack ? (slack as LiveSlackHandle) : undefined;
   // Per-space policy overlays accept a space id ("slack:C…"), a seeded
   // channel name ("ops"), or a raw channel id.
@@ -774,12 +814,12 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
           store,
           audit,
           broker: cfg.liveConnect.broker ?? connectViaAuthBroker,
-          ...(cfg.liveConnect.mcpOAuth !== undefined ? { mcpOAuth: cfg.liveConnect.mcpOAuth } : {}),
-          ...(cfg.liveConnect.uploadLink !== undefined ? { uploadLink: cfg.liveConnect.uploadLink } : {}),
+          ...(cfg.liveConnect.mcpOAuth !== undefined ? { mcpOAuth: cfg.liveConnect.mcpOAuth } : undefined),
+          ...(cfg.liveConnect.uploadLink !== undefined ? { uploadLink: cfg.liveConnect.uploadLink } : undefined),
           gate: {
             loadPolicy: async (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
             router: approvalRouter,
-            ...(cfg.liveConnect.timeoutMs !== undefined ? { timeoutMs: cfg.liveConnect.timeoutMs } : {}),
+            ...(cfg.liveConnect.timeoutMs !== undefined ? { timeoutMs: cfg.liveConnect.timeoutMs } : undefined),
           },
         }
       : undefined);
@@ -798,8 +838,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     audit,
     orgPolicy,
     router: approvalRouter,
-    ...(cfg.mcpTransport !== undefined ? { mcpTransport: cfg.mcpTransport } : {}),
-    ...(cfg.extensionBoundary !== undefined ? { boundary: cfg.extensionBoundary } : {}),
+    ...(cfg.mcpTransport !== undefined ? { mcpTransport: cfg.mcpTransport } : undefined),
+    ...(cfg.extensionBoundary !== undefined ? { boundary: cfg.extensionBoundary } : undefined),
     surfaces: extensionSurfaces,
   });
   // Memory/work-item tools ride the gated customTools path (issue #69):
@@ -813,8 +853,11 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // canary's model-role journey exercises the real seam, issue #175).
   const modelRoles = new SessionModelRoleRegistry();
   const modelTools = modelToolsDefinitions(store, { audit, modelRoles });
-  const extraGatedTools =
-    typeof cfg.gatedTools === "function" ? cfg.gatedTools({ store, audit, registry: extensionRegistry }) : cfg.gatedTools ?? [];
+  const extraGatedTools = Array.isArray(cfg.gatedTools)
+    ? cfg.gatedTools
+    : cfg.gatedTools === undefined
+      ? []
+      : cfg.gatedTools({ store, audit, registry: extensionRegistry });
   const driver = createOmpSdkDriver({
     agentDir,
     customTools: [
@@ -850,14 +893,14 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
             store: connectDeps.store,
             audit: connectDeps.audit,
             broker: connectDeps.broker,
-            ...(connectDeps.mcpOAuth !== undefined ? { mcpOAuth: connectDeps.mcpOAuth } : {}),
-            ...(connectDeps.uploadLink !== undefined ? { uploadLink: connectDeps.uploadLink } : {}),
+            ...(connectDeps.mcpOAuth !== undefined ? { mcpOAuth: connectDeps.mcpOAuth } : undefined),
+            ...(connectDeps.uploadLink !== undefined ? { uploadLink: connectDeps.uploadLink } : undefined),
             loadPolicy: connectDeps.gate.loadPolicy,
             router: connectDeps.gate.router,
             timeoutMs: connectDeps.gate.timeoutMs,
           },
         }
-      : {}),
+      : undefined),
     memoryContext: {
       provider: memoryProvider,
       enabled: orgPolicy.memory.injection.enabled,
@@ -881,7 +924,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     transcriptDir,
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
-    ...(connectDeps !== undefined ? { connect: connectDeps } : {}),
+    ...(connectDeps !== undefined ? { connect: connectDeps } : undefined),
   });
 
   // --- inbound Bolt app (the #29 seam) ----------------------------------------
@@ -954,7 +997,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
         await liveSlack!.postAsUser(channelId, text);
         return;
       }
-      const ts = typeof extra.ts === "string" ? extra.ts : nextTs();
+      // extra.ts is the string ts override when present (the type contract
+      // makes it a string); nextTs() supplies the deterministic fallback.
+      const ts = extra.ts ?? nextTs();
       // Issue #179: mirror the inbound message into the emulator store so
       // the presenter's receipt reaction (reactions.add on the inbound ts)
       // resolves — processEvent bypasses the emulator's HTTP API, and
@@ -1007,7 +1052,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       const all = slack.store.messages.all().filter((m) => m.user !== humanUserId);
       return channelId ? all.filter((m) => m.channel_id === channelId) : all;
     },
-    ...(liveSlack !== undefined ? { liveSlack } : {}),
+    ...(liveSlack !== undefined ? { liveSlack } : undefined),
     cleanup,
   };
 }

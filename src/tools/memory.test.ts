@@ -4,13 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { z } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
-import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { memoryToolsExtension, sha256Hex } from "./memory";
 
 /** The memory tools never read the extension context; only the arity needs it. */
-const noopCtx = {} as unknown as ExtensionContext;
+const noopCtx: ExtensionContext = Object.create(null);
 
 class FakeProvider implements MemoryProvider {
   saved: MemorySaveInput[] = [];
@@ -47,14 +48,24 @@ class FakeProvider implements MemoryProvider {
 interface AuditRow {
   actor: string;
   event_type: string;
-  payload: Record<string, unknown>;
+  payload: AuditPayload;
 }
 
-function fakeAudit(): { audit: Pick<AuditModule, "appendAudit">; rows: AuditRow[] } {
+/** The `memory.write` audit payload memory.ts appends (hash-only, never the content). */
+interface AuditPayload {
+  scope?: string;
+  principal?: string | null;
+  id?: string;
+  content_hash?: string;
+}
+
+function fakeAudit() {
   const rows: AuditRow[] = [];
   const audit: Pick<AuditModule, "appendAudit"> = {
     appendAudit: async (entry) => {
-      const text = typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload);
+      // The store binds string payloads verbatim and JSON-encodes the rest.
+      const parsed = z.string().safeParse(entry.payload);
+      const text = parsed.success ? parsed.data : JSON.stringify(entry.payload);
       rows.push({ actor: entry.actor, event_type: entry.event_type, payload: JSON.parse(text) });
       return rows.length;
     },
@@ -67,12 +78,14 @@ function loadTools(
   opts?: { defaultPrincipal?: string; audit?: Pick<AuditModule, "appendAudit"> },
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
-  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
+  // SAFETY: loadTools only exercises the extension's registerTool seam; the rest of the ExtensionAPI surface is never touched by the memory extension.
+  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as ExtensionAPI;
   memoryToolsExtension(provider, opts)(pi);
   return tools;
 }
 
 function resultText(res: Awaited<ReturnType<ToolDefinition["execute"]>>): string {
+  // SAFETY: the memory tools always return a single text content block.
   return (res.content[0] as { text: string }).text;
 }
 
@@ -301,7 +314,8 @@ describe("memory tools against the real SQLite provider (issue #29)", () => {
 
       const found = await searchTool.execute("tc1", { query: "vault combination", scope: "org" }, undefined, undefined, noopCtx);
       expect(found.isError).not.toBe(true);
-      const entries = JSON.parse(resultText(found)) as Array<Record<string, unknown>>;
+      // SAFETY: memory.search serializes MemoryEntry[] to JSON (the provider's search return), so the parsed payload is that same shape.
+      const entries = JSON.parse(resultText(found)) as MemoryEntry[];
       expect(entries).toHaveLength(1);
       expect(entries[0]).toMatchObject({
         id,

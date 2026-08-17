@@ -42,12 +42,21 @@ let sessionId = "sess_fake";
 /** The session/prompt request currently awaiting a response, if any. */
 let pendingPrompt: { id: number } | null = null;
 
-function send(msg: unknown): void {
+/** A JSON-RPC 2.0 message on the wire: a request/response with `id`, or a notification with `method`. */
+interface JsonRpcMessage {
+  jsonrpc?: string;
+  id?: number;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+}
+
+function send(msg: JsonRpcMessage): void {
   process.stdout.write(JSON.stringify(msg) + "\n");
   log(msg);
 }
 
-function log(msg: unknown): void {
+function log(msg: JsonRpcMessage): void {
   if (logfile) appendFileSync(logfile, JSON.stringify(msg) + "\n");
 }
 

@@ -51,6 +51,14 @@ function source(path: string, id = "handbook"): KbSource {
   return { id, url: new URL(path, server.url).toString(), type: "html" };
 }
 
+/** MEMORY_WRITE_EVENT payload (audit-events.ts): {scope, principal, id, content_hash}. */
+interface MemoryWritePayload {
+  scope: string;
+  principal: string | null;
+  id: string;
+  content_hash: string;
+}
+
 afterAll(() => {
   server.stop(true);
   for (const store of stores) store.close();
@@ -113,7 +121,9 @@ describe("KB ingestion", () => {
     expect(rows).toHaveLength(result.saved);
     for (const row of rows) {
       expect(row.actor).toBe("kb_ingest");
-      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      // SAFETY: ingestSource writes MEMORY_WRITE_EVENT rows with exactly this
+      // payload shape (audit-events.ts); the schema is pinned by this test.
+      const payload = JSON.parse(row.payload) as MemoryWritePayload;
       expect(payload.scope).toBe("org");
       expect(payload.principal).toBeNull();
       const entry = memories.find((memoryEntry) => memoryEntry.id === payload.id);

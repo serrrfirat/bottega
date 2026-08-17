@@ -176,7 +176,7 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       // Driver getter: resolves to the OMP SDK driver built over the
       // worker toolset (pre-approved gate, memory tools under it).
       const resolvedDriver = await deps.driver;
-      expect(typeof resolvedDriver.createSession).toBe("function");
+      expect(resolvedDriver.createSession).toEqual(expect.any(Function));
     } finally {
       env.cleanup();
     }

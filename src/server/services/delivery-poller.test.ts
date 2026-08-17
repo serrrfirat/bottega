@@ -63,7 +63,7 @@ class FakeAdapter implements Pick<SlackAdapter, "postMessage"> {
       this.failNext = false;
       throw new Error("postMessage failed (fake)");
     }
-    this.posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : {}) });
+    this.posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : undefined) });
     return undefined;
   }
 }
@@ -92,6 +92,9 @@ describe("pollPendingDeliveries (issue #12)", () => {
         blocks: buildDeliveryBlocks(PR_URL, "implemented it", "wi_1"),
       },
     ]);
+    // SAFETY: the toEqual assertion above pinned the announcement to
+    // buildDeliveryBlocks(...) — an interactive prompt with an actions block
+    // carrying action_id/value elements.
     const blocks = adapter.posted[0].blocks as Array<{
       type: string;
       elements?: Array<{ action_id?: string; value?: string }>;

@@ -97,6 +97,7 @@ async function createSpace(store: Store, channel: string, policyJson: string): P
 }
 
 function reflectionRows(store: Store): Array<{ id: string; content: string; metadata_json: string }> {
+  // SAFETY: the SELECT column list exactly matches the declared row shape; bun:sqlite returns plain objects with those columns.
   return store
     .getDb()
     .query(`SELECT id, content, metadata_json FROM memories WHERE metadata_json LIKE '%"kind":"reflection"%' ORDER BY rowid`)
@@ -195,6 +196,7 @@ describe("reflectionAction (issue #93)", () => {
     expect(rows).toHaveLength(4);
     const byTopic = new Map(
       rows.map((row) => {
+        // SAFETY: reflection rows' metadata_json is written by reflectionAction as a JSON object with string values.
         const metadata = JSON.parse(row.metadata_json) as Record<string, string>;
         expect(metadata).toEqual({ kind: "reflection", space, date: DATE, topic: metadata.topic });
         return [metadata.topic, row] as const;

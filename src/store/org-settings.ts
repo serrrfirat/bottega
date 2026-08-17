@@ -23,6 +23,7 @@ import { EXTENSION_ID_RE } from "../extensions/manifest";
 import type { CredentialType } from "../extensions/manifest";
 import { isKnownTool } from "../policy/config";
 import type { OrgCredentialsMode, ResponseMode } from "../policy/config";
+import { z } from "zod";
 
 export const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
 
@@ -165,52 +166,56 @@ export class OrgSettingsParseError extends Error {
   }
 }
 
-const RESPONSE_MODE_VALUES: readonly string[] = ["always", "mention", "request-only"];
-const ORG_CREDENTIALS_VALUES: readonly string[] = ["allow", "deny"];
+const RESPONSE_MODE_VALUES = ["always", "mention", "request-only"] as const;
+const ORG_CREDENTIALS_VALUES = ["allow", "deny"] as const;
 
-function normalizeEnum(value: unknown, values: readonly string[]): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  return values.includes(normalized) ? normalized : undefined;
+/** A JSON-decoded value before any org-settings contract is applied. */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+const jsonValueSchema = z.json();
+const jsonObjectSchema = z.record(z.string(), jsonValueSchema);
+
+function normalizeEnum<T extends string>(value: JsonValue, values: readonly [T, ...T[]]): T | undefined {
+  const parsed = z.string().trim().toLowerCase().pipe(z.enum(values)).safeParse(value);
+  if (!parsed.success) return undefined;
+  return parsed.data;
 }
 
 /** A positive integer, or undefined when not a number. */
-function positiveInt(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
+function positiveInt(value: JsonValue): number | undefined {
+  const parsed = z.number().int().min(1).safeParse(value);
+  if (!parsed.success) return undefined;
+  return parsed.data;
 }
 
 /** A list of well-formed extension ids, or undefined when malformed. */
-function extensionIdList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const ids: string[] = [];
-  for (const raw of value) {
-    if (typeof raw !== "string" || !EXTENSION_ID_RE.test(raw)) return undefined;
-    ids.push(raw);
-  }
-  return [...new Set(ids)];
+function extensionIdList(value: JsonValue): string[] | undefined {
+  const parsed = z.array(z.string().regex(EXTENSION_ID_RE)).safeParse(value);
+  if (!parsed.success) return undefined;
+  return [...new Set(parsed.data)];
 }
 
 /** A list of known tool names (approvals.always_approve), or undefined when malformed. */
-function toolNameList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const names: string[] = [];
-  for (const raw of value) {
-    if (typeof raw !== "string" || !isKnownTool(raw)) return undefined;
-    names.push(raw);
-  }
-  return [...new Set(names)];
+function toolNameList(value: JsonValue): string[] | undefined {
+  const parsed = z.array(z.string().refine(isKnownTool)).safeParse(value);
+  if (!parsed.success) return undefined;
+  return [...new Set(parsed.data)];
 }
 
 /** A list of owner/repo strings, or undefined when malformed. */
-function repoList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const repos: string[] = [];
-  for (const raw of value) {
-    if (typeof raw !== "string" || !/^[^/]+\/[^/]+$/.test(raw)) return undefined;
-    repos.push(raw);
-  }
-  return [...new Set(repos)];
+function repoList(value: JsonValue): string[] | undefined {
+  const parsed = z.array(z.string().regex(/^[^/]+\/[^/]+$/)).safeParse(value);
+  if (!parsed.success) return undefined;
+  return [...new Set(parsed.data)];
 }
+
+/** One 1Password location entry in `secrets_backend.mapping` (issue #190). */
+const secretsMappingEntrySchema = z.object({
+  vault: z.string().trim().min(1),
+  item: z.string().trim().min(1),
+  field: z.string().trim().min(1),
+  type: z.enum(["api_key", "oauth"]).optional(),
+});
 
 /**
  * Validates `secrets_backend.mapping` (issue #190): a flat
@@ -218,27 +223,12 @@ function repoList(value: unknown): string[] | undefined {
  * must be a well-formed 1Password location; `type` is optional and must be
  * a known credential kind. Returns undefined when malformed (fail closed).
  */
-function parseSecretsBackendMapping(value: unknown): Record<string, SecretsBackendMappingEntry> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const out: Record<string, SecretsBackendMappingEntry> = {};
-  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
-    if (key.trim() === "") return undefined;
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-    const entry = raw as Record<string, unknown>;
-    const vault = entry["vault"];
-    const item = entry["item"];
-    const field = entry["field"];
-    if (typeof vault !== "string" || vault.trim() === "") return undefined;
-    if (typeof item !== "string" || item.trim() === "") return undefined;
-    if (typeof field !== "string" || field.trim() === "") return undefined;
-    let type: CredentialType | undefined;
-    if (entry["type"] !== undefined) {
-      if (entry["type"] !== "api_key" && entry["type"] !== "oauth") return undefined;
-      type = entry["type"];
-    }
-    out[key] = { vault: vault.trim(), item: item.trim(), field: field.trim(), ...(type !== undefined ? { type } : {}) };
-  }
-  return out;
+function parseSecretsBackendMapping(value: JsonValue): Record<string, SecretsBackendMappingEntry> | undefined {
+  const parsed = z
+    .record(z.string().refine((key) => key.trim() !== ""), secretsMappingEntrySchema)
+    .safeParse(value);
+  if (!parsed.success) return undefined;
+  return parsed.data;
 }
 
 /**
@@ -253,15 +243,18 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
     doc = JSON.parse(text);
   } catch (err) {
     out.ok = false;
+    // SAFETY: JSON.parse rejects with a SyntaxError (an Error subclass), so the
+    // caught value always carries a message.
     out.errors.push(`invalid JSON: ${(err as Error).message}`);
     return out;
   }
-  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+  const blobResult = jsonObjectSchema.safeParse(doc);
+  if (!blobResult.success) {
     out.ok = false;
     out.errors.push("settings must be a JSON object");
     return out;
   }
-  const blob = doc as Record<string, unknown>;
+  const blob = blobResult.data;
   const fail = (message: string): void => {
     out.ok = false;
     out.errors.push(message);
@@ -269,14 +262,14 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
 
   for (const [name, value] of Object.entries(blob)) {
     if (name === "approvals") {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("approvals must be an object");
         continue;
       }
-      const approvals = value as Record<string, unknown>;
       const parsed: OrgApprovalsSettings = {};
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(approvals)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "timeout_minutes") {
           const n = positiveInt(raw);
           if (n === undefined) {
@@ -304,32 +297,33 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       if (mode === undefined) {
         fail("response_mode must be one of: always, mention, request-only");
       } else {
-        out.responseMode = mode as ResponseMode;
+        out.responseMode = mode;
       }
     } else if (name === "memory") {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("memory must be an object");
         continue;
       }
-      const memory = value as Record<string, unknown>;
-      const injection = memory["injection"];
+      const injection = section.data["injection"];
       if (injection === undefined) {
         continue; // `memory: {}` sets nothing
       }
-      if (typeof injection !== "object" || injection === null || Array.isArray(injection)) {
+      const injResult = jsonObjectSchema.safeParse(injection);
+      if (!injResult.success) {
         fail("memory.injection must be an object");
         continue;
       }
-      const inj = injection as Record<string, unknown>;
       const parsed: OrgMemorySettings = {};
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(inj)) {
+      for (const [key, raw] of Object.entries(injResult.data)) {
         if (key === "enabled") {
-          if (typeof raw !== "boolean") {
+          const enabled = z.boolean().safeParse(raw);
+          if (!enabled.success) {
             sectionOk = false;
             fail("memory.injection.enabled must be a boolean");
           } else {
-            parsed.enabled = raw;
+            parsed.enabled = enabled.data;
           }
         } else if (key === "max_entries") {
           const n = positiveInt(raw);
@@ -351,14 +345,14 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       }
       if (sectionOk) out.memoryInjection = parsed;
     } else if (name === "extensions") {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("extensions must be an object");
         continue;
       }
-      const extensions = value as Record<string, unknown>;
       const parsed: OrgExtensionsSettings = {};
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(extensions)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "allow") {
           const ids = extensionIdList(raw);
           if (ids === undefined) {
@@ -381,7 +375,7 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
             sectionOk = false;
             fail("extensions.org_credentials must be one of: allow, deny");
           } else {
-            parsed.orgCredentials = mode as OrgCredentialsMode;
+            parsed.orgCredentials = mode;
           }
         } else {
           sectionOk = false;
@@ -397,20 +391,21 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         out.repos = repos;
       }
     } else if (name === "models") {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("models must be an object");
         continue;
       }
-      const models = value as Record<string, unknown>;
       const parsed: OrgModelsSettings = {};
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(models)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "default" || key === "fast" || key === "reasoning" || key === "effort") {
-          if (typeof raw !== "string" || raw.trim() === "") {
+          const str = z.string().trim().min(1).safeParse(raw);
+          if (!str.success) {
             sectionOk = false;
             fail(`models.${key} must be a non-empty string`);
           } else {
-            parsed[key] = raw.trim();
+            parsed[key] = str.data;
           }
         } else {
           sectionOk = false;
@@ -419,39 +414,42 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       }
       if (sectionOk) out.models = parsed;
     } else if (name === "workspaces_dir" || name === "git_base_url" || name === "api_base_url") {
-      if (typeof value !== "string" || value.trim() === "") {
+      const str = z.string().trim().min(1).safeParse(value);
+      if (!str.success) {
         fail(`${name} must be a non-empty string`);
       } else if (name === "workspaces_dir") {
-        out.workspacesDir = value.trim();
+        out.workspacesDir = str.data;
       } else if (name === "git_base_url") {
-        out.gitBaseUrl = value.trim();
+        out.gitBaseUrl = str.data;
       } else {
-        out.apiBaseUrl = value.trim();
+        out.apiBaseUrl = str.data;
       }
     } else if (name === "allow_loose_pat") {
-      if (typeof value !== "boolean") {
+      const flag = z.boolean().safeParse(value);
+      if (!flag.success) {
         fail("allow_loose_pat must be a boolean");
       } else {
-        out.allowLoosePat = value;
+        out.allowLoosePat = flag.data;
       }
     } else if (name === "memory_backend") {
       // The backend URL (mem0) — issue #67 env pruning moved the knob out
       // of env. An EMPTY base_url clears the setting (SQLite fallback),
       // mirroring the old MEM0_BASE_URL= contract; `memory_backend: {}`
       // sets nothing.
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("memory_backend must be an object");
         continue;
       }
-      const backend = value as Record<string, unknown>;
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(backend)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "base_url") {
-          if (typeof raw !== "string") {
+          const str = z.string().safeParse(raw);
+          if (!str.success) {
             sectionOk = false;
             fail("memory_backend.base_url must be a string");
-          } else if (raw.trim() !== "") {
-            out.memoryBackend = { baseUrl: raw.trim() };
+          } else if (str.data.trim() !== "") {
+            out.memoryBackend = { baseUrl: str.data.trim() };
           }
         } else {
           sectionOk = false;
@@ -464,19 +462,20 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       // boot-time guided setup post. An EMPTY space_id clears the setting
       // (no boot post), mirroring memory_backend.base_url; `onboarding: {}`
       // sets nothing.
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("onboarding must be an object");
         continue;
       }
-      const onboarding = value as Record<string, unknown>;
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(onboarding)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "space_id") {
-          if (typeof raw !== "string") {
+          const str = z.string().safeParse(raw);
+          if (!str.success) {
             sectionOk = false;
             fail("onboarding.space_id must be a string");
-          } else if (raw.trim() !== "") {
-            out.onboarding = { spaceId: raw.trim() };
+          } else if (str.data.trim() !== "") {
+            out.onboarding = { spaceId: str.data.trim() };
           }
         } else {
           sectionOk = false;
@@ -488,29 +487,30 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       // Secret-vault backend for the extension credential boundary (issue
       // #190). Unknown types, a 1password-connect backend missing its
       // connect_url/mapping, or a malformed mapping all fail the whole
-      // blob closed — a deployment must never silently keep the default
+      // closed — a deployment must never silently keep the default
       // backend after configuring one that cannot work.
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
         fail("secrets_backend must be an object");
         continue;
       }
-      const backend = value as Record<string, unknown>;
-      const rawType = backend["type"];
-      if (rawType !== "omp-broker" && rawType !== "1password-connect") {
+      const rawType = z.enum(["omp-broker", "1password-connect"]).safeParse(section.data["type"]);
+      if (!rawType.success) {
         fail("secrets_backend.type must be one of: omp-broker, 1password-connect");
         continue;
       }
-      const parsed: OrgSecretsBackendSettings = { type: rawType };
+      const parsed: OrgSecretsBackendSettings = { type: rawType.data };
       let sectionOk = true;
-      for (const [key, raw] of Object.entries(backend)) {
+      for (const [key, raw] of Object.entries(section.data)) {
         if (key === "type") {
           continue;
         } else if (key === "connect_url") {
-          if (typeof raw !== "string" || raw.trim() === "") {
+          const str = z.string().trim().min(1).safeParse(raw);
+          if (!str.success) {
             sectionOk = false;
             fail("secrets_backend.connect_url must be a non-empty string (the Connect server base URL)");
           } else {
-            parsed.connectUrl = raw.trim();
+            parsed.connectUrl = str.data;
           }
         } else if (key === "mapping") {
           const mapping = parseSecretsBackendMapping(raw);
@@ -525,7 +525,7 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
           fail(`secrets_backend.${key}: unknown key`);
         }
       }
-      if (rawType === "1password-connect") {
+      if (rawType.data === "1password-connect") {
         if (parsed.connectUrl === undefined) {
           sectionOk = false;
           fail("secrets_backend.connect_url is required for type 1password-connect");

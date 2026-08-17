@@ -15,6 +15,7 @@ import {
   SCHEDULER_MISSED_EVENT,
 } from "../store/audit-events";
 import type { Store } from "../store/db";
+import { errorMessage } from "../tools/helpers";
 import { nextCronFire } from "./cron";
 import type {
   SchedulerActionContext,
@@ -47,10 +48,6 @@ export interface SchedulerDeps extends Omit<SchedulerTickDeps, "now" | "firstTic
 export interface Scheduler {
   start(): void;
   stop(): void;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /** Rejects after a bounded duration; the underlying action promise cannot be cancelled. */

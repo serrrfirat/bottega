@@ -190,7 +190,7 @@ export function parseYamlSubset(src: string): Record<string, YamlNode> {
   if (lines.length === 0) return {};
   const [node, next] = parseBlock(lines, 0, lines[0].indent);
   if (next !== lines.length) throw new Error(`line ${lines[next].lineNo}: unexpected content`);
-  if (typeof node === "string" || Array.isArray(node)) throw new Error("top level must be a mapping");
+  if (Array.isArray(node) || !(node instanceof Object)) throw new Error("top level must be a mapping");
   return node;
 }
 

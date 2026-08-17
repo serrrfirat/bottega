@@ -39,20 +39,46 @@ class FakeProvider implements MemoryProvider {
 
 interface Harness {
   provider: FakeProvider;
-  context(messages: TestMessage[]): Promise<{ messages: unknown[] } | undefined>;
+  context(messages: TestMessage[]): Promise<{ messages: TestMessage[] } | undefined>;
   agentStart(): Promise<void>;
+}
+
+/** Events the memory extension registers for; the harness dispatches structural subsets. */
+type HarnessEvent = { type: "context"; messages: TestMessage[] } | { type: "agent_start" };
+
+/** Handler shape the extension registers (context returns injected messages, agent_start returns nothing). */
+type RegisteredHandler = (
+  event: HarnessEvent,
+  ctx: ExtensionContext,
+) => Promise<{ messages: TestMessage[] } | undefined> | undefined;
+
+/** Minimal ExtensionAPI fake: records the handlers the extension registers. */
+function fakeApi(handlers: Map<string, RegisteredHandler>): ExtensionAPI {
+  // SAFETY: memoryContextExtension only calls pi.on(...) — the fake implements exactly
+  // that surface, and the remaining ExtensionAPI members are never touched.
+  return {
+    on(event: string, handler: RegisteredHandler): void {
+      handlers.set(event, handler);
+    },
+  } as ExtensionAPI;
 }
 
 function loadExtension(opts: MemoryContextExtensionOpts = {}): Harness {
   const provider = new FakeProvider();
-  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown>();
-  const pi = { on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => void handlers.set(event, handler) } as unknown as ExtensionAPI;
-  memoryContextExtension(provider, opts)(pi);
+  const handlers = new Map<string, RegisteredHandler>();
+  memoryContextExtension(provider, opts)(fakeApi(handlers));
+  // SAFETY: memoryContextExtension's handlers never read ctx (they only consume the event);
+  // an empty object satisfies the ExtensionHandler signature.
   const ctx = {} as ExtensionContext;
   return {
     provider,
-    context: (messages) => handlers.get("context")?.({ type: "context", messages }, ctx) as Promise<{ messages: unknown[] } | undefined>,
-    agentStart: () => handlers.get("agent_start")?.({ type: "agent_start" }, ctx) as Promise<void>,
+    context: async (messages) => {
+      const result = handlers.get("context")?.({ type: "context", messages }, ctx);
+      return result === undefined ? undefined : await result;
+    },
+    agentStart: async () => {
+      await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+    },
   };
 }
 
@@ -74,6 +100,7 @@ describe("memoryContextExtension", () => {
     expect(result).toBeDefined();
     const messages = result!.messages;
     expect(messages.length).toBe(4); // injected + 3 originals
+    // SAFETY: the extension prepends its injection as messages[0] with role/content set (memory-context.ts).
     const injected = messages[0] as { role: string; content: string };
     expect(injected.role).toBe("developer");
     expect(injected.content).toBe(
@@ -111,6 +138,7 @@ describe("memoryContextExtension", () => {
       entry({ content: "one" }), // duplicate of the first hit
     ];
     const result = await h.context(conversation());
+    // SAFETY: the extension prepends its injection as messages[0] with content set (memory-context.ts).
     const injected = result!.messages[0] as { content: string };
     expect(injected.content).toBe(`${MEMORY_INJECTION_PREFIX}\n- one\n- two`);
   });
@@ -122,6 +150,7 @@ describe("memoryContextExtension", () => {
       entry({ content: "b" }),
     ];
     const result = await h.context(conversation());
+    // SAFETY: the extension prepends its injection as messages[0] with content set (memory-context.ts).
     const injected = result!.messages[0] as { content: string };
     expect(Buffer.byteLength(injected.content, "utf8")).toBeLessThanOrEqual(64);
     expect(injected.content.startsWith(MEMORY_INJECTION_PREFIX)).toBe(true);

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { randomBytes, randomUUID } from "node:crypto";
+import type { WorkerJob, WorkerJobKind, WorkerJobStatus } from "../worker/envelope";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
@@ -9,6 +10,7 @@ import { KNOWN_ACTIONS } from "../scheduler/actions";
 import { nextCronFire } from "../scheduler/cron";
 import { schedulerJobFromRow, type SchedulerJobRow } from "../scheduler/store";
 import type { SchedulerActionName, SchedulerJob } from "../scheduler/types";
+import { z } from "zod";
 
 export type Space = {
   id: string;
@@ -175,6 +177,14 @@ export type AuditEntry = {
   payload: string;
 };
 
+/** Work-item-created audit payload (issue #10); optional fields are omitted from the JSON. */
+export type CreatedWorkItemAuditPayload = {
+  id: string;
+  requester: string;
+  model?: string;
+  reasoning_effort?: ModelThinkingLevel;
+};
+
 export type ListAuditOpts = {
   space?: string;
   since?: number;
@@ -228,13 +238,40 @@ export interface Store {
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem>;
-  /** Atomic open -> claimed: UPDATE ... WHERE id = (oldest open). Null when queue is empty. */
-  claimNextWorkItem(): Promise<WorkItem | null>;
+  /** Atomic open -> claimed for a SPECIFIC item (the worker claims by the job payload). Null when the item is not open. */
+  claimWorkItemById(id: string): Promise<WorkItem | null>;
   /** Throws unless the row exists and is in `from`. */
   transitionWorkItem(id: string, from: WorkItemState, to: WorkItemState, opts?: TransitionOpts): Promise<WorkItem>;
   getWorkItem(id: string): Promise<WorkItem | null>;
   /** Moves items idle in `from` for longer than olderThanMs to blocked; returns count. */
   markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number>;
+  /**
+   * Enqueues a worker job (epic #170). Idempotent by envelope id: a
+   * duplicate enqueue is a no-op (git/extension work items auto-enqueue at
+   * creation with the work item id as the job id).
+   */
+  enqueueJob(input: { id: string; kind: WorkerJobKind; payload: unknown; spaceId?: string | null }): Promise<void>;
+  /**
+   * Atomic claim of the oldest claimable job (epic #170): a queued job past
+   * its backoff gate, or a running job whose lease expired (crash recovery).
+   * The single UPDATE sets status=running, lease_until=now+leaseMs and
+   * bumps attempts. Null when nothing is claimable.
+   */
+  claimNextJob(leaseMs: number): Promise<WorkerJob | null>;
+  /** Returns the job row for observability/tests. */
+  getJob(id: string): Promise<WorkerJob | null>;
+  /** Requeues a running job with a backoff not-before gate; false when the job is not running. */
+  requeueJob(id: string, backoffMs: number): Promise<boolean>;
+  /** Marks a running job completed (the outbox row is the completion signal); false when not running. */
+  completeJob(id: string): Promise<boolean>;
+  /** Marks a queued/running job failed (max attempts or the unclaimed TTL); false when already terminal. */
+  failJob(id: string): Promise<boolean>;
+  /**
+   * Fails queued jobs never claimed within ttlMs and returns them — the
+   * executor audits job.unclaimed + nudges per returned job (epic #170
+   * fail-loud). A requeued job holding a backoff gate is never swept.
+   */
+  markUnclaimedJobs(ttlMs: number): Promise<WorkerJob[]>;
   /**
    * Registers or re-binds an extension credential (issue #51). One org row per
    * provider, one personal row per (provider, owner): re-running connect with
@@ -388,18 +425,26 @@ function assertLegalTransition(
   }
 }
 
+/**
+ * Result JSON accepted for a done transition (issue #128). Optional string
+ * fields; a non-object payload fails the whole parse and the checks below
+ * fail closed. Extra keys are ignored.
+ */
+const DONE_RESULT_SCHEMA = z.object({
+  pr_url: z.string().optional(),
+  url: z.string().optional(),
+  summary: z.string().optional(),
+});
+
 /** Fails closed unless result JSON satisfies the selected delivery contract (issue #128). */
 function assertDoneResult(delivery: WorkItemDelivery, result: string | undefined): void {
-  let parsed: unknown;
+  let record: z.infer<typeof DONE_RESULT_SCHEMA> = {};
   try {
-    parsed = result ? JSON.parse(result) : null;
+    record = DONE_RESULT_SCHEMA.parse(result ? JSON.parse(result) : null);
   } catch {
-    parsed = null;
+    // Malformed JSON or a non-object payload: record stays empty and the
+    // required-field checks below fail closed.
   }
-  const record =
-    typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
   if (delivery === "git" && !isNonEmptyString(record.pr_url)) {
     throw new Error("git work item cannot transition to done without result.pr_url");
   }
@@ -411,12 +456,26 @@ function assertDoneResult(delivery: WorkItemDelivery, result: string | undefined
   }
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+function isNonEmptyString(value: string | undefined): value is string {
+  return value !== undefined && value.trim().length > 0;
 }
 
 const MODEL_SETTING_KEYS = ["model", "reasoning_effort", "fast_model", "reasoning_model"] as const;
-const MODEL_THINKING_LEVELS: readonly string[] = ["off", "low", "medium", "high"];
+const MODEL_THINKING_LEVELS = ["off", "low", "medium", "high"] as const;
+const MODEL_THINKING_LEVEL_SCHEMA = z.enum(MODEL_THINKING_LEVELS);
+
+/**
+ * Lenient per-key contract for the `spaces.settings` JSON column: a known
+ * key holding a non-string value is replaced with "" (dropped by the trim
+ * check below) rather than failing the whole read, so one malformed key
+ * never discards the other settings.
+ */
+const SPACE_SETTINGS_SCHEMA = z.object({
+  model: z.string().catch("").optional(),
+  reasoning_effort: z.string().catch("").optional(),
+  fast_model: z.string().catch("").optional(),
+  reasoning_model: z.string().catch("").optional(),
+});
 
 /**
  * Parses the `spaces.settings` JSON column into a SpaceModelSettings.
@@ -426,27 +485,55 @@ const MODEL_THINKING_LEVELS: readonly string[] = ["off", "low", "medium", "high"
  */
 export function parseSpaceSettings(text: string | null | undefined): SpaceModelSettings {
   if (!text?.trim()) return {};
-  let parsed: unknown;
+  let record: z.infer<typeof SPACE_SETTINGS_SCHEMA>;
   try {
-    parsed = JSON.parse(text);
+    record = SPACE_SETTINGS_SCHEMA.parse(JSON.parse(text));
   } catch {
     return {};
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
   const out: SpaceModelSettings = {};
-  const record = parsed as Record<string, unknown>;
   for (const key of MODEL_SETTING_KEYS) {
     const value = record[key];
-    if (typeof value !== "string" || !value.trim()) continue;
+    if (!value?.trim()) continue;
     const trimmed = value.trim();
     if (key === "reasoning_effort") {
-      if (!MODEL_THINKING_LEVELS.includes(trimmed)) continue;
-      out.reasoning_effort = trimmed as SpaceModelSettings["reasoning_effort"];
+      const level = MODEL_THINKING_LEVEL_SCHEMA.safeParse(trimmed);
+      if (!level.success) continue;
+      out.reasoning_effort = level.data;
     } else {
       out[key] = trimmed;
     }
   }
   return out;
+}
+
+/** Raw `worker_jobs` row shape (epic #170). */
+type WorkerJobRow = {
+  id: string;
+  kind: WorkerJobKind;
+  payload: string;
+  space_id: string | null;
+  status: string;
+  attempts: number;
+  lease_until: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parses a worker_jobs row into the typed envelope (payload JSON decoded). */
+function parseWorkerJob(row: WorkerJobRow): WorkerJob {
+  return {
+    id: row.id,
+    kind: row.kind,
+    payload: JSON.parse(row.payload),
+    spaceId: row.space_id ?? undefined,
+    attempts: row.attempts,
+    leaseUntil: row.lease_until,
+    // SAFETY: the status column is written only by the store's own lifecycle
+    // transitions (queued/running/completed/failed), so the TEXT value is
+    // always one of the declared WorkerJobStatus values.
+    status: row.status as WorkerJobStatus,
+  };
 }
 
 /**
@@ -465,6 +552,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   // Idempotent migration (issue #47): databases created before the repo
   // column existed keep their work_items table (CREATE TABLE IF NOT EXISTS
   // is a no-op), so add the column explicitly when it is missing.
+  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
   const workItemColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
   if (!workItemColumns.includes("repo")) {
     db.exec("ALTER TABLE work_items ADD COLUMN repo TEXT");
@@ -493,6 +581,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   // Idempotent migration (issue #185): per-task model pin columns. Fresh
   // databases get them from schema.sql; existing work_items tables need the
   // explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op for them).
+  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
   const pinColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
   if (!pinColumns.includes("model")) {
     db.exec("ALTER TABLE work_items ADD COLUMN model TEXT");
@@ -505,6 +594,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   // Idempotent migration (issue #64): databases created before the model
   // settings column existed keep their spaces table (CREATE TABLE IF NOT
   // EXISTS is a no-op), so add the column explicitly when it is missing.
+  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
   const spaceColumns = (db.query("PRAGMA table_info(spaces)").all() as { name: string }[]).map((c) => c.name);
   if (!spaceColumns.includes("settings")) {
     db.exec("ALTER TABLE spaces ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'");
@@ -532,14 +622,17 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
        VALUES (?, ?, ?, ?, '{}', '{}', ?, ?)
        ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`,
     ).run(id, input.platform, input.channel_id, input.name ?? null, t, t);
+    // SAFETY: the upsert above guarantees a row with this id exists; SELECT returns its full shape.
     return getSpaceStmt.get(id) as Space;
   }
 
   async function getSpace(id: string): Promise<Space | null> {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (getSpaceStmt.get(id) as Space | null) ?? null;
   }
 
   async function updatePolicy(id: string, policyJson: string): Promise<Space> {
+    // SAFETY: UPDATE ... RETURNING * returns the updated row only when the id exists; a missing id throws below.
     const row = db
       .query("UPDATE spaces SET policy_json = ?, updated_at = ? WHERE id = ? RETURNING *")
       .get(policyJson, Date.now(), id) as Space | null;
@@ -553,6 +646,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space> {
+    // SAFETY: UPDATE ... RETURNING * returns the updated row only when the id exists; a missing id throws below.
     const row = db
       .query("UPDATE spaces SET settings = ?, updated_at = ? WHERE id = ? RETURNING *")
       .get(JSON.stringify(settings), Date.now(), id) as Space | null;
@@ -577,16 +671,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       `INSERT INTO objects (id, space_id, name, mime, size, sha256, uploaded_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(id, input.space_id, input.name, input.mime, input.size, input.sha256, input.uploaded_by, created_at);
+    // SAFETY: the INSERT above guarantees a row with this id exists; SELECT returns its full shape.
     return getObjectStmt.get(id) as SpaceObject;
   }
 
   async function listObjects(space_id: string): Promise<SpaceObject[]> {
+    // SAFETY: SELECT * returns one row per objects match, each with SpaceObject's column shape.
     return db
       .query("SELECT * FROM objects WHERE space_id = ? ORDER BY created_at DESC")
       .all(space_id) as SpaceObject[];
   }
 
   async function getObject(id: string): Promise<SpaceObject | null> {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (getObjectStmt.get(id) as SpaceObject | null) ?? null;
   }
 
@@ -596,7 +693,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     try {
       return readFileSync(join(objectsDir, object.sha256));
     } catch (err) {
-      if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") return null;
+      // SAFETY: readFileSync throws Error instances; Node fs errors carry a `code` property.
+      if (err instanceof Error && "code" in err && err.code === "ENOENT") return null;
       throw err;
     }
   }
@@ -619,6 +717,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
+    const delivery = input.delivery ?? "git";
     db.query(
       `INSERT INTO work_items (id, space_id, requester, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, result, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
@@ -628,7 +727,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       input.requester,
       input.description,
       input.repo ?? null,
-      input.delivery ?? "git",
+      delivery,
       input.model ?? null,
       input.reasoning_effort ?? null,
       input.pr_url ?? null,
@@ -638,38 +737,136 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       t,
       t,
     );
+    // SAFETY: the INSERT above guarantees a row with this id exists; SELECT returns its full shape.
     const item = getWorkItemStmt.get(id) as WorkItem;
+    const createdPayload: CreatedWorkItemAuditPayload = { id, requester: input.requester };
+    if (input.model !== undefined) createdPayload.model = input.model;
+    if (input.reasoning_effort !== undefined) createdPayload.reasoning_effort = input.reasoning_effort;
     appendAudit({
       space_id: input.space_id,
       actor: input.requester,
       event_type: WORK_ITEM_CREATED_EVENT,
-      payload: JSON.stringify({
-        id,
-        requester: input.requester,
-        ...(input.model !== undefined ? { model: input.model } : {}),
-        ...(input.reasoning_effort !== undefined ? { reasoning_effort: input.reasoning_effort } : {}),
-      }),
+      payload: JSON.stringify(createdPayload),
     });
+    // Epic #170: git/extension work items enqueue a worker job with the SAME
+    // id — one id across enqueue → claim → run → outbox → post. Chat items
+    // have no worker (the space agent handles them in-session) and never
+    // enqueue.
+    if (delivery === "git" || delivery === "extension") {
+      enqueueJob({ id, kind: delivery, payload: { workItemId: id }, spaceId: input.space_id });
+    }
     return item;
   }
 
-  async function claimNextWorkItem(): Promise<WorkItem | null> {
-    // Chat has no worker yet (#128): defer it behind executable deliveries so
-    // returning a chat item to open cannot starve git or extension work.
+  async function claimWorkItemById(id: string): Promise<WorkItem | null> {
+    // SAFETY: UPDATE ... RETURNING * returns the claimed row, or undefined when the item is not open.
+    const row = db
+      .query(`UPDATE work_items SET state = 'claimed', updated_at = ? WHERE id = ? AND state = 'open' RETURNING *`)
+      .get(Date.now(), id) as WorkItem | null;
+    return row ?? null;
+  }
+
+  async function enqueueJob(input: { id: string; kind: WorkerJobKind; payload: unknown; spaceId?: string | null }): Promise<void> {
+    const t = Date.now();
+    // ON CONFLICT DO NOTHING keeps enqueue idempotent by envelope id: a
+    // duplicate dispatch of the same job is a no-op, never a second row.
+    db.query(
+      `INSERT INTO worker_jobs (id, kind, payload, space_id, status, attempts, lease_until, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'queued', 0, NULL, ?, ?)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run(
+      input.id,
+      input.kind,
+      input.payload === undefined ? "null" : JSON.stringify(input.payload),
+      input.spaceId ?? null,
+      t,
+      t,
+    );
+  }
+
+  async function claimNextJob(leaseMs: number): Promise<WorkerJob | null> {
+    const now = Date.now();
+    // The single atomic claim UPDATE (epic #170): a queued job past its
+    // backoff gate, or a running job whose lease expired (crash recovery),
+    // oldest first. SAFETY: UPDATE ... RETURNING * returns the claimed row,
+    // or undefined when nothing is claimable.
     const row = db
       .query(
-        `UPDATE work_items
-         SET state = 'claimed', updated_at = ?
+        `UPDATE worker_jobs
+         SET status = 'running', lease_until = ?, attempts = attempts + 1, updated_at = ?
          WHERE id = (
-           SELECT id FROM work_items
-           WHERE state = 'open'
-           ORDER BY (delivery = 'chat') ASC, created_at ASC
+           SELECT id FROM worker_jobs
+           WHERE (status = 'queued' AND (lease_until IS NULL OR lease_until <= ?))
+              OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ?)
+           ORDER BY created_at ASC
            LIMIT 1
          )
          RETURNING *`,
       )
-      .get(Date.now()) as WorkItem | null;
-    return row ?? null;
+      .get(now + leaseMs, now, now, now) as WorkerJobRow | null;
+    return row ? parseWorkerJob(row) : null;
+  }
+
+  async function getJob(id: string): Promise<WorkerJob | null> {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
+    const row = db.query("SELECT * FROM worker_jobs WHERE id = ?").get(id) as WorkerJobRow | null;
+    return row ? parseWorkerJob(row) : null;
+  }
+
+  async function requeueJob(id: string, backoffMs: number): Promise<boolean> {
+    const now = Date.now();
+    // lease_until becomes the backoff not-before gate while queued.
+    // SAFETY: run() reports changed rows; 1 only when the job was running.
+    const res = db
+      .query(
+        `UPDATE worker_jobs SET status = 'queued', lease_until = ?, updated_at = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(now + backoffMs, now, id);
+    return Number(res.changes) === 1;
+  }
+
+  async function completeJob(id: string): Promise<boolean> {
+    // SAFETY: run() reports changed rows; 1 only when the job was running
+    // (a lease-reclaimed job cannot be completed twice).
+    const res = db
+      .query(
+        `UPDATE worker_jobs SET status = 'completed', lease_until = NULL, updated_at = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(Date.now(), id);
+    return Number(res.changes) === 1;
+  }
+
+  async function failJob(id: string): Promise<boolean> {
+    // SAFETY: run() reports changed rows; 1 only when the job was queued or
+    // running (terminal jobs stay terminal).
+    const res = db
+      .query(
+        `UPDATE worker_jobs SET status = 'failed', lease_until = NULL, updated_at = ?
+         WHERE id = ? AND status IN ('queued', 'running')`,
+      )
+      .run(Date.now(), id);
+    return Number(res.changes) === 1;
+  }
+
+  async function markUnclaimedJobs(ttlMs: number): Promise<WorkerJob[]> {
+    const now = Date.now();
+    const cutoff = now - ttlMs;
+    // A requeued job holding a backoff gate (lease_until in the future) is
+    // waiting on a live worker, not orphaned — never swept. SAFETY: UPDATE
+    // ... RETURNING * returns exactly the rows transitioned to failed.
+    const rows = db
+      .query(
+        `UPDATE worker_jobs SET status = 'failed', lease_until = NULL, updated_at = ?
+         WHERE id IN (
+           SELECT id FROM worker_jobs
+           WHERE status = 'queued' AND updated_at <= ? AND (lease_until IS NULL OR lease_until <= ?)
+         )
+         RETURNING *`,
+      )
+      .all(now, cutoff, now) as WorkerJobRow[];
+    return rows.map(parseWorkerJob);
   }
 
   async function transitionWorkItem(
@@ -678,6 +875,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     to: WorkItemState,
     opts?: TransitionOpts,
   ): Promise<WorkItem> {
+    // SAFETY: get() yields undefined when the id is absent; the not-found branch throws before any use.
     const current = getWorkItemStmt.get(id) as WorkItem | null;
     if (!current) throw new Error(`work item not found: ${id}`);
     assertLegalTransition(from, to, current.delivery, opts);
@@ -698,6 +896,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       params.push(opts.result);
     }
     params.push(id, from);
+    // SAFETY: UPDATE ... WHERE id AND state RETURNING * returns the transitioned row, or undefined when the guard fails.
     const row = db
       .query(`UPDATE work_items SET ${sets.join(", ")} WHERE id = ? AND state = ? RETURNING *`)
       .get(...params) as WorkItem | null;
@@ -713,6 +912,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function getWorkItem(id: string): Promise<WorkItem | null> {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (getWorkItemStmt.get(id) as WorkItem | null) ?? null;
   }
 
@@ -737,6 +937,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const t = Date.now();
     // Conflict targets match the partial unique indexes in schema.sql.
     const conflictTarget = input.scope === "org" ? "(provider) WHERE scope = 'org'" : "(provider, owner) WHERE scope = 'personal'";
+    // SAFETY: INSERT ... ON CONFLICT ... RETURNING * always returns the inserted or updated credential row.
     return db
       .query(
         `INSERT INTO extension_credentials (id, provider, identity_key, owner, scope, broker_credential_id, created_at)
@@ -751,6 +952,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function listExtensionCredentials(provider: string): Promise<ExtensionCredential[]> {
+    // SAFETY: SELECT * returns one row per extension_credentials match, each with ExtensionCredential's column shape.
     return db
       .query("SELECT * FROM extension_credentials WHERE provider = ? ORDER BY scope, created_at")
       .all(provider) as ExtensionCredential[];
@@ -772,6 +974,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // Sweep expired rows lazily so the table stays bounded by live links.
     db.query("DELETE FROM upload_tokens WHERE expires_at <= ?").run(Date.now());
     const token = randomBytes(18).toString("base64url"); // 144 bits, unguessable
+    // SAFETY: INSERT ... RETURNING * always returns the freshly inserted upload token row.
     return db
       .query(
         `INSERT INTO upload_tokens (id, token, extension, scope, actor, space_id, label, created_at, expires_at)
@@ -792,6 +995,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function getUploadToken(token: string): UploadToken | null {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (db.query("SELECT * FROM upload_tokens WHERE token = ?").get(token) as UploadToken | null) ?? null;
   }
 
@@ -799,6 +1003,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const now = Date.now();
     // Atomic single-use: only the first caller gets the row back; everyone
     // else (replay) sees nothing.
+    // SAFETY: DELETE ... RETURNING * returns the consumed row, or undefined when the token is absent or expired.
     const row = db
       .query(
         `DELETE FROM upload_tokens WHERE id = (SELECT id FROM upload_tokens WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
@@ -811,6 +1016,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function countActiveUploadTokens(actor: string): number {
+    // SAFETY: COUNT(*) AS n always returns exactly one row with a numeric n.
     const row = db
       .query("SELECT COUNT(*) AS n FROM upload_tokens WHERE actor = ? AND expires_at > ?")
       .get(actor, Date.now()) as { n: number };
@@ -839,6 +1045,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     }
     // Sweep expired rows lazily so the table stays bounded by live flows.
     db.query("DELETE FROM oauth_flows WHERE expires_at <= ?").run(Date.now());
+    // SAFETY: INSERT ... RETURNING * always returns the freshly inserted oauth flow row.
     return db
       .query(
         `INSERT INTO oauth_flows (id, token, provider, scope, actor, space_id, label, server_url, redirect_uri, flow, created_at, expires_at)
@@ -862,6 +1069,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function getOAuthFlow(token: string): OAuthFlow | null {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (db.query("SELECT * FROM oauth_flows WHERE token = ?").get(token) as OAuthFlow | null) ?? null;
   }
 
@@ -869,6 +1077,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const now = Date.now();
     // Atomic single-use: only the first caller gets the row back; everyone
     // else (replay) sees nothing.
+    // SAFETY: DELETE ... RETURNING * returns the consumed row, or undefined when the token is absent or expired.
     const row = db
       .query(
         `DELETE FROM oauth_flows WHERE id = (SELECT id FROM oauth_flows WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
@@ -881,6 +1090,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function countActiveOAuthFlows(actor: string): number {
+    // SAFETY: COUNT(*) AS n always returns exactly one row with a numeric n.
     const row = db
       .query("SELECT COUNT(*) AS n FROM oauth_flows WHERE actor = ? AND expires_at > ?")
       .get(actor, Date.now()) as { n: number };
@@ -898,12 +1108,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       throw new Error(`unknown scheduler action: ${input.action}`);
     }
     const params = input.params ?? {};
-    if (Object.values(params).some((value) => typeof value !== "string")) {
-      throw new Error("scheduler job params must contain only string values");
-    }
     const id = `sj_${randomUUID()}`;
     const createdAt = Date.now();
     const nextFireAt = nextCronFire(input.cron, createdAt);
+    // SAFETY: INSERT ... RETURNING * always returns the freshly inserted scheduler_jobs row.
     const row = db
       .query(
         `INSERT INTO scheduler_jobs
@@ -925,11 +1133,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function getSchedulerJob(id: string): Promise<SchedulerJob | null> {
+    // SAFETY: get() yields undefined when no row matches; the caller maps undefined to null.
     const row = getSchedulerJobStmt.get(id) as SchedulerJobRow | null;
     return row ? schedulerJobFromRow(row) : null;
   }
 
   async function listSchedulerJobs(): Promise<SchedulerJob[]> {
+    // SAFETY: SELECT * returns one row per scheduler_jobs match, each with SchedulerJobRow's column shape.
     const rows = db
       .query("SELECT * FROM scheduler_jobs ORDER BY created_at, id")
       .all() as SchedulerJobRow[];
@@ -948,6 +1158,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
 
   async function markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void> {
     if (!Number.isSafeInteger(at)) throw new Error("scheduler fire time must be a safe integer");
+    // SAFETY: get() yields undefined when the id is absent; the not-found branch throws before any use.
     const row = getSchedulerJobStmt.get(id) as SchedulerJobRow | null;
     if (!row) throw new Error(`scheduler job not found: ${id}`);
     const nextFireAt = nextCronFire(row.cron, at);
@@ -968,6 +1179,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
     const t = Date.now();
     const cutoff = t - olderThanMs;
+    // SAFETY: SELECT id, space_id returns rows with exactly those two string columns.
     const stale = db
       .query("SELECT id, space_id FROM work_items WHERE state = ? AND updated_at < ?")
       .all(from, cutoff) as { id: string; space_id: string }[];
@@ -990,6 +1202,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function getOrgSettings(): OrgSettings | null {
+    // SAFETY: get() yields undefined when absent (handled below) or the single org_settings row, whose settings column is a string.
     const row = db.query("SELECT settings FROM org_settings WHERE id = 1").get() as
       | { settings: string }
       | null;
@@ -1038,6 +1251,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       sql += " LIMIT ?";
       params.push(opts.limit);
     }
+    // SAFETY: SELECT * returns one row per audit match, each with AuditRow's column shape.
     return db.query(sql).all(...params) as AuditRow[];
   }
 
@@ -1052,10 +1266,17 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getObject,
     readObjectBytes,
     createWorkItem,
-    claimNextWorkItem,
+    claimWorkItemById,
     transitionWorkItem,
     getWorkItem,
     markStaleWorkItems,
+    enqueueJob,
+    claimNextJob,
+    getJob,
+    requeueJob,
+    completeJob,
+    failJob,
+    markUnclaimedJobs,
     upsertExtensionCredential,
     listExtensionCredentials,
     createUploadToken,

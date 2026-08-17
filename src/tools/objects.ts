@@ -25,24 +25,24 @@ export const objectCreateArgsSchema = z.object({
   content: z.string(),
 });
 
-const TEXT_MIME: Record<string, true> = {
-  "text/plain": true,
-  "text/csv": true,
-  "application/json": true,
-  "text/markdown": true,
-};
+const TEXT_MIME = new Set([
+  "text/plain",
+  "text/csv",
+  "application/json",
+  "text/markdown",
+]);
 
-const MIME_BY_EXTENSION: Record<string, string> = {
-  ".csv": "text/csv",
-  ".json": "application/json",
-  ".md": "text/markdown",
-  ".txt": "text/plain",
-};
+const MIME_BY_EXTENSION = new Map<string, string>([
+  [".csv", "text/csv"],
+  [".json", "application/json"],
+  [".md", "text/markdown"],
+  [".txt", "text/plain"],
+]);
 
 function mimeFromName(name: string): string {
   const dot = name.lastIndexOf(".");
   const extension = dot < 0 ? "" : name.slice(dot).toLowerCase();
-  return MIME_BY_EXTENSION[extension] ?? "application/octet-stream";
+  return MIME_BY_EXTENSION.get(extension) ?? "application/octet-stream";
 }
 
 export function objectToolDefinitions(store: Store, opts: ObjectToolsOpts): ToolDefinition[] {
@@ -84,7 +84,7 @@ export function objectToolDefinitions(store: Store, opts: ObjectToolsOpts): Tool
       try {
         const object = await store.getObject(params.id);
         if (!object) return toolError(`object not found: ${params.id}`);
-        if (TEXT_MIME[object.mime] !== true) {
+        if (!TEXT_MIME.has(object.mime)) {
           return toolError(
             `object ${object.id}: cannot extract text from ${object.mime} (unsupported format)`,
           );

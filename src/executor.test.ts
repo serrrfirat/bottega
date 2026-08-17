@@ -8,7 +8,7 @@
  * authenticated user resolved from the Bearer token, which is how the
  * "token from the FILE, never env" contract is asserted.
  */
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
@@ -23,9 +23,15 @@ import {
   DELIVERY_REQUESTED_EVENT,
   DELIVERY_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
+  JOB_CLAIMED_EVENT,
+  JOB_COMPLETED_EVENT,
+  JOB_FAILED_EVENT,
+  JOB_UNCLAIMED_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "./store/audit-events";
+import { consumeOutboxWatermarked } from "./store/outbox";
+import type { WorkerJob } from "./worker/envelope";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
@@ -54,9 +60,25 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } f
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
+import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, DriverEvent, DriverEventData, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
+import { z } from "zod";
 
 // --- Fakes ------------------------------------------------------------------
+
+/** Evidence notes the store appends to a work item (transitionWorkItem / markStaleWorkItems). */
+const urlEvidenceSchema = z.object({ kind: z.string(), url: z.string() });
+const textEvidenceSchema = z.object({ kind: z.string(), text: z.string() });
+/** Done-transition results written by the executor (git/chat deliveries). */
+const prResultSchema = z.object({ pr_url: z.string(), summary: z.string() });
+const prUrlSchema = z.object({ pr_url: z.string() });
+/** Audit payload shapes written by the executor/server. */
+const markerPayloadSchema = z.object({ id: z.string().optional() }).catch({ id: undefined });
+/** The GitHub emulator's PR record (head/base/user), asserted per test. */
+const emulatorPrSchema = z.object({
+  head: z.object({ ref: z.string() }),
+  base: z.object({ ref: z.string() }),
+  user: z.object({ login: z.string() }),
+});
 
 /** Session driver double: records createSession opts, streams one canned message per prompt. */
 class FakeSession implements AgentSessionDriver {
@@ -86,26 +108,26 @@ class FakeSession implements AgentSessionDriver {
   async prompt(text: string, _opts?: AgentTurnOptions): Promise<void> {
     this.prompts.push(text);
     if (this.failure) throw this.failure;
-    this.emit("turn_start", {});
+    this.emit("turn_start", { spaceId: this.opts.spaceId });
     await this.onPrompt?.();
     this.emit("message", { spaceId: this.opts.spaceId, text: this.messageText });
-    if (this.emittedError) this.emit("error", { message: this.emittedError });
-    this.emit("turn_end", {});
+    if (this.emittedError) this.emit("error", { spaceId: this.opts.spaceId, message: this.emittedError });
+    this.emit("turn_end", { spaceId: this.opts.spaceId });
   }
   async abort(): Promise<void> {}
   isStreaming(): boolean {
     return false;
   }
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: unknown) => void): () => void {
+  on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void {
     const set = (this.listeners[event] ??= new Set());
     set.add(cb);
     return () => set.delete(cb);
   }
   async dispose(): Promise<void> {}
-  emit(event: "message" | "turn_start" | "turn_end" | "error", data: unknown): void {
+  emit(event: DriverEvent, data: DriverEventData): void {
     for (const cb of this.listeners[event] ?? []) cb(data);
   }
-  private readonly listeners: Record<string, Set<(data: unknown) => void>> = {};
+  private readonly listeners: Record<string, Set<(data: DriverEventData) => void>> = {};
 }
 
 class FakeDriver implements AgentDriver {
@@ -322,12 +344,16 @@ function makeExtensionDeps(
   });
 }
 
-async function executeExtensionTool(tool: ToolDefinition, params: Record<string, unknown>, spaceId: string): Promise<void> {
+async function executeExtensionTool(tool: ToolDefinition, params: { city: string }, spaceId: string): Promise<void> {
   const result = await tool.execute(
     "test-call",
+    // SAFETY: the fixture tool's zod schema accepts exactly { city: string }; the
+    // generic ToolDefinition params type is wider than the concrete fixture schema.
     params as never,
     new AbortController().signal,
     () => {},
+    // SAFETY: the fixture tool reads only ctx.sessionManager.getSessionFile(); the
+    // rest of ExtensionContext is never touched by the extension's execute.
     {
       sessionManager: {
         getSessionFile: () => join("/tmp", `${spaceId}.jsonl`),
@@ -340,24 +366,6 @@ async function executeExtensionTool(tool: ToolDefinition, params: Record<string,
       .map((block) => block.text)
       .join("\n");
     throw new Error(message || "extension tool failed");
-  }
-}
-
-async function waitForTransition(
-  store: Store,
-  from: WorkItemState,
-  to: WorkItemState,
-  timeoutMs = 10_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const rows = await store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
-    if (rows.some((row) => {
-      const payload = JSON.parse(row.payload) as { from?: string; to?: string };
-      return payload.from === from && payload.to === to;
-    })) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for transition ${from} -> ${to}`);
-    await Bun.sleep(10);
   }
 }
 
@@ -385,6 +393,38 @@ async function waitForState(store: Store, id: string, state: WorkItemState, time
   }
 }
 
+/** Waits for a worker job to reach a bus status (epic #170). */
+async function waitForJobStatus(store: Store, id: string, status: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if ((await jobStatus(store, id)) === status) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for job ${id} to reach ${status} (last: ${await jobStatus(store, id)})`);
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 10);
+    await promise;
+  }
+}
+
+/** The worker_jobs.status column for a job (the envelope itself carries no bus status). */
+function jobStatus(store: Store, id: string): Promise<string | null> {
+  // SAFETY: SELECT status returns a row with exactly one string column.
+  const row = store.getDb().query("SELECT status AS s FROM worker_jobs WHERE id = ?").get(id) as { s: string } | null;
+  return Promise.resolve(row?.s ?? null);
+}
+
+/** Waits for an audit row whose payload names the job/item id (epic #170). */
+async function waitForJobAudit(store: Store, eventType: string, id: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await store.listAudit({ event_type: eventType });
+    if (rows.some((row) => markerPayloadSchema.parse(JSON.parse(row.payload)).id === id)) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${eventType} of ${id}`);
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 10);
+    await promise;
+  }
+}
+
 describe("claim loop", () => {
   test("delivers an item end to end: open → claimed → working → review → done with pr_url", async () => {
     const fx = makeFixture();
@@ -401,11 +441,11 @@ describe("claim loop", () => {
       const done = await runUntil(fx, item.id, "done", makeDeps(fx));
 
       // Result: pr_url + summary, approvals recorded, evidence written.
-      const result = JSON.parse(done.result!) as { pr_url: string; summary: string };
+      const result = prResultSchema.parse(JSON.parse(done.result!));
       expect(result.pr_url).toContain(`/acme/sandbox/pull/1`);
       expect(result.summary).toBe("implemented the requested change");
       expect(JSON.parse(done.approvals)).toEqual([{ approver: "U_HUMAN", at: expect.any(Number) }]);
-      const evidence = JSON.parse(done.evidence) as Array<{ kind: string; url: string }>;
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(done.evidence));
       expect(evidence).toHaveLength(1);
       expect(evidence[0].url).toContain(result.pr_url);
 
@@ -430,7 +470,9 @@ describe("claim loop", () => {
       // the user the PAT from the FILE resolves to (proves Bearer auth).
       const pr = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls/1`, {
         headers: { Authorization: `Bearer ${fx.pat}` },
-      }).then((r) => r.json() as Promise<{ head: { ref: string }; base: { ref: string }; user: { login: string } }>);
+      })
+        .then((r) => r.json())
+        .then((body) => emulatorPrSchema.parse(body));
       expect(pr.head.ref).toBe(`bottega/${item.id}`);
       expect(pr.base.ref).toBe("main");
       expect(pr.user.login).toBe("bottega-bot");
@@ -468,7 +510,7 @@ describe("claim loop", () => {
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
-      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
       expect(evidence).toHaveLength(1);
       expect(evidence[0].kind).toBe("note");
       expect(evidence[0].url).toContain("exit code 42");
@@ -477,7 +519,7 @@ describe("claim loop", () => {
       expect(existsSync(join(fx.workspacesDir, item.id))).toBe(true);
       const pulls = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls`, {
         headers: { Authorization: `Bearer ${fx.pat}` },
-      }).then((r) => r.json() as Promise<unknown[]>);
+      }).then((r) => r.json()).then((body) => z.array(z.unknown()).parse(body));
       expect(pulls).toHaveLength(0);
     } finally {
       fx.cleanup();
@@ -503,7 +545,9 @@ describe("claim loop", () => {
       // The PR itself was still opened before the approval request.
       const pulls = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls`, {
         headers: { Authorization: `Bearer ${fx.pat}` },
-      }).then((r) => r.json() as Promise<Array<{ number: number }>>);
+      })
+        .then((r) => r.json())
+        .then((body) => z.array(z.object({ number: z.number() })).parse(body));
       expect(pulls).toHaveLength(1);
     } finally {
       fx.cleanup();
@@ -515,7 +559,7 @@ describe("claim loop", () => {
     try {
       const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
       const item = await fx.store.createWorkItem({ space_id: space.id, requester: "U1", description: "stale run" });
-      await fx.store.claimNextWorkItem();
+      await fx.store.claimWorkItemById(item.id);
       await fx.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
       // Age the row 31 minutes so boot recovery sees it as stale (the store
       // is a plain SQLite file; WAL allows a second connection).
@@ -528,7 +572,7 @@ describe("claim loop", () => {
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
-      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; text: string }>;
+      const evidence = z.array(textEvidenceSchema).parse(JSON.parse(blocked.evidence));
       expect(evidence[0].text).toBe("interrupted by restart");
       expect(fx.driver.sessions).toHaveLength(0);
     } finally {
@@ -550,7 +594,7 @@ describe("claim loop", () => {
       const done = await runUntil(fx, item.id, "done", makeDeps(fx));
 
       // The PR went to the item's repo, not the first allowlisted one.
-      const result = JSON.parse(done.result!) as { pr_url: string };
+      const result = prUrlSchema.parse(JSON.parse(done.result!));
       expect(result.pr_url).toContain(`/acme/tooling/pull/1`);
       // The branch landed on the tooling remote and nowhere near sandbox.
       const toolingRefs = runGit(["--git-dir", fx.toolingBareRepo, "for-each-ref", "--format=%(refname:short)"]);
@@ -574,7 +618,7 @@ describe("claim loop", () => {
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
-      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
       expect(evidence).toHaveLength(1);
       expect(evidence[0].url).toBe("repo not specified — ask the requester");
       // The gate fires before any git work: no session, no workspace, no delivery.
@@ -599,7 +643,7 @@ describe("claim loop", () => {
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
-      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
       expect(evidence[0].url).toContain('"evil/corp"');
       expect(evidence[0].url).toContain("allowlist");
       expect(fx.driver.sessions).toHaveLength(0);
@@ -607,7 +651,7 @@ describe("claim loop", () => {
       // No PR was opened anywhere.
       const pulls = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls`, {
         headers: { Authorization: `Bearer ${fx.pat}` },
-      }).then((r) => r.json() as Promise<unknown[]>);
+      }).then((r) => r.json()).then((body) => z.array(z.unknown()).parse(body));
       expect(pulls).toHaveLength(0);
     } finally {
       fx.cleanup();
@@ -638,7 +682,7 @@ describe("claim loop", () => {
 
       const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
 
-      const evidence = JSON.parse(blocked.evidence) as Array<{ kind: string; url: string }>;
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
       expect(evidence[0].url).toContain("allowlist");
       expect(fx.driver.sessions).toHaveLength(0);
     } finally {
@@ -791,12 +835,8 @@ describe("delivery routing (issue #129)", () => {
     }
   });
 
-  test("chat delivery returns claimed items to open and logs the handoff", async () => {
+  test("chat items are never claimed by the worker — they stay open for the space agent (epic #170)", async () => {
     const fx = makeFixture();
-    const lines: string[] = [];
-    const log = spyOn(console, "log").mockImplementation((message?: unknown, ...args: unknown[]) => {
-      lines.push([message, ...args].map(String).join(" "));
-    });
     try {
       const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
       const item = await fx.store.createWorkItem({
@@ -805,24 +845,22 @@ describe("delivery routing (issue #129)", () => {
         description: "reply in the current conversation",
         delivery: "chat",
       });
+      // Chat has no worker job: no envelope row is ever enqueued.
+      expect(await fx.store.getJob(item.id)).toBeNull();
+
       const ac = new AbortController();
       const run = runExecutor(makeDeps(fx), ac.signal);
-      try {
-        await waitForTransition(fx.store, "claimed", "open");
-      } finally {
-        ac.abort();
-        await run;
-      }
+      // Give the claim loop enough polls to act on anything claimable.
+      await Bun.sleep(300);
+      ac.abort();
+      await run;
 
       expect((await fx.store.getWorkItem(item.id))?.state).toBe("open");
       expect(fx.driver.sessions).toHaveLength(0);
-      expect(lines.some((line) => line.includes("chat delivery is handled by the space agent"))).toBe(true);
+      // The worker never touched the item: no transition audits at all.
       const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
-      expect(transitions.map((row) => JSON.parse(row.payload))).not.toEqual(
-        expect.arrayContaining([{ from: "working", to: "blocked", by: "executor" }]),
-      );
+      expect(transitions).toHaveLength(0);
     } finally {
-      log.mockRestore();
       fx.cleanup();
     }
   });
@@ -1129,7 +1167,7 @@ describe("credential hygiene", () => {
       expect(statSync(fx.askpassScript).mode & 0o777).toBe(0o700);
 
       // Executor env dump: the token value appears nowhere.
-      const leaked = Object.entries(process.env).filter(([, v]) => typeof v === "string" && v.includes(fx.pat));
+      const leaked = Object.entries(process.env).filter(([, v]) => v !== undefined && v.includes(fx.pat));
       expect(leaked).toEqual([]);
     } finally {
       fx.cleanup();
@@ -1157,11 +1195,7 @@ describe("credential hygiene", () => {
 
 describe("delivery approval round trip (issue #149)", () => {
   /** Server-side fakes: the poller's message surface + the resolver's rewrite surface. */
-  function serverFakes(): {
-    adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
-    posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }>;
-    updated: Array<{ spaceId: string; ts: string; text: string }>;
-  } {
+  function serverFakes() {
     const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
     const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
     return {
@@ -1169,13 +1203,17 @@ describe("delivery approval round trip (issue #149)", () => {
       updated,
       adapter: {
         async postMessage(spaceId, text, opts) {
-          posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : {}) });
+          posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : undefined) });
           return "1.000001";
         },
         async updateMessage(spaceId, ts, text) {
           updated.push({ spaceId, ts, text });
         },
       },
+    } satisfies {
+      adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
+      posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }>;
+      updated: Array<{ spaceId: string; ts: string; text: string }>;
     };
   }
 
@@ -1188,7 +1226,7 @@ describe("delivery approval round trip (issue #149)", () => {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const rows = await store.listAudit({ event_type: eventType });
-      if (rows.some((row) => (JSON.parse(row.payload) as { id?: string }).id === itemId)) return;
+      if (rows.some((row) => markerPayloadSchema.parse(JSON.parse(row.payload)).id === itemId)) return;
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${eventType} of ${itemId}`);
       await Bun.sleep(10);
     }
@@ -1228,7 +1266,7 @@ describe("delivery approval round trip (issue #149)", () => {
         expect(handled).toBe(true);
 
         const done = await waitForState(fx.store, item.id, "done");
-        const result = JSON.parse(done.result!) as { pr_url: string; summary: string };
+        const result = prResultSchema.parse(JSON.parse(done.result!));
         expect(result.pr_url).toContain(`/acme/sandbox/pull/1`);
         expect(JSON.parse(done.approvals)).toEqual([{ approver: "U_HUMAN", at: expect.any(Number) }]);
 
@@ -1329,6 +1367,296 @@ describe("delivery approval round trip (issue #149)", () => {
 
       expect(approval).toBeNull(); // deny → the executor blocks the item
       expect(Date.now() - start).toBeGreaterThanOrEqual(60);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+describe("worker job envelope (epic #170)", () => {
+  test("a git item rides the envelope end to end: enqueue → claim → run → outbox → post with one id", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a health check endpoint",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+      // createWorkItem enqueued the job with the SAME id as the work item.
+      expect(await fx.store.getJob(item.id)).toMatchObject({ id: item.id, kind: "git", attempts: 0 });
+      expect(await jobStatus(fx.store, item.id)).toBe("queued");
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      // Claim + completion are both on the audit trail, keyed by the envelope id.
+      const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
+      expect(claimed.map((row) => JSON.parse(row.payload))).toContainEqual(
+        expect.objectContaining({ id: item.id, kind: "git", attempts: 1 }),
+      );
+      const completed = await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT });
+      expect(completed.map((row) => JSON.parse(row.payload))).toContainEqual(
+        expect.objectContaining({ id: item.id, kind: "git", state: "done" }),
+      );
+
+      // The outbox row is the worker→server signal: consumable, watermarked,
+      // keyed by the same id, carrying the delivery result.
+      const { rows, watermark } = consumeOutboxWatermarked(fx.store);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ id: item.id, kind: "git", space: space.id });
+      const payload = JSON.parse(rows[0].payload) as { state: string; result: { pr_url: string; summary: string } };
+      expect(payload.state).toBe("done");
+      expect(payload.result.pr_url).toContain("/acme/sandbox/pull/1");
+      expect(payload.result.summary).toBe("implemented the requested change");
+      // Consumed rows are never re-read: the watermark advanced past the row.
+      expect(consumeOutboxWatermarked(fx.store, { watermark })).toEqual({ rows: [], watermark });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an extension item completes through the envelope with its outbox result", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText =
+        'Task complete.\n{"url":"https://linear.example/issue/OPS-44","summary":"Created the envelope ticket"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create a ticket through the envelope",
+        delivery: "extension",
+      });
+
+      await runUntil(fx, item.id, "done", makeExtensionDeps(fx));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      const { rows } = consumeOutboxWatermarked(fx.store);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ id: item.id, kind: "extension" });
+      const payload = JSON.parse(rows[0].payload) as { state: string; result: { url: string; summary: string } };
+      expect(payload).toEqual({
+        state: "done",
+        result: { url: "https://linear.example/issue/OPS-44", summary: "Created the envelope ticket" },
+      });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a blocked work item completes the job with the blocked outcome (no outbox delivery result)", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.failure = new Error("agent crashed: exit code 42");
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do the thing",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "blocked", makeDeps(fx));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      const completed = await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT });
+      expect(JSON.parse(completed[0].payload)).toMatchObject({ id: item.id, kind: "git", state: "blocked" });
+      const { rows } = consumeOutboxWatermarked(fx.store);
+      const payload = JSON.parse(rows[0].payload) as { state: string };
+      expect(payload.state).toBe("blocked");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("kb and scheduled kinds route to fail-closed stubs — never a silent no-op (epic #170)", async () => {
+    const fx = makeFixture();
+    try {
+      await fx.store.enqueueJob({ id: "kb_job_1", kind: "kb", payload: { url: "https://example.com/page" } });
+      await fx.store.enqueueJob({ id: "sched_job_1", kind: "scheduled", payload: { action: "standup_digest" } });
+
+      const ac = new AbortController();
+      const run = runExecutor(
+        makeDeps(fx, { maxJobAttempts: 1, jobBackoffMs: 1, jobBackoffMaxMs: 2, pollIntervalMs: 10 }),
+        ac.signal,
+      );
+      try {
+        await waitForJobStatus(fx.store, "kb_job_1", "failed");
+        await waitForJobStatus(fx.store, "sched_job_1", "failed");
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+      const payloads = failed.map((row) => JSON.parse(row.payload));
+      expect(payloads).toContainEqual(
+        expect.objectContaining({ id: "kb_job_1", kind: "kb", attempts: 1, error: expect.stringContaining("kb job kind is not implemented") }),
+      );
+      expect(payloads).toContainEqual(
+        expect.objectContaining({ id: "sched_job_1", kind: "scheduled", attempts: 1 }),
+      );
+      // Fail-closed: nothing ran, no completion signal, no work items.
+      expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+      expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
+      expect(fx.driver.sessions).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a failing job requeues with bounded backoff and fails closed at max attempts", async () => {
+    const fx = makeFixture();
+    try {
+      await fx.store.enqueueJob({ id: "kb_retry", kind: "kb", payload: { url: "https://example.com/retry" } });
+
+      const ac = new AbortController();
+      const run = runExecutor(
+        makeDeps(fx, { maxJobAttempts: 3, jobBackoffMs: 5, jobBackoffMaxMs: 20, pollIntervalMs: 5 }),
+        ac.signal,
+      );
+      try {
+        await waitForJobStatus(fx.store, "kb_retry", "failed");
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      // Three claims (attempts 1..3), the first two requeued, the last terminal.
+      const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
+      const claimPayloads = claimed.map((row) => JSON.parse(row.payload));
+      expect(claimPayloads).toHaveLength(3);
+      expect(claimPayloads.map((p) => p.attempts)).toEqual([1, 2, 3]);
+
+      const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+      const failPayloads = failed.map((row) => JSON.parse(row.payload));
+      expect(failPayloads.filter((p) => p.requeued === true)).toHaveLength(2);
+      expect(failPayloads[2]).toMatchObject({ id: "kb_retry", kind: "kb", attempts: 3 });
+      expect(failPayloads[2].requeued).toBeUndefined();
+      // Backoff grew between attempts.
+      expect(failPayloads[0].backoff_ms).toBe(5);
+      expect(failPayloads[1].backoff_ms).toBe(10);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a job whose work item is mid-flight under another owner requeues and never double-executes", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "owned elsewhere",
+        repo: "acme/sandbox",
+      });
+      // A concurrent owner holds the item mid-flight (e.g. a lease-reclaim race
+      // after a crash): claimed → working by someone other than this worker.
+      await fx.store.claimWorkItemById(item.id);
+      await fx.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor:1" });
+
+      const ac = new AbortController();
+      const run = runExecutor(
+        makeDeps(fx, { maxJobAttempts: 2, jobBackoffMs: 5, jobBackoffMaxMs: 10, pollIntervalMs: 5 }),
+        ac.signal,
+      );
+      try {
+        await waitForJobStatus(fx.store, item.id, "failed");
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      // The item was never double-executed: still working under its owner, no
+      // session, no completion signal.
+      expect((await fx.store.getWorkItem(item.id))?.state).toBe("working");
+      expect(fx.driver.sessions).toHaveLength(0);
+      expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+      expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
+      const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+      expect(JSON.parse(failed[0].payload)).toMatchObject({ id: item.id, kind: "git", error: expect.stringContaining("another worker owns it") });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a dispatched job with no live worker surfaces as job.unclaimed at boot + nudge", async () => {
+    const fx = makeFixture();
+    const nudged: WorkerJob[] = [];
+    try {
+      await fx.store.enqueueJob({ id: "kb_orphan", kind: "kb", payload: { url: "https://example.com/orphan" } });
+      // Age the row past the TTL: the executor was down while the job sat
+      // queued with no live worker (the exact fail-loud scenario).
+      const db = new Database(join(fx.dir, "store.db"));
+      try {
+        db.run("UPDATE worker_jobs SET updated_at = ? WHERE id = ?", [Date.now() - 1000, "kb_orphan"]);
+      } finally {
+        db.close();
+      }
+
+      const ac = new AbortController();
+      const run = runExecutor(
+        makeDeps(fx, {
+          jobUnclaimedTtlMs: 50,
+          jobSweepIntervalMs: 20,
+          pollIntervalMs: 10,
+          onUnclaimed: (job) => {
+            nudged.push(job);
+          },
+        }),
+        ac.signal,
+      );
+      try {
+        await waitForJobAudit(fx.store, JOB_UNCLAIMED_EVENT, "kb_orphan");
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      const unclaimed = await fx.store.listAudit({ event_type: JOB_UNCLAIMED_EVENT });
+      expect(JSON.parse(unclaimed[0].payload)).toMatchObject({ id: "kb_orphan", kind: "kb" });
+      expect(nudged.map((job) => job.id)).toEqual(["kb_orphan"]);
+      expect(await jobStatus(fx.store, "kb_orphan")).toBe("failed");
+      // The nudge fires exactly once: the job is terminal, the sweep cannot re-audit it.
+      expect(unclaimed).toHaveLength(1);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a lease-expired job is reclaimed and completed by a fresh worker (crash recovery, epic #170)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "survive the crash",
+        repo: "acme/sandbox",
+      });
+      // Simulate a worker that claimed the job and died before running it:
+      // the lease is expired, the work item is untouched (open).
+      const db = new Database(join(fx.dir, "store.db"));
+      try {
+        db.run("UPDATE worker_jobs SET status = 'running', lease_until = ?, attempts = 1 WHERE id = ?", [
+          Date.now() - 1000,
+          item.id,
+        ]);
+      } finally {
+        db.close();
+      }
+
+      await runUntil(fx, item.id, "done", makeDeps(fx, { jobLeaseMs: 10_000 }));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      // The reclaim bumped attempts to 2 — the full lifecycle is on the trail.
+      const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
+      expect(JSON.parse(claimed[0].payload)).toMatchObject({ id: item.id, attempts: 2 });
+      expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(1);
     } finally {
       fx.cleanup();
     }

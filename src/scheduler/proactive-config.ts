@@ -1,3 +1,15 @@
+import { z } from "zod";
+
+/** The `proactive` block inside `spaces.policy_json`, decoded at the boundary. */
+const ProactivePolicySchema = z.object({
+  proactive: z
+    .object({
+      standup: z.boolean().optional(),
+      reflection: z.boolean().optional(),
+    })
+    .optional(),
+});
+
 /**
  * Reads the per-space proactive opt-in used by standups (#92) and reflections
  * (#93). Humans enable it in `spaces.policy_json` (a JSON column — every
@@ -10,11 +22,8 @@
  */
 export function proactiveEnabled(policyJson: string, feature: "standup" | "reflection"): boolean {
   try {
-    const policy: unknown = JSON.parse(policyJson);
-    if (typeof policy !== "object" || policy === null || Array.isArray(policy)) return false;
-    const proactive = (policy as Record<string, unknown>).proactive;
-    if (typeof proactive !== "object" || proactive === null || Array.isArray(proactive)) return false;
-    return (proactive as Record<string, unknown>)[feature] === true;
+    const policy = ProactivePolicySchema.parse(JSON.parse(policyJson));
+    return policy.proactive?.[feature] === true;
   } catch {
     return false;
   }

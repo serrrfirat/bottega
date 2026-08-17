@@ -6,7 +6,12 @@ import type { AuditModule } from "../../policy/audit";
 import { MEMORY_AUTO_SAVED_EVENT } from "../../store/audit-events";
 
 export interface LearningLogger {
-  error(message: string, error?: unknown): void;
+  error(message: string, error?: Error): void;
+}
+
+/** Normalize an arbitrary thrown value to the Error the logger contract accepts. */
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 export interface LearningServiceDeps {
@@ -74,12 +79,15 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
         },
       });
       offMessage = sideSession.on("message", (data) => {
-        const text = (data as { text?: unknown } | null)?.text;
-        if (typeof text === "string" && text.trim()) reply = text;
+        // SAFETY: the driver's "message" event always carries { spaceId, text }
+        // with text: string (agent-driver.ts #deliver); the optional-read only
+        // tolerates non-object payloads from scripted hosts.
+        const text = (data as { text?: string } | null)?.text;
+        if (text && text.trim()) reply = text;
       });
       await sideSession.prompt(buildExtractionPrompt(turns, scope));
     } catch (error) {
-      logger.error(`[learning] extraction failed for ${spaceId}`, error);
+      logger.error(`[learning] extraction failed for ${spaceId}`, toError(error));
       return;
     } finally {
       offMessage?.();
@@ -87,7 +95,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
         try {
           await sideSession.dispose();
         } catch (error) {
-          logger.error(`[learning] side-session dispose failed for ${spaceId}`, error);
+          logger.error(`[learning] side-session dispose failed for ${spaceId}`, toError(error));
         }
       }
     }
@@ -98,7 +106,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
       try {
         await deps.memory.save({
           scope,
-          ...(principal ? { principal } : {}),
+          ...(principal ? { principal } : undefined),
           content: fact,
           metadata: { source: "auto_extract" },
         });
@@ -106,7 +114,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
       } catch (error) {
         // Providers reject any secret shape the deterministic filter misses.
         // Learning is best effort and must never fail the human's turn.
-        logger.error(`[learning] memory save rejected for ${spaceId}`, error);
+        logger.error(`[learning] memory save rejected for ${spaceId}`, toError(error));
       }
     }
 
@@ -119,7 +127,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
         payload: { scope, count: saved },
       });
     } catch (error) {
-      logger.error(`[learning] audit write failed for ${spaceId}`, error);
+      logger.error(`[learning] audit write failed for ${spaceId}`, toError(error));
     }
   };
 
@@ -146,8 +154,11 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
       observed.set(spaceId, state);
       state.off.push(
         session.on("message", (data) => {
-          const text = (data as { text?: unknown } | null)?.text;
-          if (typeof text === "string" && text.trim()) state.reply = text;
+          // SAFETY: the driver's "message" event always carries { spaceId, text }
+          // with text: string (agent-driver.ts #deliver); the optional-read only
+          // tolerates non-object payloads from scripted hosts.
+          const text = (data as { text?: string } | null)?.text;
+          if (text && text.trim()) state.reply = text;
         }),
         session.on("turn_end", (data) => {
           if (state.inputs.length > 0 && state.reply.trim()) {
@@ -155,7 +166,10 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
             state.inputs = [];
             state.reply = "";
           } else {
-            const error = (data as { error?: unknown } | null)?.error;
+            // SAFETY: the driver's "turn_end" event carries { spaceId, error? }
+            // where error is a string when the turn failed (#78); any other
+            // payload shape means no failure and the branch is skipped.
+            const error = (data as { error?: string } | null)?.error;
             if (error !== undefined) {
               state.inputs = [];
               state.reply = "";

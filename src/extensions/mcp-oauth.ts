@@ -189,12 +189,15 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
     credential.refresh !== REMOTE_REFRESH_SENTINEL
       ? credential.refresh
       : undefined;
-  return {
+  const tokens: OAuthTokens = {
     access_token: credential.access,
     token_type: "Bearer",
-    ...(credential.expires > 0 ? { expires_in: Math.max(1, Math.floor((credential.expires - Date.now()) / 1000)) } : {}),
-    ...(refreshToken !== undefined ? { refresh_token: refreshToken } : {}),
   };
+  if (credential.expires > 0) {
+    tokens.expires_in = Math.max(1, Math.floor((credential.expires - Date.now()) / 1000));
+  }
+  if (refreshToken !== undefined) tokens.refresh_token = refreshToken;
+  return tokens;
 }
 
 /**
@@ -349,13 +352,14 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
 
 /** The OAuth client metadata bottega registers for every hosted MCP flow. */
 function clientMetadataFor(redirectUri: string, scopes: readonly string[] | undefined): OAuthClientMetadata {
-  return {
+  const metadata: OAuthClientMetadata = {
     client_name: "bottega",
     redirect_uris: [redirectUri],
     token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token"],
-    ...(scopes !== undefined && scopes.length > 0 ? { scope: scopes.join(" ") } : {}),
   };
+  if (scopes !== undefined && scopes.length > 0) metadata.scope = scopes.join(" ");
+  return metadata;
 }
 
 export interface McpOAuthStartInput {
@@ -497,9 +501,9 @@ export async function completeMcpOAuthFlow(
 ): Promise<{ brokerCredentialId: number }> {
   let persisted: PersistedOAuthFlow;
   try {
-    // The JSON round-trip degrades the SDK's URL-typed fields to strings;
+    // SAFETY: the JSON round-trip degrades the SDK's URL-typed fields to strings;
     // the exchange only reads client_id/client_secret + the separately
-    // restored codeVerifier/redirectUri, so the cast is the documented
+    // restored codeVerifier/redirectUri, so this cast is the documented
     // contract (JSON.parse of what JSON.stringify wrote in startMcpOAuthFlow).
     persisted = JSON.parse(flowRow.flow) as PersistedOAuthFlow;
   } catch {

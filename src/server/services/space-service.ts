@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
+import { z } from "zod";
 import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
@@ -126,6 +127,9 @@ export function parseConnectIntent(text: string): ConnectIntent | null {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_DIR = "data/sessions";
+
+/** A session message event's text field, validated at the digest capture boundary. */
+const digestMessageSchema = z.object({ text: z.string() });
 
 /**
  * System-prompt directive for `request-only` spaces (issue #55): the adapter
@@ -435,6 +439,9 @@ export class SpaceService {
   }
 
   async #createLive(spaceId: string): Promise<LiveSession> {
+    // SAFETY: the cold-start path only touches store members that exist on
+    // every protocol-only test double, guarded with `?.`/presence checks
+    // below; Partial<Store> widens the production Store to that subset.
     const store = this.#store as Partial<Store>;
     // Upsert the space row on first contact (issue #188): the session flow
     // previously only GET'd the space, so real spaces were never persisted
@@ -592,8 +599,9 @@ export class SpaceService {
     presenter.beginDigest();
     let captured = "";
     const offMessage = live.session.on("message", (data) => {
-      const text = typeof data === "object" && data !== null && "text" in data ? data.text : undefined;
-      if (typeof text === "string" && text.trim()) captured = text;
+      const parsed = digestMessageSchema.safeParse(data);
+      const text = parsed.success ? parsed.data.text : undefined;
+      if (text !== undefined && text.trim()) captured = text;
     });
     try {
       const instruction = marker

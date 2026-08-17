@@ -100,7 +100,7 @@ function principalKey(pool: MemoryPool): string {
   return pool.scope === "org" ? "" : pool.principal;
 }
 
-function poolPredicate(pool: MemoryPool, alias = ""): { sql: string; params: string[] } {
+function poolPredicate(pool: MemoryPool, alias = "") {
   const column = (name: string) => `${alias}${name}`;
   if (pool.scope === "org") {
     return { sql: `${column("scope")} = 'org' AND ${column("principal")} IS NULL`, params: [] };
@@ -124,12 +124,16 @@ function consolidationInput(rows: PoolRow[], lastRowId: number): string {
 }
 
 function isGenerated(metadataJson: string): boolean {
+  // SAFETY: metadata_json is authored by this module as a JSON object with string values
+  // (GENERATED_METADATA or the superseded-update object); the cast types only that object.
   const metadata = JSON.parse(metadataJson) as Record<string, string>;
   return metadata.source === GENERATED_METADATA.source;
 }
 
 
 function marker(db: Database, pool: MemoryPool): number {
+  // SAFETY: the SELECT list (last_rowid) is exactly MarkerRow's shape; bun:sqlite
+  // .get() returns that row object or undefined.
   const row = db
     .query(
       `SELECT last_rowid
@@ -144,8 +148,10 @@ function newFactCount(
   db: Database,
   pool: MemoryPool,
   lastRowId: number,
-): { count: number; maxRowId: number } {
+) {
   const predicate = poolPredicate(pool);
+  // SAFETY: the SELECT list (count, max_rowid) is exactly CountRow's shape; bun:sqlite
+  // .get() returns that row object or undefined.
   const row = db
     .query(
       `SELECT COUNT(*) AS count, MAX(rowid) AS max_rowid
@@ -160,6 +166,8 @@ function newFactCount(
 
 function readPool(db: Database, pool: MemoryPool): PoolRow[] {
   const predicate = poolPredicate(pool);
+  // SAFETY: the SELECT list (rowid, id, content, metadata_json) is exactly PoolRow's
+  // shape; bun:sqlite .all() returns one such row object per memory row.
   return db
     .query(
       `SELECT rowid, id, content, metadata_json
@@ -206,6 +214,9 @@ function applyActions(
       if (deletes.has(index)) continue;
       const row = rows[index - 1];
       if (!row) continue;
+      // SAFETY: metadata_json is authored by this module as a JSON object with string
+      // values (GENERATED_METADATA or a prior superseded-update object); the cast types
+      // only that object so superseded can be attached.
       const metadata = JSON.parse(row.metadata_json) as Record<string, string>;
       metadata.superseded = row.content;
       const updated = db
@@ -292,6 +303,8 @@ export async function maintainMemory(
   options: ConsolidationOptions = {},
 ): Promise<ConsolidationResult[]> {
   db.exec(STATE_MIGRATION);
+  // SAFETY: SELECT DISTINCT scope, principal returns one row per memory pool with
+  // exactly those columns; bun:sqlite .all() returns them as row objects.
   const pools = db
     .query(
       `SELECT DISTINCT scope, principal

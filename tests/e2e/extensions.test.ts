@@ -52,7 +52,7 @@ import {
 import { CONNECT_EXTENSION_TOOL, type BrokerConnectResult, type ConnectExtensionDeps } from "../../src/extensions/connect";
 import type { CallScope } from "../../src/extensions/credentials";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "../../src/extensions/fixture";
-import type { ExtensionManifest, McpBinding } from "../../src/extensions/manifest";
+import type { ExtensionManifest, JsonObject, McpBinding } from "../../src/extensions/manifest";
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "../../src/extensions/runtime";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { SpaceService } from "../../src/server/services/space-service";
@@ -82,8 +82,10 @@ function freshStore(): Store {
   return store;
 }
 
-function parse(row: AuditRow): Record<string, unknown> {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+function parse(row: AuditRow): JsonObject {
+  // SAFETY: every audit payload is written via JSON.stringify as a JSON
+  // object (the audit writers all serialize records).
+  return JSON.parse(row.payload) as JsonObject;
 }
 
 // Polls a condition on real time because the awaited signals live in other
@@ -152,11 +154,7 @@ class RecordingBroker {
 }
 
 /** Slack message surface double: records posts/updates, resolves ts like the real adapter. */
-function recordingAdapter(): {
-  adapter: SlackAdapter;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
-  updates: Array<{ spaceId: string; ts: string; text: string }>;
-} {
+function recordingAdapter() {
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const adapter: SlackAdapter = {
@@ -316,7 +314,13 @@ describe("journey 3: connect as me / as org (space-service connect intent)", () 
     // The interactive prompt carries the approval blocks (the router posts
     // to the channel, not threaded — the threaded reply comes with the
     // outcome below).
-    const actions = (prompt.opts!.blocks as Array<Record<string, unknown>>).find((b) => b.type === "actions") as {
+    // SAFETY: the router's approval prompt always carries an actions block
+    // with approve/deny buttons (the buttons assertions below depend on it),
+    // and the recorded posts surface is the router's own block payload.
+    const actions = (prompt.opts!.blocks as Array<{
+      type?: string;
+      elements?: Array<{ type: string; action_id: string; value: string }>;
+    }>).find((b) => b.type === "actions") as {
       elements: Array<{ type: string; action_id: string; value: string }>;
     };
     const buttons = actions.elements;
@@ -418,6 +422,8 @@ function makeRuntimeHarness(opts: {
       boundary.calls.push(credential);
     },
   };
+  // SAFETY: the stub transport records every binding the runtime requests;
+  // the array starts empty and only McpBinding values are pushed below.
   const transports = { bindings: [] as McpBinding[] };
   const mcpTransport =
     opts.mcpTransport ??
@@ -426,7 +432,9 @@ function makeRuntimeHarness(opts: {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
+        // SAFETY: the fixture call passes the tool arguments JSON from the
+        // stub transport, which forwards the caller's object verbatim.
+        const args = request.params.arguments as JsonObject;
         return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
       });
       void server.connect(serverTransport);
@@ -583,7 +591,7 @@ let acpRun = 0;
 async function acpPermissionRoundTrip(opts: {
   orgYaml: string;
   /** JSON override for the fake server's toolCall (undefined = default execute → bash). */
-  override?: Record<string, unknown>;
+  override?: JsonObject;
   /** The optionId the driver must answer with. */
   expectedOption: string;
 }): Promise<Store> {

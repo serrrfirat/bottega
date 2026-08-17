@@ -170,8 +170,26 @@ export const settingsArgsSchema = z.object({
 /** The overlay keys the space scope may set (issue #67; mirrors applySpaceOverlay). */
 const SPACE_SETTABLE_KEYS = ["response_mode", "extensions", "proactive"] as const;
 
+/**
+ * The stored policy overlay's value type: arbitrary JSON. Unknown keys are
+ * preserved verbatim on re-save (the settings tool only ever rewrites the
+ * keys it manages).
+ */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * Stored-overlay guard: returns the value as a JSON record when it is an
+ * object (arrays included, matching the old typeof-object check), else an
+ * empty record so a malformed stored value is replaced, never merged.
+ */
+function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> {
+  if (value === null || value === undefined || !(value instanceof Object)) return {};
+  // SAFETY: the instanceof guard just excluded null/primitives; a JSON value that is an object is an array or a plain record.
+  return value as Record<string, JsonValue>;
+}
+
 /** Effective-policy view for the agent: the governing knobs, not the stored blob. */
-function policyView(policy: PolicyConfig): Record<string, unknown> {
+function policyView(policy: PolicyConfig) {
   return {
     ok: policy.ok,
     timeout_minutes: policy.timeoutMinutes,
@@ -198,12 +216,12 @@ function mergeSettingsInput(base: OrgSettingsInput, partial: SettingsSetInput): 
     const baseInjection = base.memory?.injection;
     out.memory = {
       injection: {
-        ...(baseInjection?.enabled !== undefined ? { enabled: baseInjection.enabled } : {}),
-        ...(baseInjection?.max_entries !== undefined ? { max_entries: baseInjection.max_entries } : {}),
-        ...(partial.memory.injection?.enabled !== undefined ? { enabled: partial.memory.injection.enabled } : {}),
+        ...(baseInjection?.enabled !== undefined ? { enabled: baseInjection.enabled } : undefined),
+        ...(baseInjection?.max_entries !== undefined ? { max_entries: baseInjection.max_entries } : undefined),
+        ...(partial.memory.injection?.enabled !== undefined ? { enabled: partial.memory.injection.enabled } : undefined),
         ...(partial.memory.injection?.max_entries !== undefined
           ? { max_entries: partial.memory.injection.max_entries }
-          : {}),
+          : undefined),
       },
     };
   }
@@ -237,37 +255,37 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
     input.approvals = {
       ...(settings.approvals.timeoutMinutes !== undefined
         ? { timeout_minutes: settings.approvals.timeoutMinutes }
-        : {}),
-      ...(settings.approvals.alwaysApprove !== undefined ? { always_approve: settings.approvals.alwaysApprove } : {}),
+        : undefined),
+      ...(settings.approvals.alwaysApprove !== undefined ? { always_approve: settings.approvals.alwaysApprove } : undefined),
     };
   }
   if (settings.responseMode !== undefined) input.response_mode = settings.responseMode;
   if (settings.memoryInjection !== undefined) {
     input.memory = {
       injection: {
-        ...(settings.memoryInjection.enabled !== undefined ? { enabled: settings.memoryInjection.enabled } : {}),
+        ...(settings.memoryInjection.enabled !== undefined ? { enabled: settings.memoryInjection.enabled } : undefined),
         ...(settings.memoryInjection.maxEntries !== undefined
           ? { max_entries: settings.memoryInjection.maxEntries }
-          : {}),
+          : undefined),
       },
     };
   }
   if (settings.extensions !== undefined) {
     input.extensions = {
-      ...(settings.extensions.allow !== undefined ? { allow: settings.extensions.allow } : {}),
-      ...(settings.extensions.deny !== undefined ? { deny: settings.extensions.deny } : {}),
+      ...(settings.extensions.allow !== undefined ? { allow: settings.extensions.allow } : undefined),
+      ...(settings.extensions.deny !== undefined ? { deny: settings.extensions.deny } : undefined),
       ...(settings.extensions.orgCredentials !== undefined
         ? { org_credentials: settings.extensions.orgCredentials }
-        : {}),
+        : undefined),
     };
   }
   if (settings.repos !== undefined) input.repos = settings.repos;
   if (settings.models !== undefined) {
     input.models = {
-      ...(settings.models.default !== undefined ? { default: settings.models.default } : {}),
-      ...(settings.models.fast !== undefined ? { fast: settings.models.fast } : {}),
-      ...(settings.models.reasoning !== undefined ? { reasoning: settings.models.reasoning } : {}),
-      ...(settings.models.effort !== undefined ? { effort: settings.models.effort } : {}),
+      ...(settings.models.default !== undefined ? { default: settings.models.default } : undefined),
+      ...(settings.models.fast !== undefined ? { fast: settings.models.fast } : undefined),
+      ...(settings.models.reasoning !== undefined ? { reasoning: settings.models.reasoning } : undefined),
+      ...(settings.models.effort !== undefined ? { effort: settings.models.effort } : undefined),
     };
   }
   if (settings.workspacesDir !== undefined) input.workspaces_dir = settings.workspacesDir;
@@ -283,8 +301,8 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   if (settings.secretsBackend !== undefined) {
     input.secrets_backend = {
       type: settings.secretsBackend.type,
-      ...(settings.secretsBackend.connectUrl !== undefined ? { connect_url: settings.secretsBackend.connectUrl } : {}),
-      ...(settings.secretsBackend.mapping !== undefined ? { mapping: settings.secretsBackend.mapping } : {}),
+      ...(settings.secretsBackend.connectUrl !== undefined ? { connect_url: settings.secretsBackend.connectUrl } : undefined),
+      ...(settings.secretsBackend.mapping !== undefined ? { mapping: settings.secretsBackend.mapping } : undefined),
     };
   }
   return input;
@@ -391,6 +409,7 @@ async function handleOrg(
       loadPolicy: opts.gate.loadPolicy,
       // The gate only uses appendAudit; the settings.changed audit below
       // writes through the same module.
+      // SAFETY: the gate calls only appendAudit on this module, which opts.audit (Pick<AuditModule, "appendAudit">) already provides; listAudit is never invoked here.
       audit: opts.audit as AuditModule,
       router: opts.gate.router,
       timeoutMs: opts.gate.timeoutMs,
@@ -410,7 +429,7 @@ async function handleOrg(
   await opts.audit.appendAudit({
     actor,
     event_type: SETTINGS_CHANGED_EVENT,
-    payload: { scope: "org", actor, before, after: orgSettingsToInput(after) },
+    payload: JSON.parse(JSON.stringify({ scope: "org", actor, before, after: orgSettingsToInput(after) })),
   });
   return {
     content: [
@@ -435,7 +454,7 @@ async function handleSpace(
   const orgPolicy = loadOrgPolicy(store);
   const effective = await loadSpacePolicy(orgPolicy, store, spaceId);
   if (params.set === undefined) {
-    let overlay: unknown = null;
+    let overlay = null;
     if (space.policy_json.trim()) {
       try {
         overlay = JSON.parse(space.policy_json);
@@ -456,26 +475,25 @@ async function handleSpace(
   // rejected (fail closed — never silently drop a requested change).
   const requested = Object.keys(params.set);
   for (const key of requested) {
-    if (!(SPACE_SETTABLE_KEYS as readonly string[]).includes(key)) {
+    if (!SPACE_SETTABLE_KEYS.some((k) => k === key)) {
       return toolError(
         `space scope cannot set '${key}' — space knobs are limited to ${SPACE_SETTABLE_KEYS.join(", ")} ` +
           "(use org scope or the model_settings tool for the rest)",
       );
     }
   }
-  const before = space.policy_json.trim() ? (JSON.parse(space.policy_json) as Record<string, unknown>) : {};
-  const merged: Record<string, unknown> = { ...before };
+  // SAFETY: stored policy_json is a JSON object (applySpaceOverlay validates it as such on every read); unknown keys are preserved verbatim below.
+  const before: Record<string, JsonValue> = space.policy_json.trim()
+    ? (JSON.parse(space.policy_json) as Record<string, JsonValue>)
+    : {};
+  const merged = { ...before };
   if (params.set.response_mode !== undefined) merged["response_mode"] = params.set.response_mode;
   if (params.set.extensions !== undefined) {
-    const existing = typeof merged["extensions"] === "object" && merged["extensions"] !== null
-      ? (merged["extensions"] as Record<string, unknown>)
-      : {};
+    const existing = jsonRecord(merged["extensions"]);
     merged["extensions"] = { ...existing, ...params.set.extensions };
   }
   if (params.set.proactive !== undefined) {
-    const existing = typeof merged["proactive"] === "object" && merged["proactive"] !== null
-      ? (merged["proactive"] as Record<string, unknown>)
-      : {};
+    const existing = jsonRecord(merged["proactive"]);
     merged["proactive"] = { ...existing, ...params.set.proactive };
   }
   const updated = await store.updatePolicy(spaceId, JSON.stringify(merged));

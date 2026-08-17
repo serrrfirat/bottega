@@ -32,10 +32,25 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { EXTENSION_ID_RE } from "../extensions/manifest";
+import { z } from "zod";
+import { EXTENSION_ID_RE, type JsonObject, type JsonValue } from "../extensions/manifest";
 import type { Store } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
+
+/**
+ * An untrusted config value from `config.yml` (YAML-subset nodes) or the
+ * `spaces.policy_json` overlay (JSON values). The normalize helpers below
+ * re-validate every value at the boundary; this type only names the input.
+ */
+export type ConfigValue = string | number | boolean | null | ConfigValue[] | { [key: string]: ConfigValue };
+
+/** True when the config value is a plain mapping (YAML block mapping / JSON object). */
+function isConfigMapping(value: YamlNode | JsonValue): value is JsonObject {
+  // z.record rejects arrays, null, and primitives — identical to the old
+  // `typeof === "object" && !== null && !Array.isArray` check.
+  return z.record(z.string(), z.unknown()).safeParse(value).success;
+}
 
 export type Tier = "read" | "write" | "exec";
 export type PolicyAction = "allow" | "deny" | "prompt";
@@ -78,29 +93,26 @@ export type PickupConfidence = "high" | "medium" | "low";
 const DEFAULT_PICKUP_CONFIDENCE: PickupConfidence = "high";
 const PICKUP_CONFIDENCE_VALUES: readonly PickupConfidence[] = ["high", "medium", "low"];
 
-function normalizePickupConfidence(value: unknown): PickupConfidence | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  return (PICKUP_CONFIDENCE_VALUES as readonly string[]).includes(normalized)
-    ? (normalized as PickupConfidence)
-    : undefined;
+function normalizePickupConfidence(value: ConfigValue): PickupConfidence | undefined {
+  const parsed = z.string().safeParse(value);
+  if (!parsed.success) return undefined;
+  const normalized = parsed.data.trim().toLowerCase();
+  return PICKUP_CONFIDENCE_VALUES.find((v) => v === normalized);
 }
 
 /** Tightening order for response modes: always → mention → request-only. */
-const RESPONSE_MODE_STRICTNESS: Record<ResponseMode, number> = {
-  always: 0,
-  mention: 1,
-  "request-only": 2,
-};
+const RESPONSE_MODE_STRICTNESS = { always: 0, mention: 1, "request-only": 2 } satisfies Record<
+  ResponseMode,
+  number
+>;
 
 const RESPONSE_MODE_VALUES: readonly ResponseMode[] = ["always", "mention", "request-only"];
 
-function normalizeResponseMode(value: unknown): ResponseMode | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  return (RESPONSE_MODE_VALUES as readonly string[]).includes(normalized)
-    ? (normalized as ResponseMode)
-    : undefined;
+function normalizeResponseMode(value: ConfigValue): ResponseMode | undefined {
+  const parsed = z.string().safeParse(value);
+  if (!parsed.success) return undefined;
+  const normalized = parsed.data.trim().toLowerCase();
+  return RESPONSE_MODE_VALUES.find((v) => v === normalized);
 }
 
 /** The stricter of two response modes (mention/request-only tighten; always is the floor). */
@@ -109,15 +121,14 @@ function stricterResponseMode(a: ResponseMode, b: ResponseMode): ResponseMode {
 }
 
 /** Tightening order for org-credential usage: allow → deny. */
-const ORG_CREDENTIALS_STRICTNESS: Record<OrgCredentialsMode, number> = { allow: 0, deny: 1 };
+const ORG_CREDENTIALS_STRICTNESS = { allow: 0, deny: 1 } satisfies Record<OrgCredentialsMode, number>;
 const ORG_CREDENTIALS_VALUES: readonly OrgCredentialsMode[] = ["allow", "deny"];
 
-function normalizeOrgCredentials(value: unknown): OrgCredentialsMode | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  return (ORG_CREDENTIALS_VALUES as readonly string[]).includes(normalized)
-    ? (normalized as OrgCredentialsMode)
-    : undefined;
+function normalizeOrgCredentials(value: ConfigValue): OrgCredentialsMode | undefined {
+  const parsed = z.string().safeParse(value);
+  if (!parsed.success) return undefined;
+  const normalized = parsed.data.trim().toLowerCase();
+  return ORG_CREDENTIALS_VALUES.find((v) => v === normalized);
 }
 
 /** The stricter of two org-credential modes (deny tightens; allow is the floor). */
@@ -130,8 +141,13 @@ export function orgCredentialsAllowed(policy: PolicyConfig): boolean {
   return policy.orgCredentials === "allow";
 }
 
+/** Known OMP tool → capability tier lookup (unknown names resolve to exec). */
+interface ToolTiers {
+  readonly [tool: string]: Tier;
+}
+
 /** Capability tier per known OMP tool. Unknown/malformed names resolve to exec. */
-const TIER_BY_TOOL: Record<string, Tier> = {
+const TIER_BY_TOOL: ToolTiers = {
   read: "read",
   glob: "read",
   grep: "read",
@@ -423,19 +439,21 @@ export function toolAction(policy: PolicyConfig, toolName: string): PolicyAction
 
 const ACTION_VALUES: readonly PolicyAction[] = ["allow", "deny", "prompt"];
 
-function normalizeAction(value: unknown): PolicyAction | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
+function normalizeAction(value: ConfigValue): PolicyAction | undefined {
+  const parsed = z.string().safeParse(value);
+  if (!parsed.success) return undefined;
+  const normalized = parsed.data.trim().toLowerCase();
   return ACTION_VALUES.find((action) => action === normalized);
 }
 
 /** A list of well-formed extension ids, or undefined when malformed (fail closed). */
-function extensionIdList(value: unknown): string[] | undefined {
+function extensionIdList(value: ConfigValue): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const ids: string[] = [];
   for (const raw of value) {
-    if (typeof raw !== "string" || !EXTENSION_ID_RE.test(raw)) return undefined;
-    ids.push(raw);
+    const parsed = z.string().safeParse(raw);
+    if (!parsed.success || !EXTENSION_ID_RE.test(parsed.data)) return undefined;
+    ids.push(parsed.data);
   }
   return [...new Set(ids)];
 }
@@ -474,6 +492,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
   try {
     doc = parseYamlSubset(text);
   } catch (err) {
+    // SAFETY: parseYamlSubset throws Error instances (its only failure mode); the catch value has .message.
     return structuralError(policy, `config.yml: ${(err as Error).message}`);
   }
 
@@ -486,7 +505,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       if (mode) {
         policy.responseMode = mode;
       } else {
-        const shown = typeof node === "string" ? node : "<non-scalar>";
+        const shown = scalarOrUndefined(node) ?? "<non-scalar>";
         policy.warnings.push(
           `response_mode: invalid value '${shown}' — using default '${DEFAULT_RESPONSE_MODE}'`,
         );
@@ -495,15 +514,15 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
     }
     // Every other section must be a block mapping; a scalar or sequence section
     // (e.g. `tools: nope`) is a structural error.
-    if (typeof node !== "object" || node === null || Array.isArray(node)) {
+    if (!isConfigMapping(node)) {
       return structuralError(policy, `section '${name}' must be a block mapping`);
     }
-    const entries = node as Record<string, YamlNode>;
+    const entries = node;
     if (name === "tools") {
       for (const [tool, rawValue] of Object.entries(entries)) {
         const action = normalizeAction(rawValue);
         if (!action) {
-          const shown = typeof rawValue === "string" ? rawValue : "<non-scalar>";
+          const shown = scalarOrUndefined(rawValue) ?? "<non-scalar>";
           policy.errors.push(`tools.${tool}: invalid action '${shown}' (allow|deny|prompt) — denying`);
           policy.tools[tool] = "deny";
           continue;
@@ -540,10 +559,11 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         }
         const names: string[] = [];
         for (const raw of list) {
-          if (typeof raw !== "string" || !isKnownTool(raw)) {
+          const name = z.string().safeParse(raw);
+          if (!name.success || !isKnownTool(name.data)) {
             return structuralError(policy, `approvals.always_approve: unknown tool '${String(raw)}'`);
           }
-          names.push(raw);
+          names.push(name.data);
         }
         policy.alwaysApprove = names;
       }
@@ -563,10 +583,10 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       const injection = entries.injection;
       if (injection !== undefined) {
         // `memory:` with a nested `injection:` mapping; anything else is structural.
-        if (typeof injection !== "object" || injection === null || Array.isArray(injection)) {
+        if (!isConfigMapping(injection)) {
           return structuralError(policy, "memory.injection must be a block mapping");
         }
-        const inj = injection as Record<string, YamlNode>;
+        const inj = injection;
         const enabled = parseBoolean(scalarOrUndefined(inj.enabled));
         if (enabled !== undefined) {
           policy.memory.injection.enabled = enabled;
@@ -680,8 +700,9 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
 }
 
 /** A scalar node's string value; non-scalar nodes (mappings/sequences) are undefined. */
-function scalarOrUndefined(value: YamlNode | undefined): string | undefined {
-  return typeof value === "string" ? value : undefined;
+function scalarOrUndefined(value: JsonValue | undefined): string | undefined {
+  const parsed = z.string().safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /** Loads the org floor: `config.yml` in `dir`, `BOTTEGA_CONFIG_DIR`, or the repo root. */
@@ -691,17 +712,15 @@ export function loadOrgConfig(dir?: string): PolicyConfig {
   try {
     text = readFileSync(join(configDir, "config.yml"), "utf8");
   } catch (err) {
-    if (isEnoent(err)) return defaultPolicy();
+    // SAFETY: readFileSync throws Error instances; Node fs errors carry a `code` property.
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") return defaultPolicy();
+    // SAFETY: readFileSync only throws Error instances, so the catch value is an Error.
     return structuralError(defaultPolicy(), `config.yml: ${(err as Error).message}`);
   }
   return parseOrgConfigYaml(text);
 }
 
-function isEnoent(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT";
-}
-
-const STRICTNESS: Record<PolicyAction, number> = { allow: 0, prompt: 1, deny: 2 };
+const STRICTNESS = { allow: 0, prompt: 1, deny: 2 } satisfies Record<PolicyAction, number>;
 
 function stricter(a: PolicyAction, b: PolicyAction): PolicyAction {
   return STRICTNESS[b] > STRICTNESS[a] ? b : a;
@@ -731,19 +750,22 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
   try {
     parsed = JSON.parse(trimmed);
   } catch (err) {
+    // SAFETY: JSON.parse throws SyntaxError (an Error); the catch value has .message.
     return structuralError(defaultPolicy(), `spaces.policy_json: invalid JSON: ${(err as Error).message}`);
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+  const overlayDoc = z.record(z.string(), z.unknown()).safeParse(parsed);
+  if (!overlayDoc.success) {
     return structuralError(defaultPolicy(), "spaces.policy_json: must be an object");
   }
-  // JSON.parse output, validated to a plain object above.
-  const overlay = parsed as Record<string, unknown>;
+  // SAFETY: JSON.parse output is exactly JsonValue (string|number|boolean|null|array|record),
+  // and the record parse above verified the root is a plain object.
+  const overlay = overlayDoc.data as Record<string, JsonValue>;
 
   const out = clonePolicy(org);
 
   const toolsEntry = overlay["tools"];
   if (toolsEntry !== undefined) {
-    if (typeof toolsEntry !== "object" || toolsEntry === null || Array.isArray(toolsEntry)) {
+    if (!isConfigMapping(toolsEntry)) {
       return structuralError(defaultPolicy(), "spaces.policy_json: tools must be an object");
     }
     for (const [tool, rawValue] of Object.entries(toolsEntry)) {
@@ -763,10 +785,11 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
 
   const approversEntry = overlay["approvers"];
   if (approversEntry !== undefined) {
-    if (!Array.isArray(approversEntry) || approversEntry.some((a) => typeof a !== "string")) {
+    const approvers = z.array(z.string()).safeParse(approversEntry);
+    if (!approvers.success) {
       return structuralError(defaultPolicy(), "spaces.policy_json: approvers must be an array of strings");
     }
-    out.approvers = [...approversEntry];
+    out.approvers = [...approvers.data];
   }
 
   // always_approve (issue #45): the overlay lists tools to REMOVE from the
@@ -775,10 +798,11 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
   // the safe direction); malformed values are a structural error.
   const alwaysApproveEntry = overlay["always_approve"];
   if (alwaysApproveEntry !== undefined) {
-    if (!Array.isArray(alwaysApproveEntry) || alwaysApproveEntry.some((t) => typeof t !== "string")) {
+    const alwaysApprove = z.array(z.string()).safeParse(alwaysApproveEntry);
+    if (!alwaysApprove.success) {
       return structuralError(defaultPolicy(), "spaces.policy_json: always_approve must be an array of strings");
     }
-    const removed = new Set(alwaysApproveEntry as string[]);
+    const removed = new Set(alwaysApprove.data);
     out.alwaysApprove = out.alwaysApprove.filter((tool) => !removed.has(tool));
   }
 
@@ -790,7 +814,7 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
   if (responseModeEntry !== undefined) {
     const mode = normalizeResponseMode(responseModeEntry);
     if (!mode) {
-      const shown = typeof responseModeEntry === "string" ? responseModeEntry : "<non-scalar>";
+      const shown = scalarOrUndefined(responseModeEntry) ?? "<non-scalar>";
       out.warnings.push(`overlay response_mode: invalid value '${shown}' — keeping org floor '${out.responseMode}'`);
     } else {
       out.responseMode = stricterResponseMode(out.responseMode, mode);
@@ -803,10 +827,10 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
   // response_mode. Malformed entries are a structural error (fail closed).
   const extensionsEntry = overlay["extensions"];
   if (extensionsEntry !== undefined) {
-    if (typeof extensionsEntry !== "object" || extensionsEntry === null || Array.isArray(extensionsEntry)) {
+    if (!isConfigMapping(extensionsEntry)) {
       return structuralError(defaultPolicy(), "spaces.policy_json: extensions must be an object");
     }
-    const ext = extensionsEntry as Record<string, unknown>;
+    const ext = extensionsEntry;
     const allowEntry = ext["allow"];
     if (allowEntry !== undefined) {
       const ids = extensionIdList(allowEntry);
@@ -830,7 +854,7 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
     if (orgCredsEntry !== undefined) {
       const mode = normalizeOrgCredentials(orgCredsEntry);
       if (!mode) {
-        const shown = typeof orgCredsEntry === "string" ? orgCredsEntry : "<non-scalar>";
+        const shown = scalarOrUndefined(orgCredsEntry) ?? "<non-scalar>";
         out.warnings.push(
           `overlay extensions.org_credentials: invalid value '${shown}' — keeping org floor '${out.orgCredentials}'`,
         );
@@ -952,6 +976,7 @@ export function loadOrgPolicy(store: Pick<Store, "getOrgSettings">, dir?: string
   try {
     settings = store.getOrgSettings();
   } catch (err) {
+    // SAFETY: store.getOrgSettings throws Error instances (bun:sqlite errors); the catch value has .message.
     return structuralError(policy, `org_settings: ${(err as Error).message}`);
   }
   return settings ? applyOrgSettings(policy, settings) : policy;

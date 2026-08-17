@@ -36,6 +36,24 @@ import {
 
 export const OAUTH_CALLBACK_PATH = "/oauth/callback";
 
+/**
+ * The stable local port for the in-process browser-leg listeners (issue
+ * #196 follow-up): `BOTTEGA_CALLBACK_PORT` — a static tunnel / reverse
+ * proxy cannot forward to an ephemeral port (0 = pick one at boot, the
+ * default for tests and local dev). Unset or empty → 0 (ephemeral,
+ * unchanged). Set but not a valid port number → throws (fail closed: a
+ * mistyped port must not silently bind a random one).
+ */
+export function callbackPort(): number {
+  const raw = process.env.BOTTEGA_CALLBACK_PORT;
+  if (raw === undefined || raw.length === 0) return 0;
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`BOTTEGA_CALLBACK_PORT must be a port number 0-65535, got "${raw}"`);
+  }
+  return port;
+}
+
 /** The callback endpoint's store slice (the full {@link Store} satisfies it). */
 export type OAuthCallbackStoreSlice = Pick<Store, "consumeOAuthFlow" | "upsertExtensionCredential">;
 
@@ -56,6 +74,12 @@ export interface OAuthCallbackEndpointDeps {
    * ONE public ingress (reverse proxy + TLS) for both paths.
    */
   webhooks?: WebhookRouteDeps;
+  /**
+   * Local bind port override (default: `BOTTEGA_CALLBACK_PORT` when set,
+   * else 0 = ephemeral). A stable port lets a static tunnel / reverse
+   * proxy forward to this listener across restarts.
+   */
+  port?: number;
 }
 
 /** A plain, script-free result page (the browser's only output). */
@@ -130,7 +154,7 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
   const tokenStore = deps.tokenStore ?? createVaultTokenStore();
   const server = Bun.serve({
     hostname: "127.0.0.1",
-    port: 0,
+    port: deps.port ?? callbackPort(),
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === OAUTH_CALLBACK_PATH) return handleCallback(req, deps, tokenStore);

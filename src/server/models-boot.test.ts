@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { createStore } from "../store/db";
 import { main } from "./index";
 
-function tempEnv(): { dir: string; cleanup(): void } {
+function tempEnv() {
   const dir = mkdtempSync(join(tmpdir(), "bottega-boot-gen-"));
   const saved = {
     cwd: process.cwd(),

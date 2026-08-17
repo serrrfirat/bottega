@@ -48,6 +48,7 @@
  * + body snippet; timeout → Mem0Error naming the op and deadline; network
  * errors are wrapped with context. Capability discovery alone fails soft.
  */
+import { z } from "zod";
 import {
   MEMORY_LIMIT_DEFAULT,
   validateSaveInput,
@@ -82,6 +83,39 @@ export const MEM0_ORG_AGENT_ID = "bottega";
 /** Identity keys mem0 reserves for scoping; caller metadata may not set them. */
 const IDENTITY_KEYS = new Set(["user_id", "agent_id", "run_id"]);
 
+/** One JSON value — the wire domain of the mem0 REST payloads. */
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/** True when `value` is a non-array object (the typeof-free object test). */
+function isPlainRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
+  // Object(x) === x holds exactly for objects (primitives get boxed, so the
+  // identity comparison fails) — equivalent to `typeof x === "object"`.
+  return value !== undefined && value !== null && !Array.isArray(value) && Object(value) === value;
+}
+
+/** True when `value` is a string primitive (the typeof-free string test). */
+function isString(value: JsonValue): value is string {
+  // String(x) returns x itself exactly for string primitives.
+  return String(value) === value;
+}
+
+/**
+ * One `results[]` row of the mem0 add/search payloads, decoded at the HTTP
+ * boundary. Non-conforming fields fall back to their absence value so a
+ * malformed row still yields a meaningful MemoryEntry (the pre-schema code
+ * narrowed the same fields ad hoc).
+ */
+const Mem0ResultSchema = z.object({
+  id: z.union([z.string(), z.number()]).catch(""),
+  user_id: z.string().catch("").transform((value) => (value === "" ? undefined : value)),
+  memory: z.string().catch("").transform((value) => (value === "" ? undefined : value)),
+  metadata: z.record(z.string(), z.json()).catch({}),
+  created_at: z
+    .union([z.number().finite(), z.string().transform((text) => Date.parse(text.trim()))])
+    .catch(0)
+    .transform((value) => (Number.isNaN(value) ? 0 : value)),
+});
+
 interface GraphCapabilities {
   add: boolean;
   search: boolean;
@@ -100,27 +134,19 @@ export class Mem0Error extends Error {
 }
 
 /** Runtime-narrowed copy of arbitrary JSON into a plain record (no casts). */
-export function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+export function asRecord(value: JsonValue): Record<string, JsonValue> {
+  if (!isPlainRecord(value)) return {};
   return Object.fromEntries(Object.entries(value));
 }
 
 /** Metadata values are coerced to strings (our contract is Record<string, string>). */
-export function stringifyMetadata(meta: Record<string, unknown>): Record<string, string> {
+export function stringifyMetadata(meta: Record<string, JsonValue>) {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(meta)) {
-    out[key] = typeof value === "string" ? value : String(value);
+    // String(s) === s for strings, and String(x) renders every other JSON value.
+    out[key] = String(value);
   }
   return out;
-}
-
-function parseCreatedAt(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "") {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return 0;
 }
 
 /** Body snippet for error messages (kept short). */
@@ -134,7 +160,7 @@ function scopeParams(
   scope: MemoryScope,
   principal: string | undefined,
   agentId: string | undefined,
-): Record<string, string> {
+) {
   if (scope === "org") {
     // Org memory is shared across principals: pin it to one agent id.
     return { agent_id: agentId ?? MEM0_ORG_AGENT_ID };
@@ -148,7 +174,7 @@ function scopeParams(
 }
 
 /** Strip identity keys from caller metadata (mirrors the SDK's behavior). */
-function stripIdentityKeys(metadata: Record<string, string>): Record<string, string> {
+function stripIdentityKeys(metadata: Record<string, string>) {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(metadata)) {
     if (!IDENTITY_KEYS.has(key)) out[key] = value;
@@ -159,14 +185,15 @@ function stripIdentityKeys(metadata: Record<string, string>): Record<string, str
 async function requestJson(
   baseUrl: string,
   path: string,
-  body: unknown,
+  body: JsonValue,
   apiKey: string | undefined,
   timeoutMs: number,
-): Promise<unknown> {
+): Promise<JsonValue | null> {
   const method = "POST";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const headers: Record<string, string> = { "content-type": "application/json" };
+  const headers: Record<string, string> = {};
+  headers["content-type"] = "application/json";
   if (apiKey) headers["x-api-key"] = apiKey;
   try {
     const res = await fetch(`${baseUrl}${path}`, {
@@ -184,7 +211,8 @@ async function requestJson(
     }
     if (text.trim() === "") return null;
     try {
-      return JSON.parse(text) as unknown;
+      // SAFETY: mem0's wire contract is JSON, so the parsed body is a JsonValue.
+      return JSON.parse(text) as JsonValue;
     } catch (err) {
       throw new Mem0Error(
         `mem0 ${method} ${path}: invalid JSON response (${snippet(text)})`,
@@ -203,9 +231,9 @@ async function requestJson(
   }
 }
 
-function resolveOpenApiRef(document: Record<string, unknown>, ref: string): unknown {
+function resolveOpenApiRef(document: Record<string, JsonValue>, ref: string): JsonValue | undefined {
   if (!ref.startsWith("#/")) return undefined;
-  let current: unknown = document;
+  let current: JsonValue = document;
   for (const rawSegment of ref.slice(2).split("/")) {
     const segment = rawSegment.replaceAll("~1", "/").replaceAll("~0", "~");
     current = asRecord(current)[segment];
@@ -214,16 +242,16 @@ function resolveOpenApiRef(document: Record<string, unknown>, ref: string): unkn
 }
 
 function schemaAdvertisesField(
-  document: Record<string, unknown>,
-  value: unknown,
+  document: Record<string, JsonValue>,
+  value: JsonValue | undefined,
   field: string,
   seen: Set<unknown> = new Set(),
 ): boolean {
-  if (typeof value !== "object" || value === null || seen.has(value)) return false;
+  if (!isPlainRecord(value) || seen.has(value)) return false;
   seen.add(value);
-  const record = asRecord(value);
+  const record = value;
   if (Object.hasOwn(asRecord(record.properties), field)) return true;
-  if (typeof record.$ref === "string") {
+  if (isString(record.$ref)) {
     return schemaAdvertisesField(document, resolveOpenApiRef(document, record.$ref), field, seen);
   }
   for (const key of ["allOf", "anyOf", "oneOf"]) {
@@ -235,7 +263,7 @@ function schemaAdvertisesField(
   return false;
 }
 
-function operationAdvertisesGraph(document: Record<string, unknown>, path: string): boolean {
+function operationAdvertisesGraph(document: Record<string, JsonValue>, path: string): boolean {
   const operation = asRecord(asRecord(asRecord(document.paths)[path]).post);
   const content = asRecord(asRecord(operation.requestBody).content);
   const schema = asRecord(content["application/json"]).schema;
@@ -264,7 +292,7 @@ async function discoverGraphCapabilities(
       signal: controller.signal,
     });
     if (!response.ok) return { add: false, search: false };
-    const document = asRecord(await response.json());
+    const document = asRecord(z.json().parse(await response.json()));
     return {
       add: operationAdvertisesGraph(document, "/memories"),
       search: operationAdvertisesGraph(document, "/search"),
@@ -279,12 +307,12 @@ async function discoverGraphCapabilities(
 async function requestWithOptionalGraph(
   baseUrl: string,
   path: string,
-  body: Record<string, unknown>,
+  body: Record<string, JsonValue>,
   apiKey: string | undefined,
   timeoutMs: number,
   graphEnabled: boolean,
   disableGraph: () => void,
-): Promise<unknown> {
+): Promise<JsonValue | null> {
   if (!graphEnabled) return requestJson(baseUrl, path, body, apiKey, timeoutMs);
   try {
     return await requestJson(baseUrl, path, { ...body, enable_graph: true }, apiKey, timeoutMs);
@@ -302,20 +330,17 @@ async function requestWithOptionalGraph(
 }
 
 /** Parse one mem0 result dict (add or search) into a MemoryEntry. */
-function parseEntry(result: unknown, scope: MemoryScope, principal: string | null): MemoryEntry {
-  const row = asRecord(result);
-  const meta = stringifyMetadata(asRecord(row.metadata));
-  const entryPrincipal =
-    scope === "user"
-      ? (typeof row.user_id === "string" ? row.user_id : (meta.user_id ?? principal))
-      : null;
+function parseEntry(result: JsonValue, scope: MemoryScope, principal: string | null): MemoryEntry {
+  const parsed = Mem0ResultSchema.safeParse(result);
+  const row = parsed.success ? parsed.data : Mem0ResultSchema.parse({});
+  const meta = stringifyMetadata(row.metadata);
   return {
     id: String(row.id ?? ""),
     scope,
-    principal: entryPrincipal,
-    content: typeof row.memory === "string" ? row.memory : "",
+    principal: scope === "user" ? (row.user_id ?? meta.user_id ?? principal) : null,
+    content: row.memory ?? "",
     metadata: meta,
-    createdAt: parseCreatedAt(row.created_at),
+    createdAt: row.created_at,
   };
 }
 
@@ -332,7 +357,7 @@ async function saveToMem0(
   const body = {
     messages: [{ role: "user", content: input.content }],
     ...identity,
-    ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+    ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : undefined),
   };
   const graph = await getGraphCapabilities();
   const data = await requestWithOptionalGraph(
@@ -352,9 +377,10 @@ async function saveToMem0(
   // result to MemoryEntry; bottega's separate audit remains append-only.
   const results = asRecord(data).results;
   const first = Array.isArray(results) ? results[0] : undefined;
-  const row = asRecord(first);
+  const parsed = Mem0ResultSchema.safeParse(first ?? null);
+  const row = parsed.success ? parsed.data : Mem0ResultSchema.parse({});
   const id = row.id;
-  if (id === undefined || id === null || id === "") {
+  if (id === "") {
     // e.g. a NOOP extraction with no stored row — nothing to hand back.
     throw new Mem0Error(
       "mem0 save: server returned no results (extraction produced nothing?)",
@@ -364,11 +390,11 @@ async function saveToMem0(
   return {
     id: String(id),
     scope: input.scope,
-    principal: input.scope === "user" ? (typeof row.user_id === "string" ? row.user_id : (input.principal ?? null)) : null,
+    principal: input.scope === "user" ? (row.user_id ?? (input.principal ?? null)) : null,
     // NOOP entries carry memory: null — fall back to the input text.
-    content: typeof row.memory === "string" && row.memory !== "" ? row.memory : input.content,
-    metadata: stringifyMetadata(asRecord(row.metadata)),
-    createdAt: parseCreatedAt(row.created_at),
+    content: row.memory !== undefined && row.memory !== "" ? row.memory : input.content,
+    metadata: stringifyMetadata(row.metadata),
+    createdAt: row.created_at,
   };
 }
 
@@ -382,9 +408,9 @@ async function searchMem0(
 ): Promise<MemoryEntry[]> {
   // Scope first, then exact-match metadata filters. Identity keys in caller
   // metadata cannot override the scope (mirrors the SDK).
-  const filters: Record<string, string> = {
+  const filters = {
     ...scopeParams(query.scope, query.principal, agentId),
-    ...(query.metadata ? stripIdentityKeys(query.metadata) : {}),
+    ...(query.metadata ? stripIdentityKeys(query.metadata) : undefined),
   };
   const body = {
     query: query.query,

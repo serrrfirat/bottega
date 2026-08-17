@@ -114,20 +114,28 @@ describe("scheduler job store (issue #86)", () => {
       { name: "standup_digest", run: async () => {} },
     ]);
     const definitions = schedulerToolDefinitions(store, audit, registry);
+    // SAFETY: schedulerToolDefinitions registers these two tools by name;
+    // find() narrows to the union of all definitions, and the registered
+    // ones are exactly the create/delete definitions with these schemas.
     const create = definitions.find((definition) => definition.name === "create_scheduler_job") as
       | ToolDefinition<typeof createSchedulerJobArgsSchema>
       | undefined;
+    // SAFETY: same invariant as create — delete_scheduler_job is registered
+    // with the delete args schema by schedulerToolDefinitions.
     const remove = definitions.find((definition) => definition.name === "delete_scheduler_job") as
       | ToolDefinition<typeof deleteSchedulerJobArgsSchema>
       | undefined;
     if (!create || !remove) throw new Error("scheduler tool definition missing");
+    // SAFETY: scheduler tool executes never read their ExtensionContext;
+    // undefined stands in for the unused parameter position.
+    const unusedContext = undefined as never;
 
     const unavailable = await create.execute(
       "call-unavailable",
       { action: "reflection", cron: "0 9 * * *" },
       new AbortController().signal,
       () => {},
-      undefined as never,
+      unusedContext,
     );
     expect(unavailable.isError).toBe(true);
     expect(await store.listSchedulerJobs()).toEqual([]);
@@ -138,7 +146,7 @@ describe("scheduler job store (issue #86)", () => {
       { action: "standup_digest", cron: "0 9 * * *", params: { style: "brief" }, space: "slack:C1" },
       new AbortController().signal,
       () => {},
-      undefined as never,
+      unusedContext,
     );
     expect(result.isError).not.toBe(true);
     const job = (await store.listSchedulerJobs())[0];
@@ -149,7 +157,7 @@ describe("scheduler job store (issue #86)", () => {
       { id: job!.id },
       new AbortController().signal,
       () => {},
-      undefined as never,
+      unusedContext,
     );
     expect(deleted.isError).not.toBe(true);
 

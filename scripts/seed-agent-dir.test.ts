@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seedAgentDir, AGENT_DIR_TEMPLATES } from "./seed-agent-dir";
 
-function freshDirs(): { agentDir: string; templateDir: string; cleanup: () => void } {
+function freshDirs() {
   const root = mkdtempSync(join(tmpdir(), "seed-agent-dir-"));
   const agentDir = join(root, "agent");
   const templateDir = join(root, "templates");

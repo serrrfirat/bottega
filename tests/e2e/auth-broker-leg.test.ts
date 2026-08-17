@@ -72,13 +72,13 @@ function skip(reason: string): void {
 
 /** Runs a credential-less initialize against the HOSTED GitHub MCP through the REAL dev proxy in a fresh child (env at boot, like the dev server). */
 async function callHostedMcpViaProxy(): Promise<{ status: number; body: string }> {
-  const childEnv: Record<string, string> = {
+  const childEnv = {
     PATH: process.env.PATH ?? "",
     HTTP_PROXY: PROXY_URL,
     HTTPS_PROXY: PROXY_URL,
     NO_PROXY: "localhost,127.0.0.1",
     NODE_EXTRA_CA_CERTS: `${REPO_ROOT}/certs/ca.crt`,
-  };
+  } satisfies Record<string, string>;
   const script = `const r = await fetch(${JSON.stringify("https://api.githubcopilot.com/mcp/")}, { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "bottega-live-github", version: "1.0.0" } } }) }); console.log(r.status); console.log(await r.text());`;
   const proc = Bun.spawn(["bun", "-e", script], { env: childEnv, stdout: "pipe", stderr: "pipe" });
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -150,6 +150,9 @@ beforeAll(async () => {
       await Bun.sleep(500);
     }
     if (!up) {
+      // SAFETY: brokerProc was spawned with stderr: "pipe" above, so its
+      // stderr is a readable stream — the only null case is a spawn that
+      // never assigned brokerProc, which can't reach this branch.
       const err = await new Response(brokerProc.stderr as ReadableStream).text();
       skip(`local auth-broker did not become healthy (${err.trim().slice(0, 200)})`);
       return;

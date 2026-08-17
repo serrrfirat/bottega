@@ -95,9 +95,11 @@ type MemoryRow = {
 function rowToEntry(row: MemoryRow): MemoryEntry {
   return {
     id: row.id,
+    // SAFETY: validateSaveInput rejects any scope other than "org"/"user" before a row is written.
     scope: row.scope as MemoryEntry["scope"],
     principal: row.principal,
     content: row.content,
+    // SAFETY: save() writes metadata_json from the validated metadata map (string values), so parsing a stored row's JSON yields a string map.
     metadata: JSON.parse(row.metadata_json) as Record<string, string>,
     createdAt: row.created_at,
   };
@@ -194,6 +196,7 @@ export function createSqliteMemoryProvider(
       Object.keys(metadata).length === 0
         ? rows
         : rows.filter((row) => {
+            // SAFETY: stored rows' metadata_json is always a JSON object of string values (validated at save).
             const rowMetadata = JSON.parse(row.metadata_json) as Record<string, string>;
             return Object.entries(metadata).every(([key, value]) => rowMetadata[key] === value);
           });
@@ -207,6 +210,7 @@ export function createSqliteMemoryProvider(
       clauses.push("principal = ?");
       params.push(query.principal);
     }
+    // SAFETY: the SELECT column list exactly matches MemoryRow; bun:sqlite returns plain objects with those columns.
     return db
       .query(
         `SELECT id, scope, principal, content, metadata_json, created_at
@@ -231,6 +235,7 @@ export function createSqliteMemoryProvider(
       clauses.push("m.principal = ?");
       params.push(query.principal);
     }
+    // SAFETY: the SELECT column list exactly matches MemoryRow; bun:sqlite returns plain objects with those columns (blended_rank is an extra column the cast ignores).
     return db
       .query(
         `SELECT m.id, m.scope, m.principal, m.content, m.metadata_json, m.created_at,

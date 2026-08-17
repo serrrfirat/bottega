@@ -29,6 +29,7 @@
  * (issue #25); the ACP driver cannot hook their context.
  */
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import { z } from "@oh-my-pi/pi-coding-agent";
 import { MEMORY_LIMIT_MAX, type MemoryEntry, type MemoryProvider } from "../memory/types";
 
 /** Fixed label of the injected message; also the "already injected" marker. */
@@ -90,15 +91,18 @@ export function memoryContextExtension(
 
 /** True when a message is one of our injected memory blocks (by fixed prefix). */
 function isInjectionMessage(message: { role: string; content?: unknown }): boolean {
-  return typeof message.content === "string" && message.content.startsWith(MEMORY_INJECTION_PREFIX);
+  const content = z.string().safeParse(message.content);
+  return content.success && content.data.startsWith(MEMORY_INJECTION_PREFIX);
 }
 
 /** The latest user message's text (steering/synthetic included — latest wins). */
 function latestUserText(messages: Array<{ role: string; content?: unknown }>): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (message.role !== "user" || typeof message.content !== "string") continue;
-    const text = message.content.trim();
+    if (message.role !== "user") continue;
+    const content = z.string().safeParse(message.content);
+    if (!content.success) continue;
+    const text = content.data.trim();
     if (text) return text;
   }
   return null;

@@ -30,9 +30,27 @@ const CATALOG = {
   ],
 };
 
+/** Catalog document the stub serves — malformed docs exercise the fail-closed paths. */
+interface StubCatalogDoc {
+  version: number;
+  generatedAt?: string;
+  data?: unknown[];
+}
+
 /** Stub catalog server: no network in tests. */
-function stubFetch(catalog: unknown = CATALOG): typeof fetch {
-  return (async () => new Response(JSON.stringify(catalog), { status: 200 })) as unknown as typeof fetch;
+function stubFetch(catalog: StubCatalogDoc = CATALOG): typeof fetch {
+  // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+  // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
+  return (async (_input: string | URL | Request, _init?: RequestInit) =>
+    new Response(JSON.stringify(catalog), { status: 200 })) as typeof fetch;
+}
+
+/** Raw-response fetch stub: serves exactly the given body/status (malformed-catalog cases). */
+function stubResponse(body: string, status: number): typeof fetch {
+  // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+  // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
+  return (async (_input: string | URL | Request, _init?: RequestInit) =>
+    new Response(body, { status })) as typeof fetch;
 }
 
 function completedDraft(overrides: Partial<SnapshotDraft> = {}): SnapshotDraft {
@@ -81,10 +99,10 @@ describe("fetch-catalog helper (issue #54)", () => {
       CatalogError,
     );
     await expect(
-      fetchCatalogEntry("linear", { fetchImpl: (async () => new Response("nope", { status: 200 })) as unknown as typeof fetch }),
+      fetchCatalogEntry("linear", { fetchImpl: stubResponse("nope", 200) }),
     ).rejects.toThrow(/not valid JSON/);
     await expect(
-      fetchCatalogEntry("linear", { fetchImpl: (async () => new Response("", { status: 503 })) as unknown as typeof fetch }),
+      fetchCatalogEntry("linear", { fetchImpl: stubResponse("", 503) }),
     ).rejects.toThrow(/HTTP 503/);
   });
 
@@ -262,7 +280,7 @@ describe("fetch-catalog helper (issue #54)", () => {
  * the live integrations.sh failure mode, issue #118), and one truly
  * unlistable record (missing a renderable field) that must be skipped.
  */
-function catalogWithBadEntry(): { version: number; generatedAt: string; data: unknown[] } {
+function catalogWithBadEntry() {
   return {
     version: 1,
     generatedAt: "2026-08-16T00:00:00.000Z",
@@ -315,7 +333,7 @@ describe("listCatalogEntries resilience (issue #117, #118)", () => {
       name: `Spec ${i}`,
       kind: "mcp",
       domain: `spec${i}.example.com`,
-      ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : {}), // only spec0 has url
+      ...(i === 0 ? { url: `https://spec${i}.example.com/docs` } : undefined), // only spec0 has url
     }));
     const result = await listCatalogEntries(undefined, {
       fetchImpl: stubFetch({ version: 1, generatedAt: "2026-08-16T00:00:00.000Z", data }),
@@ -340,7 +358,7 @@ describe("listCatalogEntries resilience (issue #117, #118)", () => {
     await expect(listCatalogEntries(undefined, { fetchImpl: stubFetch({ version: 1 }) })).rejects.toThrow(/no data array/);
     await expect(
       listCatalogEntries(undefined, {
-        fetchImpl: (async () => new Response("<html>not json</html>", { status: 200 })) as unknown as typeof fetch,
+        fetchImpl: stubResponse("<html>not json</html>", 200),
       }),
     ).rejects.toThrow(/not valid JSON/);
   });

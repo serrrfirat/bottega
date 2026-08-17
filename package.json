@@ -7,6 +7,7 @@
     "dev": "bash scripts/dev.sh",
     "canary": "bash scripts/canary.sh",
     "check": "tsc --noEmit",
+    "lint": "bun --bun x oxlint",
     "test": "bun test",
     "test:e2e": "bun test tests/e2e/",
     "dev:watch": "bash scripts/dev.sh --watch"
@@ -15,7 +16,9 @@
     "@emulators/core": "^0.9.0",
     "@emulators/github": "^0.9.0",
     "@emulators/slack": "^0.9.0",
+    "@oxlint/plugins": "1.78.0",
     "@types/bun": "latest",
+    "oxlint": "1.78.0",
     "typescript": "^5.5.0"
   },
   "dependencies": {

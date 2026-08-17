@@ -19,7 +19,7 @@ import { createStore, type Space } from "../../store/db";
 import { createAudit } from "../../policy/audit";
 import { parseOrgConfigYaml } from "../../policy/config";
 import createPolicyExtension from "../../policy/extension";
-import type { ApprovalRouter } from "../../policy/approval-router";
+import type { ApprovalResolution, ApprovalRouter } from "../../policy/approval-router";
 import {
   APPROVE_ACTION_ID,
   DENY_ACTION_ID,
@@ -38,11 +38,13 @@ interface Posted {
   blocks?: unknown[];
 }
 
-function fakeAdapter(overrides?: { failPost?: boolean; onPosted?: () => void }): {
+interface FakeAdapterHarness {
   adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
   posted: Posted[];
   updated: { spaceId: string; ts: string; text: string }[];
-} {
+}
+
+function fakeAdapter(overrides?: { failPost?: boolean; onPosted?: () => void }): FakeAdapterHarness {
   const posted: Posted[] = [];
   const updated: { spaceId: string; ts: string; text: string }[] = [];
   return {
@@ -69,6 +71,8 @@ interface Block {
 }
 
 function actionBlocks(posted: Posted[]): Block[] {
+  // SAFETY: the router posts blocks as JSON with section/actions shapes that
+  // match the Block test interface; unknown[] widens only the union Slack uses.
   return (posted[0].blocks as Block[] | undefined) ?? [];
 }
 
@@ -85,6 +89,8 @@ function requestIdFrom(posted: Posted[]): string {
 
 /** Request id of the i-th posted prompt (0-based). */
 function requestIdAt(posted: Posted[], i: number): string {
+  // SAFETY: the router posts actions blocks whose elements carry value; the
+  // cast narrows the JSON blocks to the Block test interface those match.
   const actions = (posted[i].blocks as Block[] | undefined)?.find((b) => b.type === "actions");
   return actions?.elements?.find((e) => e.value !== undefined)?.value ?? "";
 }
@@ -209,7 +215,7 @@ describe("SlackApprovalRouter resolution", () => {
     const { adapter, posted, updated } = fakeAdapter();
     const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
 
-    let resolved: unknown = "pending";
+    let resolved: "pending" | ApprovalResolution = "pending";
     const promise = router.request(REQUEST);
     promise.then((r) => {
       resolved = r;
@@ -295,6 +301,8 @@ describe("buildApprovalBlocks", () => {
       { ...REQUEST, args: { api_key: "AKIA1234567890ABCDEF" } },
       "req-123",
     );
+    // SAFETY: buildApprovalBlocks emits section + actions blocks whose
+    // text/elements shapes match the Block test interface.
     const rendered = (blocks as Block[])
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
@@ -303,6 +311,8 @@ describe("buildApprovalBlocks", () => {
     expect(rendered).toContain(REQUEST.reason);
     expect(rendered).toContain("[REDACTED]");
     expect(rendered).not.toContain("AKIA1234567890ABCDEF");
+    // SAFETY: buildApprovalBlocks emits an actions block whose elements carry
+    // action_id/value/style — the shape the Block test interface declares.
     const buttons = (blocks as Block[])
       .find((b) => b.type === "actions")
       ?.elements?.filter((e) => e.action_id !== undefined && e.value !== undefined);
@@ -328,9 +338,19 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
 
   type ToolCallHandler = ExtensionHandler<ToolCallEvent, ToolCallEventResult>;
 
-  function makeGate(router: ApprovalRouter): (tool: string, input?: Record<string, unknown>) => Promise<ToolCallEventResult | void> {
+  /** Fields on approval.resolved audit payloads that these tests read. */
+  interface ApprovalAuditPayload {
+    tool?: string;
+    approved?: boolean;
+    approver?: string;
+  }
+
+  function makeGate(router: ApprovalRouter): (tool: string, input?: Record<string, string>) => Promise<ToolCallEventResult | void> {
     const handlers = new Map<string, ToolCallHandler>();
-    const pi = { on: (event: "tool_call", h: ToolCallHandler) => void handlers.set(event, h) } as unknown as ExtensionAPI;
+    // SAFETY: createPolicyExtension registers tool handlers through pi.on only;
+    // the double implements exactly that surface and the extension never reads
+    // the rest of ExtensionAPI during registration.
+    const pi = { on: (event: "tool_call", h: ToolCallHandler) => void handlers.set(event, h) } as ExtensionAPI;
     createPolicyExtension({
       orgPolicy: parseOrgConfigYaml("tools:\n  bash: allow\n  create_work_item: allow\n"),
       audit,
@@ -338,15 +358,22 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
       store,
     })(pi);
     return async (tool, input = {}) => {
+      // SAFETY: the gate handler only reads sessionManager.getSessionFile() on
+      // this path; the double provides it and nothing else is touched.
       const ctx = { sessionManager: { getSessionFile: () => join("/tmp/sessions", `${space.id}.jsonl`) } } as ExtensionContext;
       const handler = handlers.get("tool_call")!;
+      // SAFETY: the literal carries the type/toolCallId/toolName/input fields
+      // the policy extension reads; the union's per-toolName input narrowing
+      // cannot be composed statically from a string tool name.
       return handler({ type: "tool_call", toolCallId: "tc1", toolName: tool, input } as ToolCallEvent, ctx);
     };
   }
 
   async function resolvedAuditRows() {
     const rows = await audit.listAudit({ event_type: "approval.resolved" });
-    return rows.map((r) => JSON.parse(r.payload) as Record<string, unknown>);
+    // SAFETY: approval.resolved payloads are flat JSON objects carrying the
+    // tool/approved/approver fields these tests read.
+    return rows.map((r) => JSON.parse(r.payload) as ApprovalAuditPayload);
   }
 
   test("ask-human posts a prompt; Approve lets the tool run and both approvals are audited", async () => {
@@ -382,7 +409,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
     await router.handleAction(click(DENY_ACTION_ID, id, { principal: "U9" }));
     const result = await pending;
 
-    if (typeof result === "object" && result !== null) {
+    if (result !== undefined && result !== null) {
       expect(result.block).toBe(true);
     } else {
       expect.unreachable("expected a block result");
@@ -398,7 +425,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
 
     const result = await gate("bash", { command: "ls" });
 
-    if (typeof result === "object" && result !== null) {
+    if (result !== undefined && result !== null) {
       expect(result.block).toBe(true);
     } else {
       expect.unreachable("expected a block result");
@@ -413,7 +440,9 @@ describe("SlackApprovalRouter wiring invariants", () => {
   test("router satisfies the ApprovalRouter request contract", () => {
     const { adapter } = fakeAdapter();
     const router: ApprovalRouter = new SlackApprovalRouter({ adapter });
-    expect(typeof router.request).toBe("function");
-    expect(typeof (router as SlackApprovalRouter).handleAction).toBe("function");
+    expect(router.request).toEqual(expect.any(Function));
+    // SAFETY: handleAction is not part of the ApprovalRouter contract; the
+    // concrete SlackApprovalRouter instance exposes it for the router wiring.
+    expect((router as SlackApprovalRouter).handleAction).toEqual(expect.any(Function));
   });
 });

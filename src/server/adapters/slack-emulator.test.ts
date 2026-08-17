@@ -134,6 +134,7 @@ describe("slack adapter against @emulators/slack", () => {
       body: "{}",
     });
     expect(res.status).toBe(200);
+    // SAFETY: the emulator's auth.test endpoint always answers with the ok/user/team_id JSON contract asserted below.
     const body = (await res.json()) as { ok: boolean; user: string; team_id: string };
     expect(body.ok).toBe(true);
     expect(body.user).toBe("developer");

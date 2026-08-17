@@ -64,13 +64,19 @@ function insertWorkItem(
     );
 }
 
+/** The context fixture: the scheduler action context plus posted messages. */
+interface StandupTestContext {
+  ctx: SchedulerActionContext;
+  posted: Array<{ space: string; text: string }>;
+}
+
 function context(
   store: Store,
   options: {
     responseMode?: ResponseMode;
     memoryProvider?: MemoryProvider;
   } = {},
-): { ctx: SchedulerActionContext; posted: Array<{ space: string; text: string }> } {
+): StandupTestContext {
   const posted: Array<{ space: string; text: string }> = [];
   return {
     posted,
@@ -98,6 +104,8 @@ async function createSpace(store: Store, channel: string, policyJson: string): P
 }
 
 function memoryRows(store: Store): Array<{ id: string; content: string; metadata_json: string }> {
+  // SAFETY: the SELECT lists exactly these three TEXT columns; SQLite
+  // returns TEXT values as strings, so every row matches the annotation.
   return store
     .getDb()
     .query("SELECT id, content, metadata_json FROM memories ORDER BY created_at, rowid")

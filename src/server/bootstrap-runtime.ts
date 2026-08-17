@@ -145,7 +145,7 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // construction when a plain object was given, otherwise forward per call
   // so the server's mid-boot router assignment is observed live.
   const resolveRouter = (): ApprovalRouter =>
-    typeof deps.router === "function" ? deps.router() : deps.router;
+    "request" in deps.router ? deps.router : deps.router();
   const runtime = createExtensionRuntime({
     registry,
     store,
@@ -154,8 +154,8 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     router: { request: (request) => resolveRouter().request(request) },
     boundary,
     surfaces,
-    ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {}),
-    ...(deps.onToolStep !== undefined ? { onToolStep: deps.onToolStep } : {}),
+    ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : undefined),
+    ...(deps.onToolStep !== undefined ? { onToolStep: deps.onToolStep } : undefined),
   });
   // One memory provider per process (issues #43/#67/#135): explicit
   // memory_backend.base_url settings select mem0 first, MEM0_BASE_URL is

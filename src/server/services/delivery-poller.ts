@@ -20,6 +20,7 @@
  * `delivery.resolved`, which the executor's onDelivery wait reads as the
  * approval. This module only announces.
  */
+import { z } from "zod";
 import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { SlackAdapter } from "../adapters/slack";
@@ -42,16 +43,17 @@ export interface DeliveryPoller {
   stop(): void;
 }
 
-interface DeliveryPayload {
-  id?: unknown;
-  pr_url?: unknown;
-  summary?: unknown;
-}
+/** The `work_item.delivery_pending` marker payload, decoded at the audit-row boundary. */
+const DeliveryPayloadSchema = z.object({
+  id: z.string().optional(),
+  pr_url: z.string().optional(),
+  summary: z.string().optional().catch(""),
+});
+type DeliveryPayload = z.infer<typeof DeliveryPayloadSchema>;
 
 function parsePayload(raw: string): DeliveryPayload | null {
   try {
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null ? (parsed as DeliveryPayload) : null;
+    return DeliveryPayloadSchema.parse(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -74,16 +76,16 @@ export async function pollPendingDeliveries(
   const announced = new Set<string>();
   for (const row of requested) {
     const payload = parsePayload(row.payload);
-    if (payload && typeof payload.id === "string") announced.add(payload.id);
+    if (payload && payload.id !== undefined) announced.add(payload.id);
   }
 
   let posted = 0;
   for (const row of pending) {
     if (!row.space_id) continue;
     const payload = parsePayload(row.payload);
-    if (!payload || typeof payload.id !== "string" || typeof payload.pr_url !== "string") continue;
+    if (!payload || payload.id === undefined || payload.pr_url === undefined) continue;
     if (announced.has(payload.id)) continue;
-    const summary = typeof payload.summary === "string" ? payload.summary : "";
+    const summary = payload.summary ?? "";
     // Interactive prompt: approve/deny buttons carry the work item id, the
     // key the delivery router resolves on (issue #149).
     await adapter.postMessage(

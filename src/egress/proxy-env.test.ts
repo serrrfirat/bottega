@@ -34,8 +34,11 @@ afterAll(() => {
   proxy.stop();
 });
 
+/** The child process environment: PATH plus the proxy vars under test. */
+interface ChildEnv extends Record<string, string> {}
+
 async function fetchWithEnv(env: Record<string, string>): Promise<{ body: string; proxyHits: number }> {
-  const childEnv: Record<string, string> = { PATH: process.env.PATH ?? "" };
+  const childEnv: ChildEnv = { PATH: process.env.PATH ?? "" };
   for (const [k, v] of Object.entries(env)) childEnv[k] = v;
   const proc = Bun.spawn(["bun", "-e", `const r = await fetch(${JSON.stringify(originUrl)}); console.log(await r.text());`], {
     env: childEnv,

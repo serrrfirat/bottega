@@ -1,4 +1,5 @@
 import type { AuditRow, ListAuditOpts, Store } from "../store/db";
+import { z } from "@oh-my-pi/pi-coding-agent";
 
 /** Payload cap before write (issue #7): oversized payloads are truncated, never dropped. */
 export const MAX_PAYLOAD_BYTES = 4 * 1024;
@@ -42,13 +43,16 @@ function enforcePayloadCap(text: string): string {
   return cut + TRUNCATION_MARKER;
 }
 
+/** JSON-serializable values accepted as audit payloads (stringified on write). */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 export interface AuditModule {
   appendAudit(entry: {
     ts?: number;
     space_id?: string | null;
     actor: string;
     event_type: string;
-    payload: Record<string, unknown> | string;
+    payload: JsonValue;
   }): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
 }
@@ -62,7 +66,8 @@ export interface AuditModule {
 export function createAudit(store: Store): AuditModule {
   return {
     async appendAudit(entry) {
-      const text = typeof entry.payload === "string" ? entry.payload : JSON.stringify(entry.payload);
+      const parsed = z.string().safeParse(entry.payload);
+      const text = parsed.success ? parsed.data : JSON.stringify(entry.payload);
       return store.appendAudit({
         ts: entry.ts,
         space_id: entry.space_id,

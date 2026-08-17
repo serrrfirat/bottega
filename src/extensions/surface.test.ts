@@ -23,16 +23,20 @@ const BINDING: McpBinding = { serverUrl: "https://mcp.example.test/mcp", transpo
 
 /** A tools-less mcp manifest (the discovery subject). */
 function toolsLessManifest(overrides: Partial<ExtensionManifest> = {}): ExtensionManifest {
-  return validateManifest({
-    id: "discover.me",
-    label: "Discover Me",
-    vendor: "example",
-    kind: "mcp",
-    mcp: BINDING,
-    credentialSchema: { type: "api_key" },
-    domains: ["mcp.example.test"],
-    ...overrides,
-  });
+  return validateManifest(
+    JSON.parse(
+      JSON.stringify({
+        id: "discover.me",
+        label: "Discover Me",
+        vendor: "example",
+        kind: "mcp",
+        mcp: BINDING,
+        credentialSchema: { type: "api_key" },
+        domains: ["mcp.example.test"],
+        ...overrides,
+      }),
+    ),
+  );
 }
 
 /** A fake MCP server whose tools/list returns the given wire tools (counting calls). */
@@ -184,7 +188,12 @@ describe("extensionToolSurface (issue #158 runtime discovery)", () => {
     const broken = (): Transport => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "broken-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-      server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: "nope" }) as never);
+      server.setRequestHandler(ListToolsRequestSchema, async () =>
+        // SAFETY: the malformed response is the point of the test — the SDK's
+        // ListToolsResultSchema must reject it, so the typed handler return is
+        // deliberately bypassed (never) to inject the invalid shape.
+        ({ tools: "nope" }) as never,
+      );
       void server.connect(serverTransport);
       return clientTransport;
     };
@@ -196,16 +205,20 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
   test("resolves every registered extension's effective surface in one map", async () => {
     const registry = createExtensionRegistry();
     registry.register(
-      validateManifest({
-        id: "pinned.provider",
-        label: "Pinned",
-        vendor: "example",
-        kind: "mcp",
-        mcp: BINDING,
-        credentialSchema: { type: "api_key" },
-        tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
-        domains: ["pinned.example"],
-      }),
+      validateManifest(
+        JSON.parse(
+          JSON.stringify({
+            id: "pinned.provider",
+            label: "Pinned",
+            vendor: "example",
+            kind: "mcp",
+            mcp: BINDING,
+            credentialSchema: { type: "api_key" },
+            tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
+            domains: ["pinned.example"],
+          }),
+        ),
+      ),
     );
     registry.register(toolsLessManifest({ id: "discover.me" }));
 
@@ -271,16 +284,20 @@ describe("toolOwnerExtensionId (the MCP surface's name→extension seam)", () =>
   test("resolves owners across pinned AND discovered surfaces", async () => {
     const registry = createExtensionRegistry();
     registry.register(
-      validateManifest({
-        id: "pinned.provider",
-        label: "Pinned",
-        vendor: "example",
-        kind: "mcp",
-        mcp: BINDING,
-        credentialSchema: { type: "api_key" },
-        tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
-        domains: ["pinned.example"],
-      }),
+      validateManifest(
+        JSON.parse(
+          JSON.stringify({
+            id: "pinned.provider",
+            label: "Pinned",
+            vendor: "example",
+            kind: "mcp",
+            mcp: BINDING,
+            credentialSchema: { type: "api_key" },
+            tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
+            domains: ["pinned.example"],
+          }),
+        ),
+      ),
     );
     registry.register(toolsLessManifest({ id: "discover.me" }));
 

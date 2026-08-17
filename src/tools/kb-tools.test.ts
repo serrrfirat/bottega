@@ -5,7 +5,9 @@ import type { AuditModule } from "../policy/audit";
 import { isKnownTool, resolveTier } from "../policy/config";
 import { kbToolDefinitions } from "./kb-tools";
 
-const unusedContext = {} as unknown as ExtensionContext;
+// SAFETY: the kb tools under test never read the extension context; an empty
+// stub stands in for the real session context.
+const unusedContext = {} as ExtensionContext;
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,

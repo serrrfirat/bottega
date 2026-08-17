@@ -86,6 +86,22 @@ function completeLines(contents: string): string[] {
   return lines;
 }
 
+/** A transcript part that contributes visible text (other part types are dropped). */
+const textPartSchema = z.object({ type: z.literal("text"), text: z.string() });
+
+/**
+ * Wire shape of one indexable transcript message. Defensively permissive:
+ * non-message records and malformed lines are skipped, and a non-string
+ * timestamp is treated as absent (the record stays indexable).
+ */
+const messageLineSchema = z.object({
+  type: z.literal("message"),
+  message: z.object({
+    content: z.union([z.string(), z.array(z.unknown())]),
+  }),
+  timestamp: z.string().optional().catch(undefined),
+});
+
 function messageText(line: string): { timestamp: string | null; text: string } | null {
   let entry: unknown;
   try {
@@ -93,32 +109,21 @@ function messageText(line: string): { timestamp: string | null; text: string } |
   } catch {
     return null;
   }
-  if (!entry || typeof entry !== "object") return null;
-  const record = entry as Record<string, unknown>;
-  if (record.type !== "message" || !record.message || typeof record.message !== "object") return null;
-
-  const message = record.message as Record<string, unknown>;
-  const content = message.content;
-  let text = "";
-  if (typeof content === "string") {
-    text = content;
-  } else if (Array.isArray(content)) {
+  const parsed = messageLineSchema.safeParse(entry);
+  if (!parsed.success) return null;
+  const content = parsed.data.message.content;
+  let text: string;
+  if (Array.isArray(content)) {
     text = content
-      .filter(
-        (part): part is { type: "text"; text: string } =>
-          !!part &&
-          typeof part === "object" &&
-          (part as Record<string, unknown>).type === "text" &&
-          typeof (part as Record<string, unknown>).text === "string",
-      )
-      .map((part) => part.text)
+      .map((part) => textPartSchema.safeParse(part))
+      .flatMap((result) => (result.success ? [result.data.text] : []))
       .join("\n");
+  } else {
+    text = content;
   }
   text = text.trim();
   if (!text) return null;
-
-  const timestamp = typeof record.timestamp === "string" ? record.timestamp : null;
-  return { timestamp, text };
+  return { timestamp: parsed.data.timestamp ?? null, text };
 }
 
 /**
@@ -137,6 +142,8 @@ export function indexSessionFiles(db: Database, dir: string): SessionIndexResult
       .filter((name) => name.endsWith(".jsonl"))
       .sort();
   } catch (error) {
+    // SAFETY: Bun's fs functions reject with an ErrnoException carrying
+    // `.code`; any other rejection re-throws below.
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       names = [];
     } else {
@@ -170,12 +177,16 @@ export function indexSessionFiles(db: Database, dir: string): SessionIndexResult
         fileId = `${stat.dev}:${stat.ino}`;
         contents = readFileSync(path, "utf8");
       } catch (error) {
+        // SAFETY: statSync/readFileSync reject with an ErrnoException
+        // carrying `.code`; any other rejection re-throws below.
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
 
       currentFiles.add(name);
       const lines = completeLines(contents);
+      // SAFETY: the prepared SELECT lists exactly file, file_id,
+      // processed_lines, matching MetaRow; .get() yields null when absent.
       const prior = getMeta.get(name) as MetaRow | null;
       const rotated = prior !== null && (prior.file_id !== fileId || lines.length < prior.processed_lines);
       if (rotated) deleteFile.run(name);
@@ -193,6 +204,7 @@ export function indexSessionFiles(db: Database, dir: string): SessionIndexResult
       upsertMeta.run(name, fileId, lines.length);
     }
 
+    // SAFETY: the SELECT lists exactly one `file` column per row.
     const known = db.query("SELECT file FROM session_search_meta").all() as Array<{ file: string }>;
     const deleteMeta = db.query("DELETE FROM session_search_meta WHERE file = ?");
     for (const { file } of known) {
@@ -230,6 +242,8 @@ export function searchSessions(db: Database, input: SessionSearchQuery): Session
 
   let rows: SearchRow[];
   try {
+    // SAFETY: the SELECT lists exactly space, file, line, timestamp, text in
+    // order, matching SearchRow; CAST(line AS INTEGER) yields the number.
     rows = db
       .query(
         `SELECT space, file, CAST(line AS INTEGER) AS line, timestamp, text

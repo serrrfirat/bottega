@@ -9,21 +9,27 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("auth-broker runs the OMP vault on the internal network with a token bootstrap", () => {
     const broker = service("auth-broker");
     expect(broker["image"]).toBe("oh-my-pi/pi:dev");
+    // SAFETY: hand-authored fixture renders `entrypoint` as a block sequence of scalars.
     expect(broker["entrypoint"] as string[]).toEqual(["/entrypoints/broker.sh"]);
+    // SAFETY: hand-authored fixture renders `command` as a block sequence of scalars.
     expect(broker["command"] as string[]).toEqual([
       "auth-broker",
       "serve",
       "--bind=0.0.0.0:8765",
     ]);
     expect(serviceEnv("auth-broker")["PI_CONFIG_DIR"]).toBe("/data/.omp");
+    // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const volumes = broker["volumes"] as string[];
     expect(volumes).toContain("./config/entrypoints:/entrypoints:ro");
     expect(volumes).toContain("data:/data");
     // Vault state (token + SQLite) must survive container recreation.
+    // SAFETY: hand-authored fixture renders `networks` as a block sequence of scalars.
     expect((broker["networks"] as string[]).includes("egress")).toBe(true);
   });
 
   test("auth-broker healthcheck gates dependents on token readiness", () => {
+    // SAFETY: the healthcheck is a mapping and its `test` key a block sequence
+    // in the hand-authored fixture; a shape change fails this assertion loudly.
     const test = (service("auth-broker")["healthcheck"] as Record<string, YamlNode>)[
       "test"
     ] as string[];
@@ -33,10 +39,13 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("auth-gateway starts only after the broker is healthy and inherits the broker token", () => {
     const gateway = service("auth-gateway");
     expect(gateway["image"]).toBe("oh-my-pi/pi:dev");
+    // SAFETY: hand-authored fixture renders `depends_on` as a mapping of service conditions.
     const depends = gateway["depends_on"] as Record<string, YamlNode>;
+    // SAFETY: each depends_on entry is itself a mapping in the hand-authored fixture.
     expect((depends["auth-broker"] as Record<string, YamlNode>)["condition"]).toBe(
       "service_healthy",
     );
+    // SAFETY: hand-authored fixture renders `command` as a block sequence of scalars.
     expect(gateway["command"] as string[]).toEqual([
       "auth-gateway",
       "serve",
@@ -47,6 +56,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     // Same PI_CONFIG_DIR on the shared volume: the gateway resolves the
     // broker token from /data/.omp/auth-broker.token without an env token.
     expect(env["PI_CONFIG_DIR"]).toBe("/data/.omp");
+    // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const volumes = gateway["volumes"] as string[];
     expect(volumes).toContain("data:/data");
   });
@@ -57,7 +67,9 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       expect(env["OMP_AUTH_BROKER_URL"]).toBe("${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}");
       expect(env["OMP_AUTH_BROKER_TOKEN"]).toBe("${OMP_AUTH_BROKER_TOKEN:-}");
       // Broker-mode traffic bypasses the egress proxy.
+      // SAFETY: NO_PROXY is a scalar string in the hand-authored fixture.
       expect((env["NO_PROXY"] as string).split(",")).toContain("auth-broker");
+      // SAFETY: same scalar-string invariant for the gateway entry.
       expect((env["NO_PROXY"] as string).split(",")).toContain("auth-gateway");
     }
   });
@@ -74,6 +86,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     // /app/data/omp-agent is the container path of the app's relative
     // data/omp-agent (WORKDIR /app, issue #12).
     for (const name of ["server", "executor"]) {
+      // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
       const volumes = service(name)["volumes"] as string[];
       expect(volumes).toContain("./config/omp:/app/data/omp-agent");
     }

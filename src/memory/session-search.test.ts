@@ -19,7 +19,7 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(): { db: Database; dir: string } {
+function fixture() {
   const id = fixtureNumber++;
   const dir = join(root, `sessions-${id}`);
   mkdirSync(dir);
@@ -63,6 +63,8 @@ describe("session transcript FTS index", () => {
     expect(indexSessionFiles(db, dir)).toEqual({ files: 1, indexedLines: 1, indexedMessages: 1 });
     expect(searchSessions(db, { query: "alpha" }).map((hit) => hit.line).sort()).toEqual([3, 5]);
 
+    // SAFETY: the SELECT lists the processed_lines INTEGER column of the meta row
+    // for this file, inserted by indexSessionFiles; bun:sqlite surfaces it as a number.
     const meta = db.query("SELECT processed_lines FROM session_search_meta WHERE file = ?").get("slack:C1.jsonl") as {
       processed_lines: number;
     };
@@ -129,11 +131,14 @@ describe("session transcript FTS index", () => {
   });
 
   test("fails closed with a clear error when SQLite lacks FTS5", () => {
+    // SAFETY: searchSessions probes FTS5 availability through exec() and must see
+    // it throw; the rest of Database is never touched on that path, so the partial
+    // fake is safe to treat as a Database (never is the single-hop escape).
     const unavailableDb = {
       exec(sql: string) {
         if (sql.includes("VIRTUAL TABLE")) throw new Error("no such module: fts5");
       },
-    } as unknown as Database;
+    } as never;
 
     expect(() => searchSessions(unavailableDb, { query: "anything" })).toThrow(SessionSearchUnavailableError);
     expect(() => searchSessions(unavailableDb, { query: "anything" })).toThrow(/FTS5 support is required/);

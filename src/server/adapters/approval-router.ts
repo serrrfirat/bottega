@@ -124,6 +124,10 @@ export class SlackApprovalRouter implements ApprovalRouter {
   async request(d: ApprovalRequest): Promise<ApprovalResolution> {
     const id = randomUUID();
     if (this.pending.size >= this.maxPending) {
+      // SAFETY: a Map iterator's next() yields { value, done }; value is the
+      // oldest PendingRequest while the registry is non-empty (size >=
+      // maxPending >= 1) and undefined when empty — the guard below handles
+      // both shapes.
       const oldest = this.pending.values().next().value as PendingRequest | undefined;
       if (oldest !== undefined) {
         this.log(`[approvals] registry full — evicting request ${oldest.id}`);
@@ -213,6 +217,6 @@ export class SlackApprovalRouter implements ApprovalRouter {
     const { resolution, label } = entry.outcome!;
     void this.adapter
       .updateMessage(entry.spaceId, entry.messageTs, outcomeText(entry, resolution, label))
-      .catch((err: unknown) => this.log(`[approvals] updateMessage failed for ${entry.id}: ${String(err)}`));
+      .catch((err) => this.log(`[approvals] updateMessage failed for ${entry.id}: ${String(err)}`));
   }
 }

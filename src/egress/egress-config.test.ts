@@ -7,11 +7,36 @@ const cfg = parseYamlSubset(
   readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"),
 );
 
-const transforms = cfg["transforms"] as YamlNode[];
-const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as Record<string, YamlNode>;
-const allowlistCfg = allowlist["config"] as Record<string, YamlNode>;
-const judge = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "judge") as Record<string, YamlNode>;
-const judgeCfg = judge["config"] as Record<string, YamlNode>;
+// config/egress.yml is hand-authored to the iron-proxy v0.49.0 schema; every
+// key this suite reads is asserted below, so narrowing nodes to their rendered
+// shapes (block mapping / scalar sequence / scalar) is sound. A shape change
+// surfaces as a failing assertion, never a silent skip.
+function asRecord(node: YamlNode): Record<string, YamlNode> {
+  // SAFETY: every key this suite reads is a block mapping in the committed config.
+  return node as Record<string, YamlNode>;
+}
+function asRecordArray(node: YamlNode): Record<string, YamlNode>[] {
+  // SAFETY: `transforms` and `secrets` are block sequences of mappings in the committed config.
+  return node as Record<string, YamlNode>[];
+}
+function asStringArray(node: YamlNode): string[] {
+  // SAFETY: the domains/rules keys are block sequences of scalar strings in the committed config.
+  return node as string[];
+}
+function asString(node: YamlNode): string {
+  // SAFETY: the name/prompt/base_url keys are scalar strings in the committed config.
+  return node as string;
+}
+
+const transforms = asRecordArray(cfg["transforms"]);
+// SAFETY: the committed config names the transforms allowlist/judge/secrets;
+// the ordering assertion below pins that exact set.
+const allowlist = transforms.find((t) => asRecord(t)["name"] === "allowlist") as Record<string, YamlNode>;
+const allowlistCfg = asRecord(allowlist["config"]);
+// SAFETY: the committed config names the transforms allowlist/judge/secrets;
+// the ordering assertion below pins that exact set.
+const judge = transforms.find((t) => asRecord(t)["name"] === "judge") as Record<string, YamlNode>;
+const judgeCfg = asRecord(judge["config"]);
 
 describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   test("has the expected top-level sections", () => {
@@ -23,33 +48,33 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     // each secret file; the management block must be present in the ONE
     // committed config so both compose and local dev (docker-compose.dev.yml
     // publishes 127.0.0.1:9092) can rotate credentials without a restart.
-    const mgmt = cfg["management"] as Record<string, YamlNode>;
+    const mgmt = asRecord(cfg["management"]);
     expect(mgmt["listen"]).toBe(":9092");
     expect(mgmt["api_key_env"]).toBe("IRON_MANAGEMENT_API_KEY");
   });
 
   test("DNS resolves everything to the proxy IP (default-deny routing)", () => {
-    const dns = cfg["dns"] as Record<string, YamlNode>;
+    const dns = asRecord(cfg["dns"]);
     expect(dns["listen"]).toBe(":53");
     expect(dns["proxy_ip"]).toBe("172.30.0.2");
   });
 
   test("proxy listeners include the explicit tunnel for HTTP_PROXY clients", () => {
-    const proxy = cfg["proxy"] as Record<string, YamlNode>;
+    const proxy = asRecord(cfg["proxy"]);
     expect(proxy["http_listen"]).toBe(":80");
     expect(proxy["https_listen"]).toBe(":443");
     expect(proxy["tunnel_listen"]).toBe(":8080");
   });
 
   test("TLS MITM CA is configured (read-only mount, never committed)", () => {
-    const tls = cfg["tls"] as Record<string, YamlNode>;
+    const tls = asRecord(cfg["tls"]);
     expect(tls["ca_cert"]).toBe("/etc/iron-proxy/certs/ca.crt");
     expect(tls["ca_key"]).toBe("/etc/iron-proxy/certs/ca.key");
   });
 
   test("allowlist contains the NEAR.ai model endpoints", () => {
     expect(allowlist).toBeDefined();
-    const domains = allowlistCfg["domains"] as string[];
+    const domains = asStringArray(allowlistCfg["domains"]);
     // Live gateway used by config/omp/models.yml (issue #36); api.near.ai
     // was retired 2025-10-31 and must not be allowed.
     expect(domains).toContain("cloud-api.near.ai");
@@ -58,7 +83,7 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   });
 
   test("allowlist contains the OpenAI and Anthropic model gateways (#37ee2bf)", () => {
-    const domains = allowlistCfg["domains"] as string[];
+    const domains = asStringArray(allowlistCfg["domains"]);
     // The OpenAI/Anthropic providers (37ee2bf) reach their gateways through
     // the proxy; a missing domain = those providers dead in compose
     // (default-deny egress answers every name with the proxy IP, 403 at the
@@ -69,61 +94,58 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
 
   test("judge policy gate is configured after the allowlist", () => {
     expect(judge).toBeDefined();
-    expect((judgeCfg["name"] as string)).toBe("egress-policy");
+    expect(asString(judgeCfg["name"])).toBe("egress-policy");
     expect(judgeCfg["fallback"]).toBe("deny"); // fail closed
   });
 
   test("judge has a timeout and circuit breaker", () => {
     expect(judgeCfg["timeout"]).toBe("8s");
-    const cb = judgeCfg["circuit_breaker"] as Record<string, YamlNode>;
+    const cb = asRecord(judgeCfg["circuit_breaker"]);
     expect(Number(cb["consecutive_failures"])).toBeGreaterThan(0);
     expect(cb["cooldown"]).toMatch(/^[0-9]+(m|s)$/);
   });
 
   test("judge rules cover all traffic that passes the allowlist", () => {
-    const rules = judgeCfg["rules"] as Record<string, YamlNode>[];
+    const rules = asRecordArray(judgeCfg["rules"]);
     expect(rules).toHaveLength(1);
     expect(rules[0]["host"]).toBe("*");
   });
 
   test("judge LLM backend points at a NEAR.ai OpenAI-compatible endpoint", () => {
-    const provider = judgeCfg["provider"] as Record<string, YamlNode>;
+    const provider = asRecord(judgeCfg["provider"]);
     expect(provider["type"]).toBe("openai");
-    expect(provider["base_url"] as string).toMatch(/^https:\/\/[a-z0-9-]+\.completions\.near\.ai\/v1$/);
+    expect(asString(provider["base_url"])).toMatch(/^https:\/\/[a-z0-9-]+\.completions\.near\.ai\/v1$/);
     expect(provider["api_key_env"]).toBe("NEARAI_JUDGE_API_KEY");
     expect(Number(provider["max_tokens"])).toBeGreaterThan(0);
   });
 
   test("judge prompt encodes the deny-unless policy", () => {
-    const prompt = judgeCfg["prompt"] as string;
+    const prompt = asString(judgeCfg["prompt"]);
     expect(prompt).toMatch(/DENY/i);
     expect(prompt).toMatch(/clearly required by the\s+current task/i);
   });
 
   test("secrets transform (issue #53) runs AFTER judge and injects auth per extension", () => {
-    const secrets = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "secrets") as Record<
-      string,
-      YamlNode
-    >;
+    const secrets = transforms.find((t) => asRecord(t)["name"] === "secrets")!;
     expect(secrets).toBeDefined();
     // Ordering: allowlist, judge, secrets — the LLM judge must never see
     // real credentials (iron-proxy README's recommended ordering).
-    const names = transforms.map((t) => (t as Record<string, YamlNode>)["name"] as string);
+    const names = transforms.map((t) => asString(asRecord(t)["name"]));
     expect(names).toEqual(["allowlist", "judge", "secrets"]);
-    const cfg = secrets["config"] as Record<string, YamlNode>;
-    const entries = cfg["secrets"] as Record<string, YamlNode>[];
+    const cfg = asRecord(secrets["config"]);
+    const entries = asRecordArray(cfg["secrets"]);
     expect(entries).toHaveLength(4); // attio, github, linear, notion
     for (const entry of entries) {
-      const source = entry["source"] as Record<string, YamlNode>;
+      const source = asRecord(entry["source"]);
       expect(source["type"]).toBe("file");
-      expect(source["path"] as string).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
-      const inject = entry["inject"] as Record<string, YamlNode>;
+      expect(asString(source["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
+      const inject = asRecord(entry["inject"]);
       expect(inject["header"]).toBe("Authorization");
       expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
-      const rules = entry["rules"] as Record<string, YamlNode>[];
+      const rules = asRecordArray(entry["rules"]);
       expect(rules.length).toBeGreaterThanOrEqual(1);
       for (const rule of rules) {
-        expect(allowlistCfg["domains"] as string[]).toContain(String(rule["host"]));
+        expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
       }
     }
   });

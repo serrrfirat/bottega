@@ -31,8 +31,8 @@ async function auditError(
 export const recurringWorkAction: SchedulerAction = {
   name: ACTION_NAME,
   async run(params, ctx) {
-    const space = typeof params.space === "string" ? params.space.trim() : "";
-    const description = typeof params.description === "string" ? params.description.trim() : "";
+    const space = params.space?.trim() ?? "";
+    const description = params.description?.trim() ?? "";
 
     if (!space) {
       await auditError(ctx, null, "space is required");

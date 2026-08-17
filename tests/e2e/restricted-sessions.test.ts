@@ -15,7 +15,8 @@
  * model request the stub actually received.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { bootHarness, type Harness, type StubTurn } from "./harness";
+import { z } from "zod";
+import { bootHarness, type EmulatorMessage, type Harness, type StubTurn } from "./harness";
 import { APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../../src/store/audit-events";
 
 const dirs: Array<{ cleanup(): Promise<void> }> = [];
@@ -29,14 +30,29 @@ async function harness(turns: StubTurn[], orgConfigYaml: string): Promise<Harnes
   return h;
 }
 
+/**
+ * Payload schema for the decision/resolution events this journey audits:
+ * policy.decision rows carry {tool, tier, decision, reason, args} and
+ * approval.resolved rows {tool, approved, approver} — only the fields the
+ * journey asserts on are pinned; unknown keys pass through untouched.
+ */
+const auditPayloadSchema = z
+  .object({
+    tool: z.string().optional(),
+    tier: z.string().optional(),
+    decision: z.string().optional(),
+    approved: z.boolean().optional(),
+  })
+  .passthrough();
+
 /** Audit rows for one event type, payload parsed. */
 async function auditRows(h: Harness, eventType: string) {
   const rows = (await h.audit.listAudit({})).filter((r) => r.event_type === eventType);
-  return rows.map((row) => JSON.parse(row.payload) as Record<string, unknown>);
+  return rows.map((row) => auditPayloadSchema.parse(JSON.parse(row.payload)));
 }
 
 /** Polls the emulator for an outbound message (posts land a beat after the turn). */
-async function waitForReply(h: Harness, text: string, timeoutMs = 5_000): Promise<unknown> {
+async function waitForReply(h: Harness, text: string, timeoutMs = 5_000): Promise<EmulatorMessage | undefined> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const reply = h.messages(h.slack.dmChannelId).find((m) => m.text === text);
@@ -102,6 +118,8 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
         // Exec tier → ask-human → the harness's auto-approving router
         // resolves it; the item lands in the queue.
         const rows = h.store.getDb().query("SELECT id FROM work_items WHERE description = ?");
+        // SAFETY: the SELECT above returns exactly the `id` column, which
+        // SQLite stores as a TEXT value — every row is { id: string }.
         const items = rows.all("fix the flaky checkout") as Array<{ id: string }>;
         expect(items.length).toBe(1);
 
@@ -158,7 +176,10 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
         await h.deliverMessage(h.slack.dmChannelId, "deploy");
         await h.modelStub.waitForRequests(1);
 
-        const system = h.modelStub.latestMessages().find((m) => m.role === "system" && typeof m.content === "string");
+        const system = h
+          .modelStub
+          .latestMessages()
+          .find((m) => m.role === "system" && z.string().safeParse(m.content).success);
         expect(system).toBeDefined();
         expect(String(system!.content)).toContain("Relevant memory:");
         expect(String(system!.content)).toContain("the build runs on arm64");

@@ -1,12 +1,25 @@
 /**
- * Executor: containerized work-item delivery runner (issues #11 and #129).
+ * Executor: containerized worker for bottega's job bus (issues #11, #129,
+ * epic #170).
  *
- * One claim loop, one agent session per executable work item, no
- * orchestration framework. Boots with stale-run recovery (#10), then routes:
+ * One claim loop over the typed job envelope (kind: git | extension | kb |
+ * scheduled) — no orchestration framework. Boots with stale-run recovery
+ * (#10) and the fail-loud unclaimed sweep (#170), then routes:
  *
- *   git       → workspace → agent → push → PR → review → done | blocked
- *   extension → memory/extension agent → external object → done | blocked
- *   chat      → returned to open for the space agent
+ *   git       → work item → workspace → agent → push → PR → review → done | blocked
+ *   extension → work item → memory/extension agent → external object → done | blocked
+ *   kb        → fail-closed stub until Wave 2 (never a silent no-op)
+ *   scheduled → fail-closed stub until Wave 2 dispatchers land
+ *
+ * chat items are NOT worker jobs: the space agent handles them in-session
+ * (epic #170 — conversation stays server-side).
+ *
+ * Job lifecycle (one envelope id across enqueue → claim → run → outbox →
+ * post): the store's atomic claim UPDATE (lease expiry) hands the worker a
+ * job; completion writes an outbox row (the worker→server signal) + audit
+ * job.completed; failure requeues with bounded exponential backoff and
+ * fails closed after max attempts (audit job.failed); a job no worker
+ * claimed within its TTL surfaces as audit job.unclaimed + nudge.
  *
  * Credential boundary: the git PAT lives in a FILE (default
  * data/secrets/github-pat, mode 0600, env-overridable via
@@ -14,7 +27,8 @@
  * git reads it through a generated GIT_ASKPASS helper, and the GitHub API
  * request reads the same file. A mode other than 0600 fails boot closed
  * (org setting allow_loose_pat opts out, local dev only). The PAT value
- * also never reaches tests via env (asserted in executor.test.ts).
+ * also never reaches tests via env (asserted in executor.test.ts). The
+ * worker holds no Slack tokens — server posts happen through the outbox.
  *
  * Runtime knobs (issue #67): repo allowlist, git/api base URLs, workspaces
  * dir, and allow_loose_pat live in the org settings blob (DB — source of
@@ -41,9 +55,15 @@ import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
   DELIVERY_RESOLVED_EVENT,
+  JOB_CLAIMED_EVENT,
+  JOB_COMPLETED_EVENT,
+  JOB_FAILED_EVENT,
+  JOB_UNCLAIMED_EVENT,
   WORK_ITEM_FAILED_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "./store/audit-events";
+import { postOutboxRow } from "./store/outbox";
+import { workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
 import { DenyRouter } from "./policy/approval-router";
 import {
   assertAgentDirModelAvailable,
@@ -62,7 +82,13 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
+
+/** The session driver "message" event payload: { spaceId, text }. */
+const driverMessageSchema = z.object({ text: z.string() });
+/** The session driver "error" event payload: { spaceId, message }. */
+const driverErrorSchema = z.object({ message: z.string() });
 
 /**
  * Work-item session tool allowlist: file/code tools + bash. Git runs through
@@ -141,12 +167,36 @@ export interface ExecutorDeps {
    * `delivery.resolved` marker. Default 2000 ms.
    */
   deliveryPollIntervalMs?: number;
+  /** Job-claim lease (epic #170): how long a claimed job stays owned before another worker may reclaim it. Default: the stale-run window. */
+  jobLeaseMs?: number;
+  /** Max claim attempts before a job fails closed with audit job.failed (epic #170). Default 5. */
+  maxJobAttempts?: number;
+  /** Requeue backoff base; doubles per attempt up to jobBackoffMaxMs (epic #170). Default 5 s. */
+  jobBackoffMs?: number;
+  /** Requeue backoff ceiling. Default 5 min. */
+  jobBackoffMaxMs?: number;
+  /** Unclaimed TTL: a queued job never claimed within this window is failed with audit job.unclaimed + the nudge hook (epic #170). Default: the stale-run window. */
+  jobUnclaimedTtlMs?: number;
+  /** How often the claim loop sweeps for unclaimed jobs. Default 60 s. */
+  jobSweepIntervalMs?: number;
+  /**
+   * Nudge hook for unclaimed jobs (epic #170). The worker holds no Slack
+   * tokens (credential boundary), so the default surfaces the audit row +
+   * a log line; Wave 2 wires the server-side onboarding nudge to the
+   * job.unclaimed rows.
+   */
+  onUnclaimed?: (job: WorkerJob) => void | Promise<void>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_STALE_AFTER_MS = 30 * 60 * 1000;
 /** Delivery-approval wait poll interval (issue #149): the default onDelivery re-reads the audit trail this often. */
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000;
+/** Job-loop defaults (epic #170): lease = stale-run window, bounded requeue with exponential backoff, fail-loud unclaimed sweep. */
+const DEFAULT_MAX_JOB_ATTEMPTS = 5;
+const DEFAULT_JOB_BACKOFF_MS = 5_000;
+const DEFAULT_JOB_BACKOFF_MAX_MS = 5 * 60_000;
+const DEFAULT_JOB_SWEEP_INTERVAL_MS = 60_000;
 const DEFAULT_TRANSCRIPT_DIR = "data/transcripts";
 const DEFAULT_ORG_CONFIG_DIR = "config";
 const BASE_BRANCH = "main";
@@ -211,8 +261,8 @@ export async function bootExecutorRuntime(opts: {
   await seedBootSecretsFromVault();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
-    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
-    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
+    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
   const { store, audit, orgPolicy } = runtime;
   const agentDir = opts.agentDir ?? "data/omp-agent";
@@ -275,12 +325,23 @@ interface ExecutorConfig {
   transcriptDir: string;
   tokenFile: string;
   askpassScript: string;
+  /** Job-loop knobs (epic #170). */
+  jobLeaseMs: number;
+  maxJobAttempts: number;
+  jobBackoffMs: number;
+  jobBackoffMaxMs: number;
+  jobUnclaimedTtlMs: number;
+  jobSweepIntervalMs: number;
 }
 
-/** Boot: resolve config, recover stale runs (#10), install the askpass helper. */
+/** Boot: resolve config, recover stale runs (#10), surface unclaimed jobs (#170), install the askpass helper. */
 export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfig> {
   const cfg = resolveConfig(deps);
   await recoverStaleWorkItems(deps.store, DEFAULT_STALE_AFTER_MS);
+  // Epic #170 fail-loud: a dispatched job no worker claimed within its TTL
+  // becomes a visible job.unclaimed audit + nudge — a scheduled job
+  // silently never posting is the worst failure mode of the worker design.
+  await sweepUnclaimedJobs(deps, cfg);
   writeAskpassScript(cfg);
   return cfg;
 }
@@ -300,49 +361,185 @@ export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Pro
   await assertAgentDirModelAvailable(deps.agentDir ?? "data/omp-agent");
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   console.log(`executor ready: allowlist ${cfg.repoAllowlist.join(", ") || "(empty — no pushes until configured)"}, workspaces ${cfg.workspacesDir}`);
+  let lastSweep = Date.now();
   while (!signal?.aborted) {
-    let item: WorkItem | null = null;
+    // Fail-loud cadence (epic #170): sweep for unclaimed jobs periodically;
+    // prepareExecutor already swept once at boot.
+    if (Date.now() - lastSweep >= cfg.jobSweepIntervalMs) {
+      await sweepUnclaimedJobs(deps, cfg);
+      lastSweep = Date.now();
+    }
+    let job: WorkerJob | null = null;
     try {
-      item = await deps.store.claimNextWorkItem();
+      job = await deps.store.claimNextJob(cfg.jobLeaseMs);
     } catch (err) {
-      console.log(`claim failed: ${(err as Error).message}`);
+      console.log(`claim failed: ${err instanceof Error ? err.message : String(err)}`);
       await Bun.sleep(pollIntervalMs);
       continue;
     }
-    if (!item) {
+    if (!job) {
       await Bun.sleep(pollIntervalMs);
       continue;
     }
-    await processItem(deps, cfg, item);
-    // A chat item returns to open. Yield before it can be observed again so
-    // an otherwise chat-only queue never becomes a synchronous hot loop.
-    if (item.delivery === "chat") await Bun.sleep(pollIntervalMs);
+    await processJob(deps, cfg, job);
   }
 }
 
-/** Full lifecycle of one claimed item. Never throws: failures land the item in blocked. */
-async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkItem): Promise<void> {
-  if (item.delivery === "chat") {
-    try {
-      await deps.store.transitionWorkItem(item.id, "claimed", "open", { by: "executor" });
-      console.log(`[${item.id}] chat delivery is handled by the space agent`);
-    } catch (err) {
-      console.log(`[${item.id}] chat handoff failed (item no longer claimed): ${(err as Error).message}`);
+/**
+ * One claimed job's full lifecycle (epic #170): audit the claim, route by
+ * kind, then complete → outbox row + audit job.completed, or fail → bounded
+ * requeue with backoff (max attempts then job.failed). Never throws: the job
+ * bus absorbs every failure loudly. The outbox row (id = the envelope id) is
+ * the worker→server signal; the audit rows are pure evidence.
+ */
+async function processJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<void> {
+  await deps.store.appendAudit({
+    space_id: job.spaceId ?? null,
+    actor: "executor",
+    event_type: JOB_CLAIMED_EVENT,
+    payload: JSON.stringify({ id: job.id, kind: job.kind, attempts: job.attempts, lease_until: job.leaseUntil ?? null }),
+  });
+  let outcome: JobRunOutcome | null = null;
+  try {
+    outcome = await runJob(deps, cfg, job);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (job.attempts >= cfg.maxJobAttempts) {
+      await deps.store.failJob(job.id);
+      await deps.store.appendAudit({
+        space_id: job.spaceId ?? null,
+        actor: "executor",
+        event_type: JOB_FAILED_EVENT,
+        payload: JSON.stringify({ id: job.id, kind: job.kind, error: message.slice(0, 2000), attempts: job.attempts }),
+      });
+      console.log(`[${job.id}] job failed after ${job.attempts} attempts (${job.kind}): ${message}`);
+      return;
     }
+    const backoffMs = Math.min(cfg.jobBackoffMs * 2 ** (job.attempts - 1), cfg.jobBackoffMaxMs);
+    await deps.store.requeueJob(job.id, backoffMs);
+    await deps.store.appendAudit({
+      space_id: job.spaceId ?? null,
+      actor: "executor",
+      event_type: JOB_FAILED_EVENT,
+      payload: JSON.stringify({
+        id: job.id,
+        kind: job.kind,
+        error: message.slice(0, 2000),
+        attempts: job.attempts,
+        requeued: true,
+        backoff_ms: backoffMs,
+      }),
+    });
+    console.log(`[${job.id}] job attempt ${job.attempts} failed (${job.kind}): ${message} — requeued in ${backoffMs} ms`);
     return;
   }
+  await deps.store.completeJob(job.id);
+  // The worker→server signal (epic #170): one outbox row per completed job,
+  // keyed by the SAME envelope id so the server's watermarked consumer can
+  // join it to the audit trail. The server never scans audit as a queue.
+  postOutboxRow(deps.store, {
+    id: job.id,
+    kind: job.kind,
+    payload: { state: outcome.state, result: outcome.result ?? null },
+    space: job.spaceId ?? null,
+  });
+  await deps.store.appendAudit({
+    space_id: job.spaceId ?? null,
+    actor: "executor",
+    event_type: JOB_COMPLETED_EVENT,
+    payload: JSON.stringify({ id: job.id, kind: job.kind, state: outcome.state, result: outcome.result ?? null }),
+  });
+  console.log(`[${job.id}] job completed (${job.kind}, ${outcome.state})`);
+}
 
+/** What a job's run produced: the terminal state + the delivery result (if any). */
+interface JobRunOutcome {
+  state: string;
+  result: unknown;
+}
+
+/**
+ * Kind routing (epic #170): git and extension drive a work item through the
+ * existing delivery paths; kb and scheduled are fail-closed stubs until Wave
+ * 2 lands their claimable implementations — a dispatch can never silently
+ * no-op. Each kind's toolset/environment is its handler's composition (the
+ * git path uses the exec toolset, the extension path the memory+extension
+ * toolset); per-kind isolation (#101) falls out per kind on top.
+ */
+async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
+  switch (job.kind) {
+    case "git":
+    case "extension":
+      return runWorkItemJob(deps, cfg, job);
+    case "kb":
+      throw new Error("kb job kind is not implemented yet (epic #170 Wave 2) — failing closed");
+    case "scheduled":
+      throw new Error("scheduled job kind is not implemented yet (epic #170 Wave 2) — failing closed");
+  }
+}
+
+/**
+ * Runs a work-item-backed job (git/extension) through the existing delivery
+ * paths, unchanged in behavior: the work item's own state machine (open →
+ * claimed → working → done/blocked) is the double-execution guard. When the
+ * item already settled (aborted/blocked/done elsewhere), the job completes
+ * as a no-op; when a concurrent owner holds it mid-flight (a lease-reclaim
+ * race after a crash), the job is requeued — never double-executed.
+ */
+async function runWorkItemJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
+  const parsed = workItemJobPayloadSchema.safeParse(job.payload);
+  if (!parsed.success) {
+    throw new Error(`job ${job.id} (${job.kind}) payload must be { workItemId } — failing closed`);
+  }
+  const workItemId = parsed.data.workItemId;
+  const item = await deps.store.claimWorkItemById(workItemId);
+  if (item === null) {
+    const current = await deps.store.getWorkItem(workItemId);
+    if (current === null) throw new Error(`work item ${workItemId} not found`);
+    if (current.state === "done" || current.state === "blocked" || current.state === "aborted") {
+      console.log(`[${job.id}] work item already ${current.state} — job completes as a no-op`);
+      return { state: current.state, result: null };
+    }
+    // claimed/working/review under a live owner (lease-reclaim race): requeue
+    // with backoff instead of ever running the item twice.
+    throw new Error(`work item ${workItemId} is ${current.state} — another worker owns it`);
+  }
+  const settled = await processItem(deps, cfg, item);
+  return { state: settled.state, result: safeParseJson(settled.result) };
+}
+
+/** Parses a work item's result JSON column; null when absent or corrupt. */
+function safeParseJson(text: string | null): unknown {
+  if (text === null) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Full lifecycle of one claimed work item. Never throws for work failures:
+ * they land the item in blocked with evidence (the job then completes with
+ * that outcome). Throws only when the item cannot start (still ours but
+ * stuck) so the job bus can requeue.
+ */
+async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkItem): Promise<WorkItem> {
   try {
     await deps.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
   } catch (err) {
-    // Someone else moved the item between claim and start (e.g. aborted).
-    console.log(`[${item.id}] start failed (item no longer claimed): ${(err as Error).message}`);
-    return;
+    const current = await deps.store.getWorkItem(item.id);
+    if (current !== null && current.state !== "claimed") {
+      // Someone else moved the item between claim and start (aborted/blocked).
+      console.log(`[${item.id}] start skipped (item moved to ${current.state}): ${err instanceof Error ? err.message : String(err)}`);
+      return current;
+    }
+    throw new Error(`start failed (item no longer claimable): ${err instanceof Error ? err.message : String(err)}`);
   }
   try {
     if (item.delivery === "extension") {
       await extensionWorkerPath(deps, cfg, item);
-      return;
+      return (await deps.store.getWorkItem(item.id)) ?? item;
     }
 
     const workspace = join(cfg.workspacesDir, item.id);
@@ -355,7 +552,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
         by: "executor",
       });
       console.log(`[${item.id}] blocked: repo not specified`);
-      return;
+      return (await deps.store.getWorkItem(item.id)) ?? item;
     }
     if (!cfg.repoAllowlist.includes(repo)) {
       await deps.store.transitionWorkItem(item.id, "working", "blocked", {
@@ -363,7 +560,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
         by: "executor",
       });
       console.log(`[${item.id}] blocked: repo ${repo} not on the allowlist`);
-      return;
+      return (await deps.store.getWorkItem(item.id)) ?? item;
     }
     console.log(`[${item.id}] working (${repo}, workspace ${workspace})`);
     await setupWorkspace(cfg, item, repo, workspace);
@@ -371,6 +568,7 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
     await deliver(deps, cfg, item, workspace, summary);
     // Delivered: drop the checkout (the transcript stays for the audit trail).
     rmSync(workspace, { recursive: true, force: true });
+    return (await deps.store.getWorkItem(item.id)) ?? item;
   } catch (err) {
     // Failure: git workspaces are kept for forensics; every delivery kind
     // lands the item in blocked with evidence — never silently dropped.
@@ -388,6 +586,32 @@ async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkIt
         event_type: WORK_ITEM_FAILED_EVENT,
         payload: JSON.stringify({ id: item.id, error: message }),
       });
+    }
+    return (await deps.store.getWorkItem(item.id)) ?? item;
+  }
+}
+
+/**
+ * Fail-loud unclaimed sweep (epic #170): jobs no worker claimed within
+ * their TTL are failed and surfaced — audit job.unclaimed + the nudge hook.
+ * The worker holds no Slack tokens, so the nudge is the audit row + a log
+ * line + the injectable seam; the server-side onboarding nudge wires to
+ * these rows in Wave 2.
+ */
+async function sweepUnclaimedJobs(deps: ExecutorDeps, cfg: ExecutorConfig): Promise<void> {
+  const jobs = await deps.store.markUnclaimedJobs(cfg.jobUnclaimedTtlMs);
+  for (const job of jobs) {
+    await deps.store.appendAudit({
+      space_id: job.spaceId ?? null,
+      actor: "executor",
+      event_type: JOB_UNCLAIMED_EVENT,
+      payload: JSON.stringify({ id: job.id, kind: job.kind, reason: "no worker claimed the job within its TTL" }),
+    });
+    console.log(`[${job.id}] job unclaimed (${job.kind}) — no live worker within ${cfg.jobUnclaimedTtlMs} ms`);
+    try {
+      await deps.onUnclaimed?.(job);
+    } catch (err) {
+      console.log(`[${job.id}] unclaimed nudge hook failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }
@@ -425,12 +649,12 @@ async function extensionWorkerPath(
   let finalOutput = "";
   let sessionError: Error | null = null;
   const offMessage = session.on("message", (data) => {
-    const text = (data as { text?: unknown } | null)?.text;
-    if (typeof text === "string") finalOutput = text;
+    const parsed = driverMessageSchema.safeParse(data);
+    if (parsed.success) finalOutput = parsed.data.text;
   });
   const offError = session.on("error", (data) => {
-    const text = (data as { message?: unknown } | null)?.message;
-    sessionError = new Error(typeof text === "string" ? text : "extension worker session error");
+    const parsed = driverErrorSchema.safeParse(data);
+    sessionError = new Error(parsed.success ? parsed.data.message : "extension worker session error");
   });
   try {
     await applyWorkItemModelPin(deps, item, session);
@@ -457,7 +681,7 @@ async function extensionWorkerPath(
 
   const delivery = parseExtensionDeliveryEnvelope(finalOutput);
   const result = JSON.stringify({
-    ...(delivery.url ? { url: delivery.url } : {}),
+    ...(delivery.url ? { url: delivery.url } : undefined),
     summary: delivery.summary,
   });
   await deps.store.transitionWorkItem(item.id, "working", "done", { result, by: "executor" });
@@ -468,7 +692,7 @@ async function extensionWorkerPath(
     payload: JSON.stringify({
       id: item.id,
       kind: "extension",
-      ...(delivery.url ? { url: delivery.url } : {}),
+      ...(delivery.url ? { url: delivery.url } : undefined),
       summary: delivery.summary,
     }),
   });
@@ -523,23 +747,19 @@ function parseExtensionDeliveryEnvelope(output: string): ExtensionDeliveryResult
       validationError = "invalid JSON";
       continue;
     }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      validationError = "envelope must be an object";
+    /** The extension delivery envelope: a non-blank summary, optional url. */
+    const envelopeSchema = z.object({
+      summary: z.string().trim().min(1),
+      url: z.string().trim().optional(),
+    });
+    const envelope = envelopeSchema.safeParse(parsed);
+    if (!envelope.success) {
+      validationError = "envelope must be an object with a non-empty summary and an optional string url";
       continue;
     }
-    const record = parsed as Record<string, unknown>;
-    if (typeof record.summary !== "string" || record.summary.trim() === "") {
-      validationError = "summary must be a non-empty string";
-      continue;
-    }
-    if (record.url !== undefined && typeof record.url !== "string") {
-      validationError = "url must be a string when present";
-      continue;
-    }
-    const url = typeof record.url === "string" ? record.url.trim() : "";
     return {
-      ...(url ? { url } : {}),
-      summary: record.summary.trim(),
+      ...(envelope.data.url ? { url: envelope.data.url } : undefined),
+      summary: envelope.data.summary,
     };
   }
   throw new Error(`extension worker output missing a valid JSON envelope (${validationError})`);
@@ -573,8 +793,8 @@ async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Pro
   if (item.model === null && item.reasoning_effort === null) return settings;
   return {
     ...settings,
-    ...(item.reasoning_effort !== null ? { reasoning_effort: item.reasoning_effort } : {}),
-    ...(item.model !== null && item.model !== "fast" && item.model !== "reasoning" ? { model: item.model } : {}),
+    ...(item.reasoning_effort !== null ? { reasoning_effort: item.reasoning_effort } : undefined),
+    ...(item.model !== null && item.model !== "fast" && item.model !== "reasoning" ? { model: item.model } : undefined),
   };
 }
 
@@ -642,12 +862,12 @@ async function runAgentSession(
   let summary = "";
   let sessionError: Error | null = null;
   const offMessage = session.on("message", (data) => {
-    const text = (data as { text?: unknown } | null)?.text;
-    if (typeof text === "string") summary = text;
+    const parsed = driverMessageSchema.safeParse(data);
+    if (parsed.success) summary = parsed.data.text;
   });
   const offError = session.on("error", (data) => {
-    const text = (data as { message?: unknown } | null)?.message;
-    sessionError = new Error(typeof text === "string" ? text : "agent session error");
+    const parsed = driverErrorSchema.safeParse(data);
+    sessionError = new Error(parsed.success ? parsed.data.message : "agent session error");
   });
   try {
     await applyWorkItemModelPin(deps, item, session);
@@ -692,10 +912,16 @@ interface DeliveryResolutionPayload {
   approver?: string;
 }
 
+/** The delivery.resolved audit payload: {id, approved, approver}. */
+const deliveryResolutionSchema = z.object({
+  id: z.string().optional(),
+  approved: z.boolean().optional(),
+  approver: z.string().optional(),
+});
+
 function parseDeliveryResolution(raw: string): DeliveryResolutionPayload | null {
   try {
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null ? (parsed as DeliveryResolutionPayload) : null;
+    return deliveryResolutionSchema.parse(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -731,7 +957,7 @@ export async function waitForDeliveryApproval(
       const payload = parseDeliveryResolution(row.payload);
       if (payload === null || payload.id !== item.id) continue;
       // First recorded decision wins.
-      if (payload.approved === true && typeof payload.approver === "string") {
+      if (payload.approved === true && payload.approver !== undefined) {
         log(`[${item.id}] delivery approved by <@${payload.approver}>`);
         return { approver: payload.approver };
       }
@@ -825,8 +1051,10 @@ async function openPullRequest(
   if (!res.ok) {
     throw new Error(`PR creation failed (${res.status}): ${(await res.text()).slice(0, 500)}`);
   }
-  const parsed = (await res.json()) as { html_url?: unknown };
-  if (typeof parsed.html_url !== "string" || parsed.html_url.length === 0) {
+  /** The GitHub create-pull response: the new PR's html_url. */
+  const createdPrSchema = z.object({ html_url: z.string().optional() });
+  const parsed = createdPrSchema.parse(await res.json());
+  if (parsed.html_url === undefined || parsed.html_url.length === 0) {
     throw new Error("PR creation returned no html_url");
   }
   return parsed.html_url;
@@ -846,7 +1074,7 @@ async function openPullRequest(
  * executor refuses anything not listed here. An empty list is a legal boot
  * state — no pushes happen until a repo is configured.
  */
-function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string } {
+function loadRepoAllowlist(dir: string) {
   let gitBaseUrl = "https://github.com";
   let repos: string[] = [];
   // Missing org.yml is a loud boot error: an executor without config cannot
@@ -856,19 +1084,21 @@ function loadRepoAllowlist(dir: string): { repos: string[]; gitBaseUrl: string }
   try {
     doc = parseYamlSubset(text);
   } catch (err) {
-    throw new Error(`config/org.yml: ${(err as Error).message}`);
+    throw new Error(`config/org.yml: ${err instanceof Error ? err.message : String(err)}`);
   }
   const base = doc["git_base_url"];
   if (base !== undefined) {
-    if (typeof base !== "string") throw new Error("config/org.yml: git_base_url must be a string");
-    gitBaseUrl = base;
+    const parsedBase = z.string().safeParse(base);
+    if (!parsedBase.success) throw new Error("config/org.yml: git_base_url must be a string");
+    gitBaseUrl = parsedBase.data;
   }
   const reposNode = doc["repos"];
   if (reposNode !== undefined) {
     if (!Array.isArray(reposNode)) throw new Error("config/org.yml: repos must be a list of owner/repo strings");
     repos = reposNode.map((r) => {
-      if (typeof r !== "string") throw new Error("config/org.yml: repos must be a list of owner/repo strings");
-      return r;
+      const parsedRepo = z.string().safeParse(r);
+      if (!parsedRepo.success) throw new Error("config/org.yml: repos must be a list of owner/repo strings");
+      return parsedRepo.data;
     });
   }
   // Keep only well-formed owner/repo entries: anything else can never match
@@ -886,7 +1116,7 @@ function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   const needsFile = settings?.repos === undefined || settings?.gitBaseUrl === undefined;
   const fileConfig = needsFile
     ? loadRepoAllowlist(deps.orgConfigDir ?? DEFAULT_ORG_CONFIG_DIR)
-    : { repos: [] as string[], gitBaseUrl: "https://github.com" };
+    : { repos: [], gitBaseUrl: "https://github.com" };
   const repos = settings?.repos ?? fileConfig.repos;
   const gitBaseUrl = (settings?.gitBaseUrl ?? fileConfig.gitBaseUrl).replace(/\/+$/, "");
   const apiBaseUrl = (settings?.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
@@ -915,6 +1145,12 @@ function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
     transcriptDir: deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR,
     tokenFile,
     askpassScript: join(dirname(tokenFile), ASKPASS_SCRIPT_NAME),
+    jobLeaseMs: deps.jobLeaseMs ?? DEFAULT_STALE_AFTER_MS,
+    maxJobAttempts: deps.maxJobAttempts ?? DEFAULT_MAX_JOB_ATTEMPTS,
+    jobBackoffMs: deps.jobBackoffMs ?? DEFAULT_JOB_BACKOFF_MS,
+    jobBackoffMaxMs: deps.jobBackoffMaxMs ?? DEFAULT_JOB_BACKOFF_MAX_MS,
+    jobUnclaimedTtlMs: deps.jobUnclaimedTtlMs ?? DEFAULT_STALE_AFTER_MS,
+    jobSweepIntervalMs: deps.jobSweepIntervalMs ?? DEFAULT_JOB_SWEEP_INTERVAL_MS,
   };
 }
 

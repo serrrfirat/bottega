@@ -25,7 +25,7 @@ export type PickupDecision = "draft" | "ask" | "none";
 export type ReasoningEffort = "off" | "low" | "medium" | "high";
 
 /** Confidence ranks for the threshold comparison (high drafts the most). */
-const CONFIDENCE_RANK: Record<PickupConfidence, number> = { high: 3, medium: 2, low: 1 };
+const CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 } satisfies Record<PickupConfidence, number>;
 
 /** The intent vocabulary the guidance recognizes (issue #89). */
 export interface IntentVocabularyEntry {
@@ -127,9 +127,16 @@ export function parseModelEffortPin(text: string): ModelEffortPin | null {
   if (!match) return null;
   const model = match[1]!.trim().replace(/\s+/g, " ");
   if (!model) return null;
+  // Capture group 2 is the (off|low|medium|high) alternative in the regex
+  // above, so it is always one of the four effort levels when present.
+  const rawEffort = match[2]?.toLowerCase();
+  const reasoningEffort: ReasoningEffort | undefined =
+    rawEffort === "off" || rawEffort === "low" || rawEffort === "medium" || rawEffort === "high"
+      ? rawEffort
+      : undefined;
   return {
     model,
-    ...(match[2] !== undefined ? { reasoningEffort: match[2]!.toLowerCase() as ReasoningEffort } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : undefined),
   };
 }
 
@@ -155,7 +162,7 @@ export function deriveModelPin(text: string, catalog: ModelCatalogEntry[]): Deri
   return {
     ok: true,
     model: resolution.pin,
-    ...(parsed.reasoningEffort !== undefined ? { reasoningEffort: parsed.reasoningEffort } : {}),
+    ...(parsed.reasoningEffort !== undefined ? { reasoningEffort: parsed.reasoningEffort } : undefined),
   };
 }
 

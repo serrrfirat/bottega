@@ -22,6 +22,7 @@ import { createAudit } from "../policy/audit";
 import { createStore, type Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import type { ExtensionManifest } from "./manifest";
+import type { JsonValue } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
 import {
   completeMcpOAuthFlow,
@@ -68,7 +69,7 @@ function registryWith(serverUrl: string): ExtensionRegistry {
   return registry;
 }
 
-function json(body: unknown, status = 200): Response {
+function json(body: JsonValue, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
@@ -132,7 +133,10 @@ class StubOAuthMcp {
         }
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers });
       }
-      const body = (await req.json()) as { jsonrpc: string; id: number; method: string; params?: Record<string, unknown> };
+      // SAFETY: the MCP SDK sends jsonrpc/id/method on every request; the
+      // stub reads only method and id, and anything else falls through to
+      // the unknown-method response.
+      const body = (await req.json()) as { jsonrpc: string; id: number; method: string };
       if (body.method === "initialize") {
         return json({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stub-oauth-mcp", version: "1.0.0" } } });
       }
@@ -166,6 +170,8 @@ class StubOAuthMcp {
     if (url.pathname === "/register") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
       this.state.registerCalls += 1;
+      // SAFETY: the DCR request carries these optional fields (RFC 7591);
+      // the stub defaults each missing one in the registration response.
       const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[] };
       return json({
         client_id: `client-${this.state.registerCalls}`,
@@ -296,6 +302,8 @@ describe("startMcpOAuthFlow — discovery + DCR + PKCE (issue #198)", () => {
       expect(row.actor).toBe("UADA");
       expect(row.redirect_uri).toBe("http://127.0.0.1:9/oauth/callback");
       expect(row.server_url).toBe(stub.mcpUrl);
+      // SAFETY: the flow row is the JSON this module's own
+      // persistOAuthFlow wrote (JSON.stringify of a PersistedOAuthFlow).
       const flow = JSON.parse(row.flow) as PersistedOAuthFlow;
       expect(flow.codeVerifier).toBeTruthy();
       expect(flow.clientInformation).toMatchObject({ client_id: "client-1" });

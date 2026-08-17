@@ -26,18 +26,24 @@ function loadTools(
   opts?: { actor?: string; agentDir?: string; listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]> },
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
-  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
+  // SAFETY: the extension factory only ever calls registerTool; the rest of
+  // the ExtensionAPI surface is inert for registration.
+  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as ExtensionAPI;
   workItemsExtension(store, { orgPolicy: defaultPolicy(), ...opts })(pi);
   return tools;
 }
 
 function ctxFor(spaceId: string): ExtensionContext {
+  // SAFETY: the tool paths under test read only sessionManager.getSessionFile();
+  // the widened return matches the SDK's contract, other members untouched.
   return {
-    sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
-  } as unknown as ExtensionContext;
+    sessionManager: { getSessionFile: (): string | undefined => join("/tmp/sessions", `${spaceId}.jsonl`) },
+  } as ExtensionContext;
 }
 
 function resultText(res: Awaited<ReturnType<ToolDefinition["execute"]>>): string {
+  // SAFETY: every tool under test returns its report as a single text content
+  // block (the SDK's tool-result contract), so content[0] is that block.
   return (res.content[0] as { text: string }).text;
 }
 
@@ -355,7 +361,11 @@ describe("create_work_item", () => {
   test("fails without a space session and on an empty description", async () => {
     const s = freshStore();
     const [createTool] = loadTools(s);
-    const noCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
+    const noCtx = {
+      // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
+      // is the SDK's "no session" signal and the fail-closed path under test.
+      sessionManager: { getSessionFile: (): string | undefined => undefined },
+    } as ExtensionContext;
     const res = await createTool.execute("tc1", { description: "x" }, undefined, undefined, noCtx);
     expect(res.isError).toBe(true);
     expect(resultText(res)).toMatch(/space session/);
@@ -684,7 +694,11 @@ describe("complete_work_item", () => {
       description: "Requires a space session",
       delivery: "chat",
     });
-    const noSpaceCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
+    const noSpaceCtx = {
+      // SAFETY: the tool reads only sessionManager.getSessionFile(); undefined
+      // is the SDK's "no session" signal and the fail-closed path under test.
+      sessionManager: { getSessionFile: (): string | undefined => undefined },
+    } as ExtensionContext;
 
     const res = await completeTool(s).execute(
       "tc-complete",
@@ -773,7 +787,7 @@ describe("complete_work_item", () => {
 describe("work_item_cancel", () => {
   async function workingItem(s: Store, spaceId: string): Promise<string> {
     const item = await s.createWorkItem({ space_id: spaceId, requester: "U1", description: "to cancel" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item.id);
     await s.transitionWorkItem(item.id, "claimed", "working");
     return item.id;
   }

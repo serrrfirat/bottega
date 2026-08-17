@@ -181,7 +181,7 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
   }
 
   /** Fake broker: records the bearer it saw and serves the given snapshot. */
-  function fakeBroker(entries: unknown[]): { url: string; seenAuth: string[]; stop: () => void } {
+  function fakeBroker(entries: unknown[]) {
     const seenAuth: string[] = [];
     const server = Bun.serve({
       port: 0,
@@ -353,7 +353,7 @@ describe("secretResolverFromSettings (issue #190 backend selection)", () => {
     });
   }
 
-  function fakeBroker(entries: unknown[]): { url: string; stop: () => void } {
+  function fakeBroker(entries: unknown[]) {
     const server = Bun.serve({
       port: 0,
       fetch: async (req) => {
@@ -396,6 +396,9 @@ describe("secretResolverFromSettings (issue #190 backend selection)", () => {
 
   test("an unknown backend type fails closed at selection (never falls back silently)", () => {
     expect(() =>
+      // SAFETY: deliberately invalid secretsBackend type to exercise the
+      // unknown-backend fail-closed branch; the never assertion bypasses the
+      // settings union's literal constraint for this negative test.
       secretResolverFromSettings({ ...EMPTY_SETTINGS, secretsBackend: { type: "infisical" as never } }),
     ).toThrow(/unknown secrets_backend type "infisical"/);
   });
@@ -415,7 +418,7 @@ describe("onePasswordConnectResolver (issue #190)", () => {
   /** Stub Connect server: serves the given item fields for any vault/item. */
   function stubConnect(
     response: (path: string) => Response,
-  ): { url: string; seen: Array<{ path: string; auth: string | null }>; stop: () => void } {
+  ) {
     const seen: Array<{ path: string; auth: string | null }> = [];
     const server = Bun.serve({
       port: 0,

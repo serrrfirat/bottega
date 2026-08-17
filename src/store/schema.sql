@@ -184,3 +184,22 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
 
+-- Worker job bus (epic #170): the claim loop's queue. One row per job; the
+-- envelope id is the work item id for git/extension jobs (debuggability —
+-- one id across enqueue -> claim -> run -> outbox -> post). `lease_until`
+-- carries the running lease while claimed, and doubles as the backoff
+-- not-before gate while queued (a requeued job is claimable again only
+-- after its backoff elapses).
+CREATE TABLE IF NOT EXISTS worker_jobs (
+  id          TEXT PRIMARY KEY,      -- envelope id ("wi_..." for git/extension)
+  kind        TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+  payload     TEXT NOT NULL,         -- JSON envelope payload
+  space_id    TEXT,
+  status      TEXT NOT NULL DEFAULT 'queued'
+              CHECK (status IN ('queued','running','completed','failed')),
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue ON worker_jobs(status, created_at);

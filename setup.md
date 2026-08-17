@@ -209,7 +209,8 @@ as extensions (never a secret through chat): ask the agent for
 `connect_upload_link <provider-id>` and paste the value into the browser
 form; the endpoint stores it as the provider's `api_key` row in the vault.
 The provider ids are the table's vault rows: `slack-app`, `slack-bot`,
-`opencode`, `near`, `openai`, `anthropic`. The value applies at the next
+`opencode`, `near`, `openai`, `anthropic`, `github-webhook`. The value
+applies at the next
 boot (rotation = re-upload the row and restart). The Keychain leg is only
 for bare local runs without dev.sh: set `BOTTEGA_KEYCHAIN_SEED=1` and store
 `security add-generic-password -s bottega-<provider> -a "$(whoami)" -w '<key>'`

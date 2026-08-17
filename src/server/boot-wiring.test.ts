@@ -27,6 +27,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore } from "../store/db";
+import type { SchedulerJob } from "../scheduler/types";
 import type { McpBinding } from "../extensions/manifest";
 import type { ExtensionSurfaces } from "../extensions/surface";
 import { resetToolSurfaceCache } from "../extensions/surface";
@@ -39,7 +40,9 @@ import { main } from "./index";
 const EXTENSIONS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
 /** The scheduler tool execute never touches a session context. */
-const unusedContext = {} as unknown as ExtensionContext;
+// SAFETY: scheduler tool executes ignore their ExtensionContext; the empty
+// object only fills the required parameter position.
+const unusedContext = {} as ExtensionContext;
 
 interface BootEnv {
   dir: string;
@@ -116,13 +119,13 @@ function textOf(result: AgentToolResult): string {
 function githubWireTools(count: number): Array<{
   name: string;
   description: string;
-  inputSchema: { type: "object"; properties: Record<string, unknown> };
+  inputSchema: { type: "object"; properties: Record<string, { type: string }> };
 }> {
   const special = ["search_issues", "issue_write", "add_issue_comment"];
   const tools: Array<{
     name: string;
     description: string;
-    inputSchema: { type: "object"; properties: Record<string, unknown> };
+    inputSchema: { type: "object"; properties: Record<string, { type: string }> };
   }> = [];
   for (let i = 0; i < count; i++) {
     const wire = i < special.length ? special[i]! : `github_tool_${i}`;
@@ -193,15 +196,17 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       const actions = ["standup_digest", "reflection", "org_pulse"] as const;
       const created: Array<{ action: string; cron: string }> = [];
       for (const action of actions) {
-        const result = (await createJob!.execute(
+        const result = await createJob!.execute(
           "boot-1",
           { action, cron: "0 9 * * 1-5" },
           undefined,
           undefined,
           unusedContext,
-        )) as AgentToolResult;
+        );
         expect(result.isError).not.toBe(true);
-        created.push(JSON.parse(textOf(result)) as { action: string; cron: string });
+        // SAFETY: create_scheduler_job returns JSON.stringify(job) — a
+        // SchedulerJob row whose identifying fields are action + cron.
+        created.push(JSON.parse(textOf(result)) as SchedulerJob);
       }
       expect(created.map((job) => job.action).sort()).toEqual([...actions].sort());
 
@@ -391,7 +396,9 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       expect(opencodeSafeToolName("github.issue_write")).toBe("github_issue_write");
       expect(opencodeSafeToolName("github.add_issue_comment")).toBe("github_add_issue_comment");
       // Every definition carries a tier — nothing lands ungated.
-      expect(github.every((tool) => typeof tool.approval === "string" && ["read", "write", "exec"].includes(tool.approval))).toBe(true);
+      expect(
+        github.every((tool) => tool.approval === "read" || tool.approval === "write" || tool.approval === "exec"),
+      ).toBe(true);
     } finally {
       env.cleanup();
     }

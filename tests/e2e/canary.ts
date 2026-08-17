@@ -98,6 +98,7 @@ import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import type { BrokerConnector } from "../../src/extensions/connect";
 import type { LiveSlackTokens, SlackApiMessage } from "./slack-live";
+import { z } from "zod";
 
 /** Org policy for the canary (issues #79/#175): memory tools allowed,
  * work-item creation on the documented always-approve path (approver:
@@ -535,7 +536,7 @@ async function postAndWait(
   const inboundTs = await live.postAsUser(channelId, text);
   const reply = await waitForBotReply(h, channelId, {
     afterTs: inboundTs,
-    ...(opts.thread ? { threadTs: inboundTs } : {}),
+    ...(opts.thread ? { threadTs: inboundTs } : undefined),
     label: opts.label,
   });
   return { inboundTs, reply };
@@ -544,6 +545,13 @@ async function postAndWait(
 function snippet(text: string, max = 140): string {
   const t = text.trim().replaceAll("\n", " ");
   return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+/** The item id from a WORK_ITEM_CREATED_EVENT row (payload {id, requester}, audit-events.ts). */
+function workItemIdFromRow(row: { payload: string }): string {
+  // SAFETY: work-item audit rows are written with {id, requester} payloads
+  // (audit-events.ts); a malformed id fails the getWorkItem lookup loudly.
+  return (JSON.parse(row.payload) as { id: string }).id;
 }
 
 async function journeyChatReply(
@@ -642,7 +650,7 @@ async function journeyWorkItem(h: Harness, channelId: string, runId: string): Pr
       );
     }
     const row = rows[rows.length - 1]!;
-    const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
+    const item = await h.store.getWorkItem(workItemIdFromRow(row));
     if (!item) throw new Error("work item row created but not readable");
     if (item.state !== "open") throw new Error(`work item ${item.id} landed in state ${item.state}, expected open`);
     const permalink = await live.permalink(channelId, reply.ts);
@@ -699,10 +707,15 @@ async function journeyStandup(h: Harness, channelId: string): Promise<JourneyRes
     // the opt-in shape is the #150 contract being exercised).
     const space = await h.store.getSpace(spaceId);
     if (!space) throw new Error(`space not found: ${spaceId}`);
-    const overlay = JSON.parse(space.policy_json || "{}") as Record<string, unknown>;
-    const proactive = (typeof overlay.proactive === "object" && overlay.proactive !== null && !Array.isArray(overlay.proactive)
-      ? overlay.proactive
-      : {}) as Record<string, unknown>;
+    // spaces.policy_json is a JSON document (outside-controlled); parse it at
+    // this boundary and branch on the domain value (a non-mapping proactive
+    // field means the space never opted in).
+    const overlay = z.record(z.string(), z.unknown()).parse(JSON.parse(space.policy_json || "{}"));
+    const proactive = z
+      .record(z.string(), z.unknown())
+      .optional()
+      .catch({})
+      .parse(overlay.proactive);
     overlay.proactive = { ...proactive, standup: true };
     await h.store.updatePolicy(spaceId, JSON.stringify(overlay));
 
@@ -791,6 +804,9 @@ async function journeyExtension(h: Harness, channelId: string, runId: string): P
       "an extension tool call audit row",
     );
     const row = rows[rows.length - 1]!;
+    // SAFETY: the extension runtime audits EXTENSION_CALL_EVENT rows with
+    // {extension, tool, actor, credential_id, decision} payloads
+    // (audit-events.ts); only tool and decision are read here.
     const payload = JSON.parse(row.payload) as { tool?: string; decision?: string };
     if (payload.tool !== FIXTURE_EXTENSION_TOOL) {
       throw new Error(`extension.call audited tool "${payload.tool ?? "<missing>"}", expected ${FIXTURE_EXTENSION_TOOL}`);
@@ -839,6 +855,8 @@ async function journeyModelRole(h: Harness, channelId: string, runId: string): P
       "a model.switched audit row",
     );
     const row = rows[rows.length - 1]!;
+    // SAFETY: the model-role switch audits MODEL_SWITCHED_EVENT rows with
+    // {role, model, thinking_level, by} payloads (audit-events.ts); only role is read.
     const payload = JSON.parse(row.payload) as { role?: string };
     if (payload.role !== "fast") {
       throw new Error(`model.switched audited role "${payload.role ?? "<missing>"}", expected fast`);
@@ -908,6 +926,8 @@ async function journeyDeliveryApproval(h: Harness, channelId: string, runId: str
       STORE_TIMEOUT_MS,
       "the delivery.requested audit row",
     );
+    // SAFETY: the delivery poller audits DELIVERY_REQUESTED_EVENT rows with
+    // {id, pr_url, summary} payloads (audit-events.ts); only id is compared.
     const announced = JSON.parse(requested[requested.length - 1]!.payload) as { id?: unknown };
     if (announced.id !== item.id) throw new Error(`delivery.requested announced a different item`);
 
@@ -934,6 +954,8 @@ async function journeyDeliveryApproval(h: Harness, channelId: string, runId: str
       STORE_TIMEOUT_MS,
       "the delivery.resolved audit row",
     );
+    // SAFETY: the delivery router audits DELIVERY_RESOLVED_EVENT rows with
+    // {id, approved, approver} payloads (audit-events.ts); all three are checked.
     const decisionPayload = JSON.parse(decision[decision.length - 1]!.payload) as {
       id?: unknown;
       approved?: unknown;
@@ -1007,7 +1029,7 @@ async function journeyPerTaskPin(h: Harness, channelId: string, runId: string): 
       "the pinned work item",
     );
     const row = rows[rows.length - 1]!;
-    const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
+    const item = await h.store.getWorkItem(workItemIdFromRow(row));
     if (!item) throw new Error("pinned work item row created but not readable");
     if (item.model !== "fast") throw new Error(`item ${item.id} pin landed as model "${item.model}", expected "fast"`);
     if (item.reasoning_effort !== "low") {
@@ -1061,7 +1083,7 @@ async function journeySemanticPickup(h: Harness, channelId: string, runId: strin
       "the auto-picked-up work item",
     );
     const row = rows[rows.length - 1]!;
-    const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
+    const item = await h.store.getWorkItem(workItemIdFromRow(row));
     if (!item) throw new Error("auto-picked-up item row created but not readable");
     if (!item.description.includes(fixture)) {
       throw new Error(`picked-up item description does not carry the fixture: "${snippet(item.description)}"`);
@@ -1102,13 +1124,19 @@ async function journeySpacesPersistence(h: Harness, channelId: string, runId: st
     }
     if (!space) throw new Error("space row missing after first contact");
     const marker = `canary-persist-${runId}`;
-    const settings = (JSON.parse(space.settings) ?? {}) as Record<string, unknown>;
-    const overlay = JSON.parse(space.policy_json || "{}") as Record<string, unknown>;
+    // SAFETY: the store writes spaces.settings as SpaceModelSettings JSON —
+    // all string values (store/db.ts); the canary only round-trips those keys.
+    const settings = (JSON.parse(space.settings) ?? {}) as Record<string, string>;
+    // SAFETY: spaces.policy_json is a JSON document whose values the canary
+    // reads/writes verbatim (marker strings and the proactive mapping).
+    const overlay = z.record(z.string(), z.unknown()).parse(JSON.parse(space.policy_json || "{}"));
     await h.store.updateSpaceSettings(spaceId, { ...settings, reasoning_effort: "medium" });
     overlay[marker] = "persisted";
     await h.store.updatePolicy(spaceId, JSON.stringify(overlay));
     const after = await h.store.getSpace(spaceId);
-    const persistedSettings = JSON.parse(after!.settings) as Record<string, unknown>;
+    // SAFETY: the store writes spaces.settings as SpaceModelSettings JSON —
+    // all string values (store/db.ts).
+    const persistedSettings = JSON.parse(after!.settings) as Record<string, string>;
     if (persistedSettings.reasoning_effort !== "medium") {
       throw new Error("per-space settings did not persist in the space row");
     }
@@ -1118,8 +1146,12 @@ async function journeySpacesPersistence(h: Harness, channelId: string, runId: st
       label: "spaces persistence",
     });
     const afterTurn = await h.store.getSpace(spaceId);
-    const afterTurnSettings = JSON.parse(afterTurn!.settings) as Record<string, unknown>;
-    const afterTurnOverlay = JSON.parse(afterTurn!.policy_json || "{}") as Record<string, unknown>;
+    // SAFETY: the store writes spaces.settings as SpaceModelSettings JSON —
+    // all string values (store/db.ts).
+    const afterTurnSettings = JSON.parse(afterTurn!.settings) as Record<string, string>;
+    // SAFETY: spaces.policy_json is a JSON document whose values the canary
+    // reads/writes verbatim (marker strings and the proactive mapping).
+    const afterTurnOverlay = z.record(z.string(), z.unknown()).parse(JSON.parse(afterTurn!.policy_json || "{}"));
     if (afterTurnSettings.reasoning_effort !== "medium") {
       throw new Error("the live turn reset the space's persisted settings");
     }
@@ -1198,6 +1230,8 @@ async function journeySettingsApproval(
       STORE_TIMEOUT_MS,
       "an approval.resolved audit row",
     );
+    // SAFETY: the approval router audits APPROVAL_RESOLVED_EVENT rows with
+    // {tool, approved, approver} payloads (audit-events.ts); all three are checked.
     const payload = JSON.parse(resolved[resolved.length - 1]!.payload) as {
       tool?: unknown;
       approved?: unknown;
@@ -1261,7 +1295,10 @@ async function journeyModelHotSwap(h: Harness, channelId: string, runId: string)
       STORE_TIMEOUT_MS,
       "a model.settings_changed audit row",
     );
-    const changedPayload = JSON.parse(changed.payload) as { after?: Record<string, unknown>; before?: unknown };
+    // SAFETY: the settings tool audits MODEL_SETTINGS_CHANGED_EVENT rows with
+    // {scope, space?, actor, before, after} payloads where after holds
+    // SpaceModelSettings — all string values (store/db.ts).
+    const changedPayload = JSON.parse(changed.payload) as { after?: Record<string, string>; before?: unknown };
     if (changedPayload.after?.model !== targetModel || changedPayload.after?.reasoning_effort !== "high") {
       throw new Error(`model.settings_changed after mismatch: ${JSON.stringify(changedPayload.after)}`);
     }
@@ -1306,6 +1343,9 @@ async function journeyCatalogSurface(h: Harness, channelId: string): Promise<Jou
     )!;
     const getRes = await settingsTool.execute("tc-catalog", {}, undefined, undefined, toolCtxFor(h, spaceId));
     if (getRes.isError) throw new Error(`model_settings get failed: ${toolResultText(getRes)}`);
+    // SAFETY: the model_settings get tool serializes its catalog as JSON with
+    // available_models[{provider, models[{id}]}]; the journey asserts the
+    // list is non-empty and fails loudly otherwise.
     const body = JSON.parse(toolResultText(getRes)) as {
       available_models?: Array<{ provider: string; models: Array<{ id: string }> }>;
     };
@@ -1405,6 +1445,8 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
       toolCtxFor(h, spaceId),
     );
     if (pinned.isError) throw new Error(`pin with confirmation failed: ${toolResultText(pinned)}`);
+    // SAFETY: the catalog_browser pin tool returns {reviewed, written_to,
+    // live_registry, egress_regenerated} JSON; each field is checked below.
     const pinnedBody = JSON.parse(toolResultText(pinned)) as {
       reviewed?: unknown;
       written_to?: unknown;
@@ -1425,6 +1467,9 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
       async () => {
         const rows = await h.store.listAudit({ event_type: ADMIN_CATALOG_BROWSER_EVENT });
         return rows.some((r) => {
+          // SAFETY: the catalog browser audits ADMIN_CATALOG_BROWSER_EVENT rows
+          // with {action, spec?, query?, written_to?} payloads (audit-events.ts);
+          // only action and spec are compared here.
           const p = JSON.parse(r.payload) as { action?: unknown; spec?: unknown };
           return p.action === "pin" && p.spec === spec;
         })
@@ -1552,6 +1597,9 @@ async function journeyUploadLink(h: Harness, channelId: string, uploadLink: Uplo
       async () => {
         const rows = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT });
         return rows.some((r) => {
+          // SAFETY: the connect flow audits EXTENSION_CONNECTED_EVENT rows with
+          // {extension, scope, owner} payloads (audit-events.ts); only extension
+          // and scope are compared here.
           const p = JSON.parse(r.payload) as { extension?: unknown; scope?: unknown };
           return p.extension === FIXTURE_EXTENSION_ID && p.scope === "personal";
         })

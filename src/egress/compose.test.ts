@@ -19,8 +19,10 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
   test("iron-proxy is pinned to the latest stable image and is config-driven", () => {
     const proxy = service("iron-proxy");
     expect(proxy["image"]).toBe("ironsh/iron-proxy:0.49.0");
+    // SAFETY: the hand-authored compose fixture declares command as a list for iron-proxy.
     const command = proxy["command"] as string[];
     expect(command).toEqual(["-config", "/etc/iron-proxy/egress.yml"]);
+    // SAFETY: the fixture's iron-proxy service declares volumes as a list of mount strings.
     const vol = proxy["volumes"] as string[];
     expect(vol).toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
     expect(vol.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
@@ -45,6 +47,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     // (the same certs/ dir the proxy mounts); without it HTTPS egress
     // through the tunnel fails TLS.
     expect(env["NODE_EXTRA_CA_CERTS"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    // SAFETY: the fixture's server service declares volumes as a list of mount strings.
     const vol = service("server")["volumes"] as string[];
     expect(vol).toContain("./certs:/etc/iron-proxy/certs:ro");
   });
@@ -52,12 +55,16 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
   test("executor trusts the MITM CA too (its HTTPS egress rides the tunnel)", () => {
     const env = serviceEnv("executor");
     expect(env["NODE_EXTRA_CA_CERTS"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    // SAFETY: the fixture's executor service declares volumes as a list of mount strings.
     const vol = service("executor")["volumes"] as string[];
     expect(vol).toContain("./certs:/etc/iron-proxy/certs:ro");
   });
 
   test("iron-proxy has a static IP on the internal network", () => {
+    // SAFETY: the fixture declares iron-proxy's networks as a map whose egress
+    // entry carries the static ipv4_address asserted here.
     const net = service("iron-proxy")["networks"] as Record<string, YamlNode>;
+    // SAFETY: the egress network entry is the map node holding ipv4_address.
     expect((net["egress"] as Record<string, YamlNode>)["ipv4_address"]).toBe(IRON_PROXY_IP);
   });
 
@@ -86,6 +93,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     // mem0 joined in issue #43: the memory backend is internal too, so the
     // server bypasses the proxy for it as well. The executor has no memory
     // tools and keeps the original list.
+    // SAFETY: the fixture declares NO_PROXY as a comma-joined string on the server.
     const serverNoProxy = serviceEnv("server")["NO_PROXY"] as string;
     expect(serverNoProxy.split(",")).toEqual([
       "localhost",
@@ -95,6 +103,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       "auth-gateway",
       "mem0",
     ]);
+    // SAFETY: the fixture declares NO_PROXY as a comma-joined string on the executor.
     const executorNoProxy = serviceEnv("executor")["NO_PROXY"] as string;
     expect(executorNoProxy.split(",")).toEqual([
       "localhost",
@@ -108,13 +117,18 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
   test("executor is opt-in via profile (not started by default)", () => {
     // The executor shares the app image with the server (pinned tag asserted
     // in deploy.test.ts); the profile is what keeps it out of `up -d`.
+    // SAFETY: the fixture declares the executor's profiles as the list ["executor"].
     expect(service("executor")["profiles"] as string[]).toContain("executor");
   });
 
   test("internal network has the fixed subnet that matches dns.proxy_ip", () => {
+    // SAFETY: the fixture's egress network is a map node whose ipam.config
+    // carries the fixed subnet asserted here.
     const egress = networks["egress"] as Record<string, YamlNode>;
     expect(egress["driver"]).toBe("bridge");
+    // SAFETY: ipam is a map node inside the egress network.
     const ipam = egress["ipam"] as Record<string, YamlNode>;
+    // SAFETY: the fixture declares ipam.config as a list with one subnet entry.
     const config = ipam["config"] as Record<string, YamlNode>[];
     expect(config[0]["subnet"]).toBe("172.30.0.0/24");
   });
@@ -123,6 +137,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     expect(volumes["data"]).toBeDefined();
     // iron-proxy audits to /data; the app mounts the same volume at /app/data
     // (its relative data/ paths resolve there under WORKDIR /app, issue #12).
+    // SAFETY: the fixture declares volumes as a list of mount strings on every service.
     const proxyVol = service("iron-proxy")["volumes"] as string[];
     expect(proxyVol).toContain("data:/data");
     for (const name of ["server", "executor"]) {
@@ -138,6 +153,7 @@ describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
     expect(mem0["image"]).toBe("mem0/mem0-api-server:latest");
     expect(mem0["ports"]).toBeUndefined();
     // Internal service: on the egress network with no published ports.
+    // SAFETY: the fixture declares mem0's networks as the list ["egress"].
     expect((mem0["networks"] as string[]).includes("egress")).toBe(true);
   });
 

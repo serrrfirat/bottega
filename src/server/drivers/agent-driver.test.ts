@@ -2,7 +2,8 @@ import { describe, expect, test, vi } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type CreateAgentSessionOptions, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type AgentToolUpdateCallback, type CreateAgentSessionOptions, type ExtensionContext, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -10,7 +11,7 @@ import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { connectExtensionToolDefinition } from "../../extensions/connect";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID } from "../../extensions/fixture";
-import type { McpBinding } from "../../extensions/manifest";
+import type { McpBinding, JsonObject, JsonValue } from "../../extensions/manifest";
 import { createExtensionRuntime } from "../../extensions/runtime";
 import { extensionToolDefinitions } from "../../extensions/tools";
 import type { ExtensionRuntime } from "../../extensions/runtime";
@@ -31,7 +32,20 @@ import {
   spaceAgentToolNames,
   withPolicyGate,
 } from "./agent-driver";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
+
+/**
+ * Session event shapes the driver consumes, as injected by the stub
+ * sessions (SDK-shaped but loosely typed: the driver must fail closed on
+ * malformed events, which some tests deliberately inject).
+ */
+type StubSessionEvent =
+  | { type: "message_end"; message: JsonObject | null }
+  | { type: "message_update"; message: JsonObject; assistantMessageEvent: JsonObject }
+  | { type: "turn_end"; message: JsonObject; toolResults?: JsonValue[] }
+  | { type: "turn_start" }
+  | { type: "notice"; level: "error"; message: string }
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: JsonObject }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: JsonObject; isError: boolean };
 
 describe("omp sdk agent driver", () => {
   test("createSession materializes the space transcript file and disposes cleanly", async () => {
@@ -174,7 +188,7 @@ describe("omp sdk agent driver", () => {
           onOutput: () => {},
         }),
       ).rejects.toThrow("factory stub: no real session");
-      expect(receivedOptions?.thinkingLevel).toBe("low" as CreateAgentSessionOptions["thinkingLevel"]);
+      expect(receivedOptions?.thinkingLevel).toBe(Effort.Low);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -200,7 +214,7 @@ describe("omp sdk agent driver", () => {
         }),
       ).rejects.toThrow("factory stub: no real session");
       // "off" disables reasoning entirely — the documented fallback knob.
-      expect(receivedOptions?.thinkingLevel).toBe("off" as CreateAgentSessionOptions["thinkingLevel"]);
+      expect(receivedOptions?.thinkingLevel).toBe("off");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -369,7 +383,7 @@ describe("omp sdk agent driver", () => {
       // tools ride customTools + toolNames under their gateway-safe flat
       // names (issue #78); the restricted allowlist stays.
       const customToolNames = (receivedOptions?.customTools ?? [])
-        .map((tool) => (typeof tool === "object" && tool !== null && "name" in tool ? (tool as { name: string }).name : ""))
+        .map((tool) => tool.name)
         .filter((name) => name !== "");
       expect(customToolNames).toContain("weather_current");
       expect(receivedOptions?.toolNames).toContain("weather_current");
@@ -610,6 +624,9 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
     const calls: Array<{ modelId: string; thinkingLevel?: string; persist?: boolean }> = [];
     const thinkingCalls: string[] = [];
     return {
+      // SAFETY: the stub implements exactly the members OmpSessionDriver
+      // calls (model switching + session lifecycle); the rest of
+      // AgentSession is never touched by these tests.
       session: {
         getAvailableModels: () =>
           models.map((m) => ({ id: m.id, provider: m.provider, name: m.id, api: "openai-completions", baseUrl: "http://x", reasoning: true, input: ["text"] })),
@@ -626,7 +643,7 @@ describe("OmpSessionDriver.setModelRole (issue #64)", () => {
         steer: async () => {},
         followUp: async () => {},
         abort: async () => {},
-      } as unknown as AgentSession,
+      } as never,
       calls,
       thinkingCalls,
     };
@@ -700,6 +717,9 @@ describe("OmpSessionDriver turn-start model hot-swap (issue #189)", () => {
     const setModelCalls: Array<{ modelId: string; thinkingLevel?: string; persist?: boolean }> = [];
     const thinkingCalls: string[] = [];
     const promptCalls: string[] = [];
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (model state + lifecycle); the rest of AgentSession is never
+    // touched by these tests.
     const session = {
       getAvailableModels: () =>
         models.map((m) => ({ id: m.id, provider: m.provider, name: m.id, api: "openai-completions", baseUrl: "http://x", reasoning: true, input: ["text"] })),
@@ -727,7 +747,7 @@ describe("OmpSessionDriver turn-start model hot-swap (issue #189)", () => {
       steer: async () => {},
       followUp: async () => {},
       abort: async () => {},
-    } as unknown as AgentSession;
+    } as never;
     return { session, setModelCalls, thinkingCalls, promptCalls };
   }
 
@@ -954,9 +974,12 @@ describe("OmpSessionDriver turn-start model hot-swap (issue #189)", () => {
 describe("OmpSessionDriver error surfacing (issue #78)", () => {
   /** Stub SDK session exposing the subscribe listener for event injection. */
   function stubSession() {
-    let listener: ((event: unknown) => void) | undefined;
+    let listener: ((event: StubSessionEvent) => void) | undefined;
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (subscribe + lifecycle); the rest of AgentSession is never
+    // touched by these tests.
     const session = {
-      subscribe: (cb: (event: unknown) => void) => {
+      subscribe: (cb: (event: StubSessionEvent) => void) => {
         listener = cb;
         return () => {
           listener = undefined;
@@ -970,10 +993,10 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
       followUp: async () => {},
       abort: async () => {},
       getAvailableModels: () => [],
-    } as unknown as AgentSession;
+    } as never;
     return {
       session,
-      emit: (event: unknown) => listener?.(event),
+      emit: (event: StubSessionEvent) => listener?.(event),
     };
   }
 
@@ -1056,9 +1079,12 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
 describe("OmpSessionDriver live thinking (issue #193)", () => {
   /** Stub SDK session exposing the subscribe listener for event injection. */
   function stubSession() {
-    let listener: ((event: unknown) => void) | undefined;
+    let listener: ((event: StubSessionEvent) => void) | undefined;
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (subscribe + lifecycle); the rest of AgentSession is never
+    // touched by these tests.
     const session = {
-      subscribe: (cb: (event: unknown) => void) => {
+      subscribe: (cb: (event: StubSessionEvent) => void) => {
         listener = cb;
         return () => {
           listener = undefined;
@@ -1072,10 +1098,10 @@ describe("OmpSessionDriver live thinking (issue #193)", () => {
       followUp: async () => {},
       abort: async () => {},
       getAvailableModels: () => [],
-    } as unknown as AgentSession;
+    } as never;
     return {
       session,
-      emit: (event: unknown) => listener?.(event),
+      emit: (event: StubSessionEvent) => listener?.(event),
     };
   }
 
@@ -1148,12 +1174,15 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
    * per-round `turn_end` events distinguishable from the true turn end.
    */
   function stubTurnSession() {
-    let listener: ((event: unknown) => void) | undefined;
+    let listener: ((event: StubSessionEvent) => void) | undefined;
     let streaming = false;
     let finishTurn: (() => void) | undefined;
     const calls: Array<{ kind: "prompt" | "steer" | "followUp"; text: string }> = [];
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (streaming prompt lifecycle + event injection); the rest of
+    // AgentSession is never touched by these tests.
     const session = {
-      subscribe: (cb: (event: unknown) => void) => {
+      subscribe: (cb: (event: StubSessionEvent) => void) => {
         listener = cb;
         return () => {
           listener = undefined;
@@ -1180,11 +1209,11 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
       },
       abort: async () => {},
       getAvailableModels: () => [],
-    } as unknown as AgentSession;
+    } as never;
     return {
       session,
       calls,
-      emit: (event: unknown) => listener?.(event),
+      emit: (event: StubSessionEvent) => listener?.(event),
       setStreaming: (v: boolean) => {
         streaming = v;
       },
@@ -1286,8 +1315,7 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+        return { content: [{ type: "text", text: `sunny in ${String(request.params.arguments?.["city"] ?? "")}` }] };
       });
       void server.connect(serverTransport);
       return clientTransport;
@@ -1321,9 +1349,11 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
       // session file names.
       getCaller: () => driver.getTurnPrincipal(),
     });
-    const ctx = {
+    // SAFETY: execute() reads only ctx.sessionManager.getSessionFile() here;
+    // the stub provides exactly that and the rest is never touched.
+    const ctx: Parameters<typeof definition.execute>[4] = {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
-    } as unknown as Parameters<typeof definition.execute>[4];
+    } as never;
 
     // The user's write request opens the turn: the principal binds once.
     const opening = driver.prompt("can you create a test issue", { principal: "U0B9QUPCTJ5" });
@@ -1336,7 +1366,9 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
     expect(first.isError).not.toBe(true);
     let rows = await store.listAudit({ event_type: EXTENSION_CALL_EVENT });
     expect(rows).toHaveLength(1);
-    const payload0 = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+    // SAFETY: audit payloads are JSON.stringify'd by the runtime before the
+    // row is written; the assertion reads only the fields it names.
+    const payload0 = JSON.parse(rows[0]!.payload) as JsonObject;
     expect(payload0).toMatchObject({
       actor: "U0B9QUPCTJ5",
       decision: "allow",
@@ -1355,7 +1387,9 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
     rows = await store.listAudit({ event_type: EXTENSION_CALL_EVENT });
     expect(rows).toHaveLength(2);
     for (const row of rows) {
-      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      // SAFETY: audit payloads are JSON.stringify'd by the runtime before
+      // the row is written; the assertion reads only named fields.
+      const payload = JSON.parse(row.payload) as JsonObject;
       expect(payload).toMatchObject({ actor: "U0B9QUPCTJ5", decision: "allow" });
     }
     expect(boundaryCalls).toHaveLength(2);
@@ -1389,6 +1423,9 @@ describe("OmpSessionDriver run settlement (issue #183)", () => {
     let failBusyTimes = 0;
     let ghostAfterPrompt = false;
     const calls: Array<{ kind: "prompt" | "steer" | "followUp" | "abort"; text?: string }> = [];
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (busy-wait prompt/abort lifecycle); the rest of AgentSession is
+    // never touched by these tests.
     const session = {
       subscribe: () => () => {},
       beginDispose: () => {},
@@ -1416,14 +1453,14 @@ describe("OmpSessionDriver run settlement (issue #183)", () => {
         streaming = false;
       },
       getAvailableModels: () => [],
-    } as unknown as AgentSession;
+    } as never;
     return {
       session,
       calls,
       setStreaming: (v: boolean) => {
         streaming = v;
       },
-      setFailBusy: (n: number) => {
+      setFailBusyTimes: (n: number) => {
         failBusyTimes = n;
       },
       setGhostAfterPrompt: (v: boolean) => {
@@ -1433,7 +1470,7 @@ describe("OmpSessionDriver run settlement (issue #183)", () => {
   }
 
   test("a fresh prompt that hits the SDK's busy-wait aborts the stale run and retries once — the turn still runs", async () => {
-    const { session, calls, setFailBusy } = busyStubSession();
+    const { session, calls, setFailBusyTimes } = busyStubSession();
     const errors: unknown[] = [];
     const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
     driver.on("error", (data) => errors.push(data));
@@ -1443,7 +1480,7 @@ describe("OmpSessionDriver run settlement (issue #183)", () => {
     // first fresh prompt throws the SDK's busy-wait timeout. The driver
     // must recover — abort the stale run, retry once — never throw into the
     // caller (which would be a silent no-reply for the user).
-    setFailBusy(1);
+    setFailBusyTimes(1);
     await expect(driver.prompt("second message", { principal: "U1" })).resolves.toBeUndefined();
     expect(calls.filter((c) => c.kind === "abort")).toHaveLength(1);
     expect(calls.filter((c) => c.kind === "prompt")).toHaveLength(2); // original + retry
@@ -1456,13 +1493,13 @@ describe("OmpSessionDriver run settlement (issue #183)", () => {
   });
 
   test("a fresh prompt that stays busy even after the abort surfaces loudly via the error event", async () => {
-    const { session, calls, setFailBusy } = busyStubSession();
+    const { session, calls, setFailBusyTimes } = busyStubSession();
     const errors: unknown[] = [];
     const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
     driver.on("error", (data) => errors.push(data));
     const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    setFailBusy(2); // original AND the retry both hit the busy-wait
+    setFailBusyTimes(2); // original AND the retry both hit the busy-wait
     await expect(driver.prompt("second message", { principal: "U1" })).rejects.toThrow(
       "Timed out waiting for prior agent run to finish before prompting.",
     );
@@ -1520,7 +1557,7 @@ describe("process-global agent dir + boot guard (issue #80)", () => {
   const STUB_BASE_URL = "http://127.0.0.1:4891/v1";
 
   /** A temp agent dir whose models.yml declares ONE provider with an inline key. */
-  function agentDirWithCatalog(): { agentDir: string; cleanup(): void } {
+  function agentDirWithCatalog() {
     const dir = mkdtempSync(join(tmpdir(), "agentdir-issue80-"));
     const agentDir = join(dir, "omp-agent");
     mkdirSync(agentDir, { recursive: true });
@@ -1695,6 +1732,8 @@ describe("opencode tool-name transform (issue #78)", () => {
 
       // Executing the flat definition crosses the gate under the CANONICAL
       // name: the policy decision row and the audit trail keep memory.save.
+      // SAFETY: execute() reads only ctx.sessionManager.getSessionFile();
+      // the stub provides exactly that and the rest is never touched.
       const result = await flatDef!.execute(
         "call_1",
         { content: "x" },
@@ -1706,6 +1745,8 @@ describe("opencode tool-name transform (issue #78)", () => {
       );
       expect(result).toEqual({ content: [{ type: "text", text: "saved" }] });
       const rows = await store.listAudit({ event_type: POLICY_DECISION_EVENT });
+      // SAFETY: the policy gate writes the decision payload via
+      // JSON.stringify of { tool, decision } before auditing.
       const decisions = rows.map((row) => JSON.parse(row.payload) as { tool: string; decision: string });
       expect(decisions.find((row) => row.tool === "memory.save")?.decision).toBe("allow");
     } finally {
@@ -1739,7 +1780,7 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
         label: "Read file",
         description: "Reads a file",
         parameters: z.object({ path: z.string() }),
-        async execute(_toolCallId: string, _params: unknown, _signal: unknown, _onUpdate: unknown, _ctx: unknown) {
+        async execute(_toolCallId: string, _params: { path: string; api_key?: string }, _signal: AbortSignal | undefined, _onUpdate: AgentToolUpdateCallback | undefined, _ctx: ExtensionContext) {
           return { content: [{ type: "text", text: "file contents" }] };
         },
       },
@@ -1755,6 +1796,8 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
       store.close();
       rmSync(dir, { recursive: true, force: true });
     };
+    // SAFETY: execute() reads only ctx.sessionManager.getSessionFile(); the
+    // stub provides exactly that and the rest is never touched.
     const ctx = { sessionManager: { getSessionFile: () => join(dir, "sessions", "slack:C1.jsonl") } } as never;
     return { tool, steps, ctx, cleanup };
   }

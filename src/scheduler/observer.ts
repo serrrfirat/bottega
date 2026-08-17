@@ -1,5 +1,6 @@
 import type { MemoryEntry } from "../memory/types";
 import { OBSERVER_READ_EVENT } from "../store/audit-events";
+import { errorMessage } from "../tools/helpers";
 import type { SchedulerAction, SchedulerActionContext } from "./types";
 
 const OBSERVER_ACTOR = "scheduler:org_pulse";
@@ -60,10 +61,6 @@ function weeklySummary(reflections: MemoryEntry[], digests: MemoryEntry[]): stri
   return lines.join("\n");
 }
 
-function errorReason(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 async function auditFailure(
   ctx: SchedulerActionContext,
   pulseSpace: string | null,
@@ -77,7 +74,7 @@ async function auditFailure(
       payload: { error: reason },
     });
   } catch (auditError) {
-    ctx.log(`[org_pulse] failed to audit observer failure: ${errorReason(auditError)}`);
+    ctx.log(`[org_pulse] failed to audit observer failure: ${errorMessage(auditError)}`);
   }
 }
 
@@ -139,7 +136,7 @@ export const orgPulseAction: SchedulerAction = {
         payload: { pulse_space: pulseSpace, posted: true },
       });
     } catch (error) {
-      await auditFailure(ctx, pulseSpace || null, errorReason(error));
+      await auditFailure(ctx, pulseSpace || null, errorMessage(error));
     }
   },
 };

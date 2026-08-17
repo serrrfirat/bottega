@@ -27,6 +27,7 @@ function memoryRows(db: Database): Array<{
   content: string;
   metadata_json: string;
 }> {
+  // SAFETY: the query selects exactly these four columns, so every row carries them.
   return db
     .query(
       `SELECT scope, principal, content, metadata_json
@@ -105,6 +106,7 @@ describe("SQLite memory consolidation", () => {
       consolidated: "1",
     });
 
+    // SAFETY: consolidatePool writes this marker row before returning, and the query selects exactly these two columns.
     const marker = db
       .query(
         "SELECT last_rowid, compacted_at FROM memory_compaction_state WHERE scope = 'org' AND principal_key = ''",

@@ -68,12 +68,7 @@ function makeContext(options: {
   entries?: MemoryEntry[];
   space?: Space | null;
   searchError?: Error;
-} = {}): {
-  ctx: SchedulerActionContext;
-  provider: FakeMemoryProvider;
-  audits: AuditInput[];
-  posts: Array<{ spaceId: string; text: string }>;
-} {
+} = {}) {
   const space = options.space === undefined ? pulseSpace() : options.space;
   const provider = new FakeMemoryProvider(options.entries ?? [], options.searchError);
   const audits: AuditInput[] = [];
@@ -87,11 +82,14 @@ function makeContext(options: {
       return [];
     },
   };
+  // SAFETY: orgPulseAction's only store access is getSpace (observer.ts); the
+  // stub covers that surface and the suite asserts the action never touches
+  // the rest of Store.
   const store = {
     async getSpace(id: string) {
       return space?.id === id ? space : null;
     },
-  } as unknown as Store;
+  } as Store;
 
   return {
     provider,
@@ -101,7 +99,7 @@ function makeContext(options: {
       store,
       audit,
       memoryProvider: provider,
-      async postMessage(spaceId, text) {
+      async postMessage(spaceId: string, text: string) {
         posts.push({ spaceId, text });
         return "1712345.6789";
       },
@@ -110,7 +108,7 @@ function makeContext(options: {
       },
       log() {},
       now: () => NOW,
-    },
+    } satisfies SchedulerActionContext,
   };
 }
 

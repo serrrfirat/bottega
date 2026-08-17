@@ -14,6 +14,7 @@ import { buildRegistry } from "./actions";
 import { nextCronFire } from "./cron";
 import { startScheduler, tickScheduler, type SchedulerTickDeps } from "./runner";
 import type { SchedulerAction, SchedulerActionRegistry } from "./types";
+import { z } from "zod";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-scheduler-runner-"));
 const stores: Store[] = [];
@@ -36,6 +37,8 @@ const unusedMemory: MemoryProvider = {
   search: async () => [],
 };
 
+const jsonObjectSchema = z.record(z.string(), z.json());
+
 function deps(
   store: Store,
   audit: AuditModule,
@@ -49,6 +52,8 @@ function deps(
     registry,
     memoryProvider: unusedMemory,
     postMessage: async () => undefined,
+    // SAFETY: no scheduler action exercised by these tests resolves a policy, so
+    // the impossible return value is never observed.
     loadPolicy: async () => undefined as never,
     log: () => {},
     now: () => now,
@@ -56,8 +61,8 @@ function deps(
   };
 }
 
-function payloads(rows: AuditRow[]): Array<Record<string, unknown>> {
-  return rows.map((row) => JSON.parse(row.payload) as Record<string, unknown>);
+function payloads(rows: AuditRow[]) {
+  return rows.map((row) => jsonObjectSchema.parse(JSON.parse(row.payload)));
 }
 
 describe("scheduler runner (issue #86)", () => {
@@ -152,6 +157,8 @@ describe("scheduler runner (issue #86)", () => {
 
     await tickScheduler(deps(store, audit, new Map(), now));
 
+    // SAFETY: this test INSERTs the scheduler_jobs row with an INTEGER enabled
+    // column; bun:sqlite surfaces INTEGER columns as numbers.
     const raw = store.getDb().query("SELECT enabled FROM scheduler_jobs WHERE id = ?").get("sj_unknown") as { enabled: number };
     expect(raw.enabled).toBe(0);
     expect(payloads(await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT }))).toEqual([
@@ -180,12 +187,15 @@ describe("scheduler runner (issue #86)", () => {
 
   test("start and stop run the immediate pass without leaving a timer", async () => {
     let lists = 0;
+    // SAFETY: startScheduler reads only listSchedulerJobs on the start/stop path
+    // under test; the rest of Store is never reached, so the partial fake is safe
+    // to treat as a Store (never is the single-hop escape).
     const store = {
       listSchedulerJobs: async () => {
         lists += 1;
         return [];
       },
-    } as unknown as Store;
+    } as never;
     const audit = {
       appendAudit: async () => 1,
       listAudit: async () => [],
@@ -196,6 +206,8 @@ describe("scheduler runner (issue #86)", () => {
       registry: new Map(),
       memoryProvider: unusedMemory,
       postMessage: async () => undefined,
+      // SAFETY: the fake store returns no jobs, so startScheduler never invokes
+      // loadPolicy; the impossible return value is never observed.
       loadPolicy: async () => undefined as never,
       log: () => {},
       pollIntervalMs: 60_000,

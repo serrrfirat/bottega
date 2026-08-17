@@ -22,20 +22,27 @@
  * The first recorded click wins (the executor's wait reads the earliest
  * matching row).
  */
+import { z } from "zod";
 import { DELIVERY_REQUESTED_EVENT, DELIVERY_RESOLVED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import { DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
 
-interface DeliveryRequestPayload {
-  id?: unknown;
-  pr_url?: unknown;
-  summary?: unknown;
-}
+/**
+ * The `delivery.requested` payload as the poller writes it (all strings).
+ * Decoded at the audit-row boundary; `delivery.resolved` rows (id + boolean
+ * fields) still parse — extra keys are stripped.
+ */
+const DeliveryRequestPayloadSchema = z.object({
+  id: z.string().optional(),
+  pr_url: z.string().optional(),
+  summary: z.string().optional(),
+});
+type DeliveryRequestPayload = z.infer<typeof DeliveryRequestPayloadSchema>;
 
 function parsePayload(raw: string): DeliveryRequestPayload | null {
   try {
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null ? (parsed as DeliveryRequestPayload) : null;
+    const parsed = DeliveryRequestPayloadSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
@@ -138,7 +145,7 @@ export async function resolveDeliveryAction(
     return false;
   }
   const payload = parsePayload(announcement.payload);
-  const prUrl = typeof payload?.pr_url === "string" ? payload.pr_url : action.value;
+  const prUrl = payload?.pr_url ?? action.value;
   await deps.store.appendAudit({
     space_id: action.spaceId,
     actor: action.principal,
@@ -149,6 +156,6 @@ export async function resolveDeliveryAction(
   // row above is the decision; a failed rewrite must not lose it.
   void deps.adapter
     .updateMessage(action.spaceId, action.messageTs, outcomeText(prUrl, approved, action.principal))
-    .catch((err: unknown) => log(`[delivery] updateMessage failed for ${action.value}: ${String(err)}`));
+    .catch((err) => log(`[delivery] updateMessage failed for ${action.value}: ${String(err)}`));
   return true;
 }

@@ -30,6 +30,7 @@
  * the worst outcome.
  */
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
@@ -64,6 +65,32 @@ const ALLOWED_HOST = "cloud-api.near.ai";
 /** Anything not on the allowlist must be blocked. */
 const DENIED_HOST = "bottega-blocked.test";
 
+/**
+ * The egress.yml subset the legs read: each transform's name plus the
+ * allowlist's config.domains (the shape regenerateEgressConfig writes;
+ * everything else is stripped). The config is a generated artifact, so a
+ * shape drift is a contract break the legs surface rather than guess at.
+ */
+const EgressConfigSchema = z.object({
+  transforms: z
+    .array(
+      z.object({
+        name: z.string(),
+        config: z.object({ domains: z.array(z.string()).optional() }).optional(),
+      }),
+    )
+    .optional(),
+});
+
+/** The allowlist transform's domains from an egress-config document, or undefined. */
+function allowlistDomains(doc: Record<string, YamlNode>): string[] | undefined {
+  const parsed = EgressConfigSchema.safeParse(doc);
+  const allowlist = parsed.success
+    ? parsed.data.transforms?.find((transform) => transform.name === "allowlist")
+    : undefined;
+  return allowlist?.config?.domains;
+}
+
 describe("iron-proxy integration leg (skip-gated)", () => {
   test(
     "default-deny allowlist enforced by the pinned image",
@@ -83,13 +110,7 @@ describe("iron-proxy integration leg (skip-gated)", () => {
       //    (config/egress.yml) so the leg tracks the real policy.
       const PROXY_IMAGE = pinnedProxyImage(); // compose pin — version-bump tripwire (#177)
       const egressCfg = parseYamlSubset(readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"));
-      const transforms = egressCfg["transforms"] as YamlNode[];
-      const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as
-        | Record<string, YamlNode>
-        | undefined;
-      const domains = (allowlist?.["config"] as Record<string, YamlNode> | undefined)?.["domains"] as
-        | string[]
-        | undefined;
+      const domains = allowlistDomains(egressCfg);
       if (!domains?.includes(ALLOWED_HOST)) {
         skip(`config/egress.yml allowlist does not contain ${ALLOWED_HOST} — cannot build the leg target`);
         return;
@@ -124,7 +145,7 @@ describe("iron-proxy integration leg (skip-gated)", () => {
         port: 0,
         fetch: () => new Response("target-ok"),
       });
-      const targetPort = (target as { port: number }).port;
+      const targetPort = target.port;
 
       // 5. Leg config: allowlist domains from egress.yml, DNS sinkhole, TLS
       //    CA (required by the image), no judge (judge needs the
@@ -310,8 +331,13 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
         domains: s.manifest.domains,
       }));
       const devConfig = renderDevEgressConfig(extensionEntries);
-      const secretsEntries = parseYamlSubset(devConfig)["transforms"] as YamlNode[];
-      if (!secretsEntries.some((t) => (t as Record<string, YamlNode>)["name"] === "secrets")) {
+      const devParsed = EgressConfigSchema.safeParse(parseYamlSubset(devConfig));
+      if (!devParsed.success) {
+        throw new Error(
+          `generated dev egress config does not match the expected shape: ${devParsed.error.issues[0]?.message ?? "unknown"}`,
+        );
+      }
+      if (!devParsed.data.transforms?.some((t) => t.name === "secrets")) {
         skip("generated dev config has no secrets transform — cannot prove injection");
         return;
       }
@@ -336,7 +362,7 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
           return new Response("target-ok");
         },
       });
-      const targetPort = (target as { port: number }).port;
+      const targetPort = target.port;
 
       // Temp dir under data/ (gitignored): Docker Desktop does not reliably
       // bind-mount files from /tmp or /var/folders.
@@ -499,13 +525,7 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
       //    on INJECT_HOST being allowlisted: breaking the generated
       //    allowlist FAILS the leg (no skip).
       const egressCfg = parseYamlSubset(readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"));
-      const transforms = egressCfg["transforms"] as YamlNode[];
-      const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as
-        | Record<string, YamlNode>
-        | undefined;
-      const realDomains = (allowlist?.["config"] as Record<string, YamlNode> | undefined)?.["domains"] as
-        | string[]
-        | undefined;
+      const realDomains = allowlistDomains(egressCfg);
       if (!realDomains?.includes(INJECT_HOST)) {
         // Tripwire: the generated allowlist lost the injection host — fail.
         throw new Error(`[iron-proxy secrets leg] generated allowlist lost ${INJECT_HOST} — default-deny is broken; refusing to skip`);
@@ -542,7 +562,7 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
           return new Response("target-ok");
         },
       });
-      const targetPort = (target as { port: number }).port;
+      const targetPort = target.port;
 
       // 4. Temp dirs under data/ (gitignored; Docker Desktop bind-mounts).
       const dir = join(resolve(import.meta.dir, "../../data"), `ironproxy-secrets-leg-${process.pid}`);

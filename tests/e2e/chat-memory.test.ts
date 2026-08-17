@@ -120,7 +120,10 @@ describe("e2e journey 1: chat + memory", () => {
         await h.modelStub.waitForRequests(1);
 
         const messages = h.modelStub.latestMessages();
-        const system = messages.find((m) => m.role === "system" && typeof m.content === "string");
+        // String(x) === x holds exactly when x is a string — the memory
+        // injection rides the system prompt's text content, so only a
+        // string-content system message qualifies.
+        const system = messages.find((m) => m.role === "system" && String(m.content) === m.content);
         expect(system).toBeDefined();
         expect(String(system!.content)).toContain("Relevant memory:");
         expect(String(system!.content)).toContain("the team deploys on Tuesdays");

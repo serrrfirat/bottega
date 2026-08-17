@@ -303,7 +303,7 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
 describe("boot-secret provisioning via the upload link (issue #201)", () => {
   test("boot secrets mint by their vault provider id without a registry entry", () => {
     const store = new UploadLinkStore(freshStore(), { maxOutstandingPerActor: BOOT_SECRETS.length });
-    for (const id of ["slack-app", "slack-bot", "opencode", "near", "openai", "anthropic"]) {
+    for (const id of ["slack-app", "slack-bot", "opencode", "near", "openai", "anthropic", "github-webhook"]) {
       const outcome = mintUploadLink(
         { extension: id, scope: "org", actor: "UADA" },
         { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9" },
@@ -445,9 +445,11 @@ describe("upload link minting (issue #196)", () => {
         { extension: "fixture.weather", scope: "personal" },
         undefined,
         undefined,
+        // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
         { sessionManager: { getSessionFile: () => "slack:C1.jsonl" } } as never,
       );
       expect(result.isError).toBeUndefined();
+      // SAFETY: the tool replies with a single text content block carrying the upload URL.
       const text = (result.content[0] as { text: string }).text;
       expect(text.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
 

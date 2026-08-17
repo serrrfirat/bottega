@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionHandler, ToolCallEvent, ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 import { EXECUTOR_TOOLS, prepareExecutor, runExecutor } from "./executor";
 import { DenyRouter } from "./policy/approval-router";
 import { DEFAULT_TIMEOUT_MINUTES, defaultPolicy } from "./policy/config";
@@ -12,8 +12,8 @@ test("server main wires adapter and space service", async () => {
   process.env.SLACK_APP_TOKEN = "xapp-test-token";
   process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
   const server = await serverMain();
-  expect(typeof server.start).toBe("function");
-  expect(typeof server.stop).toBe("function");
+  expect(server.start).toEqual(expect.any(Function));
+  expect(server.stop).toEqual(expect.any(Function));
   await server.stop();
 });
 
@@ -40,22 +40,25 @@ test("server main wires the Slack approval router for space sessions (issue #44)
   // and the policy timeout from approvals.timeout_minutes.
   expect(created).toHaveLength(1);
   expect(created[0].timeoutMs).toBe(DEFAULT_TIMEOUT_MINUTES * 60_000);
-  expect(typeof created[0].adapter.postMessage).toBe("function");
-  expect(typeof created[0].adapter.updateMessage).toBe("function");
+  expect(created[0].adapter.postMessage).toEqual(expect.any(Function));
+  expect(created[0].adapter.updateMessage).toEqual(expect.any(Function));
   // The default path constructs the Slack button router itself.
   expect(SlackApprovalRouter.prototype).toBeDefined();
 });
 
 test("executor exposes the claim-loop runner and the work tool allowlist", () => {
-  expect(typeof runExecutor).toBe("function");
-  expect(typeof prepareExecutor).toBe("function");
+  expect(runExecutor).toEqual(expect.any(Function));
+  expect(prepareExecutor).toEqual(expect.any(Function));
   expect(EXECUTOR_TOOLS).toEqual(["read", "write", "glob", "grep", "bash"]);
 });
 
 test("policy extension factory registers a tool_call gate", () => {
   const events = new Set<string>();
-  // Test double: only the registration surface is exercised here.
-  const pi = { on: (event: string) => events.add(event) } as unknown as ExtensionAPI;
+  type ToolCallHandler = ExtensionHandler<ToolCallEvent, ToolCallEventResult>;
+  // SAFETY: createPolicyExtension registers a "tool_call" handler through
+  // pi.on only — the double implements exactly that surface, and the
+  // factory never reads the rest of ExtensionAPI during registration.
+  const pi = { on: (event: "tool_call", _handler: ToolCallHandler) => void events.add(event) } as ExtensionAPI;
   const factory = createPolicyExtension({
     orgPolicy: defaultPolicy(),
     audit: { appendAudit: async () => 1, listAudit: async () => [] },

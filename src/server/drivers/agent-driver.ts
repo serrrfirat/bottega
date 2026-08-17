@@ -140,7 +140,7 @@ export interface AgentSessionDriver {
   prompt(text: string, opts?: AgentTurnOptions): Promise<void>;
   abort(): Promise<void>;
   isStreaming(): boolean;
-  on(event: DriverEvent, cb: (data: unknown) => void): () => void;
+  on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void;
   dispose(): Promise<void>;
   /**
    * Optional per-session model-role switch (issue #64): applies the role for
@@ -251,10 +251,16 @@ export class SessionModelRoleRegistry {
  * - fast → fast_model ?? model at fixed low effort;
  * - reasoning → reasoning_model ?? model at reasoning_effort ?? high.
  */
+/** The per-role model + thinking target (issue #64): optional overrides, defaults applied. */
+export interface RoleTarget {
+  modelId?: string;
+  thinkingLevel?: "off" | "low" | "medium" | "high";
+}
+
 export function resolveRoleTarget(
   role: ModelRole,
   settings: SpaceModelSettings,
-): { modelId?: string; thinkingLevel?: "off" | "low" | "medium" | "high" } {
+): RoleTarget {
   switch (role) {
     case "fast":
       return { modelId: settings.fast_model ?? settings.model, thinkingLevel: "low" };
@@ -277,15 +283,32 @@ type SdkThinkingLevel = NonNullable<Parameters<AgentSession["setModel"]>[2]>["th
 export type DriverEvent = "message" | "thinking" | "turn_start" | "turn_end" | "error";
 
 /**
+ * Payloads the session drivers emit per event. Consumers key off the event
+ * name (a `message` carries `text`, an `error` carries `message`, …); the
+ * optional fields are the union of every driver's emit sites.
+ */
+export interface DriverEventData {
+  spaceId: string;
+  /** Assistant text delivered during the turn (`message` events). */
+  text?: string;
+  /** Human-readable error/notice text (`error` events). */
+  message?: string;
+  /** Accumulated reasoning text (`thinking` events). */
+  thinking?: string;
+  /** Turn failure cause (`turn_end` events carrying one). */
+  error?: string;
+}
+
+/**
  * The listener plumbing behind {@link AgentSessionDriver.on} (issue #33).
  * The OMP and ACP drivers share identical event semantics, so the emitter
  * lives here once: typed by event name, idempotent `on` (a listener
  * registers once), and unsubscribe-by-closure.
  */
 export function createEmitter<Event extends string>() {
-  const listeners = new Map<Event, Set<(data: unknown) => void>>();
+  const listeners = new Map<Event, Set<(data: DriverEventData) => void>>();
   return {
-    on(event: Event, cb: (data: unknown) => void): () => void {
+    on(event: Event, cb: (data: DriverEventData) => void): () => void {
       let set = listeners.get(event);
       if (!set) {
         set = new Set();
@@ -294,7 +317,7 @@ export function createEmitter<Event extends string>() {
       set.add(cb);
       return () => set.delete(cb);
     },
-    emit(event: Event, data: unknown): void {
+    emit(event: Event, data: DriverEventData): void {
       for (const cb of listeners.get(event) ?? []) cb(data);
     },
   };
@@ -317,23 +340,30 @@ export function sessionIdFromFilePath(file: string | null | undefined): string |
   return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : undefined;
 }
 
+const thinkingBlockSchema = z.object({
+  type: z.string(),
+  thinking: z.string(),
+});
+
 /**
  * The thinking text of an SDK message's content blocks (issue #193).
  * `{type:"thinking"}` blocks carry the model's reasoning; unknown block
  * shapes (redactedThinking, toolCall, image, …) are ignored — fail closed,
  * never surfaced. Empty when the message carries no readable thinking.
+ * Every SDK message kind carries `content`, so the param is the readable
+ * slice of the SDK's AgentMessage.
  */
-export function collectThinkingBlocks(message: unknown): string[] {
-  if (message === null || typeof message !== "object" || !("content" in message)) return [];
+export function collectThinkingBlocks(message: { content?: unknown } | null): string[] {
+  // A non-object message (or null) carries no readable thinking; the in-check
+  // below then reads only the optional `content` property.
+  if (!(message instanceof Object) || !("content" in message)) return [];
   const content = message.content;
   if (!Array.isArray(content)) return [];
   const parts: string[] = [];
   for (const block of content) {
-    if (block === null || typeof block !== "object") continue;
-    if (!("type" in block) || !("thinking" in block)) continue;
-    if (block.type !== "thinking") continue;
-    if (typeof block.thinking !== "string" || !block.thinking.trim()) continue;
-    parts.push(block.thinking.trim());
+    const parsed = thinkingBlockSchema.safeParse(block);
+    if (!parsed.success || parsed.data.type !== "thinking" || !parsed.data.thinking.trim()) continue;
+    parts.push(parsed.data.thinking.trim());
   }
   return parts;
 }
@@ -444,13 +474,16 @@ const GATE_WRAPPED_BUILTINS = [
   "bash",
 ] as const;
 
+/** Arbitrary JSON values (tool args and stored config are JSON at the boundaries). */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 /**
  * Caller-declared parameter hints for the wrapped built-ins (issue #69).
  * The native implementation validates strictly and rejects bad args with
  * its own schema, so the wrapper only needs a permissive passthrough shape
  * that guides the model without drifting from the SDK's schemas.
  */
-const GATE_WRAPPED_BUILTIN_PARAMS: Record<(typeof GATE_WRAPPED_BUILTINS)[number], ReturnType<typeof z.object>> = {
+const GATE_WRAPPED_BUILTIN_PARAMS = {
   read: z.object({ path: z.string(), offset: z.number().int().optional(), limit: z.number().int().optional() }).passthrough(),
   glob: z.object({ pattern: z.string(), path: z.string().optional(), limit: z.number().int().optional() }).passthrough(),
   grep: z.object({ pattern: z.string(), path: z.string().optional(), case: z.boolean().optional() }).passthrough(),
@@ -460,9 +493,9 @@ const GATE_WRAPPED_BUILTIN_PARAMS: Record<(typeof GATE_WRAPPED_BUILTINS)[number]
   write: z.object({ path: z.string(), content: z.string() }).passthrough(),
   edit: z.object({ path: z.string(), old_string: z.string(), new_string: z.string() }).passthrough(),
   bash: z.object({ command: z.string(), timeout: z.number().int().optional() }).passthrough(),
-};
+} satisfies Record<(typeof GATE_WRAPPED_BUILTINS)[number], ReturnType<typeof z.object>>;
 
-const GATE_WRAPPED_BUILTIN_DESCRIPTIONS: Record<(typeof GATE_WRAPPED_BUILTINS)[number], string> = {
+const GATE_WRAPPED_BUILTIN_DESCRIPTIONS = {
   read: "Read a file from the workspace. Args: path (string, required), offset (int, optional), limit (int, optional).",
   glob: "List files matching a glob pattern. Args: pattern (string, required), path (string, optional), limit (int, optional).",
   grep: "Search file contents with a regex pattern. Args: pattern (string, required), path (string, optional), case (boolean, optional).",
@@ -472,7 +505,7 @@ const GATE_WRAPPED_BUILTIN_DESCRIPTIONS: Record<(typeof GATE_WRAPPED_BUILTINS)[n
   write: "Write content to a file at path. Args: path (string, required), content (string, required).",
   edit: "Apply a string replacement to a file at path. Args: path (string, required), old_string (string, required), new_string (string, required).",
   bash: "Run a shell command in the workspace. Args: command (string, required), timeout (int, optional).",
-};
+} satisfies Record<(typeof GATE_WRAPPED_BUILTINS)[number], string>;
 
 /**
  * Marks an SDK tool definition so the SDK treats it as a
@@ -491,6 +524,7 @@ const GATE_WRAPPED_BUILTIN_DESCRIPTIONS: Record<(typeof GATE_WRAPPED_BUILTINS)[n
  * `ctx.invokeTool` delegation seam for wrapped built-ins).
  */
 export function markToolDefinition<TDef extends ToolDefinition>(def: TDef): TDef {
+  // SAFETY: spreading def preserves every ToolDefinition member; adding the marker only widens the object, never removes a member.
   return { ...def, __isToolDefinition: true } as TDef & { __isToolDefinition: boolean };
 }
 
@@ -548,8 +582,7 @@ export function withOpencodeSafeName<TDef extends ToolDefinition>(def: TDef): TD
  * the session is wedged: the driver must recover (abort + retry), never
  * treat them as a silent no-reply.
  */
-export function isBusySettlementError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
+export function isBusySettlementError(err: Error): boolean {
   return (
     err.name === "AgentBusyError" ||
     /prior agent run to finish before prompting/.test(err.message)
@@ -577,6 +610,7 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
   const execute = def.execute;
   const actor = deps.actor ?? "agent";
   const sink = deps.onToolStep;
+  // SAFETY: the wrapper spreads def unchanged and only replaces execute with a same-signature gate-wrapped implementation, preserving TDef's shape.
   return {
     ...def,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -693,6 +727,7 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
  */
 function gatedBuiltinDefinitions(names: readonly string[]): ToolDefinition[] {
   return names.map((name) => {
+    // SAFETY: gatedBuiltinDefinitions is only called with names pre-filtered by GATE_WRAPPED_BUILTINS membership (see builtinNames below), so the lookups below always hit.
     const def: ToolDefinition = {
       name,
       label: name,
@@ -706,7 +741,8 @@ function gatedBuiltinDefinitions(names: readonly string[]): ToolDefinition[] {
         if (!ctx.invokeTool) {
           throw new Error(`policy: built-in '${name}' has no native implementation to delegate to`);
         }
-        return ctx.invokeTool(params as Record<string, unknown>);
+        // SAFETY: built-in params are JSON values (the wrapper schemas above are passthrough JSON shapes); invokeTool accepts the same.
+        return ctx.invokeTool(params as Record<string, JsonValue>);
       },
     };
     return def;
@@ -760,12 +796,9 @@ export async function assertAgentDirModelAvailable(agentDir: string): Promise<nu
   let declared: string[] | null = null;
   try {
     const parsed = parseYamlSubset(readFileSync(modelsPath, "utf8"));
-    const providers = parsed.providers;
-    if (providers !== undefined && typeof providers === "object" && !Array.isArray(providers)) {
-      declared = Object.keys(providers);
-    } else {
-      declared = [];
-    }
+    // The models.yml contract: `providers` is a mapping of provider id → config; anything else means no providers declared.
+    const providers = z.record(z.string(), z.unknown()).safeParse(parsed.providers);
+    declared = providers.success ? Object.keys(providers.data) : [];
   } catch {
     declared = null;
   }
@@ -822,7 +855,7 @@ export function ensureAgentDirModelPin(agentDir: string, templatePath: string = 
   try {
     existing = readFileSync(agentConfigPath, "utf8");
   } catch (err) {
-    if (!(typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT")) return "skipped";
+    if (!z.object({ code: z.literal("ENOENT") }).safeParse(err).success) return "skipped";
   }
   let template: string | null = null;
   try {
@@ -845,10 +878,11 @@ export function ensureAgentDirModelPin(agentDir: string, templatePath: string = 
   let roleBlock: string | null = null;
   try {
     const templateParsed = parseYamlSubset(template);
-    const roles = templateParsed.modelRoles;
-    if (roles === undefined || typeof roles !== "object" || Array.isArray(roles)) return "unchanged";
-    const lines = Object.entries(roles)
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    // The template's modelRoles block is a mapping of role → model id; anything else leaves the file untouched.
+    const roles = z.record(z.string(), z.unknown()).safeParse(templateParsed.modelRoles);
+    if (!roles.success) return "unchanged";
+    const lines = Object.entries(roles.data)
+      .filter((entry): entry is [string, string] => z.string().safeParse(entry[1]).success)
       .map(([key, value]) => `  ${key}: ${value}`);
     if (lines.length === 0) return "unchanged";
     roleBlock = `\nmodelRoles:\n${lines.join("\n")}\n`;
@@ -949,8 +983,11 @@ export function createOmpSdkDriver(
       // full discovered surface lands in the session, never a partial stale
       // subset. Plain arrays pass through unchanged.
       const customToolsOption = opts.customTools;
-      const sessionCustomToolsBase =
-        typeof customToolsOption === "function" ? await customToolsOption() : (customToolsOption ?? []);
+      const sessionCustomToolsBase = Array.isArray(customToolsOption)
+        ? customToolsOption
+        : customToolsOption === undefined
+          ? []
+          : await customToolsOption();
       // The connect tool (issue #52) rides the custom-tools path — restricted
       // sessions skip extension factories — and is built per session so the
       // actor is the session's principal (personal connects record the owner).
@@ -966,7 +1003,7 @@ export function createOmpSdkDriver(
               broker: opts.connectExtension.broker ?? connectViaAuthBroker,
               ...(opts.connectExtension.mcpOAuth !== undefined
                 ? { mcpOAuth: opts.connectExtension.mcpOAuth }
-                : {}),
+                : undefined),
               gate: {
                 loadPolicy: opts.connectExtension.loadPolicy,
                 router: opts.connectExtension.router,
@@ -1002,7 +1039,7 @@ export function createOmpSdkDriver(
         ? spaceAgentToolNames([...customNames], allowTools).filter(
             (name) =>
               !customNames.has(name) &&
-              (GATE_WRAPPED_BUILTINS as readonly string[]).includes(name),
+              GATE_WRAPPED_BUILTINS.some((builtin) => builtin === name),
           )
         : [];
       const allSessionTools = [
@@ -1056,7 +1093,7 @@ export function createOmpSdkDriver(
           getModelSettings ?? opts.getModelSettings ?? (async () => ({}));
         const modelSettings = await sessionSettings(spaceId);
         const defaultModel = modelSettings.model;
-        if (typeof defaultModel === "string" && defaultModel.trim() !== "") {
+        if (defaultModel !== undefined && defaultModel.trim() !== "") {
           const catalog = await listAvailableModels(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR);
           const resolution = resolveModelPin(defaultModel, catalog);
           if (resolution.ok) {
@@ -1099,17 +1136,18 @@ export function createOmpSdkDriver(
         // gated definitions above are the live path.
         extensions: opts.extensions ?? [],
         // request-only directive (issue #55), appended to the rendered prompt.
-        ...(effectiveAppend ? { appendSystemPrompt: effectiveAppend } : {}),
+        ...(effectiveAppend ? { appendSystemPrompt: effectiveAppend } : undefined),
         // Issue #68: keep the token budget for answers, not reasoning (see
         // the thinkingLevel option on createOmpSdkDriver). The cast bridges
         // the SDK's const-enum typing: Effort members type nominally in
         // declaration files, but the runtime values are the same strings
         // DriverThinkingLevel mirrors.
+        // SAFETY: DriverThinkingLevel's strings are the SDK Effort runtime values (documented at SdkThinkingLevel).
         thinkingLevel: thinkingLevel as CreateAgentSessionOptions["thinkingLevel"],
         // Issue #199: the session starts on the RESOLVED settings default
         // (provider-qualified) — never the raw unqualified value the SDK's
         // registry would land on the wrong provider's same-named model.
-        ...(resolvedDefaultModel !== undefined ? { modelPattern: [resolvedDefaultModel] } : {}),
+        ...(resolvedDefaultModel !== undefined ? { modelPattern: [resolvedDefaultModel] } : undefined),
         // Registry + connect tools (issues #50/#52) must surface in
         // restricted sessions; discovered extensions, MCP, and ambient
         // custom tools stay disabled.
@@ -1234,15 +1272,20 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // with empty content + `errorMessage`, so the text below is empty
           // and nothing would be delivered — keep the cause for the
           // turn_end the loop emits right after.
-          const errorMessage = (event.message as { errorMessage?: unknown } | null)?.errorMessage;
-          if (typeof errorMessage === "string" && errorMessage.trim()) this.#lastError = errorMessage.trim();
+          const errorMessage =
+            event.message instanceof Object && "errorMessage" in event.message
+              ? event.message.errorMessage
+              : undefined;
+          if (errorMessage !== undefined && errorMessage.trim()) this.#lastError = errorMessage.trim();
           // Issue #193: the message's own content blocks are the
           // authoritative thinking snapshot — on the replay path the
           // deltas above don't re-fire, so the completed reasoning rides
           // the final message instead. Prefer the content blocks (they
           // are the full text); the accumulated deltas remain the
           // fallback when a provider redacts thinking from content.
-          const contentThinking = collectThinkingBlocks(event.message);
+          const contentThinking = collectThinkingBlocks(
+            event.message instanceof Object && "content" in event.message ? event.message : null,
+          );
           if (contentThinking.length > 0) {
             this.#thinkingByIndex.clear();
             contentThinking.forEach((part, index) => this.#thinkingByIndex.set(index, part));
@@ -1360,8 +1403,8 @@ export class OmpSessionDriver implements AgentSessionDriver {
     try {
       await this.#session.prompt(text);
     } catch (err) {
-      if (!isBusySettlementError(err)) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
+      if (!(err instanceof Error) || !isBusySettlementError(err)) throw err;
+      const reason = err.message;
       console.error(
         `[agent-driver] prior agent run did not settle before prompting in ${this.#spaceId}: ${reason} — aborting the stale run and retrying once`,
       );
@@ -1474,7 +1517,7 @@ export class OmpSessionDriver implements AgentSessionDriver {
     return this.#session.isStreaming || this.#turnReapplyPending;
   }
 
-  on(event: DriverEvent, cb: (data: unknown) => void): () => void {
+  on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void {
     return this.#emitter.on(event, cb);
   }
 
@@ -1499,6 +1542,7 @@ export class OmpSessionDriver implements AgentSessionDriver {
         reason: "no model settings configured for this space",
       };
     }
+    // SAFETY: DriverThinkingLevel mirrors the SDK Effort runtime strings (SdkThinkingLevel's doc comment); the settings values ARE those strings.
     const thinkingLevel = target.thinkingLevel as SdkThinkingLevel | undefined;
     if (target.modelId) {
       // Issue #199: route the settings value through the provider-aware

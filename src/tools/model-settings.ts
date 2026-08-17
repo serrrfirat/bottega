@@ -28,7 +28,7 @@
  */
 import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
-import { sessionIdFromFilePath, type ModelRole, type SessionModelRoleRegistry } from "../server/drivers/agent-driver";
+import { sessionIdFromFilePath, type SessionModelRoleRegistry } from "../server/drivers/agent-driver";
 import type { AuditModule } from "../policy/audit";
 import { MODEL_SETTINGS_CHANGED_EVENT, MODEL_SWITCHED_EVENT } from "../store/audit-events";
 import type { Store, SpaceModelSettings } from "../store/db";
@@ -163,7 +163,7 @@ export function modelToolsDefinitions(
       // persist so settings never store padded ids.
       const after: SpaceModelSettings & Record<string, string | undefined> = { ...before };
       for (const [key, raw] of Object.entries(params.set)) {
-        if (typeof raw !== "string") continue; // reasoning_effort enum value
+        // Every settable knob is a string (model ids and the reasoning_effort enum value alike).
         const trimmed = raw.trim();
         if (!trimmed) return toolError(`model_settings ${key} must not be empty`);
         after[key] = trimmed;
@@ -174,7 +174,7 @@ export function modelToolsDefinitions(
           actor,
           space_id: spaceId,
           event_type: MODEL_SETTINGS_CHANGED_EVENT,
-          payload: { before, after, by: actor },
+          payload: JSON.parse(JSON.stringify({ before, after, by: actor })),
         });
         return { content: [{ type: "text", text: JSON.stringify(after) }] };
       } catch (err) {
@@ -203,7 +203,7 @@ export function modelToolsDefinitions(
         return toolError("model role switching is not wired in this deployment");
       }
       try {
-        const outcome = await opts.modelRoles.switchRole(spaceId, params.role as ModelRole);
+        const outcome = await opts.modelRoles.switchRole(spaceId, params.role);
         if (!outcome.ok) return toolError(outcome.error);
         const { result } = outcome;
         await opts.audit?.appendAudit({

@@ -13,7 +13,7 @@ import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
-import { createAudit, type AuditModule } from "../../policy/audit";
+import { createAudit } from "../../policy/audit";
 import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
@@ -24,6 +24,13 @@ import { sha256Hex } from "../../tools/memory";
 // Fakes: no real model, no network. The driver seam is what keeps these tests
 // hermetic — SpaceService sees only AgentSessionDriver, never OMP.
 // ---------------------------------------------------------------------------
+
+/** Event payloads the fake session emits: message text, turn bounds, errors. */
+type FakeSessionEventData =
+  | { spaceId: string; text: string }
+  | { spaceId: string }
+  | { spaceId: string; message: string }
+  | { spaceId: string; error: string };
 
 class FakeSession implements AgentSessionDriver {
   readonly spaceId: string;
@@ -43,7 +50,7 @@ class FakeSession implements AgentSessionDriver {
   /** reapplyDefaultModelRole invocations (issue #189): the service must call the seam before each fresh turn. */
   reapplyCalls = 0;
 
-  private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
+  private readonly listeners = new Map<string, Set<(data: FakeSessionEventData) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
   private promptGate?: { promise: Promise<void>; resolve: () => void };
 
@@ -88,7 +95,7 @@ class FakeSession implements AgentSessionDriver {
     return this.streaming;
   }
 
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: unknown) => void): () => void {
+  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: FakeSessionEventData) => void): () => void {
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
@@ -98,7 +105,7 @@ class FakeSession implements AgentSessionDriver {
     return () => set.delete(cb);
   }
 
-  emit(event: "message" | "turn_start" | "turn_end" | "error", data: unknown): void {
+  emit(event: "message" | "turn_start" | "turn_end" | "error", data: FakeSessionEventData): void {
     // The turn's principal binding dies with the turn (issue #152) — the
     // next fresh turn rebinds from its own prompt's principal.
     if (event === "turn_end") this.turnPrincipal = undefined;
@@ -225,17 +232,7 @@ function fakeAdapter(
     downloads?: Record<string, FakeDownloadedFile | Error>;
     streaming?: boolean;
   } = {},
-): {
-  adapter: SlackAdapter;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
-  updates: Array<{ spaceId: string; ts: string; text: string }>;
-  reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
-  streams: FakeStreamCall[];
-  stops: Array<{ spaceId: string; ts: string; text?: string }>;
-  downloadedFileIds: string[];
-  uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }>;
-  releasePost: () => void;
-} {
+) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
@@ -309,11 +306,10 @@ function fakeAdapter(
   };
 }
 
-function fakeStore(): {
-  store: Store;
-  audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }>;
-} {
+function fakeStore() {
   const audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }> = [];
+  // SAFETY: the harness only exercises appendAudit/getOrgSettings; the
+  // remaining Store surface is never called through this stub.
   const store = {
     appendAudit: async (entry: { space_id: string | null; actor: string; event_type: string; payload: string }) => {
       audit.push(entry);
@@ -322,7 +318,7 @@ function fakeStore(): {
     // runWizardChecks (the default onboarding-checks seam, issue #116) reads
     // org settings; no settings blob is the normal unset state.
     getOrgSettings: () => null,
-  } as unknown as Store;
+  } as Store;
 
   return { store, audit };
 }
@@ -357,9 +353,11 @@ afterAll(() => {
 });
 
 function objectToolContext(spaceId: string): ExtensionContext {
+  // SAFETY: the object tools read only sessionManager.getSessionFile() from
+  // the context; the rest of ExtensionContext is unused by their executes.
   return {
     sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
-  } as unknown as ExtensionContext;
+  } as ExtensionContext;
 }
 
 describe("SpaceService durable object ingest (issue #124)", () => {
@@ -1821,6 +1819,8 @@ describe("SpaceService connect intent (issue #61)", () => {
     const registry = createFixtureRegistry();
     const deps: ConnectExtensionDeps = {
       registry,
+      // SAFETY: the harness exercises only upsertExtensionCredential from
+      // the store; the rest of the Store surface is unused by this path.
       store: {
         upsertExtensionCredential: async (input: {
           provider: string;
@@ -1841,14 +1841,14 @@ describe("SpaceService connect intent (issue #61)", () => {
           rows.push(credential);
           return credential;
         },
-      } as unknown as ConnectExtensionDeps["store"],
+      } as ConnectExtensionDeps["store"],
       audit: {
         appendAudit: async (entry) => {
           audit.push(entry);
           return audit.length;
         },
         listAudit: async () => [],
-      } as AuditModule,
+      },
       broker: async (input) => {
         brokerCalls.push(input);
         return { identityKey: null, brokerCredentialId: 9 };
@@ -2018,6 +2018,8 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     const nudgeAudits = audit.filter((a) => a.event_type === ADMIN_ONBOARDING_NUDGE_EVENT);
     expect(nudgeAudits).toHaveLength(1);
     expect(nudgeAudits[0]!.space_id).toBe("slack:C1");
+    // SAFETY: the onboarding-nudge audit row is written by SpaceService with
+    // a { checks: Array<{name, ok}> } payload (ADMIN_ONBOARDING_NUDGE_EVENT).
     const payload = JSON.parse(nudgeAudits[0]!.payload) as { checks: Array<{ name: string; ok: boolean }> };
     expect(payload.checks.map((c) => c.name).sort()).toEqual(["model_key", "slack_tokens"]);
   });
@@ -2246,6 +2248,8 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     await Promise.resolve();
     const replied = audit.find((a) => a.event_type === MESSAGE_REPLIED_EVENT);
     expect(replied).toMatchObject({ space_id: "slack:C1", actor: "system" });
+    // SAFETY: the message.reply audit row is written by SpaceService with a
+    // { latency_ms, phrase_ms? } payload (MESSAGE_REPLIED_EVENT).
     const payload = JSON.parse(replied!.payload) as { latency_ms: number; phrase_ms?: number };
     expect(payload.latency_ms).toBeGreaterThanOrEqual(0);
     expect(payload.phrase_ms).toBeGreaterThanOrEqual(0);

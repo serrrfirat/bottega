@@ -24,9 +24,13 @@ const base = parseYamlSubset(
   readFileSync(resolve(import.meta.dir, "../../docker-compose.yml"), "utf8"),
 );
 
+// SAFETY: docker-compose.dev.yml's top-level `services` map is an object in the checked-in fixture.
 const devServices = dev["services"] as Record<string, YamlNode>;
+// SAFETY: the dev override defines the iron-proxy service (its deltas are asserted below).
 const proxy = devServices["iron-proxy"] as Record<string, YamlNode>;
+// SAFETY: the dev override defines the auth-broker service (its deltas are asserted below).
 const broker = devServices["auth-broker"] as Record<string, YamlNode>;
+// SAFETY: the base compose file defines the auth-broker service; the override's inheritance is asserted against it below.
 const baseBroker = (base["services"] as Record<string, YamlNode>)["auth-broker"] as Record<string, YamlNode>;
 
 describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-broker #143)", () => {
@@ -35,11 +39,13 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
   });
 
   test("publishes the tunnel + management listeners bound to loopback only", () => {
+    // SAFETY: the dev override publishes exactly the two loopback ports asserted below.
     const ports = proxy["ports"] as string[];
     expect(ports.sort()).toEqual(["127.0.0.1:8080:8080", "127.0.0.1:9092:9092"]);
   });
 
   test("mounts the dev-permissive config (not the strict one), CA, and the host ./data at /data", () => {
+    // SAFETY: the dev override mounts the dev-permissive config, certs, and ./data (asserted below).
     const vols = proxy["volumes"] as string[];
     expect(vols).toContain("./config/egress.dev.yml:/etc/iron-proxy/egress.yml:ro");
     // The dev proxy must NOT mount the STRICT config/egress.yml: the dev
@@ -63,17 +69,21 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
   });
 
   test("auth-broker publishes the vault on 127.0.0.1:8765 (the broker serve port)", () => {
+    // SAFETY: the auth-broker override publishes exactly the vault port asserted below.
     const ports = broker["ports"] as string[];
     expect(ports.sort()).toEqual(["127.0.0.1:8765:8765"]);
     // The serve port must match the base service's command + healthcheck,
     // so the override only exposes what the broker already listens on.
+    // SAFETY: the base auth-broker command binds the vault port (asserted below).
     const baseCommand = baseBroker["command"] as string[];
     expect(baseCommand).toContain("--bind=0.0.0.0:8765");
+    // SAFETY: the base auth-broker healthcheck.test holds the probe command (asserted below).
     const healthcheck = (baseBroker["healthcheck"] as Record<string, YamlNode>)["test"] as string[];
     expect(healthcheck).toContain("http://127.0.0.1:8765/v1/healthz");
   });
 
   test("auth-broker swaps the named data volume for the host ./data bind (entrypoints mount stays inherited)", () => {
+    // SAFETY: the auth-broker override swaps the named volume for the host ./data bind (asserted below).
     const vols = broker["volumes"] as string[];
     // The broker's token bootstraps to /data/.omp/auth-broker.token (0600,
     // entrypoints/broker.sh); on the host that is ./data/.omp/auth-broker.token,
@@ -85,6 +95,7 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     // The entrypoints mount (the token bootstrap) is inherited from the
     // base service untouched — the override lists only its deltas.
     expect(vols).toEqual(["./data:/data"]);
+    // SAFETY: the base auth-broker keeps the entrypoints mount (asserted below).
     expect(baseBroker["volumes"] as string[]).toContain("./config/entrypoints:/entrypoints:ro");
   });
 

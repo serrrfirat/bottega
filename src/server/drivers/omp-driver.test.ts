@@ -7,8 +7,13 @@ import {
   createAgentSession,
   z,
   type AgentSession,
+  type AgentSessionEvent,
+  type AgentSessionEventListener,
   type CreateAgentSessionOptions,
   type CreateAgentSessionResult,
+  type Extension,
+  type ExtensionUIContext,
+  type LoadExtensionsResult,
 } from "@oh-my-pi/pi-coding-agent";
 import { parseYamlSubset } from "../../yaml-subset";
 import { createAudit } from "../../policy/audit";
@@ -36,11 +41,24 @@ import {
  * behavior. No network, no model call.
  */
 
+/** The SDK event shapes the error-surfacing test injects through the stub's emit seam. */
+type InjectedSdkEvent =
+  | {
+      type: "message_end";
+      message: {
+        role: "assistant";
+        content: Array<{ type: "text"; text: string }>;
+        stopReason: string;
+        errorMessage?: string;
+      };
+    }
+  | { type: "turn_end"; message: { role: "assistant"; content: Array<{ type: "text"; text: string }> } };
+
 /** Stub SDK session: captures the subscribe listener so tests can inject events. */
 function stubSdkSession() {
-  let listener: ((event: unknown) => void) | undefined;
-  const session = {
-    subscribe: (cb: (event: unknown) => void) => {
+  let listener: AgentSessionEventListener | undefined;
+  const session: Partial<AgentSession> = {
+    subscribe: (cb: AgentSessionEventListener) => {
       listener = cb;
       return () => {
         listener = undefined;
@@ -49,15 +67,19 @@ function stubSdkSession() {
     beginDispose: () => {},
     dispose: async () => {},
     isStreaming: false,
-    prompt: async () => {},
-    steer: async () => {},
-    followUp: async () => {},
+    prompt: async (_text: string) => true,
+    steer: async (_text: string) => {},
+    followUp: async (_text: string) => {},
     abort: async () => {},
     getAvailableModels: () => [],
-  } as unknown as AgentSession;
+  };
   return {
     session,
-    emit: (event: unknown) => listener?.(event),
+    emit: (event: InjectedSdkEvent) => {
+      // SAFETY: the injected events are the SDK's message_end/turn_end shapes
+      // carrying the fields the driver reads; absent optional fields are inert.
+      listener?.(event as AgentSessionEvent);
+    },
   };
 }
 
@@ -191,9 +213,7 @@ describe("createOmpSdkDriver toolset contract", () => {
         // Custom definitions ride customTools under their gateway-safe flat
         // names — the dotted originals never reach the session.
         const customToolNames = (captured!.customTools ?? [])
-          .map((tool) =>
-            typeof tool === "object" && tool !== null && "name" in tool ? (tool as { name: string }).name : "",
-          )
+          .map((tool) => tool.name)
           .filter((name) => name !== "");
         expect(customToolNames).toContain("weather_current");
         expect(customToolNames).toContain("linear_search_issues");
@@ -278,7 +298,7 @@ describe("createOmpSdkDriver toolset contract", () => {
 describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
   const PIN_ROLE = "opencode-go/deepseek-v4-flash";
 
-  function tempTemplate(role = PIN_ROLE): { dir: string; templatePath: string; template: string } {
+  function tempTemplate(role = PIN_ROLE) {
     const dir = mkdtempSync(join(tmpdir(), "omp-pin-"));
     const templatePath = join(dir, "template-config.yml");
     const template = `# template\nsecrets:\n  enabled: true\nmodelRoles:\n  default: ${role}\n`;
@@ -421,15 +441,21 @@ describe("OmpSessionDriver error surfacing through the factory (issue #78)", () 
     const dir = mkdtempSync(join(tmpdir(), "omp-driver-errorsurface-"));
     try {
       const stub = stubSdkSession();
+      // SDK result stand-ins: the driver consumes only `session` on this path
+      // (the createSession seam's other members are never touched).
+      const extensions: Extension[] = [];
+      const extensionErrors: LoadExtensionsResult["errors"] = [];
       const driver = createOmpSdkDriver({
         agentDir: join(dir, "agent"),
         createSession: async () =>
+          // SAFETY: test stub — the driver consumes only `session`; the inert
+          // extensions/runtime/eventBus members are shape-compatible stand-ins.
           ({
             session: stub.session,
-            extensionsResult: {},
-            setToolUIContext: () => {},
+            extensionsResult: { extensions, errors: extensionErrors, runtime: {} },
+            setToolUIContext: (_uiContext: ExtensionUIContext, _hasUI: boolean) => {},
             eventBus: {},
-          }) as unknown as CreateAgentSessionResult, // test stub: the driver consumes only `session`
+          }) as CreateAgentSessionResult,
       });
       const session = await driver.createSession({
         spaceId: "slack:C1",

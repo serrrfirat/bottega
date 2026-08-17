@@ -33,7 +33,7 @@ describe("renderModelsConfig (issue #67)", () => {
   test("keeps the template provider skeleton and lists the configured ids", () => {
     const yaml = renderModelsConfig({ models: { default: "zai-org/GLM-5.1-FP8", fast: "acme/chat" } });
     expect(yaml).not.toBeNull();
-    const text = yaml as string;
+    const text = yaml!;
     expect(text).toContain("opencode-go:");
     expect(text).toContain('apiKey: OPENCODE_API_KEY');
     expect(text).toContain("baseUrl: \"https://cloud-api.near.ai/v1\"");
@@ -50,7 +50,7 @@ describe("renderModelsConfig (issue #67)", () => {
     // openai/anthropic anchors add their own id lines, which is expected).
     const yaml2 = renderModelsConfig({
       models: { default: "zai-org/GLM-5.1-FP8", reasoning: "zai-org/GLM-5.1-FP8" },
-    }) as string;
+    })!;
     expect(yaml2.match(/id: "zai-org\/GLM-5\.1-FP8"/g)?.length).toBe(1);
   });
 });
@@ -66,7 +66,7 @@ describe("regenerateModelsConfig (issue #67)", () => {
       );
       expect(rendered).not.toBeNull();
       expect(rendered).not.toBeUndefined();
-      expect(readFileSync(outPath, "utf8")).toBe(rendered as string);
+      expect(readFileSync(outPath, "utf8")).toBe(rendered!);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

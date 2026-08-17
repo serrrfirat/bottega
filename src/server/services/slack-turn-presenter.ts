@@ -37,6 +37,7 @@
  * and redacted AT THE SOURCE (the same redaction the audit module applies)
  * so secret-shaped values never reach Slack.
  */
+import { z } from "zod";
 import type { Store } from "../../store/db";
 import {
   ADMIN_ONBOARDING_NUDGE_EVENT,
@@ -51,6 +52,39 @@ import {
   type SlackAdapter,
   type SlackMessage,
 } from "../adapters/slack";
+
+/**
+ * The driver session's event payloads, decoded at the presenter boundary
+ * (the session emitter's callback hands them as untyped data). The schemas
+ * mirror exactly what the drivers emit: `message` = reply text plus the
+ * optional swallowed-error cause (issue #78), `error` = the failure
+ * message, `turn_end` = the optional failure cause (issue #178),
+ * `thinking` = the live reasoning snippet (issue #193).
+ */
+export const MessageEventSchema = z.object({
+  spaceId: z.string().optional(),
+  text: z.string().optional(),
+  error: z.string().optional(),
+});
+export type MessageEvent = z.infer<typeof MessageEventSchema>;
+
+export const ErrorEventSchema = z.object({
+  spaceId: z.string().optional(),
+  message: z.string().optional(),
+});
+export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
+
+export const TurnEndEventSchema = z.object({
+  spaceId: z.string().optional(),
+  error: z.string().optional(),
+});
+export type TurnEndEvent = z.infer<typeof TurnEndEventSchema>;
+
+export const ThinkingEventSchema = z.object({
+  spaceId: z.string().optional(),
+  thinking: z.string().optional(),
+});
+export type ThinkingEvent = z.infer<typeof ThinkingEventSchema>;
 
 /**
  * Rotating status phrases posted on message receipt (issue #119) and updated
@@ -218,7 +252,7 @@ export interface TurnPresenterDeps {
  * spaces share the sequence, matching the pre-#153 single-class counter);
  * the streaming presenter consumes it for each turn's stream opening.
  */
-export function createPhraseRotation(): { next(): string } {
+export function createPhraseRotation() {
   let index = 0;
   return {
     next() {
@@ -367,10 +401,10 @@ export class SlackTurnPresenter {
   }
 
   /** A message event: stream/coalesce or replace the phrase with the reply text. */
-  onMessage(data: unknown): void {
+  onMessage(data: MessageEvent): void {
     if (this.digesting) return;
-    const text = typeof data === "object" && data !== null && "text" in data ? data.text : undefined;
-    if (typeof text !== "string") return;
+    const text = data.text;
+    if (text === undefined) return;
     this.#turnDelivered = true;
     if (!text.trim()) {
       // Empty completion (#60): surface a visible fallback so the retry
@@ -379,8 +413,8 @@ export class SlackTurnPresenter {
       // phrase in place (or appends to the stream) instead of stacking a
       // new message. A swallowed provider error (issue #78) rides the event
       // payload; the fallback carries the cause instead of the generic phrase.
-      const cause = typeof data === "object" && data !== null && "error" in data ? data.error : undefined;
-      this.#countEmptyTurn(typeof cause === "string" && cause.trim() ? cause.trim() : undefined);
+      const cause = data.error?.trim() || undefined;
+      this.#countEmptyTurn(cause);
       if (!this.#churnActive) {
         // A coalesced streaming text must not overwrite the fallback (#120);
         // neither may the elapsed tick (#193) — the fallback IS the visible
@@ -389,9 +423,7 @@ export class SlackTurnPresenter {
         this.#cancelProgressTimer();
         const pendingTs = this.pendingTs;
         if (pendingTs !== undefined) {
-          const fallback = emptyResponseFallback(
-            typeof cause === "string" && cause.trim() ? cause.trim() : undefined,
-          );
+          const fallback = emptyResponseFallback(cause);
           void this.sendTextChunk(pendingTs, fallback).catch((err) => {
             console.error(`[slack-turn-presenter] failed to update empty-response phrase in ${this.spaceId}:`, err);
           });

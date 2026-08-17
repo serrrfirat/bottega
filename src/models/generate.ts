@@ -39,7 +39,7 @@ export function configuredModelIds(settings: ModelCatalogSettings): string[] {
   const models = settings.models;
   if (!models) return [];
   const ids = [models.default, models.fast, models.reasoning].filter(
-    (id): id is string => typeof id === "string" && id.trim().length > 0,
+    (id): id is string => id !== undefined && id.trim().length > 0,
   );
   return [...new Set(ids)];
 }

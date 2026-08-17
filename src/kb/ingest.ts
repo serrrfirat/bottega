@@ -28,14 +28,15 @@ interface TextSection {
   blocks: string[];
 }
 
-const HTML_ENTITY_BY_NAME: Record<string, string> = {
-  amp: "&",
-  apos: "'",
-  gt: ">",
-  lt: "<",
-  nbsp: " ",
-  quot: '"',
-};
+/** Named HTML entities decodable by name (lowercase). */
+const HTML_ENTITY_BY_NAME = new Map<string, string>([
+  ["amp", "&"],
+  ["apos", "'"],
+  ["gt", ">"],
+  ["lt", "<"],
+  ["nbsp", " "],
+  ["quot", '"'],
+]);
 
 function decodeHtmlEntities(text: string): string {
   return text.replace(/&(#(?:x[0-9a-f]+|\d+)|[a-z]+);/gi, (entity, name: string) => {
@@ -47,7 +48,7 @@ function decodeHtmlEntities(text: string): string {
       const codePoint = Number.parseInt(name.slice(1), 10);
       return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : entity;
     }
-    return HTML_ENTITY_BY_NAME[name.toLowerCase()] ?? entity;
+    return HTML_ENTITY_BY_NAME.get(name.toLowerCase()) ?? entity;
   });
 }
 

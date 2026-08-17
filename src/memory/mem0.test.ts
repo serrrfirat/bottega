@@ -12,6 +12,7 @@
  */
 import type { Server } from "bun";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import type { MemoryProvider } from "./types";
 import { asRecord, createMem0MemoryProvider, MEM0_ORG_AGENT_ID, stringifyMetadata } from "./mem0";
 import { runMemoryConformanceTests } from "./conformance.test";
@@ -27,6 +28,40 @@ interface StubMemory {
   metadata: Record<string, string>;
   created_at: string;
 }
+
+/** Captured POST /memories request body — the fields the tests read. */
+interface AddMemoryBody {
+  messages?: unknown;
+  user_id?: string;
+  agent_id?: string;
+  run_id?: string;
+  metadata?: unknown;
+  enable_graph?: boolean;
+}
+
+/** Captured POST /search request body — the fields the tests read. */
+interface SearchMemoryBody {
+  query?: string;
+  filters?: unknown;
+  top_k?: number;
+  enable_graph?: boolean;
+}
+
+const addMemoryBodySchema = z.object({
+  messages: z.array(z.json()).optional(),
+  user_id: z.string().optional(),
+  agent_id: z.string().optional(),
+  run_id: z.string().optional(),
+  metadata: z.json().optional(),
+  enable_graph: z.boolean().optional(),
+});
+
+const searchMemoryBodySchema = z.object({
+  query: z.string().optional(),
+  filters: z.json().optional(),
+  top_k: z.number().optional(),
+  enable_graph: z.boolean().optional(),
+});
 
 interface StubOptions {
   /** When set, every request must carry `X-API-Key: <value>` or gets 401. */
@@ -53,9 +88,9 @@ interface StubHarness {
   server: Server<undefined>;
   memories: StubMemory[];
   /** Bodies of every POST /memories request, in order. */
-  addBodies: Record<string, unknown>[];
+  addBodies: AddMemoryBody[];
   /** Bodies of every POST /search request, in order. */
-  searchBodies: Record<string, unknown>[];
+  searchBodies: SearchMemoryBody[];
   /** Every request's headers, in order. */
   headers: Headers[];
   stop(): Promise<void>;
@@ -63,8 +98,8 @@ interface StubHarness {
 
 function createStub(options: StubOptions = {}): StubHarness {
   const memories: StubMemory[] = [];
-  const addBodies: Record<string, unknown>[] = [];
-  const searchBodies: Record<string, unknown>[] = [];
+  const addBodies: AddMemoryBody[] = [];
+  const searchBodies: SearchMemoryBody[] = [];
   const headers: Headers[] = [];
   let seq = 0;
 
@@ -110,7 +145,7 @@ function createStub(options: StubOptions = {}): StubHarness {
         });
       }
       if (url.pathname === "/memories" && req.method === "POST") {
-        const body = (await req.json()) as Record<string, unknown>;
+        const body = addMemoryBodySchema.parse(await req.json());
         addBodies.push(body);
         if (options.rejectGraph && body.enable_graph === true) {
           return Response.json({ detail: "enable_graph is not supported" }, { status: 422 });
@@ -137,9 +172,9 @@ function createStub(options: StubOptions = {}): StubHarness {
           );
         }
         const content = String(asRecord(messages[0]).content ?? "");
-        const userId = typeof body.user_id === "string" ? body.user_id : null;
-        const agentId = typeof body.agent_id === "string" ? body.agent_id : null;
-        const metadata = stringifyMetadata(asRecord(body.metadata));
+        const userId = body.user_id ?? null;
+        const agentId = body.agent_id ?? null;
+        const metadata = stringifyMetadata(asRecord(body.metadata ?? null));
         if (options.consolidateDuplicates) {
           const existing = memories.find(
             (memory) =>
@@ -181,20 +216,20 @@ function createStub(options: StubOptions = {}): StubHarness {
         });
       }
       if (url.pathname === "/search" && req.method === "POST") {
-        const body = (await req.json()) as Record<string, unknown>;
+        const body = searchMemoryBodySchema.parse(await req.json());
         searchBodies.push(body);
         if (options.rejectGraph && body.enable_graph === true) {
           return Response.json({ detail: "enable_graph is not supported" }, { status: 422 });
         }
         if (options.failSearch) return Response.json({ detail: "upstream search failed" }, { status: 500 });
-        const filters = asRecord(body.filters);
+        const filters = asRecord(body.filters ?? null);
         if (!filters.user_id && !filters.agent_id && !filters.run_id) {
           return Response.json(
             { detail: "filters must contain at least one of: user_id, agent_id, run_id" },
             { status: 422 },
           );
         }
-        const topK = typeof body.top_k === "number" ? body.top_k : 5;
+        const topK = body.top_k ?? 5;
         const hits = memories
           .filter((m) => {
             if (filters.user_id !== undefined && m.user_id !== filters.user_id) return false;
@@ -272,7 +307,7 @@ describe("mem0 provider (stub-backed)", () => {
     expect(saved.principal).toBeNull();
     expect(saved.content).toBe("The org deploys bottega per company.");
     expect(saved.metadata).toEqual({ source: "slack" });
-    expect(typeof saved.createdAt).toBe("number");
+    expect(saved.createdAt).toEqual(expect.any(Number));
     expect(saved.createdAt).toBe(Date.parse(stub.memories[0].created_at));
   });
 
@@ -305,7 +340,7 @@ describe("mem0 provider (stub-backed)", () => {
     expect(hits[0].scope).toBe("org");
     expect(hits[0].principal).toBeNull();
     expect(hits[0].content).toContain("search probe");
-    expect(typeof hits[0].createdAt).toBe("number");
+    expect(hits[0].createdAt).toEqual(expect.any(Number));
   });
 
   test("search filters by user scope principal", async () => {

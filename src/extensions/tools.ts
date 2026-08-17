@@ -80,7 +80,8 @@ export function extensionToolDefinitions(
         parameters: paramsToZodSchema(tool.params),
         approval: tool.tier,
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-          const args = (params ?? {}) as Record<string, unknown>;
+          // SAFETY: the declared param schema (paramsToZodSchema) admits only string/number/boolean scalars, and the SDK validates calls against it before execute.
+          const args = (params ?? {}) as Record<string, string | number | boolean>;
           const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
           const caller = opts.getCaller?.(ctx) ?? "agent";
           const result = await opts.runtime.execute({
@@ -107,11 +108,11 @@ export function extensionToolDefinitions(
 
 /** Declarative manifest params -> zod object schema (required unless marked optional). */
 function paramsToZodSchema(params: ExtensionToolParam[]): ReturnType<typeof z.object> {
-  const shape: Record<string, zod.ZodLikeSchema<unknown>> = {};
+  const fields: Record<string, zod.ZodLikeSchema<unknown>> = {};
   for (const param of params) {
     const base =
       param.type === "string" ? z.string() : param.type === "number" ? z.number() : z.boolean();
-    shape[param.name] = param.required === false ? base.optional() : base;
+    fields[param.name] = param.required === false ? base.optional() : base;
   }
-  return z.object(shape);
+  return z.object(fields);
 }

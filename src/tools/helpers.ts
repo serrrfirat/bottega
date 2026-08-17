@@ -10,6 +10,6 @@ export function toolError(text: string): AgentToolResult {
 }
 
 /** Message from an unknown throwable (never "undefined" for non-Error throws). */
-export function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+export function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }

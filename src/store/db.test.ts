@@ -26,6 +26,13 @@ function freshStore(): Store {
   return s;
 }
 
+/** The worker_jobs.status column for a job (the envelope itself carries no bus status). */
+function jobStatus(store: Store, id: string): string | null {
+  // SAFETY: SELECT status returns a row with exactly one string column.
+  const row = store.getDb().query("SELECT status AS s FROM worker_jobs WHERE id = ?").get(id) as { s: string } | null;
+  return row?.s ?? null;
+}
+
 afterAll(() => {
   for (const s of stores) s.close();
   store.close();
@@ -333,7 +340,7 @@ describe("work items", () => {
     const got = await s.getWorkItem(item.id);
     expect(got?.repo).toBe("acme/bottega");
     // claim/transition round-trips carry the repo untouched.
-    const claimed = await s.claimNextWorkItem();
+    const claimed = await s.claimWorkItemById(item.id);
     expect(claimed?.id).toBe(item.id);
     expect(claimed?.repo).toBe("acme/bottega");
   });
@@ -414,6 +421,8 @@ describe("work items", () => {
     legacy.close();
 
     const s1 = createStore(dbPath);
+    // SAFETY: PRAGMA table_info returns one row per column with name as TEXT;
+    // the migration test reads only column names.
     const columns = s1.getDb().query("PRAGMA table_info(work_items)").all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain("delivery");
     expect((await s1.getWorkItem("wi_legacy"))?.delivery).toBe("git");
@@ -464,6 +473,8 @@ describe("work items", () => {
 
     // First open migrates the pin columns; existing rows backfill to null.
     const s1 = createStore(dbPath);
+    // SAFETY: PRAGMA table_info returns one row per column with name as TEXT;
+    // the migration test reads only column names.
     const columns = s1.getDb().query("PRAGMA table_info(work_items)").all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(["model", "reasoning_effort"]));
     expect((await s1.getWorkItem("wi_prepin"))?.model).toBeNull();
@@ -494,63 +505,157 @@ describe("work items", () => {
     ).rejects.toThrow();
   });
 
-  test("claimNextWorkItem claims oldest open first, then null", async () => {
+  test("claimWorkItemById claims the specific open item, null when not open (epic #170)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C11" });
+    const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "first" });
+    const claimed = await s.claimWorkItemById(item.id);
+    expect(claimed?.id).toBe(item.id);
+    expect(claimed?.state).toBe("claimed");
+    // The same item cannot be claimed twice; an unknown id never claims.
+    expect(await s.claimWorkItemById(item.id)).toBeNull();
+    expect(await s.claimWorkItemById("wi_does-not-exist")).toBeNull();
+  });
+
+  test("enqueueJob is idempotent by envelope id and createWorkItem auto-enqueues git/extension (epic #170)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C11-enqueue" });
+    const git = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "git work" });
+    const extension = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "extension work",
+      delivery: "extension",
+    });
+    const chat = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "chat work", delivery: "chat" });
+
+    // git/extension enqueue with the work item id as the job id; chat has no
+    // worker and never enqueues.
+    const gitJob = await s.getJob(git.id);
+    expect(gitJob).toMatchObject({ id: git.id, kind: "git", payload: { workItemId: git.id }, attempts: 0 });
+    const extensionJob = await s.getJob(extension.id);
+    expect(extensionJob).toMatchObject({ id: extension.id, kind: "extension", payload: { workItemId: extension.id } });
+    expect(await s.getJob(chat.id)).toBeNull();
+
+    // Duplicate enqueue of the same envelope id is a no-op, never a second row.
+    await s.enqueueJob({ id: git.id, kind: "git", payload: { workItemId: git.id }, spaceId: space.id });
+    await s.enqueueJob({ id: git.id, kind: "git", payload: { workItemId: git.id }, spaceId: space.id });
+    const db = s.getDb();
+    // SAFETY: SELECT COUNT(*) returns a single row with a number column.
+    const count = (db.query("SELECT COUNT(*) AS n FROM worker_jobs WHERE id = ?").get(git.id) as { n: number }).n;
+    expect(count).toBe(1);
+    expect(await s.getJob(git.id)).toMatchObject({ attempts: 0 });
+    expect(jobStatus(s, git.id)).toBe("queued");
+  });
+
+  test("claimNextJob claims oldest queued first with lease + attempts (epic #170)", async () => {
     const s = freshStore();
     vi.useFakeTimers();
     try {
-      const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C11" });
-      const first = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "first" });
+      await s.enqueueJob({ id: "job_1", kind: "kb", payload: { url: "https://example.com/a" } });
       vi.advanceTimersByTime(10);
-      const second = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "second" });
+      await s.enqueueJob({ id: "job_2", kind: "kb", payload: { url: "https://example.com/b" } });
 
-      const claimed = await s.claimNextWorkItem();
-      expect(claimed?.id).toBe(first.id);
-      expect(claimed?.state).toBe("claimed");
+      const first = await s.claimNextJob(1000);
+      expect(first?.id).toBe("job_1");
+      expect(first?.attempts).toBe(1);
+      expect(first?.leaseUntil).toBeGreaterThan(Date.now());
 
-      const claimed2 = await s.claimNextWorkItem();
-      expect(claimed2?.id).toBe(second.id);
+      const second = await s.claimNextJob(1000);
+      expect(second?.id).toBe("job_2");
+      expect(second?.attempts).toBe(1);
 
-      expect(await s.claimNextWorkItem()).toBeNull();
+      // Both leases are live: nothing else is claimable.
+      expect(await s.claimNextJob(1000)).toBeNull();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  test("claimNextWorkItem prioritizes executable delivery while still claiming a lone chat item (issue #128)", async () => {
+  test("claimNextJob reclaims a running job after its lease expires (crash recovery, epic #170)", async () => {
     const s = freshStore();
-    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C11-delivery" });
-    const chat = await s.createWorkItem({
-      space_id: space.id,
-      requester: "U1",
-      description: "answer in channel",
-      delivery: "chat",
-    });
-    const extension = await s.createWorkItem({
-      space_id: space.id,
-      requester: "U1",
-      description: "create a ticket",
-      delivery: "extension",
-    });
-
-    expect((await s.claimNextWorkItem())?.id).toBe(extension.id);
-    expect((await s.claimNextWorkItem())?.id).toBe(chat.id);
+    vi.useFakeTimers();
+    try {
+      await s.enqueueJob({ id: "job_lease", kind: "kb", payload: { url: "https://example.com/x" } });
+      const claimed = await s.claimNextJob(1000);
+      expect(claimed?.id).toBe("job_lease");
+      // Lease live: no reclaim yet.
+      expect(await s.claimNextJob(1000)).toBeNull();
+      vi.advanceTimersByTime(1001);
+      const reclaimed = await s.claimNextJob(1000);
+      expect(reclaimed?.id).toBe("job_lease");
+      expect(reclaimed?.attempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  test("two concurrent claimNextWorkItem calls have exactly one winner", async () => {
-    const racePath = join(dir, "race.db");
+  test("two concurrent claimNextJob calls have exactly one winner (epic #170)", async () => {
+    const racePath = join(dir, "race-job.db");
     const a = createStore(racePath);
     const b = createStore(racePath);
     try {
-      const space = await a.getOrCreateSpace({ platform: "slack", channel_id: "C12" });
-      await a.createWorkItem({ space_id: space.id, requester: "U1", description: "one slot" });
+      await a.enqueueJob({ id: "job_race", kind: "kb", payload: { url: "https://example.com/r" } });
 
-      const [ra, rb] = await Promise.all([a.claimNextWorkItem(), b.claimNextWorkItem()]);
+      const [ra, rb] = await Promise.all([a.claimNextJob(1000), b.claimNextJob(1000)]);
       const winners = [ra, rb].filter((r) => r !== null);
       expect(winners).toHaveLength(1);
-      expect(winners[0]!.state).toBe("claimed");
+      expect(winners[0]!.attempts).toBe(1);
     } finally {
       a.close();
       b.close();
+    }
+  });
+
+  test("requeueJob backoff-gates a running job; complete/fail guard the status (epic #170)", async () => {
+    const s = freshStore();
+    vi.useFakeTimers();
+    try {
+      await s.enqueueJob({ id: "job_req", kind: "kb", payload: { url: "https://example.com/q" } });
+      await s.claimNextJob(1000);
+      // Backoff gate: requeued jobs are claimable again only after backoff elapses.
+      expect(await s.requeueJob("job_req", 1000)).toBe(true);
+      expect(await s.claimNextJob(1000)).toBeNull();
+      vi.advanceTimersByTime(1001);
+      expect((await s.claimNextJob(1000))?.id).toBe("job_req");
+
+      // completeJob only from running; failJob only from queued/running.
+      expect(await s.completeJob("job_req")).toBe(true);
+      expect(await s.completeJob("job_req")).toBe(false);
+      expect(await s.failJob("job_req")).toBe(false);
+
+      await s.enqueueJob({ id: "job_fail", kind: "kb", payload: { url: "https://example.com/f" } });
+      expect(await s.failJob("job_fail")).toBe(true);
+      expect(jobStatus(s, "job_fail")).toBe("failed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("markUnclaimedJobs fails only queued jobs past the TTL, never backoff-gated ones (epic #170)", async () => {
+    const s = freshStore();
+    vi.useFakeTimers();
+    try {
+      // A job claimed then requeued with a backoff gate is waiting on a live
+      // worker — the sweep must never touch it.
+      await s.enqueueJob({ id: "job_backoff", kind: "kb", payload: { url: "https://example.com/b" } });
+      await s.claimNextJob(1000);
+      await s.requeueJob("job_backoff", 10_000);
+
+      // A queued job never claimed past the TTL: swept (fail-loud).
+      await s.enqueueJob({ id: "job_stale", kind: "kb", payload: { url: "https://example.com/s" } });
+      vi.advanceTimersByTime(1000);
+
+      const swept = await s.markUnclaimedJobs(800);
+      expect(swept.map((j) => j.id)).toEqual(["job_stale"]);
+      expect(jobStatus(s, "job_stale")).toBe("failed");
+      // The backoff-gated job survives; a fresh job younger than the TTL survives.
+      expect(jobStatus(s, "job_backoff")).toBe("queued");
+      await s.enqueueJob({ id: "job_fresh", kind: "kb", payload: { url: "https://example.com/n" } });
+      expect(await s.markUnclaimedJobs(800)).toEqual([]);
+      expect(jobStatus(s, "job_fresh")).toBe("queued");
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -566,7 +671,7 @@ describe("work items", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C14" });
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "t2" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item.id);
 
     const moved = await s.transitionWorkItem(item.id, "claimed", "working", {
       evidence: "picked up",
@@ -591,7 +696,7 @@ describe("work items", () => {
     try {
       const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C15" });
       const old = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "old" });
-      await s.claimNextWorkItem(); // -> claimed
+      await s.claimWorkItemById(old.id); // -> claimed
       vi.advanceTimersByTime(100);
       const fresh = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "fresh" });
 
@@ -618,7 +723,7 @@ describe("work items", () => {
 
     // claimed -> open (executor crash before start)
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal" });
-    const claimed = await s.claimNextWorkItem();
+    const claimed = await s.claimWorkItemById(item.id);
     expect(claimed?.id).toBe(item.id);
     expect(claimed?.state).toBe("claimed");
     const reset = await s.transitionWorkItem(item.id, "claimed", "open");
@@ -630,7 +735,7 @@ describe("work items", () => {
 
     // claimed -> working -> blocked (evidence required)
     const item2 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal2" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item2.id);
     const working = await s.transitionWorkItem(item2.id, "claimed", "working");
     expect(working.state).toBe("working");
     const blocked = await s.transitionWorkItem(item2.id, "working", "blocked", { evidence: "the build broke" });
@@ -638,7 +743,7 @@ describe("work items", () => {
 
     // claimed -> working -> review -> blocked
     const item3 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal3" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item3.id);
     await s.transitionWorkItem(item3.id, "claimed", "working");
     const review = await s.transitionWorkItem(item3.id, "working", "review", { approval: { approver: "U9" } });
     expect(review.state).toBe("review");
@@ -648,7 +753,7 @@ describe("work items", () => {
 
     // claimed -> working -> review -> done (result.pr_url required)
     const item4 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal4" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item4.id);
     await s.transitionWorkItem(item4.id, "claimed", "working");
     await s.transitionWorkItem(item4.id, "working", "review", { approval: { approver: "U9" } });
     const done = await s.transitionWorkItem(item4.id, "review", "done", {
@@ -659,7 +764,7 @@ describe("work items", () => {
 
     // claimed -> working -> review -> aborted
     const item5 = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "legal5" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item5.id);
     await s.transitionWorkItem(item5.id, "claimed", "working");
     await s.transitionWorkItem(item5.id, "working", "review", { approval: { approver: "U9" } });
     const aborted = await s.transitionWorkItem(item5.id, "review", "aborted");
@@ -667,7 +772,17 @@ describe("work items", () => {
   });
 
   test("illegal transitions are rejected from every state", async () => {
-    const LEGAL: Record<WorkItemState, WorkItemState[]> = {
+    /** Legal transitions per state, mirroring the store's assertLegalTransition map. */
+    interface LegalTransitions {
+      open: readonly string[];
+      claimed: readonly string[];
+      working: readonly string[];
+      review: readonly string[];
+      done: readonly string[];
+      blocked: readonly string[];
+      aborted: readonly string[];
+    }
+    const LEGAL: LegalTransitions = {
       open: ["claimed", "aborted"],
       claimed: ["working", "open", "aborted"],
       working: ["review", "blocked", "aborted"],
@@ -684,19 +799,19 @@ describe("work items", () => {
         case "open":
           return item.id;
         case "claimed":
-          await s.claimNextWorkItem();
+          await s.claimWorkItemById(item.id);
           return item.id;
         case "working":
-          await s.claimNextWorkItem();
+          await s.claimWorkItemById(item.id);
           await s.transitionWorkItem(item.id, "claimed", "working");
           return item.id;
         case "review":
-          await s.claimNextWorkItem();
+          await s.claimWorkItemById(item.id);
           await s.transitionWorkItem(item.id, "claimed", "working");
           await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
           return item.id;
         case "done":
-          await s.claimNextWorkItem();
+          await s.claimWorkItemById(item.id);
           await s.transitionWorkItem(item.id, "claimed", "working");
           await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
           await s.transitionWorkItem(item.id, "review", "done", {
@@ -704,7 +819,7 @@ describe("work items", () => {
           });
           return item.id;
         case "blocked":
-          await s.claimNextWorkItem();
+          await s.claimWorkItemById(item.id);
           await s.transitionWorkItem(item.id, "claimed", "working");
           await s.transitionWorkItem(item.id, "working", "blocked", { evidence: "e" });
           return item.id;
@@ -774,7 +889,7 @@ describe("work items", () => {
         description: `${entry.delivery} done obligations`,
         delivery: entry.delivery,
       });
-      await s.claimNextWorkItem();
+      await s.claimWorkItemById(item.id);
       await s.transitionWorkItem(item.id, "claimed", "working");
       await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" } });
 
@@ -800,7 +915,7 @@ describe("work items", () => {
       description: "create an external object",
       delivery: "extension",
     });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(extension.id);
     await s.transitionWorkItem(extension.id, "claimed", "working");
     const completed = await s.transitionWorkItem(extension.id, "working", "done", {
       result: JSON.stringify({ url: "https://example.com/ticket/1", summary: "created ticket" }),
@@ -813,7 +928,7 @@ describe("work items", () => {
       description: "answer in the channel",
       delivery: "chat",
     });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(chat.id);
     await s.transitionWorkItem(chat.id, "claimed", "working");
     const chatCompleted = await s.transitionWorkItem(chat.id, "working", "done", {
       result: JSON.stringify({ summary: "answered in the channel" }),
@@ -827,7 +942,7 @@ describe("work items", () => {
       description: "ship code",
       delivery: "git",
     });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(git.id);
     await s.transitionWorkItem(git.id, "claimed", "working");
     await expect(
       s.transitionWorkItem(git.id, "working", "done", {
@@ -840,7 +955,7 @@ describe("work items", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1D" });
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "blocked obligations" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item.id);
     await s.transitionWorkItem(item.id, "claimed", "working");
 
     await expect(s.transitionWorkItem(item.id, "working", "blocked")).rejects.toThrow(/evidence/);
@@ -854,7 +969,7 @@ describe("work items", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1E" });
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "review obligations" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item.id);
     await s.transitionWorkItem(item.id, "claimed", "working");
 
     await expect(s.transitionWorkItem(item.id, "working", "review")).rejects.toThrow(/approval/);
@@ -868,10 +983,10 @@ describe("work items", () => {
     try {
       const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1F" });
       const staleClaimed = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "claimed stale" });
-      await s.claimNextWorkItem();
+      await s.claimWorkItemById(staleClaimed.id);
       vi.advanceTimersByTime(1000);
       const staleWorking = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "working stale" });
-      await s.claimNextWorkItem();
+      await s.claimWorkItemById(staleWorking.id);
       await s.transitionWorkItem(staleWorking.id, "claimed", "working");
       vi.advanceTimersByTime(1000);
       const fresh = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "fresh" });
@@ -897,8 +1012,8 @@ describe("work items", () => {
     vi.useFakeTimers();
     try {
       const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1G" });
-      await s.createWorkItem({ space_id: space.id, requester: "U1", description: "stale audited" });
-      await s.claimNextWorkItem();
+      const staleAudited = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "stale audited" });
+      await s.claimWorkItemById(staleAudited.id);
       vi.advanceTimersByTime(1000);
       await recoverStaleWorkItems(s, 100);
 
@@ -915,7 +1030,7 @@ describe("work items", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1H" });
     const item = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "audited" });
-    await s.claimNextWorkItem();
+    await s.claimWorkItemById(item.id);
     await s.transitionWorkItem(item.id, "claimed", "working", { by: "executor:1" });
     await s.transitionWorkItem(item.id, "working", "review", { approval: { approver: "U9" }, by: "executor:1" });
     await s.transitionWorkItem(item.id, "review", "done", {
@@ -1102,6 +1217,9 @@ describe("migration", () => {
   });
 });
 
+/** Arbitrary JSON-decoded value smuggled past the typed OrgSettingsInput boundary. */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 describe("org settings (issue #67)", () => {
   test("getOrgSettings returns null when no row exists", () => {
     const s = freshStore();
@@ -1137,6 +1255,8 @@ describe("org settings (issue #67)", () => {
     s.setOrgSettings({ response_mode: "mention" });
     s.setOrgSettings({ response_mode: "request-only" });
     expect(s.getOrgSettings()?.responseMode).toBe("request-only");
+    // SAFETY: SELECT id returns the singleton row's INTEGER id column;
+    // bun:sqlite surfaces INTEGER columns as numbers.
     const rows = s.getDb().query("SELECT id FROM org_settings").all() as { id: number }[];
     expect(rows).toHaveLength(1);
     expect(rows[0]!.id).toBe(1);
@@ -1149,7 +1269,9 @@ describe("org settings (issue #67)", () => {
     const s = freshStore();
     // Deliberately malformed values: cast across the typed-input boundary so
     // the runtime validator is exercised (the API type already rejects these).
-    const malformed = (v: object): OrgSettingsInput => v as unknown as OrgSettingsInput;
+    // SAFETY: the malformed literals are deliberately outside OrgSettingsInput's
+    // type; the store's runtime validator is the boundary under test.
+    const malformed = (v: JsonValue): OrgSettingsInput => v as OrgSettingsInput;
     expect(() => s.setOrgSettings(malformed({ approvals: { timeout_minutes: -1 } }))).toThrow(/timeout_minutes/);
     expect(() => s.setOrgSettings(malformed({ response_mode: "whenever" }))).toThrow(/response_mode/);
     expect(() => s.setOrgSettings(malformed({ extensions: { allow: ["Bad Id"] } }))).toThrow(/extensions\.allow/);
@@ -1193,7 +1315,9 @@ describe("org settings (issue #67)", () => {
     expect(s.setOrgSettings({ onboarding: {} }).onboarding).toBeUndefined();
 
     // Malformed values fail closed and write nothing.
-    const malformed = (v: object): OrgSettingsInput => v as unknown as OrgSettingsInput;
+    // SAFETY: the malformed literals are deliberately outside OrgSettingsInput's
+    // type; the store's runtime validator is the boundary under test.
+    const malformed = (v: JsonValue): OrgSettingsInput => v as OrgSettingsInput;
     expect(() => s.setOrgSettings(malformed({ onboarding: { space_id: 42 } }))).toThrow(/onboarding\.space_id/);
     expect(() => s.setOrgSettings(malformed({ onboarding: { channel: "C1" } }))).toThrow(/onboarding\.channel: unknown key/);
     expect(() => s.setOrgSettings(malformed({ onboarding: "slack:C1" }))).toThrow(/onboarding must be an object/);

@@ -254,6 +254,9 @@ export function onePasswordConnectResolver(
       }
       let item: { fields?: Array<{ id?: string; label?: string; value?: string }> };
       try {
+        // SAFETY: the 1Password Connect items API returns the item object; the shape is
+        // deliberately defensive (every field optional) so a malformed response simply
+        // yields no matching field and fails with the clear "no field" error below.
         item = (await res.json()) as typeof item;
       } catch (err) {
         throw new Error(`extension credential boundary: 1Password Connect returned a malformed item: ${errorMessage(err)}`);

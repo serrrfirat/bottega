@@ -115,6 +115,7 @@ async function waitForOpenWorkItem(h: Harness, spaceId: string, timeoutMs: numbe
     const rows = await h.store.listAudit({ space: spaceId, event_type: "work_item.created" });
     for (const row of rows) {
       // The creation audit payload is exactly { id } (asserted in journey 2).
+      // SAFETY: store.createWorkItem writes this payload as JSON.stringify({ id }).
       const { id } = JSON.parse(row.payload) as { id: string };
       const item = await h.store.getWorkItem(id);
       if (item) return item;
@@ -323,12 +324,15 @@ describe("canary journeys with the real model (issue #71)", () => {
             throw new Error(`executor leg: item ${item.id} ended ${settled.state} — evidence: ${settled.evidence}`);
           }
           // The done transition's result is exactly { pr_url, summary } (store obligation).
+          // SAFETY: the executor writes done results as JSON.stringify({ pr_url, summary }).
           const result = JSON.parse(settled.result!) as { pr_url: string; summary: string };
           console.log(`[canary] executor: model=${h.modelRef} pr=${result.pr_url} summary=${JSON.stringify(result.summary)}`);
           expect(result.pr_url).toContain("/acme/sandbox/pull/");
           // The PR landed on the emulator with the bottega/<id> head (the
           // emulator's shape is { head: { ref } }, asserted in journey 2),
           // and the branch reached the bare remote.
+          // SAFETY: the emulator's PR record carries head.ref (asserted in journey 2);
+          // extra fields are ignored by the destructuring below.
           const pr = (await fetch(`${gh.baseUrl}/repos/acme/sandbox/pulls/1`, {
             headers: { Authorization: `Bearer ${gh.pat}` },
           }).then((r) => r.json())) as { head: { ref: string } };

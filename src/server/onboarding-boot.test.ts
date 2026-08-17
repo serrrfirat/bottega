@@ -120,6 +120,8 @@ describe("boot-time onboarding guide (issue #116)", () => {
       const rows = await reopened.listAudit({ event_type: ADMIN_ONBOARDING_BOOT_EVENT });
       expect(rows).toHaveLength(1);
       expect(rows[0]!.space_id).toBe("slack:C123");
+      // SAFETY: the boot guide writes this payload via JSON.stringify of
+      // { posted, checks } before auditing the event.
       const payload = JSON.parse(rows[0]!.payload) as { posted: boolean; checks: Array<{ name: string; ok: boolean }> };
       expect(payload.posted).toBe(true);
       expect(payload.checks.some((c) => c.name === "model_key" && c.ok === false)).toBe(true);
@@ -201,6 +203,8 @@ describe("boot-time onboarding guide (issue #116)", () => {
       const reopened = createStore("data/bottega.db");
       const rows = await reopened.listAudit({ event_type: ADMIN_ONBOARDING_BOOT_EVENT });
       expect(rows).toHaveLength(1);
+      // SAFETY: the boot guide writes this payload via JSON.stringify of
+      // { posted, checks } before auditing the event.
       const payload = JSON.parse(rows[0]!.payload) as {
         posted: boolean;
         checks: Array<{ name: string; ok: boolean }>;

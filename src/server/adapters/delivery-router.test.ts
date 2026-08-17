@@ -15,6 +15,7 @@ import { DELIVERY_REQUESTED_EVENT, DELIVERY_RESOLVED_EVENT } from "../../store/a
 import { createStore, type Store } from "../../store/db";
 import { DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
 import { buildDeliveryBlocks, resolveDeliveryAction } from "./delivery-router";
+import { z } from "zod";
 
 const SPACE = "slack:C123";
 const ITEM = "wi_1";
@@ -32,11 +33,7 @@ interface Updated {
   text: string;
 }
 
-function fakeAdapter(opts: { failUpdate?: boolean } = {}): {
-  adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
-  posted: Posted[];
-  updated: Updated[];
-} {
+function fakeAdapter(opts: { failUpdate?: boolean } = {}) {
   const posted: Posted[] = [];
   const updated: Updated[] = [];
   return {
@@ -52,6 +49,10 @@ function fakeAdapter(opts: { failUpdate?: boolean } = {}): {
         updated.push({ spaceId, ts, text });
       },
     },
+  } satisfies {
+    adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
+    posted: Posted[];
+    updated: Updated[];
   };
 }
 
@@ -61,8 +62,8 @@ interface Block {
   elements?: { type: string; text?: { type: string; text: string }; action_id?: string; value?: string; style?: string }[];
 }
 
-function buttons(blocks: unknown[]): { actionId: string; value: string; style?: string }[] {
-  const actions = (blocks as Block[]).find((b) => b.type === "actions");
+function buttons(blocks: Block[]): { actionId: string; value: string; style?: string }[] {
+  const actions = blocks.find((b) => b.type === "actions");
   return (actions?.elements ?? [])
     .filter((e) => e.action_id !== undefined && e.value !== undefined)
     .map((e) => ({ actionId: e.action_id!, value: e.value!, style: e.style }));
@@ -82,13 +83,15 @@ async function seedAnnouncement(store: Store, itemId = ITEM, spaceId = SPACE): P
   });
 }
 
+const resolvedRowSchema = z.object({ id: z.string(), approved: z.boolean(), approver: z.string() });
+
 function resolvedRows(store: Store): Promise<Array<{ id: string; approved: boolean; approver: string }>> {
   return store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT }).then((rows) =>
-    rows.map((row) => JSON.parse(row.payload) as { id: string; approved: boolean; approver: string }),
+    rows.map((row) => resolvedRowSchema.parse(JSON.parse(row.payload))),
   );
 }
 
-function makeStore(): { store: Store; cleanup: () => void } {
+function makeStore() {
   const dir = mkdtempSync(join(tmpdir(), "bottega-delivery-router-"));
   const store = createStore(join(dir, "test.db"));
   return { store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
@@ -96,6 +99,8 @@ function makeStore(): { store: Store; cleanup: () => void } {
 
 describe("buildDeliveryBlocks", () => {
   test("renders the PR with approve/deny buttons carrying the work item id", () => {
+    // SAFETY: buildDeliveryBlocks is this repo's own renderer; its block shapes
+    // (section/actions with text/elements) are exactly what the Block view models.
     const blocks = buildDeliveryBlocks(PR_URL, "implemented it", ITEM) as Block[];
 
     const sectionText = blocks
@@ -106,7 +111,7 @@ describe("buildDeliveryBlocks", () => {
     expect(sectionText).toContain(PR_URL);
     expect(sectionText).toContain("implemented it");
 
-    const btns = buttons(blocks as unknown[]);
+    const btns = buttons(blocks);
     expect(btns.map((b) => b.actionId).sort()).toEqual([DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID]);
     expect(btns[0].value).toBe(ITEM);
     expect(btns[1].value).toBe(ITEM);

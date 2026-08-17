@@ -86,7 +86,7 @@ export interface ConformanceHost {
    * The exact options the driver passed to its underlying session factory
    * (OMP's injected createSession seam), or null when unobservable (ACP).
    */
-  capturedOptions(): Record<string, unknown> | null;
+  capturedOptions(): CreateAgentSessionOptions | null;
   /** The tool allowlist the driver passed to the underlying session, or null when unobservable. */
   sessionToolNames(): readonly string[] | null;
   /** The underlying agent's wire log (ACP fake-server log), or null. */
@@ -352,10 +352,10 @@ export function driverConformance(makeHost: () => ConformanceHost, capabilities:
       const result = await session.setModelRole("fast");
       expect(result).toBeDefined();
       expect(result.role).toBe("fast");
-      expect(typeof result.applied).toBe("boolean");
+      expect(result.applied).toEqual(expect.any(Boolean));
       if (!result.applied) {
         // A not-supported switch must SAY why — a bare no-op is the failure mode.
-        expect(typeof result.reason).toBe("string");
+        expect(result.reason).toEqual(expect.any(String));
         expect(result.reason!.length).toBeGreaterThan(0);
       }
       await session.dispose();
@@ -471,6 +471,14 @@ const OMP_CAPABILITIES: DriverConformanceCapabilities = {
   transcript: true,
 };
 
+/** Synthetic SDK session events the harness emits (a subset of the SDK's AgentSessionEvent shapes). */
+type StubSdkEvent =
+  | { type: "turn_start" }
+  | { type: "turn_end"; message: unknown }
+  | { type: "message_update"; message: unknown; assistantMessageEvent: { type: "text_delta"; contentIndex: number; delta: string } | { type: "text_end"; contentIndex: number; content: string } }
+  | { type: "message_end"; message: unknown }
+  | { type: "notice"; level: "error"; message: string };
+
 function makeOmpHost(): ConformanceHost {
   const dir = mkdtempSync(join(tmpdir(), "omp-conformance-"));
   const transcriptDir = join(dir, "sessions");
@@ -480,15 +488,15 @@ function makeOmpHost(): ConformanceHost {
   let currentControls: Controls | null = null;
 
   interface Controls {
-    emit(event: unknown): void;
+    emit(event: StubSdkEvent): void;
     release(): void;
     calls: Array<{ kind: "prompt" | "steer" | "followUp"; text: string }>;
     disposeCalls: number;
     abortCalls: number;
   }
 
-  function freshControls(): { controls: Controls; session: AgentSession } {
-    let listener: ((event: unknown) => void) | undefined;
+  function freshControls() {
+    let listener: ((event: StubSdkEvent) => void) | undefined;
     let finishPrompt: (() => void) | undefined;
     let streaming = false;
     const controls: Controls = {
@@ -501,8 +509,11 @@ function makeOmpHost(): ConformanceHost {
         finishPrompt = undefined;
       },
     };
-    const session = {
-      subscribe: (cb: (event: unknown) => void) => {
+    // The harness drives the SDK session through exactly the surface below
+    // (the OMP driver's tested paths never touch anything else), so the stub
+    // is built as a plain object and asserted once at the factory seam.
+    const makeSession = () => ({
+      subscribe: (cb: (event: StubSdkEvent) => void) => {
         listener = cb;
         return () => {
           listener = undefined;
@@ -529,8 +540,13 @@ function makeOmpHost(): ConformanceHost {
       abort: async () => void controls.abortCalls++,
       getAvailableModels: () => [],
       setThinkingLevel: () => {},
-    } as unknown as AgentSession;
-    return { controls, session };
+    });
+    const stubSession: unknown = makeSession();
+    // SAFETY: the conformance harness only drives the ten members above on
+    // the SDK session (subscribe, beginDispose, dispose, isStreaming, prompt,
+    // steer, followUp, abort, getAvailableModels, setThinkingLevel);
+    // AgentSession's remaining surface is never touched in these tests.
+    return { controls, session: stubSession as AgentSession };
   }
 
   function createDriver(): AgentDriver {
@@ -544,12 +560,17 @@ function makeOmpHost(): ConformanceHost {
         currentControls = controls;
         // The driver only destructures `session` from the result; the rest of
         // the SDK surface is stubbed so the type contract is met.
-        return {
+        const buildResult = () => ({
           session,
-          extensionsResult: { loadedExtensions: [] } as unknown as CreateAgentSessionResult["extensionsResult"],
+          extensionsResult: { loadedExtensions: [] },
           setToolUIContext: () => {},
-          eventBus: {} as CreateAgentSessionResult["eventBus"],
-        };
+          eventBus: {},
+        });
+        const stubResult: unknown = buildResult();
+        // SAFETY: the OMP driver's conformance paths only read `session` (and
+        // never the extension runtime or event bus) from the factory result;
+        // loadedExtensions is the only field of extensionsResult they touch.
+        return stubResult as CreateAgentSessionResult;
       },
     });
   }
@@ -582,7 +603,7 @@ function makeOmpHost(): ConformanceHost {
     createFailingDriver,
     transcriptDir,
     spaceId,
-    capturedOptions: () => (captured as unknown as Record<string, unknown> | null) ?? null,
+    capturedOptions: () => captured ?? null,
     sessionToolNames: () => captured?.toolNames ?? null,
     wireLog: () => null,
     prompt: async (session, text, opts) => {
@@ -754,7 +775,10 @@ function makeAcpHost(): ConformanceHost {
       }
       expect(row).not.toBeNull();
       expect(row!.actor).toBe("U9");
-      expect(JSON.parse(row!.payload) as Record<string, unknown>).toMatchObject({ tool: "read", decision: "allow" });
+      // SAFETY: the ACP permission path audits POLICY_DECISION_EVENT rows with
+      // {tool, tier, decision, reason, args} payloads (audit-events.ts); this
+      // test only reads tool and decision.
+      expect(JSON.parse(row!.payload) as { tool: string; decision: string }).toMatchObject({ tool: "read", decision: "allow" });
       store.close();
       rmSync(policyDir, { recursive: true, force: true });
     },

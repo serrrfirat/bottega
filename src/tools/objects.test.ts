@@ -23,10 +23,19 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** The context surface the tool bridge reads from an ExtensionContext. */
+interface ToolRunContext {
+  sessionManager: { getSessionFile(): string | null | undefined };
+}
+
 function ctxFor(spaceId: string): ExtensionContext {
-  return {
+  const ctx: ToolRunContext = {
     sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
-  } as unknown as ExtensionContext;
+  };
+  // SAFETY: object tools resolve the space id only via
+  // ctx.sessionManager.getSessionFile() (the tools.ts bridge); ToolRunContext
+  // is exactly that surface, so the stub is sound for every tool call.
+  return ctx as ExtensionContext;
 }
 
 function resultText(result: AgentToolResult<unknown>): string {
@@ -70,6 +79,9 @@ describe("object tools", () => {
     );
 
     expect(result.isError).not.toBe(true);
+    // SAFETY: object.create's execute always returns exactly this envelope
+    // (id/name/mime/size/sha256 — see the tool's result construction), and
+    // the toEqual assertion below pins every field.
     const output = JSON.parse(resultText(result)) as {
       id: string;
       name: string;

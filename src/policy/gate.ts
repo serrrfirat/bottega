@@ -87,7 +87,13 @@ export interface PolicyGateOutcome {
 /** Cap for the args summary embedded in policy.decision rows (appendAudit redacts + caps too). */
 const ARGS_SUMMARY_MAX = 1000;
 
-export function summarizeArgs(input: unknown): string {
+/**
+ * One-line summary of tool-call args for audit/step payloads: JSON
+ * serialization capped at ARGS_SUMMARY_MAX. Accepts any JSON-serializable
+ * value — callers hand over boundary-parsed args of heterogeneous shapes
+ * (typed tool params, parsed MCP args, raw policy-call args).
+ */
+export function summarizeArgs<T>(input: T): string {
   const text = JSON.stringify(input) ?? "";
   return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;
 }

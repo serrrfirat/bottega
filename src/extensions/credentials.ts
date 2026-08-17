@@ -115,6 +115,6 @@ export async function recordCredentialResolution(
  * API-key credentials are never filtered by the pool; the identity key is
  * still recorded for audit and harmless to include.
  */
-export function accountPoolFor(provider: string, identityKey: string): Record<string, string[]> {
+export function accountPoolFor(provider: string, identityKey: string) {
   return { [provider]: [identityKey] };
 }

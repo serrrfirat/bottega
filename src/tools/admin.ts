@@ -91,7 +91,7 @@ import {
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
 import { proxyBoundaryControlFromEnv } from "../extensions/boundary";
-import type { CliBinding, CredentialSchema, ExtensionTool, McpBinding } from "../extensions/manifest";
+import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
 import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
 import {
@@ -244,7 +244,17 @@ function pinnedMatchesQuery(entry: ResolvedExtension, needle: string): boolean {
   );
 }
 
-function pinnedView(entry: ResolvedExtension): Record<string, unknown> {
+/** One pinned extension as surfaced to the agent by the catalog browser. */
+interface PinnedView {
+  id: string;
+  label: string;
+  kind: ExtensionKind;
+  domains: string[];
+  reviewed: boolean;
+  pinned_at: string | null;
+}
+
+function pinnedView(entry: ResolvedExtension): PinnedView {
   return {
     id: entry.manifest.id,
     label: entry.manifest.label,
@@ -255,13 +265,26 @@ function pinnedView(entry: ResolvedExtension): Record<string, unknown> {
   };
 }
 
+/** The review-gate summary shape shared by the refusal and the audit trail. */
+interface DraftSummary {
+  id: string;
+  label: string;
+  kind: ExtensionKind;
+  binding: McpBinding | CliBinding | undefined;
+  credential_schema: CredentialSchema | undefined;
+  tools_count: number | null;
+  domains: string[];
+  vendor_official: boolean;
+  reviewed: boolean;
+}
+
 /**
  * The review-gate summary for a completed draft: everything the human must
  * see before confirming a pin (id, label, kind, binding, credential schema,
  * tool count, domains, provenance). One source shared by the
  * confirm-required refusal and the audit trail.
  */
-function draftSummary(draft: SnapshotDraft): Record<string, unknown> {
+function draftSummary(draft: SnapshotDraft): DraftSummary {
   return {
     id: draft.manifest.id,
     label: draft.manifest.label,
@@ -312,6 +335,8 @@ export async function defaultComposePs(
   } catch {
     return { available: false };
   }
+  // SAFETY: Bun.spawn with stdout: "pipe" always exposes a readable stream
+  // on proc.stdout (it is never null or a file descriptor here).
   const out = await new Response(proc.stdout as ReadableStream).text();
   const code = await proc.exited;
   if (code !== 0) {
@@ -322,14 +347,21 @@ export async function defaultComposePs(
   const stdout = out.trim();
   if (!stdout) return { available: true };
   try {
-    const rows = JSON.parse(stdout) as Array<Record<string, unknown>>;
+    /** One `docker compose ps --format json` row. */
+    const composeRowSchema = z.object({
+      Service: z.string().optional(),
+      State: z.string().optional(),
+      Health: z.string().optional(),
+      RestartCount: z.number().optional(),
+    });
+    const rows = z.array(composeRowSchema).parse(JSON.parse(stdout));
     const row = rows.find((r) => r["Service"] === service);
     if (!row) return { available: true };
     return {
       available: true,
-      state: typeof row["State"] === "string" ? row["State"] : undefined,
-      health: typeof row["Health"] === "string" ? row["Health"] : undefined,
-      restartCount: typeof row["RestartCount"] === "number" ? row["RestartCount"] : undefined,
+      state: row["State"],
+      health: row["Health"],
+      restartCount: row["RestartCount"],
     };
   } catch {
     // Unparseable output is evidence, not a crash: report unknown state.
@@ -343,7 +375,7 @@ export async function defaultHttpGet(url: string, timeoutMs = PROBE_TIMEOUT_MS):
     const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "follow" });
     return { ok: res.ok, evidence: `GET ${url} -> HTTP ${res.status}` };
   } catch (err) {
-    return { ok: false, evidence: `GET ${url} failed: ${(err as Error).message}` };
+    return { ok: false, evidence: `GET ${url} failed: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -703,6 +735,10 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           }
           let draft: SnapshotDraft;
           try {
+            // SAFETY: the draft file is JSON written by fetch-catalog's
+            // own buildSnapshotDraft writer, and validateManifest below is
+            // the authority on the merged shape (fail closed) before any
+            // side effect — the cast only scaffolds the in-channel merge.
             draft = JSON.parse(readFileSync(draftPath, "utf8")) as SnapshotDraft;
           } catch {
             return toolError(`draft at ${draftPath} is not valid JSON`);
@@ -713,15 +749,27 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           // authority on the merged shape.
           const manifest = { ...draft.manifest };
           if (draft.manifest.kind === "mcp") {
-            if (params.binding !== undefined) manifest.mcp = params.binding as unknown as McpBinding;
+            if (params.binding !== undefined) {
+              // SAFETY: the merged manifest is re-validated by validateManifest
+              // below (fail closed) before any write or registration; the params
+              // arrive zod-validated from the tool args schema, and the JSON
+              // round-trip keeps the validator's JSON-domain contract.
+              manifest.mcp = JSON.parse(JSON.stringify(params.binding)) as McpBinding;
+            }
           } else if (params.binding !== undefined) {
-            manifest.cli = params.binding as unknown as CliBinding;
+            // SAFETY: same invariant as the mcp branch — validateManifest is
+            // the fail-closed authority on the binding before any side effect.
+            manifest.cli = JSON.parse(JSON.stringify(params.binding)) as CliBinding;
           }
           if (params.credential_schema !== undefined) {
-            manifest.credentialSchema = params.credential_schema as unknown as CredentialSchema;
+            // SAFETY: validateManifest below is the fail-closed authority on
+            // credentialSchema before any write or registration.
+            manifest.credentialSchema = JSON.parse(JSON.stringify(params.credential_schema)) as CredentialSchema;
           }
           if (params.tools !== undefined) {
-            manifest.tools = params.tools as unknown as ExtensionTool[];
+            // SAFETY: validateManifest below is the fail-closed authority on
+            // the tool surface before any write or registration.
+            manifest.tools = JSON.parse(JSON.stringify(params.tools)) as ExtensionTool[];
           }
           // The egress allowlist must include the binding host (the proxy
           // allowlists + injects credentials per domain, issue #53) — merge
@@ -735,7 +783,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             ...mergedDraft,
             source: {
               ...draft.source,
-              ...(params.vendor_official !== undefined ? { vendorOfficial: params.vendor_official } : {}),
+              ...(params.vendor_official !== undefined ? { vendorOfficial: params.vendor_official } : undefined),
             },
           };
           // Fail closed BEFORE the review gate: an incomplete draft (missing
@@ -754,7 +802,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             );
           }
           try {
-            validateManifest(completed.manifest);
+            validateManifest(JSON.parse(JSON.stringify(completed.manifest)));
           } catch (err) {
             return toolError(errorMessage(err));
           }
@@ -823,7 +871,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 liveRegistry = "registered";
               } else {
                 try {
-                  const manifest = validateManifest(reviewed.manifest);
+                  const manifest = validateManifest(JSON.parse(JSON.stringify(reviewed.manifest)));
                   const snapshot: PinnedSnapshot = {
                     schema: reviewed.schema,
                     extensionId: reviewed.extensionId,
@@ -845,7 +893,12 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             // new domains apply immediately. Unset control URL (unconfigured
             // deployments, hermetic tests) → write-only, like the boundary.
             const control = proxyBoundaryControlFromEnv();
-            const reload: { ok: boolean; error?: string } = { ok: false };
+            /** The proxy reload attempt result (ok, or the error evidence). */
+            interface ProxyReloadResult {
+              ok: boolean;
+              error?: string;
+            }
+            const reload: ProxyReloadResult = { ok: false };
             if (control.proxyControlUrl !== undefined) {
               try {
                 const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
@@ -888,12 +941,25 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 no_hosted_variant: params.no_hosted_variant === true,
                 vendor_official: reviewed.source.vendorOfficial,
                 live_registry: liveRegistry,
-                ...(liveError !== undefined ? { live_error: liveError } : {}),
+                ...(liveError !== undefined ? { live_error: liveError } : undefined),
                 proxy_reload: proxyReload,
-                ...(reload.error !== undefined ? { proxy_reload_error: reload.error } : {}),
+                ...(reload.error !== undefined ? { proxy_reload_error: reload.error } : undefined),
               },
             });
-            const result: Record<string, unknown> = {
+            /** The pin result the tool reports back to the agent. */
+            interface PinResult {
+              action: string;
+              spec: string;
+              written_to: string;
+              reviewed: boolean;
+              hosted_variant: boolean;
+              egress_regenerated: string[];
+              live_registry: "registered" | "failed" | "absent";
+              proxy_reload: "ok" | "failed" | "unset";
+              warnings?: string[];
+              note?: string;
+            }
+            const result: PinResult = {
               action: "pin",
               spec: params.spec.trim(),
               written_to: outPath,
@@ -966,8 +1032,8 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   name: entry.name,
                   kind: entry.kind,
                   domain: entry.domain,
-                  ...(entry.url !== undefined ? { url: entry.url } : {}),
-                  ...(entry.description !== undefined ? { description: entry.description } : {}),
+                  ...(entry.url !== undefined ? { url: entry.url } : undefined),
+                  ...(entry.description !== undefined ? { description: entry.description } : undefined),
                 })),
                 catalog_truncated: truncated,
                 // Compact skipped diagnostics: total count + up to 3 examples,
@@ -976,7 +1042,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   count: catalogSkipped.length,
                   ...(catalogSkipped.length > 0
                     ? { examples: catalogSkipped.slice(0, 3).map((s) => ({ spec_id: s.specId, reason: s.reason })) }
-                    : {}),
+                    : undefined),
                 },
               }),
             },

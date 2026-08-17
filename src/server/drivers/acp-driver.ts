@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 import type { AuditModule } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import { evaluatePolicyGate } from "../../policy/gate";
@@ -184,11 +185,77 @@ function toEnvPairs(env: Record<string, string>): Array<{ name: string; value: s
   return Object.entries({ ...env, ...absolutize }).map(([name, value]) => ({ name, value }));
 }
 
-/** The ACP v1 toolCall carried by session/request_permission (issue #26). */
-interface AcpToolCall {
-  kind?: unknown;
-  rawInput?: unknown;
-}
+/** JSON values: the domain type of everything that crosses the JSON-RPC wire. */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/** Recursive JSON-value schema (validates wire payloads at the JSON-RPC boundary). */
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+
+/** A JSON-RPC 2.0 request/notification/response id (the driver sends numeric ids). */
+type JsonRpcId = number | string | null;
+
+/**
+ * The ACP v1 toolCall carried by session/request_permission (issue #26),
+ * decoded at the JSON-RPC boundary. `rawInput` keeps the shape the ACP
+ * client sends: the xdev path for MCP calls plus the JSON-text `content`.
+ */
+const acpToolCallSchema = z.object({
+  kind: z.string().optional(),
+  rawInput: z
+    .object({
+      path: z.string().optional(),
+      content: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+type AcpToolCall = z.infer<typeof acpToolCallSchema>;
+
+/** A permission-response option the agent offered (unknown extra fields kept). */
+const permissionOptionSchema = z.object({ optionId: z.string().optional() }).passthrough();
+type AcpPermissionOption = z.infer<typeof permissionOptionSchema>;
+
+/** The session/request_permission params: the toolCall being gated + offered options. */
+const permissionRequestSchema = z.object({
+  toolCall: acpToolCallSchema.optional(),
+  options: z.array(permissionOptionSchema).optional(),
+});
+type PermissionRequestParams = z.infer<typeof permissionRequestSchema>;
+
+/** JSON-RPC 2.0 envelope decoded at the stdio boundary (loose: unknown extra fields ignored). */
+const jsonRpcMessageSchema = z.object({
+  id: z.union([z.number(), z.string(), z.null()]).optional(),
+  method: z.string().optional(),
+  result: jsonValueSchema.optional(),
+  error: z.object({ message: z.string().optional() }).optional(),
+  params: jsonValueSchema.optional(),
+});
+type JsonRpcMessage = z.infer<typeof jsonRpcMessageSchema>;
+
+/** initialize result: the agent's supported protocol version (extra fields ignored). */
+const initializeResultSchema = z.object({ protocolVersion: z.number().optional() }).passthrough();
+
+/** session/new result: the session id the agent allocated (extra fields ignored). */
+const sessionNewResultSchema = z.object({ sessionId: z.string().optional() }).passthrough();
+
+/** session/update params (agent_message_chunk notifications), decoded at the boundary. */
+const sessionUpdateSchema = z.object({
+  update: z.object({
+    sessionUpdate: z.string(),
+    messageId: z.string().optional(),
+    content: z.object({ type: z.string(), text: z.string() }).optional(),
+  }),
+});
+type SessionUpdateParams = z.infer<typeof sessionUpdateSchema>;
 
 /**
  * Maps an ACP toolCall to the policy table's tool names. MCP tools surface
@@ -201,9 +268,8 @@ interface AcpToolCall {
  * caller's raw kind name reaches the table, which denies it (fail closed).
  */
 function toolNameFromAcpToolCall(toolCall: AcpToolCall | null | undefined): string | null {
-  const rawInput = toolCall?.rawInput;
-  const path = typeof rawInput === "object" && rawInput !== null ? (rawInput as Record<string, unknown>).path : undefined;
-  if (typeof path === "string" && path.startsWith("xd://mcp__")) {
+  const path = toolCall?.rawInput?.path;
+  if (path !== undefined && path.startsWith("xd://mcp__")) {
     const rest = path.slice("xd://mcp__".length);
     const sep = rest.indexOf("_");
     return sep > 0 ? rest.slice(sep + 1).replaceAll("_", ".") : null;
@@ -227,19 +293,16 @@ function toolNameFromAcpToolCall(toolCall: AcpToolCall | null | undefined): stri
 }
 
 /** Args for the audit row: the rawInput, or the parsed MCP `content` JSON. */
-function acpToolCallArgs(toolCall: AcpToolCall | null | undefined): unknown {
-  const rawInput = toolCall?.rawInput;
-  if (typeof rawInput === "object" && rawInput !== null) {
-    const content = (rawInput as Record<string, unknown>).content;
-    if (typeof content === "string") {
-      try {
-        return JSON.parse(content);
-      } catch {
-        // Not JSON; fall through to the raw shape.
-      }
+function acpToolCallArgs(toolCall: AcpToolCall | null | undefined): JsonValue | undefined {
+  const content = toolCall?.rawInput?.content;
+  if (content !== undefined) {
+    try {
+      return JSON.parse(content);
+    } catch {
+      // Not JSON; fall through to the raw shape.
     }
   }
-  return rawInput;
+  return toolCall?.rawInput === undefined ? undefined : JSON.parse(JSON.stringify(toolCall.rawInput));
 }
 
 /**
@@ -248,26 +311,30 @@ function acpToolCallArgs(toolCall: AcpToolCall | null | undefined): unknown {
  * literal id (a conforming client should pick an offered option; the
  * fallback keeps the response valid for peers that send none).
  */
-function pickPermissionOptionId(options: unknown, allow: boolean): string {
+function pickPermissionOptionId(options: AcpPermissionOption[] | undefined, allow: boolean): string {
   const wanted = allow ? "allow_once" : "reject_once";
   const kindPrefix = allow ? "allow" : "reject";
-  if (Array.isArray(options)) {
+  if (options !== undefined) {
     for (const option of options) {
-      const id = (option as { optionId?: unknown } | null)?.optionId;
-      if (id === wanted) return String(id);
+      if (option.optionId === wanted) return option.optionId;
     }
     for (const option of options) {
-      const id = (option as { optionId?: unknown } | null)?.optionId;
-      if (typeof id === "string" && id.startsWith(kindPrefix)) return id;
+      if (option.optionId !== undefined && option.optionId.startsWith(kindPrefix)) return option.optionId;
     }
   }
   return wanted;
 }
 interface PendingRequest {
   method: string;
-  resolve: (result: unknown) => void;
+  resolve: (result: JsonValue | undefined) => void;
   reject: (err: Error) => void;
 }
+
+/** Event payloads this driver emits: message text, turn bounds, and errors. */
+type AcpDriverEventData =
+  | { spaceId: string; text: string }
+  | { spaceId: string }
+  | { spaceId: string; message: string };
 
 class AcpSessionDriver implements AgentSessionDriver {
   readonly #spaceId: string;
@@ -352,14 +419,13 @@ class AcpSessionDriver implements AgentSessionDriver {
     // absolutized here (see toEnvPairs).
     this.#mcpServers = (deps.mcpServers ?? []).map((s) => {
       const env = toEnvPairs({ ...s.env, BOTTEGA_SPACE_ID: deps.spaceId });
-      const entry: { name: string; type: "stdio"; command: string; args?: string[]; env: typeof env } = {
+      return {
         name: s.name,
-        type: "stdio",
+        type: "stdio" as const,
         command: s.command,
         env,
+        ...(s.args !== undefined ? { args: s.args } : undefined),
       };
-      if (s.args) entry.args = s.args;
-      return entry;
     });
   }
 
@@ -377,11 +443,13 @@ class AcpSessionDriver implements AgentSessionDriver {
     rl.on("error", () => {}); // stdout stream closed on child exit; handled by #onChildExit
 
     try {
-      const init = (await this.#request("initialize", {
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
-        clientInfo: { name: "bottega", version: "0.1.0" },
-      })) as { protocolVersion?: unknown } | null;
+      const init = initializeResultSchema.safeParse(
+        await this.#request("initialize", {
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: {},
+          clientInfo: { name: "bottega", version: "0.1.0" },
+        }),
+      ).data;
       if (init?.protocolVersion !== PROTOCOL_VERSION) {
         throw new Error(`unsupported ACP protocol version: ${String(init?.protocolVersion)}`);
       }
@@ -393,8 +461,8 @@ class AcpSessionDriver implements AgentSessionDriver {
       // The caller's cwd is honored (issue #173): previously the driver
       // hardcoded process.cwd() and silently dropped the option.
       const created = await this.#request("session/new", { cwd: this.#cwd, mcpServers: this.#mcpServers });
-      const sessionId = (created as { sessionId?: unknown } | null)?.sessionId;
-      if (typeof sessionId !== "string" || !sessionId) {
+      const sessionId = sessionNewResultSchema.safeParse(created).data?.sessionId;
+      if (sessionId === undefined || sessionId === "") {
         throw new Error("ACP agent returned no sessionId from session/new");
       }
       this.#sessionId = sessionId;
@@ -437,7 +505,7 @@ class AcpSessionDriver implements AgentSessionDriver {
     return this.#streaming && !this.#dead && !this.#disposed;
   }
 
-  on(event: DriverEvent, cb: (data: unknown) => void): () => void {
+  on(event: DriverEvent, cb: (data: AcpDriverEventData) => void): () => void {
     return this.#emitter.on(event, cb);
   }
 
@@ -543,12 +611,12 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   // --- JSON-RPC -------------------------------------------------------------
 
-  #request(method: string, params: unknown, timeoutMs = this.#sessionTimeoutMs): Promise<unknown> {
+  #request(method: string, params: JsonValue, timeoutMs = this.#sessionTimeoutMs): Promise<JsonValue | undefined> {
     if (this.#dead || this.#disposed || !this.#child) {
       return Promise.reject(new Error("acp agent process is not running"));
     }
     const id = this.#nextId++;
-    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    const { promise, resolve, reject } = Promise.withResolvers<JsonValue | undefined>();
     const timer = setTimeout(() => {
       this.#pending.delete(id);
       reject(new Error(`ACP request timed out: ${method}`));
@@ -569,39 +637,40 @@ class AcpSessionDriver implements AgentSessionDriver {
     return promise;
   }
 
-  #write(msg: unknown): void {
+  #write(msg: JsonValue): void {
     if (!this.#child || this.#dead) return;
     this.#child.stdin?.write(JSON.stringify(msg) + "\n");
   }
 
   #onLine(line: string): void {
-    let msg: unknown;
+    let msg: JsonRpcMessage;
     try {
-      msg = JSON.parse(line);
+      msg = jsonRpcMessageSchema.parse(JSON.parse(line));
     } catch {
       console.error(`[acp-driver] ignoring non-JSON agent output: ${line}`);
       return;
     }
-    const obj = msg as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown };
-    if (typeof obj.method === "string" && obj.id !== undefined) {
-      this.#onInboundRequest(obj as { id: unknown; method: string; params?: unknown });
-    } else if (typeof obj.method === "string") {
-      this.#onInboundNotification(obj as { method: string; params?: unknown });
-    } else if (obj.id !== undefined) {
-      this.#onResponse(obj as { id: unknown; result?: unknown; error?: { message?: unknown } });
+    if (msg.method !== undefined && msg.id !== undefined) {
+      this.#onInboundRequest({ id: msg.id, method: msg.method, params: msg.params });
+    } else if (msg.method !== undefined) {
+      this.#onInboundNotification({ method: msg.method, params: msg.params });
+    } else if (msg.id !== undefined) {
+      this.#onResponse({ id: msg.id, result: msg.result, error: msg.error });
     } else {
       console.error(`[acp-driver] ignoring malformed agent message: ${line}`);
     }
   }
 
   /** Requests the agent sends to us (permission, fs, terminal, elicitation, ...). */
-  #onInboundRequest(msg: { id: unknown; method: string; params?: unknown }): void {
+  #onInboundRequest(msg: { id: JsonRpcId; method: string; params?: JsonValue }): void {
     if (msg.method === "session/request_permission" && this.#policy) {
+      const parsed = permissionRequestSchema.safeParse(msg.params);
+      const params = parsed.success ? parsed.data : undefined;
       // Fire and forget: the resolution writes the JSON-RPC response.
-      void this.#resolvePermissionRequest(msg.id, msg.params).catch((err) => {
+      void this.#resolvePermissionRequest(msg.id, params).catch((err) => {
         // Fail closed: an internal gate error denies the call.
         console.error(`[acp-driver] permission gate error (${this.#spaceId}), denying:`, err);
-        this.#answerPermission(msg.id, false, msg.params);
+        this.#answerPermission(msg.id, false, params);
       });
       return;
     }
@@ -614,9 +683,9 @@ class AcpSessionDriver implements AgentSessionDriver {
   // --- session/request_permission (issue #26) ------------------------------
 
   /** Evaluate one permission request against the shared policy gate and answer. */
-  async #resolvePermissionRequest(id: unknown, params: unknown): Promise<void> {
+  async #resolvePermissionRequest(id: JsonRpcId, params: PermissionRequestParams | undefined): Promise<void> {
     const policy = this.#policy!;
-    const toolCall = (params as { toolCall?: unknown } | null)?.toolCall as AcpToolCall | null | undefined;
+    const toolCall = params?.toolCall ?? null;
     const tool = toolNameFromAcpToolCall(toolCall);
     const outcome = await evaluatePolicyGate(
       {
@@ -626,7 +695,7 @@ class AcpSessionDriver implements AgentSessionDriver {
         timeoutMs: policy.timeoutMs,
       },
       {
-        tool: tool ?? String((toolCall as { kind?: unknown } | null)?.kind ?? "unknown"),
+        tool: tool ?? String(params?.toolCall?.kind ?? "unknown"),
         args: acpToolCallArgs(toolCall),
         spaceId: this.#spaceId,
         // The per-turn principal (#152) wins; the createSession getPrincipal
@@ -645,28 +714,31 @@ class AcpSessionDriver implements AgentSessionDriver {
    * else the first allow-kind/reject-kind option), falling back to the
    * literal ids so a peer that omits options still gets a valid response.
    */
-  #answerPermission(id: unknown, allow: boolean, params: unknown): void {
-    const optionId = pickPermissionOptionId((params as { options?: unknown } | null)?.options, allow);
+  #answerPermission(id: JsonRpcId, allow: boolean, params: PermissionRequestParams | undefined): void {
+    const optionId = pickPermissionOptionId(params?.options, allow);
     this.#write({ jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId } } });
   }
 
-  #onInboundNotification(msg: { method: string; params?: unknown }): void {
+  #onInboundNotification(msg: { method: string; params?: JsonValue }): void {
     if (msg.method === "session/update") {
-      this.#onUpdate(msg.params);
+      const parsed = sessionUpdateSchema.safeParse(msg.params);
+      this.#onUpdate(parsed.success ? parsed.data : undefined);
       return;
     }
     console.error(`[acp-driver] ignoring unknown notification from agent (${this.#spaceId}): ${msg.method}`);
   }
 
-  #onResponse(msg: { id: unknown; result?: unknown; error?: { message?: unknown } }): void {
-    const pending = this.#pending.get(msg.id as number);
+  #onResponse(msg: { id: JsonRpcId; result?: JsonValue; error?: { message?: string } }): void {
+    // SAFETY: the driver sends only numeric request ids, so a response id is always one of ours.
+    const id = msg.id as number;
+    const pending = this.#pending.get(id);
     if (!pending) {
       console.error(`[acp-driver] unexpected response for id ${String(msg.id)}`);
       return;
     }
-    this.#pending.delete(msg.id as number);
+    this.#pending.delete(id);
     if (msg.error !== undefined) {
-      pending.reject(new Error(`ACP ${pending.method} failed: ${String((msg.error as { message?: unknown })?.message ?? msg.error)}`));
+      pending.reject(new Error(`ACP ${pending.method} failed: ${msg.error.message ?? String(msg.error)}`));
     } else {
       pending.resolve(msg.result);
     }
@@ -674,14 +746,12 @@ class AcpSessionDriver implements AgentSessionDriver {
 
   // --- session/update -------------------------------------------------------
 
-  #onUpdate(params: unknown): void {
-    const update = (params as { update?: { sessionUpdate?: unknown } } | null)?.update;
-    if (!update || typeof update !== "object") return;
-    const u = update as { sessionUpdate?: unknown; messageId?: unknown; content?: { type?: unknown; text?: unknown } };
-    if (u.sessionUpdate !== "agent_message_chunk") return; // plan/tool_call/usage_update/... tolerated
+  #onUpdate(params: SessionUpdateParams | undefined): void {
+    const u = params?.update;
+    if (u === undefined || u.sessionUpdate !== "agent_message_chunk") return; // plan/tool_call/usage_update/... tolerated
     const content = u.content;
-    if (content?.type !== "text" || typeof content.text !== "string") return;
-    const messageId = typeof u.messageId === "string" ? u.messageId : "";
+    if (content === undefined || content.type !== "text") return;
+    const messageId = u.messageId ?? "";
     // A changed messageId starts a new message: deliver the previous one.
     if (this.#currentMessageId !== null && messageId !== this.#currentMessageId) {
       this.#flushMessage(this.#currentMessageId);

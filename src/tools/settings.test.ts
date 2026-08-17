@@ -16,22 +16,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore } from "../store/db";
+import type { SecretsBackendMappingEntry } from "../store/org-settings";
 import { SETTINGS_CHANGED_EVENT } from "../store/audit-events";
 import { decidePolicyCall, defaultPolicy, loadOrgPolicy, resolveTier } from "../policy/config";
 import type { AuditModule } from "../policy/audit";
 import { settingsToolsExtension, settingsArgsSchema, settingsSetSchema, type SettingsToolsExtensionOpts } from "./settings";
+import { z } from "zod";
 
 /** Session-file ctx so the execute path can derive a space id (issue #151). */
-const sessionCtx = { sessionManager: { getSessionFile: () => join("/tmp/sessions", "slack:C1.jsonl") } } as unknown as ExtensionContext;
+// SAFETY: the settings tools only read ctx.sessionManager.getSessionFile(); a fake exposing just that member exercises the executed path.
+const sessionCtx = { sessionManager: { getSessionFile: () => join("/tmp/sessions", "slack:C1.jsonl") } } as ExtensionContext;
+
+/** Parsed audit payload JSON; the tests assert on the settings-trail and approval-gate keys. */
+interface AuditPayload {
+  before?: unknown;
+  after?: unknown;
+  scope?: string;
+  approved?: boolean;
+  tool?: string;
+}
 
 interface AuditRow {
   actor: string;
   event_type: string;
   space_id?: string | null;
-  payload: Record<string, unknown>;
+  payload: AuditPayload;
 }
 
-function fakeAudit(): { audit: Pick<AuditModule, "appendAudit">; rows: AuditRow[] } {
+interface FakeAudit {
+  audit: Pick<AuditModule, "appendAudit">;
+  rows: AuditRow[];
+}
+
+function fakeAudit(): FakeAudit {
   const rows: AuditRow[] = [];
   const audit: Pick<AuditModule, "appendAudit"> = {
     appendAudit: async (entry) => {
@@ -69,20 +86,28 @@ function loadTools(
   opts?: SettingsToolsExtensionOpts,
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
-  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
+  // SAFETY: the extension factory only calls pi.registerTool; a double exposing just that member satisfies the executed path.
+  const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as ExtensionAPI;
   settingsToolsExtension(store, opts)(pi);
   return tools;
 }
 
 async function call(
   tool: ToolDefinition,
-  params: unknown,
+  params: z.input<typeof settingsArgsSchema>,
 ): Promise<{ text: string; isError: boolean }> {
   const res = await tool.execute("call-1", params, undefined, undefined, sessionCtx);
+  // SAFETY: the settings tool always replies with a single text content block.
   return { text: (res.content[0] as { text: string }).text, isError: res.isError ?? false };
 }
 
-function freshStore(): { store: ReturnType<typeof createStore>; dir: string; cleanup(): void } {
+interface FreshStore {
+  store: ReturnType<typeof createStore>;
+  dir: string;
+  cleanup(): void;
+}
+
+function freshStore(): FreshStore {
   const dir = mkdtempSync(join(tmpdir(), "bottega-settings-"));
   const store = createStore(join(dir, "test.db"));
   return {
@@ -149,6 +174,7 @@ describe("org scope (issue #67)", () => {
       const [tool] = loadTools(store);
       const res = await call(tool, { scope: "org" });
       expect(res.isError).toBe(false);
+      // SAFETY: settings.ts serializes the org get response as { scope, settings, policy }; settings is null when the blob is unset.
       const body = JSON.parse(res.text) as { scope: string; settings: unknown; policy: { response_mode: string } };
       expect(body.scope).toBe("org");
       expect(body.settings).toBeNull();
@@ -167,6 +193,7 @@ describe("org scope (issue #67)", () => {
         set: { response_mode: "mention", approvals: { timeout_minutes: 12 } },
       });
       expect(set1.isError).toBe(false);
+      // SAFETY: settings.ts serializes the org set response as { scope, settings, policy }; the asserted knobs come from the merged OrgSettingsInput.
       const after1 = JSON.parse(set1.text) as {
         settings: { response_mode: string; approvals: { timeout_minutes: number } };
       };
@@ -176,6 +203,7 @@ describe("org scope (issue #67)", () => {
       // Partial merge: a second set touches one knob and keeps the rest.
       const set2 = await call(tool, { scope: "org", set: { workspaces_dir: "/tmp/ws" } });
       expect(set2.isError).toBe(false);
+      // SAFETY: settings.ts serializes the org set response as { scope, settings, policy }; the asserted knobs come from the merged OrgSettingsInput.
       const after2 = JSON.parse(set2.text) as {
         settings: { response_mode: string; approvals: { timeout_minutes: number }; workspaces_dir: string };
       };
@@ -184,6 +212,7 @@ describe("org scope (issue #67)", () => {
       expect(after2.settings.workspaces_dir).toBe("/tmp/ws");
 
       const got = await call(tool, { scope: "org" });
+      // SAFETY: settings.ts serializes the org get response as { scope, settings, policy } via orgSettingsToInput.
       const body = JSON.parse(got.text) as {
         settings: { response_mode: string; workspaces_dir: string };
         policy: { response_mode: string };
@@ -202,6 +231,7 @@ describe("org scope (issue #67)", () => {
       const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       const res = await call(tool, { scope: "org", set: { onboarding: { space_id: "slack:C123" } } });
       expect(res.isError).toBe(false);
+      // SAFETY: orgSettingsToInput serializes onboarding as { space_id } inside the response's settings.
       const body = JSON.parse(res.text) as { settings: { onboarding: { space_id: string } } };
       expect(body.settings.onboarding.space_id).toBe("slack:C123");
       expect(store.getOrgSettings()?.onboarding?.spaceId).toBe("slack:C123");
@@ -209,6 +239,7 @@ describe("org scope (issue #67)", () => {
       // A partial set keeps the onboarding knob.
       await call(tool, { scope: "org", set: { response_mode: "mention" } });
       const got = await call(tool, { scope: "org" });
+      // SAFETY: orgSettingsToInput serializes onboarding as { space_id }; a partial set keeps the knob in the blob.
       const read = JSON.parse(got.text) as {
         settings: { response_mode: string; onboarding: { space_id: string } };
       };
@@ -234,8 +265,9 @@ describe("org scope (issue #67)", () => {
         },
       });
       expect(res.isError).toBe(false);
+      // SAFETY: orgSettingsToInput serializes secrets_backend as { type, connect_url, mapping } with SecretsBackendMappingEntry values.
       const body = JSON.parse(res.text) as {
-        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, unknown> } };
+        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, SecretsBackendMappingEntry> } };
       };
       expect(body.settings.secrets_backend.type).toBe("1password-connect");
       expect(body.settings.secrets_backend.connect_url).toBe("http://op-connect:8080");
@@ -245,8 +277,9 @@ describe("org scope (issue #67)", () => {
       // is allowed with the (now inert) Connect keys still present.
       await call(tool, { scope: "org", set: { secrets_backend: { type: "omp-broker" } } });
       const got = await call(tool, { scope: "org" });
+      // SAFETY: orgSettingsToInput serializes secrets_backend as { type, connect_url, mapping }; switching type keeps the inert Connect keys.
       const read = JSON.parse(got.text) as {
-        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, unknown> } };
+        settings: { secrets_backend: { type: string; connect_url: string; mapping: Record<string, SecretsBackendMappingEntry> } };
       };
       expect(read.settings.secrets_backend.type).toBe("omp-broker");
       expect(read.settings.secrets_backend.connect_url).toBe("http://op-connect:8080");
@@ -287,6 +320,7 @@ describe("org scope (issue #67)", () => {
       expect(bad.isError).toBe(true);
       expect(bad.text).toContain("timeout_minutes");
       const got = await call(tool, { scope: "org" });
+      // SAFETY: the org get response carries the stored settings; the failed set wrote nothing, so approvals stays absent.
       const body = JSON.parse(got.text) as { settings: { response_mode: string; approvals?: unknown } };
       expect(body.settings.response_mode).toBe("mention");
       expect(body.settings.approvals).toBeUndefined();
@@ -355,6 +389,7 @@ describe("org scope (issue #67)", () => {
       const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store) });
       await call(tool, { scope: "org", set: { response_mode: "request-only" } });
       const got = await call(tool, { scope: "org" });
+      // SAFETY: policyView serializes response_mode from the effective policy; the DB blob overrides the config floor.
       const body = JSON.parse(got.text) as { policy: { response_mode: string } };
       expect(body.policy.response_mode).toBe("request-only");
     } finally {
@@ -412,6 +447,7 @@ describe("org scope (issue #67)", () => {
       const res = await call(tool, { scope: "org", set: { response_mode: "mention" } });
       expect(res.isError).toBe(false);
       expect(store.getOrgSettings()?.responseMode).toBe("mention");
+      // SAFETY: policyView serializes always_approve from the effective policy; an empty list is the tightened default.
       const body = JSON.parse(res.text) as { policy: { always_approve: string[] } };
       // The policy view includes the tightened knobs (issue #151).
       expect(body.policy.always_approve).toEqual([]);
@@ -429,6 +465,7 @@ describe("space scope (issue #67)", () => {
       const [tool] = loadTools(store);
       const res = await call(tool, { scope: "space", space: "slack:C1" });
       expect(res.isError).toBe(false);
+      // SAFETY: handleSpace serializes the space get response as { scope, space, overlay, policy }.
       const body = JSON.parse(res.text) as {
         scope: string;
         space: string;
@@ -455,6 +492,7 @@ describe("space scope (issue #67)", () => {
         set: { response_mode: "mention", extensions: { deny: ["linear"] } },
       });
       expect(res.isError).toBe(false);
+      // SAFETY: handleSpace serializes the set response with overlay = the updated policy_json and policy = the effective view.
       const body = JSON.parse(res.text) as {
         overlay: { response_mode: string; extensions: { deny: string[] } };
         policy: { response_mode: string };
@@ -486,6 +524,7 @@ describe("space scope (issue #67)", () => {
         set: { proactive: { standup: true } },
       });
       expect(res.isError).toBe(false);
+      // SAFETY: the space overlay JSON is echoed back verbatim after the merge; proactive.standup was just written.
       const body = JSON.parse(res.text) as { overlay: { proactive: { standup: boolean } } };
       expect(body.overlay.proactive).toEqual({ standup: true });
 
@@ -495,6 +534,7 @@ describe("space scope (issue #67)", () => {
         space: "slack:C1",
         set: { proactive: { reflection: true } },
       });
+      // SAFETY: the space overlay JSON is echoed back verbatim after the merge; reflection was merged in on top of standup.
       const body2 = JSON.parse(res2.text) as {
         overlay: { proactive: { standup: boolean; reflection: boolean } };
       };

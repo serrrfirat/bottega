@@ -25,6 +25,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { z } from "zod";
 import { proactiveEnabled } from "../../src/scheduler/proactive-config";
 import { parseYamlSubset } from "../../src/yaml-subset";
 import { nextCronFire } from "../../src/scheduler/cron";
@@ -129,7 +130,9 @@ describe("scheduled-standup journey mechanism (issue #175)", () => {
       const spaceId = `slack:${channelId}`;
       await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
       const space = await h.store.getSpace(spaceId);
-      const overlay = JSON.parse(space!.policy_json || "{}") as Record<string, unknown>;
+      // SAFETY: spaces.policy_json is a JSON document (outside-controlled);
+      // parse it at this boundary and branch on the domain value.
+      const overlay = z.record(z.string(), z.unknown()).parse(JSON.parse(space!.policy_json || "{}"));
       overlay.proactive = { standup: true };
       await h.store.updatePolicy(spaceId, JSON.stringify(overlay));
 
@@ -168,9 +171,13 @@ describe("extension-call journey mechanism (issue #175)", () => {
   test("the canary's fixture MCP provider answers the fixture tool", async () => {
     const client = new Client({ name: "canary-fixture-test", version: "0.0.0" });
     await client.connect(
+      // SAFETY: the fixture transport ignores the binding entirely (in-process
+      // linked pair); the placeholder only satisfies the transport seam's type.
       canaryFixtureMcpTransport({ serverUrl: "in-memory", transport: "streamable-http" } as McpBinding),
     );
     const res = await client.callTool({ name: FIXTURE_EXTENSION_TOOL, arguments: { city: "canary-test" } });
+    // SAFETY: the canary fixture provider's callTool only ever returns text
+    // content blocks; the first text block carries the sunny-in response.
     const text =
       (res.content as Array<{ type: string; text?: string }>).find((block) => block.type === "text")?.text ?? "";
     expect(text).toBe("sunny in canary-test");

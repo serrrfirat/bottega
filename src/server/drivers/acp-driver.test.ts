@@ -14,7 +14,7 @@ import { createAcpDriver, type AcpMcpServerEntry, type AcpPolicyContext } from "
 import type { AgentSessionDriver } from "./agent-driver";
 import { SpaceService } from "../services/space-service";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
-import type { Store } from "../../store/db";
+import type { AuditEntry, Store } from "../../store/db";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-acp-server.ts");
 
@@ -40,7 +40,14 @@ async function launch(
     /** Policy context for the session/request_permission handler (issue #26). */
     policy?: AcpPolicyContext;
     /** JSON override passed to the fake server's permission scenario. */
-    permissionOverride?: Record<string, unknown>;
+    permissionOverride?: {
+      toolCall: {
+        toolCallId: string;
+        title: string;
+        kind: string;
+        rawInput?: unknown;
+      };
+    };
   } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "acp-driver-"));
@@ -54,6 +61,9 @@ async function launch(
     mcpServers: opts.mcpServers,
     policy: opts.policy,
   });
+  // SAFETY: each event key is initialized to an empty array matching the
+  // `unknown[]` payload slot of Harness["events"]; the literal has exactly
+  // the four keys the interface declares.
   const events = { message: [], turn_start: [], turn_end: [], error: [] } as Harness["events"];
   const outputs: string[] = [];
   const session = await driver.createSession({
@@ -313,7 +323,10 @@ describe("acp driver", () => {
       async start() {},
       async stop() {},
     };
-    const store = { appendAudit: async () => 1 } as unknown as Store;
+    // SAFETY: this path only drives SpaceService's receipt-audit flow, which
+    // touches store.appendAudit; the double implements exactly that member and
+    // Store is assignable to it, so the widening adds only unused members.
+    const store = { appendAudit: async (_entry: AuditEntry) => 1 } as Store;
     const service = new SpaceService({
       store,
       adapter,
@@ -348,12 +361,23 @@ describe("acp driver", () => {
   // session/request_permission policy seam (issue #26)
   // -------------------------------------------------------------------------
 
+  /** Fields on policy decision/approval audit payloads that these tests assert. */
+  interface PolicyAuditPayload {
+    tool?: string;
+    tier?: string;
+    decision?: string;
+    approved?: boolean;
+    approver?: string;
+    args?: string;
+  }
+
   interface PolicyHarness {
     policy: AcpPolicyContext;
     store: Store;
     audit: AuditModule;
     cleanup: () => void;
-    lastAudit: (eventType: string) => Promise<Record<string, unknown>>;
+    /** The audit payload fields these tests assert on. */
+    lastAudit: (eventType: string) => Promise<PolicyAuditPayload>;
   }
 
   function makePolicyHarness(orgYaml: string, opts: { router?: ApprovalRouter } = {}): PolicyHarness {
@@ -373,7 +397,9 @@ describe("acp driver", () => {
     };
     const lastAudit = async (eventType: string) => {
       const rows = await audit.listAudit({ event_type: eventType });
-      return JSON.parse(rows.at(-1)!.payload) as Record<string, unknown>;
+      // SAFETY: policy decision/approval payloads are flat JSON objects with
+      // the tool/tier/decision/approved/approver/args fields these tests read.
+      return JSON.parse(rows.at(-1)!.payload) as PolicyAuditPayload;
     };
     return { policy, store, audit, cleanup, lastAudit };
   }
