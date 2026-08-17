@@ -119,11 +119,12 @@ rule below conflicts with a rule above, the user's explicit instructions win
    message delivery (events drop, the bot goes silent). Before starting,
    check for an existing server (`pgrep -fl "src/server/index.ts"`); restart
    the existing one instead of starting a second.
-7. **Implementation is delegated to task agents.** Any code change ships via
-   a task subagent given complete, self-contained instructions (targets,
-   change steps, acceptance); the main agent handles tracking (issues, todos)
-   and reviews the agent's output before it lands. The main agent does not
-   implement directly.
+7. **The main agent NEVER implements — no exceptions.** All changes — code,
+   config, scripts, docs, hotfixes — are implemented by task agents given
+   complete, self-contained instructions (targets, change steps, acceptance).
+   The main agent handles only coordination (issues, todos, process
+   management such as server restarts) and reviews agent output before it
+   lands.
 
 ## Build, test, verify
 
