@@ -12,9 +12,11 @@
  *
  * Discovery is cached per manifest id + binding (the binding is not
  * discoverable, so it keys the cache — a re-pinned binding gets a fresh
- * surface). The #157 transport seam (listProviderTools over the injectable
- * MCP transport) and the #157 conservative tier heuristic (classifyTier /
- * toolsFromMcpList) are REUSED, never duplicated.
+ * surface). FAILED discoveries are never cached (issue #167): a rejection
+ * evicts itself so a transient failure cannot poison later boots, sessions,
+ * or the runtime's lazy path. The #157 transport seam (listProviderTools
+ * over the injectable MCP transport) and the #157 conservative tier
+ * heuristic (classifyTier / toolsFromMcpList) are REUSED, never duplicated.
  *
  * Fail closed: an unreachable provider or an invalid tools/list THROWS a
  * clear error — never a silent empty toolset. Per-call resolution (the
@@ -68,6 +70,15 @@ export async function extensionToolSurface(
     return toolsFromMcpList(wire, manifest.id).tools;
   })();
   discoveryCache.set(key, pending);
+  // Issue #167: never cache a FAILED discovery. A rejected promise evicts
+  // itself so a transient failure (proxy/credential timing at boot, a
+  // provider down for minutes) never poisons the process-global cache for
+  // later boots, sessions, or the runtime's lazy per-call path — the next
+  // resolution re-discovers instead of replaying the stale rejection.
+  // (Successful surfaces stay cached: one tools/list per key, ever.)
+  void pending.catch(() => {
+    if (discoveryCache.get(key) === pending) discoveryCache.delete(key);
+  });
   return pending;
 }
 
@@ -131,6 +142,32 @@ export async function toolOwnerExtensionId(
     if (surface.some((tool) => tool.name === toolName)) return manifest.id;
   }
   return undefined;
+}
+
+/**
+ * Refreshes the surfaces of extensions MISSING from a current map (issue
+ * #167): the session toolset resolves lazily so a provider whose discovery
+ * failed at boot (issue #166 — skipped, not fatal) is re-attempted when a
+ * session is created, and the moment it resolves the FULL surface lands —
+ * never a partial stale subset. Resolved extensions pass through untouched
+ * (their cached surfaces are authoritative); only absent tools-less mcp
+ * manifests are re-resolved, and failures are never cached, so the next
+ * refresh re-attempts. Returns a NEW merged map (the input is unchanged).
+ */
+export async function refreshMissingExtensionSurfaces(
+  extensions: readonly { manifest: ExtensionManifest }[],
+  current: ExtensionSurfaces,
+  opts: { mcpTransport?: (binding: McpBinding) => Transport } = {},
+): Promise<ExtensionSurfaces> {
+  const missing = extensions.filter(
+    ({ manifest }) => !current.has(manifest.id) && manifest.tools === undefined && manifest.kind === "mcp",
+  );
+  if (missing.length === 0) return current;
+  const refreshed = await resolveExtensionSurfaces(missing, opts);
+  if (refreshed.size === 0) return current;
+  const merged = new Map(current);
+  for (const [id, surface] of refreshed) merged.set(id, surface);
+  return merged;
 }
 
 /**

@@ -30,7 +30,11 @@ import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { brokerSecretResolverFromEnv, createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
-import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
+import {
+  refreshMissingExtensionSurfaces,
+  resolveExtensionSurfaces,
+  type ExtensionSurfaces,
+} from "../extensions/surface";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "../extensions/manifest";
 import { extensionToolDefinitions } from "../extensions/tools";
@@ -127,6 +131,18 @@ export interface BottegaServerOpts {
    * per-call path, which fails closed).
    */
   onExtensionSurfaces?: (surfaces: ExtensionSurfaces) => void;
+  /**
+   * Extension-toolset observation seam (issue #167): receives the SDK tool
+   * definitions built from the boot-resolved surfaces — the extension half
+   * of the space agent's session toolset (work items/memory/scheduler/KB
+   * ride onSessionToolset). Caller-level boot tests assert the FULL
+   * discovered surface of a reachable provider lands in the session
+   * toolset (never a truncated or stale subset). The definitions the seam
+   * receives are exactly the ones the driver's sessions start from; a
+   * session-creation refresh (refreshMissingExtensionSurfaces) can only
+   * ADD tools for providers the boot could not reach.
+   */
+  onExtensionToolset?: (tools: ToolDefinition[]) => void;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -337,6 +353,43 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     ...kbToolDefinitions(kbDeps),
   ];
   opts.onSessionToolset?.(sessionToolset);
+  // Issue #167: the extension half of the space agent's session toolset.
+  // The bridge builds SDK definitions from the boot-resolved surfaces —
+  // a boot that resolved github eagerly yields ALL 44 definitions here,
+  // never a truncated subset. The seam exposes exactly the definitions
+  // sessions start from; the per-session resolver below (passed to the
+  // driver as a lazy customTools) can only ADD tools for providers the
+  // boot could not reach.
+  // Issue #152: every extension call carries the principal of the TURN it
+  // runs in via the bridge's getCaller seam, so the #51 ladder's personal
+  // scope matches the Slack human whose message STARTED the turn. spaceService
+  // is late-bound (constructed after the driver); the closure reads it only
+  // at call time.
+  const extensionCaller = (ctx: { sessionManager?: { getSessionFile(): string | null | undefined } }) => {
+    const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
+    return spaceId ? spaceService.getTurnPrincipal(spaceId) : undefined;
+  };
+  const buildExtensionToolset = (surfaces: ExtensionSurfaces): ToolDefinition[] =>
+    extensionToolDefinitions(extensionRegistry.list(), {
+      runtime: extensionRuntime,
+      getCaller: extensionCaller,
+      surfaces,
+    });
+  opts.onExtensionToolset?.(buildExtensionToolset(extensionSurfaces));
+  // Session-creation refresh (issue #167): a provider whose discovery
+  // failed at boot (issue #166 — skipped, never a boot failure) is
+  // re-attempted when a session is created. Failed discoveries are never
+  // cached (surface.ts), so the next attempt really re-discovers; the
+  // moment it succeeds the FULL surface lands in that session. Resolved
+  // providers pass through as cache hits — zero I/O in the steady state.
+  const refreshExtensionToolset = async (): Promise<ToolDefinition[]> => {
+    const surfaces = await refreshMissingExtensionSurfaces(
+      extensionRegistry.list(),
+      extensionSurfaces,
+      opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {},
+    );
+    return buildExtensionToolset(surfaces);
+  };
   const createDriver =
     opts.createDriver ??
     ((agentDir: string) => {
@@ -381,25 +434,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         // OWN policy gate (gate → ladder → boundary → audit), so they are
         // never wrapped by the driver gate below.
         //
-        // Issue #152: every extension call carries the principal of the
-        // TURN it runs in via the bridge's getCaller seam, so the #51
-        // ladder's personal scope matches the Slack human whose message
-        // STARTED the turn — `connect github as me` resolves the caller's
-        // OWN credential. The per-turn binding (not the space-level latest
-        // inbound, #121) means user B steering into user A's in-flight
-        // turn can never re-identify A's extension calls as B. Without
-        // this the bridge falls back to caller "agent", a personal lookup
-        // never matches, and the model ends up asking the user to paste a
-        // PAT into chat. spaceService is late-bound (constructed after the
-        // driver); the closure reads it only at call time.
-        customTools: extensionToolDefinitions(extensionRegistry.list(), {
-          runtime: extensionRuntime,
-          getCaller: (ctx) => {
-            const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
-            return spaceId ? spaceService.getTurnPrincipal(spaceId) : undefined;
-          },
-          surfaces: extensionSurfaces,
-        }),
+        // Issue #167: the toolset is a lazy RESOLVER — the driver builds
+        // the definitions per session, refreshing surfaces for providers
+        // the boot could not reach. The boot snapshot (extensionSurfaces,
+        // above) is the base; refreshMissingExtensionSurfaces adds only
+        // what the boot missed, and resolved providers stay cache hits.
+        customTools: refreshExtensionToolset,
         // Policy gate (issue #69): restricted SDK sessions never evaluate
         // inline extension factories (sdk.ts), so the policy extension's
         // tool_call interception is inert in production. The gate moves to

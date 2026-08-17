@@ -17,7 +17,7 @@
  * started — the scheduler/onboarding paths the boot exposes need no
  * sessions), no live services. Same shape as onboarding-boot.test.ts (#116).
  */
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,6 +29,8 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore } from "../store/db";
 import type { McpBinding } from "../extensions/manifest";
 import type { ExtensionSurfaces } from "../extensions/surface";
+import { resetToolSurfaceCache } from "../extensions/surface";
+import { opencodeSafeToolName } from "./drivers/agent-driver";
 import { main } from "./index";
 
 /** The committed pinned extension snapshots (issue #50) — copied into the
@@ -104,7 +106,46 @@ function textOf(result: AgentToolResult): string {
   return result.content.find((block) => block.type === "text")?.text ?? "";
 }
 
+/**
+ * A github tools/list response of `count` wire tools; the first three are
+ * the #148 live-verified hosted names (search_issues, issue_write,
+ * add_issue_comment), the rest are synthetic valid wire identifiers. The
+ * real hosted server's surface is 44 tools — the count matters, the exact
+ * tail names do not.
+ */
+function githubWireTools(count: number): Array<{
+  name: string;
+  description: string;
+  inputSchema: { type: "object"; properties: Record<string, unknown> };
+}> {
+  const special = ["search_issues", "issue_write", "add_issue_comment"];
+  const tools: Array<{
+    name: string;
+    description: string;
+    inputSchema: { type: "object"; properties: Record<string, unknown> };
+  }> = [];
+  for (let i = 0; i < count; i++) {
+    const wire = i < special.length ? special[i]! : `github_tool_${i}`;
+    tools.push({
+      name: wire,
+      description: `GitHub ${wire}`,
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+    });
+  }
+  return tools;
+}
+
 describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
+  beforeEach(() => {
+    // Discovery is cached per manifest id + binding and the cache is
+    // process-global: hermetic tests injecting their OWN transport must
+    // not observe a stale surface from an earlier fixture (issue #167 —
+    // the full-suite flake was a prior test's github discovery poisoning
+    // boot-wiring's eager-discovery assertion). Same contract as
+    // providers.test.ts and surface.test.ts.
+    resetToolSurfaceCache();
+  });
+
   test("the scheduler registry and KB ingest tool are wired into the session toolset", async () => {
     const env = tempEnv();
     try {
@@ -270,6 +311,87 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       expect(surfaces!.has("linear")).toBe(false);
       expect(surfaces!.has("attio")).toBe(false);
       expect(seen.list).toBe(1); // one tools/list at boot, cached
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("a boot-resolved github surface reaches the session toolset in FULL — all 44 discovered tools, wire names intact (issue #167)", async () => {
+    const env = tempEnv();
+    try {
+      // Ship the committed tools-less snapshots (linear/github/attio) into
+      // the temp deployment root so the registry resolves the REAL
+      // manifests — the empty-registry path would make the test vacuous.
+      mkdirSync(join(env.dir, "config", "extensions"), { recursive: true });
+      for (const name of ["attio.json", "github.json", "linear.json"]) {
+        copyFileSync(join(EXTENSIONS_DIR, name), join(env.dir, "config", "extensions", name));
+      }
+      // Ship the agent-config template so the boot-time pin sync (issue
+      // #78) takes the "created" path (same as the other boot tests).
+      mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
+      writeFileSync(
+        join(env.dir, "config", "omp", "config.yml"),
+        "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n",
+      );
+
+      // The hosted GitHub server's real wire surface — the #148 live leg
+      // measured 44 tools — served through the in-memory seam (the
+      // search_issues / issue_write / add_issue_comment names are the
+      // #148 live-verified wire names).
+      const wireTools = githubWireTools(44);
+      let surfaces: ExtensionSurfaces | undefined;
+      let definitions: ToolDefinition[] | undefined;
+      const server = await main({
+        agentDir: join(env.dir, "agent"),
+        surfaceTransport: (binding: McpBinding): Transport => {
+          const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
+          if (url.includes("github")) {
+            const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+            const mcp = new Server({ name: "github-stub", version: "1.0.0" }, { capabilities: { tools: {} } });
+            mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: wireTools }));
+            void mcp.connect(serverTransport);
+            return clientTransport;
+          }
+          // Auth-gated: linear/attio 401 tools/list without a credential.
+          throw new Error(`invalid_token: no credential connected for ${url}`);
+        },
+        onExtensionSurfaces: (resolved) => {
+          surfaces = resolved;
+        },
+        onExtensionToolset: (tools) => {
+          definitions = tools;
+        },
+      });
+      await server.stop();
+
+      // Discovery restored the FULL provider surface — all 44 tools, with
+      // the #148 wire names (providerName) intact for the bridge to forward
+      // on every call.
+      expect(surfaces).toBeDefined();
+      const githubSurface = surfaces!.get("github");
+      expect(githubSurface).toBeDefined();
+      expect(githubSurface).toHaveLength(44);
+      const providerNames = githubSurface!.map((tool) => tool.providerName);
+      expect(providerNames).toContain("search_issues");
+      expect(providerNames).toContain("issue_write");
+      expect(providerNames).toContain("add_issue_comment");
+
+      // The session toolset carries ONE definition per discovered tool —
+      // the full surface lands in the space agent's session, never a
+      // truncated or stale subset (the reported "only search_issues" gap).
+      expect(definitions).toBeDefined();
+      const github = definitions!.filter((tool) => tool.name.startsWith("github."));
+      expect(github).toHaveLength(44);
+      const names = new Set(github.map((tool) => tool.name));
+      expect(names.has("github.search_issues")).toBe(true);
+      expect(names.has("github.issue_write")).toBe(true);
+      expect(names.has("github.add_issue_comment")).toBe(true);
+      // The session flattens model-facing names for the gateway (issue
+      // #78): the model sees github_issue_write / github_add_issue_comment.
+      expect(opencodeSafeToolName("github.issue_write")).toBe("github_issue_write");
+      expect(opencodeSafeToolName("github.add_issue_comment")).toBe("github_add_issue_comment");
+      // Every definition carries a tier — nothing lands ungated.
+      expect(github.every((tool) => typeof tool.approval === "string" && ["read", "write", "exec"].includes(tool.approval))).toBe(true);
     } finally {
       env.cleanup();
     }

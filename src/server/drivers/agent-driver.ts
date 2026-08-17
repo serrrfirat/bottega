@@ -734,7 +734,15 @@ export function createOmpSdkDriver(
   opts: {
     agentDir?: string;
     extensions?: ExtensionFactory[];
-    customTools?: ToolDefinition[];
+    /**
+     * Extension tool definitions for the session toolset, or a RESOLVER
+     * that builds them at session creation (issue #167): the server wires
+     * a resolver that refreshes surfaces for extensions whose discovery
+     * failed at boot, so a transient boot-time failure never permanently
+     * starves a session of the provider's FULL toolset. A plain array
+     * keeps the executor and test callers on the fixed path.
+     */
+    customTools?: ToolDefinition[] | (() => Promise<ToolDefinition[]>);
     /** Policy gate wiring (issue #69); see {@link DriverPolicyGateOpts}. */
     gate?: DriverPolicyGateOpts;
     memoryContext?: MemoryContextDriverOpts;
@@ -773,7 +781,6 @@ export function createOmpSdkDriver(
     mkdirSync(opts.agentDir, { recursive: true });
     setAgentDir(opts.agentDir);
   }
-  const customTools = opts.customTools ?? [];
   const createSession = opts.createSession ?? createAgentSession;
   const thinkingLevel: DriverThinkingLevel = opts.thinkingLevel ?? "low";
   return {
@@ -784,12 +791,19 @@ export function createOmpSdkDriver(
       // Missing/empty files start fresh; existing files resume the space's
       // transcript (server restarts keep history intact).
       await sessionManager.setSessionFile(sessionFilePath(transcriptDir, spaceId));
+      // Issue #167: a resolver builds the toolset at session creation so a
+      // provider whose discovery failed at boot is re-attempted NOW — the
+      // full discovered surface lands in the session, never a partial stale
+      // subset. Plain arrays pass through unchanged.
+      const customToolsOption = opts.customTools;
+      const sessionCustomToolsBase =
+        typeof customToolsOption === "function" ? await customToolsOption() : (customToolsOption ?? []);
       // The connect tool (issue #52) rides the custom-tools path — restricted
       // sessions skip extension factories — and is built per session so the
       // actor is the session's principal (personal connects record the owner).
       const sessionCustomTools = opts.connectExtension
         ? [
-            ...customTools,
+            ...sessionCustomToolsBase,
             connectExtensionToolDefinition({
               registry: opts.connectExtension.registry,
               store: opts.connectExtension.store,
@@ -804,7 +818,7 @@ export function createOmpSdkDriver(
               spaceIdFromFile: sessionIdFromFilePath,
             }),
           ]
-        : customTools;
+        : sessionCustomToolsBase;
       // Policy gate (issue #69): the driver wraps the caller's gated
       // definitions AND the allowlisted built-ins that would otherwise run
       // with no enforcement (the extension seam is inert under restrict).

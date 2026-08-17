@@ -327,6 +327,51 @@ describe("omp sdk agent driver", () => {
     }
   });
 
+  test("a customTools RESOLVER is awaited per session creation and its definitions land in the session toolset (issue #167)", async () => {
+    // The server wires the resolver so a provider whose discovery failed at
+    // boot is re-attempted when a session is created — the full surface
+    // lands in every session, never a partial stale subset. Hermetic: the
+    // injected session factory captures the exact options the driver builds
+    // (no SDK session, no model).
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
+    try {
+      const calls: string[] = [];
+      let receivedOptions: CreateAgentSessionOptions | undefined;
+      const stubRuntime: ExtensionRuntime = { execute: async () => ({ ok: false, error: "stub" }) };
+      const driver = createOmpSdkDriver({
+        agentDir: join(dir, "agent"),
+        customTools: async () => {
+          calls.push("resolve");
+          return extensionToolDefinitions(createFixtureRegistry().list(), { runtime: stubRuntime });
+        },
+        createSession: async (options) => {
+          receivedOptions = options;
+          throw new Error("factory stub: no real session");
+        },
+      });
+      await expect(
+        driver.createSession({ spaceId: "slack:C1", transcriptDir: join(dir, "sessions"), onOutput: () => {} }),
+      ).rejects.toThrow("factory stub: no real session");
+      await expect(
+        driver.createSession({ spaceId: "slack:C2", transcriptDir: join(dir, "sessions"), onOutput: () => {} }),
+      ).rejects.toThrow("factory stub: no real session");
+      // Resolved once PER session — the refresh seam stays live (a provider
+      // that comes back after the boot is picked up by the NEXT session).
+      expect(calls).toEqual(["resolve", "resolve"]);
+      // The resolver's definitions reached the session options: registry
+      // tools ride customTools + toolNames under their gateway-safe flat
+      // names (issue #78); the restricted allowlist stays.
+      const customToolNames = (receivedOptions?.customTools ?? [])
+        .map((tool) => (typeof tool === "object" && tool !== null && "name" in tool ? (tool as { name: string }).name : ""))
+        .filter((name) => name !== "");
+      expect(customToolNames).toContain("weather_current");
+      expect(receivedOptions?.toolNames).toContain("weather_current");
+      expect(receivedOptions?.toolNames).not.toContain("write");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("connect_extension appears in the space agent's toolset when wired (issue #52)", async () => {
     // The connect tool is built per session by createOmpSdkDriver (custom
     // tools + toolNames + allowRestrictedCustomTools); this pins the exact
