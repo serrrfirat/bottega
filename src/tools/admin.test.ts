@@ -18,7 +18,7 @@
  * - every invocation audits its admin.* event.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -662,7 +662,8 @@ describe("first_run_wizard (issue #73)", () => {
     const { store, dir, cleanup } = freshStore();
     try {
       const tokenFile = join(dir, "github-pat");
-      writeFileSync(tokenFile, "pat", { mode: 0o644 });
+      writeFileSync(tokenFile, "pat");
+      chmodSync(tokenFile, 0o644); // explicit — writeFileSync mode is umask-masked (0077 here)
       const tool = findTool(loadTools(store, { gitTokenFile: tokenFile, egressConfigPath: join(dir, "missing.yml") }), "first_run_wizard");
       const res = await call(tool, {});
       const body = JSON.parse(res.text) as { checks: Array<{ name: string; ok: boolean }> };
