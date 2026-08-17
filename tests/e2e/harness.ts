@@ -354,7 +354,17 @@ export interface SlackHandle {
   baseUrl: string;
   /** Outbound message store: emulator storage, or a live history mirror. */
   store: {
-    messages: { all(): EmulatorMessage[] };
+    messages: {
+      all(): EmulatorMessage[];
+      /**
+       * Emulator-only seam (issue #179): insert a message row so receipt
+       * reactions on inbound tss resolve — inbound events are injected via
+       * `app.processEvent` and bypass the emulator's HTTP API, so without
+       * the row `reactions.add` answers message_not_found. The live mirror
+       * is read-only and omits this.
+       */
+      insert?(row: EmulatorMessage & { type?: string; reactions?: unknown[] }): unknown;
+    };
     users: { findOneBy(field: string, value: string): { user_id?: string } | undefined };
     channels: { findOneBy(field: string, value: string): { channel_id?: string } | undefined };
   };
@@ -701,6 +711,13 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
             await approvalRouter.handleAction?.(a);
           },
           clientOptions: { slackApiUrl: `${slack.baseUrl}/api` },
+          // Issue #179: the emulator has no chat.startStream/appendStream
+          // surface — its unknown-route 404 makes the WebClient retry for
+          // ~30 minutes, hanging the turn's stream open and dropping the
+          // phrase. Report streaming unsupported so the phrase +
+          // in-place-edit fallback path is what these journeys exercise,
+          // exactly as a workspace without the Agents feature would behave.
+          streamingSupported: () => false,
           responseModeFor,
         },
   );
@@ -890,10 +907,25 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
         await liveSlack!.postAsUser(channelId, text);
         return;
       }
+      const ts = typeof extra.ts === "string" ? extra.ts : nextTs();
+      // Issue #179: mirror the inbound message into the emulator store so
+      // the presenter's receipt reaction (reactions.add on the inbound ts)
+      // resolves — processEvent bypasses the emulator's HTTP API, and
+      // without the row the store answers message_not_found (real Slack
+      // would have the human's message). `messages()` filters the human's
+      // own rows, so the outbound-only contract is unchanged.
+      slack.store.messages.insert?.({
+        ts,
+        channel_id: channelId,
+        user: humanUserId,
+        text,
+        type: "message",
+        reactions: [],
+      });
       await app.processEvent({
         body: {
           type: "event_callback",
-          event: { type: "message", channel: channelId, user: humanUserId, text, ts: nextTs(), ...extra },
+          event: { type: "message", channel: channelId, user: humanUserId, text, ts, ...extra },
         },
         ack: async () => {},
       });
@@ -922,7 +954,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     // Live mode note: `messages` reflects the mirror's last refresh —
     // prefer `liveSlack.history(channelId)` for fresh reads (canary).
     messages(channelId?: string) {
-      const all = slack.store.messages.all();
+      // Outbound only (issue #179): inbound messages are mirrored into the
+      // emulator store so receipt reactions resolve; the human's own rows
+      // are filtered here so the outbound assertions keep their meaning.
+      const all = slack.store.messages.all().filter((m) => m.user !== humanUserId);
       return channelId ? all.filter((m) => m.channel_id === channelId) : all;
     },
     ...(liveSlack !== undefined ? { liveSlack } : {}),

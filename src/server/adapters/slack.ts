@@ -507,6 +507,17 @@ export function createSlackAdapter(opts: {
    */
   clientOptions?: AppOptions["clientOptions"];
   /**
+   * Streaming-capability override (issue #179): the e2e harness points the
+   * real adapter at the Slack emulator, which has no chat.startStream /
+   * appendStream surface — its unknown-route 404 makes the WebClient retry
+   * for ~30 minutes, hanging the turn's stream open and silently dropping
+   * the phrase. Emulator journeys pass `() => false` so the phrase +
+   * in-place-edit fallback path is exercised deterministically, exactly as
+   * a workspace without the Agents feature would behave. Production
+   * callers omit it: the adapter's per-boot capability cache applies.
+   */
+  streamingSupported?: () => boolean;
+  /**
    * Per-space response mode (issue #55); defaults to `always`. The mention
    * filter applies per message, so the mode is resolved fresh for each
    * inbound message (mode changes apply immediately for mention spaces).
@@ -654,8 +665,10 @@ export function createSlackAdapter(opts: {
     },
     async startStream(spaceId, streamOpts) {
       // Feature-detect once per boot: a known-unsupported workspace never
-      // pays another failed call (the first failure flipped the flag).
-      if (!streamingCapable) {
+      // pays another failed call (the first failure flipped the flag). An
+      // explicit capability override (issue #179) wins the same way: a
+      // workspace reported as streaming-less never attempts the call.
+      if (!streamingCapable || (opts.streamingSupported !== undefined && !opts.streamingSupported())) {
         throw new Error("slack: chat streaming unsupported in this workspace (cached from an earlier failure)");
       }
       try {
@@ -687,7 +700,7 @@ export function createSlackAdapter(opts: {
     async stopStream(spaceId, ts, text) {
       await app.client.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
     },
-    streamingSupported: () => streamingCapable,
+    streamingSupported: () => (opts.streamingSupported !== undefined ? opts.streamingSupported() : streamingCapable),
     start: async () => {
       // The bot's user id (issue #55) and team id (issue #168): auth.test
       // needs only the bot token and is always allowed. A failed lookup
