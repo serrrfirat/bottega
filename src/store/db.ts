@@ -130,6 +130,31 @@ export type UploadToken = {
   expires_at: number;
 };
 
+/**
+ * Pending generic MCP OAuth flow row (issue #198): the connect mint writes
+ * one row per authorization-code + PKCE flow. The row holds ONLY flow
+ * bookkeeping — the PKCE verifier, the dynamically registered client info,
+ * the cached discovery state, and the authorization URL — NEVER a token;
+ * the access/refresh tokens land in the vault when the callback exchanges
+ * the code. `token` is the OAuth `state` parameter: opaque, single-use,
+ * short-TTL (deleted on first consume; expired/replayed are just gone —
+ * fail closed).
+ */
+export type OAuthFlow = {
+  id: string;
+  token: string;
+  provider: string;
+  scope: CredentialScope;
+  actor: string;
+  space_id: string | null;
+  label: string;
+  server_url: string;
+  redirect_uri: string;
+  flow: string;
+  created_at: number;
+  expires_at: number;
+};
+
 export type TransitionOpts = {
   /** {approver, at} entry appended to the approvals JSON array */
   approval?: { approver: string; at?: number };
@@ -251,6 +276,38 @@ export interface Store {
   consumeUploadToken(token: string): { ok: true; row: UploadToken } | { ok: false };
   /** Unexpired tokens for an actor — the mint path's per-actor rate limit. */
   countActiveUploadTokens(actor: string): number;
+  /**
+   * Mints a pending generic MCP OAuth flow (issue #198): an opaque
+   * single-use row the OAuth callback consumes. The row carries the flow's
+   * PKCE/client/discovery bookkeeping — never a token.
+   */
+  createOAuthFlow(input: {
+    token: string;
+    provider: string;
+    scope: CredentialScope;
+    actor: string;
+    spaceId?: string | null;
+    label: string;
+    serverUrl: string;
+    redirectUri: string;
+    /** JSON: {codeVerifier, clientInformation, discoveryState, authorizationUrl}. */
+    flow: string;
+    /** Absolute ms; created_at + the caller's TTL. */
+    expiresAt: number;
+  }): OAuthFlow;
+  /**
+   * Non-consuming read of a flow row (diagnostics); null when the token is
+   * unknown or already consumed.
+   */
+  getOAuthFlow(token: string): OAuthFlow | null;
+  /**
+   * Atomically consumes a flow: deletes the row and returns it on the first
+   * call. Anything else — unknown, already-used, or expired — returns
+   * `{ok: false}` and deletes the row if it was expired (fail closed).
+   */
+  consumeOAuthFlow(token: string): { ok: true; row: OAuthFlow } | { ok: false };
+  /** Unexpired flows for an actor — the mint path's per-actor rate limit. */
+  countActiveOAuthFlows(actor: string): number;
   /**
    * Org settings singleton (issue #67): the validated settings blob, or
    * null when no row exists. Sync (bun:sqlite is synchronous, like getDb).
@@ -758,6 +815,76 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return row.n;
   }
 
+  function createOAuthFlow(input: {
+    token: string;
+    provider: string;
+    scope: CredentialScope;
+    actor: string;
+    spaceId?: string | null;
+    label: string;
+    serverUrl: string;
+    redirectUri: string;
+    flow: string;
+    expiresAt: number;
+  }): OAuthFlow {
+    const provider = input.provider.trim();
+    const label = input.label.trim();
+    if (!provider || !label) throw new Error("oauth flow needs a provider and a label");
+    if (input.scope !== "org" && input.scope !== "personal") throw new Error("oauth flow scope must be org or personal");
+    if (!Number.isSafeInteger(input.expiresAt)) throw new Error("oauth flow expiresAt must be a safe integer");
+    if (!input.token || !input.serverUrl || !input.redirectUri || !input.flow) {
+      throw new Error("oauth flow needs token, serverUrl, redirectUri, and the flow JSON");
+    }
+    // Sweep expired rows lazily so the table stays bounded by live flows.
+    db.query("DELETE FROM oauth_flows WHERE expires_at <= ?").run(Date.now());
+    return db
+      .query(
+        `INSERT INTO oauth_flows (id, token, provider, scope, actor, space_id, label, server_url, redirect_uri, flow, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING *`,
+      )
+      .get(
+        `of_${randomUUID()}`,
+        input.token,
+        provider,
+        input.scope,
+        input.actor,
+        input.spaceId ?? null,
+        label,
+        input.serverUrl,
+        input.redirectUri,
+        input.flow,
+        Date.now(),
+        input.expiresAt,
+      ) as OAuthFlow;
+  }
+
+  function getOAuthFlow(token: string): OAuthFlow | null {
+    return (db.query("SELECT * FROM oauth_flows WHERE token = ?").get(token) as OAuthFlow | null) ?? null;
+  }
+
+  function consumeOAuthFlow(token: string): { ok: true; row: OAuthFlow } | { ok: false } {
+    const now = Date.now();
+    // Atomic single-use: only the first caller gets the row back; everyone
+    // else (replay) sees nothing.
+    const row = db
+      .query(
+        `DELETE FROM oauth_flows WHERE id = (SELECT id FROM oauth_flows WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
+      )
+      .get(token, now) as OAuthFlow | null;
+    if (row) return { ok: true, row };
+    // Fail closed: an expired row must not linger for a future replay.
+    db.query("DELETE FROM oauth_flows WHERE token = ?").run(token);
+    return { ok: false };
+  }
+
+  function countActiveOAuthFlows(actor: string): number {
+    const row = db
+      .query("SELECT COUNT(*) AS n FROM oauth_flows WHERE actor = ? AND expires_at > ?")
+      .get(actor, Date.now()) as { n: number };
+    return row.n;
+  }
+
   async function createSchedulerJob(input: {
     action: string;
     cron: string;
@@ -933,6 +1060,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getUploadToken,
     consumeUploadToken,
     countActiveUploadTokens,
+    createOAuthFlow,
+    getOAuthFlow,
+    consumeOAuthFlow,
+    countActiveOAuthFlows,
     getOrgSettings,
     setOrgSettings,
     createSchedulerJob,

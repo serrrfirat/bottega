@@ -26,6 +26,8 @@ import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import { startUploadLinkServer } from "../extensions/upload-link";
+import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
+import { startOAuthCallbackServer } from "../extensions/oauth-callback";
 import {
   refreshMissingExtensionSurfaces,
   type ExtensionSurfaces,
@@ -348,6 +350,29 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       timeoutMs: orgPolicy.timeoutMinutes * 60_000,
     },
   });
+  // Generic MCP OAuth callback (issue #198): an in-process HTTPS endpoint
+  // on 127.0.0.1 (loopback only — the same posture as the upload-link
+  // server above) that completes the browser leg of hosted-OAuth-MCP
+  // connects: it receives the authorization code redirect, exchanges it
+  // through the MCP SDK's OAuth client, stores the token in the vault via
+  // the existing broker upload path, and records the registry row (scope
+  // me/org) + audit — zero broker provider registration. The connect mint
+  // (connect_extension on the hosted OAuth path) points the authorization
+  // URL's redirect_uri at this endpoint's PUBLIC base
+  // (BOTTEGA_OAUTH_CALLBACK_BASE_URL in deployment, else the loopback
+  // URL). Started at boot (Bun.serve binds on creation), stopped in stop().
+  const oauthCallback = startOAuthCallbackServer({ store, audit });
+  // The connect seam's generic MCP OAuth connector (issue #198): shared by
+  // the space-service connect path and the per-session connect tool. The
+  // callback base is the loopback URL by default (local dev — the browser
+  // runs on the same host as the server, the issue #57 posture);
+  // deployments override it with BOTTEGA_OAUTH_CALLBACK_BASE_URL.
+  const mcpOAuthConnector = createMcpOAuthConnector({
+    registry: extensionRegistry,
+    store,
+    audit,
+    callbackBaseUrl: () => oauthCallback.baseUrl,
+  });
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
   // by bootstrapRuntime above with the router just assigned (the #172
@@ -466,6 +491,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
                 // shares the server's upload_tokens table and points at
                 // the SERVER process's upload endpoint.
                 BOTTEGA_UPLOAD_BASE_URL: uploadLink.baseUrl,
+                // Issue #198: same for hosted OAuth MCPs — the child's
+                // connect mint shares the server's oauth_flows table and
+                // points the authorization redirect at the SERVER's OAuth
+                // callback endpoint.
+                BOTTEGA_OAUTH_CALLBACK_BASE_URL: oauthCallback.baseUrl,
               },
             },
           ],
@@ -530,6 +560,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           audit,
           loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
           router: approvalRouter,
+          // Issue #198: hosted OAuth MCPs connect through the generic MCP
+          // OAuth flow (mint → browser callback → vault via the broker
+          // upload path — no broker provider registration).
+          mcpOAuth: mcpOAuthConnector,
           // Issue #196: the per-session mint tool shares the endpoint's
           // token store, so links minted in any session are consumable by
           // the upload endpoint started above.
@@ -644,6 +678,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       store,
       audit,
       broker: connectViaAuthBroker,
+      // Issue #198: hosted OAuth MCPs (Notion, GitHub, Linear) connect
+      // through the generic MCP OAuth flow — no broker provider
+      // registration; the broker stays a vault.
+      mcpOAuth: mcpOAuthConnector,
       gate: {
         loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
         router: approvalRouter,
@@ -685,6 +723,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     async stop() {
       if (memoryMaintenanceInterval) clearInterval(memoryMaintenanceInterval);
       uploadLink.stop();
+      oauthCallback.stop();
       deliveryPoller.stop();
       scheduler.stop();
       await spaceService.stop();

@@ -91,6 +91,7 @@ import {
   type ConnectExtensionDeps,
 } from "../extensions/connect";
 import { mintUploadLink, MINT_UPLOAD_LINK_TOOL, UploadLinkStore } from "../extensions/upload-link";
+import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import type { ExtensionRegistry } from "../extensions/registry";
 import type { ExtensionRuntime } from "../extensions/runtime";
 import type { ExtensionTool, ExtensionToolParam, McpBinding } from "../extensions/manifest";
@@ -674,6 +675,15 @@ export async function bootMemoryMcpServer(opts: {
     uploadBaseUrl && uploadBaseUrl.length > 0
       ? { store: new UploadLinkStore(store), baseUrl: () => uploadBaseUrl }
       : undefined;
+  // Issue #198: same posture for hosted OAuth MCPs — the connect tool here
+  // mints flows into the SHARED oauth_flows table with the callback pointed
+  // at the SERVER process's OAuth callback endpoint (BOTTEGA_OAUTH_CALLBACK_BASE_URL,
+  // set by the ACP driver like BOTTEGA_UPLOAD_BASE_URL).
+  const oauthBaseUrl = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+  const mcpOAuth =
+    oauthBaseUrl && oauthBaseUrl.length > 0
+      ? createMcpOAuthConnector({ registry: runtime.registry, store, audit, callbackBaseUrl: () => oauthBaseUrl })
+      : undefined;
   const server = createMemoryMcpServer({
     // The SAME memory backend the server and executor roots resolve
     // (issue #172): memory_backend.base_url set → mem0, else SQLite on the
@@ -695,6 +705,7 @@ export async function bootMemoryMcpServer(opts: {
         store,
         audit,
         broker: connectViaAuthBroker,
+        ...(mcpOAuth !== undefined ? { mcpOAuth } : {}),
         gate: {
           loadPolicy: (sid) => loadSpacePolicy(orgPolicy, store, sid),
           router: DenyRouter,

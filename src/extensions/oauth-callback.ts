@@ -1,0 +1,127 @@
+/**
+ * Generic MCP OAuth callback endpoint (issue #198): the in-process HTTP
+ * half of the connect flow's browser leg, mirroring the #196 one-time
+ * upload-link server (Bun.serve on 127.0.0.1, ephemeral port — the same
+ * public-ingress posture as issue #57's local dev; the PUBLIC base URL is
+ * BOTTEGA_OAUTH_CALLBACK_BASE_URL in deployment, the loopback URL here).
+ *
+ * The authorization URL the connect tool shows in Slack points at the
+ * hosted MCP's authorize endpoint with `redirect_uri = <base>/oauth/callback`
+ * and `state = <flow token>`. When the user authorizes, the provider
+ * redirects the browser HERE with `?code=...&state=...`; this endpoint
+ *
+ *   1. consumes the flow row (single-use, TTL, fail closed — a replayed or
+ *      expired state is just gone);
+ *   2. exchanges the code through the MCP SDK's OAuth client, cryptically
+ *      bound to the SAME flow (the persisted PKCE verifier, registered
+ *      client info, and discovery state — never a token in transit through
+ *      chat or transcripts);
+ *   3. stores the token in the vault via the existing broker upload path;
+ *   4. records the registry row (scope me/org) + the `extension.connected`
+ *      audit row — the same ladder shape as every connect, with zero
+ *      broker provider registration.
+ *
+ * The browser sees a success/error page; the token itself never touches
+ * the endpoint's response or any log.
+ */
+import { errorMessage } from "../tools/helpers";
+import type { AuditModule } from "../policy/audit";
+import type { OAuthFlow, Store } from "../store/db";
+import { completeMcpOAuthFlow, createVaultTokenStore, type McpOAuthTokenStore } from "./mcp-oauth";
+
+export const OAUTH_CALLBACK_PATH = "/oauth/callback";
+
+/** The callback endpoint's store slice (the full {@link Store} satisfies it). */
+export type OAuthCallbackStoreSlice = Pick<Store, "consumeOAuthFlow" | "upsertExtensionCredential">;
+
+export interface OAuthCallbackEndpointDeps {
+  store: OAuthCallbackStoreSlice;
+  audit: AuditModule;
+  /** Token persistence; defaults to the production vault store. */
+  tokenStore?: McpOAuthTokenStore;
+  /**
+   * The PUBLIC base URL the browser reaches the callback at (deployment:
+   * BOTTEGA_OAUTH_CALLBACK_BASE_URL; default: the loopback server URL).
+   */
+  baseUrl?: string;
+}
+
+/** A plain, script-free result page (the browser's only output). */
+function page(status: number, title: string, body: string): Response {
+  const html =
+    `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n` +
+    `<title>${title}</title>\n</head>\n<body>\n<h1>${title}</h1>\n<p>${body}</p>\n</body>\n</html>\n`;
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'",
+    },
+  });
+}
+
+/**
+ * The callback handler: consumes the flow state (single-use), exchanges the
+ * code, stores the token in the vault, and records the credential. Any
+ * failure is a clear error page — the flow row is already consumed, so a
+ * failed exchange never replays (the user re-runs connect).
+ */
+async function handleCallback(
+  req: Request,
+  deps: OAuthCallbackEndpointDeps,
+  tokenStore: McpOAuthTokenStore,
+): Promise<Response> {
+  const url = new URL(req.url);
+  if (url.pathname !== OAUTH_CALLBACK_PATH) return new Response("not found", { status: 404 });
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const error = url.searchParams.get("error");
+  if (error) {
+    return page(200, "Authorization declined", "No account was connected — you can close this window.");
+  }
+  if (!code || !state) {
+    return page(400, "Incomplete authorization", "The authorization response is missing the code or state.");
+  }
+  const consumed = deps.store.consumeOAuthFlow(state);
+  if (!consumed.ok) {
+    return page(
+      404,
+      "This authorization link is invalid",
+      "The link is invalid, expired, or already used — ask the agent for a fresh connect.",
+    );
+  }
+  const row: OAuthFlow = consumed.row;
+  try {
+    await completeMcpOAuthFlow(row, code, { store: deps.store, audit: deps.audit, tokenStore });
+  } catch (err) {
+    return page(500, "Connect failed", `Connecting ${row.label} failed: ${errorMessage(err)} — ask the agent to try again.`);
+  }
+  return page(200, "Connected", `${row.label} is connected — you can close this window.`);
+}
+
+export interface OAuthCallbackServerHandle {
+  /** http://127.0.0.1:<port> — the loopback base the connect mint uses when no public URL is set. */
+  baseUrl: string;
+  stop(): void;
+}
+
+/**
+ * Starts the in-process OAuth callback endpoint (issue #198): Bun.serve on
+ * 127.0.0.1 (loopback only — the same posture as issue #57's local dev),
+ * ephemeral port. Only `GET /oauth/callback` is served; anything else is a
+ * 404 (fail closed).
+ */
+export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuthCallbackServerHandle {
+  const tokenStore = deps.tokenStore ?? createVaultTokenStore();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(req) {
+      return handleCallback(req, deps, tokenStore);
+    },
+  });
+  const port = server.port;
+  if (port === undefined) throw new Error("oauth callback server did not bind a port");
+  return { baseUrl: `http://127.0.0.1:${port}`, stop: () => server.stop(true) };
+}

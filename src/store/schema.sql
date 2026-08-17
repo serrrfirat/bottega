@@ -88,6 +88,31 @@ CREATE TABLE IF NOT EXISTS upload_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_tokens_actor ON upload_tokens(actor);
 
+-- Generic MCP OAuth flows (issue #198): the pending authorization-code +
+-- PKCE flow for hosted OAuth MCPs (Notion, GitHub, Linear). The connect
+-- tool mints one row per flow — the row carries ONLY the flow bookkeeping
+-- (PKCE verifier, registered client info, discovery state, the
+-- authorization URL), NEVER a token; the token lands in the vault when the
+-- callback exchanges the code. The `token` column doubles as the OAuth
+-- `state` parameter: opaque, single-use, short-TTL. Shared via the SQLite
+-- file so the server process (callback endpoint) and per-session MCP child
+-- processes (connect mint) agree on the same flows.
+CREATE TABLE IF NOT EXISTS oauth_flows (
+  id           TEXT PRIMARY KEY,      -- "of_<uuid>"
+  token        TEXT NOT NULL UNIQUE,  -- opaque 128-bit random; the OAuth state
+  provider     TEXT NOT NULL,         -- extension provider id, e.g. 'notion'
+  scope        TEXT NOT NULL CHECK (scope IN ('org','personal')),
+  actor        TEXT NOT NULL,         -- principal the connect runs for
+  space_id     TEXT,
+  label        TEXT NOT NULL,         -- provider label, rendered in messages
+  server_url   TEXT NOT NULL,         -- the MCP endpoint the flow targets
+  redirect_uri TEXT NOT NULL,         -- the registered callback URL (the exchange's redirect_uri)
+  flow         TEXT NOT NULL,         -- JSON: {codeVerifier, clientInformation, discoveryState, authorizationUrl}
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER NOT NULL       -- created + short TTL (issue #198)
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_flows_actor ON oauth_flows(actor);
+
 -- Org settings singleton (issue #67): id=1 row holding the JSON settings
 -- blob (approvals, response_mode, memory.injection, extensions, repos,
 -- model defaults). DB-first policy: org DB settings override the

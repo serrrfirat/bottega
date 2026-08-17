@@ -47,6 +47,7 @@ import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage, toolError } from "../tools/helpers";
 import { looksLikeObviousSecret } from "../tools/memory";
+import type { McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 
@@ -88,6 +89,17 @@ export interface ConnectExtensionDeps {
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
   broker: BrokerConnector;
+  /**
+   * Generic MCP OAuth seam (issue #198): hosted OAuth MCPs (kind "mcp",
+   * transport streamable-http, credential type "oauth") connect through
+   * THIS — the authorization URL is minted and shown in Slack (one-time
+   * link posture), the browser flow completes at the server's callback
+   * endpoint, and the token lands in the vault via the existing upload
+   * path — with zero broker provider registration. Absent → the hosted
+   * OAuth path fails closed (never falls through to the broker's
+   * provider-registry login, which would fail anyway).
+   */
+  mcpOAuth?: McpOAuthConnector;
   /** Policy gate used for org-scope connects (the exec/ask-human flow). */
   gate: {
     loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
@@ -101,6 +113,12 @@ export interface ConnectExtensionDeps {
 
 export type ConnectOutcome =
   | { ok: true; credential: ExtensionCredential; message: string }
+  | {
+      ok: true;
+      /** Null for hosted OAuth MCPs: the credential lands when the browser flow completes (issue #198). */
+      credential: null;
+      message: string;
+    }
   | { ok: false; message: string };
 
 /**
@@ -158,6 +176,42 @@ export async function connectExtension(
     if (!outcome.allowed) return { ok: false, message: outcome.blockReason };
   }
 
+  // Hosted OAuth MCPs (issue #198) connect through the GENERIC MCP OAuth
+  // flow, never the broker's provider-registry login (the broker knows no
+  // `notion` OAuth provider, and per-provider broker work does not scale):
+  // the authorization URL is minted here and shown in Slack (one-time-link
+  // posture), the browser flow completes at the server's callback endpoint,
+  // and the token lands in the vault through the existing upload path.
+  if (
+    manifest.kind === "mcp" &&
+    manifest.mcp.transport === "streamable-http" &&
+    manifest.credentialSchema.type === "oauth"
+  ) {
+    if (!deps.mcpOAuth) {
+      return {
+        ok: false,
+        message: `connect ${label} failed: generic MCP OAuth is not wired in this server (issue #198)`,
+      };
+    }
+    let oauthStart: McpOAuthStartResult;
+    try {
+      oauthStart = await deps.mcpOAuth.start({
+        extension: input.extension,
+        provider,
+        label,
+        scope: input.scope,
+        actor: input.actor,
+        spaceId: input.spaceId,
+      });
+    } catch (err) {
+      return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
+    }
+    if (!oauthStart.ok) return { ok: false, message: oauthStart.message };
+    // No registry row yet: the callback endpoint records the credential
+    // after the browser flow completes (single-use state, fail closed).
+    return { ok: true, credential: null, message: oauthStart.message };
+  }
+
   let brokerResult: BrokerConnectResult;
   try {
     brokerResult = await deps.broker({ provider, credentialType: manifest.credentialSchema.type, apiKey: input.apiKey });
@@ -200,6 +254,17 @@ export async function connectExtension(
  */
 export function apiKeyIdentityKey(provider: string, scope: ConnectScope, owner: string | null): string {
   return scope === "org" ? `api-key:${provider}` : `api-key:${owner ?? "unknown"}`;
+}
+
+/**
+ * Stable registry identity for GENERIC MCP OAuth vault rows (issue #198):
+ * hosted OAuth servers return no account identity in the token response
+ * (no email/accountId like the broker's model-provider flows), so bottega
+ * records a deterministic, readable key — one org row per provider, one
+ * personal row per owner — exactly like API keys.
+ */
+export function oauthIdentityKey(provider: string, scope: ConnectScope, owner: string | null): string {
+  return scope === "org" ? `oauth:${provider}` : `oauth:${owner ?? "unknown"}`;
 }
 
 /** Newest broker snapshot entry (broker row ids increase monotonically). */

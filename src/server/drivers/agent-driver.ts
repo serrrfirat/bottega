@@ -15,6 +15,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent";
 import { setAgentDir } from "@oh-my-pi/pi-utils";
 import { parseYamlSubset } from "../../yaml-subset";
+import {
+  DEFAULT_MODEL_CATALOG_DIR,
+  listAvailableModels,
+  resolveModelPin,
+  type ModelCatalogEntry,
+} from "../../models/model-pin";
 import type { MemoryProvider } from "../../memory/types";
 import { MEMORY_LIMIT_MAX } from "../../memory/types";
 import type { SpaceModelSettings } from "../../store/db";
@@ -24,6 +30,7 @@ import {
   connectViaAuthBroker,
   type BrokerConnector,
 } from "../../extensions/connect";
+import type { McpOAuthConnector } from "../../extensions/mcp-oauth";
 import { mintUploadLinkToolDefinition, type UploadLinkStore } from "../../extensions/upload-link";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
@@ -67,6 +74,14 @@ export interface ConnectExtensionDriverOpts {
   timeoutMs?: number;
   /** Broker seam; defaults to the production auth-broker connector. */
   broker?: BrokerConnector;
+  /**
+   * Generic MCP OAuth seam (issue #198): hosted OAuth MCPs connect through
+   * it — the connect tool mints the authorization URL (shown in Slack),
+   * the browser flow completes at the server's callback endpoint, and the
+   * token lands in the vault. Omitted → the hosted OAuth path fails
+   * closed (never falls through to the broker's provider-registry login).
+   */
+  mcpOAuth?: McpOAuthConnector;
   /**
    * One-time upload link (issue #196): when wired, sessions also get the
    * `connect_upload_link` mint tool — the store must be the one the upload
@@ -949,6 +964,9 @@ export function createOmpSdkDriver(
               store: opts.connectExtension.store,
               audit: opts.connectExtension.audit,
               broker: opts.connectExtension.broker ?? connectViaAuthBroker,
+              ...(opts.connectExtension.mcpOAuth !== undefined
+                ? { mcpOAuth: opts.connectExtension.mcpOAuth }
+                : {}),
               gate: {
                 loadPolicy: opts.connectExtension.loadPolicy,
                 router: opts.connectExtension.router,
@@ -1024,6 +1042,46 @@ export function createOmpSdkDriver(
         const body = renderInjection(flagged, maxEntries, maxBytes);
         if (body) effectiveAppend = effectiveAppend ? `${effectiveAppend}\n\n${body}` : body;
       }
+      // Issue #199: the session's default model comes from the org/space
+      // settings — but the SDK's registry resolves a raw unqualified value
+      // to whichever provider lists it FIRST (opencode-go's #78-broken
+      // deepseek), not the working near provider. Route the settings value
+      // through the provider-aware pin resolver (#194: unqualified prefers
+      // near; explicit provider qualifiers win) and hand the SDK the
+      // resolved provider-qualified id. Fail closed: an unresolvable default
+      // logs loudly and the session starts on the agent-dir default instead.
+      let resolvedDefaultModel: string | undefined;
+      try {
+        const sessionSettings: (spaceId: string) => Promise<SpaceModelSettings> =
+          getModelSettings ?? opts.getModelSettings ?? (async () => ({}));
+        const modelSettings = await sessionSettings(spaceId);
+        const defaultModel = modelSettings.model;
+        if (typeof defaultModel === "string" && defaultModel.trim() !== "") {
+          const catalog = await listAvailableModels(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR);
+          const resolution = resolveModelPin(defaultModel, catalog);
+          if (resolution.ok) {
+            const pin = resolution.pin;
+            if (pin.kind === "id") {
+              const entry = catalog.find((model) => model.id === pin.modelId);
+              if (entry) {
+                resolvedDefaultModel = `${entry.provider}/${pin.modelId}`;
+              }
+            } else {
+              console.error(
+                `[agent-driver] session ${spaceId}: default model '${defaultModel}' resolved to a role ref, not a model — starting on the agent-dir default`,
+              );
+            }
+          } else {
+            console.error(
+              `[agent-driver] session ${spaceId}: default model '${defaultModel}' is unresolvable — ${resolution.error}; starting on the agent-dir default`,
+            );
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[agent-driver] session ${spaceId}: default model resolution failed — ${err instanceof Error ? err.message : String(err)}; starting on the agent-dir default`,
+        );
+      }
       const { session } = await createSession({
         cwd: sessionCwd,
         agentDir: opts.agentDir,
@@ -1048,6 +1106,10 @@ export function createOmpSdkDriver(
         // declaration files, but the runtime values are the same strings
         // DriverThinkingLevel mirrors.
         thinkingLevel: thinkingLevel as CreateAgentSessionOptions["thinkingLevel"],
+        // Issue #199: the session starts on the RESOLVED settings default
+        // (provider-qualified) — never the raw unqualified value the SDK's
+        // registry would land on the wrong provider's same-named model.
+        ...(resolvedDefaultModel !== undefined ? { modelPattern: [resolvedDefaultModel] } : {}),
         // Registry + connect tools (issues #50/#52) must surface in
         // restricted sessions; discovered extensions, MCP, and ambient
         // custom tools stay disabled.
@@ -1377,11 +1439,19 @@ export class OmpSessionDriver implements AgentSessionDriver {
       const settings = await this.#getModelSettings(this.#spaceId);
       const target = resolveRoleTarget("default", settings);
       if (!target.modelId && !target.thinkingLevel) return; // nothing configured
+      // Issue #199: resolve the settings value through the provider-aware
+      // resolver FIRST so the churn check compares against the model the
+      // switch would actually apply (near's DeepSeek-V4-Flash), not the raw
+      // "deepseek-v4-flash" that can never match a near id and would force a
+      // no-op switch every turn. An unresolvable default throws — the catch
+      // below logs loudly and the turn keeps the session's current model.
+      const resolvedId =
+        target.modelId === undefined ? undefined : this.#resolveModelId(target.modelId, "turn-start default re-apply");
       const current = this.#session.model;
       const modelMatches =
-        target.modelId === undefined ||
+        resolvedId === undefined ||
         (current !== undefined &&
-          (current.id === target.modelId || `${current.provider}/${current.id}` === target.modelId));
+          (current.id === resolvedId || `${current.provider}/${current.id}` === resolvedId));
       const levelMatches =
         target.thinkingLevel === undefined || this.#session.thinkingLevel === target.thinkingLevel;
       if (modelMatches && levelMatches) return; // already running the resolved default
@@ -1431,9 +1501,15 @@ export class OmpSessionDriver implements AgentSessionDriver {
     }
     const thinkingLevel = target.thinkingLevel as SdkThinkingLevel | undefined;
     if (target.modelId) {
-      const model = this.#findModel(target.modelId);
+      // Issue #199: route the settings value through the provider-aware
+      // resolver (unqualified → prefer near; explicit provider qualifiers
+      // win) — never hand the raw value to the SDK's registry, which picks
+      // the wrong provider's same-named model (opencode-go's #78-broken
+      // deepseek).
+      const modelId = this.#resolveModelId(target.modelId, `setModelRole(${role})`);
+      const model = this.#findModel(modelId);
       if (!model) {
-        throw new Error(`model '${target.modelId}' is not available to this session`);
+        throw new Error(`model '${modelId}' is not available to this session`);
       }
       await this.#session.setModel(model, undefined, {
         thinkingLevel,
@@ -1454,6 +1530,34 @@ export class OmpSessionDriver implements AgentSessionDriver {
       model: target.modelId ?? null,
       thinking_level: target.thinkingLevel ?? null,
     };
+  }
+
+  /** The session's available models in the pin resolver's catalog shape. */
+  #catalog(): ModelCatalogEntry[] {
+    return this.#session.getAvailableModels().map((model) => ({
+      id: model.id,
+      name: model.name ?? model.id,
+      provider: model.provider,
+    }));
+  }
+
+  /**
+   * Routes a settings model value through the provider-aware pin resolver
+   * (issue #199): provider-qualified ids win, unqualified values prefer
+   * near (the working deepseek provider), and an unresolvable value throws
+   * — the caller decides how to fail closed (the turn-start re-apply logs
+   * loudly and keeps the session's current model; use_model surfaces the
+   * error to the agent).
+   */
+  #resolveModelId(raw: string, context: string): string {
+    const resolution = resolveModelPin(raw, this.#catalog());
+    if (!resolution.ok) {
+      throw new Error(`[agent-driver] ${context}: cannot resolve model '${raw}' — ${resolution.error}`);
+    }
+    if (resolution.pin.kind === "role") {
+      throw new Error(`[agent-driver] ${context}: '${raw}' resolved to a role ref, not a model id`);
+    }
+    return resolution.pin.modelId;
   }
 
   /** The session's available model matching a bare id (or "provider/id"). */

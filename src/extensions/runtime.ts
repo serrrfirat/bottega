@@ -23,11 +23,16 @@
  *      credential is injected at the egress proxy (secret file + reload);
  *      the provider call carries NO credential — iron-proxy attaches the
  *      Authorization header for the extension's allowlisted domains. The
- *      credential never enters the agent env, transcripts, or audit;
+ *      credential never enters the agent env, transcripts, or audit.
+ *      Exception (issue #198): hosted OAuth MCPs carry auth IN the
+ *      transport — the MCP SDK's OAuth client (vault-backed tokens,
+ *      refresh on 401) — and the boundary's file holds the same current
+ *      access token for the proxy's inject;
  *   5. provider call: kind "mcp" → the provider's OFFICIAL MCP server via
  *      the MCP SDK client (streamable-http or stdio per the manifest
- *      binding); kind "cli" → the preinstalled CLI with a credential-safe
- *      env (issue #58). One client/process per call;
+ *      binding, streamable-http with the OAuth provider when the
+ *      credential is OAuth); kind "cli" → the preinstalled CLI with a
+ *      credential-safe env (issue #58). One client/process per call;
  *   6. audit `extension.call` {extension, tool, actor, credential_id,
  *      decision} — written for EVERY call, including denied and failed
  *      ones (credential_id null unless the ladder resolved).
@@ -41,6 +46,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
@@ -55,6 +61,7 @@ import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionTool, type McpBinding
 import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
+import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "./mcp-oauth";
 import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
 import {
   emitToolStep,
@@ -112,10 +119,18 @@ export interface ExtensionRuntimeDeps {
   /**
    * MCP transport factory (test seam): tests inject in-memory transports so
    * tool execution is exercised hermetically. Defaults to the real
-   * streamable-http / stdio transports (no credential attached — the
-   * iron-proxy boundary injects auth).
+   * streamable-http / stdio transports. The optional second argument is the
+   * OAuth client provider (issue #198): hosted OAuth MCPs (credential type
+   * "oauth") attach it to the streamable-http transport so the MCP SDK's
+   * OAuth client drives discovery/refresh with the vault-backed tokens.
    */
-  mcpTransport?: (binding: McpBinding) => Transport;
+  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
+  /**
+   * Vault token store for the runtime's OAuth provider (issue #198 test
+   * seam): defaults to the production vault-backed store (broker upload /
+   * local AuthStorage).
+   */
+  mcpOAuthTokenStore?: McpOAuthTokenStore;
   /**
    * Pre-resolved effective tool surfaces (issue #158): extensionId →
    * pinned manifest tools or the discovered tools/list surface, resolved
@@ -336,11 +351,22 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       // checks off either way — the card documents the attempt, so the
       // thinking panel never shows a stuck spinner.
       const wireName = tool.providerName ?? tool.name;
+      // Issue #198: hosted OAuth MCPs carry their auth IN the transport —
+      // the MCP SDK's OAuth client (vault-backed tokens, refresh on 401,
+      // fail-closed re-auth prompt). The boundary's secret file still gets
+      // the current access token (the proxy injects the same value for the
+      // extension's allowlisted domains — consistent with the SDK's header).
+      const mcpAuth =
+        manifest.kind === "mcp" &&
+        manifest.mcp.transport === "streamable-http" &&
+        manifest.credentialSchema.type === "oauth"
+          ? createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore })
+          : undefined;
       try {
         await boundary.authorize(credential);
         const result =
           manifest.kind === "mcp"
-            ? await callMcpTool(makeTransport, manifest.mcp, wireName, args)
+            ? await callMcpTool(makeTransport, manifest.mcp, wireName, args, mcpAuth)
             : await callCliTool(manifest.cli, wireName, args);
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
@@ -373,12 +399,21 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
  * for remote official servers, stdio for preinstalled servers. Shared by
  * the runtime's call path and the manifest tool generator's tools/list
  * discovery (issue #157); tests inject in-memory transports instead.
+ *
+ * For streamable-http bindings whose credential is an OAuth token (issue
+ * #198), the optional `authProvider` attaches the MCP SDK's OAuth client:
+ * it sends the vault-backed access token, refreshes on 401, and fails
+ * closed with a re-auth prompt when no interactive flow is possible. API
+ * keys stay at the iron-proxy boundary (no authProvider — the proxy
+ * injects the Authorization header for the extension's allowlisted
+ * domains, issue #53).
  */
-export function defaultMcpTransport(binding: McpBinding): Transport {
+export function defaultMcpTransport(binding: McpBinding, authProvider?: OAuthClientProvider): Transport {
   if (binding.transport === "streamable-http") {
-    // No client credential: iron-proxy injects the Authorization header for
-    // the extension's allowlisted domains at the boundary (issue #53).
-    return new StreamableHTTPClientTransport(new URL(binding.serverUrl));
+    return new StreamableHTTPClientTransport(
+      new URL(binding.serverUrl),
+      authProvider !== undefined ? { authProvider } : undefined,
+    );
   }
   return new StdioClientTransport({ command: binding.command });
 }
@@ -390,14 +425,15 @@ export function defaultMcpTransport(binding: McpBinding): Transport {
  * the agent tool result shape.
  */
 async function callMcpTool(
-  makeTransport: (binding: McpBinding) => Transport,
+  makeTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
   binding: McpBinding,
   toolName: string,
   params: Record<string, unknown>,
+  authProvider?: OAuthClientProvider,
 ): Promise<ExtensionRuntimeResult> {
   const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
   try {
-    await client.connect(makeTransport(binding));
+    await client.connect(makeTransport(binding, authProvider));
     // The SDK's declared return is a union with an experimental task-based
     // branch; passing CallToolResultSchema pins the runtime shape, so the
     // cast is the documented contract (guarded below).

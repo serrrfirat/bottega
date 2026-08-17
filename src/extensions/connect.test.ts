@@ -26,6 +26,7 @@ import {
 import { fixtureManifest } from "./fixture";
 import type { ExtensionManifest } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
+import type { McpOAuthStartResult } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-connect-"));
 const stores: Store[] = [];
@@ -52,10 +53,29 @@ function oauthManifest(): ExtensionManifest {
   };
 }
 
+/**
+ * A stdio OAuth MCP (no hosted authorize endpoints): these stay on the
+ * broker's provider-registry login path — the generic MCP OAuth flow only
+ * applies to hosted (streamable-http) MCPs (issue #198).
+ */
+function stdioOAuthManifest(): ExtensionManifest {
+  return {
+    id: "com.example.stdio-oauth",
+    label: "Example Stdio OAuth",
+    vendor: "bottega-fixtures",
+    kind: "mcp",
+    mcp: { command: "npx", transport: "stdio" },
+    credentialSchema: { type: "oauth", scopes: ["read"] },
+    tools: [{ name: "stdio-oauth.current", tier: "read", description: "Stdio OAuth tool", params: [] }],
+    domains: ["127.0.0.1"],
+  };
+}
+
 function registry(): ExtensionRegistry {
   const r = createExtensionRegistry();
   r.register(fixtureManifest());
   r.register(oauthManifest());
+  r.register(stdioOAuthManifest());
   return r;
 }
 
@@ -80,6 +100,19 @@ class RecordingBroker {
   }
 }
 
+/** The generic MCP OAuth seam (issue #198): records starts, serves a scripted outcome. */
+class RecordingMcpOAuth {
+  readonly calls: Array<{ extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }> = [];
+  result: McpOAuthStartResult;
+  constructor(result: McpOAuthStartResult = { ok: true, authorizationUrl: "https://auth.example/authorize?state=xyz", message: "Open this link to authorize" }) {
+    this.result = result;
+  }
+  async start(input: { extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }): Promise<McpOAuthStartResult> {
+    this.calls.push(input);
+    return this.result;
+  }
+}
+
 function defaultPolicy(): PolicyConfig {
   return parseOrgConfigYaml(""); // fail-closed default: connect_extension denied
 }
@@ -93,12 +126,19 @@ interface Harness {
   store: Store;
   router: RecordingRouter;
   broker: RecordingBroker;
+  mcpOAuth: RecordingMcpOAuth;
 }
 
-function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; broker?: RecordingBroker } = {}): Harness {
+function makeDeps(overrides: {
+  policy?: PolicyConfig;
+  router?: RecordingRouter;
+  broker?: RecordingBroker;
+  mcpOAuth?: RecordingMcpOAuth;
+} = {}): Harness {
   const store = freshStore();
   const router = overrides.router ?? new RecordingRouter();
   const broker = overrides.broker ?? new RecordingBroker();
+  const mcpOAuth = overrides.mcpOAuth ?? new RecordingMcpOAuth();
   const policy = overrides.policy ?? defaultPolicy();
   return {
     deps: {
@@ -106,11 +146,13 @@ function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; 
       store,
       audit: createAudit(store),
       broker: broker.connect.bind(broker),
+      mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth) },
       gate: { loadPolicy: () => Promise.resolve(policy), router },
     },
     store,
     router,
     broker,
+    mcpOAuth,
   };
 }
 
@@ -198,13 +240,68 @@ describe("connectExtension scope gating", () => {
 });
 
 describe("connectExtension broker seam", () => {
-  test("oauth providers drive the oauth broker flow", async () => {
+  test("hosted OAuth MCPs route to the GENERIC MCP OAuth flow, never the broker (issue #198)", async () => {
     const h = makeDeps({ broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }) });
+
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA", { spaceId: "slack:C1" });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.credential).toBeNull(); // the credential lands at the browser callback
+    expect(outcome.message).toContain("Open this link");
+    expect(h.mcpOAuth.calls).toEqual([
+      {
+        extension: "com.example.oauth",
+        provider: "com.example.oauth",
+        label: "Example OAuth",
+        scope: "personal",
+        actor: "UADA",
+        spaceId: "slack:C1",
+      },
+    ]);
+    expect(h.broker.calls).toHaveLength(0); // the broker is a vault, not an OAuth registry
+    expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0); // registry row lands at the callback
+  });
+
+  test("a stdio OAuth MCP still drives the broker oauth login (no hosted authorize endpoints)", async () => {
+    const h = makeDeps({ broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }) });
+
+    const outcome = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+
+    expect(outcome.ok).toBe(true);
+    expect(h.broker.calls).toEqual([{ provider: "com.example.stdio-oauth", credentialType: "oauth" }]);
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+  });
+
+  test("hosted OAuth connects fail closed when the generic flow is not wired", async () => {
+    const h = makeDeps();
+    delete (h.deps as { mcpOAuth?: unknown }).mcpOAuth;
 
     const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
 
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.message).toContain("generic MCP OAuth is not wired");
+    expect(h.broker.calls).toHaveLength(0);
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+  });
+
+  test("an org-scope hosted OAuth connect gates first, then mints (denied → nothing)", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+
+    const outcome = await connect(h, "com.example.oauth", "org", "UADA");
+
     expect(outcome.ok).toBe(true);
-    expect(h.broker.calls).toEqual([{ provider: "com.example.oauth", credentialType: "oauth" }]);
+    if (!outcome.ok) return;
+    expect(h.router.requests).toHaveLength(1); // the org gate ran before the mint
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+    expect(h.mcpOAuth.calls[0]!.scope).toBe("org");
+    expect(h.broker.calls).toHaveLength(0);
+
+    const denied = makeDeps(); // default policy denies connect_extension
+    const blocked = await connect(denied, "com.example.oauth", "org", "UADA");
+    expect(blocked.ok).toBe(false);
+    expect(denied.mcpOAuth.calls).toHaveLength(0); // a denied connect never mints
   });
 
   test("api-key vault rows get a stable registry identity (org)", async () => {
@@ -240,12 +337,12 @@ describe("connectExtension re-connect", () => {
   test("re-connecting personal updates the existing row, never duplicates", async () => {
     const h = makeDeps();
     h.broker.result = { identityKey: null, brokerCredentialId: 1 };
-    const a = await connect(h, "com.example.oauth", "personal", "UADA");
+    const a = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
     h.broker.result = { identityKey: "email:ada@example.com", brokerCredentialId: 2 };
-    const b = await connect(h, "com.example.oauth", "personal", "UADA");
+    const b = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
 
     expect(a.ok && b.ok).toBe(true);
-    const rows = await rowsFor(h.store, "com.example.oauth");
+    const rows = await rowsFor(h.store, "com.example.stdio-oauth");
     expect(rows).toHaveLength(1);
     expect(rows[0]!.broker_credential_id).toBe(2);
     expect(rows[0]!.identity_key).toBe("email:ada@example.com");

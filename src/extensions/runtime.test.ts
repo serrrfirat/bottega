@@ -27,10 +27,11 @@ import {
   POLICY_DECISION_EVENT,
 } from "../store/audit-events";
 import { createSecretFileBoundary, extensionSecretFileName, PROXY_SECRETS_DIR, type CredentialBoundary } from "./boundary";
-import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
+import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "./fixture";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
+import type { McpOAuthTokenStore } from "./mcp-oauth";
 import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-runtime-"));
@@ -83,9 +84,10 @@ function makeHarness(opts: {
   policy?: PolicyConfig;
   manifests?: ExtensionManifest[];
   boundary?: CredentialBoundary;
-  mcpTransport?: (binding: McpBinding) => Transport;
+  mcpTransport?: (binding: McpBinding, authProvider?: unknown) => Transport;
   onToolStep?: ExtensionRuntimeDeps["onToolStep"];
   router?: ExtensionRuntimeDeps["router"];
+  mcpOAuthTokenStore?: McpOAuthTokenStore;
 } = {}): RuntimeHarness {
   const registry = createFixtureRegistry();
   for (const manifest of opts.manifests ?? []) registry.register(manifest);
@@ -115,6 +117,7 @@ function makeHarness(opts: {
     boundary,
     mcpTransport,
     ...(opts.onToolStep !== undefined ? { onToolStep: opts.onToolStep } : {}),
+    ...(opts.mcpOAuthTokenStore !== undefined ? { mcpOAuthTokenStore: opts.mcpOAuthTokenStore } : {}),
   };
   return { runtime: createExtensionRuntime(deps), store, boundary, transports, mcpTransport };
 }
@@ -882,3 +885,141 @@ function createExtensionRegistryFor(manifests: ExtensionManifest[]) {
   for (const manifest of manifests) registry.register(manifest);
   return registry;
 }
+
+describe("extension runtime: generic MCP OAuth (issue #198)", () => {
+  const OAUTH_ID = "fixture.oauth";
+  const OAUTH_TOOL = "oauth.current";
+
+  /** A hosted OAuth MCP manifest (streamable-http + oauth credential). */
+  function oauthManifest(): ExtensionManifest {
+    const base = fixtureManifest();
+    return {
+      ...base,
+      id: OAUTH_ID,
+      label: "Fixture OAuth",
+      credentialSchema: { type: "oauth", scopes: ["read"] },
+      tools: [{ ...base.tools![0]!, name: OAUTH_TOOL }],
+    };
+  }
+
+  /** A scripted vault token store: records loads, serves tokens (or null). */
+  function tokenStore(loadResult: { access: string; refresh: string; expires: number } | null): McpOAuthTokenStore & { loads: string[]; saves: unknown[] } {
+    const loads: string[] = [];
+    const saves: unknown[] = [];
+    return {
+      loads,
+      saves,
+      async load(provider, brokerCredentialId) {
+        loads.push(`${provider}:${brokerCredentialId}`);
+        if (loadResult === null) return null;
+        return { type: "oauth" as const, ...loadResult };
+      },
+      async save(provider, credential) {
+        saves.push({ provider, credential });
+        return { brokerCredentialId: 77 };
+      },
+    };
+  }
+
+  test("OAuth MCP bindings receive the vault-backed runtime OAuth provider; api_key bindings receive none", async () => {
+    const store = tokenStore({ access: "access-1", refresh: "refresh-1", expires: Date.now() + 60_000 });
+    const captured: Array<{ binding: McpBinding; authProvider?: unknown }> = [];
+    const h = makeHarness({
+      manifests: [oauthManifest()],
+      mcpOAuthTokenStore: store,
+      mcpTransport: (binding: McpBinding, authProvider?: unknown) => {
+        captured.push({ binding, authProvider });
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
+          const args = request.params.arguments as Record<string, unknown>;
+          return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+        });
+        void server.connect(serverTransport);
+        return clientTransport;
+      },
+    });
+    await seedOrgCredential(h.store, OAUTH_ID);
+
+    const result = await h.runtime.execute({
+      extensionId: OAUTH_ID,
+      toolName: OAUTH_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The OAuth binding carried the runtime OAuth provider; the credential
+    // still crossed the boundary (the proxy injects the same access token).
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.authProvider).toBeDefined();
+    expect(h.boundary.calls).toHaveLength(1);
+    // The provider is vault-backed: tokens() loads the registry row's vault
+    // credential (the seam's scripted row) and exposes it to the SDK.
+    const provider = captured[0]!.authProvider as { tokens(): Promise<unknown> };
+    await expect(provider.tokens()).resolves.toMatchObject({ access_token: "access-1", refresh_token: "refresh-1" });
+    expect(store.loads).toEqual([`${OAUTH_ID}:7`]);
+    expect(store.saves).toHaveLength(0);
+  });
+
+  test("api_key bindings attach no OAuth provider (auth stays at the iron-proxy boundary)", async () => {
+    const captured: Array<{ binding: McpBinding; authProvider?: unknown }> = [];
+    const h = makeHarness({
+      mcpTransport: (binding: McpBinding, authProvider?: unknown) => {
+        captured.push({ binding, authProvider });
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: "text", text: "ok" }] }));
+        void server.connect(serverTransport);
+        return clientTransport;
+      },
+    });
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.authProvider).toBeUndefined();
+  });
+
+  test("a missing vault row still calls (the transport's SDK client surfaces the re-auth prompt)", async () => {
+    // The runtime constructs the provider regardless; the transport's SDK
+    // OAuth client consults tokens() and, with no row, the provider's
+    // redirectToAuthorization throws the re-auth prompt (fail closed —
+    // covered hermetically in mcp-oauth.test.ts). Here we assert the
+    // provider is built and reads the vault (null → no tokens to send).
+    const store = tokenStore(null);
+    const captured: Array<{ authProvider?: unknown }> = [];
+    const h = makeHarness({
+      manifests: [oauthManifest()],
+      mcpOAuthTokenStore: store,
+      mcpTransport: (_binding: McpBinding, authProvider?: unknown) => {
+        captured.push({ authProvider });
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: "text", text: "ok" }] }));
+        void server.connect(serverTransport);
+        return clientTransport;
+      },
+    });
+    await seedOrgCredential(h.store, OAUTH_ID);
+
+    const result = await h.runtime.execute({
+      extensionId: OAUTH_ID,
+      toolName: OAUTH_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+    });
+
+    expect(result.ok).toBe(true); // the transport seam is a fake — auth is the SDK's job
+    const provider = captured[0]!.authProvider as { tokens(): Promise<unknown> };
+    await expect(provider.tokens()).resolves.toBeUndefined();
+  });
+});
