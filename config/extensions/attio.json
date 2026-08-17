@@ -23,6 +23,7 @@
     "tools": [
       {
         "name": "attio.search_records",
+        "providerName": "search-records",
         "tier": "read",
         "description": "Full-text search Attio records (people, companies, deals) by name, email, or domain.",
         "params": [
@@ -32,6 +33,7 @@
       },
       {
         "name": "attio.create_record",
+        "providerName": "create-record",
         "tier": "write",
         "description": "Create an Attio record of the given object type with JSON-encoded attribute values.",
         "params": [
@@ -41,6 +43,7 @@
       },
       {
         "name": "attio.update_record",
+        "providerName": "update-record",
         "tier": "write",
         "description": "Update an existing Attio record's attribute values.",
         "params": [

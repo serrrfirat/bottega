@@ -57,7 +57,12 @@ export type ExtensionCallDecision = "allow" | "deny" | "error";
 export interface ExtensionRuntimeCall {
   /** Registry id of the extension (the manifest id / credential provider). */
   extensionId: string;
-  /** A tool name declared by the extension's manifest. */
+  /**
+   * A tool declared by the extension's manifest — the manifest name OR the
+   * provider's wire name (issue #148: the bridge forwards providerName ??
+   * name). Resolved against both, and the manifest identity always drives
+   * the gate/audit/tier surface.
+   */
   toolName: string;
   args: Record<string, unknown>;
   /** Actor recorded on audit rows and used for personal-scope ladder lookups. */
@@ -143,7 +148,15 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       const { extensionId, toolName, args, caller, spaceId } = call;
       const resolved = deps.registry.resolve(extensionId);
       const manifest = resolved?.manifest;
-      const tool = manifest?.tools.find((entry) => entry.name === toolName);
+      // Issue #148: the bridge forwards the provider's wire name
+      // (providerName ?? name). Resolve the manifest tool by either the
+      // manifest name (direct callers, the MCP surface) or the wire name —
+      // the manifest identity then drives the gate/audit/tier, and the
+      // provider call uses the wire name below.
+      const tool =
+        manifest?.tools.find(
+          (entry) => entry.name === toolName || (entry.providerName !== undefined && entry.providerName === toolName),
+        ) ?? manifest?.tools.find((entry) => entry.name === toolName);
 
       if (!manifest || !tool) {
         await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
@@ -158,9 +171,11 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       // 1. POLICY GATE FIRST — a denied call never resolves a credential.
       // The extensionId rides the gate call so the extension allowlist
       // (issue #56) decides before tier/approval; toolTier resolves the
-      // manifest tier for the tier stage (issue #53).
+      // manifest tier for the tier stage (issue #53). The gate sees the
+      // MANIFEST name — policies are written against bottega's surface,
+      // not the provider's wire names (#148).
       const gateCall: PolicyGateCall & { extensionId?: string } = {
-        tool: toolName,
+        tool: tool.name,
         args,
         spaceId,
         actor: caller,
@@ -178,7 +193,7 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         gateCall,
       );
       if (!outcome.allowed) {
-        await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "deny" });
+        await auditCall({ extensionId, toolName: tool.name, actor: caller, spaceId, credentialId: null, decision: "deny" });
         return { ok: false, error: outcome.blockReason };
       }
 
@@ -205,19 +220,21 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       }
       const credential = resolution.credential;
       await recordCredentialResolution(deps.store, { actor: caller, spaceId, credential });
-      await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: credential.id, decision: "allow" });
+      await auditCall({ extensionId, toolName: tool.name, actor: caller, spaceId, credentialId: credential.id, decision: "allow" });
 
       // 3. Boundary injection + provider call. The credential stays at the
       // boundary; the call carries no auth (iron-proxy attaches it for the
       // extension's allowlisted domains). Failures (boundary write, proxy
       // reload, transport, provider) are tool errors, never silent no-ops —
-      // the allow decision is already on the trail.
+      // the allow decision is already on the trail. The provider sees the
+      // WIRE name (providerName ?? manifest name, issue #148).
+      const wireName = tool.providerName ?? tool.name;
       try {
         await boundary.authorize(credential);
         if (manifest.kind === "mcp") {
-          return await callMcpTool(makeTransport, manifest.mcp, tool.name, args);
+          return await callMcpTool(makeTransport, manifest.mcp, wireName, args);
         }
-        return await callCliTool(manifest.cli, tool.name, args);
+        return await callCliTool(manifest.cli, wireName, args);
       } catch (err) {
         return { ok: false, error: `extension tool "${tool.name}" failed: ${errorMessage(err)}` };
       }

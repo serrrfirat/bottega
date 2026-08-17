@@ -179,6 +179,22 @@ describe("extension manifest validation (fail closed)", () => {
     expectInvalid(mutate(fixtureManifest(), ["tools", "0", "description"], ""), "description must be a non-empty string");
   });
 
+  test("providerName is optional, validated, and defaults to the manifest name (issue #148)", () => {
+    // Absent → no providerName on the typed tool (falls back to name).
+    const plain = validateManifest(fixtureManifest());
+    expect(plain.tools[0].providerName).toBeUndefined();
+    // Valid providerName survives validation.
+    const mapped = validateManifest(
+      mutate(fixtureManifest(), ["tools", "0", "providerName"], "wire.name-tool_1"),
+    );
+    expect(mapped.tools[0].providerName).toBe("wire.name-tool_1");
+    // Fail closed on malformed provider names.
+    expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], ""), "providerName must be a non-empty string");
+    expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], 42), "providerName must be a non-empty string");
+    expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], "Bad Name"), "must match");
+    expectInvalid(mutate(fixtureManifest(), ["tools", "0", "providerName"], "UPPER"), "must match");
+  });
+
   test("params reject unknown types, duplicates, and bad required flags", () => {
     expectInvalid(
       mutate(fixtureManifest(), ["tools", "0", "params"], [{ name: "x", type: "date" }]),

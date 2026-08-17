@@ -8,11 +8,14 @@
  * config/extensions/ at server boot (server/index.ts) and the tool bridge
  * (tools.ts) executes calls over the binding's MCP transport with the
  * injectable `mcpTransport` seam. The #53 runtime adds the credential
- * broker handoff (resolve(id) -> vault credential per the #51 ladder) and
- * still needs one mapping: manifest tool names are bottega's v1 surface
- * (e.g. linear.search_issues), while the official servers expose their own
- * names (linear_search_issues / search_issues / search-records) — the
- * bridge forwards the manifest name verbatim today.
+ * broker handoff (resolve(id) -> vault credential per the #51 ladder).
+ * Tool-name mapping (issue #148): manifest tool names are bottega's v1
+ * surface (e.g. linear.search_issues), while the official servers expose
+ * their own wire names (github → search_issues live-verified; attio →
+ * search-records per official docs; linear → unprefixed per the official
+ * server's tool list) — the bridge forwards `providerName ?? name`, so the
+ * provider call carries the wire name while the manifest name stays the
+ * SDK/policy/audit surface.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
@@ -143,7 +146,9 @@ describe("issue #54 pinned providers", () => {
     expect(search).toBeDefined();
     expect(search?.approval).toBe("read");
     const result = await run(search!, { query: "bug" });
-    expect(result.content).toEqual([{ type: "text", text: "stub linear.search_issues query=bug" }]);
+    // Issue #148: the provider sees the wire name (providerName), not the
+    // namespaced manifest name.
+    expect(result.content).toEqual([{ type: "text", text: "stub search_issues query=bug" }]);
   });
 
   test("github (hosted MCP binding) transport failures surface as tool errors, not silent no-ops", async () => {
@@ -257,5 +262,120 @@ describe("github hosted MCP live leg (skip-gated, issue #145)", () => {
       expect(body).not.toContain("ghp_");
     },
     60_000,
+  );
+
+  test(
+    "issue #148: the mapped providerName tool names exist on the hosted server and a REAL call with the mapped name succeeds",
+    async () => {
+      const skip = (reason: string) => console.log(`[github hosted MCP leg #148] SKIP: ${reason}`);
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run (dev stack: NODE_EXTRA_CA_CERTS=$PWD/certs/ca.crt)");
+        return;
+      }
+      const repoRoot = resolve(import.meta.dir, "../..");
+      const mgmt = await fetch("http://127.0.0.1:9092/v1/reload", { method: "POST" }).catch(() => null);
+      if (!mgmt) {
+        skip("dev iron-proxy not reachable on 127.0.0.1:9092 — start the dev stack (bun run dev) first");
+        return;
+      }
+      const secretPath = join(repoRoot, "data/proxy-secrets", extensionSecretFileName("github"));
+      if (!existsSync(secretPath) || readFileSync(secretPath).length === 0) {
+        skip("data/proxy-secrets/github.secret is missing or empty — the boundary has not injected a credential yet");
+        return;
+      }
+
+      // Raw streamable-http session through the dev proxy: initialize →
+      // notifications/initialized → tools/list → tools/call. The proxy's
+      // secrets transform injects the Authorization header for
+      // api.githubcopilot.com; the credential never leaves the proxy and is
+      // never printed here.
+      const base = {
+        method: "POST" as const,
+        proxy: "http://127.0.0.1:8080",
+        headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+      };
+      const rpc = (id: number, method: string, params?: Record<string, unknown>) =>
+        JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) });
+      const parseResult = (body: string): { result?: unknown; error?: unknown } => {
+        const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
+        const parsed = JSON.parse((dataLine ?? body).replace(/^data: /, ""));
+        if (parsed.error !== undefined) return { error: parsed.error };
+        return { result: parsed.result };
+      };
+
+      const initRes = await fetch("https://api.githubcopilot.com/mcp/", {
+        ...base,
+        body: rpc(1, "initialize", {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "bottega-live-leg-148", version: "1.0.0" },
+        }),
+      });
+      expect(initRes.status).not.toBe(401);
+      const init = parseResult(await initRes.text());
+      expect(init.result).toBeDefined();
+      expect(init.error).toBeUndefined();
+      const sessionId = initRes.headers.get("mcp-session-id");
+      const sessionHeaders = {
+        ...(base.headers as Record<string, string>),
+        ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+      };
+      await fetch("https://api.githubcopilot.com/mcp/", {
+        ...base,
+        headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      });
+
+      // tools/list — the EVIDENCE: the mapped wire names exist on the
+      // hosted server (never guess: an unauthenticated list would 401).
+      const listRes = await fetch("https://api.githubcopilot.com/mcp/", {
+        ...base,
+        headers: sessionHeaders,
+        body: rpc(2, "tools/list"),
+      });
+      expect(listRes.status).not.toBe(401);
+      const list = parseResult(await listRes.text()) as {
+        result?: { tools: Array<{ name: string }> };
+        error?: unknown;
+      };
+      expect(list.error).toBeUndefined();
+      const names = (list.result?.tools ?? []).map((tool) => tool.name);
+      console.log(`[github hosted MCP leg #148] tools/list count=${names.length}`);
+      for (const mapped of ["search_issues", "issue_write", "add_issue_comment"]) {
+        expect(names).toContain(mapped);
+        console.log(`[github hosted MCP leg #148] mapped wire name present: ${mapped}`);
+      }
+      expect(names).not.toContain("github.search_issues");
+
+      // A REAL tool call with the mapped name succeeds end-to-end
+      // (read-only search; the query is scoped to this repo).
+      const callRes = await fetch("https://api.githubcopilot.com/mcp/", {
+        ...base,
+        headers: sessionHeaders,
+        body: rpc(3, "tools/call", {
+          name: "search_issues",
+          arguments: { query: "repo:serrrfirat/bottega is:issue" },
+        }),
+      });
+      expect(callRes.status).not.toBe(401);
+      const call = parseResult(await callRes.text()) as {
+        result?: { isError?: boolean; content?: Array<{ type: string; text?: string }> };
+        error?: unknown;
+      };
+      expect(call.error).toBeUndefined();
+      expect(call.result?.isError).not.toBe(true);
+      expect(Array.isArray(call.result?.content)).toBe(true);
+      expect((call.result?.content ?? []).length).toBeGreaterThan(0);
+      // The result is real GitHub search data (the API's JSON envelope),
+      // never a credential: the token stays at the proxy boundary and this
+      // leg only logs statuses/counts. Issue bodies are arbitrary text, so
+      // no substring-based secret sniffing here (false positives).
+      const text = (call.result?.content ?? [])
+        .map((block) => ("text" in block ? block.text ?? "" : ""))
+        .join("");
+      expect(text).toContain("total_count");
+      console.log(`[github hosted MCP leg #148] real search_issues call OK (${text.length} chars of issue data)`);
+    },
+    90_000,
   );
 });

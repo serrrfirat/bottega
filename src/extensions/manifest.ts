@@ -52,9 +52,20 @@ export interface ExtensionToolParam {
   required?: boolean;
 }
 
-/** One tool surface entry. `tier` feeds both the SDK approval tier and policy. */
+/**
+ * One tool surface entry. `tier` feeds both the SDK approval tier and policy.
+ *
+ * `name` is bottega's model-facing surface (the SDK definition name, policy
+ * names, audit trail). `providerName` — when present — is the tool's ACTUAL
+ * wire name on the provider's MCP server (issue #148): hosted official
+ * servers expose their own names (e.g. the hosted GitHub MCP rejects
+ * `github.search_issues` and uses `search_issues`). Absent → the manifest
+ * name is forwarded verbatim (backward compatible).
+ */
 export interface ExtensionTool {
   name: string;
+  /** The provider's wire tool name; defaults to `name` when absent. */
+  providerName?: string;
   tier: ExtensionToolTier;
   description: string;
   params: ExtensionToolParam[];
@@ -270,13 +281,33 @@ function validateTools(value: unknown): ExtensionTool[] {
       throw new ExtensionValidationError(`duplicate tool name "${name}"`);
     }
     seenNames.add(name);
+    // providerName (issue #148): the provider's wire tool name, absent →
+    // fall back to the manifest name. Same identifier charset as the
+    // manifest name, fail closed on anything else.
+    const providerName = entry["providerName"];
+    if (providerName !== undefined) {
+      if (typeof providerName !== "string" || providerName.trim() === "") {
+        throw new ExtensionValidationError(`tool "${name}" providerName must be a non-empty string`);
+      }
+      if (!NAME_RE.test(providerName)) {
+        throw new ExtensionValidationError(
+          `tool "${name}" providerName "${providerName}" must match ${NAME_RE.source}`,
+        );
+      }
+    }
     const tier = entry["tier"];
     if (tier !== "read" && tier !== "write" && tier !== "exec") {
       throw new ExtensionValidationError(`tool "${name}" tier must be \"read\", \"write\", or \"exec\"`);
     }
     const description = requiredString(entry, "description");
     const params = validateParams(entry["params"], name);
-    tools.push({ name, tier, description, params });
+    tools.push({
+      name,
+      ...(providerName !== undefined ? { providerName } : {}),
+      tier,
+      description,
+      params,
+    });
   }
   return tools;
 }

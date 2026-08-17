@@ -23,6 +23,7 @@
     "tools": [
       {
         "name": "github.search_issues",
+        "providerName": "search_issues",
         "tier": "read",
         "description": "Search GitHub issues across repositories using the search query syntax, optionally limited.",
         "params": [
@@ -32,6 +33,7 @@
       },
       {
         "name": "github.create_issue",
+        "providerName": "issue_write",
         "tier": "write",
         "description": "Create an issue in a GitHub repository. Repo push/PRs stay the executor's job (#47); this is an API-level tool.",
         "params": [
@@ -43,6 +45,7 @@
       },
       {
         "name": "github.add_comment",
+        "providerName": "add_issue_comment",
         "tier": "write",
         "description": "Add a comment to an existing GitHub issue.",
         "params": [

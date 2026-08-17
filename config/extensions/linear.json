@@ -24,6 +24,7 @@
     "tools": [
       {
         "name": "linear.search_issues",
+        "providerName": "search_issues",
         "tier": "read",
         "description": "Search Linear issues by query text (title, description, or identifier), optionally limited.",
         "params": [
@@ -33,6 +34,7 @@
       },
       {
         "name": "linear.create_issue",
+        "providerName": "create_issue",
         "tier": "write",
         "description": "Create a Linear issue in the given team (or the user's default team).",
         "params": [
@@ -43,6 +45,7 @@
       },
       {
         "name": "linear.update_status",
+        "providerName": "update_status",
         "tier": "write",
         "description": "Move a Linear issue to a workflow state by name (e.g. \"In Progress\", \"Done\").",
         "params": [

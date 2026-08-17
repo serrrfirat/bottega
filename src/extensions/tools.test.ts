@@ -263,6 +263,67 @@ describe("extension tool bridge", () => {
     expect(result.content).toEqual([{ type: "text", text: "sunny in Lisbon" }]);
   });
 
+  test("the bridge forwards providerName to the runtime call and keeps the manifest name on the SDK definition (issue #148)", async () => {
+    const mcp = validateManifest({
+      id: "com.example.mcp",
+      label: "Example MCP",
+      vendor: "example",
+      kind: "mcp",
+      mcp: { serverUrl: "http://127.0.0.1:1/mcp", transport: "streamable-http" },
+      credentialSchema: { type: "oauth", scopes: ["read"] },
+      tools: [
+        {
+          name: "weather.current",
+          providerName: "current_weather",
+          tier: "read",
+          description: "Current weather",
+          params: [{ name: "city", type: "string" }],
+        },
+      ],
+      domains: ["api.example.com"],
+    });
+    // The stub records the tool name the RUNTIME forwards to the provider.
+    const seen: string[] = [];
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        seen.push(request.params.name);
+        return { content: [{ type: "text", text: "ok" }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const { runtime } = makeRuntime([mcp], { mcpTransport });
+    const [definition] = extensionToolDefinitions([{ manifest: mcp }], { runtime });
+    // The SDK-facing name stays the manifest name (policy/audit/model-facing).
+    expect(definition.name).toBe("weather.current");
+    expect(definition.label).toBe("weather.current");
+    const result = await run(definition, { city: "Lisbon" });
+    expect(result.isError).not.toBe(true);
+    // The provider received the WIRE name, not the manifest name.
+    expect(seen).toEqual(["current_weather"]);
+  });
+
+  test("without providerName the bridge forwards the manifest name verbatim (fallback, issue #148)", async () => {
+    const seen: string[] = [];
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        seen.push(request.params.name);
+        return { content: [{ type: "text", text: "ok" }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const { runtime } = makeRuntime([fixtureManifest()], { mcpTransport });
+    const [definition] = extensionToolDefinitions(createFixtureRegistry().list(), { runtime });
+    const result = await run(definition, { city: "Lisbon" });
+    expect(result.isError).not.toBe(true);
+    expect(seen).toEqual(["weather.current"]);
+  });
+
   test("mcp connection failures surface as tool errors", async () => {
     const { runtime } = makeRuntime([fixtureManifest()], {
       // Force the fixture's (unreachable) serverUrl through a transport that

@@ -57,7 +57,13 @@ export function extensionToolDefinitions(
           const caller = opts.getCaller?.(ctx) ?? "agent";
           const result = await opts.runtime.execute({
             extensionId: manifest.id,
-            toolName: tool.name,
+            // Issue #148: the runtime call carries the provider's WIRE name
+            // (providerName ?? manifest name) — hosted official servers
+            // reject bottega's namespaced names (github.search_issues →
+            // search_issues). The SDK-facing definition above keeps the
+            // manifest name: policy, audit, and the flat model-facing name
+            // (#78) are unchanged.
+            toolName: tool.providerName ?? tool.name,
             args,
             caller,
             spaceId,
