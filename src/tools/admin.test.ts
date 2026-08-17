@@ -32,8 +32,10 @@ import {
 import { decidePolicyCall, defaultPolicy, parseOrgConfigYaml, resolveTier } from "../policy/config";
 import { createAudit } from "../policy/audit";
 import type { AuditModule } from "../policy/audit";
+import type { ExtensionManifest } from "../extensions/manifest";
 import type { ResolvedExtension } from "../extensions/registry";
 import { createExtensionRegistry, parsePinnedSnapshot } from "../extensions/registry";
+import { resolveExtensionSurfaces } from "../extensions/surface";
 import { connectExtension, type ConnectExtensionDeps } from "../extensions/connect";
 import {
   adminToolDefinitions,
@@ -206,6 +208,8 @@ const ENV_KEYS = [
   "OMP_AUTH_BROKER_URL",
   "BOTTEGA_IMAGE_TAG",
   "EXECUTOR_GIT_TOKEN_FILE",
+  "BOTTEGA_PROXY_CONTROL_URL",
+  "BOTTEGA_PROXY_CONTROL_TOKEN",
 ];
 
 function backupEnv(): EnvBackup {
@@ -280,9 +284,15 @@ describe("catalog_browser (issue #73)", () => {
     const { store, cleanup } = freshStore();
     try {
       const { audit, rows } = fakeAudit();
+      const registry = createExtensionRegistry();
+      for (const entry of [pinnedEntry("linear", "Linear", "linear.app"), pinnedEntry("attio", "Attio CRM", "mcp.attio.com")]) {
+        // fixture cast: the fake manifest is the draft subset, register accepts the validated union
+        const manifest = entry.manifest as unknown as ExtensionManifest;
+        registry.register(manifest, entry.snapshot);
+      }
       const tools = loadTools(store, {
         audit,
-        registry: { list: () => [pinnedEntry("linear", "Linear", "linear.app"), pinnedEntry("attio", "Attio CRM", "mcp.attio.com")] },
+        registry,
         catalog: { fetchImpl: stubFetch() },
       });
       const [tool] = tools;
@@ -727,6 +737,161 @@ describe("catalog_browser pin (issue #195)", () => {
         expect(rows[0]!.identity_key).toBe("email:ada@example.com");
       }
     } finally {
+      cleanup();
+    }
+  });
+
+  test("pin hot-reloads: registers the snapshot into the LIVE registry — a following session's toolset includes the extension without a restart", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      // pinned manifest tools keep the surface hermetic (no tools/list discovery)
+      writeCompletedDraft(draftsDir, {
+        manifest: {
+          id: "linear",
+          label: "Linear",
+          vendor: "Linear",
+          kind: "mcp",
+          mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
+          credentialSchema: { type: "oauth", scopes: ["read", "write"] },
+          domains: ["linear.app"],
+          tools: [{ name: "linear_search", tier: "read", description: "Search Linear" }],
+        },
+      });
+      // the LIVE registry the runtime resolves against (#172) — booted empty
+      const registry = createExtensionRegistry();
+      const tools = loadTools(store, {
+        registry,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      // a pre-pin session's surface has no linear (nothing registered)
+      const bootSurfaces = await resolveExtensionSurfaces(registry.list());
+      expect(bootSurfaces.has("linear")).toBe(false);
+
+      const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as { live_registry: string; proxy_reload: string; note: string };
+      expect(body.live_registry).toBe("registered");
+      expect(body.proxy_reload).toBe("unset");
+      expect(body.note).toContain("no restart");
+
+      // the pin registered into the LIVE registry instance
+      expect(registry.resolve("linear")?.manifest.id).toBe("linear");
+      expect(registry.list().map((e) => e.manifest.id)).toContain("linear");
+
+      // a FOLLOWING session resolves its toolset from the LIVE registry
+      // (session-creation path — pinned tools resolve without discovery):
+      // the extension is there WITHOUT a restart
+      const nextSessionSurfaces = await resolveExtensionSurfaces(registry.list());
+      expect(nextSessionSurfaces.has("linear")).toBe(true);
+      expect(nextSessionSurfaces.get("linear")?.map((t) => t.name)).toEqual(["linear_search"]);
+
+      // re-pinning the same extension is idempotent: still live, no error
+      const repin = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
+      expect(repin.isError).toBe(false);
+      expect((JSON.parse(repin.text) as { live_registry: string }).live_registry).toBe("registered");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin hot-reloads: reloads the dev proxy AFTER the egress regen (stubbed management API)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    const originalFetch = globalThis.fetch;
+    try {
+      process.env.BOTTEGA_PROXY_CONTROL_URL = "http://iron-proxy:9092";
+      process.env.BOTTEGA_PROXY_CONTROL_TOKEN = "test-management-token";
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      writeCompletedDraft(draftsDir);
+      const reloadCalls: Array<{ url: string; method?: string; authorization?: string }> = [];
+      globalThis.fetch = (async (
+        input: string | URL | Request,
+        init?: { method?: string; headers?: Record<string, string> },
+      ) => {
+        // the reload must fire AFTER the egress regen wrote both configs
+        expect(existsSync(egressPath)).toBe(true);
+        expect(existsSync(devEgressPath)).toBe(true);
+        reloadCalls.push({
+          url: typeof input === "string" ? input : "url" in input ? input.url : input.toString(),
+          method: init?.method,
+          authorization: init?.headers?.["Authorization"],
+        });
+        return new Response("ok", { status: 200 });
+      }) as typeof fetch;
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as { proxy_reload: string; egress_regenerated: string[] };
+      expect(body.proxy_reload).toBe("ok");
+      expect(body.egress_regenerated).toContain(egressPath);
+      expect(reloadCalls).toHaveLength(1);
+      expect(reloadCalls[0]!.url).toBe("http://iron-proxy:9092/v1/reload");
+      expect(reloadCalls[0]!.method).toBe("POST");
+      expect(reloadCalls[0]!.authorization).toBe("Bearer test-management-token");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("pin hot-reloads fail closed: a failed proxy reload is surfaced loudly (result + audit) while the snapshot still lands", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    const originalFetch = globalThis.fetch;
+    try {
+      process.env.BOTTEGA_PROXY_CONTROL_URL = "http://iron-proxy:9092";
+      process.env.BOTTEGA_PROXY_CONTROL_TOKEN = "test-management-token";
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      writeCompletedDraft(draftsDir);
+      const { audit, rows } = fakeAudit();
+      globalThis.fetch = (async (
+        _input: string | URL | Request,
+        _init?: { method?: string; headers?: Record<string, string> },
+      ) => new Response("unavailable", { status: 503 })) as typeof fetch;
+      const tools = loadTools(store, {
+        audit,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
+      // loud: the pin result flags the failure (isError + explicit warning)
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("PROXY RELOAD FAILED");
+      expect(res.text).toContain("503");
+      // the snapshot still landed
+      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(true);
+      expect(readFileSync(egressPath, "utf8")).toContain('"mcp.linear.app"');
+      // audited with the failure
+      const pinRow = rows.find((r) => r.payload["action"] === "pin");
+      expect(pinRow?.payload["proxy_reload"]).toBe("failed");
+      expect(String(pinRow?.payload["proxy_reload_error"])).toContain("503");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(env);
       cleanup();
     }
   });

@@ -31,8 +31,16 @@
  * draft always refuses, fail closed), writes the pinned snapshot via the
  * fetch-catalog pin flow (same review gate), and regenerates
  * config/egress.yml + config/egress.dev.yml (#53 domains — the binding
- * host is merged into the allowlist domains). POLICY (#49/#195): official
- * HOSTED streamable-http + OAuth bindings are preferred; stdio/CLI
+ * host is merged into the allowlist domains), and HOT-RELOADS (issue
+ * #197): the snapshot registers into the LIVE
+ * registry the composition root wired (#172 — new sessions see the
+ * extension immediately via the #167 per-session surface refresh, no
+ * restart) and the dev proxy reloads after the egress regen (the
+ * boundary's POST /v1/reload with BOTTEGA_PROXY_CONTROL_URL/TOKEN); a
+ * failed registration or reload is surfaced loudly in the pin result +
+ * audited (fail closed — the snapshot still lands). POLICY (#49/#195):
+ * official HOSTED streamable-http + OAuth
+ * bindings are preferred; stdio/CLI
  * bindings pin only when the agent web-searched and verified NO official
  * hosted variant exists (no_hosted_variant: true — documented in the
  * guidance). Manifest tools are OPTIONAL (issue #158): omit them to pin a
@@ -82,9 +90,10 @@ import {
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
+import { proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import type { CliBinding, CredentialSchema, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
-import type { ResolvedExtension } from "../extensions/registry";
+import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
 import {
   DEV_EGRESS_CONFIG_PATH,
   EGRESS_CONFIG_PATH,
@@ -142,9 +151,12 @@ export interface AdminToolsOpts {
   actor?: string;
   /**
    * The pinned-snapshot registry (issue #50) — the catalog browser's
-   * "pinned" half. Absent → no pinned entries (still lists the catalog).
+   * "pinned" half, and the LIVE instance the runtime resolves against
+   * (#172): `pin` registers the new snapshot into it so NEW sessions see
+   * the extension immediately (no restart). Absent → no pinned entries
+   * (still lists the catalog) and no live registration.
    */
-  registry?: { list(): readonly ResolvedExtension[] };
+  registry?: ExtensionRegistry;
   /** Catalog fetch seams (the #54 helper's own seams). */
   catalog?: FetchCatalogOptions;
   /** Where catalog drafts land. Default "config/extensions/drafts". */
@@ -605,7 +617,11 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
       "records source.reviewed: true, the pinned snapshot is written to config/extensions via the fetch-catalog " +
       "pin flow (same review gate: unconfirmed/unreviewed drafts always refuse, fail closed), and " +
       "config/egress.yml + config/egress.dev.yml regenerate (the binding host is merged into the allowlist " +
-      "domains). POLICY (issue #49/#195): prefer official HOSTED streamable-http + OAuth bindings (the broker " +
+      "domains) and the pin HOT-RELOADS (issue #197): the snapshot registers into the LIVE " +
+      "registry (new sessions see the extension without a restart) and the dev proxy reloads after the egress regen " +
+      "(BOTTEGA_PROXY_CONTROL_URL/TOKEN — the boundary's mechanism); a failed registration or reload surfaces " +
+      "loudly in the result (fail closed — the snapshot still lands). POLICY (issue #49/#195): prefer official " +
+      "HOSTED streamable-http + OAuth bindings (the broker " +
       "handles the OAuth flow — no binaries, no API keys); stdio/CLI bindings pin only when web-search verified " +
       "NO official hosted variant exists (no_hosted_variant: true). Manifest tools are OPTIONAL (issue #158): " +
       "omit them to pin a tools-less manifest whose surface is discovered at runtime from the provider's " +
@@ -791,6 +807,75 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             // what the caller and the audit trail need.
             regenerateEgressConfig(snapshotsDir, egressPath);
             regenerateDevEgressConfig(snapshotsDir, devEgressPath);
+            // HOT-RELOAD (issue #197): the registry the composition root
+            // wired is the LIVE instance the runtime resolves against (#172). Register the new snapshot into it so
+            // NEW sessions resolve the extension immediately through the
+            // per-session surface refresh (#167) — NO restart. Fail closed: a
+            // failed registration surfaces loudly in the result and the audit
+            // row, and the snapshot file already landed (never rolled back).
+            // Re-pinning an already-live extension is idempotent (resolve →
+            // already registered); absent registry → nothing to register (the
+            // catalog's "pinned" half stays list-only, like the boot).
+            let liveRegistry: "registered" | "failed" | "absent" = "absent";
+            let liveError: string | undefined;
+            if (opts.registry !== undefined) {
+              if (opts.registry.resolve(reviewed.extensionId) !== undefined) {
+                liveRegistry = "registered";
+              } else {
+                try {
+                  const manifest = validateManifest(reviewed.manifest);
+                  const snapshot: PinnedSnapshot = {
+                    schema: reviewed.schema,
+                    extensionId: reviewed.extensionId,
+                    pinnedAt: reviewed.pinnedAt,
+                    source: reviewed.source,
+                    manifest,
+                  };
+                  opts.registry.register(manifest, snapshot);
+                  liveRegistry = "registered";
+                } catch (err) {
+                  liveRegistry = "failed";
+                  liveError = errorMessage(err);
+                }
+              }
+            }
+            // HOT-RELOAD: the egress regen changed the allowlist/inject rules
+            // — trigger the proxy reload (the boundary's existing mechanism,
+            // issue #123: POST /v1/reload with the management token) so the
+            // new domains apply immediately. Unset control URL (unconfigured
+            // deployments, hermetic tests) → write-only, like the boundary.
+            const control = proxyBoundaryControlFromEnv();
+            const reload: { ok: boolean; error?: string } = { ok: false };
+            if (control.proxyControlUrl !== undefined) {
+              try {
+                const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
+                  method: "POST",
+                  headers:
+                    control.proxyControlToken !== undefined
+                      ? { Authorization: `Bearer ${control.proxyControlToken}` }
+                      : undefined,
+                });
+                if (!res.ok) throw new Error(`proxy reload failed (${res.status})`);
+                reload.ok = true;
+              } catch (err) {
+                reload.error = errorMessage(err);
+              }
+            }
+            const proxyReload: "ok" | "failed" | "unset" =
+              control.proxyControlUrl === undefined ? "unset" : reload.ok ? "ok" : "failed";
+            const hotReloadWarnings: string[] = [];
+            if (liveRegistry === "failed") {
+              hotReloadWarnings.push(
+                `LIVE REGISTRY REGISTRATION FAILED — the snapshot landed, but this server's runtime won't see ` +
+                  `"${params.spec.trim()}" until a restart: ${liveError}`,
+              );
+            }
+            if (proxyReload === "failed") {
+              hotReloadWarnings.push(
+                `PROXY RELOAD FAILED — the egress config regenerated, but the dev proxy is still serving the OLD ` +
+                  `allowlist until a reload/restart: ${reload.error}`,
+              );
+            }
             await audit?.appendAudit({
               actor,
               event_type: ADMIN_CATALOG_BROWSER_EVENT,
@@ -802,25 +887,45 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 hosted_variant: hosted,
                 no_hosted_variant: params.no_hosted_variant === true,
                 vendor_official: reviewed.source.vendorOfficial,
+                live_registry: liveRegistry,
+                ...(liveError !== undefined ? { live_error: liveError } : {}),
+                proxy_reload: proxyReload,
+                ...(reload.error !== undefined ? { proxy_reload_error: reload.error } : {}),
               },
             });
+            const result: Record<string, unknown> = {
+              action: "pin",
+              spec: params.spec.trim(),
+              written_to: outPath,
+              reviewed: true,
+              hosted_variant: hosted,
+              egress_regenerated: [egressPath, devEgressPath],
+              live_registry: liveRegistry,
+              proxy_reload: proxyReload,
+            };
+            const note =
+              `PINNED — "${params.spec.trim()}" is installed, its domains are egress allowlisted, and it is live ` +
+              `in the running server (no restart). Connect the account to use it: call connect_extension ` +
+              `extension=${params.spec.trim()} scope=personal ("connect as me" — the OAuth flow opens for oauth ` +
+              "extensions) or scope=org (the org account, needs human approval). api_key extensions need the " +
+              "api_key param.";
+            if (hotReloadWarnings.length > 0) {
+              // Fail closed: the snapshot still landed, but a failed
+              // registration/reload is LOUD — the agent must not assume the
+              // new domains are being served.
+              result["warnings"] = hotReloadWarnings;
+              result["note"] =
+                `${note} HOT-RELOAD WARNING${hotReloadWarnings.length > 1 ? "S" : ""}: ${hotReloadWarnings.join(" ")} ` +
+                "The snapshot and egress config are on disk; a restart (or manual proxy reload) is needed for " +
+                "the running server to serve them.";
+              return toolError(JSON.stringify(result));
+            }
+            result["note"] = note;
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({
-                    action: "pin",
-                    spec: params.spec.trim(),
-                    written_to: outPath,
-                    reviewed: true,
-                    hosted_variant: hosted,
-                    egress_regenerated: [egressPath, devEgressPath],
-                    note:
-                      `PINNED — "${params.spec.trim()}" is installed and its domains are egress allowlisted. ` +
-                      `Connect the account to use it: call connect_extension extension=${params.spec.trim()} ` +
-                      `scope=personal ("connect as me" — the OAuth flow opens for oauth extensions) or scope=org ` +
-                      "(the org account, needs human approval). api_key extensions need the api_key param.",
-                  }),
+                  text: JSON.stringify(result),
                 },
               ],
             };
