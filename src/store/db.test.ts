@@ -47,13 +47,16 @@ describe("spaces", () => {
     const policy = '{"tools":{"bash":"deny"}}';
     await store.updatePolicy(space.id, policy);
     await store.updateSpaceSettings(space.id, { model: "deepseek-v4-flash" });
-    const before = await store.getSpace(space.id);
 
     // ...and a later contact (the inbound-path upsert, issue #188) is
     // idempotent: settings, policy, and the first-contact name survive;
     // only updated_at advances.
     vi.useFakeTimers();
     try {
+      // Read `before` on the fake clock too: the store stamps updated_at
+      // with Date.now(), so a real-ms gap between this read and the timer
+      // install would make the +1000 equality off by one on slow runners.
+      const before = await store.getSpace(space.id);
       vi.advanceTimersByTime(1000);
       const again = await store.getOrCreateSpace({ platform: "slack", channel_id: "C0123", name: "late name" });
       expect(again.id).toBe(space.id);
