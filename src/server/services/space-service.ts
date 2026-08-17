@@ -10,6 +10,7 @@ import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
+import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import {
   createPhraseRotation,
   SlackTurnPresenter,
@@ -448,6 +449,13 @@ export class SpaceService {
     // directives remain part of every cold-start prompt.
     const directives = [persona?.prompt ?? "", SLACK_FORMAT_DIRECTIVE];
     if (mode === "request-only") directives.push(REQUEST_ONLY_DIRECTIVE);
+    // Semantic auto-pickup (issue #89): opt-in org-floor flag; the pickup
+    // directive is evaluated at session creation like the response mode, so
+    // a config change applies on the next cold start. Off (the default) →
+    // no directive, so the agent never auto-drafts.
+    if (this.#orgPolicy.autoPickup) {
+      directives.push(buildAutoPickupDirective(this.#orgPolicy.pickupConfidence));
+    }
     const appendSystemPrompt = directives.filter(Boolean).join("\n\n");
     const session = await this.#driver.createSession({
       spaceId,

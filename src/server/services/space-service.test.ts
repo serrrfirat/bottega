@@ -16,6 +16,7 @@ import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type Approva
 import { createAudit, type AuditModule } from "../../policy/audit";
 import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
+import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
 import { sha256Hex } from "../../tools/memory";
 
@@ -1404,6 +1405,42 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
   });
 });
 
+describe("SpaceService run settlement after a stream/panel turn (issue #183)", () => {
+  test("a stream/panel turn followed by another message: the second turn runs fresh and its reply lands — no busy wedge", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Turn one: the agent starts streaming (the stream/panel path). A
+    // second message STEERS the running turn.
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    expect(session.prompts).toHaveLength(1);
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "second", ts: "2.2" }));
+    expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
+
+    // The stream turn settles: the reply streams, turn_end fires, and the
+    // session is idle again (no ghost run left behind).
+    session.emit("message", { spaceId: "slack:C1", text: "stream reply" });
+    await Promise.resolve();
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    session.streaming = false;
+
+    // A THIRD message after the stream turn must run a FRESH turn (never a
+    // busy timeout, never a silent steer into a dead run) and its reply
+    // must land — the phrase/reply always arrive.
+    session.autoReply = "reply to the third";
+    await service.handleInboundMessage(msg({ text: "third", ts: "3.3" }));
+    expect(session.prompts[2].opts?.streamingBehavior).toBeUndefined(); // fresh turn, not a steer
+    await Promise.resolve();
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "reply to the third" });
+    expect(posts).toHaveLength(1); // one visible message, replaced in place — never a silent no-reply
+  });
+});
+
 describe("SpaceService digest-on-idle", () => {
   test("dispose digests new messages into org memory, advances the marker, and disposes", async () => {
     const { adapter } = fakeAdapter();
@@ -1651,6 +1688,52 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await service.handleInboundMessage(msg());
 
     expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+    await service.stop();
+  });
+});
+
+describe("work-items auto-pickup → session prompt directive (issue #89)", () => {
+  test("auto_pickup on appends the pickup directive after the Slack format directive", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const orgPolicy = parseOrgConfigYaml("work_items:\n  auto_pickup: true\n");
+    const service = makeSpaceService({ store, adapter, driver, orgPolicy });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created).toHaveLength(1);
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(
+      `${SLACK_FORMAT_DIRECTIVE}\n\n${buildAutoPickupDirective("high")}`,
+    );
+    await service.stop();
+  });
+
+  test("the directive reflects the configured pickup_confidence threshold", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const orgPolicy = parseOrgConfigYaml("work_items:\n  auto_pickup: true\n  pickup_confidence: medium\n");
+    const service = makeSpaceService({ store, adapter, driver, orgPolicy });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(
+      `${SLACK_FORMAT_DIRECTIVE}\n\n${buildAutoPickupDirective("medium")}`,
+    );
+    await service.stop();
+  });
+
+  test("auto_pickup off (the default) never appends the pickup directive", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+    expect(driver.created[0].opts.appendSystemPrompt).not.toContain("CONFIRMABLE DRAFT");
     await service.stop();
   });
 });

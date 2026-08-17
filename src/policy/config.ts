@@ -67,6 +67,25 @@ export const DEFAULT_TIMEOUT_MINUTES = 5;
 export const DEFAULT_OBJECT_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_UNKNOWN_ACTION: PolicyAction = "deny";
 
+/**
+ * Semantic auto-pickup confidence (issue #89): the minimum confidence at
+ * which the space agent drafts a confirmable work item. `high` (default)
+ * drafts only direct explicit requests; `medium` also drafts hedged-but-
+ * concrete requests; `low` drafts on any detected actionable intent. Below
+ * the threshold the agent asks first — never silently creates.
+ */
+export type PickupConfidence = "high" | "medium" | "low";
+const DEFAULT_PICKUP_CONFIDENCE: PickupConfidence = "high";
+const PICKUP_CONFIDENCE_VALUES: readonly PickupConfidence[] = ["high", "medium", "low"];
+
+function normalizePickupConfidence(value: unknown): PickupConfidence | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (PICKUP_CONFIDENCE_VALUES as readonly string[]).includes(normalized)
+    ? (normalized as PickupConfidence)
+    : undefined;
+}
+
 /** Tightening order for response modes: always → mention → request-only. */
 const RESPONSE_MODE_STRICTNESS: Record<ResponseMode, number> = {
   always: 0,
@@ -226,6 +245,21 @@ export interface PolicyConfig {
   extensionsDeny: string[];
   /** Org-credential usage (issue #56): `extensions.org_credentials`, default allow; overlay can only tighten. */
   orgCredentials: OrgCredentialsMode;
+  /**
+   * Semantic auto-pickup (issue #89): `work_items.auto_pickup` org-floor
+   * flag, default false. When true, the space agent's guidance recognizes
+   * actionable messages (implement/research/create-issue/file-work/data-work)
+   * and posts a confirmable work-item draft instead of replying only.
+   * Invalid config values disable the flag (fail closed — a typo must never
+   * enable auto-creation).
+   */
+  autoPickup: boolean;
+  /**
+   * Minimum pickup confidence that drafts (issue #89): `work_items.
+   * pickup_confidence`, default high. Below the threshold the agent asks
+   * first; never silently creates.
+   */
+  pickupConfidence: PickupConfidence;
   errors: string[];
   warnings: string[];
 }
@@ -251,6 +285,8 @@ export function defaultPolicy(): PolicyConfig {
     extensionsAllow: [],
     extensionsDeny: [],
     orgCredentials: DEFAULT_ORG_CREDENTIALS,
+    autoPickup: false,
+    pickupConfidence: DEFAULT_PICKUP_CONFIDENCE,
     errors: [],
     warnings: [],
   };
@@ -604,6 +640,35 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       for (const key of Object.keys(entries)) {
         if (key !== "allow" && key !== "deny" && key !== "org_credentials") {
           policy.warnings.push(`extensions.${key}: unknown key ignored`);
+        }
+      }
+    } else if (name === "work_items") {
+      // Semantic auto-pickup (issue #89): an opt-in org-floor flag.
+      // `auto_pickup` invalid values DISABLE the flag with a warning (fail
+      // closed — an operator typo must never enable auto-creation, mirroring
+      // learning.auto_extract); `pickup_confidence` is a behavior knob that
+      // warns and keeps the conservative `high` default.
+      const autoPickup = parseBoolean(scalarOrUndefined(entries.auto_pickup));
+      if (autoPickup !== undefined) {
+        policy.autoPickup = autoPickup;
+      } else if (entries.auto_pickup !== undefined) {
+        policy.autoPickup = false;
+        policy.warnings.push("work_items.auto_pickup: invalid (true|false) — disabled");
+      }
+      const confidence = scalarOrUndefined(entries.pickup_confidence);
+      if (confidence !== undefined) {
+        const level = normalizePickupConfidence(confidence);
+        if (level) {
+          policy.pickupConfidence = level;
+        } else {
+          policy.warnings.push(
+            `work_items.pickup_confidence: invalid value '${confidence}' — using default '${DEFAULT_PICKUP_CONFIDENCE}'`,
+          );
+        }
+      }
+      for (const key of Object.keys(entries)) {
+        if (key !== "auto_pickup" && key !== "pickup_confidence") {
+          policy.warnings.push(`work_items.${key}: unknown key ignored`);
         }
       }
     } else {
