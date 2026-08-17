@@ -2,11 +2,22 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import { evaluatePolicyGate } from "../../policy/gate";
 import type { PolicyConfig } from "../../policy/config";
-import { createEmitter, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions, type DriverEvent, type ModelRole, type ModelRoleSwitchResult } from "./agent-driver";
+import {
+  createEmitter,
+  sessionFilePath,
+  SPACE_AGENT_TOOLS,
+  type AgentDriver,
+  type AgentSessionDriver,
+  type AgentTurnOptions,
+  type DriverEvent,
+  type ModelRole,
+  type ModelRoleSwitchResult,
+} from "./agent-driver";
 
 /**
  * ACP (Agent Client Protocol) driver — the second AgentDriver implementation.
@@ -95,11 +106,58 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
   const args = opts.args ?? ["acp"];
   const sessionTimeoutMs = opts.sessionTimeoutMs ?? 30_000;
   return {
-    async createSession({ spaceId, transcriptDir, onOutput }) {
-      // appendSystemPrompt (issue #55) has no ACP v1 transport field yet —
-      // the OMP driver is the shipped engine and carries the directive.
+    async createSession(options) {
+      const { spaceId, transcriptDir, onOutput, cwd, allowTools, appendSystemPrompt, getPrincipal, getModelSettings } = options;
+      // Honored-or-throws (issue #173): ACP v1 has no tool-restriction
+      // field — the agent's own config governs its surface — so an
+      // allowTools request that NARROWS the space-agent allowlist cannot be
+      // honored and is loudly rejected instead of silently handing out the
+      // full toolset (the #154 fail-open: allowTools: [] meant "zero tools"
+      // but ran everything). The SpaceService default (the full space-agent
+      // allowlist, possibly persona-widened) requests no narrowing and
+      // passes through.
+      if (allowTools !== undefined && SPACE_AGENT_TOOLS.some((tool) => !allowTools.includes(tool))) {
+        throw new Error(
+          `acp driver: unsupported option 'allowTools' — ACP v1 cannot restrict the agent's tool surface below ` +
+            `the space-agent allowlist (requested [${allowTools.join(", ")}]); remove the restriction or use the OMP SDK driver`,
+        );
+      }
+      // Per-space model settings (issue #64) are meaningless here: ACP
+      // sessions cannot switch models mid-session (setModelRole reports
+      // not-supported). Reject loudly rather than drop the option.
+      if (getModelSettings !== undefined) {
+        throw new Error(
+          "acp driver: unsupported option 'getModelSettings' — ACP sessions cannot switch models mid-session " +
+            "(the agent's own config governs there); remove the option or use the OMP SDK driver",
+        );
+      }
+      // Transcript parity (issue #173): materialize the durable space
+      // timeline at the same session-file path the OMP driver uses, so the
+      // transcript contract is driver-independent.
+      const sessionCwd = cwd ?? process.cwd();
       mkdirSync(transcriptDir, { recursive: true });
-      const session = new AcpSessionDriver({ spaceId, command, args, sessionTimeoutMs, onOutput, mcpServers: opts.mcpServers, policy: opts.policy });
+      const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
+      await sessionManager.setSessionFile(sessionFilePath(transcriptDir, spaceId));
+      const session = new AcpSessionDriver({
+        spaceId,
+        command,
+        args,
+        sessionTimeoutMs,
+        onOutput,
+        mcpServers: opts.mcpServers,
+        policy: opts.policy,
+        cwd: sessionCwd,
+        // The request-only directive (issue #55): ACP v1 has no
+        // system-prompt transport field, so the directive rides the first
+        // prompt's text — the only channel that reaches the agent's
+        // context (honored-or-throws, #173).
+        appendSystemPrompt,
+        // The space's current principal (issue #42): ACP reaches memory
+        // through the MCP tools, so the option feeds the permission-gate
+        // actor instead of memory injection — consumed, never silently
+        // dropped (#173).
+        getPrincipal,
+      });
       await session.start();
       return session;
     },
@@ -220,6 +278,21 @@ class AcpSessionDriver implements AgentSessionDriver {
   readonly #emitter = createEmitter<DriverEvent>();
   /** Policy context for session/request_permission; null = transport-only. */
   readonly #policy: AcpPolicyContext | null;
+  /** Session working directory sent in session/new (issue #173: honored, never dropped). */
+  readonly #cwd: string;
+  /**
+   * The request-only directive (issue #55): prepended to the FIRST prompt's
+   * text — ACP v1 has no system-prompt transport field (honored-or-throws,
+   * #173). Absent → prompts pass through unchanged.
+   */
+  readonly #appendSystemPrompt: string | undefined;
+  /**
+   * The space's current principal (issue #42): consumed as the
+   * permission-gate actor fallback — ACP reaches memory through the MCP
+   * tools, so the option feeds policy context instead (honored-or-throws,
+   * #173).
+   */
+  readonly #getPrincipal: (() => string | undefined) | undefined;
   /** ACP-shaped mcpServers entries (session/new payload), space id injected. */
   readonly #mcpServers: Array<{
     name: string;
@@ -236,8 +309,12 @@ class AcpSessionDriver implements AgentSessionDriver {
   #streaming = false;
   #dead = false;
   #disposed = false;
+  /** The first prompt has not been sent yet (appendSystemPrompt rides it). */
+  #firstPrompt = true;
+  /** When a turn runs with silent: true, output is captured but not delivered. */
+  #silentTurn = false;
   /** Messages prompted while a turn was in flight; sent when the turn completes. */
-  #queuedPrompts: Array<{ text: string; principal?: string }> = [];
+  #queuedPrompts: Array<{ text: string; principal?: string; silent?: boolean }> = [];
   /**
    * The principal of the CURRENT turn (issue #152): bound when a turn's
    * prompt is sent, cleared when the turn completes. ACP serializes turns
@@ -257,6 +334,9 @@ class AcpSessionDriver implements AgentSessionDriver {
     onOutput: (spaceId: string, text: string) => void;
     mcpServers?: AcpMcpServerEntry[];
     policy?: AcpPolicyContext;
+    cwd?: string;
+    appendSystemPrompt?: string;
+    getPrincipal?: () => string | undefined;
   }) {
     this.#spaceId = deps.spaceId;
     this.#command = deps.command;
@@ -264,6 +344,9 @@ class AcpSessionDriver implements AgentSessionDriver {
     this.#sessionTimeoutMs = deps.sessionTimeoutMs;
     this.#onOutput = deps.onOutput;
     this.#policy = deps.policy ?? null;
+    this.#cwd = deps.cwd ?? process.cwd();
+    this.#appendSystemPrompt = deps.appendSystemPrompt;
+    this.#getPrincipal = deps.getPrincipal;
     // The MCP server process is spawned by the agent with the session cwd,
     // so the space id is injected per session and path env vars are
     // absolutized here (see toEnvPairs).
@@ -307,7 +390,9 @@ class AcpSessionDriver implements AgentSessionDriver {
       // unconditionally: when the field is absent it crashes with
       // -32603 "undefined is not an object (evaluating 'n.length')" and may
       // never respond, so always send an explicit empty list (issue #17/#18).
-      const created = await this.#request("session/new", { cwd: process.cwd(), mcpServers: this.#mcpServers });
+      // The caller's cwd is honored (issue #173): previously the driver
+      // hardcoded process.cwd() and silently dropped the option.
+      const created = await this.#request("session/new", { cwd: this.#cwd, mcpServers: this.#mcpServers });
       const sessionId = (created as { sessionId?: unknown } | null)?.sessionId;
       if (typeof sessionId !== "string" || !sessionId) {
         throw new Error("ACP agent returned no sessionId from session/new");
@@ -326,15 +411,15 @@ class AcpSessionDriver implements AgentSessionDriver {
     if (this.#streaming) {
       // ACP v1 has no steer primitive; any streamingBehavior (steer/followUp)
       // queues the message and sends it once the in-flight turn completes.
-      // Each queued message becomes its OWN turn, so its principal queues
-      // alongside it (issue #152).
-      this.#queuedPrompts.push({ text, principal: opts?.principal });
+      // Each queued message becomes its OWN turn, so its principal (and
+      // silent flag) queue alongside it (issues #152/#173).
+      this.#queuedPrompts.push({ text, principal: opts?.principal, silent: opts?.silent });
       return;
     }
-    await this.#sendPrompt(text, opts?.principal);
+    await this.#sendPrompt(text, opts?.principal, opts?.silent);
     while (this.#queuedPrompts.length > 0) {
       const next = this.#queuedPrompts.shift()!;
-      await this.#sendPrompt(next.text, next.principal);
+      await this.#sendPrompt(next.text, next.principal, next.silent);
     }
   }
 
@@ -387,21 +472,31 @@ class AcpSessionDriver implements AgentSessionDriver {
     this.#killChild();
   }
 
-  #sendPrompt(text: string, principal?: string): Promise<void> {
+  #sendPrompt(text: string, principal?: string, silent?: boolean): Promise<void> {
     this.#streaming = true;
     // Each ACP prompt is its own turn: bind the inbound principal with it
     // and drop the binding when the turn completes (issue #152).
     this.#turnPrincipal = principal;
+    this.#silentTurn = silent ?? false;
     this.#emitter.emit("turn_start", { spaceId: this.#spaceId });
+    // appendSystemPrompt (issue #55/#173): ACP v1 has no system-prompt
+    // transport field, so the directive rides the FIRST prompt's text —
+    // the only channel that reaches the agent's context. Later prompts of
+    // the session pass through unchanged (cold-start semantics, like OMP).
+    const promptText = this.#firstPrompt && this.#appendSystemPrompt ? `${this.#appendSystemPrompt}\n\n${text}` : text;
+    this.#firstPrompt = false;
     return this.#request("session/prompt", {
       sessionId: this.#sessionId,
-      prompt: [{ type: "text", text }],
+      prompt: [{ type: "text", text: promptText }],
     })
       .then(() => undefined)
       .finally(() => {
         this.#streaming = false;
         this.#turnPrincipal = undefined;
+        // Deliver the buffered message BEFORE clearing the silent flag so a
+        // silent turn never reaches the space surface (issue #173).
         this.#flushBufferedMessage();
+        this.#silentTurn = false;
         this.#emitter.emit("turn_end", { spaceId: this.#spaceId });
       });
   }
@@ -534,7 +629,10 @@ class AcpSessionDriver implements AgentSessionDriver {
         tool: tool ?? String((toolCall as { kind?: unknown } | null)?.kind ?? "unknown"),
         args: acpToolCallArgs(toolCall),
         spaceId: this.#spaceId,
-        actor: policy.actor ?? "agent",
+        // The per-turn principal (#152) wins; the createSession getPrincipal
+        // option (#42) is the space-level fallback — consumed, never
+        // silently dropped (#173). policy.actor stays the final override.
+        actor: this.#turnPrincipal ?? this.#getPrincipal?.() ?? policy.actor ?? "agent",
       },
     );
     this.#answerPermission(id, outcome.allowed, params);
@@ -610,7 +708,10 @@ class AcpSessionDriver implements AgentSessionDriver {
   #deliver(text: string): void {
     const trimmed = text.trim();
     if (!trimmed) return;
-    this.#onOutput(this.#spaceId, trimmed);
+    // Silent turns (digest, #42) skip the output callback but still emit,
+    // so the caller can capture the text without posting it to the space
+    // (issue #173: honored, matching the OMP driver).
+    if (!this.#silentTurn) this.#onOutput(this.#spaceId, trimmed);
     this.#emitter.emit("message", { spaceId: this.#spaceId, text: trimmed });
   }
 }
