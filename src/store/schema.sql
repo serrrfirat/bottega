@@ -163,3 +163,24 @@ CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit
 BEGIN
   SELECT RAISE(ABORT, 'audit is append-only: DELETE not allowed');
 END;
+
+-- Worker → server outbox (epic #170 precondition 2, issue #187): the
+-- consumable signaling channel that replaces scanning the append-only
+-- audit table as a queue. Workers (the executor container, which never
+-- holds Slack tokens) write one row per completed job; the server post
+-- seam consumes rows with indexed watermarked queries and marks them
+-- posted. Audit stays pure evidence; the row id is the dedupe key across
+-- restarts (one id threads enqueue → claim → run → outbox → post).
+CREATE TABLE IF NOT EXISTS outbox (
+  id         TEXT PRIMARY KEY,              -- the job id (one id across the whole lifecycle)
+  kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+  payload    TEXT NOT NULL,                 -- JSON payload (never secrets; the worker has none)
+  space      TEXT,                          -- space id the result belongs to (nullable)
+  status     TEXT NOT NULL DEFAULT 'pending'
+             CHECK (status IN ('pending','posted','failed')),
+  attempts   INTEGER NOT NULL DEFAULT 0,    -- retry bookkeeping; 0 on first write
+  created_at INTEGER NOT NULL,
+  posted_at  INTEGER                        -- set when the consumer marks the row posted
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
+

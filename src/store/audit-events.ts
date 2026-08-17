@@ -158,3 +158,40 @@ export const INGEST_WEBHOOK_REJECTED_EVENT = "ingest.webhook.rejected";
  * (payload {provider, event_type, reason}).
  */
 export const INGEST_POLL_REJECTED_EVENT = "ingest.poll.rejected";
+/**
+ * A worker claim loop took a lease on a job (epic #170): the job moved
+ * from dispatched to claimed (payload {id, kind, space?}; actor = the
+ * worker). Written by the worker on a successful atomic claim.
+ */
+export const JOB_CLAIMED_EVENT = "job.claimed";
+/**
+ * A job completed successfully and its outbox row was written (epic #170):
+ * payload {id, kind, space?}; actor = the worker. Written by the worker
+ * claim loop's completion path, before/with the outbox write.
+ */
+export const JOB_COMPLETED_EVENT = "job.completed";
+/**
+ * A job exhausted its bounded requeue (epic #170): payload {id, kind,
+ * space?, error}; actor = the worker. Terminal — the job is not retried.
+ */
+export const JOB_FAILED_EVENT = "job.failed";
+/**
+ * A job with no live worker within its TTL (epic #170): payload {id, kind,
+ * space?}; actor = system. Emitted by the claim-side unclaimed sweep (a
+ * dispatched job never claimed) and by the outbox nudge (a completed job's
+ * outbox row never consumed within the TTL) — the fail-loud guarantee that
+ * a silently never-posting job surfaces.
+ */
+export const JOB_UNCLAIMED_EVENT = "job.unclaimed";
+/**
+ * An outbox row was posted by the server post seam (epic #170): payload
+ * {id, kind, space?}; actor = the server. Written after the seam's
+ * external post succeeds; the outbox row itself is the dedupe key.
+ */
+export const OUTBOX_POSTED_EVENT = "outbox.posted";
+/**
+ * An outbox row could not be posted by the server post seam (epic #170):
+ * payload {id, kind, space?, error}; actor = the server. Written when the
+ * seam's external post fails.
+ */
+export const OUTBOX_FAILED_EVENT = "outbox.failed";
