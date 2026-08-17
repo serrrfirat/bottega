@@ -396,6 +396,69 @@ describe("work items", () => {
     s2.close();
   });
 
+  test("the model-pin columns migration is idempotent on a pre-#185 database", async () => {
+    const dbPath = join(dir, "store-pre-pin.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE spaces (
+        id          TEXT PRIMARY KEY,
+        platform    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        name        TEXT,
+        policy_json TEXT NOT NULL DEFAULT '{}',
+        settings    TEXT NOT NULL DEFAULT '{}',
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+      CREATE TABLE work_items (
+        id           TEXT PRIMARY KEY,
+        space_id     TEXT NOT NULL REFERENCES spaces(id),
+        requester    TEXT NOT NULL,
+        description  TEXT NOT NULL,
+        repo         TEXT,
+        delivery     TEXT NOT NULL DEFAULT 'git'
+                     CHECK (delivery IN ('git','extension','chat')),
+        state        TEXT NOT NULL DEFAULT 'open'
+                     CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
+        approvals    TEXT NOT NULL DEFAULT '[]',
+        evidence     TEXT NOT NULL DEFAULT '[]',
+        result       TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+      );
+      INSERT INTO spaces (id, platform, channel_id, policy_json, settings, created_at, updated_at)
+      VALUES ('slack:prepin', 'slack', 'prepin', '{}', '{}', 1, 1);
+      INSERT INTO work_items
+        (id, space_id, requester, description, repo, delivery, state, approvals, evidence, result, created_at, updated_at)
+      VALUES ('wi_prepin', 'slack:prepin', 'U1', 'existing work', NULL, 'git', 'open', '[]', '[]', NULL, 1, 1);
+    `);
+    legacy.close();
+
+    // First open migrates the pin columns; existing rows backfill to null.
+    const s1 = createStore(dbPath);
+    const columns = s1.getDb().query("PRAGMA table_info(work_items)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(["model", "reasoning_effort"]));
+    expect((await s1.getWorkItem("wi_prepin"))?.model).toBeNull();
+    expect((await s1.getWorkItem("wi_prepin"))?.reasoning_effort).toBeNull();
+    // A pinned item round-trips through the migrated schema.
+    const space = await s1.getOrCreateSpace({ platform: "slack", channel_id: "prepin2" });
+    const pinned = await s1.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "pinned",
+      model: "deepseek-v4-flash",
+      reasoning_effort: "low",
+    });
+    expect(pinned.model).toBe("deepseek-v4-flash");
+    expect(pinned.reasoning_effort).toBe("low");
+    s1.close();
+
+    // Second open is a no-op (idempotent).
+    const s2 = createStore(dbPath);
+    expect((await s2.getWorkItem(pinned.id))?.reasoning_effort).toBe("low");
+    s2.close();
+  });
+
   test("createWorkItem rejects an unknown space (foreign key)", async () => {
     const s = freshStore();
     await expect(

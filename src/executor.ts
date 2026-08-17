@@ -22,20 +22,38 @@
  *
  * Git delivery approval contract: after the PR is opened the executor writes a
  * `work_item.delivery_pending` audit marker, then calls the `onDelivery`
- * seam. The server hook (follow-up, TODO in src/server) posts the PR + an
- * approval request to the space channel and resolves with the human's
- * decision; the executor then records `working → review` with that approval
- * and completes `review → done` (the legal map requires a recorded approval
- * on review, and result.pr_url on done). Without a wired hook the executor
- * logs and waits — the item stays `working` until the space decides or
- * stale recovery blocks it on restart.
+ * seam. The server posts the PR + an interactive approve/deny prompt (the
+ * delivery poller), records the human's decision as `delivery.resolved`
+ * (the delivery router), and the executor's default onDelivery wait reads
+ * that row as the approval (issue #149); the executor then records
+ * `working → review` with that approval and completes `review → done` (the
+ * legal map requires a recorded approval on review, and result.pr_url on
+ * done). The default wait is the real hook — the audit trail is the
+ * cross-process channel to the server. Headless/executor-only runs with no
+ * server to resolve the request fail closed: the wait times out (the
+ * stale-run window) and denies, landing the item in `blocked` instead of
+ * hanging at `working` forever.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
-import { DELIVERY_COMPLETED_EVENT, DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
+import { recoverStaleWorkItems, type Store, type SpaceModelSettings, type WorkItem } from "./store/db";
+import {
+  DELIVERY_COMPLETED_EVENT,
+  DELIVERY_PENDING_EVENT,
+  DELIVERY_RESOLVED_EVENT,
+  WORK_ITEM_FAILED_EVENT,
+  WORK_ITEM_PIN_APPLIED_EVENT,
+} from "./store/audit-events";
 import { DenyRouter } from "./policy/approval-router";
-import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver, type AgentSessionDriver } from "./server/drivers/agent-driver";
+import {
+  assertAgentDirModelAvailable,
+  createOmpSdkDriver,
+  ensureAgentDirModelPin,
+  OMP_CONFIG_TEMPLATE,
+  type AgentDriver,
+  type AgentSessionDriver,
+  type ModelRole,
+} from "./server/drivers/agent-driver";
 import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -366,11 +384,14 @@ async function extensionWorkerPath(
     throw new Error("extension worker tools are not configured");
   }
   const allowTools = [...toolset.memoryTools, ...toolset.extensionTools].map((tool) => tool.name);
+  // Issue #185: the pin-merged settings apply to extension deliveries too.
+  const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
   const session = await (await deps.driver).createSession({
     spaceId: item.space_id,
     transcriptDir: join(cfg.transcriptDir, item.id),
     allowTools,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] extension agent: ${text}`),
+    getModelSettings: async () => sessionSettings,
   });
   let finalOutput = "";
   let sessionError: Error | null = null;
@@ -383,6 +404,7 @@ async function extensionWorkerPath(
     sessionError = new Error(typeof text === "string" ? text : "extension worker session error");
   });
   try {
+    await applyWorkItemModelPin(deps, item, session);
     await promptExtensionWorker(
       session,
       [
@@ -509,18 +531,84 @@ async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string,
   await git(["config", "user.email", "executor@bottega.invalid"], { cwd: workspace });
 }
 
+/**
+ * The execution session's model/effort for a work item (issue #185):
+ * task pin > space settings > defaults. The pin's explicit model id and
+ * effort override the space's settings; a role ref keeps the space slot
+ * indirection (its concrete model resolves at execution via the settings
+ * below). Unpinned items get the space settings unchanged — the session
+ * runs on its agent-dir default unless a pin applies.
+ */
+async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Promise<SpaceModelSettings> {
+  const settings = await store.getSpaceSettings(item.space_id);
+  if (item.model === null && item.reasoning_effort === null) return settings;
+  return {
+    ...settings,
+    ...(item.reasoning_effort !== null ? { reasoning_effort: item.reasoning_effort } : {}),
+    ...(item.model !== null && item.model !== "fast" && item.model !== "reasoning" ? { model: item.model } : {}),
+  };
+}
+
+/**
+ * The role switch that applies the item's pin (issue #185): a role ref
+ * switches its own slot; an explicit model id rides the "default" role
+ * against the pin-merged settings (resolveRoleTarget's default slot is
+ * `model`, which the pin overrides). null = no pin → no switch; the
+ * session keeps its default.
+ */
+function pinSwitchRole(item: WorkItem): ModelRole | null {
+  if (item.model === "fast" || item.model === "reasoning") return item.model;
+  if (item.model !== null || item.reasoning_effort !== null) return "default";
+  return null;
+}
+
+/**
+ * Applies the item's model/effort pin to the execution session BEFORE its
+ * first prompt and audits what was applied (issue #185): the resolved
+ * model id, thinking level, and whether the switch applied. The session
+ * must have been created with getModelSettings resolving the pin-merged
+ * settings (resolveWorkItemSessionSettings). A driver without the
+ * setModelRole hook reports applied: false — never a silent claim.
+ */
+async function applyWorkItemModelPin(
+  deps: ExecutorDeps,
+  item: WorkItem,
+  session: AgentSessionDriver,
+): Promise<void> {
+  const role = pinSwitchRole(item);
+  if (role === null) return;
+  const result = await session.setModelRole?.(role);
+  await deps.store.appendAudit({
+    space_id: item.space_id,
+    actor: "executor",
+    event_type: WORK_ITEM_PIN_APPLIED_EVENT,
+    payload: JSON.stringify({
+      id: item.id,
+      role,
+      model: result?.model ?? null,
+      thinking_level: result?.thinking_level ?? null,
+      applied: result?.applied ?? false,
+      by: "executor",
+    }),
+  });
+}
+
 async function runAgentSession(
   deps: ExecutorDeps,
   cfg: ExecutorConfig,
   item: WorkItem,
   workspace: string,
 ): Promise<string> {
+  // Issue #185: the session resolves roles against the pin-merged settings
+  // (task pin > space settings > defaults) so the pin applies cleanly.
+  const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
   const session = await (await deps.driver).createSession({
     spaceId: item.id,
     transcriptDir: cfg.transcriptDir,
     cwd: workspace,
     allowTools: EXECUTOR_TOOLS,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] agent: ${text}`),
+    getModelSettings: async () => sessionSettings,
   });
   let summary = "";
   let sessionError: Error | null = null;
@@ -533,6 +621,7 @@ async function runAgentSession(
     sessionError = new Error(typeof text === "string" ? text : "agent session error");
   });
   try {
+    await applyWorkItemModelPin(deps, item, session);
     await session.prompt(
       [
         `You are an autonomous work executor for bottega (work item ${item.id}, space ${item.space_id}).`,

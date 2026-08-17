@@ -31,8 +31,15 @@ CREATE TABLE IF NOT EXISTS work_items (
   description  TEXT NOT NULL,
   repo         TEXT,                     -- owner/repo the agent derived from the conversation (issue #47);
                                          -- null = not specified (executor blocks and asks the requester)
+  pr_url       TEXT,                     -- existing-PR conflict-resolution job shape (issue #186): when set on a
+                                         -- git item, the executor rebases the PR's branch onto base_branch,
+                                         -- resolves conflicts, and force-with-lease pushes instead of opening a PR
+  pr_branch    TEXT,                     -- head branch of the PR to rebase/resolve/push (issue #186)
+  base_branch  TEXT,                     -- branch the PR branch is rebased onto; default 'main' (issue #186)
   delivery     TEXT NOT NULL DEFAULT 'git'
                CHECK (delivery IN ('git','extension','chat')), -- delivery-neutral work kind (issue #128)
+  model        TEXT,  -- per-task model pin (issue #185): role ref ('fast'|'reasoning') or a resolved available model id
+  reasoning_effort TEXT CHECK (reasoning_effort IN ('off','low','medium','high')), -- pinned thinking effort (issue #185)
   state        TEXT NOT NULL DEFAULT 'open'
                CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
   approvals    TEXT NOT NULL DEFAULT '[]',-- JSON array of {approver, at}

@@ -16,11 +16,12 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, type Store, type WorkItem, type WorkItemState } from "./store/db";
+import { createStore, type SpaceModelSettings, type Store, type WorkItem, type WorkItemState } from "./store/db";
 import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
   EXTENSION_CALL_EVENT,
+  WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "./store/audit-events";
 import {
@@ -42,20 +43,34 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } f
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./server/drivers/agent-driver";
+import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
 
 // --- Fakes ------------------------------------------------------------------
 
 /** Session driver double: records createSession opts, streams one canned message per prompt. */
 class FakeSession implements AgentSessionDriver {
   prompts: string[] = [];
+  /** setModelRole calls with the settings the session would resolve them against (issue #185). */
+  readonly setModelRoleCalls: Array<{ role: ModelRole; settings: SpaceModelSettings }> = [];
   constructor(
-    readonly opts: { spaceId: string; transcriptDir: string; cwd: string; allowTools: readonly string[] },
+    readonly opts: {
+      spaceId: string;
+      transcriptDir: string;
+      cwd: string;
+      allowTools: readonly string[];
+      getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    },
     private readonly failure: Error | null,
     private readonly emittedError: string | null,
     private readonly messageText: string,
     private readonly onPrompt: (() => Promise<void>) | null,
   ) {}
+
+  async setModelRole(role: ModelRole): Promise<ModelRoleSwitchResult> {
+    const settings = (await this.opts.getModelSettings?.(this.opts.spaceId)) ?? {};
+    this.setModelRoleCalls.push({ role, settings });
+    return { applied: true, role, model: settings.model ?? null, thinking_level: settings.reasoning_effort ?? null };
+  }
 
   async prompt(text: string, _opts?: AgentTurnOptions): Promise<void> {
     this.prompts.push(text);
@@ -97,6 +112,7 @@ class FakeDriver implements AgentDriver {
     onOutput: (spaceId: string, text: string) => void;
     cwd?: string;
     allowTools?: readonly string[];
+    getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
   }): Promise<AgentSessionDriver> {
     const session = new FakeSession(
       {
@@ -104,6 +120,7 @@ class FakeDriver implements AgentDriver {
         transcriptDir: opts.transcriptDir,
         cwd: opts.cwd ?? process.cwd(),
         allowTools: opts.allowTools ?? [],
+        getModelSettings: opts.getModelSettings,
       },
       this.failure,
       this.emittedError,
@@ -904,6 +921,124 @@ describe("delivery routing (issue #129)", () => {
     }
   });
 });
+
+describe("per-task model pin (issue #185)", () => {
+  test("the execution session runs on the pinned model + effort (pin beats space settings)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN1" });
+      // The space prefers a slow model at high effort; the pin must win.
+      await fx.store.updateSpaceSettings(space.id, { model: "glm-5.1", reasoning_effort: "high" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "pinned work",
+        repo: "acme/sandbox",
+        model: "deepseek-v4-flash",
+        reasoning_effort: "low",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      // The session resolved the pin via the "default" role against
+      // settings merged with the pin (task pin > space settings).
+      const session = fx.driver.sessions[0]!;
+      expect(session.setModelRoleCalls).toEqual([
+        { role: "default", settings: { model: "deepseek-v4-flash", reasoning_effort: "low" } },
+      ]);
+
+      // The application was audited with the resolved model + effort.
+      const pinAudits = await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT });
+      expect(pinAudits).toHaveLength(1);
+      expect(JSON.parse(pinAudits[0]!.payload)).toEqual({
+        id: item.id,
+        role: "default",
+        model: "deepseek-v4-flash",
+        thinking_level: "low",
+        applied: true,
+        by: "executor",
+      });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a role-ref pin switches that slot through the space's settings", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN2" });
+      await fx.store.updateSpaceSettings(space.id, {
+        model: "glm-5.1",
+        fast_model: "flash-lite",
+        reasoning_effort: "high",
+      });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "fast work",
+        repo: "acme/sandbox",
+        model: "fast",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0]!;
+      expect(session.setModelRoleCalls).toEqual([
+        {
+          role: "fast",
+          settings: { model: "glm-5.1", fast_model: "flash-lite", reasoning_effort: "high" },
+        },
+      ]);
+      const pinAudits = await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT });
+      expect(JSON.parse(pinAudits[0]!.payload)).toMatchObject({ id: item.id, role: "fast", by: "executor" });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an effort-only pin applies the effort without a model switch", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN3" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "high effort work",
+        repo: "acme/sandbox",
+        reasoning_effort: "high",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0]!;
+      // No space model configured: the default role resolves to effort only.
+      expect(session.setModelRoleCalls).toEqual([{ role: "default", settings: { reasoning_effort: "high" } }]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an unpinned item does not switch the model (no pin, no switch)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN4" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "plain work",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      expect(fx.driver.sessions[0]!.setModelRoleCalls).toEqual([]);
+      expect(await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
 describe("org config parsing (issue #33)", () => {
   test("trailing comments and quoted repo entries parse to the correct allowlist and git base", async () => {
     const fx = makeFixture();

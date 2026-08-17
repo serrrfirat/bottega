@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
 import { defaultPolicy } from "../policy/config";
+import type { ModelCatalogEntry } from "../models/model-pin";
 import { createWorkItemArgsSchema, parseGithubIssueUrl, workItemsExtension } from "./work-items";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-tools-"));
@@ -20,7 +21,10 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function loadTools(store: Store, opts?: { actor?: string }): ToolDefinition[] {
+function loadTools(
+  store: Store,
+  opts?: { actor?: string; agentDir?: string; listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]> },
+): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
   workItemsExtension(store, { orgPolicy: defaultPolicy(), ...opts })(pi);
@@ -347,6 +351,164 @@ describe("create_work_item", () => {
     const res2 = await createTool.execute("tc1", { description: "   " }, undefined, undefined, ctxFor(space.id));
     expect(res2.isError).toBe(true);
     expect(resultText(res2)).toMatch(/empty/);
+  });
+});
+
+describe("create_work_item model pin (issue #185)", () => {
+  const catalog: ModelCatalogEntry[] = [
+    { id: "gpt-sol-5.6", name: "GPT-Sol 5.6", provider: "opencode-go" },
+    { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },
+  ];
+
+  test("stores a role-ref + effort pin on the item and audits it at creation", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN1" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "fast task at low effort", model: "fast", reasoning_effort: "low" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.model).toBe("fast");
+    expect(item?.reasoning_effort).toBe("low");
+    // The response echoes the pin so the agent can confirm what was stored.
+    expect(JSON.parse(resultText(res))).toMatchObject({ model: "fast", reasoning_effort: "low" });
+    const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({
+      id: item!.id,
+      requester: "agent",
+      model: "fast",
+      reasoning_effort: "low",
+    });
+  });
+
+  test("resolves a friendly model name to the available model id at creation", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN2" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "gpt task", model: "gpt sol" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    // The RESOLVED id is stored — execution never re-interprets the name.
+    expect(item?.model).toBe("gpt-sol-5.6");
+    expect(JSON.parse(resultText(res))).toMatchObject({ model: "gpt-sol-5.6" });
+  });
+
+  test("resolves 'deepseek v4' to the deepseek model id", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN3" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "deepseek task", model: "deepseek v4" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.model).toBe("deepseek-v4-flash");
+  });
+
+  test("an unresolvable model name fails closed with candidates and creates nothing", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN4" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "ghost task", model: "gibberish" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    const text = resultText(res);
+    expect(text).toContain("matches no available model");
+    expect(text).toContain("deepseek-v4-flash");
+    expect(text).toContain("gpt-sol-5.6");
+    // Fail closed: no work item was created, nothing audited.
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+
+  test("an unavailable explicit model id fails closed", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN5" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "ghost task", model: "ghost-model" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("ghost-model");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+
+  test("an ambiguous name fails closed listing the candidates (the agent can clarify)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN6" });
+    const withTwoGptModels = [...catalog, { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" }];
+    const [createTool] = loadTools(s, { listModels: async () => withTwoGptModels });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "ambiguous", model: "gpt" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    const text = resultText(res);
+    expect(text).toContain("ambiguous");
+    expect(text).toContain("gpt-sol-5.6");
+    expect(text).toContain("gpt-5.6-luna");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+
+  test("a whitespace-only model is rejected", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN7" });
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc1",
+      { description: "blank model", model: "   " },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("must not be empty");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+
+  test("an unpinned item keeps null pins and the compact audit payload", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN8" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "no pin" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.model).toBeNull();
+    expect(item?.reasoning_effort).toBeNull();
+    const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent" });
   });
 });
 
