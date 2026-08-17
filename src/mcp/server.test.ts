@@ -940,7 +940,7 @@ describe("MCP server extension surface (in-process deps)", () => {
           listModels: internal.listModels,
         }),
         ...schedulerToolDefinitions(h.store, h.audit, internal.schedulerRegistry!),
-        ...kbToolDefinitions({ memoryProvider: h.provider, audit: h.audit, config: internal.kb! }),
+        ...kbToolDefinitions({ store: h.store, config: internal.kb! }),
       ].filter((definition) => definition.name !== "use_model");
 
       const advertisedByName: Record<string, (typeof tools)[number]> = Object.fromEntries(

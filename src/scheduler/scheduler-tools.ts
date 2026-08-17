@@ -12,7 +12,7 @@ import { parseCron } from "./cron";
 import type { SchedulerActionRegistry } from "./types";
 
 export const createSchedulerJobArgsSchema = z.object({
-  action: z.enum(["standup_digest", "reflection", "org_pulse", "recurring_work", "ingest_poll"]),
+  action: z.enum(["standup_digest", "reflection", "org_pulse", "recurring_work", "ingest_poll", "kb_ingest"]),
   cron: z.string(),
   params: z.record(z.string(), z.string()).optional(),
   space: z.string().optional(),

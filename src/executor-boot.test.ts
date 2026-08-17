@@ -138,6 +138,7 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       let driver: ExecutorDeps["driver"];
       const deps: ExecutorDeps = {
         store: boot.runtime.store,
+        memoryProvider: boot.runtime.memoryProvider,
         get driver() {
           return (driver ??= boot.getDriver());
         },

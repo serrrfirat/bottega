@@ -8,7 +8,7 @@
  * authenticated user resolved from the Bearer token, which is how the
  * "token from the FILE, never env" contract is asserted.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
@@ -27,6 +27,7 @@ import {
   JOB_COMPLETED_EVENT,
   JOB_FAILED_EVENT,
   JOB_UNCLAIMED_EVENT,
+  MEMORY_WRITE_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "./store/audit-events";
@@ -51,6 +52,7 @@ import {
   type SlackAdapter,
 } from "./server/adapters/slack";
 import { createAudit } from "./policy/audit";
+import { createSqliteMemoryProvider } from "./memory/sqlite";
 import { DenyRouter } from "./policy/approval-router";
 import { defaultPolicy } from "./policy/config";
 import { createExtensionRuntime, type ExtensionRuntime } from "./extensions/runtime";
@@ -302,6 +304,7 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
 function makeDeps(fx: Fixture, overrides: Partial<ExecutorDeps> = {}): ExecutorDeps {
   return {
     store: fx.store,
+    memoryProvider: resolveMemoryProvider(fx.store.getOrgSettings(), fx.store.getDb()),
     driver: fx.driver,
     orgConfigDir: fx.orgConfigDir,
     transcriptDir: fx.transcriptsDir,
@@ -1472,9 +1475,11 @@ describe("worker job envelope (epic #170)", () => {
     }
   });
 
-  test("kb and scheduled kinds route to fail-closed stubs — never a silent no-op (epic #170)", async () => {
+  test("kb jobs refuse undeclared hosts and scheduled stays a fail-closed stub — never a silent no-op (epic #170)", async () => {
     const fx = makeFixture();
     try {
+      // The committed config/kb.yml declares NO sources, so a kb dispatch
+      // naming an undeclared host must be refused before any fetch.
       await fx.store.enqueueJob({ id: "kb_job_1", kind: "kb", payload: { url: "https://example.com/page" } });
       await fx.store.enqueueJob({ id: "sched_job_1", kind: "scheduled", payload: { action: "standup_digest" } });
 
@@ -1494,7 +1499,12 @@ describe("worker job envelope (epic #170)", () => {
       const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
       const payloads = failed.map((row) => JSON.parse(row.payload));
       expect(payloads).toContainEqual(
-        expect.objectContaining({ id: "kb_job_1", kind: "kb", attempts: 1, error: expect.stringContaining("kb job kind is not implemented") }),
+        expect.objectContaining({
+          id: "kb_job_1",
+          kind: "kb",
+          attempts: 1,
+          error: expect.stringContaining("kb job refused: host example.com is not in the declared KB source hosts"),
+        }),
       );
       expect(payloads).toContainEqual(
         expect.objectContaining({ id: "sched_job_1", kind: "scheduled", attempts: 1 }),
@@ -1506,6 +1516,191 @@ describe("worker job envelope (epic #170)", () => {
     } finally {
       fx.cleanup();
     }
+  });
+
+  // --- kb job kind (epic #170 Wave 2): the real ingest as a claimed job ---
+
+  /** Local stub source for the kb worker's hermetic fetch (BOTTEGA_KB_BASE_URL). */
+  const kbSourceStub = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/handbook") {
+        return new Response(
+          "<html><body><h1>Company Handbook</h1><p>Remote work is supported.</p></body></html>",
+          { headers: { "content-type": "text/html; charset=utf-8" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  afterAll(() => kbSourceStub.stop(true));
+
+  /** Writes a temp config/kb.yml declaring one source; returns the temp root. */
+  function declaredKbConfig(): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-kb-job-"));
+    mkdirSync(join(dir, "config"));
+    writeFileSync(
+      join(dir, "config", "kb.yml"),
+      "sources:\n  - id: handbook\n    url: https://docs.example.com/handbook\n    type: html\n",
+    );
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  /** Points the kb worker's config + fetch base at the hermetic test env for `fn`. */
+  async function withKbEnv<T>(configDir: string, baseUrl: string, fn: () => Promise<T>): Promise<T> {
+    const savedConfigDir = process.env.BOTTEGA_CONFIG_DIR;
+    const savedBaseUrl = process.env.BOTTEGA_KB_BASE_URL;
+    process.env.BOTTEGA_CONFIG_DIR = configDir;
+    process.env.BOTTEGA_KB_BASE_URL = baseUrl;
+    try {
+      return await fn();
+    } finally {
+      if (savedConfigDir === undefined) delete process.env.BOTTEGA_CONFIG_DIR;
+      else process.env.BOTTEGA_CONFIG_DIR = savedConfigDir;
+      if (savedBaseUrl === undefined) delete process.env.BOTTEGA_KB_BASE_URL;
+      else process.env.BOTTEGA_KB_BASE_URL = savedBaseUrl;
+    }
+  }
+
+  describe("kb job kind — the real ingest as a claimed job (epic #170 Wave 2)", () => {
+    test("enqueue → claim → run: fetches the declared source, stores chunks, completes + posts the outbox row", async () => {
+      const fx = makeFixture();
+      const kb = declaredKbConfig();
+      try {
+        await withKbEnv(kb.dir, kbSourceStub.url.origin, async () => {
+          await fx.store.enqueueJob({
+            id: "kb_handbook_job",
+            kind: "kb",
+            payload: { url: "https://docs.example.com/handbook" },
+          });
+
+          const ac = new AbortController();
+          const run = runExecutor(
+            makeDeps(fx, { maxJobAttempts: 1, jobBackoffMs: 1, jobBackoffMaxMs: 2, pollIntervalMs: 10 }),
+            ac.signal,
+          );
+          try {
+            await waitForJobStatus(fx.store, "kb_handbook_job", "completed");
+          } finally {
+            ac.abort();
+            await run;
+          }
+
+          // The completion is on the audit trail, keyed by the envelope id.
+          const completed = await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT });
+          expect(JSON.parse(completed[0].payload)).toMatchObject({
+            id: "kb_handbook_job",
+            kind: "kb",
+            state: "completed",
+            result: { url: "https://docs.example.com/handbook", chunks: expect.any(Number), saved: expect.any(Number) },
+          });
+
+          // The worker→server signal: one outbox row carrying the result.
+          const { rows } = consumeOutboxWatermarked(fx.store);
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({ id: "kb_handbook_job", kind: "kb", space: null });
+          const outboxPayload = z
+            .object({ state: z.string(), result: z.object({ url: z.string(), saved: z.number() }) })
+            .safeParse(JSON.parse(rows[0].payload));
+          expect(outboxPayload.success).toBe(true);
+          if (!outboxPayload.success) throw new Error(`unexpected outbox payload: ${outboxPayload.error.message}`);
+          expect(outboxPayload.data.state).toBe("completed");
+          expect(outboxPayload.data.result.url).toBe("https://docs.example.com/handbook");
+          expect(outboxPayload.data.result.saved).toBeGreaterThanOrEqual(1);
+
+          // The parsed content actually landed in org memory with source metadata.
+          const memories = await createSqliteMemoryProvider(fx.store.getDb()).search({
+            query: "",
+            scope: "org",
+            metadata: { kind: "kb", source: "handbook" },
+            limit: 20,
+          });
+          expect(memories.length).toBeGreaterThanOrEqual(1);
+          expect(memories[0]!.content).toContain("Remote work is supported.");
+          const writes = await fx.store.listAudit({ event_type: MEMORY_WRITE_EVENT });
+          expect(writes.length).toBeGreaterThanOrEqual(1);
+          expect(writes[0]!.actor).toBe("kb_ingest");
+        });
+      } finally {
+        kb.cleanup();
+        fx.cleanup();
+      }
+    });
+
+    test("a malformed kb payload fails the job with the schema reason", async () => {
+      const fx = makeFixture();
+      try {
+        await fx.store.enqueueJob({ id: "kb_malformed", kind: "kb", payload: { url: 42 } });
+
+        const ac = new AbortController();
+        const run = runExecutor(
+          makeDeps(fx, { maxJobAttempts: 1, jobBackoffMs: 1, jobBackoffMaxMs: 2, pollIntervalMs: 10 }),
+          ac.signal,
+        );
+        try {
+          await waitForJobStatus(fx.store, "kb_malformed", "failed");
+        } finally {
+          ac.abort();
+          await run;
+        }
+
+        const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+        expect(JSON.parse(failed[0].payload)).toMatchObject({
+          id: "kb_malformed",
+          kind: "kb",
+          attempts: 1,
+          error: expect.stringContaining("payload must be { url }"),
+        });
+        expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+        expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
+      } finally {
+        fx.cleanup();
+      }
+    });
+
+    test("an undeclared host is refused before any fetch even when a source is declared", async () => {
+      const fx = makeFixture();
+      const kb = declaredKbConfig();
+      try {
+        await withKbEnv(kb.dir, kbSourceStub.url.origin, async () => {
+          // docs.example.com is declared; evil.example.com is not — refused.
+          await fx.store.enqueueJob({
+            id: "kb_evil",
+            kind: "kb",
+            payload: { url: "https://evil.example.com/handbook" },
+          });
+
+          const ac = new AbortController();
+          const run = runExecutor(
+            makeDeps(fx, { maxJobAttempts: 1, jobBackoffMs: 1, jobBackoffMaxMs: 2, pollIntervalMs: 10 }),
+            ac.signal,
+          );
+          try {
+            await waitForJobStatus(fx.store, "kb_evil", "failed");
+          } finally {
+            ac.abort();
+            await run;
+          }
+
+          const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+          expect(JSON.parse(failed[0].payload)).toMatchObject({
+            id: "kb_evil",
+            kind: "kb",
+            attempts: 1,
+            error: expect.stringContaining("kb job refused: host evil.example.com is not in the declared KB source hosts"),
+          });
+          // No fetch happened: nothing was parsed or stored.
+          expect(await fx.store.listAudit({ event_type: MEMORY_WRITE_EVENT })).toHaveLength(0);
+          expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
+        });
+      } finally {
+        kb.cleanup();
+        fx.cleanup();
+      }
+    });
   });
 
   test("a failing job requeues with bounded backoff and fails closed at max attempts", async () => {

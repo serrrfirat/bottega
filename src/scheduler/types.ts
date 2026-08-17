@@ -21,7 +21,7 @@ import type { PolicyConfig } from "../policy/config";
  * scheduled action is a statically known handler. Add a name here + a
  * handler in the registry the server builds.
  */
-export type SchedulerActionName = "standup_digest" | "reflection" | "org_pulse" | "recurring_work" | "ingest_poll";
+export type SchedulerActionName = "standup_digest" | "reflection" | "org_pulse" | "recurring_work" | "ingest_poll" | "kb_ingest";
 
 /**
  * A durable scheduler job (issue #86). Stored in the `scheduler_jobs`

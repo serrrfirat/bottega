@@ -23,6 +23,7 @@ import { standupDigestAction } from "../scheduler/standup";
 import { reflectionAction } from "../scheduler/reflection";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { kbIngestAction } from "../scheduler/kb-ingest";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
@@ -224,19 +225,26 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // A malformed settings blob fails the boot closed (getOrgSettings
   // throws; loadOrgPolicy fails the policy closed).
   const orgSettings = store.getOrgSettings();
+  // The DECLARED KB sources (config/kb.yml) — one load shared by the
+  // scheduled refresh action and the manual tool's dispatch scope. A
+  // deployment without a readable kb.yml fails the boot closed (the tool
+  // and the action are inert without a declared set).
+  const kbConfig = loadKbConfig();
   const schedulerRegistry = buildRegistry([
     standupDigestAction,
     reflectionAction,
     orgPulseAction,
     recurringWorkAction,
+    // Scheduled KB refresh (epic #170 Wave 2): dispatches kind=kb worker
+    // jobs; the containerized worker ingests, never this process.
+    kbIngestAction(kbConfig),
     // Ingest polling leg (issue #57): scheduled with a durable
     // "ingest_poll" job (create_scheduler_job, params.space = target).
     createIngestPollAction(),
   ]);
   const kbDeps: KbToolDependencies = {
-    memoryProvider,
-    audit,
-    config: loadKbConfig(),
+    store,
+    config: kbConfig,
   };
   opts.onExtensionSurfaces?.(extensionSurfaces);
   /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */

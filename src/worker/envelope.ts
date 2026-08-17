@@ -45,9 +45,10 @@ export interface WorkerJob {
 export const workItemJobPayloadSchema = z.object({ workItemId: z.string() });
 
 /**
- * The kb envelope payload (Wave 2): the ingest request. Parsed strictly
- * enough to fail closed on a malformed dispatch; Wave 2 widens it to the
- * full ingest contract (source hosts from config).
+ * The kb envelope payload (Wave 2): the ingest request. The URL names a
+ * source DECLARED in config/kb.yml — the worker resolves the source from
+ * the declared set and refuses any URL whose host is not declared (egress
+ * scope). Parsed strictly enough to fail closed on a malformed dispatch.
  */
 export const kbJobPayloadSchema = z.object({ url: z.string() }).passthrough();
 

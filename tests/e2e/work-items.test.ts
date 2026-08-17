@@ -38,6 +38,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { bootHarness, type Harness, type StubTurn } from "./harness";
 import { runExecutor, type DeliveryApproval, type DeliveryInfo } from "../../src/executor";
+import { resolveMemoryProvider } from "../../src/server/memory-provider";
 import { startDeliveryPoller } from "../../src/server/services/delivery-poller";
 import { buildApprovalBlocks } from "../../src/server/adapters/approval-router";
 import { APPROVE_ACTION_ID, type SlackAction } from "../../src/server/adapters/slack";
@@ -236,6 +237,7 @@ function startExecutor(
   const run = runExecutor(
     {
       store: harness.store,
+      memoryProvider: resolveMemoryProvider(harness.store.getOrgSettings(), harness.store.getDb()),
       driver: harness.driver,
       transcriptDir: harness.transcriptDir,
       pollIntervalMs: 10,

@@ -116,6 +116,7 @@ import { createIngestPollAction } from "../ingest/poll-action";
 import { loadKbConfig, type KbConfig } from "../kb/config";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { kbIngestAction } from "../scheduler/kb-ingest";
 import { reflectionAction } from "../scheduler/reflection";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
 import { standupDigestAction } from "../scheduler/standup";
@@ -577,7 +578,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           ? schedulerToolDefinitions(opts.internal.store, opts.audit, opts.internal.schedulerRegistry)
           : []),
         ...(opts.internal.kb !== undefined
-          ? kbToolDefinitions({ memoryProvider: opts.provider, audit: opts.audit, config: opts.internal.kb })
+          ? kbToolDefinitions({ store: opts.internal.store, config: opts.internal.kb })
           : []),
       ]
         // ACP sessions cannot switch models mid-session (the agent's own
@@ -913,6 +914,7 @@ export async function bootMemoryMcpServer(opts: {
         orgPulseAction,
         recurringWorkAction,
         createIngestPollAction(),
+        ...(kb !== undefined ? [kbIngestAction(kb)] : []),
       ]),
       ...(kb !== undefined ? { kb } : undefined),
     },

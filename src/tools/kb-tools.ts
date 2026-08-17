@@ -1,15 +1,15 @@
-/** Administrative knowledge-base ingestion tool (issue #91). */
-import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+/** Administrative knowledge-base ingestion tool (issue #91, epic #170 Wave 2). */
+import type { AgentToolResult, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
-import type { MemoryProvider } from "../memory/types";
-import type { AuditModule } from "../policy/audit";
 import type { KbConfig } from "../kb/config";
-import { ingestAll, ingestSource } from "../kb/ingest";
+import { dispatchKbIngestJobs } from "../kb/dispatch";
+import type { Store } from "../store/db";
 import { errorMessage, toolError } from "./helpers";
 
 export interface KbToolDependencies {
-  memoryProvider: MemoryProvider;
-  audit: AuditModule;
+  /** The job bus: the tool enqueues kind=kb jobs; the containerized worker ingests. */
+  store: Store;
+  /** The declared KB sources (config/kb.yml) — the dispatch scope. */
   config: KbConfig;
 }
 
@@ -21,21 +21,16 @@ export function kbToolDefinitions(deps: KbToolDependencies): ToolDefinition[] {
     name: "kb_ingest",
     label: "Ingest knowledge base",
     description:
-      "Fetches and appends configured docs/wiki sources to shared org memory. " +
-      "Pass a source id to refresh one source, or omit it to refresh all configured sources. " +
-      "The source host must be in the egress allowlist and pass the egress judge. Write-tier tool.",
+      "Dispatches KB ingestion to the worker: fetches and appends configured docs/wiki " +
+      "sources to shared org memory as containerized jobs (epic #170). Pass a source id " +
+      "to refresh one source, or omit it to dispatch every configured source. " +
+      "Egress is scoped to the declared source hosts (config/kb.yml) + the egress allowlist. Write-tier tool.",
     parameters: kbIngestArgsSchema,
     approval: "write",
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult> {
       try {
-        if (params.source !== undefined) {
-          const source = deps.config.sources.find((candidate) => candidate.id === params.source);
-          if (!source) return toolError(`unknown KB source: ${params.source}`);
-          const result = await ingestSource(deps.memoryProvider, deps.audit, source);
-          return { content: [{ type: "text", text: JSON.stringify(result) }] };
-        }
-        const results = await ingestAll(deps.memoryProvider, deps.audit, deps.config);
-        return { content: [{ type: "text", text: JSON.stringify({ sources: results }) }] };
+        const ids = await dispatchKbIngestJobs(deps.store, deps.config, { source: params.source });
+        return { content: [{ type: "text", text: JSON.stringify({ dispatched: ids }) }] };
       } catch (error) {
         return toolError(errorMessage(error));
       }

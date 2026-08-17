@@ -64,6 +64,10 @@ import {
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
 import { kbJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { createAudit } from "./policy/audit";
+import { loadKbConfig } from "./kb/config";
+import { ingestSource } from "./kb/ingest";
+import type { MemoryProvider } from "./memory/types";
 import { DenyRouter } from "./policy/approval-router";
 import {
   assertAgentDirModelAvailable,
@@ -119,6 +123,12 @@ export interface ExtensionWorkerToolset {
 
 export interface ExecutorDeps {
   store: Store;
+  /**
+   * The org memory provider (the kb job kind's write target — shared
+   * chain, same provider the server and extension sessions resolve,
+   * issue #172). The kb worker saves parsed chunks as org-scope memories.
+   */
+  memoryProvider: MemoryProvider;
   /**
    * Driver factory (lazy): constructed once per process over the extension
    * worker toolset (which resolves tools-less manifest surfaces, issue
@@ -460,27 +470,21 @@ interface JobRunOutcome {
 
 /**
  * Kind routing (epic #170): git and extension drive a work item through the
- * existing delivery paths; kb and scheduled are fail-closed stubs until Wave
- * 2 lands their claimable implementations — a dispatch can never silently
- * no-op. Each kind's toolset/environment is its handler's composition (the
- * git path uses the exec toolset, the extension path the memory+extension
- * toolset); per-kind isolation (#101) falls out per kind on top.
+ * existing delivery paths; kb runs the real ingest worker (Wave 2) against
+ * the declared source set; scheduled stays a fail-closed stub until Wave 2
+ * dispatchers land — a dispatch can never silently no-op. Each kind's
+ * toolset/environment is its handler's composition (the git path uses the
+ * exec toolset, the extension path the memory+extension toolset, the kb
+ * path the org memory provider); per-kind isolation (#101) falls out per
+ * kind on top.
  */
 async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
   switch (job.kind) {
     case "git":
     case "extension":
       return runWorkItemJob(deps, cfg, job);
-    case "kb": {
-      // Wave 2 lands the ingest worker; until then a dispatch fails closed —
-      // never a silent no-op. The payload contract parses NOW so a malformed
-      // dispatch is caught at the bus, not discovered in Wave 2.
-      const parsed = kbJobPayloadSchema.safeParse(job.payload);
-      if (!parsed.success) {
-        throw new Error(`kb job payload must be { url, ... } — failing closed: ${parsed.error.message}`);
-      }
-      throw new Error("kb job kind is not implemented yet (epic #170 Wave 2) — failing closed");
-    }
+    case "kb":
+      return runKbJob(deps, job);
     case "scheduled": {
       const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
       if (!parsed.success) {
@@ -489,6 +493,44 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
       throw new Error("scheduled job kind is not implemented yet (epic #170 Wave 2) — failing closed");
     }
   }
+}
+
+/**
+ * Runs a kb job (epic #170 Wave 2): the existing deterministic ingest
+ * (fetch + parse + chunk + store) executed as a CLAIMED job against the
+ * declared source set. Egress is scoped to the DECLARED source hosts
+ * (config/kb.yml — the iron-proxy allowlist is the network-layer
+ * enforcement; this validation is the job's own fail-closed gate BEFORE
+ * any fetch). The worker never holds Slack tokens and never touches the
+ * git PAT (credential boundary, issue #9). Fail-closed contract:
+ * malformed payload → schema reject; URL host outside the declared set →
+ * refused; URL naming no declared source → fail loud.
+ */
+async function runKbJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
+  const parsed = kbJobPayloadSchema.safeParse(job.payload);
+  if (!parsed.success) {
+    throw new Error(`job ${job.id} (kb) payload must be { url } — failing closed: ${parsed.error.message}`);
+  }
+  const payloadUrl = parsed.data.url;
+  let requestedUrl: URL;
+  try {
+    requestedUrl = new URL(payloadUrl);
+  } catch {
+    throw new Error(`kb job payload url is not a valid URL: ${payloadUrl}`);
+  }
+  const config = loadKbConfig();
+  const declaredHosts = new Set(config.sources.map((source) => new URL(source.url).hostname));
+  if (!declaredHosts.has(requestedUrl.hostname)) {
+    throw new Error(
+      `kb job refused: host ${requestedUrl.hostname} is not in the declared KB source hosts (config/kb.yml)`,
+    );
+  }
+  const source = config.sources.find((candidate) => candidate.url === payloadUrl);
+  if (!source) {
+    throw new Error(`kb job failed: no declared KB source matches ${payloadUrl} (config/kb.yml)`);
+  }
+  const result = await ingestSource(deps.memoryProvider, createAudit(deps.store), source);
+  return { state: "completed", result };
 }
 
 /**
@@ -1205,6 +1247,7 @@ if (import.meta.main) {
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,
+    memoryProvider: boot.runtime.memoryProvider,
     get driver(): AgentDriver | Promise<AgentDriver> {
       return (driver ??= boot.getDriver());
     },

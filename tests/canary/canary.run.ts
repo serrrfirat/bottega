@@ -43,6 +43,7 @@ import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
 import { CHURN_MESSAGE, THINKING_PHRASES } from "../../src/server/services/space-service";
 import { runExecutor } from "../../src/executor";
+import { resolveMemoryProvider } from "../../src/server/memory-provider";
 import { bootHarness, type Harness } from "../e2e/harness";
 import type { Store, WorkItem, WorkItemState } from "../../src/store/db";
 
@@ -311,6 +312,7 @@ describe("canary journeys with the real model (issue #71)", () => {
         const run = runExecutor(
           {
             store: h.store,
+            memoryProvider: resolveMemoryProvider(h.store.getOrgSettings(), h.store.getDb()),
             driver: h.driver,
             transcriptDir: h.transcriptDir,
             pollIntervalMs: 10,
