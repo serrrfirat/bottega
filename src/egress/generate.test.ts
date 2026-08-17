@@ -63,7 +63,25 @@ describe("egress config generation", () => {
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
-    expect(EXTENSION_DOMAINS.sort()).toEqual(["api.githubcopilot.com", "mcp.attio.com", "mcp.linear.app"]);
+    expect(EXTENSION_DOMAINS.sort()).toEqual([
+      "api.githubcopilot.com",
+      "api.notion.com",
+      "mcp.attio.com",
+      "mcp.linear.app",
+      "notion.com",
+    ]);
+  });
+
+  test("the base allowlist permits the OpenAI and Anthropic model gateways (#37ee2bf)", () => {
+    // The OpenAI/Anthropic providers (37ee2bf) call api.openai.com/v1 and
+    // api.anthropic.com/v1; without these in the deployed allowlist the new
+    // providers die in compose (default-deny egress 403s them).
+    expect(BASE_EGRESS_DOMAINS).toContain("api.openai.com");
+    expect(BASE_EGRESS_DOMAINS).toContain("api.anthropic.com");
+    const domains = allowlistDomains(COMMITTED_EGRESS);
+    expect(domains).toContain("api.openai.com");
+    expect(domains).toContain("api.anthropic.com");
+    expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("api.anthropic.com");
   });
 
   test("the base allowlist permits Slack file downloads", () => {
@@ -100,6 +118,8 @@ describe("egress config generation", () => {
     expect(mergedEgressDomains(["a.example.com", "b.example.com", "cloud-api.near.ai"])).toEqual([
       "cloud-api.near.ai",
       "*.completions.near.ai",
+      "api.openai.com",
+      "api.anthropic.com",
       "raw.githubusercontent.com",
       "files.slack.com",
       "a.example.com",
@@ -161,6 +181,8 @@ describe("egress config generation", () => {
       expect(allowlistDomains(yaml)).toEqual([
         "cloud-api.near.ai",
         "*.completions.near.ai",
+        "api.openai.com",
+        "api.anthropic.com",
         "raw.githubusercontent.com",
         "files.slack.com",
         FIXTURE_EXTENSION_DOMAIN,

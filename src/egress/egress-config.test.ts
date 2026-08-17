@@ -57,6 +57,16 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(domains).not.toContain("api.near.ai");
   });
 
+  test("allowlist contains the OpenAI and Anthropic model gateways (#37ee2bf)", () => {
+    const domains = allowlistCfg["domains"] as string[];
+    // The OpenAI/Anthropic providers (37ee2bf) reach their gateways through
+    // the proxy; a missing domain = those providers dead in compose
+    // (default-deny egress answers every name with the proxy IP, 403 at the
+    // HTTP layer).
+    expect(domains).toContain("api.openai.com");
+    expect(domains).toContain("api.anthropic.com");
+  });
+
   test("judge policy gate is configured after the allowlist", () => {
     expect(judge).toBeDefined();
     expect((judgeCfg["name"] as string)).toBe("egress-policy");
@@ -102,7 +112,7 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(names).toEqual(["allowlist", "judge", "secrets"]);
     const cfg = secrets["config"] as Record<string, YamlNode>;
     const entries = cfg["secrets"] as Record<string, YamlNode>[];
-    expect(entries).toHaveLength(3); // attio, github, linear
+    expect(entries).toHaveLength(4); // attio, github, linear, notion
     for (const entry of entries) {
       const source = entry["source"] as Record<string, YamlNode>;
       expect(source["type"]).toBe("file");
@@ -111,8 +121,10 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(inject["header"]).toBe("Authorization");
       expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
       const rules = entry["rules"] as Record<string, YamlNode>[];
-      expect(rules).toHaveLength(1);
-      expect(allowlistCfg["domains"] as string[]).toContain(String(rules[0]!["host"]));
+      expect(rules.length).toBeGreaterThanOrEqual(1);
+      for (const rule of rules) {
+        expect(allowlistCfg["domains"] as string[]).toContain(String(rule["host"]));
+      }
     }
   });
 });

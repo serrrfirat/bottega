@@ -94,6 +94,16 @@ transforms:
             formatter: "Bearer {{ .Value }}"
           rules:
             - host: "mcp.linear.app"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/notion.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+          rules:
+            - host: "api.notion.com"
+            - host: "notion.com"
 
 log:
   level: "info"
