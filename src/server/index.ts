@@ -48,6 +48,7 @@ import {
   type AgentSessionDriver,
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
+import { startOutboxPostSeam } from "./services/outbox-post-seam";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
 import {
@@ -775,6 +776,19 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     log: (line) => console.log(line),
   });
+  // Worker→server post seam (epic #170 item 3, issue #187): the worker has
+  // no Slack tokens (credential boundary, issue #9) — it signals a
+  // completed job by writing an outbox row; THIS seam consumes the rows
+  // (the Wave-1 watermarked consumer), posts each result to the row's
+  // space, audits outbox.posted, and bounded-retries post failures
+  // (outbox.failed). The same cadence routes nudgeUnclaimedOutboxRows to
+  // the Slack nudge: a completed row no consumer picked up within the TTL
+  // surfaces as job.unclaimed + a visible post (fail-loud, epic #170).
+  const outboxPostSeam = startOutboxPostSeam({
+    store,
+    adapter,
+    log: (line) => console.log(line),
+  });
   const scheduler = startScheduler({
     store,
     audit,
@@ -789,6 +803,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     async start() {
       await adapter.start();
       deliveryPoller.start();
+      outboxPostSeam.start();
       scheduler.start();
     },
     async stop() {
@@ -797,6 +812,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       // callback's shared surface, stopped here.
       oauthCallback.stop();
       deliveryPoller.stop();
+      outboxPostSeam.stop();
       scheduler.stop();
       await spaceService.stop();
       await consolidationInFlight;

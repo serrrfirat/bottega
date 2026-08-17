@@ -11,8 +11,10 @@
  * restarts. One id threads enqueue → claim → run → outbox → post.
  *
  * Row lifecycle: pending → posted (consumed) | failed (the unclaimed TTL
- * path, {@link nudgeUnclaimedOutboxRows}). The consumer never reads or
- * writes the audit table.
+ * path, {@link nudgeUnclaimedOutboxRows}, or the post seam's terminal
+ * post-failure path, {@link failOutboxRow} — a failed post is requeued via
+ * {@link requeueOutboxRow} within the seam's bounded attempts first). The
+ * consumer never reads or writes the audit table.
  */
 import { JOB_UNCLAIMED_EVENT } from "./audit-events";
 import type { Store } from "./db";
@@ -150,6 +152,50 @@ export function consumeOutboxWatermarked(
     db.exec("ROLLBACK");
     throw err;
   }
+}
+
+/**
+ * Server post seam retry (Wave 2, issue #187): returns a row whose post
+ * failed to the pending tail for another consume pass — the bounded retry
+ * path. `attempts` counts every post attempt; `created_at` is bumped to now
+ * so the row moves past the consumer's watermark (a requeued row is never
+ * skipped by the cursor) and never reads as stale to the unclaimed nudge
+ * while it is still being retried. Guarded on the posted status the consume
+ * just wrote: a row the nudge failed is terminal and never requeued. The
+ * audit trail (outbox.failed, written by the seam) is the evidence; this
+ * mutation is queue state only.
+ */
+export function requeueOutboxRow(
+  store: Store,
+  id: string,
+  opts: { now?: () => number } = {},
+): void {
+  const now = opts.now?.() ?? Date.now();
+  store
+    .getDb()
+    .query(
+      "UPDATE outbox SET status = 'pending', attempts = attempts + 1, created_at = ?, posted_at = NULL " +
+        "WHERE id = ? AND status = 'posted'",
+    )
+    .run(now, id);
+}
+
+/**
+ * Terminal mark for the server post seam (Wave 2, issue #187): a row whose
+ * post failed beyond the bounded retries — or that failed closed (malformed
+ * payload, no space) — is marked failed so it is never consumed or nudged
+ * again. The outbox.status CHECK already allows it (the unclaimed path uses
+ * the same status); the outbox.failed / job.unclaimed audit rows are the
+ * evidence. `attempts` (the seam's final attempt count, matching the audit
+ * row) records how many times the post was tried; omitted, the current
+ * column value is kept.
+ */
+export function failOutboxRow(store: Store, id: string, opts: { attempts?: number } = {}): void {
+  const attempts = opts.attempts;
+  store
+    .getDb()
+    .query("UPDATE outbox SET status = 'failed', attempts = COALESCE(?, attempts) WHERE id = ? AND status <> 'failed'")
+    .run(attempts ?? null, id);
 }
 
 /**

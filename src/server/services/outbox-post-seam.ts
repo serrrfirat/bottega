@@ -1,0 +1,302 @@
+/**
+ * Server post seam (epic #170 item 3, issue #187): the worker→server
+ * delivery leg. The executor container never holds Slack tokens (credential
+ * boundary, issue #9) — it signals a completed job by writing an outbox row
+ * (src/store/outbox.ts, the Wave-1 seam). THIS module is the server side:
+ * it polls {@link consumeOutboxWatermarked} on the delivery-poller cadence,
+ * posts each consumed row's result to the row's space via the Slack
+ * adapter, and audits `outbox.posted`. A failed post is audited
+ * `outbox.failed` and requeued for a bounded number of attempts
+ * ({@link DEFAULT_OUTBOX_MAX_POST_ATTEMPTS}, tracked in the row's
+ * `attempts` column), then marked failed (terminal). The same tick routes
+ * {@link nudgeUnclaimedOutboxRows} to the Slack nudge: a completed row no
+ * consumer picked up within the TTL surfaces as `job.unclaimed` + a visible
+ * post — fail-loud (epic #170), exactly once (the row is terminal).
+ *
+ * Crash-window decision — at-most-once per row, per the Wave-1 contract:
+ * `consumeOutboxWatermarked` marks the row posted ATOMICALLY at consume
+ * time, BEFORE this seam's Slack post. A crash between the consume and the
+ * post drops that delivery — the row is never re-read (posted rows are
+ * filtered by status), so the result never duplicates. That is the
+ * deliberate trade: the alternative (post-then-mark) can double-post on a
+ * crash or retry, and a duplicate user-facing post is worse than a rare
+ * lost one. The gap is diagnosable, not silent: the row's posted_at lands
+ * without a matching `outbox.posted` audit row (written only after a
+ * successful post), and one id threads enqueue → claim → run → outbox →
+ * post. The retry path is restart-safe: a requeued row is simply pending
+ * again, so a crash mid-retry re-consumes it on the next boot.
+ *
+ * The consumer cursor: every pass consumes from a FRESH cursor (no
+ * watermark state) — the Wave-1 consumer marks rows posted atomically, so
+ * the row status, not cursor memory, is the dedupe across passes and
+ * restarts (the Wave-1 consumer contract). A fresh cursor also keeps the
+ * bounded-retry requeue sound: a requeued row (pending again, created_at
+ * bumped to now so it never reads stale while retrying) is picked up
+ * regardless of any cursor position.
+ */
+import { z } from "zod";
+import { OUTBOX_FAILED_EVENT, OUTBOX_POSTED_EVENT } from "../../store/audit-events";
+import type { Store } from "../../store/db";
+import {
+  consumeOutboxWatermarked,
+  failOutboxRow,
+  nudgeUnclaimedOutboxRows,
+  requeueOutboxRow,
+  type OutboxRow,
+} from "../../store/outbox";
+import type { SlackAdapter } from "../adapters/slack";
+
+/** Post-seam pass interval. Default 5000 ms — the delivery poller's cadence. */
+export const DEFAULT_OUTBOX_POST_INTERVAL_MS = 5000;
+
+/** Bounded post retries per outbox row. Default 5 — the job bus's attempt bound. */
+export const DEFAULT_OUTBOX_MAX_POST_ATTEMPTS = 5;
+
+export interface OutboxPostSeamDeps {
+  /** Full store: the watermarked consumer, the audit sink, and the row helpers. */
+  store: Store;
+  /** Only postMessage is used; a full SlackAdapter also satisfies this. */
+  adapter: Pick<SlackAdapter, "postMessage">;
+  /** Pass interval. Default 5000 ms. */
+  intervalMs?: number;
+  /** Bounded post retries per row. Default 5. */
+  maxPostAttempts?: number;
+  /** Unclaimed TTL for the nudge leg. Default: the store seam's 5-minute TTL. */
+  olderThanMs?: number;
+  log?: (line: string) => void;
+}
+
+export interface OutboxPostSeam {
+  start(): void;
+  stop(): void;
+}
+
+/** The outbox payload the executor writes on completion: {state, result}. */
+const outboxPayloadSchema = z.object({
+  state: z.string().optional(),
+  result: z.unknown().optional(),
+});
+
+/** Known result fields for the one-line render (display only; unknown shapes fall back). */
+const resultSummarySchema = z
+  .object({
+    summary: z.string().optional(),
+    pr_url: z.string().optional(),
+    url: z.string().optional(),
+    source: z.string().optional(),
+    count: z.number().optional(),
+  })
+  .passthrough();
+
+function parsePayload(raw: string): { state?: string; result?: unknown } | null {
+  try {
+    const parsed = outboxPayloadSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The one-line Slack post for a consumed row — display only, never a
+ * correctness gate: unknown payloads/results fall back to a state line
+ * instead of throwing, so a future worker result shape still posts.
+ */
+export function renderOutboxMessage(row: OutboxRow): string {
+  const payload = parsePayload(row.payload);
+  const state = payload?.state ?? "completed";
+  const stateText = state === "done" ? "Done" : state === "blocked" ? "Blocked" : state;
+  const kindLabel = row.kind === "git" || row.kind === "extension" ? "" : `${row.kind} `;
+  const bits: string[] = [];
+  const result = resultSummarySchema.safeParse(payload?.result);
+  if (result.success) {
+    const r = result.data;
+    if (r.summary) bits.push(r.summary);
+    if (r.pr_url) bits.push(r.pr_url);
+    if (r.url) bits.push(r.url);
+    if (r.source) bits.push(`source: ${r.source}`);
+    if (r.count !== undefined) bits.push(`${r.count} item(s)`);
+  }
+  return bits.length > 0 ? `${kindLabel}${stateText}: ${bits.join(" — ")}` : `${kindLabel}${stateText}`;
+}
+
+export interface OutboxPostPass {
+  /** Rows successfully posted (audited outbox.posted). */
+  posted: number;
+  /** Rows surfaced by the unclaimed sweep (audited job.unclaimed + nudged). */
+  nudged: number;
+}
+
+/**
+ * One post-seam pass: consume the next pending batch (marked posted
+ * atomically by the Wave-1 consumer), post each row to its space and audit
+ * `outbox.posted`; a failed post audits `outbox.failed` and is requeued
+ * within {@link maxPostAttempts} then marked failed (terminal). After the
+ * consume, route {@link nudgeUnclaimedOutboxRows} — rows the consume could
+ * not reach (stale beyond the TTL) are audited `job.unclaimed` and nudged
+ * to Slack. Deliver-then-nudge ordering: a stale row the consume DID reach
+ * is delivered, never nudged.
+ */
+export async function postPendingOutboxRows(
+  store: Store,
+  adapter: Pick<SlackAdapter, "postMessage">,
+  opts: {
+    maxPostAttempts?: number;
+    olderThanMs?: number;
+    now?: () => number;
+    log?: (line: string) => void;
+  } = {},
+): Promise<OutboxPostPass> {
+  const maxAttempts = opts.maxPostAttempts ?? DEFAULT_OUTBOX_MAX_POST_ATTEMPTS;
+  const log = opts.log ?? (() => {});
+  // A FRESH cursor every pass, never a threaded watermark: the Wave-1
+  // consumer marks rows posted atomically, so the row status — not cursor
+  // memory — is the dedupe across passes and restarts. A fresh cursor also
+  // keeps the bounded-retry requeue sound: a requeued row (pending again,
+  // created_at bumped to now so it never reads stale while retrying) is
+  // picked up regardless of any cursor position — no same-millisecond
+  // tiebreak edge against a threaded watermark.
+  const { rows } = consumeOutboxWatermarked(store, { now: opts.now });
+  let posted = 0;
+  for (const row of rows) {
+    if (await postRow(store, adapter, row, maxAttempts, opts.now, log)) posted += 1;
+  }
+  const nudged = await nudgeUnclaimedOutboxRowsToSlack(store, adapter, {
+    olderThanMs: opts.olderThanMs,
+    now: opts.now,
+    log,
+  });
+  return { posted, nudged };
+}
+
+/** Post one consumed row; returns true when posted. Never throws for post failures. */
+async function postRow(
+  store: Store,
+  adapter: Pick<SlackAdapter, "postMessage">,
+  row: OutboxRow,
+  maxAttempts: number,
+  now: (() => number) | undefined,
+  log: (line: string) => void,
+): Promise<boolean> {
+  if (row.space === null || parsePayload(row.payload) === null) {
+    // Fail closed: a row with no target space or a malformed payload is
+    // never posted and never retried — it is a worker contract violation.
+    const reason = row.space === null ? "no space on the outbox row" : "malformed outbox payload";
+    const attempts = row.attempts + 1;
+    await auditFailed(store, row, reason, attempts);
+    failOutboxRow(store, row.id, { attempts });
+    log(`outbox post seam: row ${row.id} failed closed (${reason})`);
+    return false;
+  }
+  try {
+    await adapter.postMessage(row.space, renderOutboxMessage(row));
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    const attempts = row.attempts + 1;
+    await auditFailed(store, row, error, attempts);
+    if (attempts >= maxAttempts) {
+      failOutboxRow(store, row.id, { attempts });
+      log(`outbox post seam: row ${row.id} failed after ${attempts} attempt(s) — terminal`);
+    } else {
+      requeueOutboxRow(store, row.id, { now });
+      log(`outbox post seam: row ${row.id} post failed (${error}) — retry ${attempts}/${maxAttempts}`);
+    }
+    return false;
+  }
+  await store.appendAudit({
+    space_id: row.space,
+    actor: "server",
+    event_type: OUTBOX_POSTED_EVENT,
+    payload: JSON.stringify({ id: row.id, kind: row.kind, space: row.space }),
+  });
+  return true;
+}
+
+async function auditFailed(store: Store, row: OutboxRow, error: string, attempts: number): Promise<void> {
+  await store.appendAudit({
+    space_id: row.space,
+    actor: "server",
+    event_type: OUTBOX_FAILED_EVENT,
+    payload: JSON.stringify({ id: row.id, kind: row.kind, error: error.slice(0, 2000), attempts }),
+  });
+}
+
+/**
+ * The unclaimed nudge leg: surface rows {@link nudgeUnclaimedOutboxRows}
+ * found (stale pending rows no consume pass reached) to the row's space as
+ * a visible Slack post — the fail-loud guarantee that a completed job whose
+ * result never posts is seen, not silent. Returns the number nudged. The
+ * `job.unclaimed` audit fires inside the store function exactly once per
+ * row (the row is marked failed, terminal); a nudge post that fails is
+ * logged, never re-audited — the row is already terminal and a retry would
+ * duplicate nothing but a lost post is no worse than the audit row alone.
+ */
+export async function nudgeUnclaimedOutboxRowsToSlack(
+  store: Store,
+  adapter: Pick<SlackAdapter, "postMessage">,
+  opts: { olderThanMs?: number; now?: () => number; log?: (line: string) => void } = {},
+): Promise<number> {
+  const log = opts.log ?? (() => {});
+  const rows = await nudgeUnclaimedOutboxRows(store, { olderThanMs: opts.olderThanMs, now: opts.now });
+  for (const row of rows) {
+    if (row.space === null) continue; // no channel; the job.unclaimed audit row is the trail
+    try {
+      await adapter.postMessage(
+        row.space,
+        `A job result was not delivered: job ${row.id} (kind ${row.kind}) completed but no consumer posted it in time.`,
+      );
+    } catch (err) {
+      log(`outbox post seam: unclaimed nudge post for ${row.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return rows.length;
+}
+
+/** Background loop around {@link postPendingOutboxRows}. First pass runs immediately. */
+export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
+  const log = deps.log ?? (() => {});
+  const intervalMs = deps.intervalMs ?? DEFAULT_OUTBOX_POST_INTERVAL_MS;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+
+  const tick = async (): Promise<void> => {
+    try {
+      const pass = await postPendingOutboxRows(deps.store, deps.adapter, {
+        maxPostAttempts: deps.maxPostAttempts,
+        olderThanMs: deps.olderThanMs,
+        log,
+      });
+      if (pass.posted > 0) log(`outbox post seam: posted ${pass.posted} result(s)`);
+      if (pass.nudged > 0) log(`outbox post seam: nudged ${pass.nudged} unclaimed row(s)`);
+    } catch (err) {
+      // One bad pass must not kill the loop; the next tick retries from
+      // scratch (a fresh cursor — the row status is the dedupe).
+      log(`outbox post seam: pass failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Chain the next pass from the END of this one, keeping the loop
+    // single-flight (issue #70 pattern): an overlapping pass would be
+    // harmless to dedupe (the consume marks rows posted atomically) but
+    // wasteful and harder to reason about.
+    if (running && timer === null) {
+      timer = setTimeout(() => {
+        timer = null;
+        void tick();
+      }, intervalMs);
+    }
+  };
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      void tick(); // post anything pending from before boot immediately
+    },
+    stop() {
+      running = false;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  };
+}
