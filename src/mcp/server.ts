@@ -1,7 +1,9 @@
 /**
  * Bottega-hosted MCP server (issues #25, #61, #136): exposes the bottega
  * capability surface — memory, transcript search, the connect capability,
- * and registered extension tools — to ANY ACP agent with an MCP client.
+ * registered extension tools, and the internal tools (work items, model
+ * settings, scheduler actions, KB — issue #206) — to ANY ACP agent with an
+ * MCP client.
  *
  * The ACP driver attaches this server to a session via `session/new`'s
  * `mcpServers` field; the agent spawns `bun run src/mcp/server.ts` (stdio
@@ -62,8 +64,16 @@
 import type { Database } from "bun:sqlite";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+  type CallToolResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { z, type ExtensionContext, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
 import {
@@ -94,19 +104,34 @@ import { mintUploadLink, MINT_UPLOAD_LINK_TOOL, UploadLinkStore } from "../exten
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import type { ExtensionRegistry } from "../extensions/registry";
 import type { ExtensionRuntime } from "../extensions/runtime";
-import type { ExtensionTool, ExtensionToolParam, McpBinding } from "../extensions/manifest";
+import type { ExtensionTool, ExtensionToolParam, JsonObject, McpBinding } from "../extensions/manifest";
 import { extensionToolSurface, toolOwnerExtensionId, type ExtensionSurfaces } from "../extensions/surface";
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "../server/bootstrap-runtime";
 import { seedBootSecretsFromVault } from "../server/boot-secrets";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
+import { buildRegistry } from "../scheduler/actions";
+import { createIngestPollAction } from "../ingest/poll-action";
+import { loadKbConfig, type KbConfig } from "../kb/config";
+import { orgPulseAction } from "../scheduler/observer";
+import { recurringWorkAction } from "../scheduler/recurring-work";
+import { reflectionAction } from "../scheduler/reflection";
+import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
+import { standupDigestAction } from "../scheduler/standup";
+import type { SchedulerActionRegistry } from "../scheduler/types";
+import type { Store } from "../store/db";
+import { kbToolDefinitions } from "../tools/kb-tools";
+import { modelToolsDefinitions } from "../tools/model-settings";
+import { workItemToolDefinitions } from "../tools/work-items";
+import type { ModelCatalogEntry } from "../models/model-pin";
 
 export interface MemoryMcpServerOptions {
   provider: MemoryProvider;
   /** Org floor + space overlay, already merged (mirrors policyFor in the extension). */
   policy: PolicyConfig;
-  audit: Pick<AuditModule, "appendAudit">;
+  /** The audit trail (issue #7): every tool call's policy decision lands here. */
+  audit: AuditModule;
   /** Shared SQLite handle + durable JSONL directory for transcript search. */
   sessionSearch: { db: Database; transcriptDir: string };
   /** Session space; recorded on audit rows. */
@@ -121,6 +146,17 @@ export interface MemoryMcpServerOptions {
    * capability — identical enforcement for every agent, no per-agent path.
    */
   extensions?: McpExtensionsOptions;
+  /**
+   * Internal tool surface (issue #206): when wired, the server also
+   * advertises the internal tools (create_work_item, work_item_cancel,
+   * complete_work_item, model_settings, the scheduler actions, kb_ingest) —
+   * the SAME definitions the SDK sessions carry, executed server-side
+   * through the same policy gate + audit. ACP sessions call them through
+   * the MCP tool channel (the #154 "tool reach" gap). use_model stays
+   * SDK-session-only: ACP sessions cannot switch models mid-session (the
+   * agent's own config governs there, issue #64). Absent → none advertised.
+   */
+  internal?: McpInternalToolsOptions;
 }
 
 /**
@@ -161,9 +197,47 @@ export interface McpExtensionsOptions {
   uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
 }
 
-/** Flattens a parse failure into a single-line message for the client. */
-function zodIssues(error: { message: string; issues: Array<{ message: string }> }): string {
-  return error.issues.map((issue) => issue.message).join("; ");
+/**
+ * The internal tool surface's server-side deps (issue #206). Everything is
+ * the same wiring the SDK session toolset gets (src/server/index.ts): the
+ * same store, the same org floor, the same scheduler registry, the same KB
+ * config — so the MCP channel and the session channel run the SAME
+ * definitions with the SAME policy gate and audit trail.
+ */
+export interface McpInternalToolsOptions {
+  /** The store backing work items, model settings, and scheduler jobs. */
+  store: Store;
+  /** Org floor policy — the floor sessions gate against (work-item cancel authorization, issue #33). */
+  orgPolicy: PolicyConfig;
+  /**
+   * Agent dir whose model catalog validates create_work_item model pins
+   * (issue #185) and model_settings lists (issue #192). Default
+   * "data/omp-agent" (the server/executor default).
+   */
+  agentDir?: string;
+  /**
+   * Model-catalog seam (issue #185/#192 tests): resolves the AVAILABLE
+   * models. Defaults to the SDK registry over `agentDir`.
+   */
+  listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]>;
+  /** Scheduler action registry (create_scheduler_job validates the action name, issue #86). */
+  schedulerRegistry?: SchedulerActionRegistry;
+  /** KB config for kb_ingest (issue #91); absent → kb_ingest is not advertised. */
+  kb?: KbConfig;
+}
+
+/**
+ * Flattens a parse failure into a single-line message for the client,
+ * prefixing each issue with its field path (e.g. `scope: must be ...`) so
+ * protocol errors name the offending argument.
+ */
+function zodIssues(error: {
+  message: string;
+  issues: Array<{ message: string; path: PropertyKey[] }>;
+}): string {
+  return error.issues
+    .map((issue) => (issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message))
+    .join("; ");
 }
 
 interface GateResult {
@@ -173,6 +247,21 @@ interface GateResult {
   tier: Tier;
   /** Non-null when the call must not run: the MCP error to throw. */
   error: McpError | null;
+}
+
+/**
+ * One internal tool bound to this server (issue #206): the session
+ * definition's name/description/schema (one source of truth) plus a `run`
+ * that crosses THIS server's policy gate + audit, then executes the
+ * definition against the pinned space.
+ */
+interface InternalToolBinding {
+  name: string;
+  description: string;
+  /** JSON Schema advertised via tools/list — derived from the shared definition's parameters. */
+  inputSchema: Record<string, unknown>;
+  /** Gate → audit → validate → execute. Returns the MCP tool result. */
+  run: (callArgs: CallToolRequest["params"]["arguments"]) => Promise<CallToolResult>;
 }
 
 /**
@@ -268,49 +357,46 @@ function extensionToolJsonSchema(params: ExtensionToolParam[]) {
   for (const param of params) {
     properties[param.name] = {
       type: param.type,
-      ...(param.description !== undefined ? { description: param.description } : {}),
+      ...(param.description !== undefined ? { description: param.description } : undefined),
     };
     if (param.required !== false) required.push(param.name);
   }
   return { type: "object", properties, required, additionalProperties: false };
 }
 
-/** Hand-rolled validation of connect args (mirrors the tool's zod schema). */
-function parseConnectArgs(input: unknown): { ok: true; extension: string; scope: "org" | "personal"; apiKey?: string } | { ok: false; error: string } {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    return { ok: false, error: "arguments must be an object" };
+/** connect_extension args (mirrors the tool's CONNECT_PARAMS_SCHEMA + the paste-guard trim rule). */
+const connectArgsSchema = z.object({
+  extension: z.string().refine((value) => value.trim() !== "", { message: "extension must be a non-empty string" }),
+  scope: z.enum(["org", "personal"]),
+  api_key: z.string().optional(),
+});
+
+/** connect_upload_link args (mirrors the mint tool's params). */
+const mintUploadLinkArgsSchema = z.object({
+  extension: z.string().refine((value) => value.trim() !== "", { message: "extension must be a non-empty string" }),
+  scope: z.enum(["org", "personal"]),
+});
+
+/** Validation of connect args at the MCP boundary (mirrors the tool's zod schema). */
+function parseConnectArgs(
+  input: CallToolRequest["params"]["arguments"],
+): { ok: true; extension: string; scope: "org" | "personal"; apiKey?: string } | { ok: false; error: string } {
+  const parsed = connectArgsSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: zodIssues(parsed.error) };
   }
-  const record = input as Record<string, unknown>;
-  const extension = record["extension"];
-  const scope = record["scope"];
-  const apiKey = record["api_key"];
-  if (typeof extension !== "string" || extension.trim() === "") {
-    return { ok: false, error: "extension must be a non-empty string" };
-  }
-  if (scope !== "org" && scope !== "personal") {
-    return { ok: false, error: 'scope must be "org" or "personal"' };
-  }
-  if (apiKey !== undefined && typeof apiKey !== "string") {
-    return { ok: false, error: "api_key must be a string" };
-  }
-  return { ok: true, extension, scope, apiKey };
+  return { ok: true, extension: parsed.data.extension, scope: parsed.data.scope, apiKey: parsed.data.api_key };
 }
 
-/** Hand-rolled validation of mint args (mirrors the tool's zod schema). */
-function parseMintUploadLinkArgs(input: unknown): { ok: true; extension: string; scope: "org" | "personal" } | { ok: false; error: string } {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    return { ok: false, error: "arguments must be an object" };
+/** Validation of mint args at the MCP boundary (mirrors the tool's zod schema). */
+function parseMintUploadLinkArgs(
+  input: CallToolRequest["params"]["arguments"],
+): { ok: true; extension: string; scope: "org" | "personal" } | { ok: false; error: string } {
+  const parsed = mintUploadLinkArgsSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: zodIssues(parsed.error) };
   }
-  const record = input as Record<string, unknown>;
-  const extension = record["extension"];
-  const scope = record["scope"];
-  if (typeof extension !== "string" || extension.trim() === "") {
-    return { ok: false, error: "extension must be a non-empty string" };
-  }
-  if (scope !== "org" && scope !== "personal") {
-    return { ok: false, error: 'scope must be "org" or "personal"' };
-  }
-  return { ok: true, extension, scope };
+  return { ok: true, extension: parsed.data.extension, scope: parsed.data.scope };
 }
 
 export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
@@ -332,7 +418,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     });
 
   /** Gate + audit first, then validate, then execute. Returns the MCP result. */
-  const callSave = async (callArgs: unknown) => {
+  const callSave = async (callArgs: CallToolRequest["params"]["arguments"]) => {
     const tool = "memory.save";
     const parsed = memorySaveArgsSchema.safeParse(callArgs);
     if (!parsed.success) {
@@ -371,7 +457,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     }
   };
 
-  const callSearch = async (callArgs: unknown) => {
+  const callSearch = async (callArgs: CallToolRequest["params"]["arguments"]) => {
     const tool = "memory.search";
     const parsed = memorySearchArgsSchema.safeParse(callArgs);
     if (!parsed.success) {
@@ -401,7 +487,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     }
   };
 
-  const callSessionSearch = async (callArgs: unknown) => {
+  const callSessionSearch = async (callArgs: CallToolRequest["params"]["arguments"]) => {
     const tool = "session_search";
     const parsed = sessionSearchArgsSchema.safeParse(callArgs);
     if (!parsed.success) {
@@ -424,6 +510,86 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   const extensions = opts.extensions;
 
   /**
+   * The internal tool surface (issue #206): one source of truth — the SAME
+   * SDK definitions the session toolset carries (src/server/index.ts),
+   * bound to THIS server's gate + audit + pinned space. The session-file
+   * stub maps the pinned space id back through sessionIdFromFilePath, so
+   * the definitions resolve the space exactly like they do in-session.
+   */
+  const sessionFile = opts.spaceId ? `${opts.spaceId}.jsonl` : undefined;
+  const bindInternalTool = <TDef extends ToolDefinition>(definition: TDef): InternalToolBinding => {
+    const name = definition.name;
+    // SAFETY: every internal definition is authored with the SDK's zod
+    // surface (omptype), whose schemas carry toJsonSchema()/safeParse() —
+    // the ToolDefinition contract only promises the wider TSchema, so the
+    // two methods are narrowed here (the same zod surface the memory tools
+    // use, e.g. memorySaveArgsSchema).
+    const parameters = definition.parameters as {
+      toJsonSchema(): Record<string, unknown>;
+      safeParse(input: unknown):
+        | { success: true; data: unknown }
+        | { success: false; error: { message: string; issues: Array<{ message: string; path: PropertyKey[] }> } };
+    };
+    // SAFETY: the stub exposes only sessionManager.getSessionFile() — the
+    // one ExtensionContext member the internal tools read (they derive the
+    // space id from the session file, exactly like the in-session tools).
+    const ctx = {
+      sessionManager: { getSessionFile: () => sessionFile },
+    } as unknown as ExtensionContext;
+    return {
+      name,
+      description: definition.description,
+      inputSchema: parameters.toJsonSchema(),
+      async run(callArgs) {
+        // Gate + audit first (fail-closed: an unlisted tool denies before
+        // any validation or execution), then validate, then execute —
+        // mirrors the built-in tools' call order.
+        const gate = gateTool(opts.policy, name);
+        await auditDecision(name, gate.tier, gate.decision, gate.reason, callArgs);
+        if (gate.error) throw gate.error;
+        const parsed = parameters.safeParse(callArgs);
+        if (!parsed.success) {
+          throw new McpError(ErrorCode.InvalidParams, `${name}: invalid arguments: ${zodIssues(parsed.error)}`);
+        }
+        try {
+          const result = await definition.execute("0", parsed.data, undefined, undefined, ctx);
+          return { content: result.content, ...(result.isError === true ? { isError: true } : undefined) };
+        } catch (err) {
+          // Execution failures are tool outcomes, not protocol errors.
+          return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
+        }
+      },
+    };
+  };
+  const internalTools: InternalToolBinding[] | undefined = opts.internal
+    ? [
+        ...workItemToolDefinitions(opts.internal.store, {
+          orgPolicy: opts.internal.orgPolicy,
+          agentDir: opts.internal.agentDir,
+          listModels: opts.internal.listModels,
+        }),
+        ...modelToolsDefinitions(opts.internal.store, {
+          audit: opts.audit,
+          agentDir: opts.internal.agentDir,
+          listModels: opts.internal.listModels,
+        }),
+        ...(opts.internal.schedulerRegistry !== undefined
+          ? schedulerToolDefinitions(opts.internal.store, opts.audit, opts.internal.schedulerRegistry)
+          : []),
+        ...(opts.internal.kb !== undefined
+          ? kbToolDefinitions({ memoryProvider: opts.provider, audit: opts.audit, config: opts.internal.kb })
+          : []),
+      ]
+        // ACP sessions cannot switch models mid-session (the agent's own
+        // config governs there, issue #64): use_model stays session-only.
+        .filter((definition) => definition.name !== "use_model")
+        .map(bindInternalTool)
+    : undefined;
+  const internalToolsByName: Record<string, InternalToolBinding> = Object.fromEntries(
+    internalTools?.map((tool) => [tool.name, tool]) ?? [],
+  );
+
+  /**
    * The #52 connect capability on the MCP surface. Personal connects are
    * unprivileged (any principal connects their own account, no gate); org
    * connects cross the capability's gate — ask-human fails closed here via
@@ -431,7 +597,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
    * rule as {@link gateTool}. Failures are tool outcomes (isError), never
    * protocol errors: the call ran and reported its result.
    */
-  const callConnect = async (callArgs: unknown) => {
+  const callConnect = async (callArgs: CallToolRequest["params"]["arguments"]) => {
     if (!extensions) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${CONNECT_EXTENSION_TOOL}`);
     const parsed = parseConnectArgs(callArgs);
     if (!parsed.ok) {
@@ -442,7 +608,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       { extension: parsed.extension, scope: parsed.scope, apiKey: parsed.apiKey, actor, spaceId: opts.spaceId ?? undefined },
       extensions.connect,
     );
-    return { content: [{ type: "text", text: outcome.message }], ...(outcome.ok ? {} : { isError: true }) };
+    return { content: [{ type: "text", text: outcome.message }], ...(outcome.ok ? undefined : { isError: true }) };
   };
 
   /**
@@ -452,7 +618,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
    * stores the pasted secret directly into the vault — never through the
    * agent or a transcript.
    */
-  const callMintUploadLink = async (callArgs: unknown) => {
+  const callMintUploadLink = async (callArgs: CallToolRequest["params"]["arguments"]) => {
     if (!extensions?.uploadLink) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${MINT_UPLOAD_LINK_TOOL}`);
     const parsed = parseMintUploadLinkArgs(callArgs);
     if (!parsed.ok) {
@@ -473,11 +639,19 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
    * (policy.decision + extension.call) and never lets a denied call reach
    * a credential or the provider.
    */
-  const callExtensionTool = async (extensionId: string, toolName: string, callArgs: unknown) => {
-    if (callArgs !== undefined && (typeof callArgs !== "object" || callArgs === null || Array.isArray(callArgs))) {
+  const callExtensionTool = async (extensionId: string, toolName: string, callArgs: CallToolRequest["params"]["arguments"]) => {
+    // The runtime's args contract is a JSON object; decode the wire value
+    // here (undefined means "no arguments" → an empty object, like the
+    // in-session tools).
+    const parsed = z.record(z.string(), z.unknown()).optional().safeParse(callArgs);
+    if (!parsed.success) {
       throw new McpError(ErrorCode.InvalidParams, `${toolName}: arguments must be an object`);
     }
-    const args = (callArgs ?? {}) as Record<string, unknown>;
+    // SAFETY: MCP tool-call arguments cross the JSON-RPC wire as a JSON object
+    // (the SDK's CallToolRequest arguments contract); the record schema above
+    // already rejected non-object shapes, and the runtime only forwards JSON
+    // values to the provider.
+    const args = (parsed.data ?? {}) as JsonObject;
     const result = await extensions!.runtime.execute({
       extensionId,
       toolName,
@@ -550,6 +724,15 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           "Returns redacted, truncated message excerpts with source file, line, and timestamp. Read-only.",
         inputSchema: sessionSearchJsonSchema,
       },
+      // Issue #206: the internal tools — the SAME definitions the SDK
+      // sessions carry (name, description, schema — one source of truth).
+      ...(internalTools !== undefined
+        ? internalTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          }))
+        : []),
       ...(extensions
         ? [
             {
@@ -586,6 +769,11 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     if (name === "memory.save") return callSave(args);
     if (name === "memory.search") return callSearch(args);
     if (name === "session_search") return callSessionSearch(args);
+    // Issue #206: internal tools run through the policy gate (fail-closed)
+    // + audit like every other call; an unlisted name falls through to the
+    // unknown-tool error below.
+    const internalTool = internalToolsByName[name];
+    if (internalTool !== undefined) return internalTool.run(args);
     if (extensions) {
       if (name === CONNECT_EXTENSION_TOOL) return callConnect(args);
       if (name === MINT_UPLOAD_LINK_TOOL) return callMintUploadLink(args);
@@ -655,10 +843,10 @@ export async function bootMemoryMcpServer(opts: {
     // Env contract (see the file header): the ACP driver / tests pin the
     // DB, config, and extensions dirs; unset falls back to the defaults.
     dbPath: opts.dbPath ?? process.env.BOTTEGA_DB_PATH,
-    ...(opts.configDir !== undefined ? { configDir: opts.configDir } : {}),
-    ...(opts.extensionsDir !== undefined ? { extensionsDir: opts.extensionsDir } : {}),
-    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
-    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
+    ...(opts.configDir !== undefined ? { configDir: opts.configDir } : undefined),
+    ...(opts.extensionsDir !== undefined ? { extensionsDir: opts.extensionsDir } : undefined),
+    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
   const { store, audit, orgPolicy } = runtime;
   // Per-session space: apply the space's overlay so the session's policy
@@ -689,6 +877,17 @@ export async function bootMemoryMcpServer(opts: {
     oauthBaseUrl && oauthBaseUrl.length > 0
       ? createMcpOAuthConnector({ registry: runtime.registry, store, audit, callbackBaseUrl: () => oauthBaseUrl })
       : undefined;
+  // Issue #206: the internal tools ride the MCP surface too — the same
+  // scheduler registry the server boot builds (action-name validation for
+  // create_scheduler_job) and the same KB config. A deployment without a
+  // readable config/kb.yml simply lacks kb_ingest (fail closed, like the
+  // un-wired upload-link mint).
+  let kb: KbConfig | undefined;
+  try {
+    kb = loadKbConfig();
+  } catch {
+    // No KB config → the ingest tool is not advertised.
+  }
   const server = createMemoryMcpServer({
     // The SAME memory backend the server and executor roots resolve
     // (issue #172): memory_backend.base_url set → mem0, else SQLite on the
@@ -702,6 +901,21 @@ export async function bootMemoryMcpServer(opts: {
       db: store.getDb(),
       transcriptDir: opts.sessionDir ?? process.env.BOTTEGA_SESSION_DIR ?? "data/sessions",
     },
+    internal: {
+      store,
+      orgPolicy,
+      // The same five actions the server root registers (issue #86/#57) —
+      // create_scheduler_job validates against this registry only; the
+      // server process's runner executes the jobs.
+      schedulerRegistry: buildRegistry([
+        standupDigestAction,
+        reflectionAction,
+        orgPulseAction,
+        recurringWorkAction,
+        createIngestPollAction(),
+      ]),
+      ...(kb !== undefined ? { kb } : undefined),
+    },
     extensions: {
       runtime: runtime.runtime,
       registry: runtime.registry,
@@ -710,14 +924,14 @@ export async function bootMemoryMcpServer(opts: {
         store,
         audit,
         broker: connectViaAuthBroker,
-        ...(mcpOAuth !== undefined ? { mcpOAuth } : {}),
+        ...(mcpOAuth !== undefined ? { mcpOAuth } : undefined),
         gate: {
           loadPolicy: (sid) => loadSpacePolicy(orgPolicy, store, sid),
           router: DenyRouter,
           timeoutMs: orgPolicy.timeoutMinutes * 60_000,
         },
       },
-      ...(uploadLink !== undefined ? { uploadLink } : {}),
+      ...(uploadLink !== undefined ? { uploadLink } : undefined),
     },
   });
   return { runtime, policy, server };

@@ -20,12 +20,26 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { z } from "zod";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type AuditRow, type Store, type ExtensionCredential } from "../store/db";
 import { sha256Hex } from "../tools/memory";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
-import { createAudit } from "../policy/audit";
+import { type JsonValue } from "../memory/mem0";
+import type { MemoryProvider } from "../memory/types";
+import { createAudit, type AuditModule } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
+import { buildRegistry } from "../scheduler/actions";
+import { createIngestPollAction } from "../ingest/poll-action";
+import { orgPulseAction } from "../scheduler/observer";
+import { recurringWorkAction } from "../scheduler/recurring-work";
+import { reflectionAction } from "../scheduler/reflection";
+import { standupDigestAction } from "../scheduler/standup";
+import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
+import { kbToolDefinitions } from "../tools/kb-tools";
+import { modelToolsDefinitions } from "../tools/model-settings";
+import { workItemToolDefinitions } from "../tools/work-items";
 import {
   APPROVAL_REQUESTED_EVENT,
   APPROVAL_RESOLVED_EVENT,
@@ -33,6 +47,7 @@ import {
   EXTENSION_CONNECTED_EVENT,
   EXTENSION_CREDENTIAL_RESOLVED_EVENT,
   POLICY_DECISION_EVENT,
+  WORK_ITEM_CREATED_EVENT,
 } from "../store/audit-events";
 import type { CredentialBoundary } from "../extensions/boundary";
 import type { BrokerConnector } from "../extensions/connect";
@@ -42,7 +57,7 @@ import { validateManifest, type ExtensionManifest, type McpBinding } from "../ex
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { resetToolSurfaceCache } from "../extensions/surface";
-import { createMemoryMcpServer } from "./server";
+import { createMemoryMcpServer, type McpInternalToolsOptions } from "./server";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
 
@@ -86,11 +101,10 @@ async function launch(opts: LaunchOpts): Promise<Harness> {
     }
   }
 
-  const env: Record<string, string> = {
-    BOTTEGA_DB_PATH: dbPath,
-    BOTTEGA_CONFIG_DIR: configDir,
-    BOTTEGA_SESSION_DIR: sessionsDir,
-  };
+  const env: Record<string, string> = {};
+  env.BOTTEGA_DB_PATH = dbPath;
+  env.BOTTEGA_CONFIG_DIR = configDir;
+  env.BOTTEGA_SESSION_DIR = sessionsDir;
   if (spaceId) env.BOTTEGA_SPACE_ID = spaceId;
   if (opts.defaultPrincipal) env.BOTTEGA_MCP_DEFAULT_PRINCIPAL = opts.defaultPrincipal;
   // Pin an empty extensions dir so the spawned server never picks up the
@@ -138,8 +152,9 @@ async function auditRows(store: Store, eventType: string): Promise<AuditRow[]> {
   return store.listAudit({ event_type: eventType });
 }
 
-function payload(row: AuditRow): Record<string, unknown> {
-  return JSON.parse(row.payload) as Record<string, unknown>;
+function payload(row: AuditRow): Record<string, JsonValue> {
+  // SAFETY: audit payloads are written via JSON.stringify, so the parsed value is a JSON object.
+  return JSON.parse(row.payload) as Record<string, JsonValue>;
 }
 
 /** The SDK's callTool return type is index-signature-heavy; narrow it here. */
@@ -148,25 +163,185 @@ interface ToolCallResult {
   isError?: boolean;
 }
 
+/** callTool wrapper: narrows the SDK's index-signature-heavy result to the surface these tests assert on. */
+async function callTool(client: Client, name: string, args: Record<string, JsonValue>): Promise<ToolCallResult> {
+  // SAFETY: a callTool result is a JSON message whose content blocks carry text/type and an optional isError flag.
+  return (await client.callTool({ name, arguments: args })) as ToolCallResult;
+}
+
 /** Org floor allowing the built-in memory and transcript-search tools. */
 const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  session_search: allow\n";
+  interface InProcessHarness {
+    client: Client;
+    store: Store;
+    boundary: CredentialBoundary & { calls: ExtensionCredential[] };
+    brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }>;
+    /** The org floor policy the server gates against (the internal surface's orgPolicy too). */
+    policy: PolicyConfig;
+    /** The audit module wired into the server. */
+    audit: AuditModule;
+    /** The memory provider wired into the server (memory + KB tools). */
+    provider: MemoryProvider;
+    /** The wired internal surface options (issue #206); undefined when internal is disabled. */
+    internal?: McpInternalToolsOptions;
+    cleanup: () => Promise<void>;
+  }
+
+  /** In-process server with injected runtime deps (real store + audit, fake boundary/broker/transport). */
+  async function makeInProcessHarness(opts: {
+    policy?: PolicyConfig;
+    defaultPrincipal?: string;
+    registry?: ExtensionRegistry;
+    mcpTransport?: (binding: McpBinding) => Transport;
+    /** Issue #196: wire the one-time upload-link mint (shared store + fake base URL). */
+    uploadLink?: boolean;
+    /**
+     * Issue #206: wire the internal tool surface (work items, model
+     * settings, scheduler, KB). Default true — the production surface.
+     */
+    internal?: boolean;
+    /** Internal-surface overrides (issue #206 tests): the catalog seam / KB config. */
+    internalOptions?: Partial<Pick<McpInternalToolsOptions, "agentDir" | "listModels" | "kb" | "schedulerRegistry">>;
+  } = {}): Promise<InProcessHarness> {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const registry = opts.registry ?? createFixtureRegistry();
+    const policy = opts.policy ?? parseOrgConfigYaml(EXT_ALLOW);
+    const provider = createSqliteMemoryProvider(store.getDb());
+    const boundary = makeBoundary();
+    const brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
+    const broker: BrokerConnector = async (input) => {
+      brokerCalls.push(input);
+      return { identityKey: null, brokerCredentialId: 42 };
+    };
+    const mcpTransport =
+      opts.mcpTransport ??
+      ((_binding: McpBinding): Transport => {
+        // Stub provider MCP server: returns the city echoed back (hermetic —
+        // the fixture's serverUrl is intentionally unreachable).
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        const stub = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+        stub.setRequestHandler(CallToolRequestSchema, async (request) => {
+          const args = z.record(z.string(), z.json()).parse(request.params.arguments ?? {});
+          return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+        });
+        void stub.connect(serverTransport);
+        return clientTransport;
+      });
+    const runtime = createExtensionRuntime({
+      registry,
+      store,
+      audit,
+      orgPolicy: policy,
+      router: DenyRouter,
+      boundary,
+      mcpTransport,
+    });
+    const internalOptions: McpInternalToolsOptions | undefined =
+      opts.internal === false
+        ? undefined
+        : {
+            store,
+            orgPolicy: policy,
+            // The same five actions the server boot registers (issue
+            // #86/#57) — create_scheduler_job validates against them.
+            schedulerRegistry: buildRegistry([
+              standupDigestAction,
+              reflectionAction,
+              orgPulseAction,
+              recurringWorkAction,
+              createIngestPollAction(),
+            ]),
+            // Hermetic KB config: no sources, no egress — kb_ingest lists
+            // nothing and unknown sources fail as tool outcomes.
+            kb: { sources: [] },
+            // Hermetic catalog seam: never touches the repo's agent dir.
+            listModels: async () => [],
+            ...opts.internalOptions,
+          };
+    const server = createMemoryMcpServer({
+      provider,
+      policy,
+      audit,
+      spaceId: "slack:C1",
+      defaultPrincipal: opts.defaultPrincipal ?? "U123",
+      sessionSearch: { db: store.getDb(), transcriptDir: join(dir, "sessions") },
+      ...(internalOptions !== undefined ? { internal: internalOptions } : undefined),
+      extensions: {
+        runtime,
+        registry,
+        mcpTransport,
+        connect: {
+          registry,
+          store,
+          audit,
+          broker,
+          gate: { loadPolicy: () => Promise.resolve(policy), router: DenyRouter, timeoutMs: 1_000 },
+        },
+        ...(opts.uploadLink
+          ? { uploadLink: { store: new UploadLinkStore(store), baseUrl: () => "http://127.0.0.1:9999" } }
+          : undefined),
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    void server.connect(serverTransport);
+    const client = new Client({ name: "bottega-mcp-inproc-test", version: "0.0.1" }, { capabilities: {} });
+    await client.connect(clientTransport);
+    return {
+      client,
+      store,
+      boundary,
+      brokerCalls,
+      policy,
+      audit,
+      provider,
+      internal: internalOptions,
+      cleanup: async () => {
+        await client.close();
+        await server.close();
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+
+  function makeBoundary(): CredentialBoundary & { calls: ExtensionCredential[] } {
+    const calls: ExtensionCredential[] = [];
+    return {
+      calls,
+      async authorize(credential: ExtensionCredential) {
+        calls.push(credential);
+      },
+    };
+  }
 
 describe("MCP server conformance (spawned entrypoint)", () => {
-  test("initialize + tools/list returns the capability tools (memory + connect) with schemas", async () => {
+  test("initialize + tools/list returns the capability tools (memory + connect + internal) with schemas", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
     try {
       const { tools } = await h.client.listTools();
-      // connect_extension is a core capability: advertised even when no
-      // extension snapshots are seeded (issue #61).
+      // Issue #206: the internal tools ride the same surface (kb_ingest is
+      // absent — the spawned harness has no config/kb.yml, so the boot
+      // fails it closed).
       expect(tools.map((t) => t.name).sort()).toEqual([
+        "complete_work_item",
         "connect_extension",
+        "create_scheduler_job",
+        "create_work_item",
+        "delete_scheduler_job",
+        "list_scheduler_jobs",
         "memory.save",
         "memory.search",
+        "model_settings",
         "session_search",
+        "work_item_cancel",
       ]);
 
       const connect = tools.find((t) => t.name === "connect_extension")!;
       expect((connect.description ?? "").length).toBeGreaterThan(0);
+      // SAFETY: connect_extension's zod schema advertises each parameter as a JSON-schema object with optional type/enum.
       const connectProps = connect.inputSchema.properties as Record<string, { type?: string; enum?: string[] }>;
       expect(Object.keys(connectProps).sort()).toEqual(["api_key", "extension", "scope"]);
       expect(connectProps.scope?.enum).toEqual(["org", "personal"]);
@@ -176,6 +351,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 
       const save = tools.find((t) => t.name === "memory.save")!;
       expect((save.description ?? "").length).toBeGreaterThan(0);
+      // SAFETY: memory.save's zod schema advertises each parameter as a JSON-schema object with optional type/enum.
       const saveProps = save.inputSchema.properties as Record<string, { type?: string; enum?: string[] }>;
       expect(Object.keys(saveProps).sort()).toEqual(["content", "metadata", "principal", "scope"]);
       expect(saveProps.scope?.enum).toEqual(["org", "user"]);
@@ -184,6 +360,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(save.inputSchema.required).toContain("scope");
 
       const search = tools.find((t) => t.name === "memory.search")!;
+      // SAFETY: memory.search's zod schema advertises each parameter as a JSON-schema object with optional type.
       const searchProps = search.inputSchema.properties as Record<string, { type?: string }>;
       expect(Object.keys(searchProps).sort()).toEqual(["limit", "principal", "query", "scope"]);
       expect(searchProps.query?.type).toBe("string");
@@ -191,10 +368,23 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(search.inputSchema.required).toContain("scope");
 
       const sessionSearch = tools.find((t) => t.name === "session_search")!;
+      // SAFETY: session_search's zod schema advertises each parameter as a JSON-schema object with optional type.
       const sessionSearchProps = sessionSearch.inputSchema.properties as Record<string, { type?: string }>;
       expect(Object.keys(sessionSearchProps).sort()).toEqual(["limit", "query", "space"]);
       expect(sessionSearchProps.query?.type).toBe("string");
       expect(sessionSearch.inputSchema.required).toEqual(["query"]);
+
+      // Issue #206: the internal tools advertise the SESSION definitions'
+      // schemas (one source of truth) — create_work_item carries its full
+      // parameter shape, not a stub.
+      const createWorkItem = tools.find((t) => t.name === "create_work_item")!;
+      expect((createWorkItem.description ?? "").length).toBeGreaterThan(0);
+      // SAFETY: create_work_item's omptype zod schema emits properties as JSON-schema objects with optional type/enum.
+      const createProps = createWorkItem.inputSchema.properties as Record<string, { type?: string; enum?: string[] }>;
+      expect(Object.keys(createProps).sort()).toEqual(["delivery", "description", "model", "reasoning_effort", "repo", "requester"]);
+      expect(createProps.description?.type).toBe("string");
+      expect(createProps.delivery?.enum).toEqual(["git", "extension", "chat"]);
+      expect(createWorkItem.inputSchema.required).toEqual(["description"]);
     } finally {
       await h.cleanup();
     }
@@ -213,12 +403,9 @@ describe("MCP server conformance (spawned entrypoint)", () => {
           message: { role: "user", content: [{ type: "text", text: "release train is green" }] },
         })}\n`,
       );
-      const result = (await h.client.callTool({
-        name: "session_search",
-        arguments: { query: "release", space: "slack:C9" },
-      })) as ToolCallResult;
+      const result = await callTool(h.client, "session_search", { query: "release", space: "slack:C9" });
       expect(result.isError).not.toBe(true);
-      expect(JSON.parse(result.content[0]!.text!) as unknown).toEqual([
+      expect(JSON.parse(result.content[0]!.text!)).toEqual([
         {
           space: "slack:C9",
           file: "slack:C9.jsonl",
@@ -235,13 +422,14 @@ describe("MCP server conformance (spawned entrypoint)", () => {
   test("tools/call memory.save writes an audit row with content_hash, never the content", async () => {
     const h = await launch({ configYaml: ALLOW_ALL });
     try {
-      const res = (await h.client.callTool({
-        name: "memory.save",
-        arguments: { scope: "org", content: "the vault combination is 1234", metadata: { topic: "vault" } },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "memory.save", {
+        scope: "org",
+        content: "the vault combination is 1234",
+        metadata: { topic: "vault" },
+      });
       expect(res.isError).not.toBe(true);
-      const text = (res.content[0] as { type: string; text: string }).text;
-      const { id } = JSON.parse(text) as { id: string };
+      const text = res.content[0]!.text!;
+      const { id } = JSON.parse(text);
       expect(id).toMatch(/^mem_/);
 
       const rows = await auditRows(h.store, "memory.write");
@@ -336,15 +524,18 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       await h.client.callTool({ name: "memory.save", arguments: { scope: "user", principal: "U1", content: "alpha user fact" } });
       await h.client.callTool({ name: "memory.save", arguments: { scope: "user", principal: "U2", content: "alpha other user" } });
 
-      const org = (await h.client.callTool({ name: "memory.search", arguments: { scope: "org", query: "alpha" } })) as ToolCallResult;
-      const orgEntries = JSON.parse((org.content[0] as { text: string }).text) as Array<{ scope: string }>;
+      const org = await callTool(h.client, "memory.search", { scope: "org", query: "alpha" });
+      // SAFETY: memory.search results are MemoryEntry-shaped; the assertion reads only the scope field.
+      const orgEntries = JSON.parse(org.content[0]!.text!) as Array<{ scope: string }>;
       expect(orgEntries.map((e) => e.scope)).toEqual(["org"]);
 
-      const mine = (await h.client.callTool({
-        name: "memory.search",
-        arguments: { scope: "user", query: "alpha", principal: "U1" },
-      })) as ToolCallResult;
-      const mineEntries = JSON.parse((mine.content[0] as { text: string }).text) as Array<{ principal: string | null }>;
+      const mine = await callTool(h.client, "memory.search", {
+        scope: "user",
+        query: "alpha",
+        principal: "U1",
+      });
+      // SAFETY: memory.search results are MemoryEntry-shaped; the assertion reads only the principal field.
+      const mineEntries = JSON.parse(mine.content[0]!.text!) as Array<{ principal: string | null }>;
       expect(mineEntries.map((e) => e.principal)).toEqual(["U1"]);
     } finally {
       await h.cleanup();
@@ -376,15 +567,23 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
     try {
       const { tools } = await h.client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
+        "complete_work_item",
         "connect_extension",
+        "create_scheduler_job",
+        "create_work_item",
+        "delete_scheduler_job",
+        "list_scheduler_jobs",
         "memory.save",
         "memory.search",
+        "model_settings",
         "session_search",
         FIXTURE_EXTENSION_TOOL,
+        "work_item_cancel",
       ]);
 
       const weather = tools.find((t) => t.name === FIXTURE_EXTENSION_TOOL)!;
       expect((weather.description ?? "").length).toBeGreaterThan(0);
+      // SAFETY: the fixture manifest's tool zod schema advertises each parameter as a JSON-schema object with optional type.
       const props = weather.inputSchema.properties as Record<string, { type?: string }>;
       expect(props.city?.type).toBe("string");
       expect(weather.inputSchema.required).toEqual(["city"]);
@@ -398,10 +597,7 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
     try {
       // No credential seeded: the call clears the gate, then fails closed at
       // the credential ladder — the provider (unreachable) is never touched.
-      const res = (await h.client.callTool({
-        name: FIXTURE_EXTENSION_TOOL,
-        arguments: { city: "Lisbon" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, FIXTURE_EXTENSION_TOOL, { city: "Lisbon" });
       expect(res.isError).toBe(true);
       expect(res.content[0]?.text ?? "").toContain("no fixture.weather credential is available");
 
@@ -426,10 +622,7 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
       extensions: [fixtureManifest()],
     });
     try {
-      const res = (await h.client.callTool({
-        name: FIXTURE_EXTENSION_TOOL,
-        arguments: { city: "Lisbon" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, FIXTURE_EXTENSION_TOOL, { city: "Lisbon" });
       expect(res.isError).toBe(true);
       expect(res.content[0]?.text ?? "").toContain("denied by this space's policy");
 
@@ -449,107 +642,7 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
 
 describe("MCP server extension surface (in-process deps)", () => {
   /** Fake egress boundary: records the credential, never touches the proxy. */
-  function makeBoundary(): CredentialBoundary & { calls: ExtensionCredential[] } {
-    const calls: ExtensionCredential[] = [];
-    return {
-      calls,
-      async authorize(credential: ExtensionCredential) {
-        calls.push(credential);
-      },
-    };
-  }
 
-  interface InProcessHarness {
-    client: Client;
-    store: Store;
-    boundary: CredentialBoundary & { calls: ExtensionCredential[] };
-    brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }>;
-    cleanup: () => Promise<void>;
-  }
-
-  /** In-process server with injected runtime deps (real store + audit, fake boundary/broker/transport). */
-  async function makeInProcessHarness(opts: {
-    policy?: PolicyConfig;
-    defaultPrincipal?: string;
-    registry?: ExtensionRegistry;
-    mcpTransport?: (binding: McpBinding) => Transport;
-    /** Issue #196: wire the one-time upload-link mint (shared store + fake base URL). */
-    uploadLink?: boolean;
-  } = {}): Promise<InProcessHarness> {
-    const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
-    const store = createStore(join(dir, "test.db"));
-    const audit = createAudit(store);
-    const registry = opts.registry ?? createFixtureRegistry();
-    const policy = opts.policy ?? parseOrgConfigYaml(EXT_ALLOW);
-    const boundary = makeBoundary();
-    const brokerCalls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
-    const broker: BrokerConnector = async (input) => {
-      brokerCalls.push(input);
-      return { identityKey: null, brokerCredentialId: 42 };
-    };
-    const mcpTransport =
-      opts.mcpTransport ??
-      ((_binding: McpBinding): Transport => {
-        // Stub provider MCP server: returns the city echoed back (hermetic —
-        // the fixture's serverUrl is intentionally unreachable).
-        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-        const stub = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-        stub.setRequestHandler(CallToolRequestSchema, async (request) => {
-          const args = request.params.arguments as Record<string, unknown>;
-          return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
-        });
-        void stub.connect(serverTransport);
-        return clientTransport;
-      });
-    const runtime = createExtensionRuntime({
-      registry,
-      store,
-      audit,
-      orgPolicy: policy,
-      router: DenyRouter,
-      boundary,
-      mcpTransport,
-    });
-    const server = createMemoryMcpServer({
-      provider: createSqliteMemoryProvider(store.getDb()),
-      policy,
-      audit,
-      spaceId: "slack:C1",
-      defaultPrincipal: opts.defaultPrincipal ?? "U123",
-      sessionSearch: { db: store.getDb(), transcriptDir: join(dir, "sessions") },
-      extensions: {
-        runtime,
-        registry,
-        mcpTransport,
-        connect: {
-          registry,
-          store,
-          audit,
-          broker,
-          gate: { loadPolicy: () => Promise.resolve(policy), router: DenyRouter, timeoutMs: 1_000 },
-        },
-        ...(opts.uploadLink
-          ? { uploadLink: { store: new UploadLinkStore(store), baseUrl: () => "http://127.0.0.1:9999" } }
-          : {}),
-      },
-    });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    void server.connect(serverTransport);
-    const client = new Client({ name: "bottega-mcp-inproc-test", version: "0.0.1" }, { capabilities: {} });
-    await client.connect(clientTransport);
-    return {
-      client,
-      store,
-      boundary,
-      brokerCalls,
-      cleanup: async () => {
-        await client.close();
-        await server.close();
-        store.close();
-        rmSync(dir, { recursive: true, force: true });
-      },
-    };
-  }
 
   test("a tools-less manifest is advertised + callable on the MCP surface via discovery (issue #158)", async () => {
     const DISCOVER_ID = "discover.me";
@@ -560,6 +653,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       { name: "search_issues", description: "Search", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
       { name: "delete_issue", description: "Delete", inputSchema: { type: "object", properties: {} } },
     ];
+    // SAFETY: the wire-tool names recorded by the stub calls are strings.
     const seen = { list: 0, tool: [] as string[] };
     const registry = createExtensionRegistry();
     registry.register(
@@ -609,10 +703,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       // A call by the namespaced name resolves the owner across the
       // discovered surface and executes through the runtime with the WIRE
       // name (providerName).
-      const res = (await h.client.callTool({
-        name: "discover.me.search_issues",
-        arguments: { query: "repo:x" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "discover.me.search_issues", { query: "repo:x" });
       expect(res.isError).not.toBe(true);
       expect(res.content[0]?.text ?? "").toBe("ok search_issues");
       expect(seen.tool).toEqual(["search_issues"]);
@@ -634,10 +725,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         brokerCredentialId: 7,
       });
 
-      const res = (await h.client.callTool({
-        name: FIXTURE_EXTENSION_TOOL,
-        arguments: { city: "Lisbon" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, FIXTURE_EXTENSION_TOOL, { city: "Lisbon" });
       expect(res.isError).not.toBe(true);
       expect(res.content[0]?.text ?? "").toBe("sunny in Lisbon");
 
@@ -678,10 +766,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         brokerCredentialId: 7,
       });
 
-      const res = (await h.client.callTool({
-        name: FIXTURE_EXTENSION_TOOL,
-        arguments: { city: "Lisbon" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, FIXTURE_EXTENSION_TOOL, { city: "Lisbon" });
       expect(res.isError).toBe(true);
       expect(res.content[0]?.text ?? "").toContain("denied by this space's policy");
 
@@ -701,10 +786,7 @@ describe("MCP server extension surface (in-process deps)", () => {
   test("connect_extension personal connects for the session principal and audits", async () => {
     const h = await makeInProcessHarness();
     try {
-      const res = (await h.client.callTool({
-        name: "connect_extension",
-        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "connect_extension", { extension: FIXTURE_EXTENSION_ID, scope: "personal" });
       expect(res.isError).not.toBe(true);
       expect(res.content[0]?.text ?? "").toBe("Fixture Weather connected as @U123");
 
@@ -732,10 +814,7 @@ describe("MCP server extension surface (in-process deps)", () => {
   test("connect_extension org fails closed without an approval channel", async () => {
     const h = await makeInProcessHarness();
     try {
-      const res = (await h.client.callTool({
-        name: "connect_extension",
-        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "org" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "connect_extension", { extension: FIXTURE_EXTENSION_ID, scope: "org" });
       expect(res.isError).toBe(true);
       expect(res.content[0]?.text ?? "").toContain("policy: approval denied");
 
@@ -759,10 +838,7 @@ describe("MCP server extension surface (in-process deps)", () => {
   test("connect_extension with an unknown extension is a tool error", async () => {
     const h = await makeInProcessHarness();
     try {
-      const res = (await h.client.callTool({
-        name: "connect_extension",
-        arguments: { extension: "nope.xyz", scope: "personal" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "connect_extension", { extension: "nope.xyz", scope: "personal" });
       expect(res.isError).toBe(true);
       expect(res.content[0]?.text ?? "").toContain("unknown extension");
       expect(h.brokerCalls).toHaveLength(0);
@@ -794,10 +870,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       const { tools } = await h.client.listTools();
       expect(tools.map((t) => t.name)).toContain("connect_upload_link");
 
-      const res = (await h.client.callTool({
-        name: "connect_upload_link",
-        arguments: { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
-      })) as ToolCallResult;
+      const res = await callTool(h.client, "connect_upload_link", { extension: FIXTURE_EXTENSION_ID, scope: "personal" });
       expect(res.isError).toBeUndefined();
       const url = res.content[0]?.text ?? "";
       expect(url.startsWith("http://127.0.0.1:9999/upload/")).toBe(true);
@@ -827,6 +900,168 @@ describe("MCP server extension surface (in-process deps)", () => {
     }
   });
 
+  // Issue #206: the internal tools on the in-process surface — advertised
+  // with the session definitions' schemas, policy-gated, audited.
+  /** The SDK's advertised inputSchema shape (type: "object" + properties/required). */
+  type AdvertisedInputSchema = {
+    [key: string]: unknown;
+    type: "object";
+    properties?: Record<string, object>;
+    required?: string[];
+  };
+
+  /** Wire JSON Schema of an SDK definition's parameters (omptype zod → JSON Schema). */
+  function definitionJsonSchema(definition: ToolDefinition): AdvertisedInputSchema {
+    // SAFETY: every internal tool definition is authored with the SDK's zod
+    // surface (omptype); the ToolDefinition contract only promises the
+    // wider TSchema, so toJsonSchema is narrowed here (same as the server).
+    const parameters = definition.parameters as { toJsonSchema(): Record<string, unknown> };
+    // SAFETY: every internal definition's parameters are a z.object, so the
+    // wire document carries the SDK's advertised object shape.
+    return parameters.toJsonSchema() as AdvertisedInputSchema;
+  }
+
+  test("the MCP internal tools match the session tool definitions (one source of truth)", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      const { tools } = await h.client.listTools();
+      const internal = h.internal!;
+      // The SAME definitions the SDK session toolset carries
+      // (src/server/index.ts), built from the SAME inputs the server wired.
+      const sessionDefinitions = [
+        ...workItemToolDefinitions(h.store, {
+          orgPolicy: internal.orgPolicy,
+          agentDir: internal.agentDir,
+          listModels: internal.listModels,
+        }),
+        ...modelToolsDefinitions(h.store, {
+          audit: h.audit,
+          agentDir: internal.agentDir,
+          listModels: internal.listModels,
+        }),
+        ...schedulerToolDefinitions(h.store, h.audit, internal.schedulerRegistry!),
+        ...kbToolDefinitions({ memoryProvider: h.provider, audit: h.audit, config: internal.kb! }),
+      ].filter((definition) => definition.name !== "use_model");
+
+      const advertisedByName: Record<string, (typeof tools)[number]> = Object.fromEntries(
+        tools.map((tool) => [tool.name, tool]),
+      );
+      for (const definition of sessionDefinitions) {
+        const advertised = advertisedByName[definition.name];
+        expect(advertised, `internal tool ${definition.name} is advertised`).toBeDefined();
+        expect(advertised!.description).toBe(definition.description);
+        // The advertised schema IS the definition's parameters — no
+        // hand-written mirror to drift.
+        expect(advertised!.inputSchema).toEqual(definitionJsonSchema(definition));
+      }
+      // use_model stays SDK-session-only: ACP sessions cannot switch models
+      // mid-session (the agent's own config governs there, issue #64).
+      expect(advertisedByName["use_model"]).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("an allowed internal tool executes server-side and audits its policy decision", async () => {
+    // create_work_item is exec-tier: it auto-approves ONLY when listed
+    // under approvals.always_approve (issue #45) — the "list the tool
+    // before it can auto-approve" rule; otherwise ask-human fails closed
+    // in this headless context.
+    const h = await makeInProcessHarness({
+      policy: parseOrgConfigYaml(
+        "approvals:\n  always_approve:\n    - create_work_item\n" + "tools:\n  unknown: allow\n",
+      ),
+    });
+    try {
+      // The call crosses the gate (auto-approved exec tier) and runs the
+      // REAL definition: the item lands in the store under the pinned
+      // session space (created lazily).
+      const res = await callTool(h.client, "create_work_item", { description: "handle the deploy" });
+      expect(res.isError).not.toBe(true);
+      const { id, state } = JSON.parse(res.content[0]!.text!) as { id: string; state: string };
+      expect(id).toMatch(/^wi_/);
+      expect(state).toBe("open");
+
+      const item = await h.store.getWorkItem(id);
+      expect(item).not.toBeNull();
+      expect(item!.space_id).toBe("slack:C1");
+      expect(item!.requester).toBe("agent");
+
+      // The call was audited like the built-in tools: the policy decision
+      // (auto-approved, exec tier) + the definition's work_item.created row.
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      const createDecision = decisions.find((row) => payload(row).tool === "create_work_item")!;
+      expect(payload(createDecision).decision).toBe("allow");
+      expect(payload(createDecision).tier).toBe("exec");
+      expect(payload(createDecision).reason).toContain("always_approve");
+      expect(createDecision.space_id).toBe("slack:C1");
+      expect(await auditRows(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("model_settings, scheduler, and KB tools run through the same gate on the MCP surface", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+
+      // model_settings read (write-tier by tool name; allowed via unknown:
+      // allow) returns the space settings + the hermetic catalog.
+      const settings = await callTool(h.client, "model_settings", {});
+      expect(settings.isError).not.toBe(true);
+      expect(JSON.parse(settings.content[0]!.text!)).toMatchObject({ available_models: [] });
+
+      // model_settings write persists + audits model.settings_changed.
+      const wrote = await callTool(h.client, "model_settings", { set: { model: "deepseek-v4-flash" } });
+      expect(wrote.isError).not.toBe(true);
+      expect(JSON.parse(wrote.content[0]!.text!)).toMatchObject({ model: "deepseek-v4-flash" });
+      expect(await auditRows(h.store, "model.settings_changed")).toHaveLength(1);
+
+      // Scheduler list (read tier) runs the real store query.
+      const jobs = await callTool(h.client, "list_scheduler_jobs", {});
+      expect(jobs.isError).not.toBe(true);
+      expect(JSON.parse(jobs.content[0]!.text!)).toEqual([]);
+
+      // KB ingest with an unknown source is a TOOL OUTCOME (the call ran
+      // through the gate; the definition reported the error).
+      const kb = await callTool(h.client, "kb_ingest", { source: "missing" });
+      expect(kb.isError).toBe(true);
+      expect(kb.content[0]?.text ?? "").toContain("unknown KB source");
+
+      // Every call audited its policy decision.
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(decisions.map((row) => payload(row).tool).sort()).toEqual([
+        "kb_ingest",
+        "list_scheduler_jobs",
+        "model_settings",
+        "model_settings",
+      ]);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("an unlisted internal tool is denied by the policy gate with no execution (fail closed)", async () => {
+    // Only memory.search is allowed; create_work_item is not listed → deny.
+    const h = await makeInProcessHarness({ policy: parseOrgConfigYaml("tools:\n  memory.search: allow\n") });
+    try {
+      await expect(
+        h.client.callTool({ name: "create_work_item", arguments: { description: "blocked" } }),
+      ).rejects.toThrow(/policy/);
+
+      // The tool never executed: no work item, no work_item.created audit.
+      expect(await auditRows(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(decisions).toHaveLength(1);
+      expect(payload(decisions[0]!).tool).toBe("create_work_item");
+      expect(payload(decisions[0]!).decision).toBe("deny");
+      expect(payload(decisions[0]!).tier).toBe("exec");
+      expect(decisions[0]!.space_id).toBe("slack:C1");
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("MCP server policy + audit enforcement", () => {
