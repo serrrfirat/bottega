@@ -48,10 +48,23 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentToolResult, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import {
+  ADMIN_CATALOG_BROWSER_EVENT,
+  APPROVAL_REQUESTED_EVENT,
+  APPROVAL_RESOLVED_EVENT,
+  DELIVERY_PENDING_EVENT,
+  DELIVERY_REQUESTED_EVENT,
+  DELIVERY_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
+  EXTENSION_CONNECTED_EVENT,
+  MODEL_SETTINGS_CHANGED_EVENT,
   MODEL_SWITCHED_EVENT,
   WORK_ITEM_CREATED_EVENT,
 } from "../../src/store/audit-events";
@@ -66,23 +79,49 @@ import {
   FIXTURE_EXTENSION_ID,
   FIXTURE_EXTENSION_TOOL,
 } from "../../src/extensions/fixture";
-import type { McpBinding } from "../../src/extensions/manifest";
+import type { ExtensionRegistry } from "../../src/extensions/registry";
+import type { ExtensionManifest, McpBinding } from "../../src/extensions/manifest";
+import { pollPendingDeliveries } from "../../src/server/services/delivery-poller";
+import { resolveDeliveryAction } from "../../src/server/adapters/delivery-router";
+import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
+import { DELIVERY_APPROVE_ACTION_ID, APPROVE_ACTION_ID } from "../../src/server/adapters/slack";
+import {
+  startUploadLinkServer,
+  mintUploadLinkToolDefinition,
+  type UploadLinkServerHandle,
+} from "../../src/extensions/upload-link";
+import { OAuthFlowStore, type McpOAuthConnector, type OAuthFlowStoreSlice } from "../../src/extensions/mcp-oauth";
+import { adminToolDefinitions } from "../../src/tools/admin";
+import { modelToolsDefinitions } from "../../src/tools/model-settings";
+import { evaluatePolicyGate } from "../../src/policy/gate";
+import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
+import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
+import type { BrokerConnector } from "../../src/extensions/connect";
 import type { LiveSlackTokens, SlackApiMessage } from "./slack-live";
 
 /** Org policy for the canary (issues #79/#175): memory tools allowed,
  * work-item creation on the documented always-approve path (approver:
- * "policy"), and the fixture extension's read-tier tool allowed so the
+ * "policy"), the fixture extension's read-tier tool allowed so the
  * extension journey crosses the policy gate (the fixture extension itself
- * is registered by the canary's own registry — see runLiveLeg). */
-const CANARY_ORG_CONFIG = [
+ * is registered by the canary's own registry — see runLiveLeg), semantic
+ * auto-pickup ON so the pickup journey exercises the #89 directive,
+ * use_model allowed so the model-role journey's write-tier switch runs
+ * without a prompt, and model_settings on the PROMPT path — the
+ * org-settings approval journey (issue #151) is exactly that flow (the
+ * default unknown action denies, which would skip the prompt entirely). */
+export const CANARY_ORG_CONFIG = [
   "tools:",
   "  memory.save: allow",
   "  memory.search: allow",
   "  create_work_item: allow",
+  "  use_model: allow",
+  "  model_settings: prompt",
   `  ${FIXTURE_EXTENSION_TOOL}: allow`,
   "approvals:",
   "  always_approve:",
   "    - create_work_item",
+  "work_items:",
+  "  auto_pickup: true",
   "",
 ].join("\n");
 
@@ -138,7 +177,7 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
       appToken,
       botToken,
       qaUserToken,
-      ...(qaUserId !== undefined ? { qaUserId } : {}),
+      ...(qaUserId !== undefined ? { qaUserId } : undefined),
       qaUserName: deps.env.SLACK_QA_USER_NAME?.trim() || "bottega-qa",
       channelName: deps.env.SLACK_QA_CHANNEL?.trim() || "bottega-qa",
     },
@@ -223,6 +262,8 @@ export function canaryFixtureMcpTransport(_binding: McpBinding): Transport {
     ],
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    // SAFETY: the canary's only callTool invoker sends { city: <string> };
+    // anything else is tolerated via the ?? "unknown" fallback below.
     const args = (request.params.arguments ?? {}) as { city?: string };
     return { content: [{ type: "text", text: `sunny in ${args.city ?? "unknown"}` }] };
   });
@@ -239,6 +280,186 @@ export function canaryFixtureMcpTransport(_binding: McpBinding): Transport {
  */
 export function canaryFixtureBoundary(): CredentialBoundary {
   return createSecretFileBoundary({ resolveSecret: async () => "canary-fixture-secret" });
+}
+
+// ---------------------------------------------------------------------------
+// Full-matrix fixtures (issues #149/#185/#89/#189/#188/#192/#195/#198/#196/#193)
+// ---------------------------------------------------------------------------
+
+/** The canary's hosted-OAuth fixture extension (issue #198): a tools-less
+ * hosted streamable-http MCP with an oauth credential schema — the exact
+ * shape `connectExtension` routes through the generic MCP OAuth seam. The
+ * serverUrl is a placeholder: the canary's scripted connector never
+ * reaches it (the real SDK auth orchestration + browser leg are skip-gated
+ * with evidence). */
+export const CANARY_OAUTH_EXTENSION_ID = "fixture.oauth";
+
+function canaryOAuthManifest(): ExtensionManifest {
+  return {
+    id: CANARY_OAUTH_EXTENSION_ID,
+    label: "Fixture OAuth MCP",
+    vendor: "bottega-fixtures",
+    kind: "mcp",
+    mcp: { serverUrl: "https://oauth.fixture.test/mcp", transport: "streamable-http" },
+    credentialSchema: { type: "oauth", scopes: ["read"] },
+    // `tools: []` is the deliberate pinned "no tools" surface (issue #158):
+    // no runtime tools/list discovery, so boot never tries the placeholder
+    // serverUrl.
+    tools: [],
+    domains: ["oauth.fixture.test"],
+  };
+}
+
+/** The canary registry: the weather fixture (issue #175) + the OAuth fixture (issue #198). */
+export function createCanaryRegistry(): ExtensionRegistry {
+  const registry = createFixtureRegistry();
+  registry.register(canaryOAuthManifest());
+  return registry;
+}
+
+/**
+ * The canary's generic MCP OAuth connector (issue #198): scripted like the
+ * fixture MCP transport — the SDK's authorization-server discovery, dynamic
+ * client registration, PKCE challenge, and the browser leg need a real
+ * vendor server + browser (skip-gated with evidence). What the connector
+ * DOES exercise for real: the connect capability routes the OAuth fixture
+ * here, the mint persists a single-use flow row in the REAL store
+ * (OAuthFlowStore over the shared SQLite), and the URL is shown in Slack —
+ * the connect's one-time-link posture. The callback's first gate (single-use
+ * state, fail closed) is proven hermetically by the journey (mint → consume
+ * → replay denied). The store is read lazily at start time because the
+ * harness (and its store) does not exist when the connector is constructed.
+ */
+export function canaryMcpOAuthConnector(store: () => OAuthFlowStoreSlice): McpOAuthConnector {
+  return {
+    async start(input) {
+      const flows = new OAuthFlowStore(store());
+      const token = randomBytes(18).toString("base64url");
+      const authorizationUrl = `https://oauth.fixture.test/authorize?client_id=canary-fixture&state=${token}`;
+      const minted = flows.mint({
+        token,
+        provider: input.extension,
+        scope: input.scope,
+        actor: input.actor,
+        spaceId: input.spaceId,
+        label: input.label,
+        serverUrl: "https://oauth.fixture.test/mcp",
+        redirectUri: "http://127.0.0.1:0/oauth/callback",
+        flow: JSON.stringify({ authorizationUrl }),
+        ttlMs: 15 * 60_000,
+      });
+      if (!minted.ok) return { ok: false, message: minted.reason };
+      return {
+        ok: true,
+        authorizationUrl,
+        message:
+          `Open this link to authorize ${input.label}: ${authorizationUrl} — ` +
+          `after you authorize in the browser, ${input.label} is connected.`,
+      };
+    },
+  };
+}
+
+/** The canary's broker seam (issues #196/#198): records the upload with a
+ * fixed vault row id — the broker is a separate process in production; the
+ * registry upsert + audit are the surfaces under test. */
+export const CANARY_BROKER_CREDENTIAL_ID = 0x51a7;
+export const canaryBroker: BrokerConnector = async () => ({
+  identityKey: null,
+  brokerCredentialId: CANARY_BROKER_CREDENTIAL_ID,
+});
+
+/** The approval-outcome line posted by the Slack approval router once a request settles (issue #44). */
+const APPROVAL_OUTCOME_PREFIX = "Approval resolved";
+
+/**
+ * The deployable model id the space's default should pin to (issue #189):
+ * the bare id of the harness's model ref (near's declared GLM id, or the
+ * opencode-go deepseek id) — both resolve against the session's live
+ * catalog, so the turn-start re-apply can apply the swap.
+ */
+export function defaultModelIdFor(modelRef: string): string {
+  if (modelRef.includes("near")) return "zai-org/GLM-5.1-FP8";
+  if (modelRef.includes("opencode")) return "deepseek-v4-flash";
+  const slash = modelRef.lastIndexOf("/");
+  return slash >= 0 ? modelRef.slice(slash + 1) : modelRef;
+}
+
+/** A tool-execute session ctx pinned to the space (the session-file seam). */
+export function toolCtxFor(h: Harness, spaceId: string): ExtensionContext {
+  // SAFETY: the canary's tool-call seams only read ctx.sessionManager
+  // .getSessionFile(); the rest of the SDK ExtensionContext surface is unused
+  // in this in-process topology.
+  return {
+    sessionManager: { getSessionFile: (): string | undefined => join(h.transcriptDir, `${spaceId}.jsonl`) },
+  } as ExtensionContext;
+}
+
+/** The text of a tool result (the first text content block). */
+function toolResultText(res: AgentToolResult): string {
+  // SAFETY: SDK content blocks all carry a `type` discriminator; only "text"
+  // blocks are read for the reply text.
+  const block = (res.content ?? []).find((b) => (b as { type?: string }).type === "text") as
+    | { text?: string }
+    | undefined;
+  return block?.text ?? "";
+}
+
+/**
+ * The approve-button value (the pending request id) from an approval
+ * prompt message's blocks — the same id a human's click would carry.
+ * The blocks are Slack API JSON (outside-controlled), so the payload is
+ * parsed at this boundary and only matching action/button blocks are read.
+ * Exported for the hermetic journey-mechanism tests.
+ */
+const approvalButtonSchema = z
+  .object({
+    type: z.literal("button"),
+    action_id: z.literal(APPROVE_ACTION_ID),
+    value: z.string(),
+  })
+  .passthrough();
+
+export function approvalButtonValue(m: SlackApiMessage): string | undefined {
+  const message = z.object({ blocks: z.array(z.unknown()) }).safeParse(m);
+  if (!message.success) return undefined;
+  for (const block of message.data.blocks) {
+    const blockParsed = z.object({ type: z.literal("actions"), elements: z.array(z.unknown()) }).safeParse(block);
+    if (!blockParsed.success) continue;
+    for (const element of blockParsed.data.elements) {
+      const button = approvalButtonSchema.safeParse(element);
+      if (!button.success) continue;
+      return button.data.value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Waits for the posted approval prompt for a tool and extracts the pending
+ * request id from its button blocks (issue #151) — the click the journey
+ * then simulates through the router's handleAction seam.
+ */
+async function findApprovalPrompt(
+  h: Harness,
+  channelId: string,
+  opts: { afterTs: string; tool: string; label: string },
+): Promise<{ message: SlackApiMessage; requestId: string }> {
+  const live = h.liveSlack!;
+  const after = parseFloat(opts.afterTs);
+  const message = await waitFor(
+    async () => {
+      const history = await live.history(channelId);
+      return history.find(
+        (m) => isBotMessage(h, m) && m.text.includes(`Approval required for ${opts.tool}`) && parseFloat(m.ts) > after,
+      );
+    },
+    JOURNEY_TIMEOUT_MS,
+    `the posted approval prompt for ${opts.tool} (${opts.label})`,
+  );
+  const requestId = approvalButtonValue(message);
+  if (!requestId) throw new Error(`the ${opts.tool} approval prompt carries no approve-button value in its blocks`);
+  return { message, requestId };
 }
 
 /** Polls `fn` until it returns a truthy value; throws on timeout. */
@@ -398,14 +619,28 @@ async function journeyWorkItem(h: Harness, channelId: string, runId: string): Pr
       `create a work item: canary fixture task ${runId} (live surface check)`,
       { label: "work-item create" },
     );
-    const rows = await waitFor(
+    // Semantic auto-pickup (issue #89) may turn the create ask into a
+    // confirmable draft: give a direct create a short window, then confirm
+    // in-channel (the directive's explicit-confirm gate) and wait again.
+    let rows = await waitFor(
       async () => {
         const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
         return rows.length > before ? rows : undefined;
       },
-      STORE_TIMEOUT_MS,
-      "a new work item in the space",
-    );
+      15_000,
+      "a new work item in the space (direct create)",
+    ).catch(() => undefined);
+    if (rows === undefined) {
+      await live.postAsUser(channelId, "confirmed — proceed and create the work item now (do not ask again)");
+      rows = await waitFor(
+        async () => {
+          const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
+          return rows.length > before ? rows : undefined;
+        },
+        STORE_TIMEOUT_MS,
+        "a new work item in the space (after the pickup confirmation)",
+      );
+    }
     const row = rows[rows.length - 1]!;
     const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
     if (!item) throw new Error("work item row created but not readable");
@@ -623,26 +858,821 @@ async function journeyModelRole(h: Harness, channelId: string, runId: string): P
   }
 }
 
+/**
+ * The delivery-approval round trip (issue #149): the executor's marker →
+ * the REAL delivery poller posts the PR + approve/deny prompt → the REAL
+ * delivery router resolves the human's decision (audited delivery.resolved,
+ * prompt rewritten in place) → the executor's post-wait path moves the item
+ * working → review → done. The executor itself runs in its own container,
+ * so its two seams (the delivery_pending marker write and the post-approval
+ * transitions) are the journey's scripted legs; everything between is the
+ * server's real code.
+ */
+async function journeyDeliveryApproval(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const prUrl = `https://github.com/serrrfirat/bottega/pull/${Math.floor(Math.random() * 9000) + 1000}`;
+    // The executor's marker (issue #149): a work item whose PR opened.
+    const item = await h.store.createWorkItem({
+      space_id: spaceId,
+      requester: live.qaUserId,
+      description: `canary delivery fixture ${runId} (delivery approval round trip)`,
+      delivery: "git",
+      repo: "serrrfirat/bottega",
+    });
+    await h.audit.appendAudit({
+      space_id: spaceId,
+      actor: "executor",
+      event_type: DELIVERY_PENDING_EVENT,
+      payload: JSON.stringify({ id: item.id, pr_url: prUrl, summary: `canary delivery ${runId}` }),
+    });
+
+    // The REAL poller announces: posts the interactive prompt + records
+    // delivery.requested (dedupe key — never double-announces).
+    const posted = await pollPendingDeliveries(h.store, h.adapter);
+    if (posted !== 1) throw new Error(`delivery poller announced ${posted}, expected 1`);
+    const prompt = await waitFor(
+      async () => {
+        const history = await live.history(channelId);
+        return history.find((m) => isBotMessage(h, m) && m.text.includes("PR ready:"));
+      },
+      STORE_TIMEOUT_MS,
+      "the posted delivery-approval prompt",
+    );
+    const requested = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: DELIVERY_REQUESTED_EVENT });
+        return rows.length > 0 ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the delivery.requested audit row",
+    );
+    const announced = JSON.parse(requested[requested.length - 1]!.payload) as { id?: unknown };
+    if (announced.id !== item.id) throw new Error(`delivery.requested announced a different item`);
+
+    // The REAL delivery router resolves the human's click (the button value
+    // is the item id; the click itself cannot be driven through the Slack
+    // API — the router's handleAction seam is the exact adapter call a real
+    // click makes).
+    const resolved = await resolveDeliveryAction(
+      { store: h.store, adapter: h.adapter },
+      {
+        actionId: DELIVERY_APPROVE_ACTION_ID,
+        value: item.id,
+        spaceId,
+        principal: live.qaUserId,
+        messageTs: prompt.ts,
+      },
+    );
+    if (!resolved) throw new Error("delivery action was not resolved");
+    const decision = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: DELIVERY_RESOLVED_EVENT });
+        return rows.length > 0 ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the delivery.resolved audit row",
+    );
+    const decisionPayload = JSON.parse(decision[decision.length - 1]!.payload) as {
+      id?: unknown;
+      approved?: unknown;
+      approver?: unknown;
+    };
+    if (decisionPayload.id !== item.id || decisionPayload.approved !== true || decisionPayload.approver !== live.qaUserId) {
+      throw new Error(`delivery.resolved mismatch: ${JSON.stringify(decisionPayload)}`);
+    }
+    // The prompt was rewritten with the outcome (settle-then-rewrite).
+    const rewritten = await waitFor(
+      async () => {
+        const history = await live.history(channelId);
+        return history.find((m) => m.ts === prompt.ts && m.text.includes("Delivery approved"));
+      },
+      STORE_TIMEOUT_MS,
+      "the delivery prompt rewritten with the approval",
+    );
+
+    // The executor's post-wait path (its container runs this after reading
+    // delivery.resolved): working → review (with the recorded approval) →
+    // done (with the delivery result).
+    await h.store.transitionWorkItem(item.id, "open", "claimed", { by: "executor" });
+    await h.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
+    await h.store.transitionWorkItem(item.id, "working", "review", {
+      approval: { approver: live.qaUserId },
+      by: "executor",
+    });
+    const done = await h.store.transitionWorkItem(item.id, "review", "done", {
+      result: JSON.stringify({ pr_url: prUrl, summary: `canary delivery ${runId}` }),
+      by: "executor",
+    });
+    const permalink = await live.permalink(channelId, rewritten.ts);
+    return {
+      name: "delivery-approval",
+      status: "pass",
+      details: [
+        `item ${item.id}: poller posted the prompt → approved by <@${live.qaUserId}> (delivery.resolved) → ${done.state}`,
+        `prompt rewritten: "${snippet(rewritten.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "delivery-approval", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The per-task model pin journey (issue #185): the QA user asks for a work
+ * item "using fast at low effort"; the model calls create_work_item with
+ * the pin args; the item row carries the resolved pin. The deterministic
+ * proof is the work item's model + reasoning_effort columns (the pin the
+ * executor would apply).
+ */
+async function journeyPerTaskPin(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const before = (await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT })).length;
+    const { reply } = await postAndWait(
+      h,
+      channelId,
+      `create a work item using fast at low effort: canary pinned task ${runId}`,
+      { label: "per-task model pin" },
+    );
+    const rows = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
+        return rows.length > before ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the pinned work item",
+    );
+    const row = rows[rows.length - 1]!;
+    const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
+    if (!item) throw new Error("pinned work item row created but not readable");
+    if (item.model !== "fast") throw new Error(`item ${item.id} pin landed as model "${item.model}", expected "fast"`);
+    if (item.reasoning_effort !== "low") {
+      throw new Error(`item ${item.id} pin landed as reasoning_effort "${item.reasoning_effort}", expected "low"`);
+    }
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "per-task-model-pin",
+      status: "pass",
+      details: [
+        `item ${item.id} carries the #185 pin: model=${item.model}, reasoning_effort=${item.reasoning_effort}`,
+        `reply: "${snippet(reply.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "per-task-model-pin", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The semantic auto-pickup journey (issue #89): with work_items.auto_pickup
+ * on (the org config the leg boots with), an actionable intent should
+ * produce a confirmable draft asking for confirmation; the QA user's
+ * in-channel confirmation then creates the work item. The deterministic
+ * proof is the created item whose description carries the fixture text —
+ * the intent → draft → confirm → work-item round trip.
+ */
+async function journeySemanticPickup(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  const fixture = `canary pickup fixture ${runId}`;
+  try {
+    const before = (await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT })).length;
+    const inboundTs = await live.postAsUser(
+      channelId,
+      `implement a ${fixture}: add a docstring to the project README explaining the canary, then propose it as a work item for confirmation`,
+    );
+    // The draft ask: the agent posts a confirmable draft and waits. The
+    // reply itself is the human-visible half; the gate is the created item.
+    await waitForBotReply(h, channelId, { afterTs: inboundTs, label: "pickup draft ask" });
+    // The human's in-channel confirmation (the directive's explicit-confirm
+    // gate — never created without it).
+    const confirmTs = await live.postAsUser(channelId, "confirmed — create the work item now");
+    const rows = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
+        return rows.length > before ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the auto-picked-up work item",
+    );
+    const row = rows[rows.length - 1]!;
+    const item = await h.store.getWorkItem((JSON.parse(row.payload) as { id: string }).id);
+    if (!item) throw new Error("auto-picked-up item row created but not readable");
+    if (!item.description.includes(fixture)) {
+      throw new Error(`picked-up item description does not carry the fixture: "${snippet(item.description)}"`);
+    }
+    const reply = await waitForBotReply(h, channelId, { afterTs: confirmTs, label: "pickup confirmation reply" });
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "semantic-auto-pickup",
+      status: "pass",
+      details: [
+        `intent → draft ask → in-channel confirm → item ${item.id} (${item.state})`,
+        `description: "${snippet(item.description)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "semantic-auto-pickup", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The spaces-persistence journey (issue #188): the space row is upserted on
+ * first contact and its per-space settings survive across turns — the
+ * session re-reads them (getModelSettings) every turn, so nothing resets
+ * them. Deterministic proof: the row exists with the written settings, and
+ * a live turn later they are still there.
+ */
+async function journeySpacesPersistence(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    // The space row persists on first contact (#188): a space that only
+    // ever received messages has a durable row.
+    let space = await h.store.getSpace(spaceId);
+    if (!space) {
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
+      space = await h.store.getSpace(spaceId);
+    }
+    if (!space) throw new Error("space row missing after first contact");
+    const marker = `canary-persist-${runId}`;
+    const settings = (JSON.parse(space.settings) ?? {}) as Record<string, unknown>;
+    const overlay = JSON.parse(space.policy_json || "{}") as Record<string, unknown>;
+    await h.store.updateSpaceSettings(spaceId, { ...settings, reasoning_effort: "medium" });
+    overlay[marker] = "persisted";
+    await h.store.updatePolicy(spaceId, JSON.stringify(overlay));
+    const after = await h.store.getSpace(spaceId);
+    const persistedSettings = JSON.parse(after!.settings) as Record<string, unknown>;
+    if (persistedSettings.reasoning_effort !== "medium") {
+      throw new Error("per-space settings did not persist in the space row");
+    }
+    // A live turn re-reads the space (getModelSettings at turn start) and
+    // must not reset or lose the persisted values.
+    const { reply } = await postAndWait(h, channelId, `persistence probe ${runId}: reply with ok`, {
+      label: "spaces persistence",
+    });
+    const afterTurn = await h.store.getSpace(spaceId);
+    const afterTurnSettings = JSON.parse(afterTurn!.settings) as Record<string, unknown>;
+    const afterTurnOverlay = JSON.parse(afterTurn!.policy_json || "{}") as Record<string, unknown>;
+    if (afterTurnSettings.reasoning_effort !== "medium") {
+      throw new Error("the live turn reset the space's persisted settings");
+    }
+    if (afterTurnOverlay[marker] !== "persisted") {
+      throw new Error("the live turn reset the space's persisted policy overlay");
+    }
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "spaces-persistence",
+      status: "pass",
+      details: [
+        `space ${spaceId} persisted on first contact (settings + policy overlay survive turns)`,
+        `settings.reasoning_effort=medium + overlay.${marker} still present after the live turn`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "spaces-persistence", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The org-settings approval journey (issue #151): a model_settings write
+ * crosses the REAL policy gate, which routes ask-human through the REAL
+ * Slack approval router — the approve/deny prompt posts to the channel with
+ * buttons, the human's decision resolves it, and the trail records
+ * approval.requested → approval.resolved (approver = the QA user). The
+ * button click itself cannot be driven through the Slack API — the journey
+ * extracts the request id from the posted prompt's blocks and calls the
+ * router's handleAction seam, the exact call a real click makes.
+ */
+async function journeySettingsApproval(
+  h: Harness,
+  channelId: string,
+  approvalRouter: SlackApprovalRouter,
+): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const beforeRequested = (await h.store.listAudit({ space: spaceId, event_type: APPROVAL_REQUESTED_EVENT })).length;
+    const anchorTs = String(Date.now() / 1000 - 2);
+    const gatePromise = evaluatePolicyGate(
+      {
+        loadPolicy: async (sid) => loadSpacePolicy(h.orgPolicy, h.store, sid),
+        audit: h.audit,
+        router: approvalRouter,
+        timeoutMs: 3 * 60_000,
+      },
+      {
+        tool: "model_settings",
+        args: { set: { reasoning_effort: "low" } },
+        spaceId,
+        actor: live.qaUserId,
+      },
+    );
+    // The prompt posts while the gate waits: observe it, then approve.
+    const prompt = await findApprovalPrompt(h, channelId, {
+      afterTs: anchorTs,
+      tool: "model_settings",
+      label: "org-settings approval",
+    });
+    await approvalRouter.handleAction({
+      actionId: APPROVE_ACTION_ID,
+      value: prompt.requestId,
+      spaceId,
+      principal: live.qaUserId,
+      messageTs: prompt.message.ts,
+    });
+    const gate = await gatePromise;
+    if (!gate.allowed) throw new Error(`policy gate denied model_settings: ${gate.reason}`);
+    const resolved = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: APPROVAL_RESOLVED_EVENT });
+        return rows.length > beforeRequested ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "an approval.resolved audit row",
+    );
+    const payload = JSON.parse(resolved[resolved.length - 1]!.payload) as {
+      tool?: unknown;
+      approved?: unknown;
+      approver?: unknown;
+    };
+    if (payload.tool !== "model_settings" || payload.approved !== true || payload.approver !== live.qaUserId) {
+      throw new Error(`approval.resolved mismatch: ${JSON.stringify(payload)}`);
+    }
+    const rewritten = await waitFor(
+      async () => {
+        const history = await live.history(channelId);
+        return history.find((m) => m.ts === prompt.message.ts && m.text.startsWith(APPROVAL_OUTCOME_PREFIX));
+      },
+      STORE_TIMEOUT_MS,
+      "the approval prompt rewritten with the outcome",
+    );
+    const permalink = await live.permalink(channelId, rewritten.ts);
+    return {
+      name: "org-settings-approval",
+      status: "pass",
+      details: [
+        `model_settings prompt posted with approve/deny buttons → approved by <@${live.qaUserId}>`,
+        `trail: approval.requested → approval.resolved; prompt rewritten: "${snippet(rewritten.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "org-settings-approval", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The model hot-swap journey (issue #189): setting the space's default
+ * model + effort persists (model.settings_changed audited) and the NEXT
+ * turn applies it — the session re-applies the default role against the
+ * current settings at turn start, no restart. Deterministic proof: the
+ * settings column + the audited before/after; the live turn after the
+ * change is the hot-swap observable.
+ */
+async function journeyModelHotSwap(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const targetModel = defaultModelIdFor(h.modelRef);
+    const settingsTool = modelToolsDefinitions(h.store, { audit: h.audit, agentDir: h.agentDir }).find(
+      (t) => t.name === "model_settings",
+    )!;
+    const setRes = await settingsTool.execute(
+      "tc-hotswap",
+      { set: { model: targetModel, reasoning_effort: "high" } },
+      undefined,
+      undefined,
+      toolCtxFor(h, spaceId),
+    );
+    if (setRes.isError) throw new Error(`model_settings set failed: ${toolResultText(setRes)}`);
+    const changed = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: MODEL_SETTINGS_CHANGED_EVENT });
+        return rows.length > 0 ? rows[rows.length - 1] : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "a model.settings_changed audit row",
+    );
+    const changedPayload = JSON.parse(changed.payload) as { after?: Record<string, unknown>; before?: unknown };
+    if (changedPayload.after?.model !== targetModel || changedPayload.after?.reasoning_effort !== "high") {
+      throw new Error(`model.settings_changed after mismatch: ${JSON.stringify(changedPayload.after)}`);
+    }
+    const persisted = await h.store.getSpaceSettings(spaceId);
+    if (persisted.model !== targetModel || persisted.reasoning_effort !== "high") {
+      throw new Error(`space settings did not persist the swap: ${JSON.stringify(persisted)}`);
+    }
+    // The NEXT turn applies the changed default at turn start (issue #189):
+    // the live session re-reads the settings and the turn completes.
+    const { reply } = await postAndWait(h, channelId, `hot-swap probe ${runId}: reply with ok`, {
+      label: "hot-swap next turn",
+    });
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "model-hot-swap",
+      status: "pass",
+      details: [
+        `space default pinned to ${targetModel} at high effort (model.settings_changed audited, settings persisted)`,
+        `the next turn ran on the swapped default — reply: "${snippet(reply.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "model-hot-swap", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The model-catalog surface journey (issue #192): the model_settings get
+ * lists the deployment's available models grouped by provider — the same
+ * catalog create_work_item pins resolve against (issue #185) and the agent
+ * answers provider-aware asks from. Deterministic proof: the settings GET
+ * returns available_models (providers × models); the live reply names a
+ * model (soft — the live model's wording is not gating).
+ */
+async function journeyCatalogSurface(h: Harness, channelId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const settingsTool = modelToolsDefinitions(h.store, { audit: h.audit, agentDir: h.agentDir }).find(
+      (t) => t.name === "model_settings",
+    )!;
+    const getRes = await settingsTool.execute("tc-catalog", {}, undefined, undefined, toolCtxFor(h, spaceId));
+    if (getRes.isError) throw new Error(`model_settings get failed: ${toolResultText(getRes)}`);
+    const body = JSON.parse(toolResultText(getRes)) as {
+      available_models?: Array<{ provider: string; models: Array<{ id: string }> }>;
+    };
+    const providers = body.available_models ?? [];
+    if (providers.length === 0 || providers.some((p) => p.models.length === 0)) {
+      throw new Error(`model_settings get returned no available models: ${snippet(JSON.stringify(providers))}`);
+    }
+    const { reply } = await postAndWait(h, channelId, `which models can you use? list them briefly`, {
+      label: "catalog surface",
+    });
+    const named = /deepseek|GLM|model/i.test(reply.text);
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "model-catalog-surface",
+      status: "pass",
+      details: [
+        `model_settings get surfaced ${providers.length} provider(s): ${providers.map((p) => `${p.provider} (${p.models.length})`).join(", ")}`,
+        named ? "the live reply named the catalog" : "the live reply did not name a model (not gating)",
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "model-catalog-surface", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The chat-native extension-pin journey (issue #195): catalog_browser
+ * action=pin completes a draft IN-CHANNEL — the review gate refuses
+ * without the human's confirmation (fail closed), and confirm=true writes
+ * the pinned snapshot, hot-registers it into the LIVE registry, regenerates
+ * the egress configs, and audits. Driven through the real tool definition
+ * with temp dirs (the repo's config/extensions + egress stay untouched);
+ * the draft itself is the canary fixture (the catalog-fetch leg is the
+ * tool's own, covered hermetically by fetch-catalog tests).
+ */
+async function journeyExtensionPin(h: Harness, channelId: string): Promise<JourneyResult> {
+  const spaceId = `slack:${channelId}`;
+  const tempRoot = mkdtempSync(join(tmpdir(), "bottega-canary-pin-"));
+  const draftsDir = join(tempRoot, "drafts");
+  const snapshotsDir = join(tempRoot, "snapshots");
+  const egressPath = join(tempRoot, "egress.yml");
+  const devEgressPath = join(tempRoot, "egress.dev.yml");
+  const spec = "fixture.pin";
+  try {
+    // The draft the agent would produce (issue #195): completed binding +
+    // credentialSchema from vendor docs; source.reviewed stays false until
+    // the human confirms.
+    const draft: SnapshotDraft = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: spec,
+      pinnedAt: new Date().toISOString(),
+      // Non-default catalog marker: pinSnapshotDraft skips the catalog
+      // re-fetch (the canary fixture has no integrations.sh record).
+      source: { catalog: "canary://fixture", specId: spec, vendorOfficial: true, reviewed: false },
+      manifest: {
+        id: spec,
+        label: "Fixture Pin MCP",
+        vendor: "bottega-fixtures",
+        kind: "mcp",
+        domains: ["fixture-pin.example.com"],
+        mcp: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+        credentialSchema: { type: "oauth", scopes: ["read"] },
+        tools: [],
+      },
+    };
+    mkdirSync(draftsDir, { recursive: true });
+    writeFileSync(join(draftsDir, `${spec}.draft.json`), JSON.stringify(draft, null, 2) + "\n");
+
+    const catalogBrowser = adminToolDefinitions(h.store, {
+      audit: h.audit,
+      registry: h.extensionRegistry,
+      catalogDraftsDir: draftsDir,
+      catalogSnapshotsDir: snapshotsDir,
+      devEgressConfigPath: devEgressPath,
+      egressConfigPath: egressPath,
+    }).find((t) => t.name === "catalog_browser")!;
+
+    const pinParams = {
+      action: "pin",
+      spec,
+      binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+      credential_schema: { type: "oauth", scopes: ["read"] },
+      vendor_official: true,
+    } as const;
+    // The review gate: no human confirmation → refuse, nothing pins.
+    const refused = await catalogBrowser.execute("tc-pin-1", pinParams, undefined, undefined, toolCtxFor(h, spaceId));
+    if (!refused.isError || !toolResultText(refused).includes("confirm")) {
+      throw new Error(`pin without confirmation was not refused: ${toolResultText(refused)}`);
+    }
+    // The human confirms in-channel (the review): the pin completes.
+    const pinned = await catalogBrowser.execute(
+      "tc-pin-2",
+      { ...pinParams, confirm: true },
+      undefined,
+      undefined,
+      toolCtxFor(h, spaceId),
+    );
+    if (pinned.isError) throw new Error(`pin with confirmation failed: ${toolResultText(pinned)}`);
+    const pinnedBody = JSON.parse(toolResultText(pinned)) as {
+      reviewed?: unknown;
+      written_to?: unknown;
+      live_registry?: unknown;
+      egress_regenerated?: unknown;
+    };
+    if (pinnedBody.reviewed !== true || !pinnedBody.written_to) {
+      throw new Error(`pin result missing reviewed/written_to: ${snippet(toolResultText(pinned))}`);
+    }
+    if (pinnedBody.live_registry !== "registered") {
+      throw new Error(`pin did not hot-register into the live registry: ${JSON.stringify(pinnedBody.live_registry)}`);
+    }
+    // The live registry now resolves the extension (hot-reload, issue #197) —
+    // new sessions would see it without a restart.
+    const registered = h.extensionRegistry.resolve(spec);
+    if (!registered) throw new Error("the pinned extension is not registered in the live registry");
+    const audit = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ event_type: ADMIN_CATALOG_BROWSER_EVENT });
+        return rows.some((r) => {
+          const p = JSON.parse(r.payload) as { action?: unknown; spec?: unknown };
+          return p.action === "pin" && p.spec === spec;
+        })
+          ? rows
+          : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the catalog_browser pin audit row",
+    );
+    return {
+      name: "extension-pin",
+      status: "pass",
+      details: [
+        `catalog_browser pin for ${spec}: review gate refused unconfirmed → confirm=true pinned + hot-registered + egress regenerated`,
+        `audited (${audit.length} catalog_browser row(s)); live registry resolves ${registered.manifest.label}`,
+      ],
+    };
+  } catch (err) {
+    return { name: "extension-pin", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The generic MCP OAuth journey (issue #198): connecting a hosted OAuth MCP
+ * mints a single-use authorization flow and SHOWS the URL in Slack (the
+ * one-time-link posture — the token never touches chat). The browser leg
+ * (the vendor's authorization server + the SDK's PKCE exchange + the
+ * callback endpoint) is SKIP-GATED with evidence: it needs a real browser.
+ * The mint → URL-shown leg runs live through the connect capability; the
+ * callback's first gate (single-use state, fail closed) is proven
+ * hermetically by consuming the flow token twice.
+ */
+async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const beforeConnected = (await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT })).length;
+    const { reply } = await postAndWait(h, channelId, `connect ${CANARY_OAUTH_EXTENSION_ID}`, {
+      label: "MCP OAuth connect mint",
+    });
+    const permalink = await live.permalink(channelId, reply.ts);
+    const urlMatch = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s]+/.exec(reply.text);
+    if (!reply.text.includes("Open this link to authorize") || !urlMatch) {
+      throw new Error(`connect did not mint + show the authorization URL: "${snippet(reply.text)}"`);
+    }
+    const state = /[?&]state=([^&\s]+)/.exec(urlMatch[0])?.[1];
+    if (!state) throw new Error("authorization URL carries no state");
+    // The mint persisted a single-use flow row (the callback's first gate):
+    // consume succeeds once; a replay (stale/consumed state) fails closed.
+    const flowStore = new OAuthFlowStore(h.store);
+    const first = flowStore.consume(state);
+    if (!first.ok) throw new Error("the minted OAuth flow state was not consumable");
+    if (flowStore.consume(state).ok) throw new Error("the OAuth flow state consumed twice — replay was not denied");
+    // The credential lands only when the BROWSER leg completes — no
+    // extension.connected row yet (skip-gated with evidence).
+    const connected = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT });
+    const skipEvidence =
+      connected.length <= beforeConnected
+        ? "browser leg skip-gated: the vendor authorization + PKCE exchange + callback endpoint need a real browser (issue #198); mint → URL-shown ran live, the single-use state + replay-denied ran hermetically"
+        : "browser leg completed and recorded extension.connected";
+    return {
+      name: "mcp-oauth-connect",
+      status: "pass",
+      details: [
+        `connect ${CANARY_OAUTH_EXTENSION_ID} minted a single-use flow and showed the URL in Slack: ${snippet(urlMatch[0], 80)}`,
+        skipEvidence,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "mcp-oauth-connect", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The one-time upload link journey (issue #196): the mint tool returns a
+ * single-use URL; the browser endpoint serves the secret form; POSTing the
+ * secret stores it DIRECTLY into the vault through the same connect path as
+ * connectExtension (registry upsert + extension.connected audit) — the
+ * secret never passes through Slack. Replay of the link fails (single-use,
+ * fail closed). The upload endpoint is the REAL in-process server (loopback)
+ * over the harness store.
+ */
+async function journeyUploadLink(h: Harness, channelId: string, uploadLink: UploadLinkServerHandle): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    const secret = `canary-upload-secret-${Date.now().toString(36)}`;
+    const mintTool = mintUploadLinkToolDefinition({
+      registry: h.extensionRegistry,
+      store: uploadLink.store,
+      baseUrl: () => uploadLink.baseUrl,
+      getPrincipal: () => live.qaUserId,
+      spaceIdFromFile: () => spaceId,
+    });
+    const minted = await mintTool.execute(
+      "tc-mint",
+      { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+      undefined,
+      undefined,
+      toolCtxFor(h, spaceId),
+    );
+    if (minted.isError) throw new Error(`connect_upload_link mint failed: ${toolResultText(minted)}`);
+    const url = toolResultText(minted).trim();
+    if (!/^http:\/\/127\.0\.0\.1:\d+\/upload\/[A-Za-z0-9_-]+$/.test(url)) {
+      throw new Error(`mint returned a malformed upload URL: "${url}"`);
+    }
+    // The form (GET): no scripts, no secret on the wire.
+    const form = await fetch(url);
+    if (form.status !== 200) throw new Error(`upload form GET returned ${form.status}`);
+    const html = await form.text();
+    if (!html.includes('name="secret"')) throw new Error("upload form has no secret field");
+    // The upload (POST): the secret goes straight into the vault.
+    const body = new FormData();
+    body.append("secret", secret);
+    const upload = await fetch(url, { method: "POST", body });
+    if (upload.status !== 200) throw new Error(`upload POST returned ${upload.status}: ${await upload.text()}`);
+    const uploaded = await upload.text();
+    if (!uploaded.includes("Saved to the vault")) throw new Error("upload POST did not confirm the vault write");
+    // Vault proof: the credential row + the extension.connected audit.
+    const credentials = await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID);
+    const row = credentials.find((c) => c.scope === "personal" && c.owner === live.qaUserId);
+    if (!row) throw new Error("no personal credential row recorded for the uploaded secret");
+    await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT });
+        return rows.some((r) => {
+          const p = JSON.parse(r.payload) as { extension?: unknown; scope?: unknown };
+          return p.extension === FIXTURE_EXTENSION_ID && p.scope === "personal";
+        })
+          ? rows
+          : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "the extension.connected audit row for the upload",
+    );
+    // Single-use: the consumed link is gone (fail closed).
+    const replay = await fetch(url);
+    if (replay.status !== 404) throw new Error(`upload link replay returned ${replay.status}, expected 404`);
+    return {
+      name: "upload-link",
+      status: "pass",
+      details: [
+        `mint → form → POST stored the secret in the vault (credential row ${row.id}, extension.connected audited)`,
+        "the secret never touched Slack; the link is single-use (replay → 404)",
+      ],
+    };
+  } catch (err) {
+    return { name: "upload-link", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
+/**
+ * The live-progress journey (issue #193): during a turn the thinking phrase
+ * becomes a LIVE PROGRESS line — the current tool step ("⚙️ …"), the latest
+ * reasoning snippet ("🧠 …"), or the elapsed "Thinking… Ns" — replaced in
+ * place. DMs always use the phrase renderer (issue #180), so the journey
+ * observes the progress line in history while the turn runs.
+ */
+const PROGRESS_LINE_RE = /^(?:⚙️ |🧠 |Thinking… \d+s$)/;
+/** Exported for the hermetic mechanism tests (issue #193). */
+export { PROGRESS_LINE_RE };
+
+async function journeyLiveProgress(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  try {
+    const inboundTs = await live.postAsUser(
+      channelId,
+      `canary ${runId} (live-progress): think step by step and reply with the numbers from 1 to 10`,
+    );
+    const after = parseFloat(inboundTs);
+    const progress = await waitFor(
+      async () => {
+        const history = await live.history(channelId);
+        return history.find((m) => isBotMessage(h, m) && parseFloat(m.ts) > after && PROGRESS_LINE_RE.test(m.text.trim()));
+      },
+      JOURNEY_TIMEOUT_MS,
+      "the thinking phrase turning into a live progress line",
+    );
+    const reply = await waitForBotReply(h, channelId, { afterTs: inboundTs, label: "live-progress final reply" });
+    const permalink = await live.permalink(channelId, reply.ts);
+    return {
+      name: "live-progress",
+      status: "pass",
+      details: [
+        `the phrase became a progress line during the turn: "${snippet(progress.text)}"`,
+        `final reply: "${snippet(reply.text)}"`,
+      ],
+      permalink,
+    };
+  } catch (err) {
+    return { name: "live-progress", status: "fail", details: [errorMessage(err)] };
+  }
+}
+
 /** The live leg: boots the real stack and runs every journey. */
 export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult> {
   const journeys: JourneyResult[] = [];
   let harness: Harness | undefined;
   let scheduler: Scheduler | undefined;
+  let uploadLink: UploadLinkServerHandle | undefined;
   try {
+    // The REAL Slack-backed approval router (issue #44/#151): write-tier
+    // tool calls prompt with approve/deny buttons through the harness
+    // adapter (lazy — the adapter exists only after boot). The org-settings
+    // approval journey resolves the prompt through handleAction (the exact
+    // seam a real button click calls); use_model is allow-listed in the
+    // canary org config so the model-role journey never stalls on a prompt.
+    const approvalRouter = new SlackApprovalRouter({
+      adapter: {
+        postMessage: (spaceId, text, opts) => harness!.adapter.postMessage(spaceId, text, opts),
+        updateMessage: (spaceId, ts, text) => harness!.adapter.updateMessage(spaceId, ts, text),
+      },
+      timeoutMs: 5 * 60_000,
+    });
     harness = await bootHarness({
       realSlack: true,
       realModel: true,
       slackTokens: tokens,
       orgConfigYaml: CANARY_ORG_CONFIG,
-      // The extension journey (issue #175) uses the canary's own fixture
-      // registry + scripted MCP provider so the REAL runtime spine runs
-      // deterministically (no network provider, no connect flow).
-      registry: createFixtureRegistry(),
+      approve: approvalRouter,
+      // The canary's own registry: the weather fixture (issue #175) + the
+      // hosted-OAuth fixture (issue #198) — scripted providers so the REAL
+      // runtime spine (policy gate → credential ladder → boundary → MCP /
+      // connect capability → audit) runs deterministically.
+      registry: createCanaryRegistry(),
       mcpTransport: canaryFixtureMcpTransport,
       extensionBoundary: canaryFixtureBoundary(),
       // Real-model digests on dispose: keep the idle window well past the run.
       idleTimeoutMs: 5 * 60_000,
-      liveConnect: {},
+      liveConnect: {
+        broker: canaryBroker,
+        mcpOAuth: canaryMcpOAuthConnector(() => harness!.store),
+        timeoutMs: 3 * 60_000,
+      },
+    });
+    // The one-time upload-link endpoint (issue #196): the REAL in-process
+    // loopback server over the harness store — the mint tool + the browser
+    // form share its token table.
+    uploadLink = startUploadLinkServer({
+      store: harness.store,
+      registry: harness.extensionRegistry,
+      audit: harness.audit,
+      broker: canaryBroker,
+      gate: {
+        loadPolicy: async (spaceId) => loadSpacePolicy(harness!.orgPolicy, harness!.store, spaceId),
+        router: approvalRouter,
+      },
     });
     // The standup journey needs the REAL scheduler (issue #175): boot the
     // durable runner with the standup action over the harness's live store
@@ -662,7 +1692,9 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     const runId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffff).toString(36)}`;
     const channelName = tokens.channelName ?? "bottega-qa";
 
-    // Setup: locate/create the dedicated test channel (issue #79).
+    // Setup: locate/create the dedicated test channel (issue #79). The bot
+    // token creates it (channels:manage) and invites both members; a scope
+    // shortfall skips the channel leg with the required scopes listed.
     let channel: { id: string; created: boolean; invited: { bot: boolean; qa: boolean } } | undefined;
     try {
       channel = await live.ensureChannel(channelName);
@@ -678,7 +1710,11 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
       journeys.push({
         name: "setup-channel",
         status: "skip",
-        details: [`channel setup failed (DM journeys still run): ${errorMessage(err)}`],
+        details: [
+          `channel setup failed (DM journeys still run): ${errorMessage(err)}`,
+          "required scopes: channels:manage (conversations.create on the bot token) + channels:join / " +
+            "conversations.invite for both members (bot + QA user)",
+        ],
       });
     }
 
@@ -699,6 +1735,20 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     journeys.push(await journeyExtension(harness, live.dmChannelId, runId));
     journeys.push(await journeyModelRole(harness, live.dmChannelId, runId));
 
+    // Full-matrix journeys (#175 follow-up): each asserts one observable
+    // feature end-to-end against the live workspace.
+    journeys.push(await journeyDeliveryApproval(harness, live.dmChannelId, runId)); // #149
+    journeys.push(await journeyPerTaskPin(harness, live.dmChannelId, runId)); // #185
+    journeys.push(await journeySemanticPickup(harness, live.dmChannelId, runId)); // #89
+    journeys.push(await journeySpacesPersistence(harness, live.dmChannelId, runId)); // #188
+    journeys.push(await journeySettingsApproval(harness, live.dmChannelId, approvalRouter)); // #151
+    journeys.push(await journeyModelHotSwap(harness, live.dmChannelId, runId)); // #189
+    journeys.push(await journeyCatalogSurface(harness, live.dmChannelId)); // #192
+    journeys.push(await journeyExtensionPin(harness, live.dmChannelId)); // #195
+    journeys.push(await journeyMcpOAuth(harness, live.dmChannelId)); // #198 (browser leg skip-gated)
+    journeys.push(await journeyUploadLink(harness, live.dmChannelId, uploadLink)); // #196
+    journeys.push(await journeyLiveProgress(harness, live.dmChannelId, runId)); // #193
+
     const failed = journeys.filter((j) => j.status === "fail");
     const attempted = journeys.filter((j) => j.status !== "skip");
     const passed = attempted.filter((j) => j.status === "pass").length;
@@ -718,6 +1768,7 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     };
   } finally {
     scheduler?.stop();
+    uploadLink?.stop();
     try {
       await harness?.cleanup();
     } catch {

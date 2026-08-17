@@ -62,6 +62,8 @@ import { createExtensionRuntime } from "../../src/extensions/runtime";
 import { resolveExtensionSurfaces } from "../../src/extensions/surface";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
 import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps } from "../../src/extensions/connect";
+import type { McpOAuthConnector } from "../../src/extensions/mcp-oauth";
+import type { UploadLinkStore } from "../../src/extensions/upload-link";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
 import type { McpBinding } from "../../src/extensions/manifest";
@@ -539,9 +541,17 @@ export interface HarnessConfig {
   /**
    * Live canary connect wiring (issue #79): like {@link connect} but the
    * harness supplies its own store/audit/registry — only the broker seam is
-   * caller's (defaults to the production connectViaAuthBroker).
+   * caller's (defaults to the production connectViaAuthBroker). The generic
+   * MCP OAuth seam (issue #198) and the one-time upload-link mint
+   * (issue #196) pass through to the connect capability exactly like the
+   * server's wiring (src/server/index.ts).
    */
-  liveConnect?: { broker?: BrokerConnector; timeoutMs?: number };
+  liveConnect?: {
+    broker?: BrokerConnector;
+    mcpOAuth?: McpOAuthConnector;
+    uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
+    timeoutMs?: number;
+  };
 }
 
 export interface Harness {
@@ -751,8 +761,12 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const extensionSurfaces = await resolveExtensionSurfaces(extensionRegistry.list());
   // Connect capability (issue #52/#61): the caller's full deps, or the live
   // canary's convenience wiring (issue #79) — the harness's own
-  // store/audit/registry with the production broker seam.
-  const connectDeps: ConnectExtensionDeps | undefined =
+  // store/audit/registry with the production broker seam. The one-time
+  // upload-link mint (issue #196) rides the DRIVER's connectExtension
+  // option (not ConnectExtensionDeps), so the live-canary wiring carries it
+  // as a widened field alongside the capability deps.
+  type HarnessConnectDeps = ConnectExtensionDeps & { uploadLink?: { store: UploadLinkStore; baseUrl: () => string } };
+  const connectDeps: HarnessConnectDeps | undefined =
     cfg.connect ??
     (cfg.liveConnect !== undefined
       ? {
@@ -760,6 +774,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
           store,
           audit,
           broker: cfg.liveConnect.broker ?? connectViaAuthBroker,
+          ...(cfg.liveConnect.mcpOAuth !== undefined ? { mcpOAuth: cfg.liveConnect.mcpOAuth } : {}),
+          ...(cfg.liveConnect.uploadLink !== undefined ? { uploadLink: cfg.liveConnect.uploadLink } : {}),
           gate: {
             loadPolicy: async (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
             router: approvalRouter,
@@ -834,6 +850,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
             store: connectDeps.store,
             audit: connectDeps.audit,
             broker: connectDeps.broker,
+            ...(connectDeps.mcpOAuth !== undefined ? { mcpOAuth: connectDeps.mcpOAuth } : {}),
+            ...(connectDeps.uploadLink !== undefined ? { uploadLink: connectDeps.uploadLink } : {}),
             loadPolicy: connectDeps.gate.loadPolicy,
             router: connectDeps.gate.router,
             timeoutMs: connectDeps.gate.timeoutMs,
