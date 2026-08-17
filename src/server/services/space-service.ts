@@ -152,13 +152,15 @@ export const EMPTY_TURN_LIMIT = 3;
 /**
  * Streaming phrase-update cadence (issue #120): Slack rate-limits
  * `chat.update` (~50/min tier), so a dense streamed turn coalesces its
- * in-place phrase updates to at most one per second. The turn's FINAL reply
- * text is always delivered — flushed on turn_end with bounded retries on a
- * 429 — while interim updates may be skipped. Batching applies ONLY to the
+ * in-place phrase updates to at most one per 400ms — smooth enough to read
+ * as streaming, while a 429 (fail-soft below) merely skips an interim
+ * update instead of stalling the turn. The turn's FINAL reply text is
+ * always delivered — flushed on turn_end with bounded retries on a 429 —
+ * while interim updates may be skipped. Batching applies ONLY to the
  * streaming (steer) path; non-streaming replies update exactly as before.
  * Hardcoded default (no org setting).
  */
-export const STREAM_UPDATE_INTERVAL_MS = 1000;
+export const STREAM_UPDATE_INTERVAL_MS = 400;
 
 /**
  * Bounded retries for the FINAL streaming update (issue #120): after this
