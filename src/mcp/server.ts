@@ -66,25 +66,21 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } fr
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { validateSaveInput, validateSearchQuery } from "../memory/types";
-import { createSqliteMemoryProvider } from "../memory/sqlite";
 import {
   indexSessionFiles,
   searchSessions,
   sessionSearchArgsSchema,
 } from "../memory/session-search";
 import type { AuditModule } from "../policy/audit";
-import { createAudit } from "../policy/audit";
 import {
   applySpaceOverlay,
   decidePolicyCall,
-  loadOrgPolicy,
   resolveTier,
   type Decision,
   type PolicyConfig,
   type Tier,
 } from "../policy/config";
 import { summarizeArgs } from "../policy/gate";
-import { createStore } from "../store/db";
 import { MEMORY_WRITE_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { memorySaveArgsSchema, memorySearchArgsSchema, sha256Hex } from "../tools/memory";
@@ -94,13 +90,13 @@ import {
   CONNECT_EXTENSION_TOOL,
   type ConnectExtensionDeps,
 } from "../extensions/connect";
-import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
-import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
-import { createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import type { ExtensionRegistry } from "../extensions/registry";
+import type { ExtensionRuntime } from "../extensions/runtime";
 import type { ExtensionTool, ExtensionToolParam, McpBinding } from "../extensions/manifest";
 import { extensionToolSurface, toolOwnerExtensionId, type ExtensionSurfaces } from "../extensions/surface";
 import { DenyRouter } from "../policy/approval-router";
 import { loadSpacePolicy } from "../policy/config";
+import { bootstrapRuntime, type BootstrapRuntime } from "../server/bootstrap-runtime";
 
 export interface MemoryMcpServerOptions {
   provider: MemoryProvider;
@@ -527,64 +523,79 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   return server;
 }
 
-/** Boot the standalone server: `bun run src/mcp/server.ts` (spawned by the agent). */
-if (import.meta.main) {
-  const dbPath = process.env.BOTTEGA_DB_PATH ?? "data/bottega.db";
-  const store = createStore(dbPath);
-  const orgPolicy = loadOrgPolicy(store, process.env.BOTTEGA_CONFIG_DIR);
+/** The MCP composition root's boot result (issue #172). */
+export interface McpBoot {
+  /** The shared composition chain — the same pieces every root boots. */
+  runtime: BootstrapRuntime;
+  /** Org floor + space overlay, already merged (mirrors policyFor in the extension). */
+  policy: PolicyConfig;
+  /** The booted MCP server (stdio transport connected by the caller). */
+  server: Server;
+}
 
+/**
+ * The MCP composition root (issue #172, #153 item 2): the boot-time
+ * process-scoped resources — the shared runtime chain (bootstrapRuntime:
+ * store → audit → org policy → extension registry → effective surfaces →
+ * extension runtime → memory provider, identical to the server and
+ * executor roots), the session space's policy overlay, and the
+ * memory/extension MCP server. The memory provider and the extension
+ * boundary come from the shared chain — the historical MCP divergences
+ * (hardwired SQLite provider, boundary without the broker secret resolver)
+ * are the #172 regressions this replaces.
+ *
+ * Env contract (set by the ACP driver / caller): BOTTEGA_DB_PATH,
+ * BOTTEGA_CONFIG_DIR, BOTTEGA_EXTENSIONS_DIR, BOTTEGA_SPACE_ID,
+ * BOTTEGA_MCP_DEFAULT_PRINCIPAL, BOTTEGA_SESSION_DIR — see the file header.
+ */
+export async function bootMemoryMcpServer(opts: {
+  dbPath?: string;
+  configDir?: string;
+  extensionsDir?: string;
+  spaceId?: string | null;
+  defaultPrincipal?: string;
+  sessionDir?: string;
+  mcpTransport?: (binding: McpBinding) => Transport;
+} = {}): Promise<McpBoot> {
+  const runtime = await bootstrapRuntime({
+    router: DenyRouter,
+    // Env contract (see the file header): the ACP driver / tests pin the
+    // DB, config, and extensions dirs; unset falls back to the defaults.
+    dbPath: opts.dbPath ?? process.env.BOTTEGA_DB_PATH,
+    ...(opts.configDir !== undefined ? { configDir: opts.configDir } : {}),
+    ...(opts.extensionsDir !== undefined ? { extensionsDir: opts.extensionsDir } : {}),
+    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
+  });
+  const { store, audit, orgPolicy } = runtime;
   // Per-session space: apply the space's overlay so the session's policy
   // floor is enforced (mirrors policyFor in src/policy/extension.ts).
-  const spaceId = process.env.BOTTEGA_SPACE_ID ?? null;
+  const spaceId = opts.spaceId ?? process.env.BOTTEGA_SPACE_ID ?? null;
   let policy = orgPolicy;
   if (spaceId) {
     const space = await store.getSpace(spaceId);
     if (!space) {
-      console.error(`[mcp] space ${spaceId} not found — failing closed`);
-      process.exit(1);
+      throw new Error(`[mcp] space ${spaceId} not found — failing closed`);
     }
     policy = applySpaceOverlay(orgPolicy, space.policy_json);
   }
-
-  const audit = createAudit(store);
-  // Extension surface (issue #61): the same registry the space server
-  // boots (config/extensions; env-overridable for tests and per-org
-  // deployments). Runtime + connect run server-side, so the gate, ladder,
-  // boundary, and audit apply identically to every MCP caller.
-  const extensionRegistry = createExtensionRegistry(process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions");
-  const extensionRuntime = createExtensionRuntime({
-    registry: extensionRegistry,
-    store,
-    audit,
-    // Org floor only — the runtime applies the session space's overlay per
-    // call via loadSpacePolicy (BOTTEGA_SPACE_ID pins the session space).
-    orgPolicy,
-    // Headless MCP context: ask-human has no approval channel, so it fails
-    // closed (DenyRouter) — the same rule as the memory gate above.
-    router: DenyRouter,
-    timeoutMs: orgPolicy.timeoutMinutes * 60_000,
-    // Credential boundary (issue #123): when the proxy control URL + token
-    // are in the environment (local dev via scripts/dev.sh, compose via
-    // IRON_MANAGEMENT_API_KEY), authorize writes the secret file AND
-    // reloads the proxy — the same always-active injection path as the
-    // server entrypoint. Unset stays write-only (hermetic tests).
-    boundary: createSecretFileBoundary(proxyBoundaryControlFromEnv()),
-  });
   const server = createMemoryMcpServer({
-    provider: createSqliteMemoryProvider(store.getDb()),
+    // The SAME memory backend the server and executor roots resolve
+    // (issue #172): memory_backend.base_url set → mem0, else SQLite on the
+    // store database — never a hardwired provider.
+    provider: runtime.memoryProvider,
     policy,
     audit,
     spaceId,
-    defaultPrincipal: process.env.BOTTEGA_MCP_DEFAULT_PRINCIPAL,
+    defaultPrincipal: opts.defaultPrincipal ?? process.env.BOTTEGA_MCP_DEFAULT_PRINCIPAL,
     sessionSearch: {
       db: store.getDb(),
-      transcriptDir: process.env.BOTTEGA_SESSION_DIR ?? "data/sessions",
+      transcriptDir: opts.sessionDir ?? process.env.BOTTEGA_SESSION_DIR ?? "data/sessions",
     },
     extensions: {
-      runtime: extensionRuntime,
-      registry: extensionRegistry,
+      runtime: runtime.runtime,
+      registry: runtime.registry,
       connect: {
-        registry: extensionRegistry,
+        registry: runtime.registry,
         store,
         audit,
         broker: connectViaAuthBroker,
@@ -596,5 +607,16 @@ if (import.meta.main) {
       },
     },
   });
-  await server.connect(new StdioServerTransport());
+  return { runtime, policy, server };
+}
+
+/** Boot the standalone server: `bun run src/mcp/server.ts` (spawned by the agent). */
+if (import.meta.main) {
+  try {
+    const { server } = await bootMemoryMcpServer();
+    await server.connect(new StdioServerTransport());
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
 }

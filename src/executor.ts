@@ -32,17 +32,14 @@
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { createStore, recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
+import { recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
 import { DELIVERY_COMPLETED_EVENT, DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
-import { createAudit, type AuditModule } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
-import { loadOrgPolicy, type PolicyConfig } from "./policy/config";
 import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver, type AgentSessionDriver } from "./server/drivers/agent-driver";
-import { resolveMemoryProvider } from "./server/memory-provider";
-import { createExtensionRegistry } from "./extensions/registry";
-import { createExtensionRuntime } from "./extensions/runtime";
-import { resolveExtensionSurfaces } from "./extensions/surface";
+import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
 import { extensionToolDefinitions } from "./extensions/tools";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { McpBinding } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
@@ -123,43 +120,104 @@ const BASE_BRANCH = "main";
 const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
 
 /**
- * Builds the extension worker's process-scoped resources. The caller owns
- * memoization because the same definitions must configure the OMP driver
- * before the first restricted session is created.
- *
- * Issue #158: a tools-less manifest resolves its tool surface from the
- * provider's tools/list here (cached). Issue #166: a per-provider failure
- * (unreachable/auth-gated) is SKIPPED at boot — logged with evidence — and
- * deferred to the runtime's lazy per-call path, which fails closed; the
- * executor never dies because one provider's tools/list failed.
+ * The extension worker's toolset over the shared runtime chain (issue
+ * #172): memory definitions ride the driver's policy gate; extension
+ * definitions stay in the driver's customTools lane because the extension
+ * runtime runs its own policy gate and must never be double-wrapped.
  */
-export async function createExtensionWorkerToolset(deps: {
-  store: Store;
-  audit: AuditModule;
-  orgPolicy: PolicyConfig;
-  extensionsDir?: string;
-}): Promise<ExtensionWorkerToolset> {
-  const registry = createExtensionRegistry(
-    deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
-  );
-  const surfaces = await resolveExtensionSurfaces(registry.list());
-  const runtime = createExtensionRuntime({
-    registry,
-    store: deps.store,
-    audit: deps.audit,
-    orgPolicy: deps.orgPolicy,
-    router: DenyRouter,
-    surfaces,
-  });
-  const memoryProvider = resolveMemoryProvider(deps.store.getOrgSettings(), deps.store.getDb());
+function buildExecutorWorkerToolset(rt: BootstrapRuntime): ExtensionWorkerToolset {
   return {
-    memoryTools: memoryToolDefinitions(memoryProvider, { audit: deps.audit }),
-    extensionTools: extensionToolDefinitions(registry.list(), {
-      runtime,
+    memoryTools: memoryToolDefinitions(rt.memoryProvider, { audit: rt.audit }),
+    extensionTools: extensionToolDefinitions(rt.registry.list(), {
+      runtime: rt.runtime,
       getCaller: () => "executor",
-      surfaces,
+      surfaces: rt.surfaces,
     }),
   };
+}
+
+/** The executor composition root's boot result (issue #172). */
+export interface ExecutorBoot {
+  /** The shared composition chain — the same pieces every root boots. */
+  runtime: BootstrapRuntime;
+  /** Memoized extension-worker toolset (memory + extension tools over the boot runtime). */
+  getExtensionWorkerToolset(): Promise<ExtensionWorkerToolset>;
+  /** Memoized OMP driver over the worker toolset (issue #158). */
+  getDriver(): AgentDriver | Promise<AgentDriver>;
+}
+
+/**
+ * The executor composition root (issue #172, #153 item 2): the boot-time
+ * process-scoped resources — the shared runtime chain (bootstrapRuntime:
+ * store → audit → org policy → extension registry → surfaces → extension
+ * runtime → memory provider, identical to the server and MCP roots), the
+ * agent-dir modelRoles pin sync (issue #78), and the memoized
+ * worker-toolset/driver getters — exactly what the entrypoint's
+ * import.meta.main block runs. Caller-level boot tests
+ * (src/executor-boot.test.ts) drive this to observe the worker toolset +
+ * pin + model guard, the executor analogue of the server's
+ * boot-wiring.test.ts.
+ */
+export async function bootExecutorRuntime(opts: {
+  agentDir?: string;
+  /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
+  mcpTransport?: (binding: McpBinding) => Transport;
+} = {}): Promise<ExecutorBoot> {
+  const runtime = await bootstrapRuntime({
+    router: DenyRouter,
+    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
+  });
+  const { store, audit, orgPolicy } = runtime;
+  const agentDir = opts.agentDir ?? "data/omp-agent";
+  mkdirSync(agentDir, { recursive: true });
+  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
+  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
+  // config/omp, so a stale copy without the pin silently falls back to the
+  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
+  const pinSync = ensureAgentDirModelPin(agentDir);
+  if (pinSync === "created" || pinSync === "patched") {
+    console.log(
+      `bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`,
+    );
+  }
+  // One registry/runtime/provider/toolset per executor process. The getter
+  // defers construction until runExecutor resolves the driver, then shares
+  // the exact same definitions with session routing.
+  let cachedWorkerToolset: Promise<ExtensionWorkerToolset> | undefined;
+  const getExtensionWorkerToolset = (): Promise<ExtensionWorkerToolset> => {
+    if (cachedWorkerToolset === undefined) {
+      cachedWorkerToolset = Promise.resolve(buildExecutorWorkerToolset(runtime));
+    }
+    return cachedWorkerToolset;
+  };
+  let driver: AgentDriver | Promise<AgentDriver> | undefined;
+  const getDriver = (): AgentDriver | Promise<AgentDriver> => {
+    if (driver === undefined) {
+      // The driver getter is async-capable (the toolset resolves surfaces
+      // for tools-less manifests, issue #158); memoize the resolved value.
+      driver = getExtensionWorkerToolset().then((workerTools) => {
+        // Pre-approved session: the work item's pickup approval IS the
+        // authorization for allowlisted exec-tier built-ins. Memory tools
+        // ride this driver gate. Extension definitions stay in customTools
+        // because createExtensionRuntime runs its own policy gate and must
+        // never be double-wrapped.
+        return createOmpSdkDriver({
+          agentDir,
+          customTools: workerTools.extensionTools,
+          gate: {
+            orgPolicy,
+            audit,
+            router: DenyRouter,
+            store,
+            preApproved: true,
+            tools: workerTools.memoryTools,
+          },
+        });
+      });
+    }
+    return driver;
+  };
+  return { runtime, getExtensionWorkerToolset, getDriver };
 }
 interface ExecutorConfig {
   /** Authorization fence (issue #47): the only owner/repo pairs the executor may clone/push to. */
@@ -700,58 +758,15 @@ async function git(args: string[], opts: { cwd?: string; env?: Record<string, st
 }
 
 if (import.meta.main) {
-  const store = createStore();
-  const audit = createAudit(store);
-  const orgPolicy = loadOrgPolicy(store);
-  mkdirSync("data/omp-agent", { recursive: true });
-  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
-  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
-  // config/omp, so a stale copy without the pin silently falls back to the
-  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
-  const pinSync = ensureAgentDirModelPin("data/omp-agent");
-  if (pinSync === "created" || pinSync === "patched") {
-    console.log(`bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`);
-  }
-  // One registry/runtime/provider/toolset per executor process. The getter
-  // defers construction until runExecutor resolves the driver, then shares
-  // the exact same definitions with session routing.
-  let cachedWorkerToolset: Promise<ExtensionWorkerToolset> | undefined;
-  const getExtensionWorkerToolset = (): Promise<ExtensionWorkerToolset> => {
-    if (cachedWorkerToolset === undefined) {
-      cachedWorkerToolset = createExtensionWorkerToolset({ store, audit, orgPolicy });
-    }
-    return cachedWorkerToolset;
-  };
+  const boot = await bootExecutorRuntime();
+  const { store } = boot.runtime;
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,
     get driver(): AgentDriver | Promise<AgentDriver> {
-      if (driver === undefined) {
-        // The driver getter is async-capable (the toolset resolves surfaces
-        // for tools-less manifests, issue #158); memoize the resolved value.
-        driver = getExtensionWorkerToolset().then((workerTools) => {
-          // Pre-approved session: the work item's pickup approval IS the
-          // authorization for allowlisted exec-tier built-ins. Memory tools
-          // ride this driver gate. Extension definitions stay in customTools
-          // because createExtensionRuntime runs its own policy gate and must
-          // never be double-wrapped.
-          return createOmpSdkDriver({
-            agentDir: "data/omp-agent",
-            customTools: workerTools.extensionTools,
-            gate: {
-              orgPolicy,
-              audit,
-              router: DenyRouter,
-              store,
-              preApproved: true,
-              tools: workerTools.memoryTools,
-            },
-          });
-        });
-      }
-      return driver;
+      return (driver ??= boot.getDriver());
     },
-    getExtensionWorkerToolset,
+    getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
     orgConfigDir: "config",
   };
   const ac = new AbortController();
