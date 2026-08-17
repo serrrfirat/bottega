@@ -26,6 +26,7 @@ import {
   StreamTurnPresenter,
   SlackTurnPresenter,
   THINKING_PHRASES,
+  THINKING_SNIPPET_MAX,
   createPhraseRotation,
   emitToolStep,
   nextToolStepId,
@@ -259,6 +260,32 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     expect(toolStepTitle("github_pat_0123456789abcdefghij", "allowed (read)")).not.toContain("github_pat_0123456789abcdefghij");
     expect(toolStepTitle("github_pat_0123456789abcdefghij", "allowed (read)")).toContain("[REDACTED]");
   });
+
+  test("live thinking chunks render nothing on the panel — #193 is the plain path (issue #193)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+
+    // Thinking must not append a progress line to the stream...
+    presenter.onThinking({ spaceId: "slack:C1", thinking: "deep reasoning in progress" });
+    await flush();
+    expect(rec.texts).toHaveLength(0);
+
+    // ...and the reply still closes the stream as usual.
+    presenter.onMessage({ spaceId: "slack:C1", text: "answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.texts).toHaveLength(0);
+    expect(rec.stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "answer" }]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -490,8 +517,10 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
 // SlackTurnPresenter (the phrase renderer): no panel, but the rest is shared.
 // ---------------------------------------------------------------------------
 
-describe("SlackTurnPresenter (phrase renderer): no panel in fallback mode", () => {
-  test("tool steps render nothing, and the phrase+edit path still delivers the reply", async () => {
+describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => {
+  test("a gated tool step becomes the in-place progress line (throttled); the phrase+edit path still delivers the reply", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
     const rec = recordingAdapter();
     const { store } = recordingStore();
     const presenter = new SlackTurnPresenter({
@@ -504,13 +533,138 @@ describe("SlackTurnPresenter (phrase renderer): no panel in fallback mode", () =
     await flush();
     expect(rec.posts).toHaveLength(1);
     expect(rec.streams).toHaveLength(0);
+    const phraseTs = "post-1";
 
-    // A gated tool call in fallback mode: swallowed (no panel, no error).
+    // A gated tool call in the phrase renderer (issue #193): the step
+    // becomes the in-place progress line — never a panel card, and
+    // coalesced on the cadence (nothing flushes before the throttle).
     emitToolStep(
       (step) => presenter.onToolStep(step),
       { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" },
     );
     await flush();
     expect(rec.tasks).toHaveLength(0);
+    expect(rec.updates).toHaveLength(0);
+
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
+
+    // The final reply replaces the progress line in place — and no stale
+    // progress update (or elapsed tick) overwrites it afterwards.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the final answer" });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 3);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the final answer" });
+  });
+
+  test("a turn with tool steps + thinking blocks renders progress updates in place, throttled (issue #193)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+    const phraseTs = "post-1";
+
+    // A burst of steps + thinking inside one turn: coalesced — no
+    // per-event spam before the throttle.
+    const stepId = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:C1", taskId: stepId, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress" });
+    presenter.onThinking({ spaceId: "slack:C1", thinking: "Let me check the repo first" });
+    await flush();
+    expect(rec.updates).toHaveLength(0);
+
+    // Priority: the CURRENT STEP beats the thinking snippet.
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ github.search_issues — allowed (read)" });
+
+    // The step completes: the line falls back to the thinking snippet.
+    presenter.onToolStep({ spaceId: "slack:C1", taskId: stepId, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "complete" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me check the repo first" });
+
+    // The final reply replaces the progress line in place, exactly once.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Done — here is the answer" });
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Done — here is the answer" });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 3);
+    await flush();
+    expect(rec.updates.filter((u) => u.ts === phraseTs).at(-1)!.text).toBe("Done — here is the answer");
+  });
+
+  test("without thinking, the progress line shows the step or the elapsed phrase only (issue #193)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    const phraseTs = "post-1";
+
+    // No step, no thinking: the elapsed tick keeps the phrase live.
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s$/);
+
+    // A step supersedes the elapsed line...
+    presenter.onToolStep({ spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
+    // ...and a 🧠 line NEVER appears (no thinking ever arrived).
+    expect(rec.updates.some((u) => u.text.startsWith("🧠"))).toBe(false);
+  });
+
+  test("long reasoning truncates to a ~200-char tail snippet (issue #193)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+
+    const head = "The user wants to know why the build failed";
+    const tail = "so I should check the CI logs before answering";
+    const long = `${head} ${"reasoning ".repeat(40)} ${tail}`;
+    expect(long.length).toBeGreaterThan(THINKING_SNIPPET_MAX);
+    presenter.onThinking({ spaceId: "slack:C1", thinking: long });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+
+    const line = rec.updates.at(-1)!.text;
+    expect(line.startsWith("🧠 …")).toBe(true);
+    // The snippet is capped at THINKING_SNIPPET_MAX characters...
+    expect(line.length).toBe("🧠 ".length + THINKING_SNIPPET_MAX);
+    // ...and it is the TAIL of the reasoning (the part still moving), not
+    // the frozen head.
+    expect(line).toContain(tail);
+    expect(line).not.toContain(head);
   });
 });

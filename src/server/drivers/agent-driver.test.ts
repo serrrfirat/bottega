@@ -887,6 +887,92 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
   });
 });
 
+describe("OmpSessionDriver live thinking (issue #193)", () => {
+  /** Stub SDK session exposing the subscribe listener for event injection. */
+  function stubSession() {
+    let listener: ((event: unknown) => void) | undefined;
+    const session = {
+      subscribe: (cb: (event: unknown) => void) => {
+        listener = cb;
+        return () => {
+          listener = undefined;
+        };
+      },
+      beginDispose: () => {},
+      dispose: async () => {},
+      isStreaming: false,
+      prompt: async () => {},
+      steer: async () => {},
+      followUp: async () => {},
+      abort: async () => {},
+      getAvailableModels: () => [],
+    } as unknown as AgentSession;
+    return {
+      session,
+      emit: (event: unknown) => listener?.(event),
+    };
+  }
+
+  test("thinking deltas stream as live 'thinking' events; message_end carries the final reasoning", async () => {
+    const { session, emit } = stubSession();
+    const thinking: unknown[] = [];
+    const messages: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("thinking", (data) => thinking.push(data));
+    driver.on("message", (data) => messages.push(data));
+
+    // Each delta re-emits the accumulated reasoning — a long reasoning
+    // phase updates the presenter live, not only at message_end.
+    emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Let me " } });
+    emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "check the repo" } });
+    expect(thinking).toEqual([
+      { spaceId: "slack:C1", thinking: "Let me" }, // accumulated text is trimmed
+      { spaceId: "slack:C1", thinking: "Let me check the repo" },
+    ]);
+
+    // The completed message's content blocks are the authoritative final
+    // snapshot (replay path — deltas don't re-fire on recovery).
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: "Let me check the repo" }] } });
+    expect(thinking.at(-1)).toEqual({ spaceId: "slack:C1", thinking: "Let me check the repo" });
+
+    // A following text-only message emits no thinking (per-message reset).
+    emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } });
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
+    expect(messages).toEqual([{ spaceId: "slack:C1", text: "hi" }]);
+    expect(thinking).toHaveLength(3);
+  });
+
+  test("multiple thinking blocks join in content order; unknown shapes never emit (fail closed)", async () => {
+    const { session, emit } = stubSession();
+    const thinking: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("thinking", (data) => thinking.push(data));
+
+    // Two blocks on one message: content-order join at message_end.
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "first pass" },
+          { type: "toolCall", name: "bash" },
+          { type: "thinking", thinking: "second pass" },
+        ],
+      },
+    });
+    expect(thinking).toEqual([{ spaceId: "slack:C1", thinking: "first pass\nsecond pass" }]);
+
+    // Redacted / empty / unknown content blocks carry no readable thinking:
+    // nothing is emitted, never a crash into the turn path.
+    thinking.length = 0;
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "redactedThinking", data: "opaque" }] } });
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: "   " }] } });
+    emit({ type: "message_end", message: { role: "assistant", content: "not-an-array" } });
+    emit({ type: "message_end", message: null });
+    expect(thinking).toHaveLength(0);
+  });
+});
+
 describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
   /**
    * Stub SDK session: controllable streaming, records prompt/steer/followUp,

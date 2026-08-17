@@ -116,7 +116,7 @@ export interface AgentSessionDriver {
   prompt(text: string, opts?: AgentTurnOptions): Promise<void>;
   abort(): Promise<void>;
   isStreaming(): boolean;
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: unknown) => void): () => void;
+  on(event: DriverEvent, cb: (data: unknown) => void): () => void;
   dispose(): Promise<void>;
   /**
    * Optional per-session model-role switch (issue #64): applies the role for
@@ -250,7 +250,7 @@ export function resolveRoleTarget(
 type SdkThinkingLevel = NonNullable<Parameters<AgentSession["setModel"]>[2]>["thinkingLevel"];
 
 /** Events the session drivers emit; both drivers share this vocabulary. */
-export type DriverEvent = "message" | "turn_start" | "turn_end" | "error";
+export type DriverEvent = "message" | "thinking" | "turn_start" | "turn_end" | "error";
 
 /**
  * The listener plumbing behind {@link AgentSessionDriver.on} (issue #33).
@@ -291,6 +291,27 @@ export function sessionIdFromFilePath(file: string | null | undefined): string |
   if (!file) return undefined;
   const base = basename(file);
   return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : undefined;
+}
+
+/**
+ * The thinking text of an SDK message's content blocks (issue #193).
+ * `{type:"thinking"}` blocks carry the model's reasoning; unknown block
+ * shapes (redactedThinking, toolCall, image, …) are ignored — fail closed,
+ * never surfaced. Empty when the message carries no readable thinking.
+ */
+export function collectThinkingBlocks(message: unknown): string[] {
+  if (message === null || typeof message !== "object" || !("content" in message)) return [];
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block === null || typeof block !== "object") continue;
+    if (!("type" in block) || !("thinking" in block)) continue;
+    if (block.type !== "thinking") continue;
+    if (typeof block.thinking !== "string" || !block.thinking.trim()) continue;
+    parts.push(block.thinking.trim());
+  }
+  return parts;
 }
 
 /**
@@ -1033,6 +1054,14 @@ export class OmpSessionDriver implements AgentSessionDriver {
   readonly #getModelSettings: (spaceId: string) => Promise<SpaceModelSettings>;
   readonly #emitter = createEmitter<DriverEvent>();
   #textByIndex = new Map<number, string>();
+  /**
+   * Accumulated thinking text per content index of the CURRENT assistant
+   * message (issue #193): `thinking_delta`/`thinking_end` fill it as the
+   * provider streams reasoning, and each change emits a live "thinking"
+   * driver event so the turn presenter can render the reasoning snippet
+   * BEFORE the message completes. Cleared per message at message_end.
+   */
+  #thinkingByIndex = new Map<number, string>();
   #unsubscribe: () => void;
   /** When a prompt runs with silent: true, output is captured but not delivered. */
   #silentTurn = false;
@@ -1104,6 +1133,14 @@ export class OmpSessionDriver implements AgentSessionDriver {
             this.#textByIndex.set(ae.contentIndex, (this.#textByIndex.get(ae.contentIndex) ?? "") + ae.delta);
           } else if (ae.type === "text_end") {
             this.#textByIndex.set(ae.contentIndex, ae.content);
+          } else if (ae.type === "thinking_delta") {
+            // Issue #193: stream the model's reasoning live — every delta
+            // re-emits so a long reasoning phase never looks frozen.
+            this.#thinkingByIndex.set(ae.contentIndex, (this.#thinkingByIndex.get(ae.contentIndex) ?? "") + ae.delta);
+            this.#emitThinking();
+          } else if (ae.type === "thinking_end") {
+            this.#thinkingByIndex.set(ae.contentIndex, ae.content);
+            this.#emitThinking();
           }
           break;
         }
@@ -1115,6 +1152,19 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // turn_end the loop emits right after.
           const errorMessage = (event.message as { errorMessage?: unknown } | null)?.errorMessage;
           if (typeof errorMessage === "string" && errorMessage.trim()) this.#lastError = errorMessage.trim();
+          // Issue #193: the message's own content blocks are the
+          // authoritative thinking snapshot — on the replay path the
+          // deltas above don't re-fire, so the completed reasoning rides
+          // the final message instead. Prefer the content blocks (they
+          // are the full text); the accumulated deltas remain the
+          // fallback when a provider redacts thinking from content.
+          const contentThinking = collectThinkingBlocks(event.message);
+          if (contentThinking.length > 0) {
+            this.#thinkingByIndex.clear();
+            contentThinking.forEach((part, index) => this.#thinkingByIndex.set(index, part));
+          }
+          this.#emitThinking();
+          this.#thinkingByIndex.clear();
           const text = [...this.#textByIndex.entries()]
             .sort(([a], [b]) => a - b)
             .map(([, part]) => part)
@@ -1395,6 +1445,27 @@ export class OmpSessionDriver implements AgentSessionDriver {
     this.#unsubscribe();
     this.#session.beginDispose();
     await this.#session.dispose();
+  }
+
+  /** The accumulated thinking text across content indexes (issue #193). */
+  #accumulatedThinking(): string {
+    return [...this.#thinkingByIndex.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, part]) => part)
+      .join("\n")
+      .trim();
+  }
+
+  /**
+   * Emits the accumulated reasoning as a live "thinking" driver event
+   * (issue #193): the plain presenter renders it as the in-place phrase.
+   * No-op while nothing has accumulated — unknown/redacted content never
+   * reaches the channel (fail closed).
+   */
+  #emitThinking(): void {
+    const thinking = this.#accumulatedThinking();
+    if (!thinking) return;
+    this.#emitter.emit("thinking", { spaceId: this.#spaceId, thinking });
   }
 
   #deliver(text: string): void {

@@ -10,10 +10,13 @@
  * Two implementations:
  *
  *  - {@link SlackTurnPresenter} — the phrase + in-place-edit renderer
- *    (issues #40/#60/#119/#120, extracted verbatim). One thinking message
- *    per space, rotated on receipt/turn_start, replaced in place by the
- *    final reply; steered (streaming) turns coalesce edits to at most one
- *    per {@link STREAM_UPDATE_INTERVAL_MS} with a final-delivery guarantee.
+ *    (issues #40/#60/#119/#120/#193, extracted verbatim). One thinking
+ *    message per space, rotated on receipt/turn_start; during the turn the
+ *    phrase is a LIVE PROGRESS line (issue #193) — current tool step,
+ *    latest thinking snippet, or the elapsed "Thinking… Ns" — coalesced on
+ *    {@link STREAM_UPDATE_INTERVAL_MS} and replaced in place by the final
+ *    reply; steered (streaming) turns coalesce edits to at most one per
+ *    cadence with a final-delivery guarantee.
  *  - {@link StreamTurnPresenter} — the Slack-native thinking-panel renderer
  *    (issue #168). The thinking phrase becomes the `chat.startStream`
  *    opening; every gated tool call renders a `task_update` thinking-step
@@ -87,9 +90,19 @@ export const EMPTY_TURN_LIMIT = 3;
  * (phrase path) or carried by the stopStream closing block (stream path) —
  * while interim updates may be skipped. Batching applies ONLY to the
  * streaming (steer) path; non-streaming replies update exactly as before.
+ * The live-progress phrase (issue #193) coalesces on the SAME cadence.
  * Hardcoded default (no org setting).
  */
 export const STREAM_UPDATE_INTERVAL_MS = 400;
+
+/**
+ * Live-progress line cap (issue #193): the in-place phrase shows the
+ * current tool step or the latest reasoning snippet at most this many
+ * characters — a progress HINT, never a document. Long reasoning renders
+ * as its tail (the most recent reasoning, which keeps moving); long step
+ * titles render as their head (the tool name stays visible).
+ */
+export const THINKING_SNIPPET_MAX = 200;
 
 /**
  * Bounded retries for the FINAL delivery (issue #120): after this many
@@ -222,6 +235,12 @@ interface PendingStreamUpdate {
   ts: string;
   /** Latest streamed text; older text is dropped (coalescing). */
   text: string;
+  /**
+   * True when the entry carries a LIVE-PROGRESS line (issue #193), false
+   * for real streamed reply text. A real-text entry must never be
+   * overwritten by a progress line — the reply wins, the progress yields.
+   */
+  progress?: boolean;
   /** The turn has ended: this text is the final reply and must land. */
   final: boolean;
   /** Failed final-delivery attempts; bounded so a hard 429 cannot loop forever. */
@@ -292,6 +311,18 @@ export class SlackTurnPresenter {
    * the direct replace path.
    */
   protected alwaysStream = false;
+  /**
+   * Live progress (issue #193): the CURRENT tool step's title and the
+   * latest thinking snippet drive the in-place progress line — priority
+   * step > thinking > elapsed "Thinking… Ns". The elapsed tick timer
+   * re-renders the line on {@link STREAM_UPDATE_INTERVAL_MS} so a long
+   * silent turn (no step, no thinking) never looks frozen, and
+   * {@link #lastProgressText} skips identical re-renders.
+   */
+  #currentStepTitle: string | undefined;
+  #latestThinking: string | undefined;
+  #lastProgressText: string | undefined;
+  #progressTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -310,6 +341,11 @@ export class SlackTurnPresenter {
    */
   onInbound(msg: SlackMessage): void {
     this.lastInboundTs = msg.ts;
+    // A new turn: the previous turn's progress state is stale (#193). The
+    // opening phrase (and the elapsed tick) take over from here.
+    this.#currentStepTitle = undefined;
+    this.#latestThinking = undefined;
+    this.#lastProgressText = undefined;
     this.#postThinkingPhrase();
     this.#addReceiptReaction(msg);
     this.#auditReceipt(msg);
@@ -346,8 +382,11 @@ export class SlackTurnPresenter {
       const cause = typeof data === "object" && data !== null && "error" in data ? data.error : undefined;
       this.#countEmptyTurn(typeof cause === "string" && cause.trim() ? cause.trim() : undefined);
       if (!this.#churnActive) {
-        // A coalesced streaming text must not overwrite the fallback (#120).
+        // A coalesced streaming text must not overwrite the fallback (#120);
+        // neither may the elapsed tick (#193) — the fallback IS the visible
+        // state until the retry's turn_start re-arms the progress.
         this.cancelStreamUpdate();
+        this.#cancelProgressTimer();
         const pendingTs = this.pendingTs;
         if (pendingTs !== undefined) {
           const fallback = emptyResponseFallback(
@@ -443,10 +482,20 @@ export class SlackTurnPresenter {
     this.digesting = false;
   }
 
-  /** A gated tool-call step (issue #168); the phrase renderer has no panel, so it renders nothing. */
+  /** A gated tool-call step (issue #168); the phrase renderer shows it as the live progress line. */
   onToolStep(step: ToolStepEvent): void {
     if (this.digesting) return;
     this.renderToolStep(step);
+  }
+
+  /**
+   * A live thinking chunk from the driver (issue #193): the phrase renderer
+   * shows the latest reasoning snippet in place while the turn runs. The
+   * streaming renderer ignores it (the panel renders steps, not phrases).
+   */
+  onThinking(data: unknown): void {
+    if (this.digesting) return;
+    this.renderThinking(data);
   }
 
   /** DMs read naturally as a plain message — no thread. Team channels (C/G) keep replies threaded. */
@@ -468,6 +517,10 @@ export class SlackTurnPresenter {
     this.#pendingReactions.clear();
     this.#ackedReactions.clear();
     this.cancelStreamUpdate();
+    this.#cancelProgressTimer();
+    this.#currentStepTitle = undefined;
+    this.#latestThinking = undefined;
+    this.#lastProgressText = undefined;
     this.streamingTurns = false;
     this.#nudged = undefined;
   }
@@ -510,8 +563,109 @@ export class SlackTurnPresenter {
   /** Post-turn cleanup; streaming closes the stream here. */
   protected async finishTurn(): Promise<void> {}
 
-  /** Renders one thinking-step card; the phrase renderer has no panel. */
-  protected renderToolStep(_step: ToolStepEvent): void {}
+  /**
+   * Renders one thinking-step card; the phrase renderer has no panel. The
+   * plain renderer instead shows the CURRENT step as the in-place progress
+   * line (issue #193); the streaming renderer overrides this with the
+   * panel's task_update cards (issue #168).
+   */
+  protected renderToolStep(step: ToolStepEvent): void {
+    // A completion clears the current step: the line falls back to the
+    // latest thinking snippet or the elapsed phrase until the next step.
+    this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
+    this.#renderProgressNow();
+  }
+
+  /** A thinking chunk (issue #193); the phrase renderer shows it live as the 🧠 snippet. */
+  protected renderThinking(data: unknown): void {
+    const thinking =
+      data !== null && typeof data === "object" && "thinking" in data ? data.thinking : undefined;
+    if (typeof thinking !== "string" || !thinking.trim()) return;
+    this.#latestThinking = this.#tailSnippet(thinking.trim());
+    this.#renderProgressNow();
+  }
+
+  // -------------------------------------------------------------------------
+  // Live progress (issue #193): the in-place phrase becomes a progress line
+  // — current tool step ("⚙️ …") > latest thinking snippet ("🧠 …") >
+  // elapsed "Thinking… Ns" — coalesced on the STREAM_UPDATE_INTERVAL_MS
+  // cadence and replaced by the final reply exactly as before. The elapsed
+  // tick keeps the line moving during a silent turn so the user never stares
+  // at a frozen phrase.
+  // -------------------------------------------------------------------------
+
+  /** The current progress line: step > thinking snippet > elapsed phrase. */
+  #progressLine(): string {
+    const step = this.#currentStepTitle;
+    if (step !== undefined) return `⚙️ ${this.#headSnippet(step)}`;
+    const thinking = this.#latestThinking;
+    if (thinking !== undefined) return `🧠 ${thinking}`;
+    return this.#elapsedPhrase();
+  }
+
+  /** "Thinking… Ns" — the fallback while no step or thinking has arrived. */
+  #elapsedPhrase(): string {
+    const base = this.#receivedAt ?? Date.now();
+    const seconds = Math.max(0, Math.floor((Date.now() - base) / 1000));
+    return `Thinking… ${seconds}s`;
+  }
+
+  /** Head-truncates a long value (keeps the tool name of a step title). */
+  #headSnippet(text: string): string {
+    if (text.length <= THINKING_SNIPPET_MAX) return text;
+    return `${text.slice(0, THINKING_SNIPPET_MAX - 1)}…`;
+  }
+
+  /** Tail-truncates a long value (keeps the MOST RECENT reasoning, #193). */
+  #tailSnippet(text: string): string {
+    if (text.length <= THINKING_SNIPPET_MAX) return text;
+    return `…${text.slice(-(THINKING_SNIPPET_MAX - 1))}`;
+  }
+
+  /**
+   * Renders the current progress line in place, coalesced on the cadence.
+   * Skipped while the phrase post is in flight (ts unknown): the elapsed
+   * tick or the next step/thinking event renders once it lands. Yields to
+   * pending real reply text (the streamed answer always wins).
+   */
+  #renderProgressNow(): void {
+    this.#scheduleProgressUpdate(this.#progressLine());
+  }
+
+  /**
+   * Arms the elapsed tick; one timer per space, no-op while armed. The
+   * streaming renderer overrides this to a no-op: the panel owns the
+   * stream surface, so the phrase renderer's progress tick must never
+   * append elapsed lines to it (issue #193 is the plain path).
+   */
+  protected armProgressTimer(): void {
+    if (this.#progressTimer !== null) return;
+    this.#progressTimer = setTimeout(() => {
+      this.#progressTimer = null;
+      this.#tickProgress();
+    }, STREAM_UPDATE_INTERVAL_MS);
+    this.#progressTimer.unref?.();
+  }
+
+  /**
+   * One cadence tick: re-render the priority line (a completed step or a
+   * new elapsed second changes it; identical text and pending real reply
+   * text are skipped) and re-arm — the tick lives for the whole turn and
+   * stops via {@link #cancelProgressTimer} when a real text replaces the
+   * phrase.
+   */
+  #tickProgress(): void {
+    if (!this.digesting) this.#renderProgressNow();
+    this.armProgressTimer();
+  }
+
+  /** Stops the elapsed tick (the phrase was replaced by a delivered text). */
+  #cancelProgressTimer(): void {
+    if (this.#progressTimer !== null) {
+      clearTimeout(this.#progressTimer);
+      this.#progressTimer = null;
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Phrase machinery (issues #40/#60/#119/#120, extracted verbatim).
@@ -535,6 +689,9 @@ export class SlackTurnPresenter {
     if (this.digesting) return;
     this.#turnDelivered = false;
     if (this.#churnActive) return;
+    // Live progress (#193): the elapsed tick keeps the phrase live from the
+    // moment the turn opens (armed once; no-op while already running).
+    this.armProgressTimer();
     const pendingTs = this.pendingTs;
     if (pendingTs !== undefined) {
       // A retry (or second turn) while the phrase is up: replace in place.
@@ -660,6 +817,11 @@ export class SlackTurnPresenter {
    * updates exactly once.
    */
   #replaceOrPost(text: string): void {
+    // A delivered text (reply / error / churn) supersedes any pending
+    // live-progress update AND its elapsed tick (#193): a stale progress
+    // line or a late tick must never overwrite what actually landed.
+    this.cancelStreamUpdate();
+    this.#cancelProgressTimer();
     const pendingTs = this.pendingTs;
     if (pendingTs !== undefined) {
       this.pendingTs = undefined;
@@ -689,11 +851,36 @@ export class SlackTurnPresenter {
     const existing = this.#streamUpdate;
     if (existing) {
       existing.text = text; // latest text wins; the armed timer stays
+      // A real reply text supersedes a pending live-progress line (#193):
+      // the progress line must never clobber streamed reply text.
+      existing.progress = false;
       return;
     }
-    const entry: PendingStreamUpdate = { ts: pendingTs, text, final: false, retries: 0, timer: null };
+    const entry: PendingStreamUpdate = { ts: pendingTs, text, progress: false, final: false, retries: 0, timer: null };
     this.#streamUpdate = entry;
     this.#armStreamTimer(entry);
+  }
+
+  /**
+   * Coalesces a live-progress line (issue #193) on the same cadence as
+   * streamed text — but YIELDS to a pending real-text update: the reply is
+   * the actual answer, the progress line is decoration. Returns when the
+   * line was scheduled; identical lines are skipped.
+   */
+  #scheduleProgressUpdate(line: string): void {
+    if (line === this.#lastProgressText) return;
+    const pendingTs = this.pendingTs;
+    if (pendingTs === undefined) return; // phrase post still in flight
+    const existing = this.#streamUpdate;
+    if (existing) {
+      if (!existing.progress) return; // real streamed text pending — yield
+      existing.text = line; // latest progress line wins; the armed timer stays
+    } else {
+      const entry: PendingStreamUpdate = { ts: pendingTs, text: line, progress: true, final: false, retries: 0, timer: null };
+      this.#streamUpdate = entry;
+      this.#armStreamTimer(entry);
+    }
+    this.#lastProgressText = line;
   }
 
   /** Arms the cadence timer for a pending stream update if none is running. */
@@ -948,6 +1135,20 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
         );
       });
   }
+
+  /**
+   * Live thinking (issue #193) is the PLAIN path's progress phrase; the
+   * panel renders steps as cards and reply text as stream appends — a
+   * reasoning snippet must not pollute the stream, so it renders nothing.
+   */
+  protected renderThinking(_data: unknown): void {}
+
+  /**
+   * The panel owns the stream surface: the phrase renderer's elapsed tick
+   * must never append "Thinking… Ns" chunks to it (issue #193 is the
+   * plain path — DMs and stream fallbacks keep the rotating phrase).
+   */
+  protected armProgressTimer(): void {}
 
   /**
    * chat.stopStream with bounded retries (a 429 must not drop the final

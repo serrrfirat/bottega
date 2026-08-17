@@ -53,6 +53,7 @@ import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/r
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
 import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
 import type { McpBinding } from "../extensions/manifest";
+import type { ToolStepSink } from "./services/slack-turn-presenter";
 import { resolveMemoryProvider, type ResolvedMemoryProvider } from "./memory-provider";
 
 export interface BootstrapRuntimeDeps {
@@ -64,6 +65,14 @@ export interface BootstrapRuntimeDeps {
    * (the router is consulted per ask-human request, never at construction).
    */
   router: ApprovalRouter | (() => ApprovalRouter);
+  /**
+   * Thinking-step sink (issue #193): the extension runtime's own policy
+   * gate emits a step per gated extension tool call through this. The
+   * server wires it to the SpaceService's step router (late-bound — the
+   * service is constructed after the shared chain); headless roots omit it
+   * and no steps are emitted. Mirrors the driver gate's onToolStep.
+   */
+  onToolStep?: ToolStepSink;
   /**
    * Egress-boundary overrides (proxy control + secrets dir). The secret
    * resolver is ALWAYS wired by bootstrapRuntime from the deployment's
@@ -146,6 +155,7 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     boundary,
     surfaces,
     ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {}),
+    ...(deps.onToolStep !== undefined ? { onToolStep: deps.onToolStep } : {}),
   });
   // One memory provider per process (issues #43/#67/#135): explicit
   // memory_backend.base_url settings select mem0 first, MEM0_BASE_URL is

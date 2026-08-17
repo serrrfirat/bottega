@@ -189,6 +189,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     router: () => approvalRouter,
     ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
+    // Issue #193: extension-tool steps reach the space's turn presenter
+    // too — late-bound, same pattern as the driver gate below.
+    onToolStep: (step) => spaceService.routeToolStep(step),
   });
   const {
     store,
@@ -485,6 +488,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // The in-session tool surface, as SDK tool definitions (issue
           // #69) — see sessionToolset above.
           tools: sessionToolset,
+          // Issue #193: every gated call's step reaches the space's turn
+          // presenter (live progress phrase on the plain path, step cards
+          // on the panel). spaceService is late-bound (constructed after
+          // the driver) — the closure reads it only at call time, the same
+          // pattern as extensionCaller above.
+          onToolStep: (step) => spaceService.routeToolStep(step),
         },
         // Connect capability (issue #52): connect_extension is built per
         // session so the actor is the requesting principal; org-scope

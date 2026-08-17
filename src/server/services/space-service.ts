@@ -244,11 +244,12 @@ export class SpaceService {
   }
 
   /**
-   * Step-source bridge (issue #168): the driver's withPolicyGate wrapper
-   * and the extension runtime emit gated tool-call steps through this; the
-   * space's presenter renders them as thinking-step cards. Unknown spaces
-   * and headless calls are dropped — a step can only follow an inbound
-   * message, so a presenter exists by then.
+   * Step-source bridge (issue #168/#193): the driver's withPolicyGate
+   * wrapper and the extension runtime emit gated tool-call steps through
+   * this; the space's presenter renders them — step cards on the panel,
+   * the live "⚙️ current tool" progress line on the plain phrase path.
+   * Unknown spaces and headless calls are dropped — a step can only
+   * follow an inbound message, so a presenter exists by then.
    */
   routeToolStep(step: ToolStepEvent): void {
     if (step.spaceId === undefined) return;
@@ -487,6 +488,9 @@ export class SpaceService {
     session.on("message", (data) => this.#presenterFor(spaceId).onMessage(data));
     session.on("error", (data) => this.#presenterFor(spaceId).onError(data));
     session.on("turn_end", (data) => this.#presenterFor(spaceId).onTurnEnd(data));
+    // Issue #193: live reasoning chunks render as the in-place progress
+    // phrase on the plain path (the panel path ignores them).
+    session.on("thinking", (data) => this.#presenterFor(spaceId).onThinking(data));
     const detachLearning = this.#learning?.attachSession(spaceId, session) ?? (() => {});
     const live: LiveSession = {
       spaceId,
