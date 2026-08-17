@@ -345,7 +345,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     ...memoryToolDefinitions(memoryProvider, { audit }),
     ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
     ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
-    ...modelToolsDefinitions(store, { audit, modelRoles }),
+    ...modelToolsDefinitions(store, { audit, modelRoles, agentDir }),
     ...settingsToolDefinitions(store, {
       audit,
       // Org-scope writes cross the approval router (issue #151): the same

@@ -6,8 +6,13 @@
  * (`spaces.settings`), so it prompts in non-yolo approval modes (the policy
  * gate, issue #6, resolves it via TIER_BY_TOOL → write). Reading (no `set`
  * argument) is the same tool — get-only calls are still write-tier by tool
- * name; the settings themselves are not sensitive. Every successful set
- * appends a `model.settings_changed` audit row carrying {before, after, by}.
+ * name; the settings themselves are not sensitive. The get also returns
+ * `available_models`, the deployment's model catalog grouped by provider
+ * (issue #192) — the same catalog create_work_item model pins resolve
+ * against (issue #185), so the agent can see which provider serves which
+ * model and answer provider-aware asks ("the near deepseek"). Every
+ * successful set appends a `model.settings_changed` audit row carrying
+ * {before, after, by}.
  *
  * use_model is write-tier too: it mutates the live session's model for the
  * NEXT turn through the driver's per-session `setModelRole` hook (issue
@@ -27,6 +32,11 @@ import { sessionIdFromFilePath, type ModelRole, type SessionModelRoleRegistry } 
 import type { AuditModule } from "../policy/audit";
 import { MODEL_SETTINGS_CHANGED_EVENT, MODEL_SWITCHED_EVENT } from "../store/audit-events";
 import type { Store, SpaceModelSettings } from "../store/db";
+import {
+  DEFAULT_MODEL_CATALOG_DIR,
+  listAvailableModels,
+  type ModelCatalogEntry,
+} from "../models/model-pin";
 import { errorMessage, toolError } from "./helpers";
 
 export interface ModelToolsExtensionOpts {
@@ -39,6 +49,18 @@ export interface ModelToolsExtensionOpts {
   modelRoles?: SessionModelRoleRegistry;
   /** Actor recorded on audit rows; defaults to "agent". */
   actor?: string;
+  /**
+   * Agent dir whose model catalog the get surface lists (issue #192).
+   * Default "data/omp-agent" (the server/executor default).
+   */
+  agentDir?: string;
+  /**
+   * Model-catalog seam (issue #192 tests): resolves the AVAILABLE models
+   * the get returns grouped by provider. Defaults to the SDK registry over
+   * `agentDir` — the same catalog the sessions see and create_work_item
+   * model pins resolve against (issue #185).
+   */
+  listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]>;
 }
 
 /** Thinking-effort values the space may pin; mirrors the store's ModelThinkingLevel. */
@@ -64,6 +86,24 @@ const useModelSchema = z.object({
 export { modelSettingsSchema, useModelSchema };
 
 /**
+ * Groups the available-model catalog by provider (issue #192), providers
+ * and model ids sorted for deterministic output.
+ */
+export function groupModelsByProvider(
+  catalog: ModelCatalogEntry[],
+): Array<{ provider: string; models: Array<{ id: string; name: string }> }> {
+  const byProvider = new Map<string, Array<{ id: string; name: string }>>();
+  for (const m of catalog) {
+    const models = byProvider.get(m.provider) ?? [];
+    models.push({ id: m.id, name: m.name });
+    byProvider.set(m.provider, models);
+  }
+  return [...byProvider.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([provider, models]) => ({ provider, models: models.sort((a, b) => a.id.localeCompare(b.id)) }));
+}
+
+/**
  * The model tools as SDK {@link ToolDefinition}s (issue #69): one source
  * shared by the in-session extension surface and the driver's gatedTools
  * path. Restricted SDK sessions (restrictToolNames) drop extension-registered
@@ -82,11 +122,17 @@ export function modelToolsDefinitions(
     label: "Per-space model settings",
     description:
       "Reads or updates this space's model settings, which persist per space and are audited. " +
-      "With no `set` argument, returns the current settings. `set` writes a partial update: " +
+      "With no `set` argument, returns the current settings plus `available_models` — the " +
+      "deployment's available model catalog grouped by provider ([{provider, models: [{id, " +
+      "name}]}]), the same catalog create_work_item model pins resolve against (issue #185). " +
+      "Call it first when asked what models can be used or when a request names a provider or " +
+      "model: provider-aware asks resolve to THAT provider's model (a \"near deepseek\" ask is " +
+      "the near provider's deepseek, not opencode-go's) and exact ids like " +
+      "\"zai-org/GLM-5.1-FP8\" resolve as-is. `set` writes a partial update: " +
       "`model` (the space's default model id), `reasoning_effort` (off|low|medium|high — the " +
       "thinking effort for the reasoning role and the space's default effort), `fast_model` " +
       "and `reasoning_model` (model ids for the fast/reasoning roles; unset slots fall back to " +
-      "`model`). Model ids are the ids the session lists (e.g. \"deepseek-v4-flash\"). " +
+      "`model`). Model ids are the ids `available_models` lists (e.g. \"deepseek-v4-flash\"). " +
       "Write-tier: prompts for approval in non-yolo modes.",
     parameters: modelSettingsSchema,
     approval: "write",
@@ -95,7 +141,19 @@ export function modelToolsDefinitions(
       if (!spaceId) return toolError("model settings require a space session");
       const before = await store.getSpaceSettings(spaceId);
       if (!params.set) {
-        return { content: [{ type: "text", text: JSON.stringify(before) }] };
+        try {
+          const catalog = await (opts.listModels ?? listAvailableModels)(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ ...before, available_models: groupModelsByProvider(catalog) }),
+              },
+            ],
+          };
+        } catch (err) {
+          return toolError(errorMessage(err));
+        }
       }
       if (Object.keys(params.set).length === 0) {
         return toolError("model_settings set requires at least one field");

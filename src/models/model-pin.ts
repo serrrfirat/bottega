@@ -98,7 +98,7 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
   if (bestMatches.length > 1) {
     return {
       ok: false,
-      error: `model '${query}' is ambiguous — matches ${bestMatches.map((s) => s.entry.model.id).join(", ")}; be more specific`,
+      error: `model '${query}' is ambiguous — matches ${formatModelCandidates(bestMatches.map((s) => s.entry.model))}; be more specific`,
     };
   }
   return { ok: true, pin: { kind: "id", modelId: bestMatches[0]!.entry.model.id } };

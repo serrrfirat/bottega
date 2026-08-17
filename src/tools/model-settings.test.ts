@@ -7,7 +7,8 @@ import { createStore, type Store } from "../store/db";
 import { MODEL_SETTINGS_CHANGED_EVENT, MODEL_SWITCHED_EVENT } from "../store/audit-events";
 import { SessionModelRoleRegistry, type AgentSessionDriver, type ModelRole, type ModelRoleSwitchResult } from "../server/drivers/agent-driver";
 import { createAudit } from "../policy/audit";
-import { modelToolsExtension, modelSettingsSchema, useModelSchema } from "./model-settings";
+import { resolveModelPin, type ModelCatalogEntry } from "../models/model-pin";
+import { groupModelsByProvider, modelToolsExtension, modelSettingsSchema, useModelSchema } from "./model-settings";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-model-tools-"));
 const stores: Store[] = [];
@@ -22,10 +23,25 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function loadTools(store: Store, opts: { modelRoles?: SessionModelRoleRegistry } = {}): ToolDefinition[] {
+/** Fake available-model catalog (issue #192): deepseek at BOTH providers. */
+const catalogFixture: ModelCatalogEntry[] = [
+  { id: "gpt-sol-5.6", name: "GPT-Sol 5.6", provider: "opencode-go" },
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },
+  { id: "zai-org/GLM-5.1-FP8", name: "GLM 5.1 FP8", provider: "near" },
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "near" },
+];
+
+function loadTools(
+  store: Store,
+  opts: { modelRoles?: SessionModelRoleRegistry; listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]> } = {},
+): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   const pi = { registerTool: (t: ToolDefinition) => void tools.push(t) } as unknown as ExtensionAPI;
-  modelToolsExtension(store, { audit: createAudit(store), modelRoles: opts.modelRoles })(pi);
+  modelToolsExtension(store, {
+    audit: createAudit(store),
+    modelRoles: opts.modelRoles,
+    listModels: opts.listModels ?? (async () => catalogFixture),
+  })(pi);
   return tools;
 }
 
@@ -77,13 +93,13 @@ describe("model tools registration", () => {
 });
 
 describe("model_settings", () => {
-  test("reads the current settings (empty by default)", async () => {
+  test("reads the current settings (empty by default) plus the available catalog (issue #192)", async () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
     const tool = loadTools(s).find((t) => t.name === "model_settings")!;
     const res = await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id));
     expect(res.isError).not.toBe(true);
-    expect(JSON.parse(resultText(res))).toEqual({});
+    expect(JSON.parse(resultText(res))).toEqual({ available_models: groupModelsByProvider(catalogFixture) });
   });
 
   test("set writes a partial update, persists per space, and audits before/after", async () => {
@@ -139,7 +155,7 @@ describe("model_settings", () => {
     const tool = loadTools(s).find((t) => t.name === "model_settings")!;
     await tool.execute("tc1", { set: { model: "m-a" } }, undefined, undefined, ctxFor(a.id));
     const resB = await tool.execute("tc1", {}, undefined, undefined, ctxFor(b.id));
-    expect(JSON.parse(resultText(resB))).toEqual({});
+    expect(JSON.parse(resultText(resB))).toEqual({ available_models: groupModelsByProvider(catalogFixture) });
   });
 
   test("rejects invalid reasoning_effort values at the schema", () => {
@@ -182,6 +198,74 @@ describe("model_settings", () => {
     const res = await tool.execute("tc1", {}, undefined, undefined, noCtx);
     expect(res.isError).toBe(true);
     expect(resultText(res)).toMatch(/space session/);
+  });
+});
+
+describe("model catalog surface (issue #192)", () => {
+  test("get returns the available models grouped by provider, sorted deterministically", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C9" });
+    const tool = loadTools(s).find((t) => t.name === "model_settings")!;
+    const res = await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id));
+    expect(res.isError).not.toBe(true);
+    expect(JSON.parse(resultText(res))).toEqual({ available_models: groupModelsByProvider(catalogFixture) });
+    // The grouping: providers sorted, each provider's models by id — the
+    // same deepseek-v4-flash id appears under BOTH providers, so the agent
+    // sees where each lives.
+    expect(JSON.parse(resultText(res)).available_models).toEqual([
+      {
+        provider: "near",
+        models: [
+          { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+          { id: "zai-org/GLM-5.1-FP8", name: "GLM 5.1 FP8" },
+        ],
+      },
+      {
+        provider: "opencode-go",
+        models: [
+          { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)" },
+          { id: "gpt-sol-5.6", name: "GPT-Sol 5.6" },
+        ],
+      },
+    ]);
+  });
+
+  test("a catalog failure fails closed with a tool error instead of a partial settings read", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C10" });
+    const tool = loadTools(s, { listModels: async () => Promise.reject(new Error("registry boom")) }).find(
+      (t) => t.name === "model_settings",
+    )!;
+    const res = await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id));
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("registry boom");
+  });
+
+  test("exact provider/id and friendly provider-aware names resolve against the listed ids (#185 pin)", () => {
+    // "zai-org/GLM-5.1-FP8" — the exact id the catalog lists.
+    expect(resolveModelPin("zai-org/GLM-5.1-FP8", catalogFixture)).toEqual({
+      ok: true,
+      pin: { kind: "id", modelId: "zai-org/GLM-5.1-FP8" },
+    });
+    // "use the near GLM" → the NEAR provider's GLM (opencode-go has none).
+    expect(resolveModelPin("near glm", catalogFixture)).toEqual({
+      ok: true,
+      pin: { kind: "id", modelId: "zai-org/GLM-5.1-FP8" },
+    });
+    // "the near deepseek" → resolves (not ambiguous); without the provider
+    // the same name is ambiguous across near and opencode-go and fails
+    // closed listing both — the provider term is what picks the right one.
+    expect(resolveModelPin("near deepseek", catalogFixture)).toEqual({
+      ok: true,
+      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+    });
+    const ambiguous = resolveModelPin("deepseek v4", catalogFixture);
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok) {
+      expect(ambiguous.error).toContain("ambiguous");
+      expect(ambiguous.error).toContain("near/deepseek-v4-flash");
+      expect(ambiguous.error).toContain("opencode-go/deepseek-v4-flash");
+    }
   });
 });
 
