@@ -179,12 +179,15 @@ else
   # pullable on machines without access. Fall back to the LOCAL omp CLI
   # (same binary the image runs; verified end-to-end in #143's live leg):
   # bootstrap the token exactly like entrypoints/broker.sh, then serve.
+  # NOTE: the CLI resolves PI_CONFIG_DIR as HOME-relative (path.join), so
+  # an absolute dir would double-prefix and 401 every snapshot fetch.
   echo "auth-broker: docker image (oh-my-pi/pi:dev) unavailable — falling back to the local omp CLI" >&2
   mkdir -p data/.omp
   if [[ ! -f data/.omp/auth-broker.token ]]; then
     openssl rand -hex 32 > data/.omp/auth-broker.token && chmod 600 data/.omp/auth-broker.token
   fi
-  PI_CONFIG_DIR="$PWD/data/.omp" OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)" \
+  local_rel="${PWD#${HOME}/}/data/.omp"
+  PI_CONFIG_DIR="$local_rel" OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)" \
     nohup omp auth-broker serve --bind=0.0.0.0:8765 >> data/auth-broker.log 2>&1 &
   echo "auth-broker: local omp CLI broker starting (log: data/auth-broker.log)"
 fi
