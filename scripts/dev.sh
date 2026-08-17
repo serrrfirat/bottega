@@ -27,11 +27,18 @@
 #      management) parsed AND that the running container's
 #      IRON_MANAGEMENT_API_KEY matches data/proxy-mgmt-token (a stale
 #      container with a different token 401s the probe and fails loudly);
-#   5. exports the proxy env the server needs: HTTP(S)_PROXY, NO_PROXY (the
+#   5. starts the auth-broker vault (issue #143, docker-compose.dev.yml:
+#      127.0.0.1-bound 8765 + ./data bind) and waits for its readiness —
+#      the token file (data/.omp/auth-broker.token, 0600, bootstrapped by
+#      entrypoints/broker.sh) exists AND /v1/healthz answers — then exports
+#      OMP_AUTH_BROKER_URL/TOKEN so the extension runtime's broker secret
+#      resolver (issue #54 wiring) can fetch vault credentials;
+#   6. exports the proxy env the server needs: HTTP(S)_PROXY, NO_PROXY (the
 #      same internal names as compose), NODE_EXTRA_CA_CERTS (Bun/Node verify
 #      the proxy's MITM leaf certs against the generated CA), and
 #      BOTTEGA_PROXY_CONTROL_URL/TOKEN (the boundary's reload half).
-# The proxy stays up between dev runs (restart: on-failure); stop it with:
+# The proxy + broker stay up between dev runs (restart: on-failure); stop
+# them with:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 #
 # The OMP agent dir (data/omp-agent, issue #9) gets the deployment templates
@@ -151,7 +158,46 @@ if [[ "$READY" != 1 ]]; then
 fi
 echo "iron-proxy: ready (dev egress config loaded, management API answering)"
 
-# 5. Server proxy env (issue #123): same topology as compose — HTTP(S)_PROXY
+# 5. Auth-broker vault (issue #143): the extension credential boundary's
+#    secret FETCH half (issue #54 wiring) needs a running broker AND the
+#    vault token. The dev override publishes the broker on 127.0.0.1:8765
+#    with the host's ./data bind, so first boot bootstraps the bearer token
+#    to data/.omp/auth-broker.token (0600, entrypoints/broker.sh) — the
+#    same path the compose stack uses on the shared volume. Readiness = the
+#    token file exists AND the broker's unauthenticated /v1/healthz answers
+#    (the compose healthcheck's probe — healthy implies the token is ready
+#    for dependents). Missing image / unreadable token fail loudly below,
+#    never silently: the boundary must NOT run extension calls
+#    unauthenticated.
+echo "auth-broker: starting (${COMPOSE_DEV[*]} up -d auth-broker)..."
+"${COMPOSE_DEV[@]}" up -d auth-broker
+echo "auth-broker: waiting for the vault token (data/.omp/auth-broker.token) + /v1/healthz on 127.0.0.1:8765..."
+BROKER_READY=0
+for _ in $(seq 1 30); do
+  if [[ -f data/.omp/auth-broker.token ]] && curl -fsS -o /dev/null -m 3 http://127.0.0.1:8765/v1/healthz 2>/dev/null; then
+    BROKER_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$BROKER_READY" != 1 ]]; then
+  echo "bottega dev: auth-broker did not become ready (issue #143) — extension secrets cannot resolve without the vault. Diagnose:" >&2
+  echo "  ${COMPOSE_DEV[*]} logs auth-broker" >&2
+  echo "  ${COMPOSE_DEV[*]} ps" >&2
+  echo "The oh-my-pi/pi:dev image is required; pull it once and re-run:" >&2
+  echo "  docker pull oh-my-pi/pi:dev" >&2
+  echo "  bun run dev" >&2
+  exit 1
+fi
+# The vault token (0600, broker.sh bootstrap on the ./data bind). Read it
+# every boot — the broker persists the token, so consecutive runs stay
+# stable. These two exports are the resolver's env contract
+# (src/extensions/boundary.ts -> brokerSecretResolverFromEnv).
+export OMP_AUTH_BROKER_URL="http://127.0.0.1:8765"
+export OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)"
+echo "auth-broker: ready (vault token at data/.omp/auth-broker.token, 0600)"
+
+# 6. Server proxy env (issue #123): same topology as compose — HTTP(S)_PROXY
 #    at the tunnel, NO_PROXY for internal names, the MITM CA for Bun/Node
 #    TLS, and the boundary control URL/token (authorize writes the secret
 #    file AND reloads the proxy). The BOTTEGA_* vars reach the server

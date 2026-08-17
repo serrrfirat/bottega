@@ -24,6 +24,9 @@
  */
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+// The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
+// transitive auth package, same 17.x release train) — no new dependency.
+import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ExtensionCredential } from "../store/db";
 import { errorMessage } from "../tools/helpers";
 
@@ -56,6 +59,64 @@ export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env
   const proxyControlUrl = env.BOTTEGA_PROXY_CONTROL_URL;
   const proxyControlToken = env.BOTTEGA_PROXY_CONTROL_TOKEN;
   return proxyControlUrl && proxyControlToken ? { proxyControlUrl, proxyControlToken } : {};
+}
+
+/**
+ * The broker secret resolver (the boundary's fetch half, issue #54 wiring
+ * shipped with #143): given the ladder's resolved registry credential,
+ * returns the SECRET PAYLOAD from the OMP auth-broker vault so the
+ * boundary can write the extension's secret file (iron-proxy injects it).
+ *
+ * Env contract (set by scripts/dev.sh locally, by docker-compose.yml in
+ * deployment): `OMP_AUTH_BROKER_URL` (broker base, e.g.
+ * http://127.0.0.1:8765 or http://auth-broker:8765) and
+ * `OMP_AUTH_BROKER_TOKEN` (the vault's bearer token, bootstrapped to
+ * /data/.omp/auth-broker.token on the shared data volume).
+ *
+ * Fail closed: URL or token missing → the resolved call throws before any
+ * fetch (an unauthenticated provider call must never proceed); the vault
+ * row missing → throws; an unsupported vault credential shape → throws.
+ * The check is lazy (at resolve time, reading the live env object) so the
+ * server still BOOTS without broker env — the boundary fails closed on the
+ * first extension call, the #53 contract. The secret itself is only ever
+ * returned to the boundary — it never reaches the caller, transcripts, or
+ * audit.
+ */
+export function brokerSecretResolverFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): (credential: ExtensionCredential) => Promise<string> {
+  return async (credential: ExtensionCredential): Promise<string> => {
+    const brokerUrl = env.OMP_AUTH_BROKER_URL;
+    const brokerToken = env.OMP_AUTH_BROKER_TOKEN;
+    if (!brokerUrl || !brokerToken) {
+      throw new Error(
+        "extension credential boundary: broker secret resolution is not configured — set OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN " +
+          "(local dev: `bun run dev` starts the auth-broker vault and exports both; deployment: copy the token from the data volume " +
+          "`docker compose exec auth-broker cat /data/.omp/auth-broker.token` into .env)",
+      );
+    }
+    // A fresh client per call: rotation of the broker token applies to the
+    // next extension call without a server restart, and the snapshot is
+    // always current (the broker is the canonical writer).
+    const client = new AuthBrokerClient({ url: brokerUrl, token: brokerToken });
+    const result = await client.fetchSnapshot();
+    if (result.status !== 200) {
+      throw new Error(`extension credential boundary: broker snapshot fetch failed (status ${result.status})`);
+    }
+    const entry = result.snapshot.credentials.find(
+      (candidate) => candidate.id === credential.broker_credential_id && candidate.provider === credential.provider,
+    );
+    if (!entry) {
+      throw new Error(
+        `extension credential boundary: the broker has no "${credential.provider}" vault row ${credential.broker_credential_id} — re-run connect ${credential.provider} as me|org`,
+      );
+    }
+    if (entry.credential.type === "api_key") return entry.credential.key;
+    if (entry.credential.type === "oauth") return entry.credential.access;
+    throw new Error(
+      `extension credential boundary: unsupported vault credential type "${entry.credential["type"]}" for ${credential.provider}`,
+    );
+  };
 }
 
 /**

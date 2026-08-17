@@ -9,7 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSecretFileBoundary, extensionSecretFileName, proxyBoundaryControlFromEnv } from "./boundary";
+import { brokerSecretResolverFromEnv, createSecretFileBoundary, extensionSecretFileName, proxyBoundaryControlFromEnv } from "./boundary";
 import type { ExtensionCredential } from "../store/db";
 
 describe("proxyBoundaryControlFromEnv (issue #123)", () => {
@@ -135,6 +135,179 @@ describe("createSecretFileBoundary reload half (issue #123, dev token contract)"
       await boundary.authorize(CREDENTIAL);
       expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("s");
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
+  const BROKER_CREDENTIAL = {
+    id: "ec_test",
+    provider: "github",
+    identity_key: "api-key:dev",
+    owner: "U0B9QUPCTJ5",
+    scope: "personal",
+    broker_credential_id: 42,
+    created_at: 0,
+  } satisfies ExtensionCredential;
+
+  /** A schema-valid broker snapshot (GET /v1/snapshot, wire schemas are strict). */
+  function snapshotResponse(entries: unknown[]): string {
+    return JSON.stringify({
+      generation: 1,
+      generatedAt: Date.now(),
+      serverNowMs: Date.now(),
+      refresher: { enabled: false, intervalMs: 60000, skewMs: 0, nextSweepInMs: 0 },
+      credentials: entries,
+    });
+  }
+
+  /** Fake broker: records the bearer it saw and serves the given snapshot. */
+  function fakeBroker(entries: unknown[]): { url: string; seenAuth: string[]; stop: () => void } {
+    const seenAuth: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (new URL(req.url).pathname !== "/v1/snapshot") return new Response("not found", { status: 404 });
+        seenAuth.push(req.headers.get("authorization") ?? "");
+        return new Response(snapshotResponse(entries), { headers: { "content-type": "application/json" } });
+      },
+    });
+    return { url: `http://127.0.0.1:${server.port}`, seenAuth, stop: () => server.stop(true) };
+  }
+
+  test("missing OMP_AUTH_BROKER_URL fails closed (the boundary never runs unauthenticated)", async () => {
+    // Lazy fail-closed: the resolver is wired at boot (server boots without
+    // broker env), the FIRST RESOLUTION throws with the exact missing var.
+    const resolve = brokerSecretResolverFromEnv({ OMP_AUTH_BROKER_TOKEN: "bt" });
+    await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/OMP_AUTH_BROKER_URL/);
+  });
+
+  test("missing OMP_AUTH_BROKER_TOKEN fails closed", async () => {
+    const resolve = brokerSecretResolverFromEnv({ OMP_AUTH_BROKER_URL: "http://127.0.0.1:8765" });
+    await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/OMP_AUTH_BROKER_TOKEN/);
+  });
+
+  test("empty-string values are treated as unset (fail closed)", async () => {
+    const resolve = brokerSecretResolverFromEnv({ OMP_AUTH_BROKER_URL: "", OMP_AUTH_BROKER_TOKEN: "" });
+    await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/OMP_AUTH_BROKER_URL/);
+  });
+
+  test("wiring the resolver does not throw without broker env (the server boots fail-closed)", () => {
+    // Regression (issue #143): the boundary is constructed at server boot;
+    // the missing-env failure must surface on the first extension call, not
+    // at wiring time.
+    expect(() => brokerSecretResolverFromEnv({})).not.toThrow();
+    expect(() => brokerSecretResolverFromEnv()).not.toThrow();
+  });
+
+  test("resolves an api_key vault row by broker_credential_id (the GitHub PAT path)", async () => {
+    const broker = fakeBroker([
+      { id: 7, provider: "linear", credential: { type: "api_key", key: "lin-secret" }, identityKey: null, rotatesInMs: null },
+      { id: 42, provider: "github", credential: { type: "api_key", key: "github_pat_test" }, identityKey: "api-key:dev", rotatesInMs: null },
+    ]);
+    try {
+      const resolve = brokerSecretResolverFromEnv({
+        OMP_AUTH_BROKER_URL: broker.url,
+        OMP_AUTH_BROKER_TOKEN: "broker-token",
+      });
+      expect(await resolve(BROKER_CREDENTIAL)).toBe("github_pat_test");
+      expect(broker.seenAuth).toEqual(["Bearer broker-token"]);
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("resolves an oauth vault row to its access token (the bearer the proxy injects)", async () => {
+    const broker = fakeBroker([
+      { id: 42, provider: "github", credential: { type: "oauth", refresh: "__remote__", access: "oauth-access-token", expires: 9999999999 }, identityKey: "email:dev@example.com", rotatesInMs: null },
+    ]);
+    try {
+      const resolve = brokerSecretResolverFromEnv({
+        OMP_AUTH_BROKER_URL: broker.url,
+        OMP_AUTH_BROKER_TOKEN: "broker-token",
+      });
+      expect(await resolve(BROKER_CREDENTIAL)).toBe("oauth-access-token");
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("a missing vault row fails closed (re-connect hint, never a bare call)", async () => {
+    const broker = fakeBroker([
+      { id: 1, provider: "github", credential: { type: "api_key", key: "other" }, identityKey: null, rotatesInMs: null },
+    ]);
+    try {
+      const resolve = brokerSecretResolverFromEnv({
+        OMP_AUTH_BROKER_URL: broker.url,
+        OMP_AUTH_BROKER_TOKEN: "broker-token",
+      });
+      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no "github" vault row 42/);
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("a provider mismatch on the same id fails closed", async () => {
+    const broker = fakeBroker([
+      { id: 42, provider: "linear", credential: { type: "api_key", key: "lin" }, identityKey: null, rotatesInMs: null },
+    ]);
+    try {
+      const resolve = brokerSecretResolverFromEnv({
+        OMP_AUTH_BROKER_URL: broker.url,
+        OMP_AUTH_BROKER_TOKEN: "broker-token",
+      });
+      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no "github" vault row 42/);
+    } finally {
+      broker.stop();
+    }
+  });
+
+  test("a broker 401 (bad token) fails the extension call closed", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () => new Response("unauthorized", { status: 401 }),
+    });
+    try {
+      const resolve = brokerSecretResolverFromEnv({
+        OMP_AUTH_BROKER_URL: `http://127.0.0.1:${server.port}`,
+        OMP_AUTH_BROKER_TOKEN: "wrong-token",
+      });
+      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow();
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("the resolved secret feeds the boundary end to end (secret file + reload)", async () => {
+    const broker = fakeBroker([
+      { id: 42, provider: "github", credential: { type: "api_key", key: "github_pat_test" }, identityKey: "api-key:dev", rotatesInMs: null },
+    ]);
+    const seen: Array<{ path: string; auth: string | null }> = [];
+    const mgmt = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
+        return new Response("ok");
+      },
+    });
+    const dir = mkdtempSync(join(tmpdir(), "boundary-resolver-"));
+    try {
+      const boundary = createSecretFileBoundary({
+        secretsDir: dir,
+        resolveSecret: brokerSecretResolverFromEnv({
+          OMP_AUTH_BROKER_URL: broker.url,
+          OMP_AUTH_BROKER_TOKEN: "broker-token",
+        }),
+        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
+        proxyControlToken: "dev-mgmt-token",
+      });
+      await boundary.authorize(BROKER_CREDENTIAL);
+      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("github_pat_test");
+      expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
+    } finally {
+      broker.stop();
+      mgmt.stop(true);
       rmSync(dir, { recursive: true, force: true });
     }
   });

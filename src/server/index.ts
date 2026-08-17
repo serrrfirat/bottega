@@ -29,7 +29,7 @@ import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
-import { createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { brokerSecretResolverFromEnv, createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import { extensionToolDefinitions } from "../extensions/tools";
 import {
   assertAgentDirModelAvailable,
@@ -239,8 +239,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   });
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit. The
-  // broker secret resolver for the boundary is issue #54's wiring, so
-  // calls fail closed at the boundary until then.
+  // boundary's broker secret resolver (issue #54 wiring, shipped with
+  // #143) fetches the resolved credential's secret payload from the
+  // auth-broker vault (OMP_AUTH_BROKER_URL/TOKEN — set by scripts/dev.sh
+  // locally, by docker-compose.yml in deployment) and fails closed when
+  // the broker is not configured.
   // Credential boundary (issue #123): with BOTTEGA_PROXY_CONTROL_URL +
   // token in the environment (local dev via scripts/dev.sh, compose via
   // IRON_MANAGEMENT_API_KEY), authorize writes the secret file AND reloads
@@ -252,7 +255,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     audit,
     orgPolicy,
     router: approvalRouter,
-    boundary: createSecretFileBoundary(proxyBoundaryControlFromEnv()),
+    boundary: createSecretFileBoundary({
+      ...proxyBoundaryControlFromEnv(),
+      resolveSecret: brokerSecretResolverFromEnv(),
+    }),
   });
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through

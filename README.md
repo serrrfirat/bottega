@@ -36,9 +36,17 @@ config) via `docker-compose.dev.yml` (ports `127.0.0.1:8080`/`9092`, host
 reload) is always the injection path, and the **strict `config/egress.yml`
 stays the deployment contract** (default-deny allowlist + LLM judge;
 `NEARAI_JUDGE_API_KEY` is a deployment concern only — dev needs no judge
-key). The server runs with `HTTP(S)_PROXY` at the tunnel, `NO_PROXY` for
+key).
+
+`bun run dev` also starts the **auth-broker vault** (issue #143,
+`docker-compose.dev.yml`: `127.0.0.1:8765` + host `./data` bind) and exports
+`OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN` from the bootstrapped token
+file (`data/.omp/auth-broker.token`, 0600) — that is what lets the extension
+runtime's broker secret resolver fetch vault credentials, so connected
+extensions (GitHub, …) resolve their secrets in local runs exactly like in
+compose. The server runs with `HTTP(S)_PROXY` at the tunnel, `NO_PROXY` for
 internal names, and `NODE_EXTRA_CA_CERTS` so Bun/Node trust the proxy's MITM
-certs. The proxy stays up between runs; stop it with:
+certs. The proxy + broker stay up between runs; stop them with:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml down
@@ -187,8 +195,8 @@ Copy `.env.example` to `.env` and fill in:
 | `SLACK_BOT_TOKEN` | Bot user OAuth token | Slack app dashboard (step 1.2) |
 | `OPENCODE_API_KEY` | Primary model key (#37) | Referenced by `config/omp/models.yml` (`providers.opencode-go.apiKey`); resolved by the SDK inside the server, never in agent env. Local dev: Keychain service `bottega-opencode` |
 | `NEAR_API_KEY` | Fallback model provider key | Referenced by `config/omp/models.yml`; resolved by the SDK inside the server, never in agent env |
-| `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose |
-| `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3) |
+| `OMP_AUTH_BROKER_URL` | Broker address | Prefilled for compose. Local dev: exported by dev.sh (`http://127.0.0.1:8765`) from the broker it starts (#143) |
+| `OMP_AUTH_BROKER_TOKEN` | Broker bearer token | Generated at broker first boot — copy from the data volume once (step 3). Local dev: read by dev.sh from `data/.omp/auth-broker.token` (#143) |
 | `NEARAI_JUDGE_API_KEY` | iron-proxy egress judge key (deployment only) | Referenced by the STRICT `config/egress.yml` (`judge.provider.api_key_env`); fail-closed without it — model traffic is denied in deployment. NOT needed for local dev: the dev config (`config/egress.dev.yml`) has no judge transform (issue #126) |
 | `IRON_MANAGEMENT_API_KEY` | iron-proxy management API token (#123) | The extension credential boundary's `POST /v1/reload` bearer token (`config/egress.yml` → `management.api_key_env`); set a strong value to enable immediate credential rotation. Local dev: generated per machine by dev.sh (`data/proxy-mgmt-token`, 0600) |
 | `OPENAI_API_KEY` | mem0 memory backend key (#43) | The stack ships a self-hosted mem0 service; it refuses to boot without an LLM key (fail-closed). Not needed when memory runs on the SQLite fallback |
@@ -222,6 +230,11 @@ docker compose exec auth-broker cat /data/.omp/auth-broker.token
 # -> paste into OMP_AUTH_BROKER_TOKEN in .env
 docker compose up -d
 ```
+
+> Local dev does NOT need this: `bun run dev` (scripts/dev.sh, issue #143)
+> starts its own auth-broker against the host's `./data` and reads the
+> token from `data/.omp/auth-broker.token` itself — the broker-related env
+> is exported automatically, nothing to copy.
 
 Install the git PAT as a file on the data volume (mode 0600, never env):
 
@@ -265,6 +278,14 @@ image, or chat.
 
    Either scope requires an extension policy entry (`extensions.allow`) for
    the space; the tool then runs through the normal policy gate.
+
+   At call time the runtime fetches the credential's secret payload from the
+   broker vault (`OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN` — the boundary's
+   broker secret resolver, issue #54 wiring; set by `scripts/dev.sh` locally,
+   by compose in deployment) and hands it to the egress boundary, which writes
+   the extension's secret file (0600) and reloads iron-proxy; the proxy then
+   injects the `Authorization` header for the extension's allowlisted domains,
+   so the credential never enters the agent env, transcripts, or audit.
 
 **Never paste tokens into chat.** Transcripts are durable and never deleted,
 so a token pasted into Slack is a permanent leak (and may end up in org
