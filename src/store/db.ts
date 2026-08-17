@@ -140,6 +140,11 @@ export type ListAuditOpts = {
 };
 
 export interface Store {
+  /**
+   * Idempotent upsert on first contact (issue #188): creates the row with
+   * policy_json/settings '{}' and NEVER overwrites an existing space's
+   * settings, policy, or name — re-contacts only bump updated_at.
+   */
   getOrCreateSpace(input: {
     platform: "slack" | "telegram";
     channel_id: string;
@@ -406,6 +411,11 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const getSchedulerJobStmt = db.query("SELECT * FROM scheduler_jobs WHERE id = ?");
   const getObjectStmt = db.query("SELECT * FROM objects WHERE id = ?");
 
+  /**
+   * Idempotent upsert (issue #188): creates the row on first contact with
+   * policy_json/settings '{}' and never overwrites an existing space's
+   * settings, policy, or name — re-contacts only bump updated_at.
+   */
   async function getOrCreateSpace(input: {
     platform: "slack" | "telegram";
     channel_id: string;
@@ -416,7 +426,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     db.query(
       `INSERT INTO spaces (id, platform, channel_id, name, policy_json, settings, created_at, updated_at)
        VALUES (?, ?, ?, ?, '{}', '{}', ?, ?)
-       ON CONFLICT(id) DO NOTHING`,
+       ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`,
     ).run(id, input.platform, input.channel_id, input.name ?? null, t, t);
     return getSpaceStmt.get(id) as Space;
   }

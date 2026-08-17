@@ -425,10 +425,21 @@ export class SpaceService {
   }
 
   async #createLive(spaceId: string): Promise<LiveSession> {
+    const store = this.#store as Partial<Store>;
+    // Upsert the space row on first contact (issue #188): the session flow
+    // previously only GET'd the space, so real spaces were never persisted
+    // and per-space settings/policy (model_settings, overlays) failed with
+    // "space not found". Idempotent — the store helper never overwrites
+    // existing settings/policy; re-contacts only bump updated_at. Guarded
+    // for protocol-only test doubles that lack the store helper.
+    await store.getOrCreateSpace?.({
+      platform: "slack",
+      channel_id: channelFromSpaceId(spaceId),
+    });
     const modePromise = this.#responseModeFor(spaceId);
     // Store is required in production. The runtime branch keeps older
     // protocol-only test doubles on the original single-await cold-start path.
-    const getSpace = (this.#store as Partial<Store>).getSpace;
+    const getSpace = store.getSpace;
     const [mode, space] = getSpace
       ? await Promise.all([modePromise, getSpace.call(this.#store, spaceId)])
       : [await modePromise, undefined];

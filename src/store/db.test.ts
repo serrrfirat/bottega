@@ -33,7 +33,7 @@ afterAll(() => {
 });
 
 describe("spaces", () => {
-  test("getOrCreateSpace creates a space and is idempotent", async () => {
+  test("getOrCreateSpace creates a space; re-contact never clobbers settings/policy, only bumps updated_at", async () => {
     const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C0123" });
     expect(space.id).toBe("slack:C0123");
     expect(space.platform).toBe("slack");
@@ -43,8 +43,27 @@ describe("spaces", () => {
     expect(space.created_at).toBeGreaterThan(0);
     expect(space.updated_at).toBe(space.created_at);
 
-    const again = await store.getOrCreateSpace({ platform: "slack", channel_id: "C0123", name: "late name" });
-    expect(again).toEqual(space);
+    // Per-space settings/policy land on the row (issue #64/#130)...
+    const policy = '{"tools":{"bash":"deny"}}';
+    await store.updatePolicy(space.id, policy);
+    await store.updateSpaceSettings(space.id, { model: "deepseek-v4-flash" });
+    const before = await store.getSpace(space.id);
+
+    // ...and a later contact (the inbound-path upsert, issue #188) is
+    // idempotent: settings, policy, and the first-contact name survive;
+    // only updated_at advances.
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(1000);
+      const again = await store.getOrCreateSpace({ platform: "slack", channel_id: "C0123", name: "late name" });
+      expect(again.id).toBe(space.id);
+      expect(again.name).toBeNull();
+      expect(again.policy_json).toBe(policy);
+      expect(again.settings).toBe(before!.settings);
+      expect(again.updated_at).toBe(before!.updated_at + 1000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("getSpace returns the row or null", async () => {

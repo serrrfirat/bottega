@@ -527,6 +527,67 @@ describe("SpaceService durable object ingest (issue #124)", () => {
   });
 });
 
+describe("SpaceService space persistence (issue #188)", () => {
+  const persistDir = mkdtempSync(join(tmpdir(), "bottega-space-persist-"));
+  const persistStores: Store[] = [];
+
+  function freshPersistStore(): Store {
+    const s = createStore(join(persistDir, `store-${persistStores.length}.db`));
+    persistStores.push(s);
+    return s;
+  }
+
+  afterAll(() => {
+    for (const s of persistStores) s.close();
+    rmSync(persistDir, { recursive: true, force: true });
+  });
+
+  test("the first inbound message persists the space row, so per-space settings resolve", async () => {
+    const store = freshPersistStore();
+    const service = makeSpaceService({ store, adapter: fakeAdapter().adapter, driver: new FakeDriver() });
+    try {
+      await service.handleInboundMessage({ spaceId: "slack:C188", principal: "U1", text: "hi", ts: "1.0" });
+
+      const space = await store.getSpace("slack:C188");
+      expect(space).not.toBeNull();
+      expect(space?.platform).toBe("slack");
+      expect(space?.channel_id).toBe("C188");
+      expect(space?.policy_json).toBe("{}");
+      expect(space?.settings).toBe("{}");
+
+      // The row the bug was missing: model_settings / overlays now resolve
+      // it instead of failing with "space not found".
+      await store.updateSpaceSettings("slack:C188", { model: "deepseek-v4-flash" });
+      expect(await store.getSpaceSettings("slack:C188")).toEqual({ model: "deepseek-v4-flash" });
+    } finally {
+      await service.stop();
+      store.close();
+    }
+  });
+
+  test("a later message never clobbers per-space settings", async () => {
+    const store = freshPersistStore();
+    const service = makeSpaceService({ store, adapter: fakeAdapter().adapter, driver: new FakeDriver() });
+    try {
+      await service.handleInboundMessage({ spaceId: "slack:C188b", principal: "U1", text: "first", ts: "1.0" });
+      await store.updateSpaceSettings("slack:C188b", { model: "deepseek-v4-flash", reasoning_effort: "high" });
+
+      await service.handleInboundMessage({ spaceId: "slack:C188b", principal: "U1", text: "second", ts: "2.0" });
+
+      expect(await store.getSpaceSettings("slack:C188b")).toEqual({
+        model: "deepseek-v4-flash",
+        reasoning_effort: "high",
+      });
+      const space = await store.getSpace("slack:C188b");
+      expect(space?.policy_json).toBe("{}");
+      expect(space?.updated_at).toBeGreaterThanOrEqual(space?.created_at ?? 0);
+    } finally {
+      await service.stop();
+      store.close();
+    }
+  });
+});
+
 describe("SpaceService session lifecycle", () => {
   test("sessions are lazy: the first message cold-starts a session that gets the prompt", async () => {
     const { adapter } = fakeAdapter();

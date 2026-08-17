@@ -158,6 +158,24 @@ describe("model_settings", () => {
     expect(resultText(res)).toContain("at least one field");
   });
 
+  test("set succeeds on a DM space once the row exists after first contact (issue #188)", async () => {
+    const s = freshStore();
+    // The inbound path upserts the space row on first contact (issue #188);
+    // model_settings then resolves it instead of failing "space not found".
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "D188" });
+    const tool = loadTools(s).find((t) => t.name === "model_settings")!;
+    const res = await tool.execute(
+      "tc1",
+      { set: { model: "deepseek-v4-flash" } },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    expect(JSON.parse(resultText(res))).toEqual({ model: "deepseek-v4-flash" });
+    expect(await s.getSpaceSettings(space.id)).toEqual({ model: "deepseek-v4-flash" });
+  });
+
   test("fails without a space session", async () => {
     const tool = loadTools(freshStore()).find((t) => t.name === "model_settings")!;
     const noCtx = { sessionManager: { getSessionFile: () => null } } as unknown as ExtensionContext;
