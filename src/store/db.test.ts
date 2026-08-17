@@ -53,17 +53,23 @@ describe("spaces", () => {
     // only updated_at advances.
     vi.useFakeTimers();
     try {
-      // Read `before` on the fake clock too: the store stamps updated_at
-      // with Date.now(), so a real-ms gap between this read and the timer
-      // install would make the +1000 equality off by one on slow runners.
       const before = await store.getSpace(space.id);
       vi.advanceTimersByTime(1000);
+      // The store stamps updated_at with Date.now() — on the fake clock
+      // here. The expected value is the clock's reading right now, NOT
+      // `before.updated_at + 1000`: the pre-fake-timer stamps (create +
+      // updatePolicy above) used the REAL clock, and the real-ms gap
+      // between them and the timer install skews the delta by 0-1ms on
+      // fast/loaded runners (issue #188's read-order fix narrowed but did
+      // not eliminate it). The upsert body runs synchronously, so no
+      // timer advance can land between this read and the store's stamp.
+      const expected = Date.now();
       const again = await store.getOrCreateSpace({ platform: "slack", channel_id: "C0123", name: "late name" });
       expect(again.id).toBe(space.id);
       expect(again.name).toBeNull();
       expect(again.policy_json).toBe(policy);
       expect(again.settings).toBe(before!.settings);
-      expect(again.updated_at).toBe(before!.updated_at + 1000);
+      expect(again.updated_at).toBe(expected);
     } finally {
       vi.useRealTimers();
     }

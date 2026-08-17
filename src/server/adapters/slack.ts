@@ -614,6 +614,20 @@ export function createSlackAdapter(opts: {
     appToken: opts.appToken,
     clientPingTimeout: 24 * 60 * 60 * 1000,
   });
+  // When the Web API is pointed at an emulator/test stub
+  // (clientOptions.slackApiUrl), a connection failure must fail fast —
+  // NEVER enter the @slack/web-api default retry policy
+  // (tenRetriesInAboutThirtyMinutes). The emulator is process-local, so a
+  // "unreachable" emulator is a broken test (a stop/cleanup race, a
+  // stolen port), and the default policy would turn one failed postMessage
+  // into ~30 minutes of backoff timers — blocking the awaited delivery
+  // announces / digest posts / harness turns and hanging the whole test
+  // run. Same rule as the stream client (issue #181): one attempt, fail
+  // fast. Production callers omit slackApiUrl and keep the default policy.
+  const appClientOptions: AppOptions["clientOptions"] =
+    opts.clientOptions !== undefined
+      ? { ...opts.clientOptions, retryConfig: opts.clientOptions.retryConfig ?? STREAM_RETRY_CONFIG }
+      : undefined;
   const app = new App({
     token: opts.botToken,
     receiver,
@@ -622,7 +636,7 @@ export function createSlackAdapter(opts: {
     // token is bad. Socket-mode connect still authenticates via the app
     // token; auth failures surface as Bolt error events.
     tokenVerificationEnabled: false,
-    clientOptions: opts.clientOptions,
+    clientOptions: appClientOptions,
   });
   /**
    * Dedicated client for chat.startStream/appendStream/stopStream ONLY
