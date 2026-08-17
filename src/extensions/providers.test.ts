@@ -235,7 +235,7 @@ describe("issue #54 pinned providers", () => {
     expect(seen.tool).toEqual(["search_issues"]);
   });
 
-  test("a tools-less github manifest with an unreachable provider fails closed — never a silent empty toolset (issue #158)", async () => {
+  test("a tools-less github manifest with an unreachable provider is skipped at boot and fails closed per call (issues #158/#166)", async () => {
     const unreachable = () => {
       throw new Error("api.githubcopilot.com unreachable");
     };
@@ -246,12 +246,13 @@ describe("issue #54 pinned providers", () => {
       transport: "streamable-http",
     });
     expect(github?.manifest.tools).toBeUndefined();
-    // Fail-closed at the bridge: no pinned tools and no resolved surface →
-    // a clear error, not an empty definition list.
-    expect(() => extensionToolDefinitions([github!], { runtime })).toThrow(/no pinned tools and no resolved tool surface/);
-    // Fail-closed at the boot step: the discovery error is surfaced, never
-    // swallowed into an empty toolset.
-    await expect(resolveExtensionSurfaces([github!], { mcpTransport: unreachable })).rejects.toThrow(/unreachable/);
+    // Issue #166: the boot SKIPS a provider whose discovery failed — the
+    // map holds only RESOLVED surfaces, never a boot failure.
+    const surfaces = await resolveExtensionSurfaces([github!], { mcpTransport: unreachable });
+    expect(surfaces.has("github")).toBe(false);
+    // The bridge contributes no definitions for the skipped extension (it
+    // cannot name its tools) — no throw, and no claim of a toolset.
+    expect(extensionToolDefinitions([github!], { runtime })).toEqual([]);
     // Fail-closed at the runtime's lazy path: a tool call returns a clear
     // error result naming the unavailable surface.
     const result = await runtime.execute({

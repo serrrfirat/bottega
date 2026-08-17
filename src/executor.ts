@@ -128,9 +128,10 @@ const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
  * before the first restricted session is created.
  *
  * Issue #158: a tools-less manifest resolves its tool surface from the
- * provider's tools/list here (cached, fail closed — an unreachable
- * provider is a clear boot error, never a silent empty toolset); the
- * runtime and bridge share the resolved surfaces.
+ * provider's tools/list here (cached). Issue #166: a per-provider failure
+ * (unreachable/auth-gated) is SKIPPED at boot — logged with evidence — and
+ * deferred to the runtime's lazy per-call path, which fails closed; the
+ * executor never dies because one provider's tools/list failed.
  */
 export async function createExtensionWorkerToolset(deps: {
   store: Store;

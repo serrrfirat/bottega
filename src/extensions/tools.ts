@@ -34,9 +34,10 @@ export interface ExtensionToolBridgeOptions {
    * Pre-resolved effective tool surfaces (issue #158): extensionId →
    * pinned manifest tools or the discovered tools/list surface. Resolved
    * once at boot by resolveExtensionSurfaces (src/extensions/surface.ts).
-   * A tools-less manifest WITHOUT a resolved surface is a fail-closed
-   * error here — the bridge never silently builds an empty toolset for a
-   * provider whose surface it could not resolve.
+   * A tools-less manifest WITHOUT a resolved surface contributes no
+   * definitions here (issue #166 — the boot skips providers whose
+   * discovery failed); the runtime's lazy per-call path fails closed if a
+   * call is attempted anyway.
    */
   surfaces?: ExtensionSurfaces;
 }
@@ -46,8 +47,9 @@ export interface ExtensionToolBridgeOptions {
  * Fail-closed: an extension without a binding for its kind cannot occur
  * (validateManifest rejects it), any execution failure surfaces as a tool
  * error result (never a silent no-op), and a tools-less manifest without a
- * resolved surface (issue #158) throws a clear error instead of building
- * zero definitions.
+ * resolved surface (issue #158) contributes NO definitions (issue #166) —
+ * the runtime's lazy per-call path fails closed if a call is attempted
+ * anyway, never a silent no-op.
  */
 export function extensionToolDefinitions(
   extensions: ResolvedExtension[],
@@ -58,13 +60,17 @@ export function extensionToolDefinitions(
     const { manifest } = resolved;
     // Issue #158: the effective surface is the pinned tools when present
     // (the reviewed path wins — no discovery), else the pre-resolved
-    // discovered surface. Absent both → fail closed.
+    // discovered surface.
     const surface = opts.surfaces?.get(manifest.id) ?? manifest.tools;
     if (surface === undefined) {
-      throw new Error(
-        `extension "${manifest.id}" has no pinned tools and no resolved tool surface — ` +
-          "resolve the surface first (resolveExtensionSurfaces) or pin manifest tools",
-      );
+      // Issue #166: a tools-less manifest whose provider was unreachable /
+      // auth-gated at boot has no resolved surface here. The bridge cannot
+      // name its tools, so it contributes no definitions for this extension
+      // and the runtime's lazy per-call path fails closed ("tool surface
+      // unavailable") if a call is attempted anyway. Never a throw — the
+      // boot (which builds these definitions eagerly) must not die on a
+      // provider it could not reach.
+      continue;
     }
     for (const tool of surface) {
       definitions.push({

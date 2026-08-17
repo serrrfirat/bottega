@@ -222,10 +222,20 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
     ]);
   });
 
-  test("fails closed when ANY tools-less provider is unreachable — never a partial map", async () => {
+  test("skips an unreachable tools-less provider at boot — reachable providers still resolve eagerly (issue #166)", async () => {
     const registry = createExtensionRegistry();
-    registry.register(toolsLessManifest({ id: "reachable.one" }));
-    registry.register(toolsLessManifest({ id: "unreachable.two" }));
+    registry.register(
+      toolsLessManifest({
+        id: "reachable.one",
+        mcp: { serverUrl: "https://reachable.one.test/mcp", transport: "streamable-http" },
+      }),
+    );
+    registry.register(
+      toolsLessManifest({
+        id: "unreachable.two",
+        mcp: { serverUrl: "https://unreachable.two.test/mcp", transport: "streamable-http" },
+      }),
+    );
     const transports = new Map<string, (binding: McpBinding) => Transport>();
     transports.set(
       "reachable.one",
@@ -237,18 +247,23 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
         throw new Error("connection refused");
       },
     );
-    await expect(
-      resolveExtensionSurfaces(registry.list(), {
-        mcpTransport: (binding) => {
-          // Route by binding serverUrl so each manifest gets its own transport.
-          const serverUrl = binding.transport === "streamable-http" ? binding.serverUrl : "";
-          for (const [id, make] of transports) {
-            if (serverUrl.includes(id)) return make(binding);
-          }
-          throw new Error(`no transport for ${serverUrl}`);
-        },
-      }),
-    ).rejects.toThrow(/tools\/list failed/);
+    const surfaces = await resolveExtensionSurfaces(registry.list(), {
+      mcpTransport: (binding) => {
+        // Route by binding serverUrl so each manifest gets its own transport.
+        const serverUrl = binding.transport === "streamable-http" ? binding.serverUrl : "";
+        for (const [id, make] of transports) {
+          if (serverUrl.includes(id)) return make(binding);
+        }
+        throw new Error(`no transport for ${serverUrl}`);
+      },
+    });
+    // The boot NEVER fails on a per-provider discovery failure (issue
+    // #166): the reachable provider resolves eagerly into the map, the
+    // unreachable one is absent — deferred to the runtime's lazy per-call
+    // path, which fails closed.
+    expect(surfaces.get("reachable.one")?.map((tool) => tool.name)).toEqual(["reachable.one.get_ok"]);
+    expect(surfaces.has("unreachable.two")).toBe(false);
+    expect(surfaces.size).toBe(1);
   });
 });
 

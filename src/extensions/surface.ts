@@ -17,15 +17,17 @@
  * toolsFromMcpList) are REUSED, never duplicated.
  *
  * Fail closed: an unreachable provider or an invalid tools/list THROWS a
- * clear error — never a silent empty toolset. Callers surface that error
- * (boot failure for the pre-resolution step, a tool error result for the
- * lazy runtime path); the agent never sees zero tools as if the provider
- * had none.
+ * clear error — never a silent empty toolset. Per-call resolution (the
+ * runtime's lazy path, issue #166) surfaces that error to the caller; the
+ * BOOT step (resolveExtensionSurfaces) instead SKIPS the failing provider
+ * — logged with evidence — and defers it to that per-call path, so the
+ * boot never dies because one provider is unreachable or auth-gated.
  *
  * CLI-only extensions have no tools/list protocol: absent tools on a cli
  * manifest is an egress-only extension (empty surface, like `tools: []`).
  */
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { errorMessage } from "../tools/helpers";
 import { listProviderTools, toolsFromMcpList } from "./generate-tools";
 import type { ExtensionManifest, ExtensionTool, McpBinding } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
@@ -73,17 +75,39 @@ export async function extensionToolSurface(
  * Resolves the effective surface of every registered extension ONCE (the
  * server boot step). Pinned manifests resolve without any I/O; tools-less
  * manifests hit the provider's tools/list (in parallel, through the shared
- * cache). Fail closed: any unreachable/invalid provider throws — the boot
- * surfaces the clear error rather than silently shipping an empty toolset.
+ * cache). Issue #166: a per-provider discovery failure (an unreachable or
+ * auth-gated provider) SKIPS that provider at boot — logged with evidence
+ * (provider + error) — and defers it to the runtime's lazy per-call path,
+ * which fails closed ("tool surface unavailable"). The returned map holds
+ * only the surfaces that resolved; providers that resolve keep resolving
+ * eagerly (github stays). This function never rejects.
  */
 export async function resolveExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
   opts: { mcpTransport?: (binding: McpBinding) => Transport } = {},
 ): Promise<ExtensionSurfaces> {
   const entries = await Promise.all(
-    extensions.map(async ({ manifest }) => [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport)] as const),
+    extensions.map(async ({ manifest }) => {
+      try {
+        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport)] as const;
+      } catch (err) {
+        // Issue #166: a tools-less manifest whose provider is unreachable /
+        // auth-gated must never fail the boot. Skip it (the map carries
+        // only RESOLVED surfaces) and let the runtime's lazy per-call path
+        // fail closed if a call is attempted while the provider is down.
+        console.error(
+          `[surface] boot: skipping "${manifest.id}" — tools/list failed (${errorMessage(err)}); ` +
+            "the runtime resolves it lazily per call and fails closed if the provider is still unreachable",
+        );
+        return null;
+      }
+    }),
   );
-  return new Map(entries);
+  const map = new Map<string, readonly ExtensionTool[]>();
+  for (const entry of entries) {
+    if (entry !== null) map.set(entry[0], entry[1]);
+  }
+  return map;
 }
 
 /**

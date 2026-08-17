@@ -30,7 +30,9 @@ import { connectViaAuthBroker } from "../extensions/connect";
 import { createExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { brokerSecretResolverFromEnv, createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
-import { resolveExtensionSurfaces } from "../extensions/surface";
+import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { McpBinding } from "../extensions/manifest";
 import { extensionToolDefinitions } from "../extensions/tools";
 import {
   assertAgentDirModelAvailable,
@@ -107,6 +109,24 @@ export interface BottegaServerOpts {
    * SDK + a model).
    */
   onSessionToolset?: (tools: ToolDefinition[]) => void;
+  /**
+   * Extension MCP transport seam (issue #166): the transport used for
+   * tools/list discovery of tools-less manifests at boot AND for the
+   * runtime's lazy per-call resolution. Defaults to the production
+   * transport (src/extensions/runtime.ts); hermetic boot tests inject
+   * in-memory transports so an auth-gated/unreachable provider never
+   * touches the network.
+   */
+  surfaceTransport?: (binding: McpBinding) => Transport;
+  /**
+   * Extension-surface observation seam (issue #166): receives the map of
+   * surfaces resolved at boot — only the extensions whose discovery
+   * succeeded (a per-provider failure is skipped, never a boot failure).
+   * Caller-level boot tests assert reachable providers discover eagerly
+   * and auth-gated providers are absent (deferred to the runtime's lazy
+   * per-call path, which fails closed).
+   */
+  onExtensionSurfaces?: (surfaces: ExtensionSurfaces) => void;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -151,9 +171,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // Effective tool surfaces (issue #158): pinned manifest tools, or the
   // provider's tools/list discovered surface for tools-less manifests —
   // resolved once at boot so the agent sees the provider's real surface
-  // (never a stale subset). Fail closed: an unreachable provider aborts the
-  // boot with a clear error, never a silent empty toolset.
-  const extensionSurfaces = await resolveExtensionSurfaces(extensionRegistry.list());
+  // (never a stale subset). Issue #166: a per-provider discovery failure
+  // (an unreachable or auth-gated provider) is SKIPPED — logged with
+  // evidence — and deferred to the runtime's lazy per-call path, which
+  // fails closed; the boot never dies because one provider's tools/list
+  // failed. The map threaded onward holds only the RESOLVED surfaces.
+  const extensionSurfaces = await resolveExtensionSurfaces(
+    extensionRegistry.list(),
+    opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {},
+  );
+  opts.onExtensionSurfaces?.(extensionSurfaces);
   /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */
   const extensionToolTier = (toolName: string) => {
     const extensionId = extensionRegistry.extensionIdForTool(toolName);
@@ -268,6 +295,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       resolveSecret: brokerSecretResolverFromEnv(),
     }),
     surfaces: extensionSurfaces,
+    // Issue #166: the lazy per-call discovery path uses the same seam as
+    // boot resolution, so hermetic tests stay off the network end to end.
+    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
   });
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through

@@ -530,11 +530,14 @@ describe("extension tool bridge: tools-less manifests (issue #158)", () => {
     expect(seen.list).toBe(1);
   });
 
-  test("a tools-less manifest WITHOUT a resolved surface fails closed at the bridge", () => {
+  test("a tools-less manifest WITHOUT a resolved surface contributes no definitions (issue #166 — the runtime lazy path fails closed per call)", () => {
     const registry = createExtensionRegistry();
     registry.register(toolsLessManifest());
-    expect(() => extensionToolDefinitions(registry.list(), { runtime: stubRuntime })).toThrow(
-      /no pinned tools and no resolved tool surface/,
-    );
+    // The boot skips a provider whose discovery failed; the bridge cannot
+    // name its tools, so it contributes no definitions — never a throw
+    // (the boot builds these definitions eagerly), never a silent empty
+    // toolset claim. Any call attempt fails closed through the runtime's
+    // lazy per-call path.
+    expect(extensionToolDefinitions(registry.list(), { runtime: stubRuntime })).toEqual([]);
   });
 });

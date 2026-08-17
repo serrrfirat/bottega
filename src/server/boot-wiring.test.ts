@@ -18,12 +18,23 @@
  * sessions), no live services. Same shape as onboarding-boot.test.ts (#116).
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore } from "../store/db";
+import type { McpBinding } from "../extensions/manifest";
+import type { ExtensionSurfaces } from "../extensions/surface";
 import { main } from "./index";
+
+/** The committed pinned extension snapshots (issue #50) — copied into the
+ * temp deployment root so a hermetic boot loads the real tools-less
+ * manifests instead of an empty registry. */
+const EXTENSIONS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
 /** The scheduler tool execute never touches a session context. */
 const unusedContext = {} as unknown as ExtensionContext;
@@ -191,6 +202,74 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       // Reaching stop() means the ACP boot path (driver factory + service
       // wiring) completed; the MCP server spawn happens only per session,
       // so this stays hermetic.
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("an auth-gated tools-less provider never fails the boot — skipped, reachable providers discover eagerly (issue #166)", async () => {
+    const env = tempEnv();
+    try {
+      // Ship the committed tools-less snapshots (linear/github/attio) into
+      // the temp deployment root so the registry resolves the REAL
+      // manifests — the empty-registry path would make the test vacuous.
+      mkdirSync(join(env.dir, "config", "extensions"), { recursive: true });
+      for (const name of ["attio.json", "github.json", "linear.json"]) {
+        copyFileSync(join(EXTENSIONS_DIR, name), join(env.dir, "config", "extensions", name));
+      }
+      // Ship the agent-config template so the boot-time pin sync (issue
+      // #78) takes the "created" path (same as the scheduler test above).
+      mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
+      writeFileSync(
+        join(env.dir, "config", "omp", "config.yml"),
+        "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n",
+      );
+
+      // GitHub's hosted MCP server is reachable (tools/list served by an
+      // in-memory stub); Linear/Attio are auth-gated — tools/list 401s
+      // without a credential. Discovery must not fail the boot: linear and
+      // attio are skipped (deferred to the runtime's lazy per-call path),
+      // github resolves eagerly.
+      const seen = { list: 0 };
+      let surfaces: ExtensionSurfaces | undefined;
+      const server = await main({
+        agentDir: join(env.dir, "agent"),
+        surfaceTransport: (binding: McpBinding): Transport => {
+          const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
+          if (url.includes("github")) {
+            seen.list += 1;
+            const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+            const mcp = new Server({ name: "github-stub", version: "1.0.0" }, { capabilities: { tools: {} } });
+            mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+              tools: [
+                {
+                  name: "search_issues",
+                  description: "Search issues",
+                  inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+                },
+              ],
+            }));
+            void mcp.connect(serverTransport);
+            return clientTransport;
+          }
+          // Auth-gated: the provider 401s tools/list without a credential.
+          throw new Error(`invalid_token: no credential connected for ${url}`);
+        },
+        onExtensionSurfaces: (resolved) => {
+          surfaces = resolved;
+        },
+      });
+      await server.stop();
+
+      // The boot threaded only the RESOLVED surfaces: github discovered
+      // eagerly at boot, linear/attio skipped (absent → the runtime's lazy
+      // per-call path fails closed if a call is attempted).
+      expect(surfaces).toBeDefined();
+      expect(surfaces!.has("github")).toBe(true);
+      expect(surfaces!.get("github")!.map((tool) => tool.name)).toEqual(["github.search_issues"]);
+      expect(surfaces!.has("linear")).toBe(false);
+      expect(surfaces!.has("attio")).toBe(false);
+      expect(seen.list).toBe(1); // one tools/list at boot, cached
     } finally {
       env.cleanup();
     }
