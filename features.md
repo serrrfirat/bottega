@@ -102,8 +102,9 @@ create derived text objects with `object.create`.
 
 Text extraction supports `text/plain`, `text/csv`, `application/json`, and
 `text/markdown`. PDF and XLS/XLSX objects are stored and attached, but
-`object.get` returns an explicit unsupported-format error until per-format
-extractors land.
+`object.get` returns an explicit unsupported-format error: binary content
+extraction is executor-harness work (the tools image runs python3, sqlite3,
+and CLIs over the shared data volume), not a server-side extractor.
 
 ## Policy & approvals (user-facing)
 
@@ -407,8 +408,10 @@ the canary opens it via `conversations.open`).
 - **Dev egress restore is temporary** — in local dev, platform + model
   traffic bypasses the proxy until the egress judge rules pass them
   (tracked in #126); extension traffic stays proxied.
-- **No PDF/XLSX binary content extraction yet** — these objects store and
-  attach normally; per-format extractors are a follow-up.
+- **No PDF/XLSX binary content extraction in `object.get`** — these objects
+  store and attach normally; binary extraction is executor-harness work (the
+  tools image runs python3, sqlite3, and CLIs over the shared data volume),
+  not a server-side extractor.
 
 ## Roadmap
 
