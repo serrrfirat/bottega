@@ -397,14 +397,18 @@ heavy layer) is in [features.md](features.md#extensions--the-registry).
    Slack approval router. api_key-type extensions still need the agent
    tool (or CLI) to supply the key.
 
-**Caller identity and durable-secret hygiene (#121).** `SpaceService`
-records the latest inbound principal before session creation and exposes it
-through `getLastPrincipal`. The in-process extension-tool bridge derives
-the space id from the session transcript and supplies that principal
-through `getCaller`, so the credential ladder's personal lookup matches the
-Slack human who sent the message rather than the `"agent"` fallback.
-Personal `connect ... as me` credentials can therefore be used by later
-extension calls in that space without asking for another token in chat.
+**Caller identity and durable-secret hygiene (#121/#152).** The driver
+captures the inbound principal when a fresh turn starts and binds it to
+that turn (the message's `principal` rides the prompt's turn options);
+`SpaceService` exposes it through `getTurnPrincipal`. The in-process
+extension-tool bridge derives the space id from the session transcript and
+supplies that per-turn principal through `getCaller`, so the credential
+ladder's personal lookup matches the Slack human whose message started the
+turn rather than the `"agent"` fallback. Personal `connect ... as me`
+credentials can therefore be used by later extension calls in that turn
+without asking for another token in chat — and because the binding is
+per-turn, another user's mid-turn message (a steer) never re-identifies the
+running turn's calls as theirs (#152).
 
 The separate `memory.save` boundary in `src/tools/memory.ts` rejects narrow,
 obvious credential shapes (including common GitHub, Slack, OpenAI, AWS, and

@@ -237,7 +237,14 @@ class AcpSessionDriver implements AgentSessionDriver {
   #dead = false;
   #disposed = false;
   /** Messages prompted while a turn was in flight; sent when the turn completes. */
-  #queuedPrompts: string[] = [];
+  #queuedPrompts: Array<{ text: string; principal?: string }> = [];
+  /**
+   * The principal of the CURRENT turn (issue #152): bound when a turn's
+   * prompt is sent, cleared when the turn completes. ACP serializes turns
+   * (messages during a turn queue), so each prompt is its own turn and
+   * binds its own inbound principal.
+   */
+  #turnPrincipal: string | undefined;
   /** Accumulated agent text per messageId (chunks sharing a messageId join up). */
   #buffers = new Map<string, string>();
   #currentMessageId: string | null = null;
@@ -312,20 +319,28 @@ class AcpSessionDriver implements AgentSessionDriver {
     }
   }
 
-  async prompt(text: string, _opts?: AgentTurnOptions): Promise<void> {
+  async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     if (this.#dead || this.#disposed) {
       throw new Error("acp agent process is not running");
     }
     if (this.#streaming) {
       // ACP v1 has no steer primitive; any streamingBehavior (steer/followUp)
       // queues the message and sends it once the in-flight turn completes.
-      this.#queuedPrompts.push(text);
+      // Each queued message becomes its OWN turn, so its principal queues
+      // alongside it (issue #152).
+      this.#queuedPrompts.push({ text, principal: opts?.principal });
       return;
     }
-    await this.#sendPrompt(text);
+    await this.#sendPrompt(text, opts?.principal);
     while (this.#queuedPrompts.length > 0) {
-      await this.#sendPrompt(this.#queuedPrompts.shift()!);
+      const next = this.#queuedPrompts.shift()!;
+      await this.#sendPrompt(next.text, next.principal);
     }
+  }
+
+  /** The principal of the current turn (issue #152); undefined between turns. */
+  getTurnPrincipal(): string | undefined {
+    return this.#turnPrincipal;
   }
 
   async abort(): Promise<void> {
@@ -372,8 +387,11 @@ class AcpSessionDriver implements AgentSessionDriver {
     this.#killChild();
   }
 
-  #sendPrompt(text: string): Promise<void> {
+  #sendPrompt(text: string, principal?: string): Promise<void> {
     this.#streaming = true;
+    // Each ACP prompt is its own turn: bind the inbound principal with it
+    // and drop the binding when the turn completes (issue #152).
+    this.#turnPrincipal = principal;
     this.#emitter.emit("turn_start", { spaceId: this.#spaceId });
     return this.#request("session/prompt", {
       sessionId: this.#sessionId,
@@ -382,6 +400,7 @@ class AcpSessionDriver implements AgentSessionDriver {
       .then(() => undefined)
       .finally(() => {
         this.#streaming = false;
+        this.#turnPrincipal = undefined;
         this.#flushBufferedMessage();
         this.#emitter.emit("turn_end", { spaceId: this.#spaceId });
       });

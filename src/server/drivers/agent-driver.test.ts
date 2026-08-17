@@ -604,6 +604,80 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
   });
 });
 
+describe("OmpSessionDriver per-turn principal (issue #152)", () => {
+  /** Stub SDK session: controllable streaming, records prompt/steer/followUp, injectable events. */
+  function stubTurnSession() {
+    let listener: ((event: unknown) => void) | undefined;
+    let streaming = false;
+    const calls: Array<{ kind: "prompt" | "steer" | "followUp"; text: string }> = [];
+    const session = {
+      subscribe: (cb: (event: unknown) => void) => {
+        listener = cb;
+        return () => {
+          listener = undefined;
+        };
+      },
+      beginDispose: () => {},
+      dispose: async () => {},
+      get isStreaming() {
+        return streaming;
+      },
+      prompt: async (text: string) => {
+        streaming = true;
+        calls.push({ kind: "prompt", text });
+      },
+      steer: async (text: string) => {
+        calls.push({ kind: "steer", text });
+      },
+      followUp: async (text: string) => {
+        calls.push({ kind: "followUp", text });
+      },
+      abort: async () => {},
+      getAvailableModels: () => [],
+    } as unknown as AgentSession;
+    return {
+      session,
+      calls,
+      emit: (event: unknown) => listener?.(event),
+      setStreaming: (v: boolean) => {
+        streaming = v;
+      },
+    };
+  }
+
+  test("a fresh prompt binds the inbound principal; steer/followUp keep it; turn_end drops it", async () => {
+    const { session, emit, setStreaming } = stubTurnSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+
+    // A's message opens the turn: A is bound for every call in the turn.
+    await driver.prompt("a's message", { principal: "UA" });
+    expect(driver.getTurnPrincipal()).toBe("UA");
+
+    // B steers into A's in-flight turn: the binding stays A's — B's
+    // personal credential must never resolve for A's extension calls.
+    await driver.prompt("b's message", { streamingBehavior: "steer", principal: "UB" });
+    await driver.prompt("b's follow-up", { streamingBehavior: "followUp", principal: "UB" });
+    expect(driver.getTurnPrincipal()).toBe("UA");
+
+    // The turn ends: the binding drops (fail closed between turns).
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    expect(driver.getTurnPrincipal()).toBeUndefined();
+
+    // B's own message starts B's turn: B binds.
+    setStreaming(false);
+    await driver.prompt("b's next message", { principal: "UB" });
+    expect(driver.getTurnPrincipal()).toBe("UB");
+  });
+
+  test("a turn nobody started (digest) binds no principal", async () => {
+    const { session } = stubTurnSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+
+    await driver.prompt("summarize", { silent: true });
+    expect(driver.getTurnPrincipal()).toBeUndefined();
+  });
+});
+
 describe("process-global agent dir + boot guard (issue #80)", () => {
   const PROVIDER = "agentdir-test";
   const MODEL_ID = "model-1";

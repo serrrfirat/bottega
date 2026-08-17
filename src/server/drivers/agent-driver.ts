@@ -77,6 +77,14 @@ export interface AgentTurnOptions {
    * "message" event still fires, so callers can capture the turn's text.
    */
   silent?: boolean;
+  /**
+   * The inbound principal whose message STARTS this turn (issue #152). Bound
+   * to the turn when a fresh turn begins; steers/follow-ups mid-turn inherit
+   * the running turn's binding, so a second user's message can never
+   * re-identify an in-flight turn's extension calls. Turns nobody started
+   * (digest, #42) pass none — their binding fails closed to caller "agent".
+   */
+  principal?: string;
 }
 
 /**
@@ -117,6 +125,17 @@ export interface AgentSessionDriver {
    * live-session registry (SessionModelRoleRegistry).
    */
   setModelRole?(role: ModelRole): Promise<ModelRoleSwitchResult>;
+  /**
+   * The principal bound to the CURRENT turn (issue #152): the user whose
+   * message started the in-flight turn. Bound when a fresh turn begins,
+   * unchanged by steers/follow-ups, cleared when the turn ends. Undefined
+   * between turns, for turns nobody started (digest), or when the driver
+   * cannot bind — callers then fall back to "agent" (fail closed).
+   * Replaces the space-level "latest inbound" source for credential
+   * resolution: a second user's message mid-turn must not re-identify the
+   * running turn's extension calls.
+   */
+  getTurnPrincipal?(): string | undefined;
 }
 
 export interface AgentDriver {
@@ -905,6 +924,13 @@ export class OmpSessionDriver implements AgentSessionDriver {
    * each turn's cause is fresh; absent when the turn errored silently.
    */
   #lastError: string | undefined;
+  /**
+   * The principal of the CURRENT turn (issue #152): bound when a fresh turn
+   * starts, untouched by steers/follow-ups, cleared at turn_end. Resolves
+   * extension-call callers so a second user's message mid-turn can never
+   * re-identify the running turn's credential lookups.
+   */
+  #turnPrincipal: string | undefined;
 
   constructor(deps: {
     spaceId: string;
@@ -951,6 +977,10 @@ export class OmpSessionDriver implements AgentSessionDriver {
           this.#emitter.emit("turn_start", { spaceId: deps.spaceId });
           break;
         case "turn_end":
+          // The turn is over: no tool call can run after this, so the
+          // per-turn binding is dropped (fail closed — the next fresh turn
+          // rebinds from its own prompt's principal, issue #152).
+          this.#turnPrincipal = undefined;
           // Carry the cause (when one exists) so the empty-completion path
           // can surface it instead of the generic phrase (#78).
           this.#emitter.emit("turn_end", { spaceId: deps.spaceId, error: this.#lastError });
@@ -972,17 +1002,28 @@ export class OmpSessionDriver implements AgentSessionDriver {
     this.#silentTurn = opts?.silent ?? false;
     try {
       if (this.#session.isStreaming) {
+        // Mid-turn: the running turn keeps its principal. The SDK's
+        // isStreaming flips synchronously inside the prompt() call below,
+        // so any prompt racing this one observes it and steers instead —
+        // only the message that OPENS a turn binds (issue #152).
         if (opts?.streamingBehavior === "followUp") {
           await this.#session.followUp(text);
         } else {
           await this.#session.steer(text);
         }
       } else {
+        // Fresh turn: capture the inbound principal with the turn.
+        this.#turnPrincipal = opts?.principal;
         await this.#session.prompt(text);
       }
     } finally {
       this.#silentTurn = false;
     }
+  }
+
+  /** The principal of the current turn (issue #152); undefined between turns. */
+  getTurnPrincipal(): string | undefined {
+    return this.#turnPrincipal;
   }
 
   async abort(): Promise<void> {

@@ -37,6 +37,8 @@ class FakeSession implements AgentSessionDriver {
   failPrompt = false;
   /** When set, prompt() emits a message event with this text (the model's reply). */
   autoReply?: string;
+  /** The principal of the current turn; mirrors the real drivers' binding (issue #152). */
+  turnPrincipal: string | undefined;
 
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
@@ -49,6 +51,9 @@ class FakeSession implements AgentSessionDriver {
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     if (this.failPrompt) throw new Error("fake prompt failure");
     this.prompts.push({ text, opts });
+    // Mirrors the drivers: a FRESH turn (not streaming) binds the inbound
+    // principal; a steer into the running turn keeps the turn's principal.
+    if (!this.streaming) this.turnPrincipal = opts?.principal;
     if (this.deferPrompt) {
       const gate = Promise.withResolvers<void>();
       this.promptGate = gate;
@@ -57,6 +62,11 @@ class FakeSession implements AgentSessionDriver {
     if (this.autoReply !== undefined) {
       this.emit("message", { spaceId: this.spaceId, text: this.autoReply });
     }
+  }
+
+  /** The principal bound to the current turn (issue #152). */
+  getTurnPrincipal(): string | undefined {
+    return this.turnPrincipal;
   }
 
   finishPrompt(): void {
@@ -81,6 +91,9 @@ class FakeSession implements AgentSessionDriver {
   }
 
   emit(event: "message" | "turn_start" | "turn_end" | "error", data: unknown): void {
+    // The turn's principal binding dies with the turn (issue #152) — the
+    // next fresh turn rebinds from its own prompt's principal.
+    if (event === "turn_end") this.turnPrincipal = undefined;
     for (const cb of this.listeners.get(event) ?? []) cb(data);
   }
 
@@ -505,7 +518,7 @@ describe("SpaceService session lifecycle", () => {
 
     expect(driver.created).toHaveLength(1);
     expect(driver.created[0].opts.spaceId).toBe("slack:C1");
-    expect(driver.last().prompts).toEqual([{ text: "hello", opts: undefined }]);
+    expect(driver.last().prompts).toEqual([{ text: "hello", opts: { principal: "U1" } }]);
   });
 
   test("live sessions register in the model-role registry and unregister on dispose (issue #64)", async () => {
@@ -558,7 +571,10 @@ describe("SpaceService session lifecycle", () => {
     const session = driver.last();
     expect(driver.created).toHaveLength(1); // same session reused
     expect(session.prompts).toHaveLength(2);
-    expect(session.prompts[1]).toEqual({ text: "second", opts: { streamingBehavior: "steer" } });
+    expect(session.prompts[1]).toEqual({
+      text: "second",
+      opts: { streamingBehavior: "steer", principal: "U1" },
+    });
   });
 
   test("idle timeout disposes the session; the next message cold-starts a fresh one", async () => {
@@ -580,7 +596,7 @@ describe("SpaceService session lifecycle", () => {
 
       expect(driver.created).toHaveLength(2);
       expect(driver.last()).not.toBe(first);
-      expect(driver.last().prompts).toEqual([{ text: "second", opts: undefined }]);
+      expect(driver.last().prompts).toEqual([{ text: "second", opts: { principal: "U1" } }]);
     } finally {
       vi.useRealTimers();
     }
@@ -641,7 +657,7 @@ describe("SpaceService session lifecycle", () => {
 
       await service.handleInboundMessage(msg({ text: "after", ts: "3.3" }));
       expect(driver.created).toHaveLength(2); // cold start once disposal completed
-      expect(driver.last().prompts).toEqual([{ text: "after", opts: undefined }]);
+      expect(driver.last().prompts).toEqual([{ text: "after", opts: { principal: "U1" } }]);
     } finally {
       vi.useRealTimers();
     }
@@ -674,18 +690,33 @@ describe("SpaceService session lifecycle", () => {
     expect(driver.last().prompts).toHaveLength(1);
   });
 
-  test("sessions get a getPrincipal getter that tracks the space's last inbound principal", async () => {
+  test("the getPrincipal getter resolves the CURRENT TURN's principal, not the space's latest inbound (issue #152)", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = makeSpaceService({ store, adapter, driver });
 
-    await service.handleInboundMessage(msg({ principal: "U1", ts: "1.1" }));
-    await service.handleInboundMessage(msg({ principal: "U2", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ principal: "UA", ts: "1.1" }));
+    const session = driver.last();
 
-    expect(driver.created).toHaveLength(1); // same session, getter stays fresh
+    // A's turn is in flight (mid-tool-call); user B messages → the message
+    // STEERS the running turn, and the turn's binding must stay A's — B's
+    // personal credential must never resolve for A's extension calls.
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ principal: "UB", ts: "2.2" }));
+    expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
     const getPrincipal = driver.created[0].opts.getPrincipal!;
-    expect(getPrincipal()).toBe("U2");
+    expect(getPrincipal()).toBe("UA");
+
+    // The turn ends (binding drops, fail closed), then B's own message
+    // starts B's turn → B binds for B's extension calls.
+    session.streaming = false;
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    expect(getPrincipal()).toBeUndefined(); // between turns: no caller identity
+
+    await service.handleInboundMessage(msg({ principal: "UB", ts: "3.3" }));
+    expect(session.prompts[2].opts).toEqual({ principal: "UB" }); // fresh turn
+    expect(getPrincipal()).toBe("UB");
   });
 });
 
@@ -1894,7 +1925,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     while (driver.createGate === undefined) await Promise.resolve();
     driver.finishCreate();
     await inbound;
-    expect(driver.last().prompts).toEqual([{ text: "hello", opts: undefined }]);
+    expect(driver.last().prompts).toEqual([{ text: "hello", opts: { principal: "U1" } }]);
   });
 
   test("a receipt reaction is added on receipt and removed when the reply lands (issue #119)", async () => {

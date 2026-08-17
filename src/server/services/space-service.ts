@@ -244,8 +244,6 @@ export class SpaceService {
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /** ts of the latest inbound message per space; agent replies thread under it. */
   readonly #lastInboundTs = new Map<string, string>();
-  /** Principal of the latest inbound message per space (memory injection, #42). */
-  readonly #lastPrincipal = new Map<string, string>();
   /**
    * ts of the in-place thinking phrase per space; consumed when the reply lands.
    * NOTE: the ts is only known after postMessage resolves — the posting guard
@@ -333,16 +331,22 @@ export class SpaceService {
   }
 
   /**
-   * Principal of the latest inbound message for a space (issue #121): the
+   * Principal of the space's CURRENT turn (issue #152): captured when a
+   * fresh turn starts and bound until that turn ends (the driver binds it
+   * atomically with the fresh-turn decision, so a steer — another user's
+   * message mid-turn — never re-identifies the running turn). The
    * extension-tool bridge resolves the caller of every extension tool call
-   * from this map, so `connect github as me` personal credentials match the
-   * real Slack user instead of the bridge's "agent" fallback (which never
-   * matches a personal credential row and forced the ask-PAT-in-chat path).
-   * Undefined when the space has no inbound message yet (the bridge then
-   * falls back to "agent").
+   * from this, so `connect github as me` personal credentials match the
+   * Slack human whose message STARTED the turn instead of the bridge's
+   * "agent" fallback (which never matches a personal credential row and
+   * forced the ask-PAT-in-chat path). Undefined between turns and for
+   * turns nobody started (digest) — callers then fall back to "agent"
+   * (fail closed). Replaces the space-level "latest inbound" source
+   * (#121), which let user B's mid-turn message re-identify user A's
+   * in-flight extension calls as B.
    */
-  getLastPrincipal(spaceId: string): string | undefined {
-    return this.#lastPrincipal.get(spaceId);
+  getTurnPrincipal(spaceId: string): string | undefined {
+    return this.#sessions.get(spaceId)?.session.getTurnPrincipal?.();
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
@@ -381,7 +385,6 @@ export class SpaceService {
       // Each is fire-and-forget: the turn path never blocks on Slack
       // latency or a missing reactions:write scope.
       this.#lastInboundTs.set(msg.spaceId, msg.ts);
-      this.#lastPrincipal.set(msg.spaceId, msg.principal);
       this.#postThinkingPhrase(msg.spaceId);
       this.#addReceiptReaction(msg);
       this.#auditReceipt(msg);
@@ -391,12 +394,17 @@ export class SpaceService {
       this.#learning?.recordInput(msg);
       if (live.session.isStreaming()) {
         // Streaming turn (issue #120): phrase updates coalesce on the cadence.
+        // The steer inherits the RUNNING turn's principal (issue #152) — the
+        // driver only binds on a fresh turn — so user B steering into user
+        // A's turn never re-identifies A's in-flight extension calls.
         this.#streamingTurns.add(msg.spaceId);
-        await live.session.prompt(turnText, { streamingBehavior: "steer" });
+        await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
       } else {
         // Non-streaming turn: replies update in place immediately, unbatched.
+        // The principal travels WITH this turn: the driver binds it when the
+        // fresh turn starts and drops it at turn_end (issue #152).
         this.#streamingTurns.delete(msg.spaceId);
-        await live.session.prompt(turnText);
+        await live.session.prompt(turnText, { principal: msg.principal });
       }
     } catch (err) {
       console.error(`[space-service] failed to handle message in ${msg.spaceId}:`, err);
@@ -471,7 +479,6 @@ export class SpaceService {
    */
   async #handleConnectIntent(msg: SlackMessage, intent: ConnectIntent, deps: ConnectExtensionDeps): Promise<void> {
     this.#lastInboundTs.set(msg.spaceId, msg.ts);
-    this.#lastPrincipal.set(msg.spaceId, msg.principal);
     const outcome = await connectExtension(
       { extension: intent.extension, scope: intent.scope, actor: msg.principal, spaceId: msg.spaceId },
       deps,
@@ -520,9 +527,11 @@ export class SpaceService {
       // same signal (both drivers emit both), so it must stay unconsumed or
       // every reply would be posted twice.
       onOutput: () => {},
-      // Memory-context injection seam (#42): re-read the space's current
-      // principal on every LLM call so user-scope search stays fresh.
-      getPrincipal: () => this.#lastPrincipal.get(spaceId),
+      // Memory-context injection seam (#42): re-read the CURRENT TURN's
+      // principal on every LLM call so user-scope search stays fresh — and
+      // a mid-turn steer from another user never switches the scope
+      // (issue #152).
+      getPrincipal: () => this.getTurnPrincipal(spaceId),
     });
     session.on("turn_start", () => this.#postThinkingPhrase(spaceId));
     session.on("message", (data) => this.#onSessionMessage(spaceId, data));
@@ -562,9 +571,8 @@ export class SpaceService {
     } finally {
       // Session-scoped inbound state: no event can fire after dispose
       // resolves (both drivers unsubscribe/kill), and the next inbound
-      // re-sets both maps.
+      // re-sets the threading map.
       this.#lastInboundTs.delete(spaceId);
-      this.#lastPrincipal.delete(spaceId);
       this.#pendingThinkingTs.delete(spaceId);
       this.#phrasePosting.delete(spaceId);
       this.#emptyTurnCount.delete(spaceId);

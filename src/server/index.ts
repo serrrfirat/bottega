@@ -332,19 +332,22 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         // OWN policy gate (gate → ladder → boundary → audit), so they are
         // never wrapped by the driver gate below.
         //
-        // Issue #121: every extension call carries the space's REAL
-        // principal (the latest inbound user) via the bridge's getCaller
-        // seam, so the #51 ladder's personal scope matches — `connect
-        // github as me` resolves the caller's OWN credential. Without this
-        // the bridge falls back to caller "agent", a personal lookup never
-        // matches, and the model ends up asking the user to paste a PAT
-        // into chat. spaceService is late-bound (constructed after the
+        // Issue #152: every extension call carries the principal of the
+        // TURN it runs in via the bridge's getCaller seam, so the #51
+        // ladder's personal scope matches the Slack human whose message
+        // STARTED the turn — `connect github as me` resolves the caller's
+        // OWN credential. The per-turn binding (not the space-level latest
+        // inbound, #121) means user B steering into user A's in-flight
+        // turn can never re-identify A's extension calls as B. Without
+        // this the bridge falls back to caller "agent", a personal lookup
+        // never matches, and the model ends up asking the user to paste a
+        // PAT into chat. spaceService is late-bound (constructed after the
         // driver); the closure reads it only at call time.
         customTools: extensionToolDefinitions(extensionRegistry.list(), {
           runtime: extensionRuntime,
           getCaller: (ctx) => {
             const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
-            return spaceId ? spaceService.getLastPrincipal(spaceId) : undefined;
+            return spaceId ? spaceService.getTurnPrincipal(spaceId) : undefined;
           },
         }),
         // Policy gate (issue #69): restricted SDK sessions never evaluate
