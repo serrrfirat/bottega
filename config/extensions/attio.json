@@ -20,39 +20,6 @@
     "credentialSchema": {
       "type": "oauth"
     },
-    "tools": [
-      {
-        "name": "attio.search_records",
-        "providerName": "search-records",
-        "tier": "read",
-        "description": "Full-text search Attio records (people, companies, deals) by name, email, or domain.",
-        "params": [
-          { "name": "query", "type": "string", "description": "Search text", "required": true },
-          { "name": "objectType", "type": "string", "description": "Object type slug (e.g. people, companies)" }
-        ]
-      },
-      {
-        "name": "attio.create_record",
-        "providerName": "create-record",
-        "tier": "write",
-        "description": "Create an Attio record of the given object type with JSON-encoded attribute values.",
-        "params": [
-          { "name": "objectType", "type": "string", "description": "Object type slug", "required": true },
-          { "name": "valuesJson", "type": "string", "description": "JSON object of attribute values", "required": true }
-        ]
-      },
-      {
-        "name": "attio.update_record",
-        "providerName": "update-record",
-        "tier": "write",
-        "description": "Update an existing Attio record's attribute values.",
-        "params": [
-          { "name": "recordId", "type": "string", "description": "Record id", "required": true },
-          { "name": "objectType", "type": "string", "description": "Object type slug", "required": true },
-          { "name": "valuesJson", "type": "string", "description": "JSON object of attribute values", "required": true }
-        ]
-      }
-    ],
     "domains": ["mcp.attio.com"]
   }
 }

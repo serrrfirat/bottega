@@ -16,13 +16,21 @@
  * server's tool list) — the bridge forwards `providerName ?? name`, so the
  * provider call carries the wire name while the manifest name stays the
  * SDK/policy/audit surface.
+ *
+ * The committed manifests are TOOLS-LESS (issue #158): the pinned
+ * hand-authored 3-tool subsets are gone, so the runtime discovers each
+ * provider's full surface from tools/list at boot. These tests exercise
+ * that discovery through the hermetic transport seam (in-memory MCP
+ * servers per provider) and keep the #148 wire-name semantics — the
+ * discovered surface carries the provider's wire providerNames, and the
+ * bridge still forwards them on every call.
  */
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createAudit } from "../policy/audit";
@@ -34,18 +42,74 @@ import { createExtensionRegistry, readPinnedSnapshots } from "./registry";
 import { extensionToolDefinitions } from "./tools";
 import { createExtensionRuntime } from "./runtime";
 import { validateManifest, type McpBinding } from "./manifest";
-import { resolveExtensionSurfaces } from "./surface";
+import { resetToolSurfaceCache, resolveExtensionSurfaces, type ExtensionSurfaces } from "./surface";
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
 const PROVIDERS = ["linear", "github", "attio"] as const;
 
-/** The v1 tool surface per provider, from the issue body: search/create/update. */
-const TOOL_SURFACE = {
-  linear: ["linear.search_issues", "linear.create_issue", "linear.update_status"],
-  github: ["github.search_issues", "github.create_issue", "github.add_comment"],
-  attio: ["attio.search_records", "attio.create_record", "attio.update_record"],
+/** The WIRE tool surface per provider (issue #148): the names the hosted
+ * servers expose (github live-verified; attio per official docs; linear
+ * unprefixed). The hermetic transports below serve these from tools/list,
+ * so discovery yields the namespaced manifest names with these wire
+ * providerNames. */
+const WIRE_SURFACE = {
+  linear: ["search_issues", "create_issue", "update_status"],
+  github: ["search_issues", "issue_write", "add_issue_comment"],
+  attio: ["search-records", "create-record", "update-record"],
 } as const;
+
+/** Minimal inputSchema per wire tool — the MCP spec requires one. */
+function wireInputSchema(wire: string): { type: "object"; properties: Record<string, unknown>; required?: string[] } {
+  return {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      title: { type: "string" },
+    },
+    ...(wire.includes("search") ? { required: ["query"] } : {}),
+  };
+}
+
+/**
+ * The hermetic transport seam (issue #158): an in-memory MCP server for one
+ * provider serving tools/list (discovery) and tools/call (execution) — no
+ * network, deterministic. Mirrors the hosted servers' wire names (#148);
+ * `seen` records every provider call so tests can assert the wire name
+ * forwarding.
+ */
+function stubMcpTransport(provider: (typeof PROVIDERS)[number], seen?: { tool: string[] }) {
+  return (_binding: McpBinding): Transport => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = new Server({ name: `${provider}-stub`, version: "1.0.0" }, { capabilities: { tools: {} } });
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: WIRE_SURFACE[provider].map((wire) => ({
+        name: wire,
+        description: `${provider} ${wire}`,
+        inputSchema: wireInputSchema(wire),
+      })),
+    }));
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      seen?.tool.push(request.params.name);
+      const args = request.params.arguments as Record<string, unknown>;
+      return {
+        content: [{ type: "text", text: `stub ${request.params.name} query=${String(args["query"])}` }],
+      };
+    });
+    void server.connect(serverTransport);
+    return clientTransport;
+  };
+}
+
+/** One transport factory dispatching per binding to the right provider stub. */
+function stubTransports(seen?: { tool: string[] }) {
+  return (binding: McpBinding): Transport => {
+    const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
+    if (url.includes("linear.app")) return stubMcpTransport("linear", seen)(binding);
+    if (url.includes("attio.com")) return stubMcpTransport("attio", seen)(binding);
+    return stubMcpTransport("github", seen)(binding);
+  };
+}
 
 function run(def: ToolDefinition, params: Record<string, unknown>) {
   return def.execute("1", params, undefined, undefined, {
@@ -59,7 +123,10 @@ function run(def: ToolDefinition, params: Record<string, unknown>) {
  * injected MCP transport seam (issue #53 owns gate → ladder → boundary →
  * audit; #54 exercises the provider tool surface through it).
  */
-function makeRuntime(mcpTransport?: (binding: McpBinding) => Transport) {
+function makeRuntime(
+  mcpTransport?: (binding: McpBinding) => Transport,
+  surfaces?: ExtensionSurfaces,
+) {
   const registry = createExtensionRegistry(SNAPSHOTS_DIR);
   const store = createStore(":memory:");
   for (const id of PROVIDERS) {
@@ -80,12 +147,19 @@ function makeRuntime(mcpTransport?: (binding: McpBinding) => Transport) {
     orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
     router: DenyRouter,
     boundary: { async authorize() {} },
-    mcpTransport,
+    ...(mcpTransport !== undefined ? { mcpTransport } : {}),
+    ...(surfaces !== undefined ? { surfaces } : {}),
   });
   return { registry, runtime };
 }
 
 describe("issue #54 pinned providers", () => {
+  beforeEach(() => {
+    // Discovery is cached per manifest id + binding and the cache is
+    // process-global: hermetic tests must not observe a stale surface from
+    // an earlier test (or a skip-gated live leg) in the same process.
+    resetToolSurfaceCache();
+  });
   test("all three snapshots parse against the #50 validator as vendor-official, reviewed", () => {
     const snapshots = readPinnedSnapshots(SNAPSHOTS_DIR);
     expect(snapshots.map((s) => s.extensionId).sort()).toEqual([...PROVIDERS].sort());
@@ -107,19 +181,34 @@ describe("issue #54 pinned providers", () => {
     }
   });
 
-  test("each provider exposes the v1 search/create/update surface with read/write/write tiers", () => {
+  test("the committed manifests are tools-less; discovery restores the full surface with wire names and conservative tiers (issue #158)", async () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
+    // The hand-authored tool subsets are gone: binding + credentialSchema +
+    // domains stay, the surface is discovered at runtime — the registry
+    // has no sync tool names.
     for (const id of PROVIDERS) {
-      const tools = registry.resolve(id)?.manifest.tools;
-      expect(tools?.map((t) => t.name)).toEqual([...TOOL_SURFACE[id]]);
-      expect(tools?.map((t) => t.tier)).toEqual(["read", "write", "write"]);
-      for (const tool of tools ?? []) {
+      const resolved = registry.resolve(id);
+      expect(resolved?.manifest.tools).toBeUndefined();
+      expect(resolved?.manifest.mcp).toBeDefined();
+      expect(resolved?.manifest.credentialSchema).toBeDefined();
+      expect(resolved?.manifest.domains.length).toBeGreaterThan(0);
+    }
+    expect(registry.toolNames()).toEqual([]);
+
+    // The server-boot step: discovery through the hermetic transport seam
+    // restores the v1 search/create/update surface — namespaced manifest
+    // names, wire providerNames (issue #148), conservative read/write/write
+    // tiers, and non-empty descriptions. Never a silent empty set.
+    const surfaces = await resolveExtensionSurfaces(registry.list(), { mcpTransport: stubTransports() });
+    for (const id of PROVIDERS) {
+      const tools = [...(surfaces.get(id) ?? [])];
+      expect(tools.map((t) => t.name)).toEqual([...WIRE_SURFACE[id]].map((wire) => `${id}.${wire}`));
+      expect(tools.map((t) => t.providerName)).toEqual([...WIRE_SURFACE[id]]);
+      expect(tools.map((t) => t.tier)).toEqual(["read", "write", "write"]);
+      for (const tool of tools) {
         expect(tool.description.length).toBeGreaterThan(0);
       }
     }
-    expect(registry.toolNames().sort()).toEqual(
-      Object.values(TOOL_SURFACE).flat().sort(),
-    );
   });
 
   test("the egress allowlist contains the three provider domains", () => {
@@ -128,21 +217,14 @@ describe("issue #54 pinned providers", () => {
     expect(registry.egressDomains()).toEqual(["mcp.attio.com", "api.githubcopilot.com", "mcp.linear.app"]);
   });
 
-  test("linear executes end-to-end through the tool bridge against a stub transport", async () => {
-    const mcpTransport = (_binding: McpBinding): Transport => {
-      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-      const server = new Server({ name: "linear-stub", version: "1.0.0" }, { capabilities: { tools: {} } });
-      server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const args = request.params.arguments as Record<string, unknown>;
-        return {
-          content: [{ type: "text", text: `stub ${request.params.name} query=${String(args["query"])}` }],
-        };
-      });
-      void server.connect(serverTransport);
-      return clientTransport;
-    };
+  test("linear executes end-to-end through the tool bridge against a stub transport (discovered surface)", async () => {
+    const seen = { tool: [] as string[] };
+    const mcpTransport = stubTransports(seen);
     const { registry, runtime } = makeRuntime(mcpTransport);
-    const definitions = extensionToolDefinitions(registry.list(), { runtime });
+    // The tools-less manifest's surface comes from tools/list (the #158
+    // hermetic seam), pre-resolved exactly like the server boot step.
+    const surfaces = await resolveExtensionSurfaces(registry.list(), { mcpTransport });
+    const definitions = extensionToolDefinitions(registry.list(), { runtime, surfaces });
     const search = definitions.find((def) => def.name === "linear.search_issues");
     expect(search).toBeDefined();
     expect(search?.approval).toBe("read");
@@ -150,21 +232,39 @@ describe("issue #54 pinned providers", () => {
     // Issue #148: the provider sees the wire name (providerName), not the
     // namespaced manifest name.
     expect(result.content).toEqual([{ type: "text", text: "stub search_issues query=bug" }]);
+    expect(seen.tool).toEqual(["search_issues"]);
   });
 
-  test("github (hosted MCP binding) transport failures surface as tool errors, not silent no-ops", async () => {
-    const { registry, runtime } = makeRuntime(() => {
+  test("a tools-less github manifest with an unreachable provider fails closed — never a silent empty toolset (issue #158)", async () => {
+    const unreachable = () => {
       throw new Error("api.githubcopilot.com unreachable");
-    });
+    };
+    const { registry, runtime } = makeRuntime(unreachable);
     const github = registry.resolve("github");
     expect(github?.manifest.mcp).toEqual({
       serverUrl: "https://api.githubcopilot.com/mcp/",
       transport: "streamable-http",
     });
-    const definitions = extensionToolDefinitions([github!], { runtime });
-    const result = await run(definitions[0], { query: "repo:foo" });
-    expect(result.isError).toBe(true);
-    expect((result.content[0] as { text: string }).text).toContain("unreachable");
+    expect(github?.manifest.tools).toBeUndefined();
+    // Fail-closed at the bridge: no pinned tools and no resolved surface →
+    // a clear error, not an empty definition list.
+    expect(() => extensionToolDefinitions([github!], { runtime })).toThrow(/no pinned tools and no resolved tool surface/);
+    // Fail-closed at the boot step: the discovery error is surfaced, never
+    // swallowed into an empty toolset.
+    await expect(resolveExtensionSurfaces([github!], { mcpTransport: unreachable })).rejects.toThrow(/unreachable/);
+    // Fail-closed at the runtime's lazy path: a tool call returns a clear
+    // error result naming the unavailable surface.
+    const result = await runtime.execute({
+      extensionId: "github",
+      toolName: "github.search_issues",
+      args: { query: "repo:foo" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    const error = result.ok ? "unexpected success" : result.error;
+    expect(result.ok).toBe(false);
+    expect(error).toContain("tool surface unavailable");
+    expect(error).toContain("unreachable");
   });
 });
 
@@ -419,6 +519,11 @@ describe("github hosted MCP live leg (skip-gated, issue #158 — tools-less disc
         skip("data/proxy-secrets/github.secret is missing or empty — the boundary has not injected a credential yet");
         return;
       }
+
+      // Hermetic tests cache the same manifest id + binding key: clear the
+      // process-global discovery cache so this leg observes the REAL hosted
+      // surface, never a stub surface from an earlier test in this process.
+      resetToolSurfaceCache();
 
       // The tools-less github manifest: binding + credentialSchema only.
       // The tool surface comes from the hosted server's tools/list.

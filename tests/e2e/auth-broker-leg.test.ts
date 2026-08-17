@@ -42,7 +42,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   brokerSecretResolverFromEnv,
@@ -245,6 +245,17 @@ describe("auth-broker live leg (issue #143, skip-gated)", () => {
             { name: "bottega-live-github", version: "1.0.0" },
             { capabilities: { tools: {} } },
           );
+          // The github manifest is tools-less (issue #158): the runtime
+          // discovers the surface from tools/list first. Serve the hosted
+          // server's wire names so `github.search_issues` resolves through
+          // the discovered surface before the call below.
+          server.setRequestHandler(ListToolsRequestSchema, async () => ({
+            tools: [
+              { name: "search_issues", description: "Search issues", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+              { name: "issue_write", description: "Create an issue", inputSchema: { type: "object", properties: {} } },
+              { name: "add_issue_comment", description: "Comment on an issue", inputSchema: { type: "object", properties: {} } },
+            ],
+          }));
           server.setRequestHandler(CallToolRequestSchema, async () => {
             // Stand-in for the hosted github MCP server: performs the same
             // initialize call through the dev proxy with NO credential —
