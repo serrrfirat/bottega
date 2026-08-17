@@ -95,9 +95,11 @@ export const STREAM_UPDATE_INTERVAL_MS = 400;
  * Bounded retries for the FINAL delivery (issue #120): after this many
  * consecutive final-flush failures (e.g. a hard 429), the update is dropped
  * with a log rather than hammering Slack forever. Interim updates never
- * retry on their own — they wait for the turn-end flush.
+ * retry on their own — they wait for the turn-end flush. A stopStream that
+ * exhausts this budget flips the presenter to the phrase path so the final
+ * reply still lands (issue #181).
  */
-const STREAM_FINAL_RETRY_LIMIT = 3;
+export const STREAM_FINAL_RETRY_LIMIT = 3;
 
 /** Shown on a `message` event whose text is empty/whitespace (issue #60). */
 export const EMPTY_RESPONSE_FALLBACK = "Hmm — I got an empty response, retrying…";
@@ -813,11 +815,14 @@ export class SlackTurnPresenter {
  * the same coalescing cadence as the phrase renderer; turn_end closes with
  * chat.stopStream carrying the final reply as the closing block.
  *
- * Fallback (fail closed): the first stream failure — a workspace without
- * the Agents feature, missing recipient_team_id, a rate limit — switches
- * this renderer to the phrase+edit path PERMANENTLY (per boot) and the
- * adapter remembers the failure, so no turn ever pays the failed call twice
- * and no reply is dropped.
+ * Fallback (fail closed): ANY stream call failure — opening, appending, or
+ * closing — a workspace without the Agents feature, missing
+ * recipient_team_id, a rate limit — switches this renderer to the
+ * phrase+edit path PERMANENTLY (per boot) and the adapter remembers the
+ * failure, so no turn ever pays the failed call twice and no reply is
+ * dropped: the final text lands as a stopStream closing block when the
+ * stream is healthy, or as an in-place chat.update when a stream call
+ * fails (issue #181).
  */
 export class StreamTurnPresenter extends SlackTurnPresenter {
   /** ts of the OPEN stream; undefined between turns / after a fallback. */
@@ -859,7 +864,18 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
   /** Interim reply text appends to the stream (markdown_text) on the cadence. */
   protected async sendTextChunk(ts: string, text: string): Promise<void> {
     if (!this.#streamMode) return super.sendTextChunk(ts, text);
-    await this.adapter.appendText(this.spaceId, ts, text);
+    try {
+      await this.adapter.appendText(this.spaceId, ts, text);
+    } catch (err) {
+      // Any stream failure flips to the phrase path for the boot (issue
+      // #181) — and the text still lands: edit the stream message in place.
+      this.#streamMode = false;
+      console.error(
+        `[slack-turn-presenter] chat.appendStream failed in ${this.spaceId} — falling back to phrase+edit for the boot:`,
+        err,
+      );
+      await super.sendTextChunk(ts, text);
+    }
   }
 
   /**
@@ -879,7 +895,14 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     const ts = this.#streamTs;
     this.#streamTs = undefined;
     this.pendingTs = undefined;
-    await this.#stopWithRetry(ts, finalText);
+    if (await this.#stopWithRetry(ts, finalText)) return;
+    // stopStream never landed and the closing block was the final reply's
+    // only carrier — flip to the phrase path and edit the stream message in
+    // place so the reply is NEVER dropped (issue #181).
+    this.#streamMode = false;
+    if (finalText !== undefined) {
+      await super.sendTextChunk(ts, finalText);
+    }
   }
 
   /** Post-turn: close the stream when one is open (error path, no final text). */
@@ -888,38 +911,51 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     const ts = this.#streamTs;
     this.#streamTs = undefined;
     this.pendingTs = undefined;
-    await this.#stopWithRetry(ts, undefined);
+    if (!(await this.#stopWithRetry(ts, undefined))) {
+      this.#streamMode = false;
+    }
   }
 
   /** One thinking-step card per gated tool call (issue #168). */
   protected renderToolStep(step: ToolStepEvent): void {
     if (!this.#streamMode || this.#streamTs === undefined) return; // no panel in fallback mode
+    const ts = this.#streamTs;
     void this.adapter
-      .appendTask(this.spaceId, this.#streamTs, {
+      .appendTask(this.spaceId, ts, {
         id: step.taskId,
         title: step.title,
         status: step.status,
         ...(step.output !== undefined ? { output: step.output } : {}),
       })
       .catch((err) => {
-        console.error(`[slack-turn-presenter] failed to append task step in ${this.spaceId}:`, err);
+        // Any stream failure flips to the phrase path for the boot (issue #181).
+        this.#streamMode = false;
+        console.error(
+          `[slack-turn-presenter] failed to append task step in ${this.spaceId} — falling back to phrase+edit for the boot:`,
+          err,
+        );
       });
   }
 
-  /** chat.stopStream with bounded retries (a 429 must not drop the final reply). */
-  async #stopWithRetry(ts: string, text: string | undefined): Promise<void> {
+  /**
+   * chat.stopStream with bounded retries (a 429 must not drop the final
+   * reply). Resolves true when the stream closed; false after the retries
+   * are exhausted, so the caller can fall back to the phrase path instead
+   * of dropping the reply (issue #181).
+   */
+  async #stopWithRetry(ts: string, text: string | undefined): Promise<boolean> {
     let retries = 0;
     for (;;) {
       try {
         await this.adapter.stopStream(this.spaceId, ts, text);
-        return;
+        return true;
       } catch (err) {
         if (retries >= STREAM_FINAL_RETRY_LIMIT) {
           console.error(
             `[slack-turn-presenter] stopStream failed in ${this.spaceId} after ${retries} retries:`,
             err,
           );
-          return;
+          return false;
         }
         retries += 1;
         await new Promise((resolve) => setTimeout(resolve, STREAM_UPDATE_INTERVAL_MS));

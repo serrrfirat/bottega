@@ -21,6 +21,7 @@ import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit
 import { redact } from "../../policy/audit";
 import type { SlackAdapter, SlackMessage, SlackStreamTask } from "../adapters/slack";
 import {
+  STREAM_FINAL_RETRY_LIMIT,
   STREAM_UPDATE_INTERVAL_MS,
   StreamTurnPresenter,
   SlackTurnPresenter,
@@ -52,7 +53,9 @@ interface RecordedAdapter {
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
 }
 
-function recordingAdapter(opts: { failStart?: boolean; streaming?: boolean } = {}): RecordedAdapter {
+function recordingAdapter(
+  opts: { failStart?: boolean; streaming?: boolean; failAppend?: boolean; failStop?: boolean } = {},
+): RecordedAdapter {
   const streams: StreamCall[] = [];
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
   const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
@@ -88,13 +91,16 @@ function recordingAdapter(opts: { failStart?: boolean; streaming?: boolean } = {
       return `stream-${streams.length}`;
     },
     async appendText(spaceId, ts, text) {
+      if (opts.failAppend) throw new Error("invalid_stream_arguments: Agents feature not enabled");
       texts.push({ spaceId, ts, text });
     },
     async appendTask(spaceId, ts, task) {
+      if (opts.failAppend) throw new Error("invalid_stream_arguments: Agents feature not enabled");
       tasks.push({ spaceId, ts, task });
     },
     async stopStream(spaceId, ts, text) {
       stops.push({ spaceId, ts, text });
+      if (opts.failStop) throw new Error("invalid_stream_arguments: Agents feature not enabled");
     },
     streamingSupported: () => opts.streaming ?? true,
     async start() {},
@@ -318,6 +324,89 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     await flush();
     expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: "post-1", text: "Here is the final answer" }]);
     expect(rec.stops).toHaveLength(0);
+  });
+
+  test("a mid-boot appendStream failure flips to the phrase+edit path without dropping the reply", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ failAppend: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // The stream opens (the workspace looked capable at the turn start).
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    const streamTs = "stream-1";
+
+    // Interim reply text: the append FAILS — the presenter flips to the
+    // phrase path and the text lands as an in-place edit of the stream
+    // message (never dropped, never re-attempted on a dead stream).
+    presenter.onMessage({ spaceId: "slack:C1", text: "Working on it" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.texts).toHaveLength(0); // the append never landed
+    expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: streamTs, text: "Working on it" }]);
+
+    // The final reply still lands (in place), and the stream is never
+    // re-opened: the fallback holds for the boot.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: "Here is the final answer" });
+    expect(rec.stops).toHaveLength(0);
+    expect(rec.streams).toHaveLength(1);
+
+    // Turn two keeps the one-message rule (#120): the phrase ROTATES the
+    // stream message in place (no fresh post, no stream re-open) — the
+    // fallback is permanent.
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.posts).toHaveLength(0);
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: THINKING_PHRASES[1] });
+  });
+
+  test("a stopStream failure never drops the final reply — it lands as an in-place edit", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ failStop: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    const streamTs = "stream-1";
+
+    presenter.onMessage({ spaceId: "slack:C1", text: "The final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    // The bounded stopStream retries all fail...
+    for (let attempt = 0; attempt <= STREAM_FINAL_RETRY_LIMIT; attempt += 1) {
+      vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+      await flush();
+    }
+    // ...and the final reply lands as an in-place edit of the stream message.
+    expect(rec.stops.length).toBe(STREAM_FINAL_RETRY_LIMIT + 1); // initial + bounded retries
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: "The final answer" });
+
+    // The fallback holds: the next turn opens a plain phrase post.
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[1], opts: { threadTs: "2.2" } }]);
   });
 
   test("receipt reaction, message.reply latency audit, and phrase rotation are unchanged by streaming mode", async () => {

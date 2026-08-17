@@ -1,5 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import type { ChatAppendStreamArguments, ChatPostMessageArguments, ChatStartStreamArguments, ChatStopStreamArguments, FilesInfoResponse } from "@slack/web-api";
+import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type FilesInfoResponse } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
@@ -338,6 +338,19 @@ export function buildUpdateMessageArgs(
  */
 export const STREAM_TASK_OUTPUT_MAX = 256;
 
+/**
+ * Retry policy for the dedicated stream client (issue #181): NO retries.
+ * The @slack/web-api default (`tenRetriesInAboutThirtyMinutes`) retries ANY
+ * failure — including the `ok:false` PlatformError a workspace without the
+ * Agents feature returns — for ~30 minutes, silently hanging the turn.
+ * Stream calls must fail fast: one attempt, the per-boot cache flips, the
+ * phrase+edit fallback takes over.
+ */
+export const STREAM_RETRY_CONFIG = { retries: 0, factor: 1, minTimeout: 1, maxTimeout: 1, randomize: false };
+
+/** Bounds every stream call (boot probe included): a hung connection fails fast, never blocks a turn. */
+export const STREAM_CALL_TIMEOUT_MS = 10_000;
+
 /** The markdown_text chunk: streamed reply text (issue #168). */
 export interface StreamMarkdownChunk {
   type: "markdown_text";
@@ -427,6 +440,62 @@ export function buildStopStreamArgs(
       ? { blocks: [{ type: "section" as const, text: { type: "mrkdwn" as const, text: renderSlackText(text) } }] }
       : {}),
   };
+}
+
+/**
+ * The `error` code on a @slack/web-api PlatformError payload
+ * (`{ ok: false, error: "…", needed?, provided? }`), when the thrown value
+ * carries one. Runtime-narrowed: unknown shapes read as undefined.
+ */
+function streamErrorCode(err: unknown): string | undefined {
+  if (err === null || typeof err !== "object" || !("data" in err)) return undefined;
+  const data = err.data;
+  if (data === null || typeof data !== "object" || !("error" in data)) return undefined;
+  return typeof data.error === "string" ? data.error : undefined;
+}
+
+/**
+ * Whether a chat.startStream failure PROVES the workspace cannot stream
+ * (issue #181): a scope/token-level error — the app lacks `assistant:write`
+ * or the Agents feature — versus a channel-level error (invalid channel,
+ * missing ts), which only means the probe's dummy channel was rejected and
+ * the token CAN stream. Fail closed: any error we cannot classify as a
+ * scope/token problem counts as supported — the probe is an optimization;
+ * the first real stream call still fails fast (no-retry client) and flips
+ * the per-boot cache.
+ */
+export function isStreamingCapabilityError(err: unknown): boolean {
+  const code = streamErrorCode(err);
+  return code === "missing_required_scope" || code === "not_allowed_token_type" || code === "invalid_auth";
+}
+
+/**
+ * PRODUCTION streaming feature-detect (issue #181): a FAST, bounded probe —
+ * one no-retry `chat.startStream` attempt against a deliberately invalid
+ * channel, so a supported workspace fails with a channel-level error and
+ * NOTHING is posted, while a workspace missing `assistant:write` / the
+ * Agents feature fails with the scope/token error that proves it cannot
+ * stream. Runs once at boot; the result is cached per boot (the adapter's
+ * `streamingCapable`) and logged with the failure as evidence.
+ */
+export async function probeStreamingSupport(client: WebClient, teamId: string | undefined): Promise<{
+  supported: boolean;
+  error?: string;
+}> {
+  try {
+    await client.chat.startStream({
+      channel: "C00000000", // deliberately invalid: never opens a visible stream
+      thread_ts: "1.000000",
+      ...(teamId !== undefined ? { recipient_team_id: teamId } : {}),
+      chunks: [{ type: "markdown_text", text: "streaming capability probe" }],
+    });
+    // Unreachable with an invalid channel; fail open regardless.
+    return { supported: true };
+  } catch (err) {
+    return isStreamingCapabilityError(err)
+      ? { supported: false, error: streamErrorCode(err) }
+      : { supported: true };
+  }
 }
 
 export interface MessageHandlerOptions {
@@ -545,6 +614,21 @@ export function createSlackAdapter(opts: {
     tokenVerificationEnabled: false,
     clientOptions: opts.clientOptions,
   });
+  /**
+   * Dedicated client for chat.startStream/appendStream/stopStream ONLY
+   * (issue #181): the @slack/web-api default retry policy
+   * (tenRetriesInAboutThirtyMinutes) retries ANY failure — including the
+   * `ok:false` PlatformError a workspace without the Agents feature
+   * returns — for ~30 minutes, silently hanging the turn. Stream calls
+   * never retry: one attempt, fail fast, the per-boot cache flips, the
+   * phrase+edit fallback takes over. All other calls keep the default
+   * policy on `app.client`.
+   */
+  const streamClient = new WebClient(opts.botToken, {
+    ...(opts.clientOptions ?? {}),
+    retryConfig: STREAM_RETRY_CONFIG,
+    timeout: STREAM_CALL_TIMEOUT_MS,
+  });
 
   // Resolved once at start via auth.test; the mention filter matches
   // `<@U0XXX>` in channel text and no event can arrive before the socket
@@ -557,12 +641,14 @@ export function createSlackAdapter(opts: {
    */
   let teamId: string | undefined;
   /**
-   * Per-boot streaming capability cache (issue #168): assumed true until
-   * the first startStream failure flips it false for the rest of the
-   * process — a workspace without the Agents feature is detected once,
-   * never probed per message. Fail closed: any failure (missing feature,
-   * missing recipient_team_id, rate limit) degrades to the phrase+edit
-   * path rather than silently dropping replies.
+   * Per-boot streaming capability cache (issue #168/#181): probed once at
+   * start() with a fast, bounded capability probe; assumed true until the
+   * first stream call failure flips it false for the rest of the process —
+   * a workspace without the Agents feature is detected once, never probed
+   * per message. Fail closed: any failure (missing feature, missing scope,
+   * missing recipient_team_id, rate limit, network) degrades to the
+   * phrase+edit path, and the no-retry stream client guarantees the
+   * failure arrives fast instead of a ~30-minute SDK retry storm.
    */
   let streamingCapable = true;
 
@@ -673,12 +759,14 @@ export function createSlackAdapter(opts: {
       }
       try {
         const args = buildStartStreamArgs(spaceId, streamOpts, teamId) as ChatStartStreamArguments;
-        const res = await app.client.chat.startStream(args);
+        const res = await streamClient.chat.startStream(args);
         return res.ts;
       } catch (err) {
         // Fail closed + cached: any stream failure degrades the workspace
         // to the phrase+edit path for the rest of the boot. The caller
-        // falls back immediately, so no reply is dropped.
+        // falls back immediately, so no reply is dropped. The dedicated
+        // no-retry client guarantees the failure arrives fast — never a
+        // ~30-minute SDK retry storm (issue #181).
         streamingCapable = false;
         console.error(
           `[slack] chat.startStream failed (${err instanceof Error ? err.message : String(err)}) — ` +
@@ -688,17 +776,44 @@ export function createSlackAdapter(opts: {
       }
     },
     async appendText(spaceId, ts, text) {
-      await app.client.chat.appendStream(
-        buildAppendTextArgs(spaceId, ts, text) as ChatAppendStreamArguments,
-      );
+      try {
+        await streamClient.chat.appendStream(
+          buildAppendTextArgs(spaceId, ts, text) as ChatAppendStreamArguments,
+        );
+      } catch (err) {
+        streamingCapable = false;
+        console.error(
+          `[slack] chat.appendStream (markdown) failed (${err instanceof Error ? err.message : String(err)}) — ` +
+            "disabling streaming for this boot; falling back to phrase+edit",
+        );
+        throw err;
+      }
     },
     async appendTask(spaceId, ts, task) {
-      await app.client.chat.appendStream(
-        buildAppendTaskArgs(spaceId, ts, task) as ChatAppendStreamArguments,
-      );
+      try {
+        await streamClient.chat.appendStream(
+          buildAppendTaskArgs(spaceId, ts, task) as ChatAppendStreamArguments,
+        );
+      } catch (err) {
+        streamingCapable = false;
+        console.error(
+          `[slack] chat.appendStream (task_update) failed (${err instanceof Error ? err.message : String(err)}) — ` +
+            "disabling streaming for this boot; falling back to phrase+edit",
+        );
+        throw err;
+      }
     },
     async stopStream(spaceId, ts, text) {
-      await app.client.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
+      try {
+        await streamClient.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
+      } catch (err) {
+        streamingCapable = false;
+        console.error(
+          `[slack] chat.stopStream failed (${err instanceof Error ? err.message : String(err)}) — ` +
+            "disabling streaming for this boot; falling back to phrase+edit",
+        );
+        throw err;
+      }
     },
     streamingSupported: () => (opts.streamingSupported !== undefined ? opts.streamingSupported() : streamingCapable),
     start: async () => {
@@ -714,6 +829,26 @@ export function createSlackAdapter(opts: {
         if (auth.ok && typeof auth.team_id === "string") teamId = auth.team_id;
       } catch (err) {
         console.error("[slack] failed to resolve bot user id (mention filtering disabled):", err);
+      }
+      // PRODUCTION streaming feature-detect (issue #181): a fast, bounded
+      // probe once per boot — cached per boot, logged with evidence. An
+      // explicit capability override (issue #179, e2e harness) already IS
+      // the decision, so the probe is skipped. The probe needs teamId
+      // (recipient_team_id) to make a well-formed channel call: without it
+      // the only error would be an arg-level one that discriminates
+      // nothing, so skip the probe and let the first real stream call
+      // fail fast on the no-retry client instead. A probe that cannot
+      // prove "unsupported" leaves the cache at its assumed-true default.
+      if (opts.streamingSupported === undefined && teamId !== undefined) {
+        const probe = await probeStreamingSupport(streamClient, teamId);
+        streamingCapable = probe.supported;
+        if (probe.supported) {
+          console.log("[slack] streaming supported: chat.startStream capability probe passed — thinking panel enabled");
+        } else {
+          console.error(
+            `[slack] streaming unsupported: ${probe.error ?? "unknown"} — using the phrase+edit fallback for this boot`,
+          );
+        }
       }
       await app.start();
     },
