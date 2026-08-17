@@ -18,8 +18,10 @@
  * catalog (via the #54 fetch-catalog helper — same seams, same fail-closed
  * errors). `draft` fetches a catalog entry and writes an UNREVIEWED draft
  * snapshot (source.reviewed: false) to config/extensions/drafts/ — drafts
- * are never installed or pinned by this tool; a maintainer completes the
- * binding facts from the vendor docs and pins through the fetch-catalog
+ * are never installed or pinned by this tool; catalog entries carry no
+ * MCP/CLI binding, so the draft result surfaces that and tells the agent to
+ * web-search the vendor's OFFICIAL MCP server (issue #146) before a
+ * maintainer completes the binding facts and pins through the fetch-catalog
  * flow (which enforces the review gate). The drafts dir sits OUTSIDE the
  * registry's scan (readPinnedSnapshots reads only top-level *.json), so a
  * draft can never fail the boot.
@@ -497,10 +499,12 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
       "PINNED snapshots (config/extensions) and the integrations.sh catalog; the catalog is capped " +
       "at 50 matches with a truncated flag. `draft` requires `spec` (catalog slug or id, e.g. " +
       "\"linear\") and writes an UNREVIEWED draft snapshot (source.reviewed: false) to " +
-      "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this tool; a " +
-      "maintainer completes the binding facts (mcp/cli, credentialSchema, tools) from the vendor " +
-      "docs and pins through the fetch-catalog flow after review. Write-tier: prompts for approval " +
-      "in non-yolo modes (admin-gated like the settings tool).",
+      "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this tool. " +
+      "Catalog entries carry no MCP/CLI binding, so when drafting one, web-search the vendor's " +
+      "OFFICIAL MCP server (serverUrl + transport + credentialSchema + tools from the vendor's " +
+      "published MCP spec; vendor-official URLs only — never guess or use community URLs), complete " +
+      "the draft keeping source.reviewed: false, and pin through the fetch-catalog flow after human " +
+      "review. Write-tier: prompts for approval in non-yolo modes (admin-gated like the settings tool).",
     parameters: catalogBrowserArgsSchema,
     approval: "write",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
@@ -511,6 +515,9 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           }
           const entry = await fetchCatalogEntry(params.spec.trim(), catalogOpts);
           const draft = buildSnapshotDraft(entry);
+          // The catalog record carries no MCP/CLI binding (issue #146): the
+          // agent must research the vendor's official server before completing.
+          const bindingMissing = draft.manifest.mcp === undefined && draft.manifest.cli === undefined;
           mkdirSync(draftsDir, { recursive: true });
           const outPath = resolve(draftsDir, `${draft.extensionId}.draft.json`);
           writeFileSync(outPath, JSON.stringify(draft, null, 2) + "\n");
@@ -528,10 +535,17 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   spec: params.spec.trim(),
                   written_to: outPath,
                   reviewed: false,
-                  note:
-                    "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema, " +
-                    "tools) from the vendor docs, mark source.reviewed, and pin via the fetch-catalog " +
-                    "flow (--pin) to install.",
+                  binding_missing: bindingMissing,
+                  note: bindingMissing
+                    ? "DRAFT — not installed. This catalog entry has NO MCP/CLI binding: research the " +
+                      "vendor's OFFICIAL MCP server via web_search before completing the draft — " +
+                      "serverUrl + transport + credentialSchema + tools from the vendor's published MCP " +
+                      "spec; vendor-official URLs only, do NOT guess or use community URLs. Complete the " +
+                      "draft, keep source.reviewed: false (human review gates the pin), then pin via the " +
+                      "fetch-catalog flow (--pin)."
+                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema, " +
+                      "tools) from the vendor docs, mark source.reviewed, and pin via the fetch-catalog " +
+                      "flow (--pin) to install.",
                   draft,
                 }),
               },

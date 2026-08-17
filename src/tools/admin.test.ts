@@ -355,9 +355,22 @@ describe("catalog_browser (issue #73)", () => {
       });
       const res = await call(tools[0], { action: "draft", spec: "linear" });
       expect(res.isError).toBe(false);
-      const body = JSON.parse(res.text) as { written_to: string; reviewed: boolean; draft: { source: { reviewed: boolean } } };
+      const body = JSON.parse(res.text) as {
+        written_to: string;
+        reviewed: boolean;
+        binding_missing: boolean;
+        note: string;
+        draft: { source: { reviewed: boolean } };
+      };
       expect(body.written_to).toBe(join(draftsDir, "linear.draft.json"));
       expect(body.reviewed).toBe(false);
+      expect(body.binding_missing).toBe(true);
+      // Catalog entries carry no MCP/CLI binding: the note must explicitly
+      // instruct web_search research of the vendor's OFFICIAL server (issue #146).
+      expect(body.note).toContain("NO MCP/CLI binding");
+      expect(body.note).toContain("web_search");
+      expect(body.note).toContain("OFFICIAL MCP server");
+      expect(body.note).toContain("do NOT guess or use community URLs");
       expect(body.draft.source.reviewed).toBe(false);
       expect(existsSync(join(draftsDir, "linear.draft.json"))).toBe(true);
 

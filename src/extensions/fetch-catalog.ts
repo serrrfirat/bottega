@@ -10,6 +10,11 @@
  * in the binding facts (mcp/cli, credentialSchema, tools) from vendor docs
  * and marked source.reviewed / source.vendorOfficial.
  *
+ * The catalog record never carries an MCP/CLI binding, so the agent draft
+ * flow (catalog_browser) instructs web-searching the vendor's OFFICIAL MCP
+ * server and filling the scaffold from the vendor's published spec (issue
+ * #146); the pin/review gate is unchanged.
+ *
  * Why the draft is never written directly: the catalog record carries only
  * id/slug/name/kind/domain/url — not the MCP endpoint, auth, or tool
  * surface. A scaffold manifest therefore fails validateManifest (fail
