@@ -1,5 +1,9 @@
 # Bottega
 
+<p align="center">
+  <img src=".github/assets/hero.png" alt="Illustration of people and AI collaborators working together in the Bottega workshop" width="100%">
+</p>
+
 **An AI co-worker that lives in your Slack and picks up real work for your
 org.** Update the CRM, chase a follow-up, run the weekly ops chore, answer
 the question nobody has time to dig into, ship a fix — ask in the channel,
