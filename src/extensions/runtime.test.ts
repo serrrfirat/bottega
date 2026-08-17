@@ -343,6 +343,34 @@ describe("extension runtime: ladder (org / me / auto) and boundary", () => {
     expect(parse(calls[0]!)).toMatchObject({ decision: "error", credential_id: null });
   });
 
+  test("a provider isError result surfaces as a tool error, not a masked success (issue #178)", async () => {
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(CallToolRequestSchema, async () => ({
+        content: [{ type: "text", text: "parameter labels could not be coerced to []string, is string" }],
+        isError: true,
+      }));
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const h = makeHarness({ mcpTransport });
+    await seedOrgCredential(h.store);
+
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "U0B9QUPCTJ5",
+    });
+    // The provider's error flag is NOT masked as a success: the caller sees
+    // a failure naming the provider's message (the old behavior returned
+    // ok:true with the error text as content, which made the agent retry a
+    // write "blind" — the duplicate-execution half of issue #178).
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("parameter labels could not be coerced");
+  });
+
   test("a boundary failure fails closed as a tool error (allow already audited)", async () => {
     const failingBoundary: CredentialBoundary = {
       async authorize() {

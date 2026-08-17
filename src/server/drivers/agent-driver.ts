@@ -991,12 +991,12 @@ export class OmpSessionDriver implements AgentSessionDriver {
           this.#emitter.emit("turn_start", { spaceId: deps.spaceId });
           break;
         case "turn_end":
-          // The turn is over: no tool call can run after this, so the
-          // per-turn binding is dropped (fail closed — the next fresh turn
-          // rebinds from its own prompt's principal, issue #152).
-          this.#turnPrincipal = undefined;
           // Carry the cause (when one exists) so the empty-completion path
-          // can surface it instead of the generic phrase (#78).
+          // can surface it instead of the generic phrase (#78). The turn
+          // principal is NOT cleared here: the SDK's agent loop emits
+          // turn_end after EVERY tool round (willContinue), so a mid-turn
+          // round boundary must not drop the binding — the opening prompt's
+          // resolution is the true turn end (issue #178).
           this.#emitter.emit("turn_end", { spaceId: deps.spaceId, error: this.#lastError });
           break;
         case "notice":
@@ -1028,7 +1028,17 @@ export class OmpSessionDriver implements AgentSessionDriver {
       } else {
         // Fresh turn: capture the inbound principal with the turn.
         this.#turnPrincipal = opts?.principal;
-        await this.#session.prompt(text);
+        try {
+          await this.#session.prompt(text);
+        } finally {
+          // The turn truly ends when the OPENING prompt resolves. The SDK's
+          // agent loop emits turn_end after EVERY tool round (willContinue
+          // true), so clearing here — never in the turn_end event handler —
+          // keeps the binding for later rounds of the same turn (issue
+          // #178): a continued or retried tool call must carry the turn's
+          // principal, not fall back to the bridge's "agent" default.
+          this.#turnPrincipal = undefined;
+        }
       }
     } finally {
       this.#silentTurn = false;

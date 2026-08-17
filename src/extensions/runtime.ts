@@ -314,6 +314,19 @@ async function callMcpTool(
     if (!("content" in result)) {
       throw new Error(`MCP server returned a task-based result for "${toolName}" (not supported)`);
     }
+    // The provider's isError flag must surface as a FAILURE, not a success:
+    // a server-side validation/execution error delivered as content (e.g.
+    // GitHub's "parameter labels could not be coerced") is a tool error —
+    // masking it as a success made the agent retry the write "blind" and
+    // amplified the duplicate-execution confusion of issue #178.
+    if (result.isError === true) {
+      const text = result.content
+        .filter((block): block is { type: "text"; text: string } => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+      return { ok: false, error: text || `MCP server reported an error for "${toolName}"` };
+    }
     return {
       ok: true,
       content: result.content.map((block) =>

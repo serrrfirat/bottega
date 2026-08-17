@@ -4,15 +4,21 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type CreateAgentSessionOptions, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { connectExtensionToolDefinition } from "../../extensions/connect";
-import { createFixtureRegistry } from "../../extensions/fixture";
+import { createFixtureRegistry, FIXTURE_EXTENSION_ID } from "../../extensions/fixture";
+import type { McpBinding } from "../../extensions/manifest";
+import { createExtensionRuntime } from "../../extensions/runtime";
 import { extensionToolDefinitions } from "../../extensions/tools";
 import type { ExtensionRuntime } from "../../extensions/runtime";
 import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
-import { createStore, type SpaceModelSettings } from "../../store/db";
-import { POLICY_DECISION_EVENT } from "../../store/audit-events";
+import { createStore, type ExtensionCredential, type SpaceModelSettings } from "../../store/db";
+import { EXTENSION_CALL_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-events";
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
@@ -649,11 +655,18 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
   });
 });
 
-describe("OmpSessionDriver per-turn principal (issue #152)", () => {
-  /** Stub SDK session: controllable streaming, records prompt/steer/followUp, injectable events. */
+describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
+  /**
+   * Stub SDK session: controllable streaming, records prompt/steer/followUp,
+   * injectable events. The SDK's `prompt` resolves only when the WHOLE turn
+   * ends (all tool rounds + the final message), so the stub's prompt stays
+   * pending until the test calls `endTurn()` — that is what makes
+   * per-round `turn_end` events distinguishable from the true turn end.
+   */
   function stubTurnSession() {
     let listener: ((event: unknown) => void) | undefined;
     let streaming = false;
+    let finishTurn: (() => void) | undefined;
     const calls: Array<{ kind: "prompt" | "steer" | "followUp"; text: string }> = [];
     const session = {
       subscribe: (cb: (event: unknown) => void) => {
@@ -670,6 +683,10 @@ describe("OmpSessionDriver per-turn principal (issue #152)", () => {
       prompt: async (text: string) => {
         streaming = true;
         calls.push({ kind: "prompt", text });
+        await new Promise<void>((resolve) => {
+          finishTurn = resolve;
+        });
+        streaming = false;
       },
       steer: async (text: string) => {
         calls.push({ kind: "steer", text });
@@ -687,15 +704,21 @@ describe("OmpSessionDriver per-turn principal (issue #152)", () => {
       setStreaming: (v: boolean) => {
         streaming = v;
       },
+      endTurn: () => {
+        finishTurn?.();
+        finishTurn = undefined;
+      },
     };
   }
 
-  test("a fresh prompt binds the inbound principal; steer/followUp keep it; turn_end drops it", async () => {
-    const { session, emit, setStreaming } = stubTurnSession();
+  test("a fresh prompt binds the inbound principal; steer/followUp keep it; the opening prompt's resolution drops it", async () => {
+    const { session, emit, endTurn } = stubTurnSession();
     const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
 
     // A's message opens the turn: A is bound for every call in the turn.
-    await driver.prompt("a's message", { principal: "UA" });
+    // The opening prompt stays pending until endTurn() — like the SDK's
+    // prompt, which resolves only when the whole turn completes.
+    const opening = driver.prompt("a's message", { principal: "UA" });
     expect(driver.getTurnPrincipal()).toBe("UA");
 
     // B steers into A's in-flight turn: the binding stays A's — B's
@@ -704,22 +727,162 @@ describe("OmpSessionDriver per-turn principal (issue #152)", () => {
     await driver.prompt("b's follow-up", { streamingBehavior: "followUp", principal: "UB" });
     expect(driver.getTurnPrincipal()).toBe("UA");
 
-    // The turn ends: the binding drops (fail closed between turns).
-    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    // The SDK's agent loop emits turn_end after EVERY tool round
+    // (willContinue true): a round boundary is NOT the turn end, so the
+    // binding must survive it (issue #178).
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "round done" }] } });
+    expect(driver.getTurnPrincipal()).toBe("UA");
+
+    // The turn truly ends when the OPENING prompt resolves: the binding
+    // drops (fail closed between turns — the next fresh turn rebinds).
+    endTurn();
+    await opening;
     expect(driver.getTurnPrincipal()).toBeUndefined();
 
     // B's own message starts B's turn: B binds.
-    setStreaming(false);
-    await driver.prompt("b's next message", { principal: "UB" });
+    const second = driver.prompt("b's next message", { principal: "UB" });
     expect(driver.getTurnPrincipal()).toBe("UB");
+    endTurn();
+    await second;
   });
 
   test("a turn nobody started (digest) binds no principal", async () => {
-    const { session } = stubTurnSession();
+    const { session, endTurn } = stubTurnSession();
     const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
 
-    await driver.prompt("summarize", { silent: true });
+    const opening = driver.prompt("summarize", { silent: true });
     expect(driver.getTurnPrincipal()).toBeUndefined();
+    endTurn();
+    await opening;
+    expect(driver.getTurnPrincipal()).toBeUndefined();
+  });
+
+  test("a continued tool round in the same turn keeps the turn principal — never 'agent' (issue #178)", async () => {
+    const { session, emit, endTurn } = stubTurnSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+
+    // The user's write request opens the turn: the principal binds once.
+    const opening = driver.prompt("can you create a test issue", { principal: "U0B9QUPCTJ5" });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+
+    // Round 1: the first tool call runs under the principal.
+    emit({ type: "turn_start" });
+    emit({ type: "tool_execution_start", toolCallId: "call_1", toolName: "github_issue_write", args: {} });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+    emit({ type: "tool_execution_end", toolCallId: "call_1", toolName: "github_issue_write", result: { content: [] }, isError: false });
+    // Round boundary: the SDK's agent loop emits turn_end + turn_start
+    // between rounds. The old code cleared the binding here — the retry
+    // then hit the credential ladder as caller "agent" (#178's live
+    // evidence: extension.call {tool:"issue_write", actor:"agent"}).
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "github_issue_write", arguments: {} }] }, toolResults: [] });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+
+    // Round 2: the model's retried write call executes under the SAME
+    // principal — the personal credential still resolves.
+    emit({ type: "turn_start" });
+    emit({ type: "tool_execution_start", toolCallId: "call_2", toolName: "github_issue_write", args: {} });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+    emit({ type: "tool_execution_end", toolCallId: "call_2", toolName: "github_issue_write", result: { content: [] }, isError: true });
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_2", name: "github_issue_write", arguments: {} }] }, toolResults: [] });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+
+    // The turn ends when the opening prompt resolves: the binding drops.
+    endTurn();
+    await opening;
+    expect(driver.getTurnPrincipal()).toBeUndefined();
+  });
+
+  test("full path: one execution per tool call, every round audited with the turn principal + resolved credential — no wire-name 'agent' duplicate (issue #178)", async () => {
+    const { session, emit, endTurn } = stubTurnSession();
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+
+    const store = createStore(":memory:");
+    const boundaryCalls: ExtensionCredential[] = [];
+    const mcpTransport = (_binding: McpBinding): Transport => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const args = request.params.arguments as Record<string, unknown>;
+        return { content: [{ type: "text", text: `sunny in ${String(args["city"] ?? "")}` }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const runtime = createExtensionRuntime({
+      registry: createFixtureRegistry(),
+      store,
+      audit: createAudit(store),
+      // org denied so the ladder resolves the CALLER's personal row (never
+      // falls through to an org credential for the wrong principal).
+      orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\nextensions:\n  org_credentials: deny\n"),
+      router: DenyRouter,
+      boundary: {
+        async authorize(credential: ExtensionCredential) {
+          boundaryCalls.push(credential);
+        },
+      },
+      mcpTransport,
+    });
+    await store.upsertExtensionCredential({
+      provider: FIXTURE_EXTENSION_ID,
+      identityKey: "email:u0b9qupctj5@example.com",
+      owner: "U0B9QUPCTJ5",
+      scope: "personal",
+      brokerCredentialId: 2,
+    });
+    const [definition] = extensionToolDefinitions(createFixtureRegistry().list(), {
+      runtime,
+      // The server adapter wires exactly this seam (issue #152): the caller
+      // of every extension call is the turn principal of the space the
+      // session file names.
+      getCaller: () => driver.getTurnPrincipal(),
+    });
+    const ctx = {
+      sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
+    } as unknown as Parameters<typeof definition.execute>[4];
+
+    // The user's write request opens the turn: the principal binds once.
+    const opening = driver.prompt("can you create a test issue", { principal: "U0B9QUPCTJ5" });
+    expect(driver.getTurnPrincipal()).toBe("U0B9QUPCTJ5");
+
+    // Round 1: ONE tool request → exactly ONE execution, audited with the
+    // turn principal + the resolved personal credential.
+    emit({ type: "turn_start" });
+    const first = await definition.execute("call_1", { city: "Lisbon" }, undefined, undefined, ctx);
+    expect(first.isError).not.toBe(true);
+    let rows = await store.listAudit({ event_type: EXTENSION_CALL_EVENT });
+    expect(rows).toHaveLength(1);
+    const payload0 = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+    expect(payload0).toMatchObject({
+      actor: "U0B9QUPCTJ5",
+      decision: "allow",
+    });
+    expect(payload0["credential_id"]).toBeTruthy();
+    expect(boundaryCalls).toHaveLength(1);
+    expect(boundaryCalls[0]!.owner).toBe("U0B9QUPCTJ5");
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "weather.current", arguments: {} }] }, toolResults: [] });
+
+    // Round 2 (the model's retry): the SAME principal is still bound — the
+    // ladder resolves the personal credential again, never "agent", and the
+    // second call is a distinct execution (not a duplicate of round 1).
+    emit({ type: "turn_start" });
+    const second = await definition.execute("call_2", { city: "Porto" }, undefined, undefined, ctx);
+    expect(second.isError).not.toBe(true);
+    rows = await store.listAudit({ event_type: EXTENSION_CALL_EVENT });
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      expect(payload).toMatchObject({ actor: "U0B9QUPCTJ5", decision: "allow" });
+    }
+    expect(boundaryCalls).toHaveLength(2);
+    expect(boundaryCalls[1]!.owner).toBe("U0B9QUPCTJ5");
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_2", name: "weather.current", arguments: {} }] }, toolResults: [] });
+
+    // The turn ends when the opening prompt resolves: fail closed between turns.
+    endTurn();
+    await opening;
+    expect(driver.getTurnPrincipal()).toBeUndefined();
+    store.close();
   });
 });
 
