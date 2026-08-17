@@ -20,16 +20,29 @@
  * snapshot (source.reviewed: false) to config/extensions/drafts/ — drafts
  * are never installed or pinned by this tool; catalog entries carry no
  * MCP/CLI binding, so the draft result surfaces that and tells the agent to
- * web-search the vendor's OFFICIAL MCP server (issue #146) before a
- * maintainer completes the binding facts. Manifest tools are OPTIONAL
- * (issue #158): omit them to pin a tools-less manifest whose surface is
- * discovered at runtime from the provider's tools/list with conservative
- * tiers (the agent sees the provider's FULL real surface, never a
- * hand-authored subset), or pin tools explicitly via fetch-catalog
- * --generate-tools (issue #157). The draft pins through the fetch-catalog
- * flow (which enforces the review gate). The drafts dir sits OUTSIDE the
- * registry's scan (readPinnedSnapshots reads only top-level *.json), so a
- * draft can never fail the boot.
+ * web-search the vendor's OFFICIAL MCP server (issue #146) before
+ * completing the binding facts. `pin` is the CHAT-NATIVE pin (issue #195):
+ * the agent completes the draft IN-CHANNEL (binding/credentialSchema/tools
+ * via params — the space agent has no write/bash tools, so the binding
+ * facts come from the call, the provenance from the draft file), the tool
+ * surfaces the draft summary and REQUIRES the human's in-channel
+ * confirmation (confirm: true — the confirmation IS the review: the
+ * snapshot records source.reviewed: true, and an unconfirmed/unreviewed
+ * draft always refuses, fail closed), writes the pinned snapshot via the
+ * fetch-catalog pin flow (same review gate), and regenerates
+ * config/egress.yml + config/egress.dev.yml (#53 domains — the binding
+ * host is merged into the allowlist domains). POLICY (#49/#195): official
+ * HOSTED streamable-http + OAuth bindings are preferred; stdio/CLI
+ * bindings pin only when the agent web-searched and verified NO official
+ * hosted variant exists (no_hosted_variant: true — documented in the
+ * guidance). Manifest tools are OPTIONAL (issue #158): omit them to pin a
+ * tools-less manifest whose surface is discovered at runtime from the
+ * provider's tools/list with conservative tiers (the agent sees the
+ * provider's FULL real surface, never a hand-authored subset), or pin
+ * tools explicitly via the tools param / fetch-catalog --generate-tools
+ * (issue #157). The drafts dir sits OUTSIDE the registry's scan
+ * (readPinnedSnapshots reads only top-level *.json), so a draft can never
+ * fail the boot.
  *
  * Stack health (`stack_health`): per-service status for
  * broker/gateway/iron-proxy/mem0/executor. Compose state via
@@ -65,9 +78,20 @@ import {
   buildSnapshotDraft,
   fetchCatalogEntry,
   listCatalogEntries,
+  pinSnapshotDraft,
   type FetchCatalogOptions,
+  type SnapshotDraft,
 } from "../extensions/fetch-catalog";
+import type { CliBinding, CredentialSchema, ExtensionTool, McpBinding } from "../extensions/manifest";
+import { validateManifest } from "../extensions/manifest";
 import type { ResolvedExtension } from "../extensions/registry";
+import {
+  DEV_EGRESS_CONFIG_PATH,
+  EGRESS_CONFIG_PATH,
+  SNAPSHOTS_DIR,
+  regenerateDevEgressConfig,
+  regenerateEgressConfig,
+} from "../egress/generate";
 import type { Store } from "../store/db";
 import type { AuditModule } from "../policy/audit";
 import { errorMessage, toolError } from "./helpers";
@@ -125,6 +149,10 @@ export interface AdminToolsOpts {
   catalog?: FetchCatalogOptions;
   /** Where catalog drafts land. Default "config/extensions/drafts". */
   catalogDraftsDir?: string;
+  /** Where the pin action writes pinned snapshots. Default "config/extensions" (SNAPSHOTS_DIR). */
+  catalogSnapshotsDir?: string;
+  /** Dev-permissive egress output for the pin's regeneration. Default "config/egress.dev.yml". */
+  devEgressConfigPath?: string;
   /** Stack-health probe seams; defaults are the real probes. */
   health?: HealthProbeSeams;
   /** Git token file for the wizard's PAT check. Default EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat". */
@@ -137,13 +165,36 @@ export interface AdminToolsOpts {
   configDir?: () => string;
 }
 
-/** Tool args: browser action + optional query/spec. */
+/** Tool args: browser action + optional query/spec + the pin completion facts. */
 export const catalogBrowserArgsSchema = z.object({
-  action: z.enum(["list", "draft"]).default("list"),
+  action: z.enum(["list", "draft", "pin"]).default("list"),
   /** Substring filter for `list` (name/slug/id/kind/domain, case-insensitive). */
   query: z.string().optional(),
-  /** Catalog slug or id (e.g. "linear", "mcp/linear") — required for `draft`. */
+  /** Catalog slug or id (e.g. "linear", "mcp/linear") — required for `draft`; draft id — required for `pin`. */
   spec: z.string().optional(),
+  /** Pin: the human's IN-CHANNEL confirmation. REQUIRED to pin — the confirmation is the review. */
+  confirm: z.boolean().optional().describe("Human confirmation for the pin (required: the review gate)"),
+  /** Pin: true when web-search verified NO official hosted MCP variant exists (required for stdio/CLI bindings). */
+  no_hosted_variant: z
+    .boolean()
+    .optional()
+    .describe("True when the agent verified no official hosted MCP server exists (stdio/CLI fallback)"),
+  /** Pin: the completed MCP binding ({serverUrl|command, transport}) or CLI binding ({command, args?, env?}) the agent filled from vendor docs. */
+  binding: z.record(z.string(), z.unknown()).optional().describe("The completed MCP/CLI binding from the vendor's official spec"),
+  /** Pin: the completed credentialSchema ({type: "oauth"|"api_key", scopes?}). */
+  credential_schema: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("The completed credentialSchema ({type: oauth|api_key, scopes?})"),
+  /** Pin: the explicit tool surface (optional — absent → runtime discovery of the provider's tools/list, issue #158). */
+  tools: z
+    .array(z.record(z.string(), z.unknown()))
+    .optional()
+    .describe("The explicit pinned tool surface (optional; omit for runtime discovery)"),
+  /** Pin: additional egress domains (the binding host is always merged automatically). */
+  domains: z.array(z.string()).optional().describe("Extra egress allowlist domains"),
+  /** Pin: true when the binding is the vendor's OFFICIAL server (the #146 web-search determination). */
+  vendor_official: z.boolean().optional().describe("True when the binding is the vendor's official server (per #146)"),
 });
 
 /** No args: the health report covers every service. */
@@ -190,6 +241,43 @@ function pinnedView(entry: ResolvedExtension): Record<string, unknown> {
     reviewed: entry.snapshot?.source.reviewed ?? false,
     pinned_at: entry.snapshot?.pinnedAt ?? null,
   };
+}
+
+/**
+ * The review-gate summary for a completed draft: everything the human must
+ * see before confirming a pin (id, label, kind, binding, credential schema,
+ * tool count, domains, provenance). One source shared by the
+ * confirm-required refusal and the audit trail.
+ */
+function draftSummary(draft: SnapshotDraft): Record<string, unknown> {
+  return {
+    id: draft.manifest.id,
+    label: draft.manifest.label,
+    kind: draft.manifest.kind,
+    binding: draft.manifest.kind === "mcp" ? draft.manifest.mcp : draft.manifest.cli,
+    credential_schema: draft.manifest.credentialSchema,
+    tools_count: draft.manifest.tools?.length ?? null,
+    domains: draft.manifest.domains,
+    vendor_official: draft.source.vendorOfficial,
+    reviewed: draft.source.reviewed,
+  };
+}
+
+/**
+ * The binding's egress host when the binding is a hosted streamable-http
+ * MCP server (the host the proxy must allowlist + inject credentials for,
+ * issue #53/#195); null for stdio/CLI bindings (no remote host). Used by
+ * the pin action to merge the MCP host into the allowlist domains.
+ */
+function hostedBindingHost(draft: SnapshotDraft): string | null {
+  if (draft.manifest.kind !== "mcp" || draft.manifest.mcp === undefined || draft.manifest.mcp.transport !== "streamable-http") {
+    return null;
+  }
+  try {
+    return new URL(draft.manifest.mcp.serverUrl).host;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,26 +582,36 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
   const audit = opts.audit;
   const catalogOpts: FetchCatalogOptions = opts.catalog ?? {};
   const draftsDir = opts.catalogDraftsDir ?? "config/extensions/drafts";
+  const snapshotsDir = opts.catalogSnapshotsDir ?? SNAPSHOTS_DIR;
+  const egressPath = opts.egressConfigPath ?? EGRESS_CONFIG_PATH;
+  const devEgressPath = opts.devEgressConfigPath ?? DEV_EGRESS_CONFIG_PATH;
 
   const catalogBrowser: ToolDefinition<typeof catalogBrowserArgsSchema> = {
     name: "catalog_browser",
     label: "Browse the extension catalog",
     description:
-      "Lists available extensions and drafts new ones. `list` (default) matches the query " +
-      "(name/slug/id/kind/domain substring, case-insensitive; no query = everything) against the " +
-      "PINNED snapshots (config/extensions) and the integrations.sh catalog; the catalog is capped " +
-      "at 50 matches with a truncated flag. `draft` requires `spec` (catalog slug or id, e.g. " +
+      "Lists available extensions, drafts new ones, and PINS a completed draft in-channel (issue #195). " +
+      "`list` (default) matches the query (name/slug/id/kind/domain substring, case-insensitive; no query = " +
+      "everything) against the PINNED snapshots (config/extensions) and the integrations.sh catalog; the catalog " +
+      "is capped at 50 matches with a truncated flag. `draft` requires `spec` (catalog slug or id, e.g. " +
       "\"linear\") and writes an UNREVIEWED draft snapshot (source.reviewed: false) to " +
-      "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this tool. " +
-      "Catalog entries carry no MCP/CLI binding, so when drafting one, web-search the vendor's " +
-      "OFFICIAL MCP server (serverUrl + transport + credentialSchema from the vendor's published " +
-      "MCP spec; vendor-official URLs only — never guess or use community URLs). Manifest tools " +
-      "are OPTIONAL (issue #158): omit them to pin a tools-less manifest whose surface is " +
-      "discovered at runtime from the provider's tools/list with conservative tiers (the default — " +
-      "the agent then sees the provider's FULL real surface), or pin tools explicitly via " +
-      "fetch-catalog --generate-tools (issue #157). Complete the draft keeping source.reviewed: " +
-      "false, and pin through the fetch-catalog flow after human review. Write-tier: prompts for " +
-      "approval in non-yolo modes (admin-gated like the settings tool).",
+      "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this action. Catalog " +
+      "entries carry no MCP/CLI binding, so when drafting one, web-search the vendor's OFFICIAL MCP server " +
+      "(serverUrl + transport + credentialSchema from the vendor's published MCP spec; vendor-official URLs " +
+      "only — never guess or use community URLs). `pin` completes the draft IN-CHANNEL and REQUIRES the human's " +
+      "confirmation (the review gate): pass `spec` + the completed `binding` / `credential_schema` (+ optional " +
+      "`tools` / `domains` / `vendor_official`) and FIRST call WITHOUT confirm to surface the draft summary, then " +
+      "call WITH confirm=true after the human confirms in-channel — the confirmation IS the review, the snapshot " +
+      "records source.reviewed: true, the pinned snapshot is written to config/extensions via the fetch-catalog " +
+      "pin flow (same review gate: unconfirmed/unreviewed drafts always refuse, fail closed), and " +
+      "config/egress.yml + config/egress.dev.yml regenerate (the binding host is merged into the allowlist " +
+      "domains). POLICY (issue #49/#195): prefer official HOSTED streamable-http + OAuth bindings (the broker " +
+      "handles the OAuth flow — no binaries, no API keys); stdio/CLI bindings pin only when web-search verified " +
+      "NO official hosted variant exists (no_hosted_variant: true). Manifest tools are OPTIONAL (issue #158): " +
+      "omit them to pin a tools-less manifest whose surface is discovered at runtime from the provider's " +
+      "tools/list with conservative tiers (the default — the agent then sees the provider's FULL real surface), " +
+      "or pass `tools` explicitly. Write-tier: prompts for approval in non-yolo modes (admin-gated like the " +
+      "settings tool).",
     parameters: catalogBrowserArgsSchema,
     approval: "write",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult> {
@@ -549,23 +647,186 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                     ? "DRAFT — not installed. This catalog entry has NO MCP/CLI binding: research the " +
                       "vendor's OFFICIAL MCP server via web_search before completing the draft — " +
                       "serverUrl + transport + credentialSchema from the vendor's published MCP " +
-                      "spec; vendor-official URLs only, do NOT guess or use community URLs. Manifest " +
+                      "spec; vendor-official URLs only, do NOT guess or use community URLs. PREFER the " +
+                      "official HOSTED streamable-http server with OAuth (policy #49/#195 — no binaries, " +
+                      "the broker handles the OAuth flow); stdio/API-key only when no hosted variant " +
+                      "exists. Complete the draft IN-CHANNEL: call catalog_browser action=pin spec=<id> " +
+                      "with the binding + credential_schema (+ optional tools) params, then ASK THE " +
+                      "HUMAN to confirm in-channel (confirm=true) — the confirmation is the review that " +
+                      "pins — then connect_extension (\"connect as me\" opens the OAuth flow). Manifest " +
                       "tools are OPTIONAL (issue #158): omit them to pin a tools-less manifest whose " +
                       "surface is discovered at runtime from the provider's tools/list with " +
                       "conservative tiers (the agent then sees the provider's FULL surface), or run " +
                       "`bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json>` to pin " +
-                      "tools explicitly. Keep source.reviewed: false (human review gates the pin), " +
-                      "then pin via the fetch-catalog flow (--pin)."
+                      "tools explicitly."
                     : "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema) " +
-                      "from the vendor docs; manifest tools are OPTIONAL (issue #158) — omit them for " +
-                      "runtime discovery of the provider's tools/list surface with conservative tiers, " +
-                      "or pin tools explicitly via fetch-catalog --generate-tools. Mark " +
-                      "source.reviewed, and pin via the fetch-catalog flow (--pin) to install.",
+                      "from the vendor docs IN-CHANNEL: call catalog_browser action=pin spec=<id> with the " +
+                      "binding + credential_schema (+ optional tools) params, then ASK THE HUMAN to confirm " +
+                      "in-channel (confirm=true) — the confirmation is the review that pins — then " +
+                      "connect_extension (\"connect as me\" opens the OAuth flow for oauth extensions). " +
+                      "PREFER the official HOSTED streamable-http + OAuth server (policy #49/#195); " +
+                      "stdio/API-key only when no hosted variant exists. Manifest tools are OPTIONAL " +
+                      "(issue #158) — omit them for runtime discovery of the provider's tools/list surface " +
+                      "with conservative tiers, or pin tools explicitly via fetch-catalog --generate-tools.",
                   draft,
                 }),
               },
             ],
           };
+        }
+        if (params.action === "pin") {
+          if (!params.spec || !params.spec.trim()) {
+            return toolError('catalog_browser pin requires `spec` (the draft id, e.g. "notion")');
+          }
+          const draftPath = resolve(draftsDir, `${params.spec.trim()}.draft.json`);
+          if (!existsSync(draftPath)) {
+            return toolError(
+              `no draft for "${params.spec.trim()}" at ${draftPath} — draft it first ` +
+                `(catalog_browser action=draft spec=${params.spec.trim()})`,
+            );
+          }
+          let draft: SnapshotDraft;
+          try {
+            draft = JSON.parse(readFileSync(draftPath, "utf8")) as SnapshotDraft;
+          } catch {
+            return toolError(`draft at ${draftPath} is not valid JSON`);
+          }
+          // The agent completes the draft IN-CHANNEL (the space agent has no
+          // write/bash tools): merge the pin params into the draft's
+          // provenance scaffold. The strict manifest validation below is the
+          // authority on the merged shape.
+          const manifest = { ...draft.manifest };
+          if (draft.manifest.kind === "mcp") {
+            if (params.binding !== undefined) manifest.mcp = params.binding as unknown as McpBinding;
+          } else if (params.binding !== undefined) {
+            manifest.cli = params.binding as unknown as CliBinding;
+          }
+          if (params.credential_schema !== undefined) {
+            manifest.credentialSchema = params.credential_schema as unknown as CredentialSchema;
+          }
+          if (params.tools !== undefined) {
+            manifest.tools = params.tools as unknown as ExtensionTool[];
+          }
+          // The egress allowlist must include the binding host (the proxy
+          // allowlists + injects credentials per domain, issue #53) — merge
+          // the MCP host in, keep the scaffold/extra domains, deduped.
+          const mergedDraft: SnapshotDraft = { ...draft, manifest };
+          const host = hostedBindingHost(mergedDraft);
+          manifest.domains = [
+            ...new Set<string>([...(params.domains ?? draft.manifest.domains), ...(host !== null ? [host] : [])]),
+          ];
+          const completed: SnapshotDraft = {
+            ...mergedDraft,
+            source: {
+              ...draft.source,
+              ...(params.vendor_official !== undefined ? { vendorOfficial: params.vendor_official } : {}),
+            },
+          };
+          // Fail closed BEFORE the review gate: an incomplete draft (missing
+          // the binding or credentialSchema — the not-discoverable facts) or
+          // a malformed manifest must never reach the human's confirmation.
+          const needsBinding =
+            completed.manifest.kind === "mcp"
+              ? completed.manifest.mcp === undefined
+              : completed.manifest.cli === undefined;
+          if (needsBinding || completed.manifest.credentialSchema === undefined) {
+            return toolError(
+              `draft for "${completed.extensionId}" is incomplete: add the ${completed.manifest.kind} binding and ` +
+                "credentialSchema from the vendor docs (web-search the vendor's OFFICIAL MCP spec per #146) " +
+                "before pinning; manifest tools are OPTIONAL (issue #158) — omit them to discover the surface at " +
+                "runtime from the provider's tools/list with conservative tiers, or pass them via the tools param.",
+            );
+          }
+          try {
+            validateManifest(completed.manifest);
+          } catch (err) {
+            return toolError(errorMessage(err));
+          }
+          // Hosted-vs-stdio policy (#49/#195): official hosted
+          // streamable-http + OAuth is preferred; stdio/CLI bindings are the
+          // no-hosted-variant fallback and pin only when the agent's
+          // web-search verified no official hosted server exists.
+          const hosted = host !== null;
+          if (!hosted && params.no_hosted_variant !== true) {
+            return toolError(
+              `refusing to pin "${params.spec.trim()}": the binding is NOT an official hosted streamable-http MCP ` +
+                "server (policy #195/#49 prefers hosted MCP + OAuth — no binaries, the broker handles the OAuth " +
+                `flow). Draft summary: ${JSON.stringify(draftSummary(completed))}. Only pin a stdio/CLI binding ` +
+                "when web-search verified NO official hosted variant exists — then confirm with " +
+                "no_hosted_variant: true.",
+            );
+          }
+          // THE REVIEW GATE: the tool surfaces the draft summary and the
+          // human must confirm in-channel. Nothing pins without the
+          // confirmation — unconfirmed/unreviewed drafts always refuse
+          // (fail closed).
+          if (params.confirm !== true) {
+            return toolError(
+              JSON.stringify({
+                action: "pin",
+                spec: params.spec.trim(),
+                confirm_required: true,
+                hosted_variant: hosted,
+                summary: draftSummary(completed),
+                note:
+                  `REVIEW REQUIRED — nothing was pinned. The human must confirm this draft in-channel before it ` +
+                  `pins. To confirm, call catalog_browser again with action=pin spec=${params.spec.trim()} ` +
+                  "confirm=true — the confirmation IS the review (the snapshot records source.reviewed: true). " +
+                  `Then connect the account: connect_extension extension=${params.spec.trim()} scope=personal ` +
+                  '("connect as me" — opens the OAuth flow for oauth extensions) or scope=org (org account, needs ' +
+                  "approval).",
+              }),
+            );
+          }
+          try {
+            // The confirmation is the human review: unreviewed/community
+            // drafts pin AS reviewed — never without it.
+            const reviewed: SnapshotDraft = {
+              ...completed,
+              source: { ...completed.source, reviewed: true },
+            };
+            mkdirSync(snapshotsDir, { recursive: true });
+            const outPath = await pinSnapshotDraft(reviewed, snapshotsDir, catalogOpts);
+            // regenerateEgressConfig returns the rendered YAML; the paths are
+            // what the caller and the audit trail need.
+            regenerateEgressConfig(snapshotsDir, egressPath);
+            regenerateDevEgressConfig(snapshotsDir, devEgressPath);
+            await audit?.appendAudit({
+              actor,
+              event_type: ADMIN_CATALOG_BROWSER_EVENT,
+              payload: {
+                action: "pin",
+                spec: params.spec.trim(),
+                written_to: outPath,
+                egress_config: egressPath,
+                hosted_variant: hosted,
+                no_hosted_variant: params.no_hosted_variant === true,
+                vendor_official: reviewed.source.vendorOfficial,
+              },
+            });
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    action: "pin",
+                    spec: params.spec.trim(),
+                    written_to: outPath,
+                    reviewed: true,
+                    hosted_variant: hosted,
+                    egress_regenerated: [egressPath, devEgressPath],
+                    note:
+                      `PINNED — "${params.spec.trim()}" is installed and its domains are egress allowlisted. ` +
+                      `Connect the account to use it: call connect_extension extension=${params.spec.trim()} ` +
+                      `scope=personal ("connect as me" — the OAuth flow opens for oauth extensions) or scope=org ` +
+                      "(the org account, needs human approval). api_key extensions need the api_key param.",
+                  }),
+                },
+              ],
+            };
+          } catch (err) {
+            return toolError(errorMessage(err));
+          }
         }
         const pinned = opts.registry?.list() ?? [];
         const needle = params.query?.trim().toLowerCase() ?? "";

@@ -29,9 +29,12 @@ import {
   ADMIN_FIRST_RUN_EVENT,
   ADMIN_STACK_HEALTH_EVENT,
 } from "../store/audit-events";
-import { decidePolicyCall, defaultPolicy, resolveTier } from "../policy/config";
+import { decidePolicyCall, defaultPolicy, parseOrgConfigYaml, resolveTier } from "../policy/config";
+import { createAudit } from "../policy/audit";
 import type { AuditModule } from "../policy/audit";
 import type { ResolvedExtension } from "../extensions/registry";
+import { createExtensionRegistry, parsePinnedSnapshot } from "../extensions/registry";
+import { connectExtension, type ConnectExtensionDeps } from "../extensions/connect";
 import {
   adminToolDefinitions,
   adminToolsExtension,
@@ -143,6 +146,50 @@ const CATALOG = {
 
 function stubFetch(catalog: unknown = CATALOG): typeof fetch {
   return (async () => new Response(JSON.stringify(catalog), { status: 200 })) as unknown as typeof fetch;
+}
+
+/**
+ * A COMPLETED linear draft file in `draftsDir` (the maintainer-completed /
+ * in-file form: binding + credentialSchema already filled). The catalog
+ * scaffold produced by the `draft` action never carries a binding — the
+ * pin tests use this to exercise the completed paths.
+ */
+function writeCompletedDraft(draftsDir: string, overrides: Record<string, unknown> = {}): void {
+  const draft = {
+    schema: "bottega.extension-snapshot.v1",
+    extensionId: "linear",
+    pinnedAt: "2026-08-16T00:00:00.000Z",
+    source: { catalog: "https://integrations.sh/api.json", specId: "linear", vendorOfficial: false, reviewed: false },
+    manifest: {
+      id: "linear",
+      label: "Linear",
+      vendor: "Linear",
+      kind: "mcp",
+      mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
+      credentialSchema: { type: "oauth", scopes: ["read", "write"] },
+      domains: ["linear.app"],
+    },
+    ...overrides,
+  };
+  mkdirSync(draftsDir, { recursive: true });
+  writeFileSync(join(draftsDir, "linear.draft.json"), JSON.stringify(draft, null, 2) + "\n");
+}
+
+/** Fake broker seam: records the vault row the OAuth flow would. */
+async function fakeBroker(input: { provider: string; credentialType: string; apiKey?: string }): Promise<{
+  identityKey: string | null;
+  brokerCredentialId: number;
+}> {
+  void input;
+  return { identityKey: "email:ada@example.com", brokerCredentialId: 5 };
+}
+
+/** A personal-scope connect never crosses the policy gate — this seam is never invoked. */
+function minimalConnectGate(): ConnectExtensionDeps["gate"] {
+  return {
+    loadPolicy: () => Promise.resolve(parseOrgConfigYaml("")),
+    router: { request: async () => ({ approved: false }) },
+  };
 }
 
 interface EnvBackup {
@@ -408,6 +455,277 @@ describe("catalog_browser (issue #73)", () => {
       expect(unknownSpec.isError).toBe(true);
       expect(unknownSpec.text).toContain('not found');
       expect(existsSync(draftsDir)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("catalog_browser pin (issue #195)", () => {
+  test("pin surfaces the draft summary and refuses without the human confirmation (review gate)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      writeCompletedDraft(draftsDir);
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        // the provenance re-check (pinSnapshotDraft) needs the linear entry
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const res = await call(tools[0], { action: "pin", spec: "linear" });
+      expect(res.isError).toBe(true);
+      const body = JSON.parse(res.text) as {
+        confirm_required: boolean;
+        hosted_variant: boolean;
+        summary: { id: string; binding: Record<string, unknown>; credential_schema: Record<string, unknown> };
+        note: string;
+      };
+      expect(body.confirm_required).toBe(true);
+      expect(body.hosted_variant).toBe(true);
+      expect(body.summary.id).toBe("linear");
+      expect(body.summary.binding).toEqual({ serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" });
+      expect(body.summary.credential_schema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(body.note).toContain("REVIEW REQUIRED");
+      // fail closed: nothing was pinned, nothing regenerated
+      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
+      expect(existsSync(join(dir, "egress.yml"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin with the human confirmation completes a review-gated draft: snapshot written + egress regenerated", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      // community + unreviewed in the file — the confirmation IS the review
+      writeCompletedDraft(draftsDir);
+      const { audit, rows } = fakeAudit();
+      const tools = loadTools(store, {
+        audit,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
+      expect(res.isError).toBe(false);
+      const body = JSON.parse(res.text) as { written_to: string; reviewed: boolean; egress_regenerated: string[] };
+      expect(body.written_to).toBe(join(snapshotsDir, "linear.json"));
+      expect(body.reviewed).toBe(true);
+      expect(body.egress_regenerated).toContain(egressPath);
+
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
+      expect(snapshot.source.reviewed).toBe(true);
+      expect(snapshot.source.vendorOfficial).toBe(true);
+      expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" });
+      // the binding host was merged into the egress allowlist domains
+      expect(snapshot.manifest.domains).toEqual(["linear.app", "mcp.linear.app"]);
+
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain('"mcp.linear.app"');
+      expect(existsSync(devEgressPath)).toBe(true);
+      expect(readFileSync(devEgressPath, "utf8")).toContain('"*"');
+
+      // the pinned dir seeds a registry that resolves the provider
+      const registry = createExtensionRegistry(snapshotsDir);
+      expect(registry.resolve("linear")?.manifest.id).toBe("linear");
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0].event_type).toBe(ADMIN_CATALOG_BROWSER_EVENT);
+      expect(rows[0].payload["action"]).toBe("pin");
+      expect(rows[0].payload["written_to"]).toBe(join(snapshotsDir, "linear.json"));
+      expect(rows[0].payload["hosted_variant"]).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin refuses a stdio/CLI binding unless the agent verified no hosted variant (policy #195)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      writeCompletedDraft(draftsDir, {
+        manifest: {
+          id: "linear",
+          label: "Linear",
+          vendor: "Linear",
+          kind: "mcp",
+          mcp: { command: "linear-mcp", transport: "stdio" },
+          credentialSchema: { type: "api_key" },
+          domains: ["linear.app"],
+        },
+      });
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const refused = await call(tools[0], { action: "pin", spec: "linear", confirm: true });
+      expect(refused.isError).toBe(true);
+      expect(refused.text).toContain("NOT an official hosted streamable-http MCP");
+      expect(refused.text).toContain("no_hosted_variant: true");
+      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
+
+      const pinned = await call(tools[0], { action: "pin", spec: "linear", confirm: true, no_hosted_variant: true });
+      expect(pinned.isError).toBe(false);
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
+      expect(snapshot.manifest.mcp).toEqual({ command: "linear-mcp", transport: "stdio" });
+      expect(snapshot.manifest.credentialSchema).toEqual({ type: "api_key" });
+      // a stdio binding has no remote host — domains stay the scaffold's
+      expect(snapshot.manifest.domains).toEqual(["linear.app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin fails closed: missing spec, unknown draft, incomplete binding", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        catalog: { fetchImpl: stubFetch() },
+      });
+
+      const noSpec = await call(tools[0], { action: "pin" });
+      expect(noSpec.isError).toBe(true);
+      expect(noSpec.text).toContain("spec");
+
+      const unknown = await call(tools[0], { action: "pin", spec: "ghost" });
+      expect(unknown.isError).toBe(true);
+      expect(unknown.text).toContain("no draft");
+
+      // the catalog scaffold draft has no binding — pin must refuse it as incomplete
+      const drafted = await call(tools[0], { action: "draft", spec: "linear" });
+      expect(drafted.isError).toBe(false);
+      const incomplete = await call(tools[0], { action: "pin", spec: "linear", confirm: true });
+      expect(incomplete.isError).toBe(true);
+      expect(incomplete.text).toContain("incomplete");
+      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("full chat flow: draft → confirm → pin → connect as me (hosted OAuth, temp dirs)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      const notionCatalog = {
+        version: 1,
+        data: [
+          ...CATALOG.data,
+          {
+            id: "mcp/notion",
+            slug: "notion",
+            kind: "mcp",
+            name: "Notion",
+            url: "https://developers.notion.com/reference/mcp",
+            domain: "notion.com",
+          },
+        ],
+      };
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch(notionCatalog) },
+      });
+      const [tool] = tools;
+
+      // 1. draft (the agent finds the official hosted MCP per #146)
+      const drafted = await call(tool, { action: "draft", spec: "notion" });
+      expect(drafted.isError).toBe(false);
+      expect(existsSync(join(draftsDir, "notion.draft.json"))).toBe(true);
+
+      // 2. pin with the completed binding, NO confirm → review gate refuses
+      const refused = await call(tool, {
+        action: "pin",
+        spec: "notion",
+        binding: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
+        credential_schema: { type: "oauth", scopes: ["read", "write"] },
+        vendor_official: true,
+      });
+      expect(refused.isError).toBe(true);
+      const refusedBody = JSON.parse(refused.text) as {
+        confirm_required: boolean;
+        hosted_variant: boolean;
+        summary: { id: string; binding: Record<string, unknown>; credential_schema: Record<string, unknown> };
+      };
+      expect(refusedBody.confirm_required).toBe(true);
+      expect(refusedBody.hosted_variant).toBe(true);
+      expect(refusedBody.summary.id).toBe("notion");
+      expect(refusedBody.summary.binding).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
+      expect(refusedBody.summary.credential_schema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(existsSync(join(snapshotsDir, "notion.json"))).toBe(false);
+
+      // 3. the human confirms in-channel → pin completes
+      const pinned = await call(tool, {
+        action: "pin",
+        spec: "notion",
+        confirm: true,
+        binding: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
+        credential_schema: { type: "oauth", scopes: ["read", "write"] },
+        vendor_official: true,
+      });
+      expect(pinned.isError).toBe(false);
+      const pinnedBody = JSON.parse(pinned.text) as { written_to: string; reviewed: boolean; note: string };
+      expect(pinnedBody.written_to).toBe(join(snapshotsDir, "notion.json"));
+      expect(pinnedBody.reviewed).toBe(true);
+      expect(pinnedBody.note).toContain("connect_extension");
+
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "notion.json"), "utf8"));
+      expect(snapshot.extensionId).toBe("notion");
+      expect(snapshot.source.reviewed).toBe(true);
+      expect(snapshot.source.vendorOfficial).toBe(true);
+      expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
+      expect(snapshot.manifest.credentialSchema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(snapshot.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
+
+      // egress regenerated with the hosted MCP host allowlisted
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain('"mcp.notion.com"');
+      expect(egress).toContain('"notion.com"');
+      expect(existsSync(devEgressPath)).toBe(true);
+
+      // 4. connect as me against the temp snapshots dir (the OAuth flow's vault row)
+      const outcome = await connectExtension(
+        { extension: "notion", scope: "personal", actor: "UADA" },
+        {
+          registry: createExtensionRegistry(snapshotsDir),
+          store,
+          audit: createAudit(store),
+          broker: fakeBroker,
+          gate: minimalConnectGate(),
+        },
+      );
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.message).toBe("Notion connected as @UADA");
+        const rows = await store.listExtensionCredentials("notion");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.owner).toBe("UADA");
+        expect(rows[0]!.scope).toBe("personal");
+        expect(rows[0]!.identity_key).toBe("email:ada@example.com");
+      }
     } finally {
       cleanup();
     }
