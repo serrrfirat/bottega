@@ -56,6 +56,25 @@ rule below conflicts with a rule above, the user's explicit instructions win
   involved — that's what the emulate.dev tests are for.
 - Test through the caller, not the helper: a policy gate is covered by driving
   the extension wiring, not only the pure decision function.
+- **Definition of done: issue acceptance criteria land as caller-level
+  tests** (user-mandated, 2026-08-17, issue #174). A PR that closes a
+  feature issue must include the issue's acceptance criteria as tests at the
+  caller surface — inbound message / tool call / scheduler fire in,
+  observable effect out — in the highest hermetic tier that can express
+  them. Caller surface means driving `SpaceService.handleInboundMessage`,
+  the tool definition's `execute`, the scheduler tick, or the executor claim
+  loop — not the new private helper. Patterns to reuse:
+  `src/server/boot-wiring.test.ts` (real `main()` in a temp cwd),
+  `src/server/onboarding-boot.test.ts` (same shape, #116),
+  `src/executor.test.ts` (real store + real git + GitHub emulator), and the
+  fake-ACP fixture (`src/server/drivers/fixtures/fake-acp-server.ts`).
+  Criteria that genuinely need live infra (real Slack, real model) are never
+  silently skipped: they land as a skip-gated leg (`BOTTEGA_RUN_INTEGRATION=1`)
+  or a named canary journey, and the PR says which. Reviewer checklist line:
+  **does a test fail if the feature's headline flow breaks?** — the #149
+  question (unit tests around the delivery loop all passed while nothing
+  drove a work item to `done` through the real pipeline; `review`/`done`
+  shipped unreachable). Enforcement is review, not tooling.
 - **Chat-discovered bugs ship a hermetic regression test** (user-mandated,
   2026-08-17): a fix for a bug found in conversation must include a test that
   reproduces the exact failure (e.g. an unwired seam defaulting to a wrong
@@ -167,6 +186,33 @@ double local.
 - Real-infra verification (live Slack app, real PAT/PR round-trip, live
   provider keys) is a **manual checklist** in `setup.md` / `scripts/smoke.sh`.
   Never report it as passing without running it.
+
+## Scheduled live-Slack canary (issue #175)
+
+`.github/workflows/canary.yml` runs the live-Slack canary
+(`tests/e2e/canary.ts`, issue #79) weekly against the dedicated QA
+workspace — real Socket Mode, real model, real Slack — with repository
+secrets (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN`,
+`NEAR_API_KEY`/`CANARY_MODEL_REF`; see features.md → "Live-Slack QA
+canary" for the full list). It runs CI-strict (`--ci`): missing
+credentials FAIL the job instead of skipping — a canary that silently
+skips in CI is worse than none. On failure it posts the per-journey report
++ permalinks + the run URL to the QA channel.
+
+- **Release gate, not a merge gate.** The scheduled canary is live infra
+  and can flake, so it never gates merges; a red scheduled run BLOCKS the
+  next deploy until a human triages it (the QA channel post + the CI
+  status are the notification). Fix the regression or explicitly waive the
+  run before deploying.
+- **One journey per major feature, as features land.** When a shipped
+  feature lands, it gets a canary journey (chat reply, memory, work-item,
+  connect intent, scheduled standup, extension call, model role switch;
+  delivery approval once #149 lands). A journey asserts the human-visible
+  round-trip with deterministic store/audit evidence, never a fabricated
+  pass. Missing tokens locally → skip-and-exit-0 stays correct; in CI →
+  fail.
+- Never run the live leg in ad-hoc CI without `--ci` (it stays skip-gated
+  there); never report a live journey as passing without running it.
 
 ## Code discipline
 
