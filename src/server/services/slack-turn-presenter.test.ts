@@ -447,6 +447,43 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     expect(rec.streams).toHaveLength(2);
     expect(rec.streams[1]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "2.2", openingText: THINKING_PHRASES[1] } });
   });
+
+  test("the receipt reaction acks once per unique inbound ts — redeliveries never re-fire (issue #183)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // Slack redelivers the same inbound message (same ts): the #119 ack
+    // used to re-fire addReaction and hit `already_reacted`. One ack per
+    // unique ts, and a NEW ts still acks normally.
+    presenter.onInbound(msg({ ts: "1.1" }));
+    presenter.onInbound(msg({ ts: "1.1" })); // redelivery — must NOT re-ack
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.reactions.filter((r) => r.kind === "add")).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "add", spaceId: "slack:C1", ts: "2.2" },
+    ]);
+
+    // The reply clears each pending reaction exactly once; a redelivery of
+    // an ALREADY-ACKED ts after the reply never re-acks (the message was
+    // answered — no stale 👀 resurrection).
+    presenter.onMessage({ spaceId: "slack:C1", text: "answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.reactions.filter((r) => r.kind === "remove")).toEqual([
+      { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "2.2" },
+    ]);
+    presenter.onInbound(msg({ ts: "1.1" })); // post-reply redelivery
+    await flush();
+    expect(rec.reactions.filter((r) => r.kind === "add")).toHaveLength(2);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -275,6 +275,13 @@ export class SlackTurnPresenter {
   #phrasePostedMs: number | undefined;
   /** Inbound message tss still carrying the receipt reaction (#119). */
   #pendingReactions = new Set<string>();
+  /**
+   * Inbound tss whose 👀 receipt ack already fired (issue #183). Slack
+   * redelivers the same inbound message (same ts); without this, each
+   * redelivery re-fired addReaction and hit `already_reacted`. Dedupe by
+   * ts: one ack per unique inbound message, cleared on dispose.
+   */
+  #ackedReactions = new Set<string>();
   /** Onboarding-nudge dedupe snapshot (issue #116). */
   #nudged: string | undefined;
   /** Shared THINKING_PHRASES rotation (one per SpaceService; see deps). */
@@ -459,6 +466,7 @@ export class SlackTurnPresenter {
     this.#receivedAt = undefined;
     this.#phrasePostedMs = undefined;
     this.#pendingReactions.clear();
+    this.#ackedReactions.clear();
     this.cancelStreamUpdate();
     this.streamingTurns = false;
     this.#nudged = undefined;
@@ -569,9 +577,13 @@ export class SlackTurnPresenter {
    * Receipt ack (issue #119): adds the 👀 reaction to the inbound message
    * and remembers its ts so the reply can remove it. Fail-soft — a missing
    * `reactions:write` scope is logged by the caller's catch, never thrown
-   * into the turn path.
+   * into the turn path. Deduped by inbound ts (issue #183): Slack
+   * redelivers the same message (same ts) and each redelivery used to
+   * re-fire the ack into `already_reacted` — one ack per unique ts.
    */
   #addReceiptReaction(msg: SlackMessage): void {
+    if (this.#ackedReactions.has(msg.ts)) return;
+    this.#ackedReactions.add(msg.ts);
     this.#pendingReactions.add(msg.ts);
     void this.adapter.addReaction(this.spaceId, msg.ts).catch((err) => {
       console.error(`[slack-turn-presenter] failed to add receipt reaction in ${this.spaceId}:`, err);
