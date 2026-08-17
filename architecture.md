@@ -23,58 +23,86 @@ How bottega works under the hood. For user-facing capabilities see
 
 ```mermaid
 flowchart TB
-    subgraph Slack["Slack (Socket Mode — no public ports)"]
-        CH["channel #team"]
+    subgraph Slack["Slack — Socket Mode, no public ingress"]
+        H["human in DM or channel"]
     end
-    CH -- "adapter validates & normalizes (the ONLY ingress)" --> AD["slack.ts — Bolt adapter"]
-    AD --> SS["space-service.ts<br/>one AgentSessionDriver per ACTIVE space"]
-    SS --> DRV["AgentDriver — OMP SDK | ACP (agents are pluggable)"]
-    DRV --> TOOLS["tools + policy + audit extensions"]
-    TOOLS --> POL["policy gate — tier × policy × roles"]
-    POL -- "ask-human" --> AR["ApprovalRouter — Approve/Deny buttons"]
-    POL -- "create_work_item (approved)" --> WI[("work_items (SQLite)")]
-    WI -- "atomic claim" --> EX["executor (Bun, container)"]
-    EX --> EXDRV["AgentDriver — pre-approved policy scope"]
-    EX --> PR["PR via GitHub API (PAT from 0600 file)"]
-    EX -- "all outbound" --> PXY["iron-proxy sidecar"]
-    SS --> DB[("SQLite data/bottega.db (WAL)")]
-    EX --> DB
-    POL --> AUD[("audit — append-only")]
-    DRV --> MEM["memory provider — SQLite fallback | mem0"]
-    DRV --> MCP["bottega MCP server (agent-agnostic surface)"]
-    MCP --> POL
+    H --> AD["src/server/adapters/slack.ts<br/>validate + normalize principal/space/text"]
+    AD --> SS["SpaceService<br/>conversation + orchestration"]
+    SS --> DRV["AgentSessionDriver<br/>OMP SDK | ACP"]
+    DRV --> GATE["policy gate<br/>tier × org floor × space overlay"]
+    GATE -- "ask-human" --> AR["Slack ApprovalRouter"]
+    GATE -- "approved work" --> WI[("work_items + audit<br/>SQLite WAL")]
+    WI -- "atomic claim" --> EX["executor container<br/>headless worker session"]
+    EX --> OUT["git PR | extension result"]
+    OUT --> DP["delivery pending → poller → human decision"]
+    DP --> WI
+    DRV --> EXT["extension runtime"]
+    EXT --> PXY["iron-proxy<br/>egress + secret injection"]
+    DRV --> MEM["memory<br/>SQLite | mem0"]
+    DRV --> MCP["bottega MCP surface"]
+    MCP --> GATE
 ```
 
 ## Runtime topology
 
 ```mermaid
-flowchart LR
-    subgraph compose["docker compose"]
-        S["server (Bun)"]
-        E["executor (profile)"]
-        AB["auth-broker (vault)"]
-        AG["auth-gateway"]
-        PXY["iron-proxy"]
-        M["mem0 (optional memory backend)"]
+flowchart TB
+    subgraph roots["Three composition roots"]
+        S["src/server/index.ts<br/>Slack router + conversation tools"]
+        E["src/executor.ts<br/>DenyRouter + worker tools"]
+        M["src/mcp/server.ts<br/>DenyRouter + MCP tools"]
     end
-    DB[("SQLite — data volume, WAL")]
-    S --> DB
-    E --> DB
-    S --> PXY
-    E --> PXY
-    AB --> AG
-    S --> AB
-    PXY --> NEAR["NEAR.ai model endpoints"]
-    PXY --> EXT["extensions — mcp.attio.com, api.github.com, mcp.linear.app"]
-    PXY --> RAW["raw.githubusercontent.com"]
-    S -. "Socket Mode (outbound only)" .-> SLK["Slack"]
+
+    S --> B["bootstrapRuntime()<br/>src/server/bootstrap-runtime.ts"]
+    E --> B
+    M --> B
+
+    B --> DB["createStore"]
+    DB --> AU["createAudit"]
+    AU --> OP["loadOrgPolicy"]
+    OP --> REG["createExtensionRegistry<br/>pinned snapshots"]
+    REG --> SURF["resolveExtensionSurfaces<br/>pinned tools or tools/list<br/>failed provider skipped, not cached"]
+    SURF --> SEC["secretResolverFromSettings<br/>omp-broker | 1Password Connect"]
+    SEC --> BND["createSecretFileBoundary"]
+    BND --> RT["createExtensionRuntime<br/>gate → ladder → boundary → provider → audit"]
+    RT --> MP["resolveMemoryProvider<br/>SQLite | mem0"]
+
+    S -. "late-bound Slack router + progress sink" .-> RT
+    E -. "headless router" .-> RT
+    M -. "headless router" .-> RT
 ```
 
-Every container in the compose network resolves DNS through iron-proxy
-(compose `dns:`), so the proxy is the only path out of the container
-network; non-allowlisted hosts get a 403 at the HTTP layer. The server and
-the executor share one SQLite file (`bun:sqlite`, WAL, busy_timeout for the
-two-process share), migrated idempotently at boot.
+Issue #172 makes that chain the single construction site. Server, executor,
+and MCP may assemble different visible tool subsets, but they cannot silently
+select a different memory backend, registry, or secret resolver. The
+caller-level parity suite in `src/server/composition-root-parity.test.ts`
+boots all three roots and holds those invariants.
+
+```mermaid
+flowchart LR
+    subgraph compose["docker compose"]
+        SVC["server"]
+        WORK["executor profile"]
+        BROKER["auth-broker"]
+        GATEWAY["auth-gateway"]
+        PROXY["iron-proxy"]
+        MEM0["mem0 optional"]
+    end
+    DATA[("shared data volume<br/>SQLite WAL + secret files")]
+    SVC --> DATA
+    WORK --> DATA
+    SVC --> PROXY
+    WORK --> PROXY
+    SVC --> BROKER
+    BROKER --> GATEWAY
+    PROXY --> MODEL["model endpoints"]
+    PROXY --> PROVIDERS["provider MCP/API hosts"]
+    SVC -. "Socket Mode outbound" .-> SLACK["Slack"]
+```
+
+Every container resolves DNS through iron-proxy, so it is the only path out
+of the compose network. The server and executor share one SQLite file with
+WAL and `busy_timeout`, migrated idempotently at boot.
 
 ## Egress: the iron-proxy boundary
 
@@ -135,8 +163,9 @@ starting the Bun server alone. `scripts/dev.sh`:
    `certs/` on first run, persists a mode-0600 management token, starts the
    proxy with `docker-compose.dev.yml`, and proves readiness by reloading
    `config/egress.dev.yml`.
-3. Starts the auth-broker vault on `127.0.0.1:8765`. When the private
-   `oh-my-pi/pi:dev` image is unavailable, it falls back to
+3. Starts the auth-broker vault on `127.0.0.1:8765`. `scripts/dev.sh`
+   checks for the private `oh-my-pi/pi:dev` image **before** invoking
+   Compose, so a missing image cannot hang on a pull. It falls back to
    `omp auth-broker serve`; that CLI's `PI_CONFIG_DIR` is deliberately
    HOME-relative, while the same mode-0600 token remains at
    `data/.omp/auth-broker.token`.
@@ -153,6 +182,12 @@ The broker fallback does not remove the Docker requirement: local
 iron-proxy still runs in Compose. Deployment keeps the base
 `docker-compose.yml`, strict `config/egress.yml`, internal service names,
 and unpublished management/vault ports.
+
+`AGENTS.md` carries the development-side safety rules for this topology:
+only one dev server may use a Slack app token at a time; implementation work
+is delegated to isolated task agents rather than the coordinating agent;
+and every chat-discovered bug ships with a hermetic regression test. These
+are workflow controls, not runtime enforcement.
 
 ## Agent driver abstraction (agents are pluggable)
 
@@ -220,31 +255,54 @@ flowchart LR
   `setModel`/`setThinkingLevel`) and the ACP driver reports as
   not-supported — `use_model` surfaces that as an error.
 
-### Model selection stays pinned and fails visibly (#78/#80)
+**Driver conformance (#173).** One suite,
+`src/server/drivers/driver-conformance.test.ts`, runs against both drivers.
+Every session option must be honored or rejected as unsupported; nothing may
+be silently dropped. OMP honors tool narrowing. ACP v1 has no narrowing
+field, so `allowTools` requests narrower than the standard space surface
+throw; ACP likewise rejects per-space model settings it cannot apply.
 
-The OMP model registry reads the process-global agent directory, not only a
-session option. `createOmpSdkDriver` therefore installs
-`data/omp-agent` before creating any session, and both server and executor
-run `ensureAgentDirModelPin` first. A missing config is copied from
-`config/omp/config.yml`; a parseable stale config gets only the missing
-`modelRoles` block appended; an existing or unparseable operator block is
-never overwritten. The committed default is pinned to
-`opencode-go/deepseek-v4-flash`, so SDK catalog changes cannot silently
-select `kimi-k2.7-code`. When opencode auth is unavailable but
-`NEAR_API_KEY` is configured, the declared NEAR
-`zai-org/GLM-5.1-FP8` model remains the fallback.
+### Model resolution is catalog-backed and turn-aware (#78/#80/#185/#189/#192/#194)
 
-After the driver installs the directory, `assertAgentDirModelAvailable`
-uses the SDK registry against that directory's `models.yml` (issue #80).
-When the file declares providers but none has usable auth, boot stops with
-the agent-dir, model-config, and auth cause instead of deferring a
-`No model selected` failure to the first Slack message.
+```mermaid
+flowchart LR
+    DECL["data/omp-agent/models.yml<br/>declared providers/models"] --> BUILD["listAvailableModels"]
+    AUTH["resolved provider auth"] --> PROBE["NEAR /v1/models probe<br/>5 s bound, cached per agent dir"]
+    PROBE --> BUILD
+    BUILD --> CAT["available catalog<br/>id + name + provider"]
+    CAT --> SHOW["model_settings get<br/>grouped by provider (#192)"]
+    CAT --> PIN["resolveModelPin (#185)<br/>role | exact provider/id | friendly name"]
+    PIN -- "none or ambiguous" --> ERR["fail closed<br/>no work item"]
+    PIN -- "resolved" --> ITEM[("work item<br/>model + reasoning_effort")]
+    ITEM --> START["executor session setup<br/>apply pin + audit"]
+    SHOW --> SET["space settings update"]
+    SET --> HOT["fresh turn starts (#189)<br/>reapply current default role"]
+    HOT --> OVR{"pending use_model override?"}
+    OVR -- "yes" --> ROLE["fast/reasoning wins for this turn"]
+    OVR -- "no" --> DEF["resolved current default"]
+```
 
-Provider failures that the SDK represents as an empty assistant message
-are also no longer silent. `OmpSessionDriver` preserves the SDK
-`errorMessage` (or error notice) through `turn_end`; `SpaceService` includes
-that cause in the empty-response and churn text instead of always guessing
-that the model key is wrong.
+The agent directory is installed before OMP sessions start. Server and
+executor run `ensureAgentDirModelPin`, and `assertAgentDirModelAvailable`
+stops boot with the actual directory/config/auth cause when no declared
+provider is usable (#80). Operator-owned `modelRoles` blocks are not
+overwritten.
+
+`src/models/model-pin.ts` merges the declared catalog with a bounded NEAR
+gateway probe (#194). A qualified `provider/id` is explicit. Friendly names
+match case-insensitively over ids, display names, and provider-qualified ids;
+no match or an unresolved tie is an error. When providers tie at the best
+unqualified match, one NEAR candidate wins.
+
+Work-item pins override space model settings only for that worker session
+and record the applied model/effort (#185). For conversations,
+`OmpSessionDriver.reapplyDefaultModelRole` reads current settings before
+each fresh turn, so a settings change reaches an already-live session
+(#189); a pending `use_model` override remains one-turn intent.
+
+Provider failures represented by the SDK as empty assistant messages are
+also surfaced: `OmpSessionDriver` preserves the provider/session cause
+through `turn_end`, and `SpaceService` includes it in retry/churn text.
 
 ## Policy & approvals (internals)
 
@@ -304,6 +362,12 @@ flowchart TD
    writes `approval.requested` / `approval.resolved` (approver = the Slack
    user who clicked).
 
+**Settings escalation (#151).** The `settings` tool's org-scope write path
+crosses the synthetic exec-tier `settings_org_write` action through the same
+router. Space-scope settings accept only `response_mode`, `extensions`, and
+`proactive`, and effective-policy merging clamps them to the org floor;
+`always_approve` can only become stricter. Headless org writes deny.
+
 **Executor sessions** run with `preApproved: true` policy scope: the work
 item's pickup approval (the human-approved `create_work_item` call in the
 channel) **is** the authorization. Allowlisted exec tools are then permitted
@@ -328,129 +392,128 @@ credential ladder's `auto` scope skip org credentials.
 
 ## Extension runtime: the safety spine
 
-`src/extensions/` implements the registry (issue #50): an extension is a
-typed, declarative integration — **manifest + pinned spec snapshot + vault
-binding + policy**. The user-facing view (connect-from-chat, CLI toolset,
-heavy layer) is in [features.md](features.md#extensions--the-registry).
+`src/extensions/` implements the registry (issue #50): pinned provenance,
+manifest/binding, credential schema, effective tool surface, and policy. The
+user-facing view is in
+[features.md](features.md#extensions--the-registry).
 
-1. **Manifest** (`manifest.ts`) — `{ id, label, vendor, kind: "mcp" | "cli",
-   mcp?: {serverUrl | command, transport}, cli?: {command, args, env?},
-   credentialSchema: {type: oauth | api_key, scopes?}, tools: [{name, tier,
-   description, params}], domains: [egress allowlist entries] }`. `kind`
-   decides the integration: **mcp** = the provider's OFFICIAL MCP server
-   (bottega never implements provider API clients), **cli** = a preinstalled
-   CLI in the tools image that bottega shells out to. Validation fails
-   closed: duplicate ids, malformed schemas, unresolvable bindings, tool
-   names shadowing runtime built-ins — anything invalid is rejected, never
-   partially registered.
-2. **Pinned spec snapshot** (`registry.ts`) — registration resolves the
-   provider's spec from the integrations.sh catalog and snapshots it locally
-   PINNED: per-org deployments resolve from `config/extensions/<id>.json`
-   files, never from the catalog at runtime. Snapshot format:
-   `{ schema: "bottega.extension-snapshot.v1", extensionId, pinnedAt,
-   source: { catalog, specId, vendorOfficial, reviewed }, manifest }`.
-   Community entries (`vendorOfficial: false`) require explicit
-   `reviewed: true` before they register. The catalog fetch itself
-   (integrations.sh) is a later issue; it only writes these files.
-3. **Vault binding & policy** — `credentialSchema` declares what the vault
-   must hold (oauth scopes / api_key); `bootstrapRuntime`
-   (`src/server/bootstrap-runtime.ts`) wires the deployment's configured
-   secret resolver into the boundary (omp-broker by default, issues
-   #54/#143; 1Password Connect when the settings blob selects it, issue
-   #190). Tool `tier` declarations feed both the SDK approval tier and the
-   policy gate.
-4. **Wiring** — registry tools become SDK definitions (`tools.ts`) that ride
-   the custom-tools path into the space agent's restricted toolset; mcp
-   tools call the provider's official MCP server (streamable-http or stdio),
-   cli tools spawn the preinstalled command with `--name value` flags.
-   Extension `domains` merge into the iron-proxy allowlist via
-   `src/egress/generate.ts` (run `bun run src/egress/generate.ts` after
-   adding snapshots; `config/egress.yml` is the generated artifact).
-5. **Runtime** (`runtime.ts`, issue #53) — every extension tool call crosses
-   the safety spine: **policy gate first** (the extension allowlist +
-   manifest tier, shared with the in-process policy extension) → **credential
-   ladder** (`credentials.ts`, org/me/auto scopes over the store's registry
-   rows) → **egress boundary** (`boundary.ts`: the deployment's configured
-   secret resolver — issue #190 — fetches the resolved credential's secret
-   payload: the `omp-broker` backend over `OMP_AUTH_BROKER_URL`/
-   `OMP_AUTH_BROKER_TOKEN` by default, or a 1Password Connect server when
-   the settings blob's `secrets_backend` says so, resolving the
-   `"provider:identityKey" → {vault, item, field}` mapping over the
-   Connect REST API with `OP_CONNECT_TOKEN`; the secret is written to the
-   extension's shared-volume file, mode 0600, and iron-proxy's
-   `secrets` transform injects it as the `Authorization` header for the
-   extension's allowlisted domains) → provider call → audit. The client
-   call itself carries no credential, so nothing reaches agent env,
-   transcripts, or audit. Every call writes `extension.call`
-   `{extension, tool, actor, credential_id, decision}`; denied calls never
-   resolve a credential. Missing backend configuration, a missing vault
-   row / mapping, an unsupported credential shape, or a failed proxy
-   reload stops the call before it can run unauthenticated.
-6. **Agent-agnostic surface** (`src/mcp/server.ts`, issue #61) — the bottega
-   MCP server (attached to every ACP session via `mcpServers`, #26)
-   advertises `connect_extension` + each registered extension's manifest
-   tools and executes them **server-side** through the same #53 runtime /
-   #52 connect capability. The gate, ladder, boundary, and audit apply
-   identically to every agent — no per-agent adapters. Headless MCP
-   contexts have no approval channel: ask-human fails closed (DenyRouter).
-7. **Connect intent seam** (`src/server/services/space-service.ts`, issue
-   #61) — inbound Slack messages matching the narrow patterns
-   `connect <extension>`, `connect <extension> as org`, `connect
-   <extension> as me` route directly to the connect capability: no agent
-   tool call, no session. Exact shapes only (case-insensitive; anything
-   with extra words, punctuation, or keys stays natural-language agent
-   territory). Bare / `as me` connects the sender's personal account
-   (unprivileged); `as org` crosses the policy gate with the space's
-   Slack approval router. api_key-type extensions still need the agent
-   tool (or CLI) to supply the key.
+1. **Manifest and snapshot** — `manifest.ts` validates ids, bindings,
+   `credentialSchema`, domains, and optional tools. A top-level
+   `config/extensions/<id>.json` snapshot must carry reviewed provenance;
+   drafts live under `config/extensions/drafts/`, outside the registry scan.
+   Invalid or unreviewed snapshots never partially register.
+2. **Chat-native draft/review/pin** — `catalog_browser` in
+   `src/tools/admin.ts` creates the unreviewed catalog draft, instructs the
+   agent to use `web_search` for the vendor-official binding (#146), and
+   requires a second `confirm: true` pin call after showing the completed
+   summary (#195). Confirmation is the review. The tool reuses
+   `pinSnapshotDraft` in `src/extensions/fetch-catalog.ts`, writes the
+   snapshot, and regenerates both `config/egress.yml` and
+   `config/egress.dev.yml`; the binding host joins the domain set. Hosted
+   streamable-HTTP + OAuth is preferred. A stdio/CLI binding requires both
+   `no_hosted_variant: true` and human confirmation.
+3. **Effective tools** — `tools` is optional (#158). Present tools,
+   including `[]`, are the reviewed pinned surface. An absent MCP surface
+   comes from paginated provider `tools/list`. `generate-tools.ts` can pin
+   that surface (#157): model-facing names are namespaced, `providerName`
+   preserves the wire name (#148), read/destructive hints and verbs select
+   read/exec, and everything else defaults to write for review.
+4. **Lazy failure** — `surface.ts` resolves providers at boot, caches
+   successes per binding, and never caches failures (#166/#167). A failed
+   provider is skipped with evidence so boot continues; session creation
+   and per-call ownership resolution retry it. If it remains unavailable,
+   the call fails as "tool surface unavailable" rather than running with an
+   empty or stale subset.
+5. **One execution with one principal** — the SDK definition in `tools.ts`
+   binds the caller from the current turn (#152), maps the provider wire
+   name once, and calls `ExtensionRuntime.execute` once (#178). The manifest
+   name remains the policy/audit identity. Another human steering the live
+   turn cannot replace the principal that began it.
+6. **One runtime spine** — `runtime.ts` resolves policy before credentials,
+   then the org/me/auto ladder, the credential boundary, the provider call,
+   and `extension.call` audit. Denied calls never touch the resolver.
+   Provider `isError` results remain errors. `src/mcp/server.ts` exposes the
+   same runtime to ACP/future agents, with `DenyRouter` for ask-human
+   decisions in its headless process (#61/#172).
+7. **No-secrets upload path** — `connect_upload_link` is available in OMP
+   sessions and, when `BOTTEGA_UPLOAD_BASE_URL` is wired, the MCP surface
+   (#196). `src/extensions/upload-link.ts` mints a 144-bit opaque token in
+   SQLite, limited to five live links per actor and 15 minutes by default.
+   The loopback browser endpoint atomically consumes the token, limits POST
+   attempts per client IP, and invokes the existing `connectExtension` path
+   so org approval, broker upload, registry metadata, and audit stay
+   identical. Consumption precedes the vault write: a failed upload burns
+   the link and requires a re-mint. OAuth providers have no uploadable
+   secret and are refused by the mint path. The connect path rejects
+   recognized credential shapes before gate/broker/audit work; this is a
+   narrow guard, not a general scanner for arbitrary Slack text.
 
-**Caller identity and durable-secret hygiene (#121/#152).** The driver
-captures the inbound principal when a fresh turn starts and binds it to
-that turn (the message's `principal` rides the prompt's turn options);
-`SpaceService` exposes it through `getTurnPrincipal`. The in-process
-extension-tool bridge derives the space id from the session transcript and
-supplies that per-turn principal through `getCaller`, so the credential
-ladder's personal lookup matches the Slack human whose message started the
-turn rather than the `"agent"` fallback. Personal `connect ... as me`
-credentials can therefore be used by later extension calls in that turn
-without asking for another token in chat — and because the binding is
-per-turn, another user's mid-turn message (a steer) never re-identifies the
-running turn's calls as theirs (#152).
-
-The separate `memory.save` boundary in `src/tools/memory.ts` rejects narrow,
-obvious credential shapes (including common GitHub, Slack, OpenAI, AWS, and
-NEAR tokens) before either persistence or audit. This is a refusal guard,
-not a general secret detector: credentials still belong in auth-broker,
-while durable memory never receives values the guard recognizes.
-
-The test-only fixture extension (`fixture.ts`) proves the registration and
-egress shape end to end. Production snapshots under `config/extensions/`
-currently describe Attio, GitHub, and Linear; their official MCP/CLI
-surfaces still run through the same runtime rather than bottega-owned
-provider API clients.
+GitHub's production snapshot is the hosted streamable-HTTP endpoint
+`https://api.githubcopilot.com/mcp/`; no local GitHub MCP binary is installed
+(#145). Production snapshots also cover Attio and Linear.
 
 ```mermaid
 sequenceDiagram
-    participant A as agent session
+    participant T as tool bridge
     participant P as policy gate
-    participant C as credential ladder
-    participant B as egress boundary
-    participant K as auth-broker vault
+    participant L as credential ladder
+    participant R as configured resolver
+    participant B as credential boundary
     participant X as iron-proxy
-    participant V as provider
-    participant U as audit
-    A->>P: extension tool call
-    P->>P: allowlist + manifest tier (denied/unknown → stop, audit)
-    P->>C: resolve credential (org / me / auto)
-    C->>B: resolved credential registry row
-    B->>K: fetchSnapshot (broker URL + bearer token)
-    K-->>B: secret payload for credential id
-    B->>X: write mode-0600 file + POST /v1/reload
-    A->>X: provider call — no credential in payload/env/transcript
-    X->>X: secrets transform: inject Authorization<br/>(allowlisted domain only)
-    X->>V: credentialed request
-    A->>U: extension.call {extension, tool, actor, credential_id, decision}
+    participant H as hosted provider MCP
+    participant A as append-only audit
+
+    T->>P: manifest tool + turn principal + space
+    P->>P: extension allowlist + tier
+    alt denied / unknown
+        P->>A: policy.decision + extension.call(deny)
+    else allowed
+        P->>L: resolve me / org / auto
+        L->>R: credential metadata only
+        alt secrets_backend = omp-broker
+            R->>R: broker snapshot; OAuth refresh stays in broker
+        else secrets_backend = 1password-connect
+            R->>R: provider:identityKey → vault/item/field
+        end
+        R-->>B: secret payload
+        B->>X: atomic mode-0600 file + POST /v1/reload
+        T->>X: credential-free streamable-HTTP request
+        X->>X: allowlist → judge → inject Authorization
+        X->>H: credentialed tools/call<br/>providerName wire value
+        H-->>T: one result (isError preserved)
+        T->>A: extension.call {tool, actor, credential_id, decision}
+    end
 ```
+
+Missing backend configuration, credential row/mapping, supported secret
+shape, or proxy reload stops the request before it can run unauthenticated.
+The agent environment, transcript, and audit never receive the secret.
+
+```mermaid
+flowchart LR
+    CHAT["connect_extension<br/>api_key argument"] --> GUARD{"recognized secret shape?"}
+    GUARD -- "yes" --> REFUSE["refuse before gate/broker/audit<br/>point to OAuth, vault, or upload link"]
+    GUARD -- "no" --> CONNECT["existing connect path"]
+
+    MINT["connect_upload_link<br/>turn principal + extension + scope"] --> TOK[("upload_tokens<br/>144-bit opaque token<br/>15 min, single-use")]
+    TOK --> FORM["GET loopback browser form<br/>password field, no-store CSP"]
+    FORM --> POST["POST secret<br/>IP attempt limit"]
+    POST --> CONSUME["atomic DELETE … RETURNING<br/>expiry + replay fail closed"]
+    CONSUME --> CONNECT
+    CONNECT --> ORG{"org scope?"}
+    ORG -- "yes" --> APPROVE["policy + human approval"]
+    ORG -- "no" --> VAULT["broker vault upload"]
+    APPROVE --> VAULT
+    VAULT --> META[("extension credential metadata")]
+    META --> AUDIT[("extension.connected audit<br/>no secret")]
+```
+
+The endpoint currently binds `127.0.0.1` and returns its local URL. It does
+not create public ingress; a deployment serving remote Slack participants
+must supply routing outside this repository. A standalone MCP process
+without `BOTTEGA_UPLOAD_BASE_URL` does not advertise the mint tool. A raw
+secret already typed into an arbitrary Slack message is outside this
+typed-boundary guard.
 
 ### CLI surface (thick tools image + spawn path)
 
@@ -571,33 +634,44 @@ in-conversation recovery:
   the record so a later regression is visible. Check failures suppress only
   the nudge, never the underlying error reply.
 
-## Slack responsiveness and delivery (#119/#120)
+## Slack responsiveness and turn delivery (#119/#120/#179/#180/#181/#184/#193)
 
-For normal agent-bound messages, `SpaceService` performs receipt work before
-attachment ingestion or a session cold start:
+```mermaid
+flowchart TD
+    IN["validated inbound<br/>{space, principal, text, ts}"] --> DIRECT{"direct connect intent<br/>or dropped during dispose?"}
+    DIRECT -- "yes" --> BYPASS["handle/skip directly<br/>no false receipt claim"]
+    DIRECT -- "no" --> RECEIPT["before cold start, fire-and-forget<br/>phrase + 👀 reaction + message.in"]
+    RECEIPT --> KIND{"DM channel?"}
+    KIND -- "yes (#180)" --> PLAIN["plain top-level message<br/>no thread, no stream"]
+    KIND -- "no" --> CAP{"startup stream probe passed?"}
+    CAP -- "yes" --> STREAM["chat.startStream in thread<br/>thinking blocks + tool task_update steps"]
+    CAP -- "no / any stream failure" --> FALL["disable streaming for this boot<br/>phrase + in-place edit fallback"]
+    FALL --> PLAIN
+    PLAIN --> LIVE["400 ms coalesced live line (#193)<br/>tool step > thinking snippet > elapsed time"]
+    STREAM --> FINAL["turn_end: stopStream with final reply"]
+    LIVE --> FINALPLAIN["turn_end: immediate final edit<br/>bounded retries"]
+    FINAL --> CLEAN["remove receipt reactions<br/>message.reply latency audit"]
+    FINALPLAIN --> CLEAN
+```
 
-1. Record the inbound timestamp and real principal.
-2. Post the rotating thinking phrase, add a 👀 reaction to the inbound
-   message, and append `message.in`, all fire-and-forget.
-3. Create or reuse the session and submit the turn.
+`SpaceService` starts receipt work before attachment ingestion or session
+creation. Phrase and reaction failures are logged but never block the turn;
+audit payloads contain the Slack timestamp, not message text (#119).
 
-The direct connect-intent path and messages dropped during session disposal
-skip those receipt claims because they do not enter an agent turn. Reaction
-add/remove failures (including a missing Slack `reactions:write` scope) are
-logged but never fail the turn. A visible reply or error removes every
-pending receipt reaction for the space.
+DMs always instantiate `SlackTurnPresenter`, whose `replyOpts()` returns no
+thread. Channels use `StreamTurnPresenter` only when the adapter's bounded
+probe says streaming is available. The stream client has retries disabled
+and a ten-second call bound; any failure flips the per-boot capability flag
+and the presenter falls back to the plain path (#181). The hermetic e2e
+harness uses the explicit `streamingSupported: () => false` seam to exercise
+that fallback (#179). `agent_view` and `assistant:write` remain absent from
+the Slack manifest because they hid DM messages (#184).
 
-Receipt audit payloads contain the Slack timestamp, never message text.
-The first visible reply/error consumes the receipt clock and appends
-`message.reply` with `latency_ms` and, when a phrase was posted,
-`phrase_ms`. Empty retry bookkeeping does not manufacture a reply row.
-
-On a steered streaming turn, the latest reply text wins and in-place Slack
-updates are coalesced to at most one per
-`STREAM_UPDATE_INTERVAL_MS` (1,000 ms). `turn_end` immediately flushes the
-final text; failures are retained and retried on the same cadence up to the
-bounded final retry limit. Interim failures wait for that final flush.
-Non-streaming replies keep the direct, unbatched update path.
+On the plain path, progress prefers the current gated tool step, then the
+latest model thinking snippet, then `Thinking… Ns` (#193). Reply/progress
+updates coalesce at `STREAM_UPDATE_INTERVAL_MS = 400`; `turn_end` flushes
+the latest final text immediately and retries final delivery up to the
+bounded limit (#120).
 
 ## Data flow: "issue shared in Slack gets implemented"
 
@@ -610,37 +684,80 @@ sequenceDiagram
     participant E as Executor
     H->>A: "Can we fix the flaky checkout?"
     A->>S: validated {space, principal, text}
-    S->>S: agent session (driver): steer or prompt
-    S->>A: reply streams to the channel
-    H->>A: "@agent take this" (pickup is explicit)
+    S->>S: receipt + agent session (steer or fresh turn)
+    S->>A: live progress, then final reply
+    H->>A: approve confirmable pickup draft<br/>(explicit tool or semantic #89)
     A->>S: create_work_item (exec tier)
-    S->>P: ask-human → H approves (v1: anyone in channel)
-    P->>S: approved → work item open
-    E->>E: claims row (atomic) → working, workspace, clone, branch
-    E->>E: agent session (pre-approved scope) implements
-    E->>E: push branch → PR via GitHub API (PAT from 0600 file)
-    E->>S: delivery_pending marker + evidence
-    S->>A: "PR ready: <url> — approve to finish" (delivery poller)
-    S->>S: approval recorded → review → done (requires pr_url)
+    S->>P: ask-human → H approves
+    P->>S: approved → work item open with optional model/effort pin
+    E->>E: atomic claim → working → isolated workspace/session
+    E->>E: apply task pin, implement, push branch, open PR
+    E->>S: work_item.delivery_pending audit marker
+    S->>A: poller posts PR + interactive delivery prompt
+    H->>A: approve delivery
+    A->>S: delivery.resolved (first durable click wins)
+    S->>E: audit-backed onDelivery wait resolves
+    E->>E: working → review → done
 ```
+
+## Worker boundary direction (epic #170)
+
+```mermaid
+flowchart LR
+    subgraph shipped["Shipped boundary"]
+        SL["server<br/>conversation, receipt, approvals,<br/>scheduling, orchestration"]
+        Q[("SQLite queue + audit<br/>current cross-process seam")]
+        EX["executor container<br/>claim loop"]
+        GIT["git job<br/>workspace → branch → PR"]
+        EXT["extension job<br/>headless session → provider result"]
+        DEL["delivery approval seam (#149)<br/>pending → resolved → done"]
+        SL --> Q --> EX
+        EX --> GIT --> DEL --> Q
+        EX --> EXT --> Q
+    end
+
+    subgraph planned["Epic #170 direction — not all shipped"]
+        OUT["durable outbox (#187)<br/>reliable dispatch"]
+        ROUTER["worker router<br/>job kind"]
+        C1["per-job container<br/>git"]
+        C2["per-job container<br/>extension"]
+        C3["per-job container<br/>other risky/credentialed work"]
+        OUT --> ROUTER
+        ROUTER --> C1
+        ROUTER --> C2
+        ROUTER --> C3
+    end
+
+    Q -. "planned cutover" .-> OUT
+```
+
+The server's target responsibility is conversation + orchestration. Risky
+or credentialed execution belongs behind the worker boundary. The
+preconditions already shipped are the complete delivery round-trip (#149)
+and composition-root parity (#172); the durable outbox is separately
+tracked in #187. Today there is one shared executor container for git and
+extension deliveries, and no chat worker. The right side is direction, not
+current-state documentation.
 
 ## Persistence & audit
 
 One SQLite file (`bun:sqlite`, WAL, busy_timeout for the server+executor
 two-process share), migrated idempotently at boot:
 
-- `spaces` — space registry + per-space policy overlay.
-- `work_items` — the queue and the state machine below, with a legal-move
-  map enforced in the store (single choke point) and obligations: `done`
-  requires a `pr_url`, `blocked` requires evidence, `review` requires a
-  recorded approval. Stale rows (`claimed`/`working` past a TTL) are
-  recovered to `blocked` with evidence on boot.
-- `scheduler_jobs` — durable cron rows (id, action, cron, params,
-  space_id, next_fire_at, last_result, enabled).
-- `audit` — append-only; UPDATE/DELETE rejected by triggers. Every policy
-  decision, approval, tool call (redacted), and work-item transition is a
-  row. Payloads are redacted (secret-shaped values → `[REDACTED]`) and
-  capped at 4 KB before write.
+- `spaces` — registry + per-space policy/model settings. First contact uses
+  an idempotent upsert that never overwrites an existing overlay (#188).
+- `work_items` — the queue and legal state machine below, including optional
+  per-task model and reasoning-effort pins (#185). `done` requires delivery
+  evidence, `blocked` requires evidence, and git `review` requires a recorded
+  human approval. Stale claimed/working rows recover to `blocked`.
+- `scheduler_jobs` — durable cron rows (id, action, cron, params, space id,
+  next fire, last result, enabled).
+- `upload_tokens` — opaque, expiring, single-use #196 browser-upload
+  grants. The MCP child and server endpoint share the table; atomic delete
+  makes only the first valid POST consumable.
+- `audit` — append-only; triggers reject UPDATE/DELETE. Policy decisions,
+  approvals, tool calls, delivery decisions, model-pin application, and
+  work-item transitions are rows. Payloads are redacted and capped at 4 KiB.
 
 ```mermaid
 stateDiagram-v2
@@ -673,74 +790,86 @@ is never deleted: "cleanup" evicts caches, never rows.
 | Threat surface | Control |
 |---|---|
 | Untrusted ingress | Adapters validate every event; only adapters mint messages |
-| Credential exposure | Provider keys in auth-broker vault; Slack tokens only in server `.env`; git PAT only in a mode-0600 file on the data volume; OMP secret obfuscation (`secrets.enabled`); extension credentials injected at the proxy boundary, never in env/transcripts |
-| Malicious repo content | Work items run in the executor container in disposable workspaces; server never mounts repo paths |
-| Exfiltration / rogue egress | Default-deny deployment egress through iron-proxy: static allowlist, LLM judge on allowlisted traffic, DNS sinkhole (containers resolve only through the proxy). Local dev still routes all traffic through iron-proxy, but `config/egress.dev.yml` deliberately uses allow-all with no judge while retaining secret injection and management (#123/#126) |
-| Unauthorized side effects | Policy gate on every tool call; exec prompts to humans; unknown → deny |
-| Data loss / tampering | Append-only audit (SQLite triggers reject UPDATE/DELETE), transcripts retained, never deleted |
-| Failure | Fail closed: parse errors, policy errors, model outages, missing tokens → deny or block with evidence |
+| Credential exposure | Per-turn principal selects the credential; omp-broker or 1Password Connect resolves it; mode-0600 files and iron-proxy inject it only at the allowlisted host. API-key onboarding can use a single-use browser upload (#196). Slack tokens stay server-only; the git PAT stays file-only |
+| Secret pasted into a typed connect/memory write | Recognized shapes are refused before broker/persistence/audit and redirected to OAuth, the configured vault, or `connect_upload_link`. This does not scrub arbitrary Slack text already received |
+| Malicious repo content | Work items run in the executor container in disposable workspaces; the server never mounts repository paths. Epic #170 moves toward per-job containers |
+| Exfiltration / rogue egress | Default-deny deployment proxy: allowlist, judge, secret injection, and DNS sinkhole. Dev uses `config/egress.dev.yml` (allow-all/no judge) but keeps the proxy and injection path |
+| Unauthorized side effects | Policy gate on every tool call; exec and org-settings writes ask humans; unknown → deny |
+| Cross-user credential confusion | The driver binds the fresh turn's principal; steers do not replace it (#152), and one tool call dispatches once (#178) |
+| Data loss / tampering | Append-only audit, retained transcripts, delivery decisions as durable cross-process rows |
+| Failure | Parse/policy/surface/model/secret failures deny, error, or block with evidence; streaming degrades to plain delivery |
 
 ## Verification architecture
 
-The default Bun suite stays hermetic. `src/server/boot-wiring.test.ts`
-drives a real `main()` in a temporary working directory and observes the
-caller-level session toolset, proving scheduler/KB registration, model-pin
-sync, fail-closed Slack-token boot, and the ACP driver flip without opening
-a Slack connection. `src/server/onboarding-boot.test.ts` uses the same real
-composition-root shape for the proactive boot post.
+The default Bun suite is hermetic and has grown to roughly 1,190 test cases
+across the full repository wave. The exact count is not a contract; behavior
+at the caller surface is. `src/server/boot-wiring.test.ts`,
+`src/executor-boot.test.ts`, and
+`src/server/composition-root-parity.test.ts` boot the real construction
+paths in temporary directories. The driver conformance suite runs both OMP
+and ACP. `src/executor.test.ts` drives the full delivery approval round-trip
+through real SQLite and boundary doubles.
 
-`bunfig.toml` excludes only live-connection helpers from coverage.
-`bun run scripts/check-coverage.ts` runs the full suite with coverage,
-parses Bun's aggregate `All files` row, and enforces 85% for both lines and
-functions. The separate script is intentional: Bun 1.3.14 applies
-`coverageThreshold` per file rather than to the suite aggregate.
+The definition of done is caller-level acceptance coverage (#174): drive a
+real inbound message, tool call, scheduler fire, or executor claim and assert
+the observable result. Helper-only coverage cannot close a feature. Criteria
+that require live infrastructure become named integration legs or canary
+journeys rather than silent skips.
 
-Real infrastructure keeps an opt-in leg rather than entering the hermetic
-default: Mem0 and strict/dev iron-proxy legs run with
-`BOTTEGA_RUN_INTEGRATION=1`; the opencode provider leg requires a usable
-key and gateway; the auth-broker leg exercises the personal credential →
-vault fetch → secret file → proxy injection → GitHub chain. Each leg either
-records the real assertion or prints a concrete skip reason when Docker,
-an image, a key, the gateway, or the broker is unavailable.
+`bun run scripts/check-coverage.ts` runs the entire suite with coverage,
+parses Bun's aggregate `All files` row, and enforces an 85% floor for both
+lines and functions. The wave's measured aggregate is around the low-to-mid
+90s (approximately 94% in the batch snapshot); the checked-in floor, not a
+transient measurement, is the merge contract. The separate gate exists
+because Bun 1.3.14 applies `coverageThreshold` per file.
+
+The highest-risk external boundaries also have explicit legs:
+
+- `src/egress/iron-proxy.test.ts` runs the real proxy for default-deny,
+  DNS-sinkhole, and header-injection behavior (#177).
+- `tests/e2e/auth-broker-leg.test.ts` covers personal credential → vault
+  fetch → secret file → proxy injection → hosted GitHub MCP.
+- `.github/workflows/canary.yml` runs real Slack/model journeys weekly and
+  fails rather than skips when CI credentials are absent (#175). It is a
+  release gate, not a merge gate.
+- Other real infrastructure stays `BOTTEGA_RUN_INTEGRATION=1` skip-gated
+  with a concrete reason; no skipped leg is reported as passing.
 
 ## Repository layout
 
 ```
 src/
-  server/           index.ts (composition root)
-  server/adapters/  slack.ts
-  server/drivers/   agent-driver.ts (AgentDriver + OMP SDK), acp-driver.ts
-  server/services/  space-service.ts, delivery-poller.ts
+  server/           index.ts (Slack composition root), bootstrap-runtime.ts (shared chain)
+  server/adapters/  slack.ts, approval-router.ts, delivery-router.ts
+  server/drivers/   agent-driver.ts (OMP), acp-driver.ts, conformance suite
+  server/services/  space-service.ts, slack-turn-presenter.ts, delivery-poller.ts
   policy/           config.ts, extension.ts, approval-router.ts, audit.ts
-  extensions/       registry (manifest + pinned snapshots + tool bridge)
-  scheduler/        cron.ts, store.ts, runner.ts, actions.ts (standup/reflection/pulse/recurring work)
-  kb/               doc ingestion pipeline (kb_ingest)
-  store/            db.ts, schema.sql
-  tools/            work-items.ts, memory.ts, kb-tools.ts, helpers.ts
-  memory/           sqlite.ts, mem0.ts, types.ts (providers behind one interface)
-  mcp/              server.ts (bottega-hosted MCP surface: memory + connect + extension tools, #25/#61)
-  executor.ts       containerized work-item runner (claim → PR)
-  yaml-subset.ts    shared strict YAML-subset parser (configs + tests)
-  egress/           generate.ts (allowlist from extension domains) + tests: compose topology, egress.yml, iron-proxy leg
-  secrets/          broker/gateway wiring + tests: credential boundary, omp templates, agent-dir
+  extensions/       manifest/registry, discovery/generation, tool bridge, runtime/boundary, upload-link
+  models/           model-pin.ts (declared + probed catalog, friendly-name resolution)
+  scheduler/        cron, store, runner, actions (standup/reflection/pulse/recurring work)
+  kb/               deterministic document ingestion
+  store/            db.ts, schema.sql, org settings
+  tools/            work items/pickup, model/settings/admin, memory/KB/object tools
+  memory/           SQLite + mem0 providers behind one interface
+  mcp/              server.ts (third composition root; memory/connect/extensions)
+  executor.ts       second composition root + containerized claim/delivery runner
+  egress/           generated allowlists + real iron-proxy leg
+  secrets/          broker/gateway wiring and auth-boundary tests
+  yaml-subset.ts    strict shared config parser
 config/
-  extensions/       pinned extension snapshots (one JSON per extension)
-  egress.yml        generated iron-proxy allowlist + judge policy (transforms: allowlist → judge → secrets)
-  egress.dev.yml    generated local-dev allow-all/no-judge config (secrets + management retained)
-  omp/              config.yml (secrets.enabled), secrets.yml, models.yml
-  org.yml           executor repos + git base
-  kb.yml            knowledge-base document sources (#91)
-  entrypoints/      broker.sh (auth-broker token bootstrap)
-Dockerfile          single image (server + executor entrypoints), bun user
-Dockerfile.tools    curated CLI image (built in CI docker job)
-Dockerfile.tools-heavy  opt-in Rust/kubectl/helm/gcloud layer (NOT default)
-docker-compose.yml  server, executor (profile), auth-broker, auth-gateway, iron-proxy, mem0
-docker-compose.dev.yml  local-dev overlay (host-only proxy + auth-broker ports, host data bind)
-scripts/dev.sh      dev boot: agent-dir seed, MITM CA, permissive proxy, broker/CLI fallback, env export
-scripts/smoke.sh    local checks + manual checklist
-scripts/e2e-smoke.sh  compose e2e smoke leg: fail-closed boots + wiring (skip-gated)
-bunfig.toml         coverage exclusions for live-only helpers
-scripts/check-coverage.ts  aggregate line/function coverage gate (85%)
-scripts/seed-agent-dir.ts  per-file, only-if-missing OMP template seed
-tests/e2e/          skip-gated live provider/proxy/broker legs with evidence
+  extensions/       reviewed snapshots; drafts/ is outside the registry scan
+  egress.yml        strict generated allowlist → judge → secrets config
+  egress.dev.yml    generated dev allow-all/no-judge config; secrets retained
+  omp/              agent config, secrets settings, declared model catalog
+  org.yml           deployment defaults (repos, git/API base)
+  kb.yml            knowledge-base sources
+  entrypoints/      auth-broker token bootstrap
+Dockerfile              server/executor image
+Dockerfile.tools        curated CLI base
+Dockerfile.tools-heavy  opt-in Rust/kubectl/helm/gcloud layer
+docker-compose.yml      server, executor, auth services, proxy, optional mem0
+docker-compose.dev.yml  host-only dev proxy/broker ports + host data bind
+scripts/dev.sh          CA/proxy boot, image-check-first broker fallback, env contract
+scripts/check-coverage.ts  aggregate 85% line/function gate
+tests/e2e/              skip-gated provider/proxy/broker legs + live canary
 ```
