@@ -63,7 +63,7 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
-import { workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { kbJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
 import { DenyRouter } from "./policy/approval-router";
 import {
   assertAgentDirModelAvailable,
@@ -471,10 +471,23 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
     case "git":
     case "extension":
       return runWorkItemJob(deps, cfg, job);
-    case "kb":
+    case "kb": {
+      // Wave 2 lands the ingest worker; until then a dispatch fails closed —
+      // never a silent no-op. The payload contract parses NOW so a malformed
+      // dispatch is caught at the bus, not discovered in Wave 2.
+      const parsed = kbJobPayloadSchema.safeParse(job.payload);
+      if (!parsed.success) {
+        throw new Error(`kb job payload must be { url, ... } — failing closed: ${parsed.error.message}`);
+      }
       throw new Error("kb job kind is not implemented yet (epic #170 Wave 2) — failing closed");
-    case "scheduled":
+    }
+    case "scheduled": {
+      const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
+      if (!parsed.success) {
+        throw new Error(`scheduled job payload must be { action, ... } — failing closed: ${parsed.error.message}`);
+      }
       throw new Error("scheduled job kind is not implemented yet (epic #170 Wave 2) — failing closed");
+    }
   }
 }
 
