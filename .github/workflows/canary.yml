@@ -1,0 +1,68 @@
+# Scheduled live-Slack canary (issue #175).
+#
+# The canary (tests/e2e/canary.ts, issue #79) is the repo's only true
+# "does the product work" check — real Socket Mode, real model, real
+# workspace, journeys driven as a QA user. This workflow schedules it
+# against the dedicated QA workspace with repository secrets and runs it
+# CI-strict: missing credentials FAIL the job (never a silent skip in CI).
+#
+# Release gate, not a merge gate (live infra can flake): a red scheduled
+# run blocks the next deploy until triaged (AGENTS.md → "Scheduled
+# live-Slack canary (issue #175)").
+#
+# Secrets (set in the repository): SLACK_APP_TOKEN, SLACK_BOT_TOKEN,
+# SLACK_QA_USER_TOKEN (required), SLACK_QA_USER_ID, SLACK_QA_CHANNEL,
+# NEAR_API_KEY (or CANARY_MODEL_REF) — see features.md → "Live-Slack QA
+# canary" for the QA user + token setup.
+name: Canary
+
+on:
+  schedule:
+    # Weekly: Monday 06:00 UTC. One run is a handful of model calls and
+    # Slack messages; nightly is an option if the workspace tolerates it.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  live-slack-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+
+      # CI-strict (--ci): the canary fails loudly when any secret is
+      # missing instead of skipping — a canary that silently skips in CI is
+      # worse than none. Output is teed to canary-report.txt so the failure
+      # notification can carry the per-journey report + permalinks.
+      - name: Run the live-Slack canary (CI-strict)
+        id: canary
+        env:
+          CI: "true"
+          CANARY_CI: "1"
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_QA_USER_TOKEN: ${{ secrets.SLACK_QA_USER_TOKEN }}
+          SLACK_QA_USER_ID: ${{ secrets.SLACK_QA_USER_ID }}
+          SLACK_QA_CHANNEL: ${{ secrets.SLACK_QA_CHANNEL }}
+          NEAR_API_KEY: ${{ secrets.NEAR_API_KEY }}
+          CANARY_MODEL_REF: ${{ secrets.CANARY_MODEL_REF }}
+        run: |
+          set -o pipefail
+          bun run canary --live-slack --ci 2>&1 | tee canary-report.txt
+
+      # Failure notifies loudly: the QA channel itself gets the per-journey
+      # report + permalinks + the Actions run URL (the CI status is the
+      # second, native notification).
+      - name: Notify the QA channel on failure
+        if: failure() && steps.canary.outcome == 'failure'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_QA_CHANNEL: ${{ secrets.SLACK_QA_CHANNEL }}
+        run: bun run scripts/canary-notify.ts canary-report.txt

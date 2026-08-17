@@ -14,6 +14,12 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { channelFromSpaceId } from "../server/adapters/slack";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
+import {
+  DEFAULT_MODEL_CATALOG_DIR,
+  listAvailableModels,
+  resolveModelPin,
+  type ModelCatalogEntry,
+} from "../models/model-pin";
 import { errorMessage, toolError } from "./helpers";
 import type { Store } from "../store/db";
 
@@ -22,6 +28,17 @@ export interface WorkItemsExtensionOpts {
   actor?: string;
   /** Org floor policy; the space overlay's `approvers` list authorizes cancels. */
   orgPolicy: PolicyConfig;
+  /**
+   * Agent dir whose model catalog validates create_work_item model pins
+   * (issue #185). Default "data/omp-agent" (the server/executor default).
+   */
+  agentDir?: string;
+  /**
+   * Model-catalog seam (issue #185 tests): resolves the AVAILABLE models a
+   * model pin may name. Defaults to the SDK registry over `agentDir` (the
+   * same catalog the sessions see).
+   */
+  listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]>;
 }
 
 /**
@@ -45,6 +62,14 @@ export const createWorkItemArgsSchema = z.object({
   requester: z.string().optional(),
   repo: z.string().optional(),
   delivery: z.enum(["git", "extension", "chat"]).optional(),
+  /**
+   * Per-task model pin (issue #185): a role ref ("fast"/"reasoning") or a
+   * friendly model name ("deepseek v4") resolved against the available
+   * model catalog at creation, fail closed. Stored on the item.
+   */
+  model: z.string().optional(),
+  /** Per-task thinking-effort pin (issue #185): off/low/medium/high. */
+  reasoning_effort: z.enum(["off", "low", "medium", "high"]).optional(),
 });
 export const cancelWorkItemArgsSchema = z.object({ id: z.string() });
 
@@ -75,6 +100,10 @@ export function workItemToolDefinitions(
       "GitHub issue URL or the conversation. When any description contains a GitHub issue URL, the link " +
       "is recorded as evidence; repo derivation from that URL applies only to git delivery. " +
       "Git delivery can only push to repos on the allowlist (org settings repos, config/org.yml by default). " +
+      "Optional `model` pins the model this task runs on: a role ref (\"fast\" or \"reasoning\") or a model name " +
+      "(\"deepseek v4\", \"gpt sol\") resolved against the available models at creation — a name that matches no " +
+      "available model is rejected and no item is created. Optional `reasoning_effort` (off/low/medium/high) pins " +
+      "the thinking effort. The pin overrides the space's model settings for this item's execution only. " +
       "Requires human approval (exec-tier tool).",
     parameters: createWorkItemArgsSchema,
     approval: "exec",
@@ -83,6 +112,18 @@ export function workItemToolDefinitions(
       const delivery = params.delivery ?? "git";
       if (delivery === "git" && params.repo !== undefined && !params.repo.trim()) {
         return toolError("repo must be a non-empty string when provided");
+      }
+      // Per-task model pin (issue #185): role refs pass through; friendly
+      // names resolve against the available catalog at creation, fail
+      // closed — an unresolvable/ambiguous name never creates the item.
+      let model: string | undefined;
+      if (params.model !== undefined && !params.model.trim()) {
+        return toolError("model must not be empty when provided");
+      }
+      if (params.model !== undefined) {
+        const resolution = resolveModelPin(params.model, await (opts.listModels ?? listAvailableModels)(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR));
+        if (!resolution.ok) return toolError(resolution.error);
+        model = resolution.pin.kind === "role" ? resolution.pin.role : resolution.pin.modelId;
       }
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("work items require a space session");
@@ -111,13 +152,25 @@ export function workItemToolDefinitions(
           description,
           delivery,
           evidence,
+          model,
+          reasoning_effort: params.reasoning_effort,
           repo:
             delivery === "git"
               ? params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined)
               : undefined,
         });
         return {
-          content: [{ type: "text", text: JSON.stringify({ id: item.id, state: item.state }) }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                id: item.id,
+                state: item.state,
+                ...(model !== undefined ? { model } : {}),
+                ...(params.reasoning_effort !== undefined ? { reasoning_effort: params.reasoning_effort } : {}),
+              }),
+            },
+          ],
         };
       } catch (err) {
         return toolError(errorMessage(err));

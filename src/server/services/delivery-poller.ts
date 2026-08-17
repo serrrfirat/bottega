@@ -1,13 +1,13 @@
 /**
- * Delivery approval poller (issue #12, #11 follow-up).
+ * Delivery approval poller (issue #12, #11 follow-up; round trip #149).
  *
  * The executor runs in its own container and cannot post to Slack: when a
  * work item's PR is opened it writes a `work_item.delivery_pending` audit
  * marker (payload {id, pr_url, summary}) and then waits on the onDelivery
  * seam. The server side of that seam is this poller: it watches the audit
- * trail, posts the PR + approval request to the space channel via the
- * adapter, and records a `delivery.requested` audit row so a restart never
- * double-posts.
+ * trail, posts the PR + an interactive approve/deny prompt to the space
+ * channel via the adapter, and records a `delivery.requested` audit row so
+ * a restart never double-posts.
  *
  * `delivery.requested` is distinct from `approval.requested` (which is
  * reserved for policy-tool approvals with payload {tool, reason}) — the
@@ -15,13 +15,15 @@
  * (issue #33).
  *
  * The button round-trip (the human's decision resolving the seam into
- * working -> review -> done) is a later adapter issue; this module only
- * announces. The executor keeps waiting, so the item stays `working` until
- * that path lands.
+ * working -> review -> done) is the delivery router's job
+ * (src/server/adapters/delivery-router.ts): a block-action click records
+ * `delivery.resolved`, which the executor's onDelivery wait reads as the
+ * approval. This module only announces.
  */
 import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import type { SlackAdapter } from "../adapters/slack";
+import { buildDeliveryBlocks } from "../adapters/delivery-router";
 
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -81,7 +83,14 @@ export async function pollPendingDeliveries(
     const payload = parsePayload(row.payload);
     if (!payload || typeof payload.id !== "string" || typeof payload.pr_url !== "string") continue;
     if (announced.has(payload.id)) continue;
-    await adapter.postMessage(row.space_id, `PR ready: ${payload.pr_url} — approve to finish`);
+    const summary = typeof payload.summary === "string" ? payload.summary : "";
+    // Interactive prompt: approve/deny buttons carry the work item id, the
+    // key the delivery router resolves on (issue #149).
+    await adapter.postMessage(
+      row.space_id,
+      `PR ready: ${payload.pr_url} — approve to finish`,
+      { blocks: buildDeliveryBlocks(payload.pr_url, summary, payload.id) },
+    );
     await store.appendAudit({
       space_id: row.space_id,
       actor: "server",
@@ -89,7 +98,7 @@ export async function pollPendingDeliveries(
       payload: JSON.stringify({
         id: payload.id,
         pr_url: payload.pr_url,
-        summary: typeof payload.summary === "string" ? payload.summary : "",
+        summary,
       }),
     });
     announced.add(payload.id);

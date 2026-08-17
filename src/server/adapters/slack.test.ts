@@ -1,22 +1,35 @@
 import { describe, expect, test } from "bun:test";
 import { App, type Logger } from "@slack/bolt";
+import { WebClient } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 import {
   APPROVE_ACTION_ID,
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
   DENY_ACTION_ID,
+  buildAppendTaskArgs,
+  buildAppendTextArgs,
   buildPostMessageArgs,
+  buildStartStreamArgs,
+  buildStopStreamArgs,
   buildUpdateMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
   isBotMessage,
   isDmChannel,
+  isStreamingCapabilityError,
+  markdownChunk,
   normalizeActionEvent,
   isMentionedMessage,
   normalizeMessage,
+  probeStreamingSupport,
   registerActionHandler,
   registerMessageHandler,
   renderSlackText,
   spaceIdFromChannel,
+  STREAM_RETRY_CONFIG,
+  STREAM_TASK_OUTPUT_MAX,
+  taskUpdateChunk,
   type SlackAction,
   type MessageHandlerOptions,
   type SlackMessage,
@@ -290,6 +303,24 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
     expect(received[0].value).toBe("req-2");
   });
 
+  test("delivers delivery-approval clicks to onAction (issue #149)", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (a) => { received.push(a); });
+
+    await deliver({
+      ...approveBody,
+      actions: [{ type: "button", action_id: DELIVERY_APPROVE_ACTION_ID, value: "wi_1" }],
+    });
+    await deliver({
+      ...approveBody,
+      actions: [{ type: "button", action_id: DELIVERY_DENY_ACTION_ID, value: "wi_2" }],
+    });
+
+    expect(received.map((a) => a.actionId)).toEqual([DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID]);
+    expect(received[0].value).toBe("wi_1");
+    expect(received[1].value).toBe("wi_2");
+  });
+
   test("unrelated action ids do not reach onAction", async () => {
     const received: SlackAction[] = [];
     const { deliver } = bootApp(async (a) => { received.push(a); });
@@ -407,6 +438,76 @@ describe("renderSlackText (Markdown → Slack mrkdwn, issue #84)", () => {
   });
 });
 
+describe("stream arg builders (issue #168)", () => {
+  test("buildStartStreamArgs: channels carry the required recipient_team_id; DMs omit it", () => {
+    expect(buildStartStreamArgs("slack:C123ABC", { threadTs: "1.1", openingText: "Thinking…" }, "T123")).toEqual({
+      channel: "C123ABC",
+      thread_ts: "1.1",
+      recipient_team_id: "T123",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+    expect(buildStartStreamArgs("slack:D123ABC", { threadTs: "1.1", openingText: "Thinking…" }, "T123")).toEqual({
+      channel: "D123ABC",
+      thread_ts: "1.1",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+  });
+
+  test("buildStartStreamArgs: no team id yet → channels omit recipient_team_id (startStream fails once, then falls back)", () => {
+    expect(buildStartStreamArgs("slack:C123ABC", { threadTs: "1.1", openingText: "x" }, undefined)).toEqual({
+      channel: "C123ABC",
+      thread_ts: "1.1",
+      chunks: [{ type: "markdown_text", text: "x" }],
+    });
+  });
+
+  test("markdownChunk renders Slack mrkdwn, taskUpdateChunk keeps the flat task_update shape", () => {
+    expect(markdownChunk("see [docs](https://x.dev)")).toEqual({
+      type: "markdown_text",
+      text: "see <https://x.dev|docs>",
+    });
+    expect(taskUpdateChunk({ id: "step-1", title: "bash — allowed (exec)", status: "in_progress", output: '{"command":"ls"}' })).toEqual({
+      type: "task_update",
+      id: "step-1",
+      title: "bash — allowed (exec)",
+      status: "in_progress",
+      output: '{"command":"ls"}',
+    });
+    expect(taskUpdateChunk({ id: "step-2", title: "x", status: "complete" })).toEqual({
+      type: "task_update",
+      id: "step-2",
+      title: "x",
+      status: "complete",
+    });
+  });
+
+  test("task_update output is capped at 256 chars so a long args card never 400s the stream", () => {
+    const long = "x".repeat(500);
+    const chunk = taskUpdateChunk({ id: "s", title: "t", status: "in_progress", output: long });
+    expect(chunk.output).toHaveLength(STREAM_TASK_OUTPUT_MAX);
+    expect(chunk.output).toBe("x".repeat(STREAM_TASK_OUTPUT_MAX));
+  });
+
+  test("buildAppendTextArgs / buildAppendTaskArgs / buildStopStreamArgs map to appendStream/stopStream arguments", () => {
+    expect(buildAppendTextArgs("slack:C1", "ts-1", "more")).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      chunks: [{ type: "markdown_text", text: "more" }],
+    });
+    expect(buildAppendTaskArgs("slack:C1", "ts-1", { id: "s", title: "t", status: "complete" })).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      chunks: [{ type: "task_update", id: "s", title: "t", status: "complete" }],
+    });
+    expect(buildStopStreamArgs("slack:C1", "ts-1", "final reply")).toEqual({
+      channel: "C1",
+      ts: "ts-1",
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: "final reply" } }],
+    });
+    expect(buildStopStreamArgs("slack:C1", "ts-1")).toEqual({ channel: "C1", ts: "ts-1" });
+  });
+});
+
 describe("createSlackAdapter", () => {
   test("returns an adapter exposing messages, files, reactions, start and stop", () => {
     const adapter = createSlackAdapter({
@@ -422,6 +523,144 @@ describe("createSlackAdapter", () => {
     expect(typeof adapter.uploadFile).toBe("function");
     expect(typeof adapter.start).toBe("function");
     expect(typeof adapter.stop).toBe("function");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Streaming robustness (issue #181): fast capability probe + fail-fast
+// stream calls that never hit the SDK's ~30-minute retry policy and flip
+// the per-boot cache on ANY failure.
+// ---------------------------------------------------------------------------
+
+describe("streaming capability probe (issue #181)", () => {
+  test("scope/token-level errors prove the workspace cannot stream", () => {
+    expect(isStreamingCapabilityError({ data: { error: "missing_required_scope", needed: "assistant:write" } })).toBe(true);
+    expect(isStreamingCapabilityError({ data: { error: "not_allowed_token_type" } })).toBe(true);
+    expect(isStreamingCapabilityError({ data: { error: "invalid_auth" } })).toBe(true);
+  });
+
+  test("channel-level errors mean the token CAN stream (the dummy channel was rejected, not the feature)", () => {
+    expect(isStreamingCapabilityError({ data: { error: "channel_not_found" } })).toBe(false);
+    expect(isStreamingCapabilityError({ data: { error: "invalid_arguments" } })).toBe(false);
+    expect(isStreamingCapabilityError({ data: { error: "invalid_ts" } })).toBe(false);
+    expect(isStreamingCapabilityError(new Error("network down"))).toBe(false);
+    expect(isStreamingCapabilityError(undefined)).toBe(false);
+  });
+
+  test("the stream client is configured with NO retries — a failure must arrive fast, never a ~30-minute retry storm", () => {
+    expect(STREAM_RETRY_CONFIG.retries).toBe(0);
+  });
+
+  test("probeStreamingSupport: a scope error reports unsupported with the code as evidence", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () => Response.json({ ok: false, error: "missing_required_scope", needed: "assistant:write", provided: "chat:write" }),
+    });
+    const client = new WebClient("xoxb-probe-token", {
+      slackApiUrl: `http://127.0.0.1:${server.port}/api`,
+      retryConfig: STREAM_RETRY_CONFIG,
+    });
+    try {
+      expect(await probeStreamingSupport(client, "T123")).toEqual({ supported: false, error: "missing_required_scope" });
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("probeStreamingSupport: a channel-level error means supported — the probe posted nothing and the panel can stream", async () => {
+    let startStreamHits = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () => {
+        startStreamHits += 1;
+        return Response.json({ ok: false, error: "channel_not_found" });
+      },
+    });
+    const client = new WebClient("xoxb-probe-token", {
+      slackApiUrl: `http://127.0.0.1:${server.port}/api`,
+      retryConfig: STREAM_RETRY_CONFIG,
+    });
+    try {
+      expect(await probeStreamingSupport(client, "T123")).toEqual({ supported: true });
+      expect(startStreamHits).toBe(1); // exactly one attempt: fail fast
+    } finally {
+      server.stop();
+    }
+  });
+});
+
+describe("stream calls fail fast and flip the per-boot cache (issue #181)", () => {
+  const BOT_TOKEN = "xoxb-stream-test-token";
+
+  /** Boots the real adapter against a mock Web API that always errors stream calls. */
+  function bootStreamlessApi() {
+    const hits: Record<string, number> = {};
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const method = url.pathname.replace("/api/", "");
+        hits[method] = (hits[method] ?? 0) + 1;
+        return Response.json({ ok: false, error: "not_allowed_token_type" });
+      },
+    });
+    const adapter = createSlackAdapter({
+      appToken: "xapp-stream-test-token",
+      botToken: BOT_TOKEN,
+      onMessage: async () => {},
+      clientOptions: { slackApiUrl: `http://127.0.0.1:${server.port}/api` },
+    });
+    return { adapter, hits, server };
+  }
+
+  test("startStream: one attempt (no retry), the failure flips streamingSupported for the boot", async () => {
+    const { adapter, hits, server } = bootStreamlessApi();
+    try {
+      expect(adapter.streamingSupported()).toBe(true);
+      await expect(adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "Thinking…" })).rejects.toThrow();
+      expect(hits["chat.startStream"]).toBe(1); // no SDK retry storm
+      expect(adapter.streamingSupported()).toBe(false); // cached per boot
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("appendText/appendTask/stopStream failures also flip the cache (fail-fast on every stream call)", async () => {
+    const { adapter, hits, server } = bootStreamlessApi();
+    try {
+      await expect(adapter.appendText("slack:C1", "ts-1", "more")).rejects.toThrow();
+      await expect(adapter.appendTask("slack:C1", "ts-1", { id: "s1", title: "t", status: "in_progress" })).rejects.toThrow();
+      await expect(adapter.stopStream("slack:C1", "ts-1")).rejects.toThrow();
+      expect(hits["chat.appendStream"]).toBe(2);
+      expect(hits["chat.stopStream"]).toBe(1);
+      expect(adapter.streamingSupported()).toBe(false);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("an explicit streamingSupported override still wins over the cache", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () => Response.json({ ok: false, error: "not_allowed_token_type" }),
+    });
+    const adapter = createSlackAdapter({
+      appToken: "xapp-stream-test-token",
+      botToken: BOT_TOKEN,
+      onMessage: async () => {},
+      streamingSupported: () => false, // e2e harness seam (issue #179)
+      clientOptions: { slackApiUrl: `http://127.0.0.1:${server.port}/api` },
+    });
+    try {
+      expect(adapter.streamingSupported()).toBe(false);
+      // The guard throws BEFORE any network call: a stream-less surface is
+      // never even attempted.
+      await expect(adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "x" })).rejects.toThrow(
+        "chat streaming unsupported",
+      );
+    } finally {
+      server.stop();
+    }
   });
 });
 

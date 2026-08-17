@@ -25,6 +25,7 @@ import type { AuditModule } from "./audit";
 import type { ApprovalRouter } from "./approval-router";
 import { loadSpacePolicy, type PolicyConfig, type Tier } from "./config";
 import { evaluatePolicyGate } from "./gate";
+import type { ToolStepSink } from "../server/services/slack-turn-presenter";
 
 export interface PolicyExtensionDeps {
   orgPolicy: PolicyConfig;
@@ -63,6 +64,17 @@ export interface PolicyExtensionDeps {
    * id validation is skipped (executor sessions have no extension tools).
    */
   knownExtensionIds?: readonly string[];
+  /**
+   * Thinking-step sink (issue #168): the driver's withPolicyGate wrapper
+   * emits one task_update per gated tool call through this — in_progress
+   * on start ("allowed (tier)" / "waiting for approval"), complete on
+   * resolution, a terminal denied card on denial. The sink is the
+   * presenter bridge (SpaceService routes by space id); headless callers
+   * omit it. The inline policy extension itself does not emit (its
+   * tool_call interception is inert for restricted sessions — the ACP
+   * driver's own permission seam is a separate surface).
+   */
+  onToolStep?: ToolStepSink;
 }
 
 export default function createPolicyExtension(deps: PolicyExtensionDeps): ExtensionFactory {

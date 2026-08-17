@@ -1,14 +1,12 @@
 /**
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
-import { createStore } from "../store/db";
 import { pruneDigestMemories } from "../memory/sqlite";
 import { maintainMemory, type ConsolidationModelCall } from "../memory/consolidation";
 import { sessionSearchToolDefinitions } from "../memory/session-search";
-import { resolveMemoryProvider } from "./memory-provider";
-import { createAudit } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
-import { loadOrgPolicy, loadSpacePolicy, type ResponseMode } from "../policy/config";
+import { loadSpacePolicy, type ResponseMode } from "../policy/config";
+import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
@@ -27,12 +25,8 @@ import { recurringWorkAction } from "../scheduler/recurring-work";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
-import { createExtensionRegistry } from "../extensions/registry";
-import { createExtensionRuntime } from "../extensions/runtime";
-import { brokerSecretResolverFromEnv, createSecretFileBoundary, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import {
   refreshMissingExtensionSurfaces,
-  resolveExtensionSurfaces,
   type ExtensionSurfaces,
 } from "../extensions/surface";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -50,7 +44,14 @@ import {
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { SlackApprovalRouter } from "./adapters/approval-router";
-import { createSlackAdapter, type SlackAction, type SlackAdapter } from "./adapters/slack";
+import { resolveDeliveryAction } from "./adapters/delivery-router";
+import {
+  createSlackAdapter,
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+} from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
@@ -143,6 +144,17 @@ export interface BottegaServerOpts {
    * ADD tools for providers the boot could not reach.
    */
   onExtensionToolset?: (tools: ToolDefinition[]) => void;
+  /**
+   * Shared-chain observation seam (issue #172): receives the
+   * {@link BootstrapRuntime} the boot built — store → audit → org policy →
+   * extension registry → effective surfaces → extension runtime → memory
+   * provider, the SAME construction the executor and MCP roots use. The
+   * composition-root parity test drives a real main() with this seam to
+   * assert the server resolves the same memory backend, registry contents,
+   * org-policy source, and boundary (broker secret resolver present) as
+   * the other two roots under the same settings.
+   */
+  onRuntimeWiring?: (wiring: BootstrapRuntime) => void;
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
@@ -152,8 +164,31 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     throw new Error("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required");
   }
 
-  const store = createStore();
-  const audit = createAudit(store);
+  // Shared composition chain (issue #172, #153 item 2): ONE construction
+  // site for store → audit → org policy → extension registry → effective
+  // surfaces → extension runtime → memory provider, identical across the
+  // server / executor / MCP roots. The extension runtime's ask-human
+  // router is late-bound (the Slack-backed router is constructed below,
+  // after the adapter); the runtime reads it per call.
+  let approvalRouter: ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
+  // Delivery-approval clicks (issue #149) resolve the executor's delivery
+  // seam; late-bound like approvalRouter — assigned after the adapter and
+  // store are available, before main() returns.
+  let deliveryActionHandler: (a: SlackAction) => Promise<void>;
+  const wiring = await bootstrapRuntime({
+    router: () => approvalRouter,
+    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
+  });
+  const {
+    store,
+    audit,
+    orgPolicy,
+    registry: extensionRegistry,
+    runtime: extensionRuntime,
+    surfaces: extensionSurfaces,
+    memoryProvider,
+  } = wiring;
+  opts.onRuntimeWiring?.(wiring);
   // Issue #67: the org settings blob is the source of truth — the policy
   // loader reads DB-first (config.yml is the default/fallback), the memory
   // backend URL and model catalog come from settings, and the agent-dir
@@ -162,13 +197,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // A malformed settings blob fails the boot closed (getOrgSettings
   // throws; loadOrgPolicy fails the policy closed).
   const orgSettings = store.getOrgSettings();
-  const orgPolicy = loadOrgPolicy(store);
-  // One memory provider for the whole process: shared by the agent
-  // memory tools, the context-injection extension, and digest-on-idle (#42).
-  // Explicit memory_backend.base_url settings select mem0 first; compose's
-  // MEM0_BASE_URL is the deployment fallback. An unset local environment
-  // keeps SQLite on the store database.
-  const memoryProvider = resolveMemoryProvider(orgSettings, store.getDb());
   const schedulerRegistry = buildRegistry([
     standupDigestAction,
     reflectionAction,
@@ -180,22 +208,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     audit,
     config: loadKbConfig(),
   };
-  // Extension registry (issue #50): loads pinned spec snapshots from
-  // config/extensions/ at boot. Per-org deployments resolve extensions from
-  // these local files — never from the integrations.sh catalog at runtime.
-  const extensionRegistry = createExtensionRegistry("config/extensions");
-  // Effective tool surfaces (issue #158): pinned manifest tools, or the
-  // provider's tools/list discovered surface for tools-less manifests —
-  // resolved once at boot so the agent sees the provider's real surface
-  // (never a stale subset). Issue #166: a per-provider discovery failure
-  // (an unreachable or auth-gated provider) is SKIPPED — logged with
-  // evidence — and deferred to the runtime's lazy per-call path, which
-  // fails closed; the boot never dies because one provider's tools/list
-  // failed. The map threaded onward holds only the RESOLVED surfaces.
-  const extensionSurfaces = await resolveExtensionSurfaces(
-    extensionRegistry.list(),
-    opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {},
-  );
   opts.onExtensionSurfaces?.(extensionSurfaces);
   /** Manifest tier of an extension tool, shared by the policy extension and the runtime gate (issue #53). */
   const extensionToolTier = (toolName: string) => {
@@ -238,12 +250,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     return policy.responseMode;
   };
   let spaceService: SpaceService;
-  let approvalRouter: ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
   const adapter = createSlackAdapter({
     appToken,
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
-    onAction: (a) => approvalRouter.handleAction(a),
+    onAction: (a) => {
+      // Delivery buttons (issue #149) resolve the executor's delivery seam;
+      // every other interactive click is an exec-tier approval (issue #44).
+      if (a.actionId === DELIVERY_APPROVE_ACTION_ID || a.actionId === DELIVERY_DENY_ACTION_ID) {
+        return deliveryActionHandler(a);
+      }
+      return approvalRouter.handleAction(a);
+    },
     responseModeFor,
   });
   // Boot-time onboarding guide (issue #116): proactive Slack-side setup.
@@ -288,33 +306,24 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
   });
+  // Delivery resolution (issue #149): a block-action click on the poller's
+  // prompt records the human's decision as delivery.resolved — the audit
+  // row the executor's onDelivery wait reads — and rewrites the prompt with
+  // the outcome.
+  deliveryActionHandler = async (a) => {
+    await resolveDeliveryAction({ store, adapter, log: (line) => console.log(line) }, a);
+  };
   // Extension tool runtime (issue #53): every extension tool call crosses
-  // the policy gate → credential ladder → egress boundary → audit. The
-  // boundary's broker secret resolver (issue #54 wiring, shipped with
-  // #143) fetches the resolved credential's secret payload from the
-  // auth-broker vault (OMP_AUTH_BROKER_URL/TOKEN — set by scripts/dev.sh
-  // locally, by docker-compose.yml in deployment) and fails closed when
-  // the broker is not configured.
-  // Credential boundary (issue #123): with BOTTEGA_PROXY_CONTROL_URL +
-  // token in the environment (local dev via scripts/dev.sh, compose via
-  // IRON_MANAGEMENT_API_KEY), authorize writes the secret file AND reloads
-  // the proxy — rotation applies immediately, and the boundary is ALWAYS
-  // the injection path. Unset (hermetic tests) stays write-only.
-  const extensionRuntime = createExtensionRuntime({
-    registry: extensionRegistry,
-    store,
-    audit,
-    orgPolicy,
-    router: approvalRouter,
-    boundary: createSecretFileBoundary({
-      ...proxyBoundaryControlFromEnv(),
-      resolveSecret: brokerSecretResolverFromEnv(),
-    }),
-    surfaces: extensionSurfaces,
-    // Issue #166: the lazy per-call discovery path uses the same seam as
-    // boot resolution, so hermetic tests stay off the network end to end.
-    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
-  });
+  // the policy gate → credential ladder → egress boundary → audit — built
+  // by bootstrapRuntime above with the router just assigned (the #172
+  // shared chain). Its boundary ALWAYS carries the broker secret resolver
+  // (#54 wiring, shipped with #143): the resolver fetches the resolved
+  // credential's secret payload from the auth-broker vault
+  // (OMP_AUTH_BROKER_URL/TOKEN — set by scripts/dev.sh locally, by
+  // docker-compose.yml in deployment) and fails closed when the broker is
+  // not configured. With BOTTEGA_PROXY_CONTROL_URL + token in the
+  // environment (issue #123), authorize writes the secret file AND reloads
+  // the proxy; unset (hermetic tests) stays write-only.
   // Live-session registry (issue #64): SpaceService registers each live
   // session; the model tools extension resolves use_model switches through
   // it. Created here (before both) because the two share it.
@@ -329,7 +338,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // (#86/#111), KB ingest (#91). Hoisted out of the driver factory so the
   // onSessionToolset seam can expose the wiring to caller-level boot tests.
   const sessionToolset = [
-    ...workItemToolDefinitions(store, { orgPolicy }),
+    ...workItemToolDefinitions(store, { orgPolicy, agentDir }),
     ...memoryToolDefinitions(memoryProvider, { audit }),
     ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
     ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
@@ -592,13 +601,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
   });
-  // Executor's delivery seam (issue #11 follow-up, #12): the executor runs
-  // in its own container and cannot post to Slack. When a work item's PR is
-  // opened it writes a work_item.delivery_pending audit marker; this poller
-  // watches that trail, posts the PR + approval request to the space
-  // channel, and records delivery.requested (dedupe across restarts). The
-  // button round-trip that resolves the seam (working -> review -> done) is
-  // a later adapter issue.
+  // Executor's delivery seam (issue #11 follow-up, #12, round trip #149):
+  // the executor runs in its own container and cannot post to Slack. When a
+  // work item's PR is opened it writes a work_item.delivery_pending audit
+  // marker; this poller watches that trail, posts the PR + an interactive
+  // approve/deny prompt to the space channel, and records
+  // delivery.requested (dedupe across restarts). A button click resolves
+  // the seam (delivery.resolved via deliveryActionHandler above) and the
+  // executor's onDelivery wait completes working -> review -> done.
   const deliveryPoller = startDeliveryPoller({
     store,
     adapter,

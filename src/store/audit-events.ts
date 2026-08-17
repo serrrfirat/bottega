@@ -16,8 +16,23 @@ export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
 export const WORK_ITEM_FAILED_EVENT = "work_item.failed";
 /** Executor marker: PR open, delivery approval pending (payload {id, pr_url, summary}). */
 export const DELIVERY_PENDING_EVENT = "work_item.delivery_pending";
+/**
+ * Executor applied a work item's per-task model pin (issue #185): what the
+ * session actually switched to (payload {id, role, model, thinking_level,
+ * applied, by}); `applied: false` means the switch was a no-op (e.g. a role
+ * ref with no space settings to resolve it).
+ */
+export const WORK_ITEM_PIN_APPLIED_EVENT = "work_item.model_pin_applied";
 /** Server announcement of a pending delivery (payload {id, pr_url, summary}). */
 export const DELIVERY_REQUESTED_EVENT = "delivery.requested";
+/**
+ * Human resolution of a pending delivery (payload {id, approved, approver}).
+ * Written by the server's block-actions handler; the executor's onDelivery
+ * wait reads it as the approval decision (issue #149). Never shares
+ * `delivery.requested`'s event name (issue #33: one payload schema per
+ * event name).
+ */
+export const DELIVERY_RESOLVED_EVENT = "delivery.resolved";
 /**
  * Completed delivery (payload {id, kind, url?, summary}). This never shares
  * `delivery.requested`'s event name because issue #33 requires one payload

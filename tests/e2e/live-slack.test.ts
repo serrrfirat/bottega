@@ -1,11 +1,13 @@
 /**
- * Live-Slack canary skip-gate proofs (issue #79).
+ * Live-Slack canary skip-gate proofs (issues #79 + #175).
  *
- * The live leg needs real workspace tokens and NEVER runs in CI — this
- * file proves the gates: missing tokens → clean skip message; no flag →
- * usage skip; CI set → refusal; harness refuses realSlack without tokens.
- * All hermetic: env is scrubbed per test, the Keychain reader is stubbed,
- * and no Slack API call can ever be reached from these tests.
+ * The live leg needs real workspace tokens and NEVER runs in ad-hoc CI —
+ * this file proves the gates: missing tokens → clean skip message; no flag
+ * → usage skip; CI set → refusal; CI-strict mode (--ci / CANARY_CI=1, the
+ * scheduled workflow, #175) FAILS instead of skipping when tokens or the
+ * model key are missing; harness refuses realSlack without tokens. All
+ * hermetic: env is scrubbed per test, the Keychain reader is stubbed, and
+ * no Slack API call can ever be reached from these tests.
  */
 import { describe, expect, test } from "bun:test";
 import { runCanary, resolveLiveTokens, resolveModelKey } from "./canary";
@@ -21,6 +23,7 @@ const CANARY_ENV_KEYS = [
   "SLACK_QA_CHANNEL",
   "LIVE_SLACK",
   "CI",
+  "CANARY_CI",
   "NEAR_API_KEY",
   "OPENCODE_API_KEY",
   "CANARY_MODEL_REF",
@@ -79,6 +82,44 @@ describe("live-slack canary skip gates (issue #79)", () => {
       const result = await runCanary(["--live-slack"], { env: process.env, keychain: () => null });
       expect(result.status).toBe("skipped");
       expect(result.message).toMatch(/CI/i);
+    });
+  });
+
+  test("CI-strict mode (--ci) fails instead of skipping when secrets are missing (issue #175)", async () => {
+    await withScrubbedEnv(async () => {
+      process.env.CI = "true";
+      const result = await runCanary(["--live-slack", "--ci"], { env: process.env, keychain: () => null });
+      expect(result.status).toBe("failed");
+      expect(result.message).toMatch(/FAILED in CI-strict mode/);
+      expect(result.message).toContain("SLACK_APP_TOKEN");
+      expect(result.message).toContain("SLACK_BOT_TOKEN");
+      expect(result.message).toContain("SLACK_QA_USER_TOKEN");
+      expect(result.message).toContain("issue #175");
+      expect(result.journeys).toEqual([]);
+    });
+  });
+
+  test("CANARY_CI=1 is equivalent to --ci for the missing-secrets gate (issue #175)", async () => {
+    await withScrubbedEnv(async () => {
+      process.env.CI = "true";
+      process.env.CANARY_CI = "1";
+      const result = await runCanary(["--live-slack"], { env: process.env, keychain: () => null });
+      expect(result.status).toBe("failed");
+      expect(result.message).toMatch(/FAILED in CI-strict mode/);
+    });
+  });
+
+  test("CI-strict mode fails when the model key is missing but tokens are present (issue #175)", async () => {
+    await withScrubbedEnv(async () => {
+      process.env.CI = "true";
+      process.env.SLACK_APP_TOKEN = "xapp-test";
+      process.env.SLACK_BOT_TOKEN = "xoxb-test";
+      process.env.SLACK_QA_USER_TOKEN = "xoxp-test";
+      const result = await runCanary(["--live-slack", "--ci"], { env: process.env, keychain: () => null });
+      expect(result.status).toBe("failed");
+      expect(result.message).toMatch(/FAILED in CI-strict mode/);
+      expect(result.message).toContain("NEAR_API_KEY");
+      expect(result.message).toContain("CANARY_MODEL_REF");
     });
   });
 

@@ -51,6 +51,14 @@ export interface PolicyGateDeps {
    * the seam never runs without an extensionId.
    */
   toolTier?: (toolName: string) => Tier | undefined;
+  /**
+   * Fired when an ask-human call begins waiting for the approval router
+   * (issue #168): lets the caller render a "waiting for approval" thinking
+   * step while the prompt is pending, instead of after the fact. Fire and
+   * forget — never awaited, and a throwing hook is caught and logged, never
+   * thrown into the turn path.
+   */
+  onAskHuman?: (request: ApprovalRequest) => void;
 }
 
 export interface PolicyGateCall {
@@ -149,6 +157,17 @@ export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateC
     event_type: APPROVAL_REQUESTED_EVENT,
     payload: { tool: request.tool, reason },
   });
+
+  // Issue #168: surface the wait to the thinking panel BEFORE the router
+  // resolves — the step source renders "waiting for approval" in_progress.
+  // Fire and forget: a throwing hook is logged, never thrown into the turn.
+  if (deps.onAskHuman !== undefined) {
+    try {
+      deps.onAskHuman(request);
+    } catch (err) {
+      console.error("[policy] onAskHuman hook failed:", err);
+    }
+  }
 
   const timeoutMs = deps.timeoutMs ?? policy.timeoutMinutes * 60_000;
   const resolution = await requestWithTimeout(deps.router, request, timeoutMs);

@@ -17,6 +17,16 @@ features:
   app_home:
     home_tab_enabled: false
     messages_tab_enabled: true
+  # Agents feature (issue #168) — DISABLED (#184): agent_view swallows DM
+  # visibility — replies render in the app's agent surface (the Messages
+  # tab), not the DM channel — so the feature is OFF. The app is a regular
+  # bot: DMs post normally (chat.postMessage); the thinking panel is
+  # dropped (the feature is app-wide; it cannot be channel-only). The #168
+  # stream code stays: the boot probe fails → phrase+edit everywhere.
+  # Re-enable = uncomment agent_view below + restore assistant:write +
+  # reinstall the app.
+  # agent_view:
+  #   agent_description: "Team agents that live in your chat: pick up work items, implement them, open PRs — and show each step as it happens."
   bot_user:
     display_name: Bottega
     always_online: true
@@ -25,6 +35,10 @@ oauth_config:
     bot:
       # Posting agent replies and delivery announcements to channels.
       - chat:write
+      # assistant:write (the Slack Agents feature, issue #168) is REMOVED
+      # (#184): the scope only applies when agent_view is enabled, which
+      # swallows DM visibility. Re-enabling the feature = uncomment the
+      # agent_view block above + restore this scope + reinstall the app.
       # Receiving @mentions of the bot.
       - app_mentions:read
       # Receiving messages in public channels, private channels, and DMs.

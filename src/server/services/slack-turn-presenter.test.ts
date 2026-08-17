@@ -1,0 +1,479 @@
+/**
+ * SlackTurnPresenter / StreamTurnPresenter (issues #153/#168) — hermetic
+ * turn-rendering tests. The Slack surface is a recording adapter (no
+ * network); the audit sink is an in-memory array. Covers the issue #168
+ * Acceptance:
+ *
+ *   - one collapsed thinking panel per streamed turn, N steps advancing
+ *     in_progress → complete in real time, final reply streaming below it;
+ *   - a denied call renders a deny step; an ask-human call shows
+ *     "waiting for approval" until it resolves;
+ *   - secret-shaped args never appear in any step (redaction);
+ *   - stream appends respect the STREAM_UPDATE_INTERVAL_MS throttle;
+ *   - a failing stream falls back to the phrase + edit path with no
+ *     dropped reply;
+ *   - the 👀 receipt reaction, the message.reply latency audit, and the
+ *     phrase rotation are unchanged by streaming mode.
+ */
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import type { Store } from "../../store/db";
+import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
+import { redact } from "../../policy/audit";
+import type { SlackAdapter, SlackMessage, SlackStreamTask } from "../adapters/slack";
+import {
+  STREAM_FINAL_RETRY_LIMIT,
+  STREAM_UPDATE_INTERVAL_MS,
+  StreamTurnPresenter,
+  SlackTurnPresenter,
+  THINKING_PHRASES,
+  createPhraseRotation,
+  emitToolStep,
+  nextToolStepId,
+  toolStepTitle,
+  type ToolStepEvent,
+} from "./slack-turn-presenter";
+
+// ---------------------------------------------------------------------------
+// Recording doubles: no network, no real store.
+// ---------------------------------------------------------------------------
+
+interface StreamCall {
+  spaceId: string;
+  opts: { threadTs: string; openingText: string };
+}
+
+interface RecordedAdapter {
+  adapter: SlackAdapter;
+  streams: StreamCall[];
+  texts: Array<{ spaceId: string; ts: string; text: string }>;
+  tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }>;
+  stops: Array<{ spaceId: string; ts: string; text?: string }>;
+  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
+  updates: Array<{ spaceId: string; ts: string; text: string }>;
+  reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
+}
+
+function recordingAdapter(
+  opts: { failStart?: boolean; streaming?: boolean; failAppend?: boolean; failStop?: boolean } = {},
+): RecordedAdapter {
+  const streams: StreamCall[] = [];
+  const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
+  const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
+  const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
+  const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
+  let tsSeq = 0;
+  const adapter: SlackAdapter = {
+    async postMessage(spaceId, text, replyOpts) {
+      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string } | undefined });
+      tsSeq += 1;
+      return `post-${tsSeq}`;
+    },
+    async updateMessage(spaceId, ts, text) {
+      updates.push({ spaceId, ts, text });
+    },
+    async downloadFile() {
+      throw new Error("not used");
+    },
+    async uploadFile() {
+      return undefined;
+    },
+    async addReaction(spaceId, ts) {
+      reactions.push({ kind: "add", spaceId, ts });
+    },
+    async removeReaction(spaceId, ts) {
+      reactions.push({ kind: "remove", spaceId, ts });
+    },
+    async startStream(spaceId, streamOpts) {
+      if (opts.failStart) throw new Error("invalid_stream_arguments: Agents feature not enabled");
+      streams.push({ spaceId, opts: streamOpts });
+      return `stream-${streams.length}`;
+    },
+    async appendText(spaceId, ts, text) {
+      if (opts.failAppend) throw new Error("invalid_stream_arguments: Agents feature not enabled");
+      texts.push({ spaceId, ts, text });
+    },
+    async appendTask(spaceId, ts, task) {
+      if (opts.failAppend) throw new Error("invalid_stream_arguments: Agents feature not enabled");
+      tasks.push({ spaceId, ts, task });
+    },
+    async stopStream(spaceId, ts, text) {
+      stops.push({ spaceId, ts, text });
+      if (opts.failStop) throw new Error("invalid_stream_arguments: Agents feature not enabled");
+    },
+    streamingSupported: () => opts.streaming ?? true,
+    async start() {},
+    async stop() {},
+  };
+  return { adapter, streams, texts, tasks, stops, posts, updates, reactions };
+}
+
+function recordingStore(): { store: Store; audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }> } {
+  const audit: Array<{ space_id: string | null; actor: string; event_type: string; payload: string }> = [];
+  const store = {
+    appendAudit: async (entry: { space_id: string | null; actor: string; event_type: string; payload: string }) => {
+      audit.push(entry);
+      return audit.length;
+    },
+    getOrgSettings: () => null,
+  } as unknown as Store;
+  return { store, audit };
+}
+
+function msg(overrides: Partial<SlackMessage> = {}): SlackMessage {
+  return { spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1", ...overrides };
+}
+
+/** Flushes the fire-and-forget promise chains (phrase post, reaction, audits). */
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+let fakeTimers = false;
+
+afterEach(() => {
+  if (fakeTimers) {
+    vi.useRealTimers();
+    fakeTimers = false;
+  }
+  vi.restoreAllMocks();
+});
+
+// ---------------------------------------------------------------------------
+// StreamTurnPresenter: the Slack-native thinking panel (issue #168).
+// ---------------------------------------------------------------------------
+
+describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
+  test("a turn with N gated tool calls renders N steps advancing in real time, and the final reply streams below", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // Receipt: the stream opens with the thinking phrase as its opening.
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.streams[0]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "1.1", openingText: THINKING_PHRASES[0] } });
+    const streamTs = `stream-${rec.streams.length}`;
+
+    // N gated tool calls: each opens a card in_progress and checks it off.
+    const steps: ToolStepEvent[] = [
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress", output: '{"query":"bugs"}' },
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("create_work_item", "allowed (write)"), status: "in_progress", output: '{"title":"fix bug"}' },
+    ];
+    for (const step of steps) presenter.onToolStep(step);
+    await flush();
+    presenter.onToolStep({ ...steps[0]!, status: "complete" });
+    presenter.onToolStep({ ...steps[1]!, status: "complete" });
+    await flush();
+
+    expect(rec.tasks).toHaveLength(4); // two opens + two completions
+    expect(rec.tasks.map((c) => c.task.id)).toEqual([steps[0]!.taskId, steps[1]!.taskId, steps[0]!.taskId, steps[1]!.taskId]);
+    expect(rec.tasks[0]!.task.status).toBe("in_progress");
+    expect(rec.tasks[2]!.task.status).toBe("complete");
+    expect(rec.tasks.map((c) => c.task.title)).toEqual([
+      "github.search_issues — allowed (read)",
+      "create_work_item — allowed (write)",
+      "github.search_issues — allowed (read)",
+      "create_work_item — allowed (write)",
+    ]);
+    expect(rec.tasks[0]!.task.output).toBe('{"query":"bugs"}');
+
+    // Interim reply text streams below the panel...
+    presenter.onMessage({ spaceId: "slack:C1", text: "Working on it" });
+    presenter.onMessage({ spaceId: "slack:C1", text: "Done — here is the answer" });
+    // ...and turn_end closes the stream with the final reply as the block.
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+
+    expect(rec.stops).toHaveLength(1);
+    expect(rec.stops[0]).toMatchObject({ spaceId: "slack:C1", ts: streamTs, text: "Done — here is the answer" });
+    // The coalesced interim append never landed: the final block superseded it.
+    expect(rec.texts).toHaveLength(0);
+  });
+
+  test("a denied call renders one step stating the deny", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg());
+    await flush();
+
+    const taskId = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("bash", "denied (exec)"), status: "complete", output: '{"command":"rm -rf /"}' });
+    await flush();
+
+    expect(rec.tasks).toHaveLength(1);
+    expect(rec.tasks[0]!.task).toMatchObject({ id: taskId, title: "bash — denied (exec)", status: "complete" });
+  });
+
+  test("an ask-human call shows waiting for approval until it resolves, sharing one card id", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg());
+    await flush();
+
+    const taskId = nextToolStepId();
+    // While the approval router waits: in_progress "waiting for approval".
+    presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("create_work_item", "waiting for approval"), status: "in_progress", output: '{"title":"x"}' });
+    await flush();
+    // Approved: the SAME card checks off as complete.
+    presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("create_work_item", "approved (write)"), status: "complete", output: '{"title":"x"}' });
+    await flush();
+
+    expect(rec.tasks).toHaveLength(2);
+    expect(rec.tasks[0]!.task).toMatchObject({ id: taskId, status: "in_progress", title: "create_work_item — waiting for approval" });
+    expect(rec.tasks[1]!.task).toMatchObject({ id: taskId, status: "complete", title: "create_work_item — approved (write)" });
+  });
+
+  test("secret-shaped args never reach a step: redacted at the source, rendered as [REDACTED]", () => {
+    // The source composes + redacts (the audit's pass). Secret-shaped values
+    // in the args summary render [REDACTED]; the panel never sees raw args.
+    const stepArgs = redact(JSON.stringify({ api_key: "sk-ant-api03-0123456789abcdef", token: "xoxb-1234567890-abcdef" }));
+    expect(stepArgs).not.toContain("sk-ant-api03-0123456789abcdef");
+    expect(stepArgs).not.toContain("xoxb-1234567890-abcdef");
+    expect(stepArgs).toContain("[REDACTED]");
+    expect(stepArgs).toContain("sk-[REDACTED]");
+  });
+
+  test("secret-shaped tool names are redacted in step titles too", () => {
+    expect(toolStepTitle("github_pat_0123456789abcdefghij", "allowed (read)")).not.toContain("github_pat_0123456789abcdefghij");
+    expect(toolStepTitle("github_pat_0123456789abcdefghij", "allowed (read)")).toContain("[REDACTED]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Streaming coalescing + fallback (issues #120/#168).
+// ---------------------------------------------------------------------------
+
+describe("StreamTurnPresenter: throttle and fallback", () => {
+  test("interim markdown_text appends respect the STREAM_UPDATE_INTERVAL_MS throttle", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg());
+    await flush();
+
+    // Burst of reply text inside one turn: coalesced, nothing appended yet.
+    for (const chunk of ["The", "The quick", "The quick brown"]) {
+      presenter.onMessage({ spaceId: "slack:C1", text: chunk });
+    }
+    await flush();
+    expect(rec.texts).toHaveLength(0); // batched: no per-chunk spam
+
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.texts).toHaveLength(1); // at most one append per tick
+    expect(rec.texts[0]!.text).toBe("The quick brown"); // latest text only
+
+    // turn_end closes the stream with the final text; a pending append is superseded.
+    presenter.onMessage({ spaceId: "slack:C1", text: "The quick brown fox" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.stops).toHaveLength(1);
+    expect(rec.stops[0]!.text).toBe("The quick brown fox");
+    expect(rec.texts).toHaveLength(1); // the interim append; the final rode stopStream
+  });
+
+  test("a failing startStream falls back to the phrase + edit path with no dropped reply", async () => {
+    const rec = recordingAdapter({ failStart: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    // The stream failed: the phrase landed as a plain post, no stream opened.
+    expect(rec.streams).toHaveLength(0);
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.posts[0]).toMatchObject({ spaceId: "slack:C1", text: THINKING_PHRASES[0] });
+
+    // The reply edits the phrase in place — never dropped.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: "post-1", text: "Here is the final answer" }]);
+    expect(rec.stops).toHaveLength(0);
+  });
+
+  test("a mid-boot appendStream failure flips to the phrase+edit path without dropping the reply", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ failAppend: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // The stream opens (the workspace looked capable at the turn start).
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    const streamTs = "stream-1";
+
+    // Interim reply text: the append FAILS — the presenter flips to the
+    // phrase path and the text lands as an in-place edit of the stream
+    // message (never dropped, never re-attempted on a dead stream).
+    presenter.onMessage({ spaceId: "slack:C1", text: "Working on it" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.texts).toHaveLength(0); // the append never landed
+    expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: streamTs, text: "Working on it" }]);
+
+    // The final reply still lands (in place), and the stream is never
+    // re-opened: the fallback holds for the boot.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: "Here is the final answer" });
+    expect(rec.stops).toHaveLength(0);
+    expect(rec.streams).toHaveLength(1);
+
+    // Turn two keeps the one-message rule (#120): the phrase ROTATES the
+    // stream message in place (no fresh post, no stream re-open) — the
+    // fallback is permanent.
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.posts).toHaveLength(0);
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: THINKING_PHRASES[1] });
+  });
+
+  test("a stopStream failure never drops the final reply — it lands as an in-place edit", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ failStop: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    const streamTs = "stream-1";
+
+    presenter.onMessage({ spaceId: "slack:C1", text: "The final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    // The bounded stopStream retries all fail...
+    for (let attempt = 0; attempt <= STREAM_FINAL_RETRY_LIMIT; attempt += 1) {
+      vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+      await flush();
+    }
+    // ...and the final reply lands as an in-place edit of the stream message.
+    expect(rec.stops.length).toBe(STREAM_FINAL_RETRY_LIMIT + 1); // initial + bounded retries
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: "The final answer" });
+
+    // The fallback holds: the next turn opens a plain phrase post.
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[1], opts: { threadTs: "2.2" } }]);
+  });
+
+  test("receipt reaction, message.reply latency audit, and phrase rotation are unchanged by streaming mode", async () => {
+    const rec = recordingAdapter();
+    const { store, audit } = recordingStore();
+    const rotation = createPhraseRotation();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+      phraseRotation: rotation,
+    });
+
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    // Receipt reaction lands; receipt audit row written (ts only, never text).
+    expect(rec.reactions.filter((r) => r.kind === "add")).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+    const received = audit.find((row) => row.event_type === MESSAGE_RECEIVED_EVENT);
+    expect(received).toMatchObject({ space_id: "slack:C1", actor: "U1" });
+    expect(JSON.parse(received!.payload)).toEqual({ ts: "1.1" });
+
+    // Reply lands → reaction removed, latency audited, stream closed.
+    presenter.onMessage({ spaceId: "slack:C1", text: "answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.reactions.filter((r) => r.kind === "remove")).toEqual([{ kind: "remove", spaceId: "slack:C1", ts: "1.1" }]);
+    const replied = audit.find((row) => row.event_type === MESSAGE_REPLIED_EVENT);
+    expect(replied).toMatchObject({ space_id: "slack:C1" });
+    const latency = JSON.parse(replied!.payload);
+    expect(typeof latency.latency_ms).toBe("number");
+    expect(latency.latency_ms).toBeGreaterThanOrEqual(0);
+
+    // Turn two: the stream re-opens under the new inbound ts, rotating the
+    // phrase through the SHARED rotation (one sequence across turns).
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    expect(rec.streams).toHaveLength(2);
+    expect(rec.streams[1]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "2.2", openingText: THINKING_PHRASES[1] } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SlackTurnPresenter (the phrase renderer): no panel, but the rest is shared.
+// ---------------------------------------------------------------------------
+
+describe("SlackTurnPresenter (phrase renderer): no panel in fallback mode", () => {
+  test("tool steps render nothing, and the phrase+edit path still delivers the reply", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.streams).toHaveLength(0);
+
+    // A gated tool call in fallback mode: swallowed (no panel, no error).
+    emitToolStep(
+      (step) => presenter.onToolStep(step),
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" },
+    );
+    await flush();
+    expect(rec.tasks).toHaveLength(0);
+  });
+});

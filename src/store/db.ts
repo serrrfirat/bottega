@@ -66,7 +66,17 @@ export type WorkItem = {
   requester: string;
   description: string;
   repo: string | null;
+  /** Existing-PR conflict-resolution shape (issue #186): non-null on a git item switches the executor to rebase/resolve/push. */
+  pr_url: string | null;
+  /** Head branch of the PR to rebase (issue #186). */
+  pr_branch: string | null;
+  /** Branch the PR branch is rebased onto; the executor defaults to "main". */
+  base_branch: string | null;
   delivery: WorkItemDelivery;
+  /** Per-task model pin (issue #185): a role ref ("fast"/"reasoning") or a resolved available model id. */
+  model: string | null;
+  /** Per-task thinking-effort pin (issue #185); null = no pin (space/default effort applies). */
+  reasoning_effort: ModelThinkingLevel | null;
   state: WorkItemState;
   approvals: string;
   evidence: string;
@@ -130,6 +140,11 @@ export type ListAuditOpts = {
 };
 
 export interface Store {
+  /**
+   * Idempotent upsert on first contact (issue #188): creates the row with
+   * policy_json/settings '{}' and NEVER overwrites an existing space's
+   * settings, policy, or name — re-contacts only bump updated_at.
+   */
   getOrCreateSpace(input: {
     platform: "slack" | "telegram";
     channel_id: string;
@@ -159,6 +174,14 @@ export interface Store {
     description: string;
     repo?: string;
     delivery?: WorkItemDelivery;
+    /** Per-task model pin (issue #185): a role ref ("fast"/"reasoning") or a resolved available model id. */
+    model?: string;
+    /** Per-task thinking-effort pin (issue #185). */
+    reasoning_effort?: ModelThinkingLevel;
+    /** PR context for the conflict-resolution job shape (issue #186): pr_url set → rebase/resolve/push instead of open-PR. */
+    pr_url?: string;
+    pr_branch?: string;
+    base_branch?: string;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem>;
@@ -350,6 +373,31 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       "ALTER TABLE work_items ADD COLUMN delivery TEXT NOT NULL DEFAULT 'git' CHECK (delivery IN ('git','extension','chat'))",
     );
   }
+  // Idempotent migration (issue #186): the resolve-conflicts job shape's
+  // PR-context columns (pr_url set on a git item = rebase/resolve/push an
+  // existing PR instead of opening one). Nullable; existing rows are
+  // untouched (implement-and-open-PR remains the default).
+  if (!workItemColumns.includes("pr_url")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN pr_url TEXT");
+  }
+  if (!workItemColumns.includes("pr_branch")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN pr_branch TEXT");
+  }
+  if (!workItemColumns.includes("base_branch")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN base_branch TEXT");
+  }
+  // Idempotent migration (issue #185): per-task model pin columns. Fresh
+  // databases get them from schema.sql; existing work_items tables need the
+  // explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op for them).
+  const pinColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
+  if (!pinColumns.includes("model")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN model TEXT");
+  }
+  if (!pinColumns.includes("reasoning_effort")) {
+    db.exec(
+      "ALTER TABLE work_items ADD COLUMN reasoning_effort TEXT CHECK (reasoning_effort IN ('off','low','medium','high'))",
+    );
+  }
   // Idempotent migration (issue #64): databases created before the model
   // settings column existed keep their spaces table (CREATE TABLE IF NOT
   // EXISTS is a no-op), so add the column explicitly when it is missing.
@@ -363,6 +411,11 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const getSchedulerJobStmt = db.query("SELECT * FROM scheduler_jobs WHERE id = ?");
   const getObjectStmt = db.query("SELECT * FROM objects WHERE id = ?");
 
+  /**
+   * Idempotent upsert (issue #188): creates the row on first contact with
+   * policy_json/settings '{}' and never overwrites an existing space's
+   * settings, policy, or name — re-contacts only bump updated_at.
+   */
   async function getOrCreateSpace(input: {
     platform: "slack" | "telegram";
     channel_id: string;
@@ -373,7 +426,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     db.query(
       `INSERT INTO spaces (id, platform, channel_id, name, policy_json, settings, created_at, updated_at)
        VALUES (?, ?, ?, ?, '{}', '{}', ?, ?)
-       ON CONFLICT(id) DO NOTHING`,
+       ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`,
     ).run(id, input.platform, input.channel_id, input.name ?? null, t, t);
     return getSpaceStmt.get(id) as Space;
   }
@@ -450,14 +503,21 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     description: string;
     repo?: string;
     delivery?: WorkItemDelivery;
+    /** Per-task model pin (issue #185): a role ref ("fast"/"reasoning") or a resolved available model id. */
+    model?: string;
+    /** Per-task thinking-effort pin (issue #185). */
+    reasoning_effort?: ModelThinkingLevel;
+    pr_url?: string;
+    pr_branch?: string;
+    base_branch?: string;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, description, repo, delivery, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
+      `INSERT INTO work_items (id, space_id, requester, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
     ).run(
       id,
       input.space_id,
@@ -465,6 +525,11 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       input.description,
       input.repo ?? null,
       input.delivery ?? "git",
+      input.model ?? null,
+      input.reasoning_effort ?? null,
+      input.pr_url ?? null,
+      input.pr_branch ?? null,
+      input.base_branch ?? null,
       JSON.stringify((input.evidence ?? []).map((e) => ({ ...e, at: t }))),
       t,
       t,
@@ -474,7 +539,12 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       space_id: input.space_id,
       actor: input.requester,
       event_type: WORK_ITEM_CREATED_EVENT,
-      payload: JSON.stringify({ id, requester: input.requester }),
+      payload: JSON.stringify({
+        id,
+        requester: input.requester,
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.reasoning_effort !== undefined ? { reasoning_effort: input.reasoning_effort } : {}),
+      }),
     });
     return item;
   }

@@ -22,27 +22,42 @@
  *
  * Git delivery approval contract: after the PR is opened the executor writes a
  * `work_item.delivery_pending` audit marker, then calls the `onDelivery`
- * seam. The server hook (follow-up, TODO in src/server) posts the PR + an
- * approval request to the space channel and resolves with the human's
- * decision; the executor then records `working → review` with that approval
- * and completes `review → done` (the legal map requires a recorded approval
- * on review, and result.pr_url on done). Without a wired hook the executor
- * logs and waits — the item stays `working` until the space decides or
- * stale recovery blocks it on restart.
+ * seam. The server posts the PR + an interactive approve/deny prompt (the
+ * delivery poller), records the human's decision as `delivery.resolved`
+ * (the delivery router), and the executor's default onDelivery wait reads
+ * that row as the approval (issue #149); the executor then records
+ * `working → review` with that approval and completes `review → done` (the
+ * legal map requires a recorded approval on review, and result.pr_url on
+ * done). The default wait is the real hook — the audit trail is the
+ * cross-process channel to the server. Headless/executor-only runs with no
+ * server to resolve the request fail closed: the wait times out (the
+ * stale-run window) and denies, landing the item in `blocked` instead of
+ * hanging at `working` forever.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { createStore, recoverStaleWorkItems, type Store, type WorkItem } from "./store/db";
-import { DELIVERY_COMPLETED_EVENT, DELIVERY_PENDING_EVENT, WORK_ITEM_FAILED_EVENT } from "./store/audit-events";
-import { createAudit, type AuditModule } from "./policy/audit";
+import { recoverStaleWorkItems, type Store, type SpaceModelSettings, type WorkItem } from "./store/db";
+import {
+  DELIVERY_COMPLETED_EVENT,
+  DELIVERY_PENDING_EVENT,
+  DELIVERY_RESOLVED_EVENT,
+  WORK_ITEM_FAILED_EVENT,
+  WORK_ITEM_PIN_APPLIED_EVENT,
+} from "./store/audit-events";
 import { DenyRouter } from "./policy/approval-router";
-import { loadOrgPolicy, type PolicyConfig } from "./policy/config";
-import { assertAgentDirModelAvailable, createOmpSdkDriver, ensureAgentDirModelPin, OMP_CONFIG_TEMPLATE, type AgentDriver, type AgentSessionDriver } from "./server/drivers/agent-driver";
-import { resolveMemoryProvider } from "./server/memory-provider";
-import { createExtensionRegistry } from "./extensions/registry";
-import { createExtensionRuntime } from "./extensions/runtime";
-import { resolveExtensionSurfaces } from "./extensions/surface";
+import {
+  assertAgentDirModelAvailable,
+  createOmpSdkDriver,
+  ensureAgentDirModelPin,
+  OMP_CONFIG_TEMPLATE,
+  type AgentDriver,
+  type AgentSessionDriver,
+  type ModelRole,
+} from "./server/drivers/agent-driver";
+import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
 import { extensionToolDefinitions } from "./extensions/tools";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { McpBinding } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
@@ -110,56 +125,130 @@ export interface ExecutorDeps {
   /**
    * Delivery approval seam: called with the opened PR, resolves the human
    * decision. `null` → delivery denied (item blocked). Absent → the
-   * executor logs the pending request and waits indefinitely.
+   * default hook ({@link waitForDeliveryApproval}): polls the audit trail
+   * for the server's `delivery.resolved` marker and resolves with the
+   * recorded decision. Headless/executor-only runs with no server to
+   * resolve fail closed — the wait times out (the stale-run window) and
+   * denies, so the item lands in `blocked` instead of hanging at `working`
+   * forever.
    */
   onDelivery?: (item: WorkItem, delivery: DeliveryInfo) => Promise<DeliveryApproval | null>;
+  /**
+   * Delivery-approval wait poll interval (issue #149): how often the
+   * default onDelivery wait re-reads the audit trail for the server's
+   * `delivery.resolved` marker. Default 2000 ms.
+   */
+  deliveryPollIntervalMs?: number;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_STALE_AFTER_MS = 30 * 60 * 1000;
+/** Delivery-approval wait poll interval (issue #149): the default onDelivery re-reads the audit trail this often. */
+const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000;
 const DEFAULT_TRANSCRIPT_DIR = "data/transcripts";
 const DEFAULT_ORG_CONFIG_DIR = "config";
 const BASE_BRANCH = "main";
 const ASKPASS_SCRIPT_NAME = "git-askpass.sh";
 
 /**
- * Builds the extension worker's process-scoped resources. The caller owns
- * memoization because the same definitions must configure the OMP driver
- * before the first restricted session is created.
- *
- * Issue #158: a tools-less manifest resolves its tool surface from the
- * provider's tools/list here (cached). Issue #166: a per-provider failure
- * (unreachable/auth-gated) is SKIPPED at boot — logged with evidence — and
- * deferred to the runtime's lazy per-call path, which fails closed; the
- * executor never dies because one provider's tools/list failed.
+ * The extension worker's toolset over the shared runtime chain (issue
+ * #172): memory definitions ride the driver's policy gate; extension
+ * definitions stay in the driver's customTools lane because the extension
+ * runtime runs its own policy gate and must never be double-wrapped.
  */
-export async function createExtensionWorkerToolset(deps: {
-  store: Store;
-  audit: AuditModule;
-  orgPolicy: PolicyConfig;
-  extensionsDir?: string;
-}): Promise<ExtensionWorkerToolset> {
-  const registry = createExtensionRegistry(
-    deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
-  );
-  const surfaces = await resolveExtensionSurfaces(registry.list());
-  const runtime = createExtensionRuntime({
-    registry,
-    store: deps.store,
-    audit: deps.audit,
-    orgPolicy: deps.orgPolicy,
-    router: DenyRouter,
-    surfaces,
-  });
-  const memoryProvider = resolveMemoryProvider(deps.store.getOrgSettings(), deps.store.getDb());
+function buildExecutorWorkerToolset(rt: BootstrapRuntime): ExtensionWorkerToolset {
   return {
-    memoryTools: memoryToolDefinitions(memoryProvider, { audit: deps.audit }),
-    extensionTools: extensionToolDefinitions(registry.list(), {
-      runtime,
+    memoryTools: memoryToolDefinitions(rt.memoryProvider, { audit: rt.audit }),
+    extensionTools: extensionToolDefinitions(rt.registry.list(), {
+      runtime: rt.runtime,
       getCaller: () => "executor",
-      surfaces,
+      surfaces: rt.surfaces,
     }),
   };
+}
+
+/** The executor composition root's boot result (issue #172). */
+export interface ExecutorBoot {
+  /** The shared composition chain — the same pieces every root boots. */
+  runtime: BootstrapRuntime;
+  /** Memoized extension-worker toolset (memory + extension tools over the boot runtime). */
+  getExtensionWorkerToolset(): Promise<ExtensionWorkerToolset>;
+  /** Memoized OMP driver over the worker toolset (issue #158). */
+  getDriver(): AgentDriver | Promise<AgentDriver>;
+}
+
+/**
+ * The executor composition root (issue #172, #153 item 2): the boot-time
+ * process-scoped resources — the shared runtime chain (bootstrapRuntime:
+ * store → audit → org policy → extension registry → surfaces → extension
+ * runtime → memory provider, identical to the server and MCP roots), the
+ * agent-dir modelRoles pin sync (issue #78), and the memoized
+ * worker-toolset/driver getters — exactly what the entrypoint's
+ * import.meta.main block runs. Caller-level boot tests
+ * (src/executor-boot.test.ts) drive this to observe the worker toolset +
+ * pin + model guard, the executor analogue of the server's
+ * boot-wiring.test.ts.
+ */
+export async function bootExecutorRuntime(opts: {
+  agentDir?: string;
+  /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
+  mcpTransport?: (binding: McpBinding) => Transport;
+} = {}): Promise<ExecutorBoot> {
+  const runtime = await bootstrapRuntime({
+    router: DenyRouter,
+    ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : {}),
+  });
+  const { store, audit, orgPolicy } = runtime;
+  const agentDir = opts.agentDir ?? "data/omp-agent";
+  mkdirSync(agentDir, { recursive: true });
+  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
+  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
+  // config/omp, so a stale copy without the pin silently falls back to the
+  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
+  const pinSync = ensureAgentDirModelPin(agentDir);
+  if (pinSync === "created" || pinSync === "patched") {
+    console.log(
+      `bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`,
+    );
+  }
+  // One registry/runtime/provider/toolset per executor process. The getter
+  // defers construction until runExecutor resolves the driver, then shares
+  // the exact same definitions with session routing.
+  let cachedWorkerToolset: Promise<ExtensionWorkerToolset> | undefined;
+  const getExtensionWorkerToolset = (): Promise<ExtensionWorkerToolset> => {
+    if (cachedWorkerToolset === undefined) {
+      cachedWorkerToolset = Promise.resolve(buildExecutorWorkerToolset(runtime));
+    }
+    return cachedWorkerToolset;
+  };
+  let driver: AgentDriver | Promise<AgentDriver> | undefined;
+  const getDriver = (): AgentDriver | Promise<AgentDriver> => {
+    if (driver === undefined) {
+      // The driver getter is async-capable (the toolset resolves surfaces
+      // for tools-less manifests, issue #158); memoize the resolved value.
+      driver = getExtensionWorkerToolset().then((workerTools) => {
+        // Pre-approved session: the work item's pickup approval IS the
+        // authorization for allowlisted exec-tier built-ins. Memory tools
+        // ride this driver gate. Extension definitions stay in customTools
+        // because createExtensionRuntime runs its own policy gate and must
+        // never be double-wrapped.
+        return createOmpSdkDriver({
+          agentDir,
+          customTools: workerTools.extensionTools,
+          gate: {
+            orgPolicy,
+            audit,
+            router: DenyRouter,
+            store,
+            preApproved: true,
+            tools: workerTools.memoryTools,
+          },
+        });
+      });
+    }
+    return driver;
+  };
+  return { runtime, getExtensionWorkerToolset, getDriver };
 }
 interface ExecutorConfig {
   /** Authorization fence (issue #47): the only owner/repo pairs the executor may clone/push to. */
@@ -308,11 +397,14 @@ async function extensionWorkerPath(
     throw new Error("extension worker tools are not configured");
   }
   const allowTools = [...toolset.memoryTools, ...toolset.extensionTools].map((tool) => tool.name);
+  // Issue #185: the pin-merged settings apply to extension deliveries too.
+  const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
   const session = await (await deps.driver).createSession({
     spaceId: item.space_id,
     transcriptDir: join(cfg.transcriptDir, item.id),
     allowTools,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] extension agent: ${text}`),
+    getModelSettings: async () => sessionSettings,
   });
   let finalOutput = "";
   let sessionError: Error | null = null;
@@ -325,6 +417,7 @@ async function extensionWorkerPath(
     sessionError = new Error(typeof text === "string" ? text : "extension worker session error");
   });
   try {
+    await applyWorkItemModelPin(deps, item, session);
     await promptExtensionWorker(
       session,
       [
@@ -451,18 +544,84 @@ async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string,
   await git(["config", "user.email", "executor@bottega.invalid"], { cwd: workspace });
 }
 
+/**
+ * The execution session's model/effort for a work item (issue #185):
+ * task pin > space settings > defaults. The pin's explicit model id and
+ * effort override the space's settings; a role ref keeps the space slot
+ * indirection (its concrete model resolves at execution via the settings
+ * below). Unpinned items get the space settings unchanged — the session
+ * runs on its agent-dir default unless a pin applies.
+ */
+async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Promise<SpaceModelSettings> {
+  const settings = await store.getSpaceSettings(item.space_id);
+  if (item.model === null && item.reasoning_effort === null) return settings;
+  return {
+    ...settings,
+    ...(item.reasoning_effort !== null ? { reasoning_effort: item.reasoning_effort } : {}),
+    ...(item.model !== null && item.model !== "fast" && item.model !== "reasoning" ? { model: item.model } : {}),
+  };
+}
+
+/**
+ * The role switch that applies the item's pin (issue #185): a role ref
+ * switches its own slot; an explicit model id rides the "default" role
+ * against the pin-merged settings (resolveRoleTarget's default slot is
+ * `model`, which the pin overrides). null = no pin → no switch; the
+ * session keeps its default.
+ */
+function pinSwitchRole(item: WorkItem): ModelRole | null {
+  if (item.model === "fast" || item.model === "reasoning") return item.model;
+  if (item.model !== null || item.reasoning_effort !== null) return "default";
+  return null;
+}
+
+/**
+ * Applies the item's model/effort pin to the execution session BEFORE its
+ * first prompt and audits what was applied (issue #185): the resolved
+ * model id, thinking level, and whether the switch applied. The session
+ * must have been created with getModelSettings resolving the pin-merged
+ * settings (resolveWorkItemSessionSettings). A driver without the
+ * setModelRole hook reports applied: false — never a silent claim.
+ */
+async function applyWorkItemModelPin(
+  deps: ExecutorDeps,
+  item: WorkItem,
+  session: AgentSessionDriver,
+): Promise<void> {
+  const role = pinSwitchRole(item);
+  if (role === null) return;
+  const result = await session.setModelRole?.(role);
+  await deps.store.appendAudit({
+    space_id: item.space_id,
+    actor: "executor",
+    event_type: WORK_ITEM_PIN_APPLIED_EVENT,
+    payload: JSON.stringify({
+      id: item.id,
+      role,
+      model: result?.model ?? null,
+      thinking_level: result?.thinking_level ?? null,
+      applied: result?.applied ?? false,
+      by: "executor",
+    }),
+  });
+}
+
 async function runAgentSession(
   deps: ExecutorDeps,
   cfg: ExecutorConfig,
   item: WorkItem,
   workspace: string,
 ): Promise<string> {
+  // Issue #185: the session resolves roles against the pin-merged settings
+  // (task pin > space settings > defaults) so the pin applies cleanly.
+  const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
   const session = await (await deps.driver).createSession({
     spaceId: item.id,
     transcriptDir: cfg.transcriptDir,
     cwd: workspace,
     allowTools: EXECUTOR_TOOLS,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] agent: ${text}`),
+    getModelSettings: async () => sessionSettings,
   });
   let summary = "";
   let sessionError: Error | null = null;
@@ -475,6 +634,7 @@ async function runAgentSession(
     sessionError = new Error(typeof text === "string" ? text : "agent session error");
   });
   try {
+    await applyWorkItemModelPin(deps, item, session);
     await session.prompt(
       [
         `You are an autonomous work executor for bottega (work item ${item.id}, space ${item.space_id}).`,
@@ -493,6 +653,84 @@ async function runAgentSession(
     await session.dispose();
   }
   return summary.trim();
+}
+
+export interface DeliveryWaitOpts {
+  /**
+   * How long the wait holds before denying (headless fallback). Default:
+   * the stale-run window ({@link DEFAULT_STALE_AFTER_MS}) — the same bound
+   * stale recovery uses, so a run with no server to resolve the request
+   * fails closed in-process instead of hanging at `working`.
+   */
+  timeoutMs?: number;
+  /** Poll interval for the server's `delivery.resolved` marker. Default 2000 ms. */
+  pollIntervalMs?: number;
+  /** Observability seam; defaults to console.log. */
+  log?: (line: string) => void;
+}
+
+/** Shape of a `delivery.resolved` audit payload (issue #149). */
+interface DeliveryResolutionPayload {
+  id?: string;
+  approved?: boolean;
+  approver?: string;
+}
+
+function parseDeliveryResolution(raw: string): DeliveryResolutionPayload | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as DeliveryResolutionPayload) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The executor container's default onDelivery (issue #149): the server
+ * cannot reach into this process, so the audit trail is the channel. The
+ * server's delivery router records the human's decision as
+ * `delivery.resolved` ({id, approved, approver}); this wait polls for that
+ * row and resolves with the recorded decision — approved → {approver},
+ * denied → null (the executor then blocks the item with evidence). The
+ * FIRST recorded decision wins (listAudit returns rows in ts order).
+ *
+ * Headless/executor-only runs (no server to resolve) fail closed on the
+ * timeout: null → the item lands in `blocked`, never a silent hang at
+ * `working`.
+ */
+export async function waitForDeliveryApproval(
+  store: Pick<Store, "listAudit">,
+  item: WorkItem,
+  delivery: DeliveryInfo,
+  opts: DeliveryWaitOpts = {},
+): Promise<DeliveryApproval | null> {
+  const log = opts.log ?? ((line: string) => console.log(line));
+  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_DELIVERY_POLL_INTERVAL_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_STALE_AFTER_MS;
+  const deadline = Date.now() + timeoutMs;
+  log(`[${item.id}] delivery approval pending for ${delivery.prUrl} — waiting for the space's decision`);
+  for (;;) {
+    const rows = await store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+    for (const row of rows) {
+      const payload = parseDeliveryResolution(row.payload);
+      if (payload === null || payload.id !== item.id) continue;
+      // First recorded decision wins.
+      if (payload.approved === true && typeof payload.approver === "string") {
+        log(`[${item.id}] delivery approved by <@${payload.approver}>`);
+        return { approver: payload.approver };
+      }
+      log(`[${item.id}] delivery denied — blocking`);
+      return null;
+    }
+    if (Date.now() >= deadline) {
+      log(
+        `[${item.id}] delivery approval unresolved after ${timeoutMs}ms (no server resolution) — ` +
+          "denying (headless fallback)",
+      );
+      return null;
+    }
+    await Bun.sleep(pollIntervalMs);
+  }
 }
 
 /** Push the branch (PAT via the askpass file), open the PR, request delivery approval. */
@@ -521,14 +759,11 @@ async function deliver(
   });
   const requestApproval =
     deps.onDelivery ??
-    ((_item, delivery) => {
-      console.log(
-        `[${_item.id}] delivery approval pending for ${delivery.prUrl} — ` +
-          "server onDelivery hook not wired (follow-up; see src/server TODO)",
-      );
-      const { promise } = Promise.withResolvers<DeliveryApproval | null>();
-      return promise;
-    });
+    ((_item, delivery) =>
+      waitForDeliveryApproval(deps.store, _item, delivery, {
+        pollIntervalMs: deps.deliveryPollIntervalMs,
+        log: (line) => console.log(line),
+      }));
   const approval = await requestApproval(item, { prUrl, summary });
   if (!approval) {
     await deps.store.transitionWorkItem(item.id, "working", "blocked", {
@@ -700,58 +935,15 @@ async function git(args: string[], opts: { cwd?: string; env?: Record<string, st
 }
 
 if (import.meta.main) {
-  const store = createStore();
-  const audit = createAudit(store);
-  const orgPolicy = loadOrgPolicy(store);
-  mkdirSync("data/omp-agent", { recursive: true });
-  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
-  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
-  // config/omp, so a stale copy without the pin silently falls back to the
-  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
-  const pinSync = ensureAgentDirModelPin("data/omp-agent");
-  if (pinSync === "created" || pinSync === "patched") {
-    console.log(`bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`);
-  }
-  // One registry/runtime/provider/toolset per executor process. The getter
-  // defers construction until runExecutor resolves the driver, then shares
-  // the exact same definitions with session routing.
-  let cachedWorkerToolset: Promise<ExtensionWorkerToolset> | undefined;
-  const getExtensionWorkerToolset = (): Promise<ExtensionWorkerToolset> => {
-    if (cachedWorkerToolset === undefined) {
-      cachedWorkerToolset = createExtensionWorkerToolset({ store, audit, orgPolicy });
-    }
-    return cachedWorkerToolset;
-  };
+  const boot = await bootExecutorRuntime();
+  const { store } = boot.runtime;
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,
     get driver(): AgentDriver | Promise<AgentDriver> {
-      if (driver === undefined) {
-        // The driver getter is async-capable (the toolset resolves surfaces
-        // for tools-less manifests, issue #158); memoize the resolved value.
-        driver = getExtensionWorkerToolset().then((workerTools) => {
-          // Pre-approved session: the work item's pickup approval IS the
-          // authorization for allowlisted exec-tier built-ins. Memory tools
-          // ride this driver gate. Extension definitions stay in customTools
-          // because createExtensionRuntime runs its own policy gate and must
-          // never be double-wrapped.
-          return createOmpSdkDriver({
-            agentDir: "data/omp-agent",
-            customTools: workerTools.extensionTools,
-            gate: {
-              orgPolicy,
-              audit,
-              router: DenyRouter,
-              store,
-              preApproved: true,
-              tools: workerTools.memoryTools,
-            },
-          });
-        });
-      }
-      return driver;
+      return (driver ??= boot.getDriver());
     },
-    getExtensionWorkerToolset,
+    getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
     orgConfigDir: "config",
   };
   const ac = new AbortController();

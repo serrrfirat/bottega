@@ -16,6 +16,7 @@ import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type Approva
 import { createAudit, type AuditModule } from "../../policy/audit";
 import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
+import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
 import { sha256Hex } from "../../tools/memory";
 
@@ -204,26 +205,36 @@ interface FakeDownloadedFile {
   bytes: Uint8Array;
 }
 
+interface FakeStreamCall {
+  spaceId: string;
+  opts: { threadTs: string; openingText: string };
+}
+
 function fakeAdapter(
   opts: {
     deferPost?: boolean;
     failUpdateCalls?: number;
     failReactions?: boolean;
     downloads?: Record<string, FakeDownloadedFile | Error>;
+    streaming?: boolean;
   } = {},
 ): {
   adapter: SlackAdapter;
   posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
+  streams: FakeStreamCall[];
+  stops: Array<{ spaceId: string; ts: string; text?: string }>;
   downloadedFileIds: string[];
   uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }>;
   releasePost: () => void;
 } {
-  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {} } = opts;
+  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
   const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
+  const streams: FakeStreamCall[] = [];
+  const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
   const downloadedFileIds: string[] = [];
   const uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }> = [];
   let releasePost = () => {};
@@ -265,6 +276,16 @@ function fakeAdapter(
     async removeReaction(spaceId, ts) {
       reactions.push({ kind: "remove", spaceId, ts });
     },
+    async startStream(spaceId, streamOpts) {
+      streams.push({ spaceId, opts: streamOpts });
+      return `stream-${streams.length}`;
+    },
+    async appendText() {},
+    async appendTask() {},
+    async stopStream(spaceId, ts, text) {
+      stops.push({ spaceId, ts, text });
+    },
+    streamingSupported: () => streaming,
     async start() {},
     async stop() {},
   };
@@ -273,6 +294,8 @@ function fakeAdapter(
     posts,
     updates,
     reactions,
+    streams,
+    stops,
     downloadedFileIds,
     uploads,
     releasePost: () => releasePost(),
@@ -502,6 +525,67 @@ describe("SpaceService durable object ingest (issue #124)", () => {
       `object ${pdf.id}: cannot extract text from application/pdf (unsupported format)`,
     );
     await service.stop();
+  });
+});
+
+describe("SpaceService space persistence (issue #188)", () => {
+  const persistDir = mkdtempSync(join(tmpdir(), "bottega-space-persist-"));
+  const persistStores: Store[] = [];
+
+  function freshPersistStore(): Store {
+    const s = createStore(join(persistDir, `store-${persistStores.length}.db`));
+    persistStores.push(s);
+    return s;
+  }
+
+  afterAll(() => {
+    for (const s of persistStores) s.close();
+    rmSync(persistDir, { recursive: true, force: true });
+  });
+
+  test("the first inbound message persists the space row, so per-space settings resolve", async () => {
+    const store = freshPersistStore();
+    const service = makeSpaceService({ store, adapter: fakeAdapter().adapter, driver: new FakeDriver() });
+    try {
+      await service.handleInboundMessage({ spaceId: "slack:C188", principal: "U1", text: "hi", ts: "1.0" });
+
+      const space = await store.getSpace("slack:C188");
+      expect(space).not.toBeNull();
+      expect(space?.platform).toBe("slack");
+      expect(space?.channel_id).toBe("C188");
+      expect(space?.policy_json).toBe("{}");
+      expect(space?.settings).toBe("{}");
+
+      // The row the bug was missing: model_settings / overlays now resolve
+      // it instead of failing with "space not found".
+      await store.updateSpaceSettings("slack:C188", { model: "deepseek-v4-flash" });
+      expect(await store.getSpaceSettings("slack:C188")).toEqual({ model: "deepseek-v4-flash" });
+    } finally {
+      await service.stop();
+      store.close();
+    }
+  });
+
+  test("a later message never clobbers per-space settings", async () => {
+    const store = freshPersistStore();
+    const service = makeSpaceService({ store, adapter: fakeAdapter().adapter, driver: new FakeDriver() });
+    try {
+      await service.handleInboundMessage({ spaceId: "slack:C188b", principal: "U1", text: "first", ts: "1.0" });
+      await store.updateSpaceSettings("slack:C188b", { model: "deepseek-v4-flash", reasoning_effort: "high" });
+
+      await service.handleInboundMessage({ spaceId: "slack:C188b", principal: "U1", text: "second", ts: "2.0" });
+
+      expect(await store.getSpaceSettings("slack:C188b")).toEqual({
+        model: "deepseek-v4-flash",
+        reasoning_effort: "high",
+      });
+      const space = await store.getSpace("slack:C188b");
+      expect(space?.policy_json).toBe("{}");
+      expect(space?.updated_at).toBeGreaterThanOrEqual(space?.created_at ?? 0);
+    } finally {
+      await service.stop();
+      store.close();
+    }
   });
 });
 
@@ -809,6 +893,45 @@ describe("SpaceService output routing", () => {
       { spaceId: "slack:C1", ts: "ts-2", text: "Working on it…" },
       { spaceId: "slack:C1", ts: "ts-2", text: "channel answer" },
     ]);
+  });
+
+  test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
+    const { adapter, posts, updates, streams, stops } = fakeAdapter({ streaming: true });
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+    try {
+      await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+      const dm = driver.last();
+      dm.emit("turn_start", { spaceId: "slack:D1" });
+      await Promise.resolve();
+      dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
+      await Promise.resolve();
+      dm.emit("turn_end", { spaceId: "slack:D1" });
+      await Promise.resolve();
+
+      await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
+      const channel = driver.last();
+      channel.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
+      await Promise.resolve();
+      channel.emit("turn_end", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // DM: one plain message, phrase replaced in place — no stream call
+      // and no thread_ts anywhere on the DM surface (issue #180).
+      expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
+      expect(streams[0].opts.threadTs).toBe("9.9");
+      expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts === undefined)).toBe(true);
+      expect(updates).toContainEqual({ spaceId: "slack:D1", ts: "ts-1", text: "dm answer" });
+      // Channel: the panel opened (threaded under the inbound ts) and
+      // closed with the final reply as the stopStream block.
+      expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
+    } finally {
+      await service.stop();
+    }
   });
 
   test("a session error replaces the thinking phrase with the error text", async () => {
@@ -1282,6 +1405,42 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
   });
 });
 
+describe("SpaceService run settlement after a stream/panel turn (issue #183)", () => {
+  test("a stream/panel turn followed by another message: the second turn runs fresh and its reply lands — no busy wedge", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Turn one: the agent starts streaming (the stream/panel path). A
+    // second message STEERS the running turn.
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    expect(session.prompts).toHaveLength(1);
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "second", ts: "2.2" }));
+    expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
+
+    // The stream turn settles: the reply streams, turn_end fires, and the
+    // session is idle again (no ghost run left behind).
+    session.emit("message", { spaceId: "slack:C1", text: "stream reply" });
+    await Promise.resolve();
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    session.streaming = false;
+
+    // A THIRD message after the stream turn must run a FRESH turn (never a
+    // busy timeout, never a silent steer into a dead run) and its reply
+    // must land — the phrase/reply always arrive.
+    session.autoReply = "reply to the third";
+    await service.handleInboundMessage(msg({ text: "third", ts: "3.3" }));
+    expect(session.prompts[2].opts?.streamingBehavior).toBeUndefined(); // fresh turn, not a steer
+    await Promise.resolve();
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "reply to the third" });
+    expect(posts).toHaveLength(1); // one visible message, replaced in place — never a silent no-reply
+  });
+});
+
 describe("SpaceService digest-on-idle", () => {
   test("dispose digests new messages into org memory, advances the marker, and disposes", async () => {
     const { adapter } = fakeAdapter();
@@ -1529,6 +1688,52 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await service.handleInboundMessage(msg());
 
     expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+    await service.stop();
+  });
+});
+
+describe("work-items auto-pickup → session prompt directive (issue #89)", () => {
+  test("auto_pickup on appends the pickup directive after the Slack format directive", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const orgPolicy = parseOrgConfigYaml("work_items:\n  auto_pickup: true\n");
+    const service = makeSpaceService({ store, adapter, driver, orgPolicy });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created).toHaveLength(1);
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(
+      `${SLACK_FORMAT_DIRECTIVE}\n\n${buildAutoPickupDirective("high")}`,
+    );
+    await service.stop();
+  });
+
+  test("the directive reflects the configured pickup_confidence threshold", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const orgPolicy = parseOrgConfigYaml("work_items:\n  auto_pickup: true\n  pickup_confidence: medium\n");
+    const service = makeSpaceService({ store, adapter, driver, orgPolicy });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(
+      `${SLACK_FORMAT_DIRECTIVE}\n\n${buildAutoPickupDirective("medium")}`,
+    );
+    await service.stop();
+  });
+
+  test("auto_pickup off (the default) never appends the pickup directive", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg());
+
+    expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+    expect(driver.created[0].opts.appendSystemPrompt).not.toContain("CONFIRMABLE DRAFT");
     await service.stop();
   });
 });

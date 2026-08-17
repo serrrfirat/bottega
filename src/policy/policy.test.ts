@@ -334,6 +334,53 @@ memory:
     expect(p.responseMode).toBe("always");
     expect(p.warnings.some((w) => w.includes("response_mode"))).toBe(true);
   });
+
+  test("work_items.auto_pickup defaults to false (opt-in, issue #89)", () => {
+    expect(defaultPolicy().autoPickup).toBe(false);
+    expect(parseOrgConfigYaml("").autoPickup).toBe(false);
+    expect(parseOrgConfigYaml("tools:\n  bash: deny\n").autoPickup).toBe(false);
+  });
+
+  test("work_items.auto_pickup parses true and false", () => {
+    expect(parseOrgConfigYaml("work_items:\n  auto_pickup: true\n").autoPickup).toBe(true);
+    expect(parseOrgConfigYaml("work_items:\n  auto_pickup: false\n").autoPickup).toBe(false);
+    expect(parseOrgConfigYaml("work_items:\n  auto_pickup: TRUE\n").autoPickup).toBe(true);
+  });
+
+  test("an invalid auto_pickup value disables the flag with a warning (fail closed)", () => {
+    const p = parseOrgConfigYaml("work_items:\n  auto_pickup: sometimes\n");
+    expect(p.ok).toBe(true);
+    expect(p.autoPickup).toBe(false);
+    expect(p.warnings.some((w) => w.includes("work_items.auto_pickup"))).toBe(true);
+  });
+
+  test("work_items section must be a block mapping", () => {
+    const p = parseOrgConfigYaml("work_items: nope\n");
+    expect(p.ok).toBe(false);
+    expect(p.autoPickup).toBe(false);
+  });
+
+  test("pickup_confidence defaults to high and parses all levels (issue #89)", () => {
+    expect(defaultPolicy().pickupConfidence).toBe("high");
+    expect(parseOrgConfigYaml("").pickupConfidence).toBe("high");
+    expect(parseOrgConfigYaml("work_items:\n  pickup_confidence: medium\n").pickupConfidence).toBe("medium");
+    expect(parseOrgConfigYaml("work_items:\n  pickup_confidence: low\n").pickupConfidence).toBe("low");
+    expect(parseOrgConfigYaml("work_items:\n  pickup_confidence:  HIGH \n").pickupConfidence).toBe("high");
+  });
+
+  test("an invalid pickup_confidence warns and keeps the high default", () => {
+    const p = parseOrgConfigYaml("work_items:\n  pickup_confidence: whenever\n");
+    expect(p.ok).toBe(true);
+    expect(p.pickupConfidence).toBe("high");
+    expect(p.warnings.some((w) => w.includes("pickup_confidence"))).toBe(true);
+  });
+
+  test("unknown keys in the work_items section warn and never enable the flag", () => {
+    const p = parseOrgConfigYaml("work_items:\n  auto_pickup_always: true\n");
+    expect(p.ok).toBe(true);
+    expect(p.autoPickup).toBe(false);
+    expect(p.warnings.some((w) => w.includes("work_items.auto_pickup_always"))).toBe(true);
+  });
 });
 
 describe("extension policy parsing (issue #56)", () => {

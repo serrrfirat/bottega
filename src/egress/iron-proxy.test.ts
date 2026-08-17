@@ -9,23 +9,52 @@
  *     a helper container, since the host can't reach the container's UDP
  *     port reliably on Docker Desktop).
  *
+ * Issue #177 adds the missing halves of the safety model against the real
+ * binary: the boundary's secrets transform (mode-0600 secret file written
+ * per the #53 contract, POST /v1/reload with the management token, and the
+ * injected Authorization header observed at the upstream — on allowlisted
+ * hosts only), plus the version-bump tripwire (the image tag is read from
+ * docker-compose.yml, so a proxy-upgrade PR must pass the leg before the
+ * pin moves). The dev-permissive leg (issue #126) proves allow-all +
+ * secrets + management on the real dev config.
+ *
  * The judge transform from egress.yml is intentionally omitted: it needs the
  * NEARAI_JUDGE_API_KEY LLM round-trip (manual checklist, like the mem0 leg's
- * LLM key); the allowlist + default-deny layer is what this leg proves.
+ * LLM key); the allowlist + default-deny + secrets + management layers are
+ * what this leg proves.
  *
  * Skip-gated with evidence when Docker or the image is unavailable; hard
  * timeout so CI never hangs. The target server is local — no external
- * network is ever contacted.
+ * network is ever contacted. The CI integration lane (BOTTEGA_RUN_INTEGRATION=1)
+ * treats any printed SKIP as a failure: a silently-skipped security test is
+ * the worst outcome.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
-import { renderDevEgressConfig, SNAPSHOTS_DIR } from "./generate";
+import { renderDevEgressConfig, renderSecretsTransform, SNAPSHOTS_DIR } from "./generate";
 import { readPinnedSnapshots } from "../extensions/registry";
-import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
+import {
+  createSecretFileBoundary,
+  extensionSecretFileName,
+  PROXY_SECRETS_MOUNT_PATH,
+} from "../extensions/boundary";
+import type { ExtensionCredential } from "../store/db";
 
-const PROXY_IMAGE = "ironsh/iron-proxy:0.49.0";
+/**
+ * The pinned iron-proxy image, read from docker-compose.yml (issue #177
+ * version-bump tripwire): the leg runs against the SAME tag the deployment
+ * pins, so a proxy-upgrade PR must pass the leg before the pin moves.
+ * Throws when compose does not pin the image — the pin is the contract.
+ */
+function pinnedProxyImage(): string {
+  const compose = readFileSync(resolve(import.meta.dir, "../../docker-compose.yml"), "utf8");
+  const match = compose.match(/image:\s*(ironsh\/iron-proxy:[^\s#]+)/);
+  if (!match) throw new Error("docker-compose.yml does not pin an ironsh/iron-proxy image");
+  return match[1];
+}
+
 /** Pinned tiny image with nslookup, used to query the proxy's DNS. */
 const DNS_CLIENT_IMAGE = "alpine:3.19";
 /** Arbitrary sinkhole IP for the leg config; must never be a real host. */
@@ -52,6 +81,7 @@ describe("iron-proxy integration leg (skip-gated)", () => {
 
       // 1. Allowlist domains straight from the deployment contract
       //    (config/egress.yml) so the leg tracks the real policy.
+      const PROXY_IMAGE = pinnedProxyImage(); // compose pin — version-bump tripwire (#177)
       const egressCfg = parseYamlSubset(readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"));
       const transforms = egressCfg["transforms"] as YamlNode[];
       const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as
@@ -255,6 +285,7 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
         skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run");
         return;
       }
+      const PROXY_IMAGE = pinnedProxyImage(); // compose pin — version-bump tripwire (#177)
       const docker = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], { timeout: 10_000 });
       if (!docker.success) {
         skip(`docker unavailable (${docker.stderr.toString().trim().slice(0, 120) || "no daemon"}). Manual checklist: install Docker, pre-pull ${PROXY_IMAGE}, and re-run this leg.`);
@@ -404,6 +435,301 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
           expect(injected.status).toBe(200);
           expect(await injected.text()).toBe("target-ok");
           expect(seenAuth.at(-1)).toBe(`Bearer ${SECRET_VALUE}`);
+        } finally {
+          Bun.spawnSync(["docker", "rm", "-f", name], { timeout: 30_000 });
+        }
+      } finally {
+        target.stop(true);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    240_000,
+  );
+});
+
+/**
+ * Strict-config secrets leg (issue #177, gap #2): boots the pinned image
+ * with a TEST-RENDERED strict config — the REAL allowlist domains from
+ * config/egress.yml plus a leg-local target mapped to a local Bun.serve
+ * upstream, the REAL generated secrets transform (renderSecretsTransform,
+ * issue #53), and the management block (issue #123) — and proves, against
+ * the actual binary:
+ *   - a non-allowlisted host is 403'd and NEVER receives the injected
+ *     Authorization header (the upstream never sees the request),
+ *   - an allowlisted host without a secrets rule passes with NO header,
+ *   - an allowlisted host with the rule receives the boundary's secret as
+ *     `Authorization: Bearer <value>` — via the REAL boundary code path
+ *     (mode-0600 write-temp + rename, POST /v1/reload with the management
+ *     token), so rotation applies to a RUNNING proxy without a restart,
+ *   - the secret file honors the mode-0600 boundary contract,
+ *   - the management API is token-gated (a reload without the token 401s),
+ *   - DNS sinkhole answers arbitrary names with the proxy IP.
+ *
+ * The judge transform is intentionally omitted (needs the
+ * NEARAI_JUDGE_API_KEY LLM round-trip — documented manual checklist, same
+ * as the strict leg above). Breaking the generated allowlist (removing a
+ * domain this leg depends on) FAILS the leg — a silently-skipped security
+ * test is the worst outcome.
+ */
+describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
+  test(
+    "default-deny, DNS sinkhole, and reload-injected Authorization on allowlisted-only",
+    async () => {
+      const skip = (reason: string) => {
+        console.log(`[iron-proxy secrets leg] SKIP: ${reason}`);
+      };
+      if (process.env.BOTTEGA_RUN_INTEGRATION !== "1") {
+        skip("integration leg skipped: set BOTTEGA_RUN_INTEGRATION=1 to run");
+        return;
+      }
+      const PROXY_IMAGE = pinnedProxyImage(); // compose pin — version-bump tripwire (#177)
+
+      // A real allowlisted extension host with a real secrets rule
+      // (config/egress.yml -> mcp.attio.com + attio.secret injection).
+      const INJECT_HOST = "mcp.attio.com";
+      // Leg-local allowlisted host: passes the allowlist but has NO secrets
+      // rule, so it must receive NO Authorization header.
+      const LEG_TARGET = "bottega-leg-target.test";
+      const DENIED_HOST = "bottega-blocked.test";
+      const MGMT_TOKEN = "leg-mgmt-token";
+      const SECRET_V1 = "leg-secret-v1";
+      const SECRET_V2 = "leg-secret-v2";
+
+      // 1. Allowlist domains from the deployment contract. The leg depends
+      //    on INJECT_HOST being allowlisted: breaking the generated
+      //    allowlist FAILS the leg (no skip).
+      const egressCfg = parseYamlSubset(readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"));
+      const transforms = egressCfg["transforms"] as YamlNode[];
+      const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as
+        | Record<string, YamlNode>
+        | undefined;
+      const realDomains = (allowlist?.["config"] as Record<string, YamlNode> | undefined)?.["domains"] as
+        | string[]
+        | undefined;
+      if (!realDomains?.includes(INJECT_HOST)) {
+        // Tripwire: the generated allowlist lost the injection host — fail.
+        throw new Error(`[iron-proxy secrets leg] generated allowlist lost ${INJECT_HOST} — default-deny is broken; refusing to skip`);
+      }
+      // Test-rendered allowlist: real domains + the leg-local target.
+      const domains = [...realDomains, LEG_TARGET];
+
+      // 2. Docker + pinned image present?
+      const docker = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], { timeout: 10_000 });
+      if (!docker.success) {
+        skip(`docker unavailable (${docker.stderr.toString().trim().slice(0, 120) || "no daemon"}). Manual checklist: install Docker, pre-pull ${PROXY_IMAGE}, and re-run this leg.`);
+        return;
+      }
+      const pullIfMissing = (image: string): string | null => {
+        const inspect = Bun.spawnSync(["docker", "image", "inspect", image], { timeout: 10_000 });
+        if (inspect.success) return null;
+        const pull = Bun.spawnSync(["docker", "pull", image], { timeout: 120_000 });
+        return pull.success ? null : pull.stderr.toString().trim().slice(0, 120);
+      };
+      const proxyPullError = pullIfMissing(PROXY_IMAGE);
+      if (proxyPullError) {
+        skip(`could not pull ${PROXY_IMAGE} (${proxyPullError}). Manual checklist: pre-pull the image and re-run this leg.`);
+        return;
+      }
+
+      // 3. Local upstream: records {host, Authorization} per request so the
+      //    leg can prove who got the injected header — and who never did.
+      const seen: Array<{ host: string; auth: string }> = [];
+      const target = Bun.serve({
+        hostname: "0.0.0.0",
+        port: 0,
+        fetch: (req) => {
+          seen.push({ host: new URL(req.url).hostname, auth: req.headers.get("authorization") ?? "" });
+          return new Response("target-ok");
+        },
+      });
+      const targetPort = (target as { port: number }).port;
+
+      // 4. Temp dirs under data/ (gitignored; Docker Desktop bind-mounts).
+      const dir = join(resolve(import.meta.dir, "../../data"), `ironproxy-secrets-leg-${process.pid}`);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const certsDir = join(dir, "certs");
+      const secretsDir = join(dir, "secrets");
+      const cfgPath = join(dir, "egress-secrets-leg.yml");
+      mkdirSync(certsDir, { recursive: true });
+      mkdirSync(secretsDir, { recursive: true });
+      try {
+        const genCa = Bun.spawnSync(
+          ["docker", "run", "--rm", "-v", `${certsDir}:/certs`, PROXY_IMAGE, "generate-ca", "-outdir", "/certs"],
+          { timeout: 60_000 },
+        );
+        if (!genCa.success) {
+          skip(`CA generation failed (${genCa.stderr.toString().trim().slice(0, 120)}). Manual checklist: run 'docker run --rm -v $PWD/certs:/certs ${PROXY_IMAGE} generate-ca -outdir /certs'.`);
+          return;
+        }
+
+        // 5. The boundary's secret file for attio (the extension with an
+        //    injection rule), written per the #53 contract BEFORE boot
+        //    (mode 0600, write-temp + rename). Rotation via the REAL
+        //    boundary below proves the reload path on a running proxy.
+        const secretName = extensionSecretFileName("attio");
+        const secretPath = join(secretsDir, secretName);
+        writeFileSync(`${secretPath}.tmp`, SECRET_V1, { mode: 0o600 });
+        renameSync(`${secretPath}.tmp`, secretPath);
+
+        // 6. Test-rendered strict config: real allowlist + leg target, the
+        //    REAL generated secrets transform, management (token-gated).
+        writeFileSync(
+          cfgPath,
+          [
+            "dns:",
+            `  listen: ":53"`,
+            `  proxy_ip: "${SINKHOLE_IP}"`,
+            "proxy:",
+            '  http_listen: ":80"',
+            "tls:",
+            '  mode: "mitm"',
+            '  ca_cert: "/etc/iron-proxy/certs/ca.crt"',
+            '  ca_key: "/etc/iron-proxy/certs/ca.key"',
+            "management:",
+            '  listen: ":9092"',
+            '  api_key_env: "IRON_MANAGEMENT_API_KEY"',
+            "transforms:",
+            "  - name: allowlist",
+            "    config:",
+            "      domains:",
+            ...domains.map((d) => `        - "${d}"`),
+            "",
+            renderSecretsTransform([{ extensionId: "attio", domains: [INJECT_HOST] }]).trimEnd(),
+            "log:",
+            '  level: "error"',
+            "",
+          ].join("\n"),
+        );
+
+        const name = `bottega-ironproxy-secrets-${process.pid}`;
+        const run = Bun.spawnSync(
+          [
+            "docker", "run", "-d", "--name", name,
+            `--add-host=${INJECT_HOST}:host-gateway`,
+            `--add-host=${LEG_TARGET}:host-gateway`,
+            "-p", "127.0.0.1::80",
+            "-p", "127.0.0.1::9092",
+            "-e", `IRON_MANAGEMENT_API_KEY=${MGMT_TOKEN}`,
+            "-v", `${cfgPath}:/etc/iron-proxy/egress.yml:ro`,
+            "-v", `${certsDir}:/etc/iron-proxy/certs:ro`,
+            "-v", `${secretsDir}:${PROXY_SECRETS_MOUNT_PATH}:ro`,
+            PROXY_IMAGE,
+            "-config", "/etc/iron-proxy/egress.yml",
+          ],
+          { timeout: 30_000 },
+        );
+        if (!run.success) {
+          skip(`container start failed (${run.stderr.toString().trim().slice(0, 120)}). Manual checklist: check iron-proxy logs, then re-run this leg.`);
+          return;
+        }
+
+        try {
+          const ports = Bun.spawnSync(["docker", "port", name], { timeout: 10_000 }).stdout.toString();
+          const httpPort = Number((ports.match(/80\/tcp -> 127\.0\.0\.1:(\d+)/) ?? [])[1]);
+          const mgmtPort = Number((ports.match(/9092\/tcp -> 127\.0\.0\.1:(\d+)/) ?? [])[1]);
+          if (!httpPort || !mgmtPort) {
+            skip(`published ports not found in \`docker port ${name}\` output: ${ports.trim().slice(0, 120)}`);
+            return;
+          }
+
+          // 7. Readiness: a proxied request to the denied host returns 403
+          //    once the proxy is up (deny needs no upstream resolution).
+          const proxyUrl = `http://127.0.0.1:${httpPort}`;
+          const deadline = Date.now() + 60_000;
+          let denied: Response | null = null;
+          while (Date.now() < deadline) {
+            try {
+              const res = await fetch(`http://${DENIED_HOST}/`, { proxy: proxyUrl });
+              if (res.status === 403) {
+                denied = res;
+                break;
+              }
+            } catch {
+              // proxy not up yet
+            }
+            await Bun.sleep(500);
+          }
+          if (!denied) {
+            const logs = Bun.spawnSync(["docker", "logs", "--tail", "10", name], { timeout: 10_000 });
+            const tail = `${logs.stdout.toString()}\n${logs.stderr.toString()}`.trim().slice(0, 300);
+            skip(`proxy never became reachable (${tail || "no logs"}). Manual checklist: run the image with the strict config locally and inspect.`);
+            return;
+          }
+
+          // 8. Default-deny: the non-allowlisted host is 403'd and NEVER
+          //    reaches the upstream — so it never receives the header.
+          expect(denied.status).toBe(403);
+          expect(seen.some((r) => r.host === DENIED_HOST)).toBe(false);
+
+          // 9. Allowlisted host WITHOUT a secrets rule: passes, no header.
+          const noRule = await fetch(`http://${LEG_TARGET}:${targetPort}/`, { proxy: proxyUrl });
+          expect(noRule.status).toBe(200);
+          expect(await noRule.text()).toBe("target-ok");
+          expect(seen.at(-1)?.host).toBe(LEG_TARGET);
+          expect(seen.at(-1)?.auth).toBe("");
+
+          // 10. Allowlisted host WITH the rule: the boot-time secret file is
+          //     injected as Bearer auth.
+          const bootInjected = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
+          expect(bootInjected.status).toBe(200);
+          expect(seen.at(-1)?.host).toBe(INJECT_HOST);
+          expect(seen.at(-1)?.auth).toBe(`Bearer ${SECRET_V1}`);
+
+          // 11. Management is token-gated: a reload without the token 401s.
+          const noToken = await fetch(`http://127.0.0.1:${mgmtPort}/v1/reload`, { method: "POST" });
+          expect(noToken.status).toBe(401);
+
+          // 12. The #53 chain against the REAL binary: the boundary writes
+          //     the rotated secret (mode 0600, write-temp + rename) and
+          //     POSTs /v1/reload with the management token; the RUNNING
+          //     proxy must now inject the new value without a restart.
+          const boundary = createSecretFileBoundary({
+            resolveSecret: async () => SECRET_V2,
+            secretsDir,
+            proxyControlUrl: `http://127.0.0.1:${mgmtPort}`,
+            proxyControlToken: MGMT_TOKEN,
+          });
+          await boundary.authorize({
+            id: "leg-attio",
+            provider: "attio",
+            identity_key: "leg",
+            owner: null,
+            scope: "org",
+            broker_credential_id: 1,
+            created_at: Date.now(),
+          } satisfies ExtensionCredential);
+          expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+
+          const reloadDeadline = Date.now() + 20_000;
+          let rotated: string | null = null;
+          while (Date.now() < reloadDeadline) {
+            const res = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
+            if (res.status === 200 && seen.at(-1)?.auth === `Bearer ${SECRET_V2}`) {
+              rotated = seen.at(-1)?.auth ?? null;
+              break;
+            }
+            await Bun.sleep(500);
+          }
+          expect(rotated).toBe(`Bearer ${SECRET_V2}`);
+
+          // 13. DNS sinkhole: every name answers with the configured proxy
+          //     IP (queried from a helper container on the same bridge).
+          const proxyIp = Bun.spawnSync(
+            ["docker", "inspect", name, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
+            { timeout: 10_000 },
+          ).stdout.toString().trim();
+          const clientPullError = pullIfMissing(DNS_CLIENT_IMAGE);
+          if (clientPullError) {
+            console.log(`[iron-proxy secrets leg] DNS sinkhole assertion skipped: could not pull ${DNS_CLIENT_IMAGE} (${clientPullError})`);
+          } else {
+            const lookup = Bun.spawnSync(
+              ["docker", "run", "--rm", "--dns", proxyIp, DNS_CLIENT_IMAGE, "nslookup", "does-not-exist.test"],
+              { timeout: 30_000 },
+            );
+            const out = `${lookup.stdout.toString()}\n${lookup.stderr.toString()}`;
+            expect(out).toContain(`Address: ${SINKHOLE_IP}`);
+          }
         } finally {
           Bun.spawnSync(["docker", "rm", "-f", name], { timeout: 30_000 });
         }

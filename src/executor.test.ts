@@ -16,22 +16,34 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, type Store, type WorkItem, type WorkItemState } from "./store/db";
+import { createStore, type SpaceModelSettings, type Store, type WorkItem, type WorkItemState } from "./store/db";
 import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
+  DELIVERY_REQUESTED_EVENT,
+  DELIVERY_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
+  WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "./store/audit-events";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
   runExecutor,
+  waitForDeliveryApproval,
   type DeliveryApproval,
   type DeliveryInfo,
   type ExecutorDeps,
   type ExtensionWorkerToolset,
 } from "./executor";
+import { resolveDeliveryAction } from "./server/adapters/delivery-router";
+import { pollPendingDeliveries } from "./server/services/delivery-poller";
+import {
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+} from "./server/adapters/slack";
 import { createAudit } from "./policy/audit";
 import { DenyRouter } from "./policy/approval-router";
 import { defaultPolicy } from "./policy/config";
@@ -42,20 +54,34 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } f
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import type { AgentDriver, AgentSessionDriver, AgentTurnOptions } from "./server/drivers/agent-driver";
+import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
 
 // --- Fakes ------------------------------------------------------------------
 
 /** Session driver double: records createSession opts, streams one canned message per prompt. */
 class FakeSession implements AgentSessionDriver {
   prompts: string[] = [];
+  /** setModelRole calls with the settings the session would resolve them against (issue #185). */
+  readonly setModelRoleCalls: Array<{ role: ModelRole; settings: SpaceModelSettings }> = [];
   constructor(
-    readonly opts: { spaceId: string; transcriptDir: string; cwd: string; allowTools: readonly string[] },
+    readonly opts: {
+      spaceId: string;
+      transcriptDir: string;
+      cwd: string;
+      allowTools: readonly string[];
+      getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    },
     private readonly failure: Error | null,
     private readonly emittedError: string | null,
     private readonly messageText: string,
     private readonly onPrompt: (() => Promise<void>) | null,
   ) {}
+
+  async setModelRole(role: ModelRole): Promise<ModelRoleSwitchResult> {
+    const settings = (await this.opts.getModelSettings?.(this.opts.spaceId)) ?? {};
+    this.setModelRoleCalls.push({ role, settings });
+    return { applied: true, role, model: settings.model ?? null, thinking_level: settings.reasoning_effort ?? null };
+  }
 
   async prompt(text: string, _opts?: AgentTurnOptions): Promise<void> {
     this.prompts.push(text);
@@ -97,6 +123,7 @@ class FakeDriver implements AgentDriver {
     onOutput: (spaceId: string, text: string) => void;
     cwd?: string;
     allowTools?: readonly string[];
+    getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
   }): Promise<AgentSessionDriver> {
     const session = new FakeSession(
       {
@@ -104,6 +131,7 @@ class FakeDriver implements AgentDriver {
         transcriptDir: opts.transcriptDir,
         cwd: opts.cwd ?? process.cwd(),
         allowTools: opts.allowTools ?? [],
+        getModelSettings: opts.getModelSettings,
       },
       this.failure,
       this.emittedError,
@@ -904,6 +932,124 @@ describe("delivery routing (issue #129)", () => {
     }
   });
 });
+
+describe("per-task model pin (issue #185)", () => {
+  test("the execution session runs on the pinned model + effort (pin beats space settings)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN1" });
+      // The space prefers a slow model at high effort; the pin must win.
+      await fx.store.updateSpaceSettings(space.id, { model: "glm-5.1", reasoning_effort: "high" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "pinned work",
+        repo: "acme/sandbox",
+        model: "deepseek-v4-flash",
+        reasoning_effort: "low",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      // The session resolved the pin via the "default" role against
+      // settings merged with the pin (task pin > space settings).
+      const session = fx.driver.sessions[0]!;
+      expect(session.setModelRoleCalls).toEqual([
+        { role: "default", settings: { model: "deepseek-v4-flash", reasoning_effort: "low" } },
+      ]);
+
+      // The application was audited with the resolved model + effort.
+      const pinAudits = await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT });
+      expect(pinAudits).toHaveLength(1);
+      expect(JSON.parse(pinAudits[0]!.payload)).toEqual({
+        id: item.id,
+        role: "default",
+        model: "deepseek-v4-flash",
+        thinking_level: "low",
+        applied: true,
+        by: "executor",
+      });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a role-ref pin switches that slot through the space's settings", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN2" });
+      await fx.store.updateSpaceSettings(space.id, {
+        model: "glm-5.1",
+        fast_model: "flash-lite",
+        reasoning_effort: "high",
+      });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "fast work",
+        repo: "acme/sandbox",
+        model: "fast",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0]!;
+      expect(session.setModelRoleCalls).toEqual([
+        {
+          role: "fast",
+          settings: { model: "glm-5.1", fast_model: "flash-lite", reasoning_effort: "high" },
+        },
+      ]);
+      const pinAudits = await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT });
+      expect(JSON.parse(pinAudits[0]!.payload)).toMatchObject({ id: item.id, role: "fast", by: "executor" });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an effort-only pin applies the effort without a model switch", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN3" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "high effort work",
+        repo: "acme/sandbox",
+        reasoning_effort: "high",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0]!;
+      // No space model configured: the default role resolves to effort only.
+      expect(session.setModelRoleCalls).toEqual([{ role: "default", settings: { reasoning_effort: "high" } }]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an unpinned item does not switch the model (no pin, no switch)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "PIN4" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "plain work",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      expect(fx.driver.sessions[0]!.setModelRoleCalls).toEqual([]);
+      expect(await fx.store.listAudit({ event_type: WORK_ITEM_PIN_APPLIED_EVENT })).toHaveLength(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
 describe("org config parsing (issue #33)", () => {
   test("trailing comments and quoted repo entries parse to the correct allowlist and git base", async () => {
     const fx = makeFixture();
@@ -1003,6 +1149,186 @@ describe("credential hygiene", () => {
         allow_loose_pat: true,
       });
       await expect(prepareExecutor(makeDeps(fx))).resolves.toMatchObject({ tokenFile: fx.tokenFile });
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+describe("delivery approval round trip (issue #149)", () => {
+  /** Server-side fakes: the poller's message surface + the resolver's rewrite surface. */
+  function serverFakes(): {
+    adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
+    posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }>;
+    updated: Array<{ spaceId: string; ts: string; text: string }>;
+  } {
+    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    return {
+      posted,
+      updated,
+      adapter: {
+        async postMessage(spaceId, text, opts) {
+          posted.push({ spaceId, text, ...(opts?.blocks ? { blocks: opts.blocks } : {}) });
+          return "1.000001";
+        },
+        async updateMessage(spaceId, ts, text) {
+          updated.push({ spaceId, ts, text });
+        },
+      },
+    };
+  }
+
+  function click(itemId: string, actionId: string): SlackAction {
+    return { actionId, value: itemId, spaceId: "slack:C1", principal: "U_HUMAN", messageTs: "1.000001" };
+  }
+
+  /** Polls the audit trail for an event whose payload names the item. */
+  async function waitForMarker(store: Store, itemId: string, eventType: string, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const rows = await store.listAudit({ event_type: eventType });
+      if (rows.some((row) => (JSON.parse(row.payload) as { id?: string }).id === itemId)) return;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${eventType} of ${itemId}`);
+      await Bun.sleep(10);
+    }
+  }
+
+  test("a git-delivered item reaches done via the Slack approval (poller post → click → onDelivery wait → review → done)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      // The executor container runs with NO injected hook — the default
+      // onDelivery wait is the real production wiring (issue #149).
+      const deps = makeDeps(fx, { onDelivery: undefined, deliveryPollIntervalMs: 10 });
+      const ac = new AbortController();
+      const run = runExecutor(deps, ac.signal);
+      try {
+        // The PR lands and the delivery_pending marker appears.
+        await waitForMarker(fx.store, item.id, DELIVERY_PENDING_EVENT);
+
+        // Server side: the poller posts the interactive prompt.
+        const { adapter } = serverFakes();
+        const posted = await pollPendingDeliveries(fx.store, adapter);
+        expect(posted).toBe(1);
+
+        // A human clicks Approve; the server records delivery.resolved.
+        const handled = await resolveDeliveryAction(
+          { store: fx.store, adapter },
+          click(item.id, DELIVERY_APPROVE_ACTION_ID),
+        );
+        expect(handled).toBe(true);
+
+        const done = await waitForState(fx.store, item.id, "done");
+        const result = JSON.parse(done.result!) as { pr_url: string; summary: string };
+        expect(result.pr_url).toContain(`/acme/sandbox/pull/1`);
+        expect(JSON.parse(done.approvals)).toEqual([{ approver: "U_HUMAN", at: expect.any(Number) }]);
+
+        // The documented path: working → review → done, by the executor.
+        const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+        expect(transitions.map((row) => JSON.parse(row.payload))).toEqual(
+          expect.arrayContaining([
+            { from: "working", to: "review", by: "executor" },
+            { from: "review", to: "done", by: "executor" },
+          ]),
+        );
+
+        // The whole decision is on the trail: announced → resolved.
+        const requested = await fx.store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+        expect(requested).toHaveLength(1);
+        const resolved = await fx.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+        expect(resolved).toHaveLength(1);
+        expect(JSON.parse(resolved[0].payload)).toEqual({ id: item.id, approved: true, approver: "U_HUMAN" });
+      } finally {
+        ac.abort();
+        await run;
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a denied delivery blocks the item with evidence (poller post → click deny → blocked)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      const deps = makeDeps(fx, { onDelivery: undefined, deliveryPollIntervalMs: 10 });
+      const ac = new AbortController();
+      const run = runExecutor(deps, ac.signal);
+      try {
+        await waitForMarker(fx.store, item.id, DELIVERY_PENDING_EVENT);
+
+        const { adapter } = serverFakes();
+        expect(await pollPendingDeliveries(fx.store, adapter)).toBe(1);
+
+        const handled = await resolveDeliveryAction(
+          { store: fx.store, adapter },
+          click(item.id, DELIVERY_DENY_ACTION_ID),
+        );
+        expect(handled).toBe(true);
+
+        const blocked = await waitForState(fx.store, item.id, "blocked");
+        expect(JSON.parse(blocked.evidence)[0].url).toContain("approval denied");
+        expect(JSON.parse(blocked.approvals)).toEqual([]);
+
+        // The decision is recorded: denied, by the clicking human.
+        const resolved = await fx.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
+        expect(JSON.parse(resolved[0].payload)).toEqual({ id: item.id, approved: false, approver: "U_HUMAN" });
+        // Deny never enters review/done.
+        const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
+        expect(transitions.map((row) => JSON.parse(row.payload))).not.toEqual(
+          expect.arrayContaining([
+            { from: "working", to: "review", by: "executor" },
+            { from: "review", to: "done", by: "executor" },
+          ]),
+        );
+      } finally {
+        ac.abort();
+        await run;
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("headless fallback: no server resolution times out and denies (item would land in blocked)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a feature",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      const start = Date.now();
+      const approval = await waitForDeliveryApproval(
+        fx.store,
+        item,
+        { prUrl: "https://github.com/acme/sandbox/pull/1", summary: "implemented it" },
+        { timeoutMs: 60, pollIntervalMs: 5 },
+      );
+
+      expect(approval).toBeNull(); // deny → the executor blocks the item
+      expect(Date.now() - start).toBeGreaterThanOrEqual(60);
     } finally {
       fx.cleanup();
     }

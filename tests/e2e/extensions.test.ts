@@ -175,6 +175,17 @@ function recordingAdapter(): {
     },
     async addReaction() {},
     async removeReaction() {},
+    async startStream() {
+      throw new Error("not used");
+    },
+    async appendText() {},
+    async appendTask() {},
+    async stopStream() {},
+    // The Slack emulator has no chat.startStream/appendStream surface
+    // (issue #168), so `streamingSupported` is always false here: the
+    // phrase + in-place-edit fallback path is what these journeys exercise,
+    // exactly as a workspace without the Agents feature would behave.
+    streamingSupported: () => false,
     async start() {},
     async stop() {},
   };

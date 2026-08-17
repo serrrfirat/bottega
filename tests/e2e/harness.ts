@@ -55,18 +55,20 @@ import type { MemoryProvider } from "../../src/memory/types";
 import { createSqliteMemoryProvider, pruneDigestMemories } from "../../src/memory/sqlite";
 import { workItemToolDefinitions } from "../../src/tools/work-items";
 import { memoryToolDefinitions } from "../../src/tools/memory";
+import { modelToolsDefinitions } from "../../src/tools/model-settings";
 import type { ExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRegistry } from "../../src/extensions/registry";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
 import { resolveExtensionSurfaces } from "../../src/extensions/surface";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
 import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps } from "../../src/extensions/connect";
+import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
 import type { McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver } from "../../src/server/drivers/agent-driver";
-import { createOmpSdkDriver } from "../../src/server/drivers/agent-driver";
+import { createOmpSdkDriver, SessionModelRoleRegistry } from "../../src/server/drivers/agent-driver";
 import {
   createSlackAdapter,
   registerActionHandler,
@@ -354,7 +356,17 @@ export interface SlackHandle {
   baseUrl: string;
   /** Outbound message store: emulator storage, or a live history mirror. */
   store: {
-    messages: { all(): EmulatorMessage[] };
+    messages: {
+      all(): EmulatorMessage[];
+      /**
+       * Emulator-only seam (issue #179): insert a message row so receipt
+       * reactions on inbound tss resolve — inbound events are injected via
+       * `app.processEvent` and bypass the emulator's HTTP API, so without
+       * the row `reactions.add` answers message_not_found. The live mirror
+       * is read-only and omits this.
+       */
+      insert?(row: EmulatorMessage & { type?: string; reactions?: unknown[] }): unknown;
+    };
     users: { findOneBy(field: string, value: string): { user_id?: string } | undefined };
     channels: { findOneBy(field: string, value: string): { channel_id?: string } | undefined };
   };
@@ -490,6 +502,14 @@ export interface HarnessConfig {
   /** MCP transport factory injected into the real extension runtime. */
   mcpTransport?: (binding: McpBinding) => Transport;
   /**
+   * Credential boundary override (issue #53 seam, mirrors `mcpTransport`):
+   * the live canary injects a resolver-backed write-only boundary so its
+   * fixture extension call exercises the real boundary write without a
+   * proxy control URL (issue #175). Defaults to the production boundary
+   * (fail-closed without a broker secret resolver).
+   */
+  extensionBoundary?: CredentialBoundary;
+  /**
    * Extra SDK tool definitions merged into the session's customTools
    * (already-gated tools — e.g. registry extension tools that run through
    * the #53 runtime; the driver never double-wraps them).
@@ -569,11 +589,18 @@ export const AutoApproveRouter: ApprovalRouter = {
   },
 };
 
-let tsCounter = 0;
+let tsCounter = 1_000_000;
 const BASE_TS_SECONDS = Math.floor(Date.now() / 1000);
+// The emulator's chat.postMessage generates ts from ITS OWN counter
+// starting at 1 (${seconds}.000001, .000002, …). When a harness-injected
+// inbound message lands in the same wall-clock second as the first
+// outbound post, both ts collide (e.g. .000001) and the presenter's
+// in-place reply update resolves to the WRONG row (cant_update_message,
+// the reply is dropped). Offsetting the harness counter far above the
+// emulator's per-test range makes the collision impossible.
 function nextTs(): string {
   tsCounter += 1;
-  return `${BASE_TS_SECONDS}.${String(tsCounter).padStart(6, "0")}`;
+  return `${BASE_TS_SECONDS}.${String(tsCounter).padStart(7, "0")}`;
 }
 
 /**
@@ -701,6 +728,13 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
             await approvalRouter.handleAction?.(a);
           },
           clientOptions: { slackApiUrl: `${slack.baseUrl}/api` },
+          // Issue #179: the emulator has no chat.startStream/appendStream
+          // surface — its unknown-route 404 makes the WebClient retry for
+          // ~30 minutes, hanging the turn's stream open and dropping the
+          // phrase. Report streaming unsupported so the phrase +
+          // in-place-edit fallback path is what these journeys exercise,
+          // exactly as a workspace without the Agents feature would behave.
+          streamingSupported: () => false,
           responseModeFor,
         },
   );
@@ -749,6 +783,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     orgPolicy,
     router: approvalRouter,
     ...(cfg.mcpTransport !== undefined ? { mcpTransport: cfg.mcpTransport } : {}),
+    ...(cfg.extensionBoundary !== undefined ? { boundary: cfg.extensionBoundary } : {}),
     surfaces: extensionSurfaces,
   });
   // Memory/work-item tools ride the gated customTools path (issue #69):
@@ -757,12 +792,18 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // cross the driver-level policy gate before executing.
   const memoryTools = memoryToolDefinitions(memoryProvider, { audit });
   const workItemTools = workItemToolDefinitions(store, { orgPolicy });
+  // Model tools (issue #64): use_model reaches the live session through
+  // the registry the server wires (the harness mirrors index.ts so the
+  // canary's model-role journey exercises the real seam, issue #175).
+  const modelRoles = new SessionModelRoleRegistry();
+  const modelTools = modelToolsDefinitions(store, { audit, modelRoles });
   const extraGatedTools =
     typeof cfg.gatedTools === "function" ? cfg.gatedTools({ store, audit, registry: extensionRegistry }) : cfg.gatedTools ?? [];
   const driver = createOmpSdkDriver({
     agentDir,
     customTools: [
       ...(cfg.customTools ?? []),
+      ...modelTools,
       ...extensionToolDefinitions(extensionRegistry.list(), {
         runtime: extensionRuntime,
         surfaces: extensionSurfaces,
@@ -779,8 +820,11 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       toolExtensionId: (name) => extensionRegistry.extensionIdForTool(name),
       toolTier: (name) => extensionToolTier(name),
       knownExtensionIds: extensionRegistry.list().map((r) => r.manifest.id),
-      tools: [...memoryTools, ...workItemTools, ...extraGatedTools],
+      tools: [...memoryTools, ...workItemTools, ...modelTools, ...extraGatedTools],
     },
+    // Per-space model settings (issue #64): the OMP session resolves
+    // use_model roles against the space's settings column (server parity).
+    getModelSettings: (spaceId) => store.getSpaceSettings(spaceId),
     // Connect capability (issue #52): connect_extension is built per
     // session so the actor is the requesting principal.
     ...(connectDeps !== undefined
@@ -817,6 +861,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     },
     idleTimeoutMs: cfg.idleTimeoutMs ?? 30_000,
     transcriptDir,
+    // Live sessions register here (issue #64) so use_model can reach them.
+    modelRoles,
     ...(connectDeps !== undefined ? { connect: connectDeps } : {}),
   });
 
@@ -890,10 +936,25 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
         await liveSlack!.postAsUser(channelId, text);
         return;
       }
+      const ts = typeof extra.ts === "string" ? extra.ts : nextTs();
+      // Issue #179: mirror the inbound message into the emulator store so
+      // the presenter's receipt reaction (reactions.add on the inbound ts)
+      // resolves — processEvent bypasses the emulator's HTTP API, and
+      // without the row the store answers message_not_found (real Slack
+      // would have the human's message). `messages()` filters the human's
+      // own rows, so the outbound-only contract is unchanged.
+      slack.store.messages.insert?.({
+        ts,
+        channel_id: channelId,
+        user: humanUserId,
+        text,
+        type: "message",
+        reactions: [],
+      });
       await app.processEvent({
         body: {
           type: "event_callback",
-          event: { type: "message", channel: channelId, user: humanUserId, text, ts: nextTs(), ...extra },
+          event: { type: "message", channel: channelId, user: humanUserId, text, ts, ...extra },
         },
         ack: async () => {},
       });
@@ -922,7 +983,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     // Live mode note: `messages` reflects the mirror's last refresh —
     // prefer `liveSlack.history(channelId)` for fresh reads (canary).
     messages(channelId?: string) {
-      const all = slack.store.messages.all();
+      // Outbound only (issue #179): inbound messages are mirrored into the
+      // emulator store so receipt reactions resolve; the human's own rows
+      // are filtered here so the outbound assertions keep their meaning.
+      const all = slack.store.messages.all().filter((m) => m.user !== humanUserId);
       return channelId ? all.filter((m) => m.channel_id === channelId) : all;
     },
     ...(liveSlack !== undefined ? { liveSlack } : {}),
