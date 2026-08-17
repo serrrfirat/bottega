@@ -33,22 +33,30 @@ const EXTENSION_ENTRIES = SNAPSHOTS.map((s) => ({
 
 function allowlistDomains(yaml: string): string[] {
   const cfg = parseYamlSubset(yaml);
+  // SAFETY: every rendered egress config emits `transforms` as a top-level sequence (the strict and dev templates both do).
   const transforms = cfg["transforms"] as YamlNode[];
+  // SAFETY: every transform entry is a block mapping carrying a `name` scalar, and exactly one entry is the allowlist.
   const allowlist = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "allowlist") as Record<
     string,
     YamlNode
   >;
+  // SAFETY: the allowlist transform's `config` is a block mapping whose `domains` is a sequence of scalar strings.
   const config = allowlist["config"] as Record<string, YamlNode>;
+  // SAFETY: the allowlist config's `domains` is a sequence of scalar strings.
   return config["domains"] as string[];
 }
 
 /** The secrets transform's entries from a rendered config, or null when absent. */
 function secretsEntries(yaml: string): Record<string, YamlNode>[] | null {
   const cfg = parseYamlSubset(yaml);
+  // SAFETY: every rendered egress config emits `transforms` as a top-level sequence whose entries are mappings with a `name` scalar.
   const transforms = cfg["transforms"] as YamlNode[];
+  // SAFETY: when present, the secrets transform entry is a mapping carrying a `name` scalar.
   const secrets = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "secrets");
   if (secrets === undefined) return null;
+  // SAFETY: when a secrets transform exists it is a mapping whose `config` is a block mapping.
   const config = (secrets as Record<string, YamlNode>)["config"] as Record<string, YamlNode>;
+  // SAFETY: the secrets config's `secrets` value is a sequence of inject-entry mappings.
   return config["secrets"] as Record<string, YamlNode>[];
 }
 
@@ -110,6 +118,7 @@ describe("egress config generation", () => {
       source: { type: "file", path: `/data/proxy-secrets/${FIXTURE_EXTENSION_ID}.secret` },
       inject: { header: "Authorization", formatter: "Bearer {{ .Value }}" },
     });
+    // SAFETY: renderSecretsTransform emits each entry's `rules` as a sequence of host-rule mappings.
     const rules = entries[0]!["rules"] as Record<string, YamlNode>[];
     expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
   });
@@ -122,6 +131,7 @@ describe("egress config generation", () => {
       "api.anthropic.com",
       "raw.githubusercontent.com",
       "files.slack.com",
+      "api.github.com",
       "a.example.com",
       "b.example.com",
     ]);
@@ -185,6 +195,7 @@ describe("egress config generation", () => {
         "api.anthropic.com",
         "raw.githubusercontent.com",
         "files.slack.com",
+        "api.github.com",
         FIXTURE_EXTENSION_DOMAIN,
       ]);
     } finally {

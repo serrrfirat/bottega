@@ -134,3 +134,27 @@ export const ADMIN_ONBOARDING_BOOT_EVENT = "admin.onboarding_boot";
  * the nudge actually fires (dedupe suppressed repeats are not audited).
  */
 export const ADMIN_ONBOARDING_NUDGE_EVENT = "admin.onboarding_nudge";
+/**
+ * Ingest dispatch via the WEBHOOK leg (issue #57): a validated inbound
+ * webhook event became a work item + Slack post
+ * (payload {provider, event_type, url?, work_item_id, space_id}).
+ */
+export const INGEST_WEBHOOK_DISPATCH_EVENT = "ingest.webhook.dispatch";
+/**
+ * Ingest dispatch via the POLLING leg (issue #57): a validated polled
+ * event became a work item + Slack post
+ * (payload {provider, event_type, url?, work_item_id, space_id}).
+ */
+export const INGEST_POLL_DISPATCH_EVENT = "ingest.poll.dispatch";
+/**
+ * Ingest event REJECTED at the webhook leg (issue #57): validation or
+ * signature failure — nothing was created or posted
+ * (payload {provider, event_type, reason}).
+ */
+export const INGEST_WEBHOOK_REJECTED_EVENT = "ingest.webhook.rejected";
+/**
+ * Ingest event REJECTED at the polling leg (issue #57): validation
+ * failure — nothing was created or posted
+ * (payload {provider, event_type, reason}).
+ */
+export const INGEST_POLL_REJECTED_EVENT = "ingest.poll.rejected";

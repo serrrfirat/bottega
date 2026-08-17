@@ -60,6 +60,7 @@ export const BOOT_SECRETS: readonly BootSecret[] = [
   { envName: "NEAR_API_KEY", vaultProvider: "near", label: "NEAR AI Cloud key" },
   { envName: "OPENAI_API_KEY", vaultProvider: "openai", label: "OpenAI key" },
   { envName: "ANTHROPIC_API_KEY", vaultProvider: "anthropic", label: "Anthropic key" },
+  { envName: "GITHUB_WEBHOOK_SECRET", vaultProvider: "github-webhook", label: "GitHub webhook shared secret" },
 ];
 
 /** The boot secret with the given vault provider identity, if any. */

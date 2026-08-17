@@ -20,8 +20,9 @@ import { readPinnedSnapshots } from "../extensions/registry";
 import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
- * #36, #37ee2bf) plus the example KB host (issue #91) and Slack file
- * downloads (issue #124). */
+ * #36, #37ee2bf) plus the example KB host (issue #91), Slack file
+ * downloads (issue #124), and the GitHub API for the ingest poller
+ * (issue #57, mentions search). */
 export const BASE_EGRESS_DOMAINS = [
   "cloud-api.near.ai",
   "*.completions.near.ai",
@@ -29,6 +30,7 @@ export const BASE_EGRESS_DOMAINS = [
   "api.anthropic.com",
   "raw.githubusercontent.com",
   "files.slack.com",
+  "api.github.com",
 ] as const;
 
 /** Where pinned snapshots live; mounted/baked per deployment. */

@@ -28,6 +28,11 @@ import { errorMessage } from "../tools/helpers";
 import type { AuditModule } from "../policy/audit";
 import type { OAuthFlow, Store } from "../store/db";
 import { completeMcpOAuthFlow, createVaultTokenStore, type McpOAuthTokenStore } from "./mcp-oauth";
+import {
+  handleWebhookRequest,
+  WEBHOOK_PATH_PREFIX,
+  type WebhookRouteDeps,
+} from "../ingest/webhook-server";
 
 export const OAUTH_CALLBACK_PATH = "/oauth/callback";
 
@@ -44,6 +49,13 @@ export interface OAuthCallbackEndpointDeps {
    * BOTTEGA_OAUTH_CALLBACK_BASE_URL; default: the loopback server URL).
    */
   baseUrl?: string;
+  /**
+   * The ingest webhook route (issue #57): when present, this surface also
+   * serves `POST /webhooks/<extension>` — the webhook leg joins the SAME
+   * inbound HTTP surface as the OAuth callback, so a deployment exposes
+   * ONE public ingress (reverse proxy + TLS) for both paths.
+   */
+  webhooks?: WebhookRouteDeps;
 }
 
 /** A plain, script-free result page (the browser's only output). */
@@ -107,10 +119,12 @@ export interface OAuthCallbackServerHandle {
 }
 
 /**
- * Starts the in-process OAuth callback endpoint (issue #198): Bun.serve on
- * 127.0.0.1 (loopback only — the same posture as issue #57's local dev),
- * ephemeral port. Only `GET /oauth/callback` is served; anything else is a
- * 404 (fail closed).
+ * Starts the in-process inbound HTTP surface (issue #198 + #57): Bun.serve
+ * on 127.0.0.1 (loopback only — the same posture as issue #57's local dev),
+ * ephemeral port. `GET /oauth/callback` completes the OAuth connect flow;
+ * when the deps carry `webhooks`, `POST /webhooks/<extension>` serves the
+ * ingest webhook route (issue #57) on the SAME surface — one public
+ * ingress for both. Anything else is a 404 (fail closed).
  */
 export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuthCallbackServerHandle {
   const tokenStore = deps.tokenStore ?? createVaultTokenStore();
@@ -118,7 +132,13 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
     hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
-      return handleCallback(req, deps, tokenStore);
+      const url = new URL(req.url);
+      if (url.pathname === OAUTH_CALLBACK_PATH) return handleCallback(req, deps, tokenStore);
+      // Issue #57: the webhook route joins the same inbound surface.
+      if (deps.webhooks !== undefined && url.pathname.startsWith(`${WEBHOOK_PATH_PREFIX}/`)) {
+        return handleWebhookRequest(req, deps.webhooks);
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   const port = server.port;

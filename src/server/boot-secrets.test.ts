@@ -23,7 +23,7 @@ const NO_KEYCHAIN = (): Promise<string | null> => Promise.resolve(null);
 const SILENT = (): void => {};
 
 function freshEnv(): NodeJS.ProcessEnv {
-  return {} as NodeJS.ProcessEnv;
+  return {};
 }
 
 describe("seedBootSecretsFromVault precedence (issue #201)", () => {
@@ -36,6 +36,7 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
       ["near", "near-vault-key"],
       ["openai", "sk-openai-vault"],
       ["anthropic", "sk-anthropic-vault"],
+      ["github-webhook", "gh-webhook-vault"],
     ]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
     expect(env.SLACK_APP_TOKEN).toBe("xapp-vault");
@@ -44,17 +45,18 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
     expect(env.NEAR_API_KEY).toBe("near-vault-key");
     expect(env.OPENAI_API_KEY).toBe("sk-openai-vault");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-anthropic-vault");
+    expect(env.GITHUB_WEBHOOK_SECRET).toBe("gh-webhook-vault");
   });
 
   test("vault beats env — the source of truth moved to the vault", async () => {
-    const env = { NEAR_API_KEY: "env-key" } as NodeJS.ProcessEnv;
+    const env = { NEAR_API_KEY: "env-key" };
     const vault = new Map([["near", "vault-key"]]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
     expect(env.NEAR_API_KEY).toBe("vault-key");
   });
 
   test("env wins as the fallback when the vault has no row", async () => {
-    const env = { NEAR_API_KEY: "env-key", SLACK_APP_TOKEN: "xapp-env" } as NodeJS.ProcessEnv;
+    const env = { NEAR_API_KEY: "env-key", SLACK_APP_TOKEN: "xapp-env" };
     await seedBootSecretsFromVault({ env, fetchVault: NO_VAULT, readKeychain: NO_KEYCHAIN, log: SILENT });
     expect(env.NEAR_API_KEY).toBe("env-key");
     expect(env.SLACK_APP_TOKEN).toBe("xapp-env");
@@ -83,7 +85,7 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
   });
 
   test("empty-string env values are treated as unset (fall through to Keychain)", async () => {
-    const env = { NEAR_API_KEY: "" } as NodeJS.ProcessEnv;
+    const env = { NEAR_API_KEY: "" };
     await seedBootSecretsFromVault({ env, fetchVault: NO_VAULT, readKeychain: async () => "kc-key", log: SILENT });
     expect(env.NEAR_API_KEY).toBe("kc-key");
   });
@@ -100,7 +102,7 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
   });
 
   test("an empty vault api_key row is treated as absent", async () => {
-    const env = { NEAR_API_KEY: "env-key" } as NodeJS.ProcessEnv;
+    const env = { NEAR_API_KEY: "env-key" };
     const vault = new Map([["near", ""]]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
     expect(env.NEAR_API_KEY).toBe("env-key");
@@ -110,7 +112,15 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
 describe("boot secret identity table (issue #201)", () => {
   test("every vault provider id maps back to its secret", () => {
     const providers = BOOT_SECRETS.map((s) => s.vaultProvider);
-    expect(providers).toEqual(["slack-app", "slack-bot", "opencode", "near", "openai", "anthropic"]);
+    expect(providers).toEqual([
+      "slack-app",
+      "slack-bot",
+      "opencode",
+      "near",
+      "openai",
+      "anthropic",
+      "github-webhook",
+    ]);
     for (const provider of providers) {
       expect(bootSecretForProvider(provider)?.vaultProvider).toBe(provider);
     }
@@ -137,7 +147,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
   }
 
   /** Fake broker: serves every boot secret as an api_key vault row. */
-  function fakeBroker(): { url: string; stop: () => void } {
+  function fakeBroker() {
     const server = Bun.serve({
       port: 0,
       fetch: async (req) => {
@@ -150,6 +160,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
             { id: 4, provider: "near", credential: { type: "api_key", key: "near-vault-key" }, identityKey: null, rotatesInMs: null },
             { id: 5, provider: "openai", credential: { type: "api_key", key: "sk-openai-vault" }, identityKey: null, rotatesInMs: null },
             { id: 6, provider: "anthropic", credential: { type: "api_key", key: "sk-anthropic-vault" }, identityKey: null, rotatesInMs: null },
+            { id: 7, provider: "github-webhook", credential: { type: "api_key", key: "gh-webhook-vault" }, identityKey: null, rotatesInMs: null },
           ]),
           { headers: { "content-type": "application/json" } },
         );
@@ -176,6 +187,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
       near: process.env.NEAR_API_KEY,
       openai: process.env.OPENAI_API_KEY,
       anthropic: process.env.ANTHROPIC_API_KEY,
+      githubWebhook: process.env.GITHUB_WEBHOOK_SECRET,
       brokerUrl: process.env.OMP_AUTH_BROKER_URL,
       brokerToken: process.env.OMP_AUTH_BROKER_TOKEN,
       snapshotTtl: process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS,
@@ -195,6 +207,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
     delete process.env.NEAR_API_KEY;
     delete process.env.OPENAI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.GITHUB_WEBHOOK_SECRET;
     delete process.env.BOTTEGA_CONFIG_DIR;
     delete process.env.BOTTEGA_DB_PATH;
     return {
@@ -213,6 +226,8 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
         else process.env.OPENAI_API_KEY = saved.openai;
         if (saved.anthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = saved.anthropic;
+        if (saved.githubWebhook === undefined) delete process.env.GITHUB_WEBHOOK_SECRET;
+        else process.env.GITHUB_WEBHOOK_SECRET = saved.githubWebhook;
         if (saved.brokerUrl === undefined) delete process.env.OMP_AUTH_BROKER_URL;
         else process.env.OMP_AUTH_BROKER_URL = saved.brokerUrl;
         if (saved.brokerToken === undefined) delete process.env.OMP_AUTH_BROKER_TOKEN;
@@ -259,6 +274,7 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
         expect(process.env.NEAR_API_KEY).toBe("near-vault-key");
         expect(process.env.OPENAI_API_KEY).toBe("sk-openai-vault");
         expect(process.env.ANTHROPIC_API_KEY).toBe("sk-anthropic-vault");
+        expect(process.env.GITHUB_WEBHOOK_SECRET).toBe("gh-webhook-vault");
       } finally {
         await server.stop();
       }

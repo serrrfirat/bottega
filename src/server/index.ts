@@ -7,7 +7,7 @@ import { sessionSearchToolDefinitions } from "../memory/session-search";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
-import { seedBootSecretsFromVault } from "./boot-secrets";
+import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
@@ -23,6 +23,7 @@ import { standupDigestAction } from "../scheduler/standup";
 import { reflectionAction } from "../scheduler/reflection";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -227,6 +228,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     reflectionAction,
     orgPulseAction,
     recurringWorkAction,
+    // Ingest polling leg (issue #57): scheduled with a durable
+    // "ingest_poll" job (create_scheduler_job, params.space = target).
+    createIngestPollAction(),
   ]);
   const kbDeps: KbToolDependencies = {
     memoryProvider,
@@ -369,7 +373,39 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // URL's redirect_uri at this endpoint's PUBLIC base
   // (BOTTEGA_OAUTH_CALLBACK_BASE_URL in deployment, else the loopback
   // URL). Started at boot (Bun.serve binds on creation), stopped in stop().
-  const oauthCallback = startOAuthCallbackServer({ store, audit });
+  const ingestWebhooks =
+    onboardingSpaceId !== undefined
+      ? {
+          store,
+          audit,
+          postMessage: (spaceId: string, text: string) => adapter.postMessage(spaceId, text),
+          spaceId: onboardingSpaceId,
+          // The webhook shared secret comes from the vault-backed boot
+          // secret (issue #201 + #57): the `github-webhook` row seeds
+          // GITHUB_WEBHOOK_SECRET at boot. An unprovisioned secret fails
+          // closed per delivery (401 + rejected audit), never a no-op.
+          secretFor: (provider: string) => {
+            const boot = bootSecretForProvider(provider);
+            return boot !== undefined ? process.env[boot.envName] : undefined;
+          },
+        }
+      : undefined;
+  if (ingestWebhooks === undefined) {
+    console.log(
+      "bottega boot: ingest webhook leg not mounted — no org channel (onboarding.space_id) configured",
+    );
+  }
+  const oauthCallback = startOAuthCallbackServer({
+    store,
+    audit,
+    // Issue #57: the ingest webhook route (/webhooks/<extension>) joins the
+    // OAuth callback's inbound HTTP surface — ONE public ingress serves both
+    // paths (ngrok in dev compose; nginx + TLS in production). The dispatch
+    // targets the org channel (onboarding.space_id, the org settings blob);
+    // WITHOUT a configured org channel the leg is NOT mounted — /webhooks/*
+    // 404s, fail closed: an undeliverable delivery is never accepted.
+    ...(ingestWebhooks !== undefined ? { webhooks: ingestWebhooks } : undefined),
+  });
   // The connect seam's generic MCP OAuth connector (issue #198): shared by
   // the space-service connect path and the per-session connect tool. The
   // callback base is the loopback URL by default (local dev — the browser

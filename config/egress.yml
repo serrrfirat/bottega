@@ -62,6 +62,7 @@ transforms:
         - "api.anthropic.com"
         - "raw.githubusercontent.com"
         - "files.slack.com"
+        - "api.github.com"
         - "mcp.attio.com"
         - "api.githubcopilot.com"
         - "mcp.linear.app"

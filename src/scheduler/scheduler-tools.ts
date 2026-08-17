@@ -12,7 +12,7 @@ import { parseCron } from "./cron";
 import type { SchedulerActionRegistry } from "./types";
 
 export const createSchedulerJobArgsSchema = z.object({
-  action: z.enum(["standup_digest", "reflection", "org_pulse", "recurring_work"]),
+  action: z.enum(["standup_digest", "reflection", "org_pulse", "recurring_work", "ingest_poll"]),
   cron: z.string(),
   params: z.record(z.string(), z.string()).optional(),
   space: z.string().optional(),
@@ -60,7 +60,7 @@ export function schedulerToolDefinitions(
             id: job.id,
             action: job.action,
             cron: job.cron,
-            ...(job.spaceId !== null ? { space_id: job.spaceId } : {}),
+            ...(job.spaceId !== null ? { space_id: job.spaceId } : undefined),
           },
         });
         return { content: [{ type: "text", text: JSON.stringify(job) }] };
