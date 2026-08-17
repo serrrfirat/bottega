@@ -85,3 +85,32 @@ jobs:
           [ "$status" -ne 0 ] || { echo "expected non-zero exit, got $status"; exit 1; }
           grep -q "git token file not found: data/secrets/github-pat" <<<"$output" \
             || { echo "expected fail-closed message, got: $output"; exit 1; }
+
+  # Real iron-proxy integration lane (issue #177, gap #2): runs the
+  # skip-gated Docker leg against the pinned image with
+  # BOTTEGA_RUN_INTEGRATION=1. NOT part of the default fast `ci` job (the
+  # leg skips there with evidence). Treats any printed SKIP as a failure: a
+  # silently-skipped security test is the worst outcome, so absence of
+  # Docker (or an unpullable image) fails this job instead of passing green.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Iron-proxy integration leg (skip = failure)
+        run: |
+          set +e
+          output="$(BOTTEGA_RUN_INTEGRATION=1 bun test src/egress/iron-proxy.test.ts 2>&1)"
+          status=$?
+          echo "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "iron-proxy integration leg failed (exit $status)" >&2
+            exit 1
+          fi
+          if grep -q "SKIP:" <<<"$output"; then
+            echo "iron-proxy integration leg skipped — treating as failure" >&2
+            exit 1
+          fi
