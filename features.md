@@ -81,11 +81,11 @@ billing.
   Codex CLI auth file, `~/.codex/auth.json` by default (`CODEX_AUTH_PATH`
   overrides the path). Create it by logging in with the Codex CLI
   (`codex login`). The server never reads the token into its env: the boot
-  credential sync (issue #214) copies `tokens.access_token` +
-  `tokens.refresh_token` into the proxy's mode-0600 boundary blob
-  (`data/proxy-secrets/openai-codex-oauth.json`, atomic write-temp +
-  rename) and iron-proxy mints/attaches the live bearer at egress — the
-  app process only ever sends the placeholder.
+  credential sync (issue #214 + #230) REFRESHES the grant itself and
+  writes the ACCESS token to the proxy's mode-0600 boundary file
+  (`data/proxy-secrets/openai-codex.secret`, atomic write-temp + rename)
+  — the app process only ever sends the placeholder, and the proxy never
+  mints anything for codex (the seed owns the refresh, issue #230).
 - **Model** — `gpt-5.6-luna` (the CHEAP ChatGPT-account model — $0.2 in /
   $1.2 out per M tokens vs gpt-5.4's $2.5/$15 — with the full gpt-5.x
   family, `gpt-5.4`/`gpt-5.5`/..., available alongside; the flat ids are
@@ -97,33 +97,38 @@ billing.
   `store: false` are required by the Codex backend and enforced by the
   native transport; `max_output_tokens` is rejected by the backend and
   never sent (the transport strips it). `input` is always a list.
-- **Refresh semantics** — the proxy's `oauth_token` transform holds the
-  refresh token + the Codex public OAuth client id
-  (`app_EMoamEEZ73f0CkXaXp7hrann`) and mints fresh access tokens at egress
-  via the Codex CLI's OAuth refresh endpoint
-  (`https://auth.openai.com/oauth/token`, verified from the openai/codex
-  OAuth flow; the exact grant acceptance for every account plan is
-  validated on the first real deployment). `require: true` — a missing or
-  unmintable credential 502s instead of forwarding unauthenticated.
+- **Refresh semantics (issue #230)** — the SEED owns the codex refresh:
+  at boot (and on the hourly re-refresh check) it decodes the access
+  token's JWT `exp` claim and, when the token is within 24h of expiry,
+  POSTs the refresh grant to the Codex CLI's OAuth refresh endpoint
+  (`https://auth.openai.com/oauth/token` with the Codex public OAuth
+  client id `app_EMoamEEZ73f0CkXaXp7hrann`, the shape verified 200
+  repeatedly from the live flow). The access token has a ~7-day lifetime;
+  the seed re-mints long before it dies, so a long-running deployment
+  (no restarts) never hits a dead token. The rotated refresh token is
+  written back to the Codex CLI auth file (the CLI session stays valid)
+  and the oauth blob. The PROXY never touches auth.openai.com — no
+  in-proxy rotation, no mid-session staleness (the #218 recurrence is
+  structurally gone).
 - **Egress** — `chatgpt.com` is allowlisted (the Codex responses host) and
-  the codex entry joins the `oauth_token` transform in the generated
-  `config/egress.yml` + `config/egress.dev.yml`.
-- **Fail closed** — when the auth file is missing or unparseable, the sync
-  DELETES the boundary blob, so the provider's requests 502 until the user
-  logs in with the Codex CLI. `dev.sh` does NOT export the codex token
-  into env: the seed reads the file directly at boot.
-- **Recovery (issue #218)** — when model calls fail with the proxy's mint
-  error (`oauth_token failed to mint an access token`) or turns come back
-  empty with a 403, the subscription login is stale: run `codex login`,
-  then restart the server (the seed re-verifies and the proxy reloads with
-  the fresh token). The boot sync now VERIFIES the refresh token mints
-  before seeding it — a dead token fails the boot loudly with that same
-  remedy instead of being written silently. The verification POSTs the
-  refresh grant to the token endpoint and writes the endpoint's ROTATED
-  refresh token back to both the boundary blob and the Codex CLI auth file
-  (the proxy's `oauth_token` transform rotates the token in memory only —
-  x/oauth2 semantics — so the write-back keeps the file copy live across
-  reloads/restarts).
+  the codex provider is a STATIC `secrets` injection entry reading
+  `data/proxy-secrets/openai-codex.secret` (the near/opencode pattern) in
+  the generated `config/egress.yml` + `config/egress.dev.yml` —
+  `require: true` (fail closed). There is NO `oauth_token` entry for
+  codex.
+- **Fail closed** — when the auth file is missing or unparseable, or a
+  refresh is rejected (a stale/revoked token), the sync DELETES
+  `openai-codex.secret` (and the oauth blob), so the provider's requests
+  502 until the user logs in with the Codex CLI. `dev.sh` does NOT export
+  the codex token into env: the seed reads the file directly at boot.
+- **Recovery (issue #218, remedy unchanged)** — when model calls fail with
+  the proxy's mint error (`oauth_token failed to mint an access token` —
+  the OAuth extensions' transform) or turns come back empty with a 403,
+  the subscription login is stale: run `codex login`, then restart the
+  server (the seed re-verifies and the proxy reloads with the fresh
+  token). The boot sync now REFRESHES the token itself before seeding — a
+  dead token fails the boot loudly with that same remedy instead of being
+  written silently.
 - **Catalog + pins** — `openai-codex/gpt-5.6-luna` resolves in the available
   catalog (listAvailableModels), so `model_settings`, `use_model`, and
   per-work-item pins can target it by name.

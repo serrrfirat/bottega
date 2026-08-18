@@ -9,6 +9,11 @@
  * writes mode-0600 boundary files atomically, clears provider env values,
  * and reloads the proxy. Missing credentials delete stale files so
  * `require: true` rejects the request.
+ *
+ * The codex provider (issue #214) is special (issue #230): the seed OWNS
+ * the codex refresh — it mints the access token itself and writes it to a
+ * STATIC secret file (openai-codex.secret) that the egress secrets
+ * transform injects; the proxy never touches auth.openai.com for codex.
  */
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -16,7 +21,7 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
-import { OAUTH_TOKEN_ENDPOINTS, oauthTokenBlobFileName } from "../egress/generate";
+import { oauthTokenBlobFileName } from "../egress/generate";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { fetchVaultApiKeysFromEnv, keychainReaderFromEnv, keychainServiceFor } from "../server/boot-secrets";
@@ -29,7 +34,10 @@ import type { JsonValue } from "./manifest";
  * (provider ids must match — the generated config reads exactly these
  * files). The env name is the same one models.yml historically referenced
  * (dev.sh's Keychain load) and the vault provider identity is the #201
- * row id.
+ * row id. The openai-codex gateway is NOT in this list: it is a
+ * FILESYSTEM credential (the Codex CLI auth file), seeded by the codex
+ * leg (issue #230) as the same `<provider>.secret` shape the egress
+ * static entry reads.
  */
 export interface ModelProxyKey {
   provider: string;
@@ -85,20 +93,33 @@ export function proxyOAuthBlobFileName(provider: string): string {
 }
 
 /**
- * The codex provider's filesystem credential (issue #214): the ChatGPT
- * subscription OAuth tokens come from the Codex CLI's auth file — the
- * default `~/.codex/auth.json`, overridable with `CODEX_AUTH_PATH` (the
- * same env var the canary resolution gates on). Only the ACCESS + REFRESH
- * tokens are read; the id_token and other fields never enter the app.
+ * The codex provider's filesystem credential (issue #214 + #230): the
+ * ChatGPT subscription OAuth tokens come from the Codex CLI's auth file —
+ * the default `~/.codex/auth.json`, overridable with `CODEX_AUTH_PATH`
+ * (the same env var the canary resolution gates on). Only the ACCESS +
+ * REFRESH tokens are read; the id_token and other fields never enter the
+ * app. The seed REFRESHES the grant itself and writes the ACCESS token to
+ * the proxy's static openai-codex.secret — the proxy never mints for
+ * codex (issue #230).
  */
 export const CODEX_AUTH_FILE_ENV = "CODEX_AUTH_PATH";
 export const CODEX_AUTH_FILE_DEFAULT = "~/.codex/auth.json";
 /**
  * The Codex public OAuth client id (the openai/codex CLI's login client —
  * verified from the OAuth flow; the refresh grant at
- * https://auth.openai.com/oauth/token uses it, see OAUTH_TOKEN_ENDPOINTS).
+ * {@link CODEX_TOKEN_ENDPOINT} uses it).
  */
 export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/**
+ * The Codex OAuth refresh endpoint (issue #230): the seed owns the codex
+ * refresh — POST grant_type=refresh_token with the Codex public client id
+ * (the grant shape verified 200 repeatedly from the live proxy; the same
+ * endpoint the CLI's CODEX_REFRESH_TOKEN_URL_OVERRIDE targets). The egress
+ * proxy no longer touches auth.openai.com: this endpoint is called ONLY by
+ * the seed's refresh path.
+ */
+export const CODEX_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 
 /** The Codex CLI auth file's token shape: { tokens: { access_token, refresh_token } }. */
 export interface CodexAuthTokens {
@@ -121,14 +142,19 @@ export function codexAuthFilePathFromEnv(env: NodeJS.ProcessEnv = process.env): 
 }
 
 /**
- * The iron-proxy `oauth_token` transform's mint-failure marker (issue
- * #218), verified from the iron-proxy v0.49.0 source + binary: when the
- * refresh grant cannot mint, the transform 502s the request with
+ * The historical iron-proxy `oauth_token` transform mint-failure marker
+ * (issue #218, verified from the iron-proxy v0.49.0 source + binary):
+ * when a refresh grant cannot mint, the transform 502s the request with
  * `{"error":"oauth_token failed to mint an access token","grant":"..."}`
  * (`require: true` — fail closed, never an unauthenticated upstream call).
- * The model SDK's error message carries that body text; the driver
- * surfaces it in the session error, so this string is the turn-side
- * fingerprint of a dead/rotated Codex refresh token.
+ * Under issue #230 the codex provider is a STATIC secrets entry (the
+ * seed owns the refresh), but the OAuth extensions still mint through the
+ * transform and the 403-no-body family (a standalone `403` in the message
+ * — the upstream rejecting with no body, e.g. an account-plan denial)
+ * remains the codex turn-side fingerprint; the model SDK's error message
+ * carries the body text and the driver surfaces it in the session error,
+ * so this string is the turn-side fingerprint of a dead/denied Codex
+ * credential.
  */
 export const CODEX_MINT_FAILURE_MARKER = "oauth_token failed to mint";
 
@@ -158,15 +184,24 @@ export function codexMintFailureText(message: string | undefined): string | null
 }
 
 /**
- * One Codex refresh-grant probe outcome (issue #218): the token endpoint's
- * verdict on the seeded refresh token, plus the refresh token to persist —
- * the endpoint's rotation when it returned one, else the probed token.
+ * One Codex refresh-grant probe outcome (issue #218 + #230): the token
+ * endpoint's verdict on the seeded refresh token, the freshly minted
+ * ACCESS token (the seed's static secret), and the refresh token to
+ * persist — the endpoint's rotation when it returned one, else the probed
+ * token.
  */
 export interface CodexMintOutcome {
   /** True when the token endpoint accepted the refresh grant (HTTP 2xx). */
   minted: boolean;
   /** The endpoint's HTTP status on a rejected grant; undefined on transport errors. */
   status?: number;
+  /**
+   * The freshly minted access token (RFC 6749 §5.1 `access_token`), when
+   * the endpoint returned one — the value the seed writes to
+   * openai-codex.secret. Undefined when no refresh happened or the
+   * endpoint omitted it; the seed then keeps the auth file's access token.
+   */
+  accessToken?: string;
   /** The refresh token to persist: the endpoint's rotated token or the probed one. */
   refreshToken: string;
 }
@@ -182,18 +217,23 @@ export interface CodexMintProbeInput {
 export type CodexMintProbe = (input: CodexMintProbeInput) => Promise<CodexMintOutcome>;
 
 /**
- * The default Codex mint probe (issue #218): POSTs the refresh grant to
- * the Codex token endpoint with the Codex public client id and reports the
- * verdict. A 2xx response's `refresh_token` (rotation) is returned for
- * write-back. Under the test runner this is a no-op success — hermetic
- * tests never touch the network (the #191 isolation rule); the probe's own
- * tests inject the seam.
+ * The default Codex mint probe (issue #218 + #230): POSTs the refresh
+ * grant to the Codex token endpoint with the Codex public client id and
+ * reports the verdict. A 2xx response's `access_token` (the seed's static
+ * secret) and `refresh_token` (rotation, written back) are returned. Under
+ * the test runner this is a no-op success — hermetic tests never touch the
+ * network (the #191 isolation rule); the probe's own tests inject the
+ * seam.
  */
 /**
- * The Codex token endpoint's 2xx response (RFC 6749 §5.1): `refresh_token`
- * is present only when the endpoint rotates it, and is a non-empty string.
+ * The Codex token endpoint's 2xx response (RFC 6749 §5.1): `access_token`
+ * is the minted bearer; `refresh_token` is present only when the endpoint
+ * rotates it, and is a non-empty string.
  */
-const codexTokenResponseSchema = z.object({ refresh_token: z.string().min(1).optional() });
+const codexTokenResponseSchema = z.object({
+  access_token: z.string().min(1).optional(),
+  refresh_token: z.string().min(1).optional(),
+});
 
 async function probeCodexMint(input: CodexMintProbeInput): Promise<CodexMintOutcome> {
   if (process.env.NODE_ENV === "test") return { minted: true, refreshToken: input.refreshToken };
@@ -212,16 +252,20 @@ async function probeCodexMint(input: CodexMintProbeInput): Promise<CodexMintOutc
     return { minted: false, refreshToken: input.refreshToken };
   }
   if (!res.ok) return { minted: false, status: res.status, refreshToken: input.refreshToken };
+  let accessToken: string | undefined;
   let rotated = input.refreshToken;
   try {
     const parsed = codexTokenResponseSchema.safeParse(await res.json());
-    if (parsed.success && parsed.data.refresh_token !== undefined) {
-      rotated = parsed.data.refresh_token;
+    if (parsed.success) {
+      accessToken = parsed.data.access_token;
+      if (parsed.data.refresh_token !== undefined) {
+        rotated = parsed.data.refresh_token;
+      }
     }
   } catch {
-    // A 2xx with a non-JSON body still minted; keep the probed token.
+    // A 2xx with a non-JSON body still minted; keep the probed tokens.
   }
-  return { minted: true, refreshToken: rotated };
+  return { minted: true, accessToken, refreshToken: rotated };
 }
 
 /**
@@ -301,6 +345,193 @@ export function readCodexAuthTokens(authFilePath: string): CodexAuthTokens | nul
   }
 }
 
+/**
+ * The re-refresh window (issue #230): the seed refreshes the access token
+ * when its JWT `exp` is within this horizon of the current time — the
+ * access token's ~7-day lifetime means a check cadence far below the
+ * window always re-mints long before the token dies.
+ */
+export const CODEX_REFRESH_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+/**
+ * The periodic re-refresh cadence (issue #230): the armed hourly check
+ * decodes the access token's `exp` and refreshes when it enters the
+ * {@link CODEX_REFRESH_WINDOW_MS} window — well under the ~7-day lifetime,
+ * so a long-running deployment (no restarts) still re-refreshes long
+ * before the token dies.
+ */
+const CODEX_REFRESH_CHECK_INTERVAL_MS = 60 * 60 * 1_000;
+
+/**
+ * Decodes a JWT's `exp` claim (seconds since epoch) from the middle
+ * (payload) segment, base64url, WITHOUT verifying the signature — the
+ * seed only needs the expiry to schedule the re-refresh, never to trust
+ * the token (the refresh grant verifies the credential). Returns null for
+ * anything that is not a three-segment JWT with a numeric `exp` — the
+ * caller treats an undecodable expiry as "cannot verify freshness" and
+ * refreshes (fail-safe).
+ */
+export function decodeCodexJwtExp(accessToken: string): number | null {
+  const segments = accessToken.split(".");
+  if (segments.length !== 3) return null;
+  let payload: string;
+  try {
+    payload = Buffer.from(segments[1], "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(payload) as { exp?: unknown };
+    if (typeof parsed.exp !== "number" || !Number.isFinite(parsed.exp)) return null;
+    return parsed.exp;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The codex static credential sync (issue #230): the seed OWNS the codex
+ * refresh. Reads the Codex CLI auth file, refreshes the grant when the
+ * access token is within {@link CODEX_REFRESH_WINDOW_MS} of its JWT exp
+ * (or the exp is undecodable — freshness cannot be verified), and writes:
+ *   (a) the ACCESS token to `openai-codex.secret` (the egress static
+ *       secrets injection entry, mode 0600, atomic) — the proxy never
+ *       mints or rotates anything for codex,
+ *   (b) the (possibly rotated) refresh token back to the oauth blob AND
+ *       the CLI auth file, so the CLI session stays valid and a later
+ *       boot re-reads a LIVE refresh token (the #218 write-back).
+ * Fail closed unchanged: a missing/unparseable auth file or a REJECTED
+ * refresh grant deletes BOTH boundary files — `require: true` 502s the
+ * codex provider until the user logs in with the Codex CLI. A transport
+ * error / 5xx / 429 is transient, not dead: warn and write the existing
+ * access token (the runtime failure still surfaces the remedy).
+ *
+ * `throwOnRejected` distinguishes the boot path (a dead token FAILS the
+ * boot loudly with the remedy — issue #218) from the background re-refresh
+ * path (a dead token deletes the files and logs; a timer must never throw
+ * the process).
+ */
+async function syncCodexCredential(opts: {
+  env: NodeJS.ProcessEnv;
+  secretsDir: string;
+  mintCodexRefreshToken?: CodexMintProbe;
+  log: (line: string) => void;
+  throwOnRejected: boolean;
+}): Promise<void> {
+  const { env, secretsDir, log } = opts;
+  const codexSecretFileName = proxyKeyFileName("openai-codex");
+  const codexBlobFileName = proxyOAuthBlobFileName("openai-codex");
+  const removeBoundaryFiles = (): void => {
+    deleteSecretFile(secretsDir, codexSecretFileName);
+    deleteSecretFile(secretsDir, codexBlobFileName);
+  };
+  const codexAuthPath = codexAuthFilePathFromEnv(env);
+  if (codexAuthPath === null) {
+    removeBoundaryFiles();
+    log(
+      `bottega boot: proxy ${codexSecretFileName} + ${codexBlobFileName} REMOVED — no Codex auth file ` +
+        `(set ${CODEX_AUTH_FILE_ENV} or log in with the Codex CLI to create ~/.codex/auth.json; fail closed)`,
+    );
+    return;
+  }
+  const codexTokens = readCodexAuthTokens(codexAuthPath);
+  if (codexTokens === null) {
+    removeBoundaryFiles();
+    log(
+      `bottega boot: proxy ${codexSecretFileName} + ${codexBlobFileName} REMOVED — Codex auth file unreadable ` +
+        `(set ${CODEX_AUTH_FILE_ENV} or log in with the Codex CLI to create ~/.codex/auth.json; fail closed)`,
+    );
+    return;
+  }
+  const exp = decodeCodexJwtExp(codexTokens.accessToken);
+  const needsRefresh = exp === null || exp * 1_000 <= Date.now() + CODEX_REFRESH_WINDOW_MS;
+  const writeBoundaryFiles = (accessToken: string, refreshToken: string): void => {
+    writeSecretFile(secretsDir, codexSecretFileName, accessToken);
+    writeSecretFile(
+      secretsDir,
+      codexBlobFileName,
+      JSON.stringify({ access_token: accessToken, refresh_token: refreshToken, client_id: CODEX_OAUTH_CLIENT_ID }),
+    );
+  };
+  if (!needsRefresh) {
+    // Fresh access token (exp comfortably ahead): write it statically — no
+    // refresh round-trip, the proxy injects it at egress as-is.
+    writeBoundaryFiles(codexTokens.accessToken, codexTokens.refreshToken);
+    log(
+      `bottega boot: proxy ${codexSecretFileName} seeded (Codex access token valid until ${new Date(exp * 1_000).toISOString()} — no refresh needed)`,
+    );
+    return;
+  }
+  const mintProbe = opts.mintCodexRefreshToken ?? probeCodexMint;
+  const probe = await mintProbe({
+    refreshToken: codexTokens.refreshToken,
+    clientId: CODEX_OAUTH_CLIENT_ID,
+    tokenEndpoint: CODEX_TOKEN_ENDPOINT,
+  });
+  if (!probe.minted && probe.status !== undefined && probe.status >= 400 && probe.status < 500 && probe.status !== 429) {
+    removeBoundaryFiles();
+    const err = new Error(
+      `bottega boot: Codex refresh token REJECTED (HTTP ${probe.status}) — ${CODEX_MINT_REMEDY} ` +
+        `(issue #230: the seed's refresh grant failed; the token is stale or was revoked)`,
+    );
+    if (opts.throwOnRejected) throw err;
+    log(err.message);
+    return;
+  }
+  if (!probe.minted) {
+    log(
+      `bottega boot: proxy ${codexSecretFileName} Codex refresh could not be verified ` +
+        `(${probe.status === undefined ? "token endpoint unreachable" : `HTTP ${probe.status}`}) — writing the existing access token unverified; ` +
+        "any egress failure surfaces the remedy in the turn",
+    );
+    writeBoundaryFiles(codexTokens.accessToken, codexTokens.refreshToken);
+    return;
+  }
+  const accessToken = probe.accessToken !== undefined && probe.accessToken !== "" ? probe.accessToken : codexTokens.accessToken;
+  writeBoundaryFiles(accessToken, probe.refreshToken);
+  if (probe.refreshToken !== codexTokens.refreshToken) {
+    // Rotation write-back (issue #218, kept in #230): persist the
+    // endpoint's rotated refresh token to the CLI auth file so a later
+    // boot re-reads a LIVE token instead of the rotated-away one.
+    writeCodexAuthTokens(codexAuthPath, probe.refreshToken);
+    log(
+      `bottega boot: proxy ${codexSecretFileName} seeded (Codex access token refreshed; refresh token rotated — ` +
+        `wrote back to ${codexAuthPath})`,
+    );
+  } else {
+    log(`bottega boot: proxy ${codexSecretFileName} seeded (Codex access token refreshed; refresh grant verified)`);
+  }
+}
+
+/**
+ * The periodic codex re-refresh timer (issue #230): armed once per process
+ * after a REAL boot seed (never under the test runner — hermetic isolation
+ * rule) and unref'd so it never keeps the process alive. Every hour it
+ * re-runs the codex credential sync, which refreshes when the access
+ * token enters the final 24h of its JWT exp — a long-running deployment
+ * re-refreshes long before the ~7-day access token dies, with the rotated
+ * refresh token persisted to the blob + CLI auth file. The background
+ * path never throws: a rejected grant deletes the boundary files (fail
+ * closed — turns 502 with the remedy) and logs.
+ */
+let codexReRefreshArmed = false;
+
+function armCodexReRefresh(opts: {
+  env: NodeJS.ProcessEnv;
+  secretsDir: string;
+  mintCodexRefreshToken?: CodexMintProbe;
+  log: (line: string) => void;
+}): void {
+  if (codexReRefreshArmed || process.env.NODE_ENV === "test") return;
+  codexReRefreshArmed = true;
+  const timer = setInterval(() => {
+    void syncCodexCredential({ ...opts, throwOnRejected: false }).catch((err) => {
+      opts.log(`bottega boot: Codex re-refresh check failed: ${errorMessage(err)}`);
+    });
+  }, CODEX_REFRESH_CHECK_INTERVAL_MS);
+  timer.unref?.();
+}
+
 export interface ProxyCredentialSyncOpts {
   /** The env to read; defaults to process.env. */
   env?: NodeJS.ProcessEnv;
@@ -328,11 +559,12 @@ export interface ProxyCredentialSyncOpts {
    */
   readOAuthRows?: (provider: string) => Promise<Array<{ refresh?: string }>>;
   /**
-   * Codex mint-probe seam (issue #218): verifies the refresh token mints
-   * BEFORE the blob is written — a dead token fails the boot loudly with
-   * the remedy instead of being seeded silently. Default: a real
-   * refresh-grant POST to the Codex token endpoint (a no-op success under
-   * the test runner — the #191 isolation rule). Tests stub it.
+   * Codex refresh-grant seam (issue #218 + #230): performs the seed's
+   * refresh — a dead token fails the boot loudly with the remedy instead
+   * of being seeded silently, and a minted access token becomes the
+   * static secret. Default: a real refresh-grant POST to the Codex token
+   * endpoint (a no-op success under the test runner — the #191 isolation
+   * rule). Tests stub it.
    */
   mintCodexRefreshToken?: CodexMintProbe;
   /** Proxy management API base + bearer (the reload half); default from env. */
@@ -462,82 +694,30 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
     log(`bottega boot: proxy ${fileName} seeded (${credential.provider} OAuth refresh token)`);
   }
 
-  // 2.5. Codex subscription blob (issue #214): the ChatGPT subscription
-  // OAuth tokens come from the Codex CLI auth file (CODEX_AUTH_PATH, default
-  // ~/.codex/auth.json) — a FILESYSTEM credential, never env/Keychain/vault.
-  // The tokens (access + refresh) land in the proxy's openai-codex-oauth.json
-  // boundary blob (the egress oauth_token transform mints the live bearer
-  // at egress); nothing enters the app env. A missing/unparseable auth
-  // file DELETES the blob (fail closed — require: true 502s the codex
-  // provider until the user logs in with the Codex CLI).
-  {
-    const codexFileName = proxyOAuthBlobFileName("openai-codex");
-    const codexAuthPath = codexAuthFilePathFromEnv(env);
-    if (codexAuthPath === null) {
-      deleteSecretFile(secretsDir, codexFileName);
-      log(
-        `bottega boot: proxy ${codexFileName} REMOVED — no Codex auth file ` +
-          `(set ${CODEX_AUTH_FILE_ENV} or log in with the Codex CLI to create ~/.codex/auth.json; fail closed)`,
-      );
-    } else {
-      const codexTokens = readCodexAuthTokens(codexAuthPath);
-      if (codexTokens === null) {
-        deleteSecretFile(secretsDir, codexFileName);
-        log(
-          `bottega boot: proxy ${codexFileName} REMOVED — Codex auth file unreadable ` +
-            `(set ${CODEX_AUTH_FILE_ENV} or log in with the Codex CLI to create ~/.codex/auth.json; fail closed)`,
-        );
-      } else {
-        // Issue #218: verify the refresh token mints BEFORE seeding it. A
-        // dead token (the endpoint rejects the grant) must fail the boot
-        // loudly with the remedy — never a silent write of a credential
-        // that 502s every turn. Transport errors / 5xx / 429 are transient
-        // or unverifiable, not dead: warn and write (the runtime mint
-        // failure still surfaces the same remedy loudly in the turn).
-        const mintProbe = opts.mintCodexRefreshToken ?? probeCodexMint;
-        const probe = await mintProbe({
-          refreshToken: codexTokens.refreshToken,
-          clientId: CODEX_OAUTH_CLIENT_ID,
-          tokenEndpoint: OAUTH_TOKEN_ENDPOINTS.codex,
-        });
-        if (!probe.minted && probe.status !== undefined && probe.status >= 400 && probe.status < 500 && probe.status !== 429) {
-          deleteSecretFile(secretsDir, codexFileName);
-          throw new Error(
-            `bottega boot: Codex refresh token REJECTED (HTTP ${probe.status}) — ${CODEX_MINT_REMEDY} ` +
-              `(issue #218: the refresh grant failed; the token is stale or was rotated by the proxy's oauth_token transform without a write-back)`,
-          );
-        }
-        if (!probe.minted) {
-          log(
-            `bottega boot: proxy ${codexFileName} Codex mint probe could not verify the refresh token ` +
-              `(${probe.status === undefined ? "token endpoint unreachable" : `HTTP ${probe.status}`}) — writing the blob unverified; ` +
-              "any egress mint failure surfaces the remedy in the turn",
-          );
-        }
-        const blob = {
-          access_token: codexTokens.accessToken,
-          refresh_token: probe.refreshToken,
-          client_id: CODEX_OAUTH_CLIENT_ID,
-        };
-        writeSecretFile(secretsDir, codexFileName, JSON.stringify(blob));
-        if (probe.refreshToken !== codexTokens.refreshToken) {
-          // Rotation write-back (issue #218): the endpoint rotated the
-          // refresh token. The proxy's oauth_token transform rotates in
-          // memory only (x/oauth2, verified from the iron-proxy v0.49.0
-          // source) — persist the minted token to the CLI's auth file too,
-          // so a reload/restart re-reads a LIVE token instead of the
-          // rotated-away one.
-          writeCodexAuthTokens(codexAuthPath, probe.refreshToken);
-          log(
-            `bottega boot: proxy ${codexFileName} seeded (Codex OAuth tokens; refresh token rotated by the mint probe — ` +
-              `wrote back to ${codexAuthPath})`,
-          );
-        } else {
-          log(`bottega boot: proxy ${codexFileName} seeded (Codex subscription OAuth tokens; refresh grant verified)`);
-        }
-      }
-    }
-  }
+  // 2.5. Codex static credential (issue #214 + #230): the ChatGPT
+  // subscription OAuth tokens come from the Codex CLI auth file
+  // (CODEX_AUTH_PATH, default ~/.codex/auth.json) — a FILESYSTEM
+  // credential, never env/Keychain/vault. The SEED owns the codex refresh
+  // (issue #230): it refreshes the grant when the access token is within
+  // 24h of its JWT exp, writes the ACCESS token to openai-codex.secret
+  // (the egress static secrets injection entry — the proxy never touches
+  // auth.openai.com), and writes the rotated refresh token back to the
+  // oauth blob + the CLI auth file. A missing/unparseable auth file or a
+  // REJECTED grant deletes BOTH boundary files (fail closed — require:
+  // true 502s the codex provider until the user logs in with the Codex
+  // CLI). The boot path throws on a dead token (loud remedy); the
+  // background re-refresh path deletes + logs.
+  await syncCodexCredential({
+    env,
+    secretsDir,
+    mintCodexRefreshToken: opts.mintCodexRefreshToken,
+    log,
+    throwOnRejected: true,
+  });
+  // Issue #230: the periodic re-refresh timer — a long-running deployment
+  // re-refreshes long before the ~7-day access token dies, without a
+  // restart. Armed once per process after a real (non-test) seed.
+  armCodexReRefresh({ env, secretsDir, mintCodexRefreshToken: opts.mintCodexRefreshToken, log });
 
   // 3. Reload: a running proxy re-reads the file sources (ttl + reload).
   //    Configured control → the reload is REQUIRED (throw on failure);

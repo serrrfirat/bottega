@@ -116,16 +116,19 @@ describe("egress config generation", () => {
 
   test("rendering without extensions still emits the model-gateway secrets entries (base config is unchanged)", () => {
     // Issue #208: the model-gateway static-key entries are base config —
-    // only the extension entries are optional. The codex oauth_token entry
-    // (issue #214) is base config too: the model-provider OAuth transform
-    // is emitted even with no extension entries.
+    // only the extension entries are optional. The codex provider (issue
+    // #214) is one of those static entries now (issue #230: the seed owns
+    // the refresh and writes the access token to openai-codex.secret) —
+    // the oauth_token transform is emitted ONLY when an extension
+    // snapshot carries an oauth credential.
     const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS);
     expect(yaml).toContain("- name: secrets");
     expect(yaml).toContain('path: "/data/proxy-secrets/near.secret"');
-    expect(yaml).toContain("- name: oauth_token");
-    expect(yaml).toContain('path: "/data/proxy-secrets/openai-codex-oauth.json"');
-    expect(yaml).toContain('token_endpoint: "https://auth.openai.com/oauth/token"');
-    expect(secretsEntries(yaml)?.length).toBe(4); // near/opencode/openai/anthropic
+    expect(yaml).toContain('path: "/data/proxy-secrets/openai-codex.secret"');
+    expect(yaml).not.toContain("- name: oauth_token");
+    expect(yaml).not.toContain("openai-codex-oauth.json");
+    expect(yaml).not.toContain("https://auth.openai.com/oauth/token");
+    expect(secretsEntries(yaml)?.length).toBe(5); // near/opencode/openai/anthropic/openai-codex
   });
 
   test("rendered config enables the management API for boundary reloads (issue #123)", () => {
@@ -140,8 +143,8 @@ describe("egress config generation", () => {
       { extensionId: FIXTURE_EXTENSION_ID, domains: [FIXTURE_EXTENSION_DOMAIN, "api.example.com"] },
     ]);
     const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
-    // 4 model-gateway keys (issue #208) + the fixture extension.
-    expect(entries).toHaveLength(5);
+    // 5 model-gateway keys (issue #208 + #230, incl. openai-codex) + the fixture extension.
+    expect(entries).toHaveLength(6);
     // SAFETY: every rendered secrets entry's `source` is a block mapping
     // carrying a `path` scalar (renderSecretsTransform emits it).
     const fixture = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(FIXTURE_EXTENSION_ID));
@@ -153,7 +156,7 @@ describe("egress config generation", () => {
     const rules = fixture!["rules"] as Record<string, YamlNode>[];
     expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
     // The gateway entries are REQUIRED (fail closed — issue #208).
-    for (const provider of ["near", "opencode", "openai", "anthropic"]) {
+    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex"]) {
       // SAFETY: each gateway entry's `source` is a block mapping with a `path` scalar.
       const entry = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(`${provider}.secret`));
       expect(entry, `${provider} gateway entry`).toBeDefined();
@@ -307,7 +310,7 @@ describe("dev-permissive egress config (issue #126)", () => {
   test("rendering the dev config without extensions still allow-alls, keeps management + the gateway entries", () => {
     const yaml = renderDevEgressConfig();
     expect(allowlistDomains(yaml)).toEqual(["*"]);
-    expect(secretsEntries(yaml)?.length).toBe(4); // the model-gateway keys (issue #208)
+    expect(secretsEntries(yaml)?.length).toBe(5); // the model-gateway keys (issue #208 + #230)
     expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
     expect(yaml).not.toContain("- name: judge");
   });

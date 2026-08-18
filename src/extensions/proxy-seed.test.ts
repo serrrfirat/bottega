@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   CODEX_AUTH_FILE_ENV,
   CODEX_OAUTH_CLIENT_ID,
+  decodeCodexJwtExp,
   MODEL_PROXY_KEYS,
   proxyKeyFileName,
   proxyOAuthBlobFileName,
@@ -37,6 +38,21 @@ function codexAuthFile(auth: JsonValue) {
   const path = join(dir, "auth.json");
   writeFileSync(path, JSON.stringify(auth));
   return { dir, path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+/**
+ * A JWT-shaped access token fixture whose payload carries the given `exp`
+ * (seconds since epoch) — the seed's re-refresh trigger decodes exactly
+ * this claim (issue #230). The header/signature segments are opaque.
+ */
+function jwtAccessToken(expSeconds: number): string {
+  const payload = Buffer.from(JSON.stringify({ exp: expSeconds })).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
+/** Seconds since epoch `hours` from now. */
+function expInHours(hours: number): number {
+  return Math.floor(Date.now() / 1_000) + hours * 60 * 60;
 }
 
 describe("model gateway keys (issue #208)", () => {
@@ -227,8 +243,8 @@ describe("OAuth blobs (issue #208)", () => {
   });
 });
 
-describe("codex subscription blob (issue #214)", () => {
-  test("a Codex CLI auth file seeds the codex-oauth.json blob (mode 0600, access + refresh + client id)", async () => {
+describe("codex static credential (issue #214 + #230)", () => {
+  test("a Codex CLI auth file seeds the static openai-codex.secret AND the codex-oauth.json blob (mode 0600, access + refresh + client id)", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
       tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1", id_token: "never-read" },
@@ -243,6 +259,12 @@ describe("codex subscription blob (issue #214)", () => {
         readOAuthRows: NO_ROWS,
         log: SILENT,
       });
+      // The egress static entry reads openai-codex.secret (issue #230): the
+      // access token, mode 0600, atomic.
+      const secretPath = join(s.dir, proxyKeyFileName("openai-codex"));
+      expect(readFileSync(secretPath, "utf8")).toBe("codex-access-1");
+      expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+      // The rotation-persistence blob keeps the same shape as before.
       const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
       const blob = JSON.parse(readFileSync(blobPath, "utf8"));
       expect(blob).toEqual({
@@ -260,11 +282,13 @@ describe("codex subscription blob (issue #214)", () => {
     }
   });
 
-  test("a missing auth file DELETES the blob (fail closed — require: true 502s)", async () => {
+  test("a missing auth file DELETES the secret + blob (fail closed — require: true 502s)", async () => {
     const s = tempSecretsDir();
     try {
-      const stale = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
-      writeFileSync(stale, "{}", { mode: 0o600 });
+      const staleBlob = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      const staleSecret = join(s.dir, proxyKeyFileName("openai-codex"));
+      writeFileSync(staleBlob, "{}", { mode: 0o600 });
+      writeFileSync(staleSecret, "stale", { mode: 0o600 });
       await syncProxyCredentialsFromEnv({
         env: { [CODEX_AUTH_FILE_ENV]: join(s.dir, "does-not-exist.json") },
         secretsDir: s.dir,
@@ -273,15 +297,17 @@ describe("codex subscription blob (issue #214)", () => {
         readOAuthRows: NO_ROWS,
         log: SILENT,
       });
-      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(staleBlob)).toBe(false);
+      expect(existsSync(staleSecret)).toBe(false);
     } finally {
       s.cleanup();
     }
   });
 
-  test("an unparseable auth file or missing tokens DELETES the blob (fail closed)", async () => {
+  test("an unparseable auth file or missing tokens DELETES the secret + blob (fail closed)", async () => {
     const s = tempSecretsDir();
     const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+    const secretPath = join(s.dir, proxyKeyFileName("openai-codex"));
     try {
       // Invalid JSON.
       const bad = codexAuthFile("not json at all");
@@ -294,10 +320,12 @@ describe("codex subscription blob (issue #214)", () => {
         log: SILENT,
       });
       expect(existsSync(blobPath)).toBe(false);
+      expect(existsSync(secretPath)).toBe(false);
       bad.cleanup();
       // Valid JSON, no tokens.access_token.
       const noAccess = codexAuthFile({ tokens: { refresh_token: "codex-refresh-1" } });
       writeFileSync(blobPath, "{}", { mode: 0o600 });
+      writeFileSync(secretPath, "stale", { mode: 0o600 });
       await syncProxyCredentialsFromEnv({
         env: { [CODEX_AUTH_FILE_ENV]: noAccess.path },
         secretsDir: s.dir,
@@ -307,6 +335,7 @@ describe("codex subscription blob (issue #214)", () => {
         log: SILENT,
       });
       expect(existsSync(blobPath)).toBe(false);
+      expect(existsSync(secretPath)).toBe(false);
       noAccess.cleanup();
     } finally {
       s.cleanup();
@@ -316,11 +345,13 @@ describe("codex subscription blob (issue #214)", () => {
   test("under the test runner, an UNSET CODEX_AUTH_PATH never reads a real home auth file (fail closed)", async () => {
     // The #191 isolation rule: with NODE_ENV=test and no explicit path, the
     // sync must NOT touch ~/.codex/auth.json on the dev machine — it treats
-    // the source as absent and deletes the blob.
+    // the source as absent and deletes the boundary files.
     const s = tempSecretsDir();
     try {
-      const stale = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
-      writeFileSync(stale, "{}", { mode: 0o600 });
+      const staleBlob = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      const staleSecret = join(s.dir, proxyKeyFileName("openai-codex"));
+      writeFileSync(staleBlob, "{}", { mode: 0o600 });
+      writeFileSync(staleSecret, "stale", { mode: 0o600 });
       const log: string[] = [];
       await syncProxyCredentialsFromEnv({
         env: {},
@@ -330,8 +361,9 @@ describe("codex subscription blob (issue #214)", () => {
         readOAuthRows: NO_ROWS,
         log: (line) => log.push(line),
       });
-      expect(existsSync(stale)).toBe(false);
-      expect(log.join("\n")).toContain("openai-codex-oauth.json REMOVED");
+      expect(existsSync(staleBlob)).toBe(false);
+      expect(existsSync(staleSecret)).toBe(false);
+      expect(log.join("\n")).toContain("openai-codex.secret + openai-codex-oauth.json REMOVED");
     } finally {
       s.cleanup();
     }
@@ -353,20 +385,111 @@ describe("codex subscription blob (issue #214)", () => {
     // Missing file → null.
     expect(readCodexAuthTokens("/nonexistent/codex-auth.json")).toBeNull();
   });
+
+  test("decodeCodexJwtExp reads the exp claim without verifying the signature (issue #230)", () => {
+    // A real JWT's payload segment carries the numeric exp (seconds).
+    expect(decodeCodexJwtExp(jwtAccessToken(1_800_000_000))).toBe(1_800_000_000);
+    // Non-JWT / malformed payloads / missing or non-numeric exp → null
+    // (the seed treats null as "cannot verify freshness" and refreshes).
+    expect(decodeCodexJwtExp("codex-access-1")).toBeNull();
+    expect(decodeCodexJwtExp("a.b")).toBeNull();
+    expect(decodeCodexJwtExp("a.b.c.d")).toBeNull();
+    expect(decodeCodexJwtExp(`a.${Buffer.from("not json").toString("base64url")}.c`)).toBeNull();
+    expect(decodeCodexJwtExp(`a.${Buffer.from('{"exp":"soon"}').toString("base64url")}.c`)).toBeNull();
+  });
+
+  test("a FRESH access token (exp > 24h away) is written statically — NO refresh round-trip (issue #230)", async () => {
+    const s = tempSecretsDir();
+    // exp 7 days out — far beyond the 24h re-refresh window.
+    const accessToken = jwtAccessToken(expInHours(24 * 7));
+    const auth = codexAuthFile({
+      tokens: { access_token: accessToken, refresh_token: "codex-refresh-1" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      let probeCalls = 0;
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+        // Must never be called: the fresh token needs no refresh.
+        mintCodexRefreshToken: async () => {
+          probeCalls += 1;
+          throw new Error("probe must not run for a fresh access token");
+        },
+      });
+      expect(probeCalls).toBe(0);
+      const secretPath = join(s.dir, proxyKeyFileName("openai-codex"));
+      expect(readFileSync(secretPath, "utf8")).toBe(accessToken);
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
+      expect(blob.refresh_token).toBe("codex-refresh-1");
+      // The CLI auth file is untouched (no refresh happened).
+      expect(readFileSync(auth.path, "utf8")).toContain("codex-refresh-1");
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("an access token within 24h of expiry triggers the seed's re-refresh — the MINTED token lands in the static secret, the rotated refresh token is written back to the blob + auth file (issue #230)", async () => {
+    const s = tempSecretsDir();
+    // exp 1 hour out — inside the 24h re-refresh window.
+    const auth = codexAuthFile({
+      tokens: { access_token: jwtAccessToken(expInHours(1)), refresh_token: "codex-refresh-1" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+        // The endpoint minted a fresh access token AND rotated the refresh
+        // token (the seed's own refresh — the proxy no longer mints).
+        mintCodexRefreshToken: async () => ({
+          minted: true,
+          accessToken: "codex-access-minted",
+          refreshToken: "codex-refresh-2-rotated",
+        }),
+      });
+      // The static secret carries the MINTED access token.
+      expect(readFileSync(join(s.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-minted");
+      // The rotation-persistence blob carries the minted access + rotated refresh token.
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
+      expect(blob).toEqual({
+        access_token: "codex-access-minted",
+        refresh_token: "codex-refresh-2-rotated",
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      });
+      // Rotation write-back keeps the CLI session valid (issue #218 helper).
+      const written = JSON.parse(readFileSync(auth.path, "utf8"));
+      expect(written.tokens.refresh_token).toBe("codex-refresh-2-rotated");
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
 });
 
 describe("codex mint probe + rotation write-back (issue #218)", () => {
   const OK_PROBE = (refreshToken: string) => async () => ({ minted: true, refreshToken });
 
-  test("a dead refresh token (mint probe 401) makes the seed THROW with the remedy and never writes the blob", async () => {
+  test("a dead refresh token (mint probe 401) makes the seed THROW with the remedy and never writes the secret or blob", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
       tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
     });
     try {
-      // A stale blob from a previous boot must not survive a dead token.
+      // Stale boundary files from a previous boot must not survive a dead token.
       const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      const secretPath = join(s.dir, proxyKeyFileName("openai-codex"));
       writeFileSync(blobPath, "{}", { mode: 0o600 });
+      writeFileSync(secretPath, "stale", { mode: 0o600 });
       const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
       await expect(
         syncProxyCredentialsFromEnv({
@@ -391,13 +514,14 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         }),
       ).rejects.toThrow(/restart the server/);
       expect(existsSync(blobPath)).toBe(false); // never a silent write of a dead token
+      expect(existsSync(secretPath)).toBe(false);
     } finally {
       auth.cleanup();
       s.cleanup();
     }
   });
 
-  test("a verified refresh token (mint probe 200) writes the blob with the file tokens", async () => {
+  test("a verified refresh token (mint probe 200) writes the static secret + blob with the file tokens", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
       tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
@@ -413,6 +537,9 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         log: SILENT,
         mintCodexRefreshToken: OK_PROBE("codex-refresh-1"),
       });
+      // The static secret carries the (unrotated) access token — the probe
+      // returned no minted access token, so the file's token is kept.
+      expect(readFileSync(join(s.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-1");
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
       expect(blob).toEqual({
         access_token: "codex-access-1",
@@ -442,7 +569,9 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         // The token endpoint rotated the refresh token on the probe mint.
         mintCodexRefreshToken: OK_PROBE("codex-refresh-2-rotated"),
       });
-      // The proxy blob carries the LIVE (rotated) token.
+      // The static secret keeps the file's access token (no minted token
+      // in this probe stub); the blob + auth file carry the rotated one.
+      expect(readFileSync(join(s.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-1");
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
       expect(blob.refresh_token).toBe("codex-refresh-2-rotated");
       // The CLI auth file was patched in place: rotated token, everything
@@ -458,7 +587,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
     }
   });
 
-  test("an unverifiable probe (endpoint unreachable) warns and still writes the blob (transient ≠ dead)", async () => {
+  test("an unverifiable probe (endpoint unreachable) warns and still writes the secret + blob (transient ≠ dead)", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
       tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
@@ -475,8 +604,9 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         log: (line) => log.push(line),
         mintCodexRefreshToken: async () => ({ minted: false, refreshToken: "codex-refresh-1" }),
       });
+      expect(existsSync(join(s.dir, proxyKeyFileName("openai-codex")))).toBe(true);
       expect(existsSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")))).toBe(true);
-      expect(log.join("\n")).toContain("could not verify the refresh token");
+      expect(log.join("\n")).toContain("could not be verified");
       expect(readFileSync(auth.path, "utf8")).toContain("codex-refresh-1"); // auth file untouched
     } finally {
       auth.cleanup();

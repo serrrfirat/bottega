@@ -9,7 +9,11 @@
  * providers' placeholder bearer swapped for the real key at egress,
  * require: true — fail closed) and the `oauth_token` transform for the
  * OAuth extensions (#198: linear/attio — the proxy holds the refresh
- * token + client credentials and mints access tokens at egress).
+ * token + client credentials and mints access tokens at egress). Issue
+ * #230 moves the codex provider (the ChatGPT subscription credential)
+ * from the oauth_token transform to the STATIC-key entries: the SEED
+ * owns the codex refresh and writes the access token to
+ * openai-codex.secret — the proxy never touches auth.openai.com.
  *
  * Run `bun run src/egress/generate.ts` after adding or updating snapshots in
  * config/extensions/; the committed config/egress.yml (strict, deployment)
@@ -76,14 +80,18 @@ export interface ExtensionEgressEntry {
 }
 
 /**
- * The model-gateway static keys (issue #208): the providers config/omp/
- * models.yml declares (near/opencode/openai/anthropic) talk to their
- * gateways with a PLACEHOLDER bearer; the proxy injects the real key from
- * the provider's secret file (`data/proxy-secrets/<provider>.secret`,
+ * The model-gateway static keys (issue #208 + #230): the providers
+ * config/omp/models.yml declares (near/opencode/openai/anthropic, plus
+ * openai-codex — the ChatGPT subscription credential) talk to their
+ * gateways with a PLACEHOLDER bearer; the proxy injects the real value
+ * from the provider's secret file (`data/proxy-secrets/<provider>.secret`,
  * seeded at boot by the proxy credential sync, src/extensions/proxy-seed).
  * Each entry REQUIRES its secret file (`inject.require: true`) — a missing
  * key fails the request closed (502) instead of letting the placeholder
- * reach the gateway (the #208 fail-closed invariant).
+ * reach the gateway (the #208 fail-closed invariant). For codex the
+ * secret file holds the ACCESS token minted by the seed's own refresh
+ * (issue #230: the seed owns the rotation; the proxy injects the static
+ * bearer at egress and never touches auth.openai.com).
  */
 export interface ModelGatewayKey {
   /** The provider id (the sync's vault provider / Keychain service suffix). */
@@ -100,6 +108,12 @@ export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
   { provider: "opencode", host: "opencode.ai" },
   { provider: "openai", host: "api.openai.com" },
   { provider: "anthropic", host: "api.anthropic.com" },
+  // Issue #214/#230 (the openai-codex model provider): the ChatGPT
+  // subscription OAuth access token, seeded as a STATIC secret by the
+  // proxy credential sync's codex leg (data/proxy-secrets/openai-codex.secret
+  // — the seed owns the refresh and writes the minted access token; the
+  // proxy injects it as the bearer for chatgpt.com, require: true).
+  { provider: "openai-codex", host: "chatgpt.com" },
 ] as const;
 
 /**
@@ -136,8 +150,11 @@ export interface OAuthTokenEntry {
  * test-only and synthesize their endpoint from their own allowlisted
  * domain in {@link oauthTokenEntries} — they never appear in
  * config/extensions, so the production map stays fake-domain-free.
+ * (The codex endpoint moved out under issue #230: the SEED calls
+ * auth.openai.com/oauth/token directly — see CODEX_TOKEN_ENDPOINT in
+ * src/extensions/proxy-seed.ts — the proxy never mints for codex.)
  */
-/** Verified token endpoints keyed by OAuth extension id (the #198 providers + codex, issue #214). */
+/** Verified token endpoints keyed by OAuth extension id (the #198 providers). */
 interface VerifiedTokenEndpoints {
   [extensionId: string]: string;
 }
@@ -146,40 +163,7 @@ export const OAUTH_TOKEN_ENDPOINTS: VerifiedTokenEndpoints = {
   linear: "https://mcp.linear.app/token",
   attio: "https://app.attio.com/oidc/token",
   notion: "https://mcp.notion.com/token",
-  // Issue #214 (the openai-codex model provider): the ChatGPT subscription OAuth
-  // refresh endpoint the Codex CLI uses — the openai/codex public client
-  // (app_EMoamEEZ73f0CkXaXp7hrann) exchanges the refresh grant at
-  // https://auth.openai.com/oauth/token (verified from the openai/codex
-  // OAuth flow 2026-08-18; CODEX_REFRESH_TOKEN_URL_OVERRIDE in the CLI).
-  // The exact acceptance of the grant for every account plan cannot be
-  // verified hermetically — the boot sync now PROBES the refresh grant
-  // before seeding (issue #218: a dead token fails the boot loudly with
-  // the remedy instead of being written silently), and the transform stays
-  // require: true, so an unmintable grant still 502s instead of forwarding
-  // unauthenticated.
-  codex: "https://auth.openai.com/oauth/token",
 };
-
-/**
- * The model-provider OAuth token entries (issue #214): the openai-codex
- * provider (config/omp/models.yml — the key-only placeholder decl) talks
- * to chatgpt.com/backend-api/codex with the ChatGPT SUBSCRIPTION OAuth
- * access token — NOT a static API key — so it joins the `oauth_token`
- * transform like the #198 OAuth extensions: the proxy mints the access
- * token from the refresh grant at egress, sourcing the credential from ONE
- * JSON blob (`data/proxy-secrets/openai-codex-oauth.json`, seeded by the
- * sync from the Codex CLI auth file). require: true — a missing/unmintable
- * credential rejects the request (502), never an unauthenticated upstream
- * call. BASE config (like the model-gateway keys above): the sync deletes
- * the blob when the filesystem credential is missing (fail closed).
- */
-export const MODEL_OAUTH_TOKEN_ENTRIES: readonly OAuthTokenEntry[] = [
-  {
-    extensionId: "openai-codex",
-    domains: ["chatgpt.com"],
-    tokenEndpoint: OAUTH_TOKEN_ENDPOINTS.codex,
-  },
-] as const;
 
 /**
  * The canary's OAuth fixture id prefix (issue #212): test-only extensions
@@ -320,9 +304,11 @@ function renderModelGatewayEntries(keys: readonly ModelGatewayKey[]): string {
  * injecting it as the Authorization header for the extension's domains,
  * plus the model-gateway static-key entries (the providers' placeholders
  * swapped for the real key at egress, REQUIRED — a missing key rejects
- * the request closed). The judge transform runs BEFORE secrets so the LLM
- * judge sees no real credentials (iron-proxy README's recommended
- * ordering).
+ * the request closed). The openai-codex provider is one of those static
+ * entries (issue #230): the seed writes the minted access token to
+ * openai-codex.secret, the proxy injects it for chatgpt.com. The judge
+ * transform runs BEFORE secrets so the LLM judge sees no real credentials
+ * (iron-proxy README's recommended ordering).
  */
 export function renderSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
   const extensionEntries = renderSecretsEntries(extensions);
@@ -337,12 +323,16 @@ export function renderSecretsTransform(extensions: readonly ExtensionEgressEntry
   #    do the same for the providers config/omp/models.yml declares: the
   #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
   #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
-  #    (seeded at boot by src/extensions/proxy-seed). require: true — a
-  #    missing key rejects the request (502) instead of letting the
-  #    placeholder reach the gateway. File sources re-read on config reload
-  #    and on ttl expiry, so credentials rotate on a running proxy. Judge
-  #    runs BEFORE secrets so the LLM judge never sees real credentials
-  #    (iron-proxy README's recommended ordering).
+  #    (seeded at boot by src/extensions/proxy-seed). The openai-codex
+  #    provider is one of these entries (issue #230): the seed owns the
+  #    codex refresh and writes the minted access token to
+  #    openai-codex.secret — the proxy injects it for chatgpt.com and never
+  #    touches auth.openai.com. require: true — a missing key rejects the
+  #    request (502) instead of letting the placeholder reach the gateway.
+  #    File sources re-read on config reload and on ttl expiry, so
+  #    credentials rotate on a running proxy. Judge runs BEFORE secrets so
+  #    the LLM judge never sees real credentials (iron-proxy README's
+  #    recommended ordering).
   - name: secrets
     config:
       secrets:
@@ -352,15 +342,16 @@ ${extensionBlock}${gatewayEntries}
 
 /**
  * Renders the `oauth_token` transform (iron-proxy v0.49.0, issue #208):
- * one refresh_token-grant entry per OAuth extension (#198 providers) plus
- * the model-provider entries (issue #214 — openai-codex: the ChatGPT subscription
- * OAuth credential from the Codex CLI auth file). The proxy holds the
- * provider's refresh token + client credentials (from the sync's JSON
- * blob) and mints the access token at egress; inbound requests to the
- * configured token_endpoint are stubbed with a synthetic token so the app's
- * SDK can complete its own OAuth dance against the proxy (the GCP stub
- * pattern). require: true — an unmintable credential rejects the request
- * (502), never an unauthenticated upstream call.
+ * one refresh_token-grant entry per OAuth extension (#198 providers —
+ * linear/attio/notion). The proxy holds the provider's refresh token +
+ * client credentials (from the sync's JSON blob) and mints the access
+ * token at egress; inbound requests to the configured token_endpoint are
+ * stubbed with a synthetic token so the app's SDK can complete its own
+ * OAuth dance against the proxy (the GCP stub pattern). require: true —
+ * an unmintable credential rejects the request (502), never an
+ * unauthenticated upstream call. The codex model provider is NOT here
+ * (issue #230): it is a STATIC secrets entry — the seed owns the refresh,
+ * the proxy injects the access token at egress.
  */
 export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
   const tokenBlocks = entries
@@ -384,17 +375,17 @@ export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): 
 ${hostLines}`;
     })
     .join("\n");
-  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) and
-  #    the openai-codex model provider (issue #214 — the ChatGPT subscription
-  #    credential, data/proxy-secrets/openai-codex-oauth.json) send the placeholder
-  #    bearer; this transform holds each provider's refresh token + client
-  #    credentials (the sync's JSON blob,
+  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send the
+  #    placeholder bearer; this transform holds each provider's refresh
+  #    token + client credentials (the sync's JSON blob,
   #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
   #    tokens at egress, and stubs inbound requests to each configured
   #    token_endpoint with a synthetic token so the SDK's own token dance
   #    completes against the proxy. require: true — a missing/unmintable
   #    credential rejects the request (502), never an unauthenticated
-  #    upstream call.
+  #    upstream call. The codex model provider is NOT here (issue #230):
+  #    its access token is a STATIC secrets entry — the seed owns the
+  #    refresh, the proxy injects the minted token for chatgpt.com.
   - name: oauth_token
     config:
       tokens:
@@ -417,10 +408,11 @@ export function renderEgressConfig(
   // entries (issue #208) are base config — only the extension entries are
   // optional.
   const secretsTransform = `${renderSecretsTransform(extensions)}\n`;
-  // The model-provider OAuth entry (issue #214, openai-codex) is base config —
-  // emitted even without extension entries; extension oauth entries append.
-  const oauthEntries = [...oauthTokens, ...MODEL_OAUTH_TOKEN_ENTRIES];
-  const oauthTransform = oauthEntries.length > 0 ? `${renderOAuthTokenTransform(oauthEntries)}\n` : "";
+  // The oauth_token transform covers only extension OAuth entries (issue
+  // #230: the codex model provider is a STATIC secrets entry now — the
+  // seed owns the refresh); it is omitted entirely when no extension
+  // snapshots carry an oauth credential.
+  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
   return `# iron-proxy egress policy for bottega (issue #8).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -531,10 +523,11 @@ export function renderDevEgressConfig(
   // entries (issue #208) are base config — only the extension entries are
   // optional.
   const secretsTransform = `${renderDevSecretsTransform(extensions)}\n`;
-  // The model-provider OAuth entry (issue #214, openai-codex) is base config —
-  // emitted even without extension entries; extension oauth entries append.
-  const oauthEntries = [...oauthTokens, ...MODEL_OAUTH_TOKEN_ENTRIES];
-  const oauthTransform = oauthEntries.length > 0 ? `${renderOAuthTokenTransform(oauthEntries)}\n` : "";
+  // The oauth_token transform covers only extension OAuth entries (issue
+  // #230: the codex model provider is a STATIC secrets entry now — the
+  // seed owns the refresh); it is omitted entirely when no extension
+  // snapshots carry an oauth credential.
+  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
   return `# iron-proxy egress policy for bottega — LOCAL DEV (permissive, issue #126).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml

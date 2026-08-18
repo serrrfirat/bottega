@@ -62,9 +62,11 @@ providers:
   # REJECTED, input MUST be a list — the transport enforces all of it), and
   # the SDK's models.yml validation treats any provider declaration as
   # CUSTOM — redeclaring its models without a baseUrl fails the boot guard.
-  # The key is the proxy placeholder (#208): the proxy mints the live bearer
-  # from data/proxy-secrets/openai-codex-oauth.json at egress (the
-  # oauth_token transform; the app process never holds the live token).
+  # The key is the proxy placeholder (#208): the seed owns the codex refresh
+  # (issue #230) and writes the minted ACCESS token to
+  # data/proxy-secrets/openai-codex.secret at egress (the static secrets
+  # transform entry — the app process never holds the live token, and the
+  # proxy never touches auth.openai.com).
   openai-codex:
     apiKey: bottega-proxy-placeholder
   # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Same pattern as

@@ -113,12 +113,16 @@ transforms:
   #    do the same for the providers config/omp/models.yml declares: the
   #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
   #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
-  #    (seeded at boot by src/extensions/proxy-seed). require: true — a
-  #    missing key rejects the request (502) instead of letting the
-  #    placeholder reach the gateway. File sources re-read on config reload
-  #    and on ttl expiry, so credentials rotate on a running proxy. Judge
-  #    runs BEFORE secrets so the LLM judge never sees real credentials
-  #    (iron-proxy README's recommended ordering).
+  #    (seeded at boot by src/extensions/proxy-seed). The openai-codex
+  #    provider is one of these entries (issue #230): the seed owns the
+  #    codex refresh and writes the minted access token to
+  #    openai-codex.secret — the proxy injects it for chatgpt.com and never
+  #    touches auth.openai.com. require: true — a missing key rejects the
+  #    request (502) instead of letting the placeholder reach the gateway.
+  #    File sources re-read on config reload and on ttl expiry, so
+  #    credentials rotate on a running proxy. Judge runs BEFORE secrets so
+  #    the LLM judge never sees real credentials (iron-proxy README's
+  #    recommended ordering).
   - name: secrets
     config:
       secrets:
@@ -171,18 +175,28 @@ transforms:
             require: true
           rules:
             - host: "api.anthropic.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/openai-codex.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "chatgpt.com"
 
-  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) and
-  #    the openai-codex model provider (issue #214 — the ChatGPT subscription
-  #    credential, data/proxy-secrets/openai-codex-oauth.json) send the placeholder
-  #    bearer; this transform holds each provider's refresh token + client
-  #    credentials (the sync's JSON blob,
+  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send the
+  #    placeholder bearer; this transform holds each provider's refresh
+  #    token + client credentials (the sync's JSON blob,
   #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
   #    tokens at egress, and stubs inbound requests to each configured
   #    token_endpoint with a synthetic token so the SDK's own token dance
   #    completes against the proxy. require: true — a missing/unmintable
   #    credential rejects the request (502), never an unauthenticated
-  #    upstream call.
+  #    upstream call. The codex model provider is NOT here (issue #230):
+  #    its access token is a STATIC secrets entry — the seed owns the
+  #    refresh, the proxy injects the minted token for chatgpt.com.
   - name: oauth_token
     config:
       tokens:
@@ -216,21 +230,6 @@ transforms:
           require: true
           rules:
             - host: "mcp.linear.app"
-        - grant: refresh_token
-          refresh_token:
-            type: file
-            path: "/data/proxy-secrets/openai-codex-oauth.json"
-            ttl: "30s"
-            json_key: "refresh_token"
-          client_id:
-            type: file
-            path: "/data/proxy-secrets/openai-codex-oauth.json"
-            ttl: "30s"
-            json_key: "client_id"
-          token_endpoint: "https://auth.openai.com/oauth/token"
-          require: true
-          rules:
-            - host: "chatgpt.com"
 
 log:
   level: "info"
