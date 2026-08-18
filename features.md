@@ -103,6 +103,18 @@ billing.
   DELETES the boundary blob, so the provider's requests 502 until the user
   logs in with the Codex CLI. `dev.sh` does NOT export the codex token
   into env: the seed reads the file directly at boot.
+- **Recovery (issue #218)** — when model calls fail with the proxy's mint
+  error (`oauth_token failed to mint an access token`) or turns come back
+  empty with a 403, the subscription login is stale: run `codex login`,
+  then restart the server (the seed re-verifies and the proxy reloads with
+  the fresh token). The boot sync now VERIFIES the refresh token mints
+  before seeding it — a dead token fails the boot loudly with that same
+  remedy instead of being written silently. The verification POSTs the
+  refresh grant to the token endpoint and writes the endpoint's ROTATED
+  refresh token back to both the boundary blob and the Codex CLI auth file
+  (the proxy's `oauth_token` transform rotates the token in memory only —
+  x/oauth2 semantics — so the write-back keeps the file copy live across
+  reloads/restarts).
 - **Catalog + pins** — `openai-codex/gpt-5.6-luna` resolves in the available
   catalog (listAvailableModels), so `model_settings`, `use_model`, and
   per-work-item pins can target it by name.
@@ -270,6 +282,10 @@ clients.
   persisted in SQLite for cross-process use, capped per actor, consumed
   atomically, and POST attempts are rate-limited per client IP. OAuth
   extensions use their normal broker login and cannot mint an upload link.
+  The minted link's public base (BOTTEGA_OAUTH_CALLBACK_BASE_URL) is
+  health-checked at mint time (#211): a reachable URL wins, a stale one
+  (rotated/dead tunnel) falls back to the loopback URL with a loud warning
+  in the reply — the .env value must be refreshed when the tunnel rotates.
 - **Draft and pin from chat** — `catalog_browser` writes an unreviewed
   draft outside the registry, tells the agent to use `web_search` for the
   vendor's official binding (#146), and refuses to pin until a human

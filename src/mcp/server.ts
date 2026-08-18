@@ -104,8 +104,9 @@ import {
   mintUploadLink,
   MINT_UPLOAD_LINK_TOOL,
   UploadLinkStore,
-  uploadLinkRelayText,
+  uploadLinkReplyText,
   UPLOAD_LINK_RELAY_GUIDANCE,
+  type PublicBaseResolution,
 } from "../extensions/upload-link";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import type { ExtensionRegistry } from "../extensions/registry";
@@ -123,6 +124,7 @@ import { createIngestPollAction } from "../ingest/poll-action";
 import { loadKbConfig, type KbConfig } from "../kb/config";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { sendMessageAction } from "../scheduler/send-message";
 import { kbIngestAction } from "../scheduler/kb-ingest";
 import { reflectionAction } from "../scheduler/reflection";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
@@ -198,11 +200,17 @@ export interface McpExtensionsOptions {
    * advertises `connect_upload_link` — mints a single-use, expiring URL
    * whose secret the server's browser endpoint stores DIRECTLY into the
    * vault. The store must share the `upload_tokens` table with the server
-   * process's endpoint (both read the same SQLite file); the base URL
-   * points at that endpoint (BOTTEGA_UPLOAD_BASE_URL, set by the ACP
-   * driver). Absent → the mint tool is not advertised.
+   * process's endpoint (both read the same SQLite file); `baseUrl` is the
+   * LOOPBACK fallback (BOTTEGA_UPLOAD_BASE_URL, set by the ACP driver) and
+   * `resolvePublicBase` health-checks the PUBLIC URL (issue #211; absent →
+   * probe BOTTEGA_OAUTH_CALLBACK_BASE_URL). Absent → the mint tool is not
+   * advertised.
    */
-  uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
+  uploadLink?: {
+    store: UploadLinkStore;
+    baseUrl: () => string;
+    resolvePublicBase?: () => Promise<PublicBaseResolution>;
+  };
 }
 
 /**
@@ -632,15 +640,21 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     if (!parsed.ok) {
       throw new McpError(ErrorCode.InvalidParams, `${MINT_UPLOAD_LINK_TOOL}: invalid arguments: ${parsed.error}`);
     }
-    const outcome = mintUploadLink(
+    const outcome = await mintUploadLink(
       { extension: parsed.extension, scope: parsed.scope, actor: opts.defaultPrincipal ?? "agent", spaceId: opts.spaceId ?? undefined },
-      { registry: extensions.connect.registry, store: extensions.uploadLink.store, baseUrl: extensions.uploadLink.baseUrl },
+      {
+        registry: extensions.connect.registry,
+        store: extensions.uploadLink.store,
+        baseUrl: extensions.uploadLink.baseUrl,
+        resolvePublicBase: extensions.uploadLink.resolvePublicBase,
+      },
     );
     if (!outcome.ok) return { content: [{ type: "text", text: outcome.message }], isError: true };
     // Issue #210: same canonical reply as the session tool — the exact
     // minted URL plus the relay contract, never a bare URL the agent may
-    // reconstruct from context.
-    return { content: [{ type: "text", text: uploadLinkRelayText(outcome.url) }] };
+    // reconstruct from context. Issue #211: a stale public base prepends
+    // its warning so the reply explains a loopback-only link.
+    return { content: [{ type: "text", text: uploadLinkReplyText(outcome) }] };
   };
 
   /**
@@ -919,7 +933,7 @@ export async function bootMemoryMcpServer(opts: {
     internal: {
       store,
       orgPolicy,
-      // The same five actions the server root registers (issue #86/#57) —
+      // The same actions the server root registers (issue #86/#57/#220) —
       // create_scheduler_job validates against this registry only; the
       // server process's runner executes the jobs.
       schedulerRegistry: buildRegistry([
@@ -927,6 +941,7 @@ export async function bootMemoryMcpServer(opts: {
         reflectionAction,
         orgPulseAction,
         recurringWorkAction,
+        sendMessageAction,
         createIngestPollAction(),
         ...(kb !== undefined ? [kbIngestAction(kb)] : []),
       ]),

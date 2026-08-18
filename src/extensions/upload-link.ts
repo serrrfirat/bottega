@@ -70,6 +70,63 @@ export function uploadLinkPublicBase(): string | undefined {
   return base !== undefined && base.length > 0 ? base : undefined;
 }
 
+/** How long the public-base liveness probe may take before the tunnel is treated as dead (issue #211). */
+export const PUBLIC_BASE_PROBE_TIMEOUT_MS = 5_000;
+
+/** The mint's public-base resolution (issue #211): the reachable public base plus any staleness warning. */
+export interface PublicBaseResolution {
+  /**
+   * The reachable public base to mint with. `undefined` → the mint falls
+   * back to the loopback endpoint URL.
+   */
+  base: string | undefined;
+  /**
+   * Set when a configured public URL exists but the liveness probe failed:
+   * the minted link is loopback-only and the .env tunnel URL is stale.
+   */
+  warning: string | undefined;
+}
+
+/**
+ * Resolves the upload-link mint's PUBLIC base (issue #211): a quick tunnel
+ * rotates, so the env value goes stale between boots — the mint must never
+ * trust it blindly. The configured base is health-checked at MINT time:
+ *   - any non-5xx HTTP response → REACHABLE. The app's own ingress 404s
+ *     unknown paths, so a 2xx/3xx/4xx means the tunnel forwards to the
+ *     listener; a 5xx (Cloudflare 502/530 when the tunnel is gone, an
+ *     nginx 502 when the backend is down) or a transport failure (DNS,
+ *     refused connection, timeout) means DEAD.
+ *   - reachable → mint with the configured base.
+ *   - dead → base = undefined (loopback fallback) with a LOUD warning that
+ *     surfaces the staleness (the user sees why the link is loopback-only).
+ * No caching: mints are rare (exec-tier, per-actor capped) and every probe
+ * re-reads the tunnel's CURRENT liveness, so a refreshed tunnel is picked
+ * up by the very next mint.
+ */
+export async function resolveUploadLinkPublicBase(
+  configuredBase: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<PublicBaseResolution> {
+  if (configuredBase === undefined) return { base: undefined, warning: undefined };
+  if (await probePublicBase(configuredBase, fetchImpl)) return { base: configuredBase, warning: undefined };
+  return {
+    base: undefined,
+    warning:
+      `WARNING: the configured public base (BOTTEGA_OAUTH_CALLBACK_BASE_URL=${configuredBase}) is unreachable — ` +
+      `the tunnel URL in .env is stale (issue #211). The minted link below is LOOPBACK-only: a remote user ` +
+      `cannot open it. Refresh the tunnel and BOTTEGA_OAUTH_CALLBACK_BASE_URL, restart the server, then re-mint.`,
+  };
+}
+
+async function probePublicBase(base: string, fetchImpl: typeof fetch): Promise<boolean> {
+  try {
+    const res = await fetchImpl(base, { redirect: "follow", signal: AbortSignal.timeout(PUBLIC_BASE_PROBE_TIMEOUT_MS) });
+    return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
 export interface UploadLinkStoreOpts {
   /** Token lifetime in ms (default {@link UPLOAD_LINK_TTL_MS}). */
   ttlMs?: number;
@@ -174,13 +231,28 @@ export class UploadLinkStore {
 export interface MintUploadLinkDeps {
   registry: Pick<ExtensionRegistry, "resolve">;
   store: UploadLinkStore;
-  /** Resolves the endpoint base URL (http://127.0.0.1:<port>) at call time. */
+  /**
+   * The LOOPBACK fallback base (http://127.0.0.1:<port>) — used when no
+   * public base is configured or the configured one is unreachable (issue
+   * #211). Never the raw env value: the public URL comes from
+   * {@link resolvePublicBase}, health-checked at mint time.
+   */
   baseUrl: () => string;
+  /**
+   * Resolves the PUBLIC base (issue #211): health-checks the configured
+   * public URL at mint time and returns it when reachable, else
+   * `base: undefined` plus a loud staleness warning (loopback fallback).
+   * Default: probe `BOTTEGA_OAUTH_CALLBACK_BASE_URL` via
+   * {@link resolveUploadLinkPublicBase} — the production wiring.
+   */
+  resolvePublicBase?: () => Promise<PublicBaseResolution>;
   /** Overrides the store's default TTL for this link. */
   ttlMs?: number;
 }
 
-export type MintUploadLinkOutcome = { ok: true; url: string } | { ok: false; message: string };
+export type MintUploadLinkOutcome =
+  | { ok: true; url: string; warning?: string }
+  | { ok: false; message: string };
 
 /**
  * The mint core: resolves the extension (api_key-type only — OAuth has no
@@ -188,10 +260,10 @@ export type MintUploadLinkOutcome = { ok: true; url: string } | { ok: false; mes
  * the session tool definition and the MCP surface so both surfaces mint
  * identically.
  */
-export function mintUploadLink(
+export async function mintUploadLink(
   input: { extension: string; scope: ConnectScope; actor: string; spaceId?: string },
   deps: MintUploadLinkDeps,
-): MintUploadLinkOutcome {
+): Promise<MintUploadLinkOutcome> {
   const resolved = deps.registry.resolve(input.extension);
   // Issue #201: boot secrets (Slack tokens + provider keys) have no
   // extension manifest — the mint resolves them by their stable vault
@@ -209,6 +281,13 @@ export function mintUploadLink(
       message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
     };
   }
+  // Issue #211: the public base is HEALTH-CHECKED at mint time — a quick
+  // tunnel rotates, so the env value goes stale between boots. A reachable
+  // public URL wins; a dead one falls back to loopback with a loud warning
+  // (surfaced in the tool reply) instead of silently minting a dead link.
+  const resolvePublicBase = deps.resolvePublicBase ?? (() => resolveUploadLinkPublicBase(uploadLinkPublicBase()));
+  const publicBase = await resolvePublicBase();
+  const base = publicBase.base ?? deps.baseUrl();
   const minted = deps.store.mint({
     extension: input.extension,
     scope: input.scope,
@@ -218,7 +297,7 @@ export function mintUploadLink(
     ttlMs: deps.ttlMs,
   });
   if (!minted.ok) return { ok: false, message: minted.reason };
-  return { ok: true, url: `${deps.baseUrl()}/upload/${minted.token}` };
+  return { ok: true, url: `${base}/upload/${minted.token}`, warning: publicBase.warning };
 }
 
 /**
@@ -232,6 +311,17 @@ export function mintUploadLink(
  */
 export function uploadLinkRelayText(url: string): string {
   return `${url}\nRelay this upload link exactly as written — never construct, reformat, or substitute the URL.`;
+}
+
+/**
+ * The mint's full reply (issue #211): the relay text plus any public-base
+ * staleness warning prepended — the user must see WHY the link is
+ * loopback-only (a dead tunnel URL in .env). Shared by the session tool
+ * and the MCP surface so both reply identically.
+ */
+export function uploadLinkReplyText(outcome: { url: string; warning?: string }): string {
+  const relay = uploadLinkRelayText(outcome.url);
+  return outcome.warning === undefined ? relay : `${outcome.warning}\n\n${relay}`;
 }
 
 /** Issue #210: description guidance for both mint surfaces — the returned link is final. */
@@ -278,14 +368,16 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const spaceId = spaceIdFromFile(ctx.sessionManager.getSessionFile());
       const actor = deps.getPrincipal?.() ?? deps.defaultActor ?? "agent";
-      const outcome = mintUploadLink(
+      const outcome = await mintUploadLink(
         { extension: params.extension, scope: params.scope, actor, spaceId },
         deps,
       );
       if (!outcome.ok) return toolError(outcome.message);
       // Issue #210: the reply anchors to the exact minted URL — never a
-      // reconstructed base (a loopback rewrite renders a dead link).
-      return { content: [{ type: "text", text: uploadLinkRelayText(outcome.url) }] };
+      // reconstructed base (a loopback rewrite renders a dead link). Issue
+      // #211: a stale public base prepends its warning above the URL so the
+      // user sees why the link is loopback-only.
+      return { content: [{ type: "text", text: uploadLinkReplyText(outcome) }] };
     },
   };
 }

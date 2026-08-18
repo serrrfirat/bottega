@@ -35,6 +35,7 @@ import { buildRegistry } from "../scheduler/actions";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { sendMessageAction } from "../scheduler/send-message";
 import { reflectionAction } from "../scheduler/reflection";
 import { standupDigestAction } from "../scheduler/standup";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
@@ -247,13 +248,14 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
         : {
             store,
             orgPolicy: policy,
-            // The same five actions the server boot registers (issue
-            // #86/#57) — create_scheduler_job validates against them.
+            // The same actions the server boot registers (issue
+            // #86/#57/#220) — create_scheduler_job validates against them.
             schedulerRegistry: buildRegistry([
               standupDigestAction,
               reflectionAction,
               orgPulseAction,
               recurringWorkAction,
+              sendMessageAction,
               createIngestPollAction(),
             ]),
             // Hermetic KB config: no sources, no egress — kb_ingest lists
@@ -287,6 +289,13 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
               uploadLink: {
                 store: new UploadLinkStore(store),
                 baseUrl: () => opts.uploadLinkBaseUrl ?? "http://127.0.0.1:9999",
+                // Issue #211: the harness mints hermetically — the public
+                // base is the injected URL, never a live probe of the
+                // ambient BOTTEGA_OAUTH_CALLBACK_BASE_URL.
+                resolvePublicBase: async () =>
+                  opts.uploadLinkBaseUrl === undefined
+                    ? { base: undefined, warning: undefined }
+                    : { base: opts.uploadLinkBaseUrl, warning: undefined },
               },
             }
           : undefined),

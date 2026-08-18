@@ -131,6 +131,14 @@ function postSecret(url: string, secret: string): Promise<Response> {
   return fetch(url, { method: "POST", body });
 }
 
+/**
+ * Issue #211: the hermetic mint — no public base configured, so the mint
+ * resolves loopback WITHOUT probing. The ambient .env (auto-loaded by bun)
+ * carries a live tunnel URL; tests that don't exercise the liveness probe
+ * must pin this resolver so the suite never touches the network.
+ */
+const noPublicBase = async () => ({ base: undefined, warning: undefined });
+
 describe("one-time upload link — mint → upload → vault (issue #196)", () => {
   test("GET serves the form; POST stores the secret through the same connect path", async () => {
     const h = makeDeps();
@@ -308,12 +316,12 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
 });
 
 describe("boot-secret provisioning via the upload link (issue #201)", () => {
-  test("boot secrets mint by their vault provider id without a registry entry", () => {
+  test("boot secrets mint by their vault provider id without a registry entry", async () => {
     const store = new UploadLinkStore(freshStore(), { maxOutstandingPerActor: BOOT_SECRETS.length });
     for (const id of ["slack-app", "slack-bot", "opencode", "near", "openai", "anthropic", "github-webhook"]) {
-      const outcome = mintUploadLink(
+      const outcome = await mintUploadLink(
         { extension: id, scope: "org", actor: "UADA" },
-        { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9" },
+        { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9", resolvePublicBase: noPublicBase },
       );
       expect(outcome.ok).toBe(true);
       if (outcome.ok) expect(outcome.url).toContain(`http://127.0.0.1:9/upload/`);
@@ -415,21 +423,21 @@ describe("upload link minting (issue #196)", () => {
     if (!third.ok) expect(third.reason).toContain("too many outstanding");
   });
 
-  test("oauth extensions cannot mint — they have no secret to upload", () => {
+  test("oauth extensions cannot mint — they have no secret to upload", async () => {
     const store = new UploadLinkStore(freshStore());
-    const outcome = mintUploadLink(
+    const outcome = await mintUploadLink(
       { extension: "com.example.oauth", scope: "personal", actor: "UADA" },
-      { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9" },
+      { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9", resolvePublicBase: noPublicBase },
     );
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.message).toContain("OAuth");
   });
 
-  test("unknown extensions cannot mint", () => {
+  test("unknown extensions cannot mint", async () => {
     const store = new UploadLinkStore(freshStore());
-    const outcome = mintUploadLink(
+    const outcome = await mintUploadLink(
       { extension: "com.nope", scope: "personal", actor: "UADA" },
-      { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9" },
+      { registry: registry(), store, baseUrl: () => "http://127.0.0.1:9", resolvePublicBase: noPublicBase },
     );
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.message).toContain("unknown extension");
@@ -443,6 +451,7 @@ describe("upload link minting (issue #196)", () => {
         registry: h.deps.registry,
         store: endpoint.store,
         baseUrl: () => endpoint.baseUrl,
+        resolvePublicBase: noPublicBase,
         getPrincipal: () => "UADA",
         spaceIdFromFile: (file) => (file === "slack:C1.jsonl" ? "slack:C1" : undefined),
       });
@@ -478,15 +487,19 @@ describe("upload link minting (issue #196)", () => {
   test("the mint tool anchors its reply to the minted public URL — never a loopback (issue #210)", async () => {
     const h = makeDeps();
     const endpoint = startUploadLinkServer(h.deps);
+    // Issue #211: the "tunnel" is a live Bun.serve stub (404 on unknown
+    // paths, exactly like the real inbound surface) — the tool's DEFAULT
+    // resolver health-checks the configured base and must mint with it.
+    const tunnel = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("not found", { status: 404 }) });
     try {
-      // The exact wiring expression server/index.ts uses: the deployment's
-      // public base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set, else the
-      // in-process loopback URL. A configured public base is the bug's
-      // trigger: the agent re-emitted the token with a loopback base
-      // pattern-copied from older context, rendering a dead link.
-      const baseUrl = () => uploadLinkPublicBase() ?? endpoint.baseUrl;
+      // The post-fix wiring expression server/index.ts uses: baseUrl is
+      // the loopback FALLBACK only; the mint resolves the PUBLIC base
+      // itself (health-checked, issue #211). A configured public base is
+      // the bug's trigger: the agent re-emitted the token with a loopback
+      // base pattern-copied from older context, rendering a dead link.
+      const baseUrl = () => endpoint.baseUrl;
       const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
-      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = `http://127.0.0.1:${tunnel.port}`;
       try {
         const tool = mintUploadLinkToolDefinition({
           registry: h.deps.registry,
@@ -506,14 +519,16 @@ describe("upload link minting (issue #196)", () => {
         const text = (result.content[0] as { text: string }).text;
         // The minted URL is anchored verbatim (first line)…
         const url = text.split("\n")[0]!;
-        expect(url.startsWith("https://upload.example.com/upload/")).toBe(true);
+        expect(url.startsWith(`http://127.0.0.1:${tunnel.port}/upload/`)).toBe(true);
         // …with an explicit relay contract the agent must follow…
         expect(text).toContain("exactly as written");
+        // …a LIVE public base mints without a staleness warning…
+        expect(text).not.toMatch(/WARNING|unreachable|stale/i);
         // …and no loopback base can leak into the reply.
-        expect(text).not.toMatch(/127\.0\.0\.1|localhost/);
+        expect(text).not.toMatch(new RegExp(`127\\.0\\.0\\.1:${endpoint.baseUrl.split(":").pop()}`));
 
         // The token is real: the SHARED endpoint store consumes it.
-        const token = url.slice("https://upload.example.com/upload/".length);
+        const token = url.slice(`http://127.0.0.1:${tunnel.port}/upload/`.length);
         const consumed = endpoint.store.consume(token);
         expect(consumed.ok).toBe(true);
         if (consumed.ok) expect(consumed.row.actor).toBe("UADA");
@@ -522,6 +537,7 @@ describe("upload link minting (issue #196)", () => {
         else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
       }
     } finally {
+      tunnel.stop();
       endpoint.stop();
     }
   });
@@ -543,35 +559,41 @@ describe("upload link public base + stable port (issue #196)", () => {
     }
   });
 
-  test("the mint returns the public base URL when configured, else the loopback fallback", async () => {
+  test("the mint returns the public base URL when configured and reachable, else the loopback fallback", async () => {
     const h = makeDeps();
     const endpoint = startUploadLinkServer(h.deps);
+    // Issue #211: the "tunnel" is a live Bun.serve stub (404 on unknown
+    // paths, exactly like the real inbound surface). The mint's DEFAULT
+    // resolver probes the configured base — the post-fix server/index.ts
+    // wiring: baseUrl is the loopback fallback only.
+    const tunnel = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("not found", { status: 404 }) });
     try {
-      // The exact wiring expression server/index.ts uses: the deployment's
-      // public base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set, else the
-      // in-process loopback URL.
-      const baseUrl = () => uploadLinkPublicBase() ?? endpoint.baseUrl;
+      const baseUrl = () => endpoint.baseUrl;
       const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
       try {
         delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
-        const local = mintUploadLink(
+        const local = await mintUploadLink(
           { extension: "fixture.weather", scope: "personal", actor: "UADA" },
           { registry: registry(), store: endpoint.store, baseUrl },
         );
         expect(local.ok).toBe(true);
-        if (local.ok) expect(local.url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+        if (local.ok) {
+          expect(local.url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+          expect(local.warning).toBeUndefined(); // absent env is the normal local-dev posture
+        }
 
-        process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
-        const remote = mintUploadLink(
+        process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = `http://127.0.0.1:${tunnel.port}`;
+        const remote = await mintUploadLink(
           { extension: "fixture.weather", scope: "personal", actor: "UADA" },
           { registry: registry(), store: endpoint.store, baseUrl },
         );
         expect(remote.ok).toBe(true);
         if (remote.ok) {
-          expect(remote.url.startsWith("https://upload.example.com/upload/")).toBe(true);
+          expect(remote.url.startsWith(`http://127.0.0.1:${tunnel.port}/upload/`)).toBe(true);
+          expect(remote.warning).toBeUndefined(); // the live probe passed
           // The public prefix changes only the browser-facing base: the
           // token is the same single-use token the loopback endpoint burns.
-          const token = remote.url.slice("https://upload.example.com/upload/".length);
+          const token = remote.url.slice(`http://127.0.0.1:${tunnel.port}/upload/`.length);
           expect(endpoint.store.consume(token).ok).toBe(true);
         }
       } finally {
@@ -579,6 +601,7 @@ describe("upload link public base + stable port (issue #196)", () => {
         else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
       }
     } finally {
+      tunnel.stop();
       endpoint.stop();
     }
   });
@@ -637,6 +660,101 @@ describe("upload link public base + stable port (issue #196)", () => {
         const probe = `http://${lan.address}:${port}/upload/nope`;
         await expect(fetch(probe, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
         expect((await fetch(`${endpoint.baseUrl}/upload/nope`)).status).toBe(404);
+      }
+    } finally {
+      endpoint.stop();
+    }
+  });
+});
+
+describe("upload link public base liveness (issue #211)", () => {
+  /** The mint reply's URL line: the warning block precedes the relay text. */
+  function urlLine(text: string): string {
+    return text.split("\n").find((line) => line.startsWith("http://"))!;
+  }
+
+  test("a dead configured public URL (5xx from the ingress) → the mint falls back to loopback WITH a loud warning", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    // The tunnel is GONE but the hostname still resolves: Cloudflare's edge
+    // answers 502/530 for the dead quick tunnel — the observed canary
+    // failure mode (run msyi15gi-iwa). The app's own surface never 5xxs an
+    // unknown path, so a 5xx means the ingress cannot reach the listener.
+    const deadTunnel = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response("Bad Gateway", { status: 502 }),
+    });
+    try {
+      const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = `http://127.0.0.1:${deadTunnel.port}`;
+      try {
+        const tool = mintUploadLinkToolDefinition({
+          registry: h.deps.registry,
+          store: endpoint.store,
+          baseUrl: () => endpoint.baseUrl, // the post-fix wiring: loopback fallback only
+          getPrincipal: () => "UADA",
+        });
+        const result = await tool.execute(
+          "t1",
+          { extension: "fixture.weather", scope: "personal" },
+          undefined,
+          undefined,
+          // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
+          { sessionManager: { getSessionFile: () => null } } as never,
+        );
+        expect(result.isError).toBeUndefined();
+        const text = (result.content[0] as { text: string }).text;
+        // The warning is LOUD and actionable: it names the env var, says
+        // the tunnel URL is stale, and flags the link as loopback-only.
+        expect(text).toContain("WARNING");
+        expect(text).toContain("BOTTEGA_OAUTH_CALLBACK_BASE_URL");
+        expect(text).toContain("stale");
+        expect(text).toContain("LOOPBACK-only");
+        // The minted link is the loopback fallback — never the dead URL…
+        const url = urlLine(text);
+        expect(url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+        // …and the relay contract still anchors the reply to that URL.
+        expect(text).toContain("exactly as written");
+        const token = url.slice(endpoint.baseUrl.length + "/upload/".length);
+        expect(endpoint.store.consume(token).ok).toBe(true);
+      } finally {
+        if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+        else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
+      }
+    } finally {
+      deadTunnel.stop();
+      endpoint.stop();
+    }
+  });
+
+  test("a dead configured public URL (connection refused) → the mint falls back to loopback WITH a loud warning", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    // The tunnel process is DOWN: nothing listens on the host — the probe's
+    // connection is refused (the DNS-failure leg of the liveness check;
+    // hermetically equivalent and local).
+    const dead = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });
+    const deadPort = dead.port;
+    dead.stop();
+    try {
+      const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = `http://127.0.0.1:${deadPort}`;
+      try {
+        const outcome = await mintUploadLink(
+          { extension: "fixture.weather", scope: "personal", actor: "UADA" },
+          { registry: registry(), store: endpoint.store, baseUrl: () => endpoint.baseUrl },
+        );
+        expect(outcome.ok).toBe(true);
+        if (outcome.ok) {
+          expect(outcome.url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+          expect(outcome.warning).toBeDefined();
+          expect(outcome.warning).toContain("WARNING");
+          expect(outcome.warning).toContain("stale");
+        }
+      } finally {
+        if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+        else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
       }
     } finally {
       endpoint.stop();

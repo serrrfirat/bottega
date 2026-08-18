@@ -25,6 +25,7 @@ import { standupDigestAction } from "../scheduler/standup";
 import { reflectionAction } from "../scheduler/reflection";
 import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
+import { sendMessageAction } from "../scheduler/send-message";
 import { kbIngestAction } from "../scheduler/kb-ingest";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
@@ -243,6 +244,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     reflectionAction,
     orgPulseAction,
     recurringWorkAction,
+    // Deterministic scheduled messages/reminders (issue #220): posts
+    // directly, no executor round-trip.
+    sendMessageAction,
     // Scheduled KB refresh (epic #170 Wave 2): dispatches kind=kb worker
     // jobs; the containerized worker ingests, never this process.
     kbIngestAction(kbConfig),
@@ -272,14 +276,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   if (orgSettings !== null) {
     regenerateModelsConfig(orgSettings, join(agentDir, "models.yml"));
   }
-  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles
-  // from the agent dir's config.yml; host-dev agent dirs are never re-synced
-  // from config/omp, so a stale copy without the pin makes every session
-  // silently fall back to the provider catalog default (kimi-k2.7-code),
-  // which the Console Go gateway 400s into empty completions. Sync the pin
-  // before the driver guard runs.
-  const pinSync = ensureAgentDirModelPin(agentDir);
-  if (pinSync === "created" || pinSync === "patched") {
+  // Boot-time pin sync (issue #78 recurrence, staleness #207): the SDK
+  // reads modelRoles from the agent dir's config.yml; host-dev agent dirs
+  // are never re-synced from config/omp, so a stale copy without the pin
+  // makes every session silently fall back to the provider catalog default
+  // (kimi-k2.7-code), which the Console Go gateway 400s into empty
+  // completions. Sync the pin before the driver guard runs — but only when
+  // the org settings do NOT override the default (then the operator's own
+  // agent-dir pin is inert and must not be clobbered, #125).
+  const pinSync = ensureAgentDirModelPin(agentDir, OMP_CONFIG_TEMPLATE, {
+    orgDefault: orgSettings?.models?.default,
+  });
+  if (pinSync === "created" || pinSync === "patched" || pinSync === "updated") {
     console.log(
       `bottega boot: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`,
     );
@@ -498,6 +506,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
         router: approvalRouter,
       },
+      // Issue #207: an org-scope settings update regenerates the agent-dir
+      // models.yml catalog so a FRESH session resolves the new default
+      // instead of a boot-stale catalog.
+      agentDir,
     }),
     // Admin tools (issue #73): catalog browser, stack health, deploy info,
     // first-run wizard — gated like the settings tool (write tier →
@@ -571,11 +583,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
                 BOTTEGA_EXTENSIONS_DIR: "config/extensions",
                 // Issue #196: the ACP child's connect_upload_link mint
                 // shares the server's upload_tokens table and points at
-                // the SERVER process's upload endpoint — the deployment's
-                // PUBLIC base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set
-                // (a browser on a remote host reaches the form through the
-                // ingress), else the loopback URL.
-                BOTTEGA_UPLOAD_BASE_URL: uploadPublicBase ?? oauthCallback.baseUrl,
+                // the SERVER process's upload endpoint. BOTTEGA_UPLOAD_BASE_URL
+                // is the LOOPBACK fallback (the shared listener's URL) —
+                // the PUBLIC base is BOTTEGA_OAUTH_CALLBACK_BASE_URL below,
+                // which the child HEALTH-CHECKS at mint time (issue #211: a
+                // dead tunnel URL must never reach a user as a minted link).
+                BOTTEGA_UPLOAD_BASE_URL: oauthCallback.baseUrl,
                 // Issue #198: same for hosted OAuth MCPs — the child's
                 // connect mint shares the server's oauth_flows table and
                 // points the authorization redirect at the SERVER's OAuth
@@ -652,14 +665,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           mcpOAuth: mcpOAuthConnector,
           // Issue #196: the per-session mint tool shares the endpoint's
           // token store (the upload mount's), so links minted in any
-          // session are consumable by the shared listener started above;
-          // the mint URL is the deployment's public base when configured
-          // (BOTTEGA_OAUTH_CALLBACK_BASE_URL), else the loopback URL.
-          uploadLink: { store: uploadMount.store, baseUrl: () => uploadPublicBase ?? oauthCallback.baseUrl },
+          // session are consumable by the shared listener started above.
+          // baseUrl is the LOOPBACK fallback only — the mint health-checks
+          // BOTTEGA_OAUTH_CALLBACK_BASE_URL itself at mint time (issue
+          // #211) and uses the public URL only when it is reachable.
+          uploadLink: { store: uploadMount.store, baseUrl: () => oauthCallback.baseUrl },
         },
-        // Per-space model settings (issue #64): the OMP session resolves
-        // use_model roles against the space's settings column.
-        getModelSettings: (spaceId) => store.getSpaceSettings(spaceId),
+        // Effective model settings (issue #64, org fallback #207): the OMP
+        // session resolves its default/roles against the space's settings
+        // column with the org-wide models.default filling unset slots — the
+        // operator's per-org choice wins over the agent-dir pin.
+        getModelSettings: (spaceId) => store.getEffectiveSpaceSettings(spaceId),
         // Turn-start memory injection (#42), gated by the org policy config.
         memoryContext: {
           provider: memoryProvider,

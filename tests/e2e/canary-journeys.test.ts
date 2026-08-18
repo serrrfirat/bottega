@@ -925,9 +925,17 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
         },
       });
       try {
-        const minted = mintUploadLink(
+        const minted = await mintUploadLink(
           { extension: FIXTURE_EXTENSION_ID, scope: "personal", actor: "U-owner", spaceId },
-          { registry: h.extensionRegistry, store: uploadLink.store, baseUrl: () => uploadLink.baseUrl },
+          {
+            registry: h.extensionRegistry,
+            store: uploadLink.store,
+            baseUrl: () => uploadLink.baseUrl,
+            // Issue #211: hermetic — the canary mints the loopback URL, never
+            // a live probe of the ambient public base (the suite must not
+            // touch the network).
+            resolvePublicBase: async () => ({ base: undefined, warning: undefined }),
+          },
         );
         expect(minted.ok).toBe(true);
         const url = minted.ok ? minted.url : "";
