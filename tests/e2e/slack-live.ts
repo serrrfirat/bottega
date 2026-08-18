@@ -115,6 +115,13 @@ export interface LiveSlackHandle {
   refresh(): Promise<void>;
   /** Fresh conversation history (each call re-reads the API). */
   history(channelId: string): Promise<SlackApiMessage[]>;
+  /**
+   * Fresh messages in one thread (conversations.replies): the parent +
+   * every reply. conversations.history returns ONLY top-level messages, so
+   * a threaded bot reply (channels answer in-thread, #40) is invisible to
+   * history — the thread poll is the journey's second eye (issue #212).
+   */
+  replies(channelId: string, threadTs: string): Promise<SlackApiMessage[]>;
   /** Post a message AS the QA user; resolves with the message ts. */
   postAsUser(channelId: string, text: string): Promise<string>;
   /** Permalink for a message (bot token, chat.getPermalink). */
@@ -260,6 +267,14 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
         limit: 50,
       });
       historyMirror.set(channelId, res.messages);
+      return res.messages;
+    },
+    async replies(channelId, threadTs) {
+      const res = await qa.call<{ messages: SlackApiMessage[] }>("conversations.replies", {
+        channel: channelId,
+        ts: threadTs,
+        limit: 50,
+      });
       return res.messages;
     },
     async postAsUser(channelId, text) {

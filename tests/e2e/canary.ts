@@ -361,6 +361,22 @@ export function canaryMcpOAuthConnector(store: () => OAuthFlowStoreSlice): McpOA
   };
 }
 
+/**
+ * The OAuth `state` from the authorize URL in the journey's reply text
+ * (issue #212): the connector mints the URL with the single-use flow token
+ * as its state param, and the journey reads the URL back from the POSTED
+ * Slack message — where Slack renders URLs as `<url>` in the message text.
+ * The extraction must therefore stop the URL and the state at the `>`
+ * (and at whitespace/`&`), or the captured state carries a trailing `>`
+ * and the callback's flow consume never matches the minted row (the #212
+ * finding). Exported for the hermetic journey-mechanism tests.
+ */
+export function oauthAuthorizeStateFrom(replyText: string): string | undefined {
+  const url = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s<>]+/.exec(replyText)?.[0];
+  if (url === undefined) return undefined;
+  return /[?&]state=([^&\s>]+)/.exec(url)?.[1];
+}
+
 /** The canary's broker seam (issues #196/#198): records the upload with a
  * fixed vault row id — the broker is a separate process in production; the
  * registry upsert + audit are the surfaces under test. */
@@ -489,8 +505,16 @@ function isBotMessage(h: Harness, m: SlackApiMessage): boolean {
  * (and threaded under it in channels — DMs reply plain, #40). Thinking
  * phrases are excluded: the real adapter replaces them in place (#40/#60).
  * Transient history errors retry; only a timeout fails the journey.
+ *
+ * Threaded polls (postAndWait(thread: true) — the channel journeys) read
+ * conversations.replies for the thread instead of history: Slack's
+ * conversations.history returns ONLY top-level messages, so an in-thread
+ * bot reply (the channel answer shape, #40) would never appear to the
+ * poll — the #212 finding (the bot replied 0.8s after the ping but the
+ * journey reported "no bot reply"). Exported for the hermetic
+ * journey-mechanism tests (issue #212).
  */
-async function waitForBotReply(
+export async function waitForBotReply(
   h: Harness,
   channelId: string,
   opts: { afterTs: string; threadTs?: string; label: string; timeoutMs?: number },
@@ -502,8 +526,9 @@ async function waitForBotReply(
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      const history = await live.history(channelId);
-      const hit = history.find(
+      const messages =
+        opts.threadTs !== undefined ? await live.replies(channelId, opts.threadTs) : await live.history(channelId);
+      const hit = messages.find(
         (m) =>
           isBotMessage(h, m) &&
           m.text.trim().length > 0 &&
@@ -1511,11 +1536,11 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
       label: "MCP OAuth connect mint",
     });
     const permalink = await live.permalink(channelId, reply.ts);
-    const urlMatch = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s]+/.exec(reply.text);
+    const urlMatch = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s<>]+/.exec(reply.text);
     if (!reply.text.includes("Open this link to authorize") || !urlMatch) {
       throw new Error(`connect did not mint + show the authorization URL: "${snippet(reply.text)}"`);
     }
-    const state = /[?&]state=([^&\s]+)/.exec(urlMatch[0])?.[1];
+    const state = oauthAuthorizeStateFrom(reply.text);
     if (!state) throw new Error("authorization URL carries no state");
     // The mint persisted a single-use flow row (the callback's first gate):
     // consume succeeds once; a replay (stale/consumed state) fails closed.
@@ -1542,6 +1567,20 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
   } catch (err) {
     return { name: "mcp-oauth-connect", status: "fail", details: [errorMessage(err)] };
   }
+}
+
+/**
+ * The minted upload URL from the connect_upload_link result text (issue
+ * #212): the mint tool returns the URL on its own line followed by the
+ * relay-copy instruction (uploadLinkRelayText — the model must relay the
+ * link verbatim), and Slack renders URLs as <url> in message text. The
+ * journey reads the URL back from that text, so the extraction stops at
+ * the newline / `>` / whitespace — the relay line and the angle brackets
+ * are the tool's/chat's copy, never part of the link. Exported for the
+ * hermetic journey-mechanism tests.
+ */
+export function uploadLinkUrlFrom(text: string): string | undefined {
+  return /http:\/\/127\.0\.0\.1:\d+\/upload\/[A-Za-z0-9_-]+/.exec(text.trim())?.[0];
 }
 
 /**
@@ -1573,10 +1612,8 @@ async function journeyUploadLink(h: Harness, channelId: string, uploadLink: Uplo
       toolCtxFor(h, spaceId),
     );
     if (minted.isError) throw new Error(`connect_upload_link mint failed: ${toolResultText(minted)}`);
-    const url = toolResultText(minted).trim();
-    if (!/^http:\/\/127\.0\.0\.1:\d+\/upload\/[A-Za-z0-9_-]+$/.test(url)) {
-      throw new Error(`mint returned a malformed upload URL: "${url}"`);
-    }
+    const url = uploadLinkUrlFrom(toolResultText(minted));
+    if (!url) throw new Error(`mint returned a malformed upload URL: "${toolResultText(minted).trim()}"`);
     // The form (GET): no scripts, no secret on the wire.
     const form = await fetch(url);
     if (form.status !== 200) throw new Error(`upload form GET returned ${form.status}`);

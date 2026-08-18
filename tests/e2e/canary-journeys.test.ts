@@ -21,9 +21,10 @@
  *     line shapes.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SlackApiMessage } from "./slack-live";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { z } from "zod";
 import { proactiveEnabled } from "../../src/scheduler/proactive-config";
@@ -53,13 +54,14 @@ import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
 import { DELIVERY_APPROVE_ACTION_ID, APPROVE_ACTION_ID } from "../../src/server/adapters/slack";
 import { evaluatePolicyGate } from "../../src/policy/gate";
 import { startUploadLinkServer, mintUploadLink } from "../../src/extensions/upload-link";
+import { OAuthFlowStore } from "../../src/extensions/mcp-oauth";
 import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import { adminToolDefinitions } from "../../src/tools/admin";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
 import { classifyPickupIntent, buildAutoPickupDirective } from "../../src/tools/work-item-pickup";
 import type { McpBinding } from "../../src/extensions/manifest";
-import { bootHarness, AutoApproveRouter, type StubTurn } from "./harness";
+import { bootHarness, AutoApproveRouter, type Harness, type StubTurn } from "./harness";
 import { opencodeSafeToolName } from "../../src/server/drivers/agent-driver";
 import {
   approvalButtonValue,
@@ -69,9 +71,12 @@ import {
   CANARY_ORG_CONFIG,
   canaryFixtureMcpTransport,
   createCanaryRegistry,
+  oauthAuthorizeStateFrom,
   PROGRESS_LINE_RE,
   standupCronFor,
   toolCtxFor,
+  uploadLinkUrlFrom,
+  waitForBotReply,
 } from "./canary";
 const callbackPort = process.env.BOTTEGA_CALLBACK_PORT;
 beforeAll(() => {
@@ -172,6 +177,45 @@ describe("scheduled-standup journey mechanism (issue #175)", () => {
     } finally {
       await h.cleanup();
     }
+  });
+});
+
+describe("channel chat-reply thread polling (issue #212)", () => {
+  test("waitForBotReply finds an IN-THREAD bot reply via conversations.replies when history only has top-level messages", async () => {
+    // Live finding (run msyggnjh-123m): in channels the bot answered the
+    // ping IN-THREAD (conversations.replies shows the reply 0.8s after the
+    // ping's ts) but the journey timed out — conversations.history returns
+    // ONLY top-level messages, so a threaded reply never appeared to the
+    // poll. The stub client mirrors the live handle: history returns the
+    // top-level QA ping (no bot rows), replies returns the threaded bot
+    // reply — the journey must poll the thread (postAndWait(thread: true)
+    // passes threadTs: inboundTs) to see it.
+    const pingTs = "1787000000.000100";
+    const botReply: SlackApiMessage = {
+      ts: "1787000000.000900",
+      channel: "C1",
+      bot_id: "B-bot",
+      text: "in-thread bot reply",
+      thread_ts: pingTs,
+    };
+    // SAFETY: the stub only exposes the sync members waitForBotReply reads
+    // (history/replies for the poll, botUserId/qaUserId for isBotMessage);
+    // the rest of the Harness surface is unused in this mechanism test.
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        history: async () => [{ ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" }],
+        replies: async () => [botReply],
+      },
+    } as unknown as Harness;
+    const reply = await waitForBotReply(h, "C1", {
+      afterTs: pingTs,
+      threadTs: pingTs,
+      label: "channel ping",
+      timeoutMs: 2_000,
+    });
+    expect(reply.text).toBe("in-thread bot reply");
   });
 });
 
@@ -575,6 +619,96 @@ describe("extension-pin journey mechanism (issue #195)", () => {
       await h.cleanup();
     }
   });
+
+  test("the journey's OAuth fixture.pin regenerates the egress configs — fixtures need no verified token endpoint (#212)", async () => {
+    // Live finding (run msyggnjh-123m): the #195 journey pins fixture.pin
+    // with an oauth credentialSchema (the preferred hosted-OAuth shape),
+    // and the pin's egress regeneration failed with
+    //   egress config generation: the OAuth extension "fixture.pin" has no
+    //   verified token endpoint — add one to OAUTH_TOKEN_ENDPOINTS
+    // The draft/params below are the journey's EXACT shape (canary.ts
+    // journeyExtensionPin) driven through the real catalog_browser tool;
+    // the regenerated egress config must carry the fixture's oauth_token
+    // entry. The deployed config/egress.yml is untouched (temp dirs).
+    const tempRoot = mkdtempSync(join(tmpdir(), "bottega-canary-pin-oauth-"));
+    const draftsDir = join(tempRoot, "drafts");
+    const snapshotsDir = join(tempRoot, "snapshots");
+    const egressPath = join(tempRoot, "egress.yml");
+    const devEgressPath = join(tempRoot, "egress.dev.yml");
+    const spec = "fixture.pin";
+    const h = await bootHarness({ registry: createCanaryRegistry() });
+    try {
+      const dm = h.slack.dmChannelId;
+      const spaceId = `slack:${dm}`;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: dm });
+      const draft: SnapshotDraft = {
+        schema: SNAPSHOT_SCHEMA,
+        extensionId: spec,
+        pinnedAt: new Date().toISOString(),
+        source: { catalog: "canary://fixture", specId: spec, vendorOfficial: true, reviewed: false },
+        manifest: {
+          id: spec,
+          label: "Fixture Pin MCP",
+          vendor: "bottega-fixtures",
+          kind: "mcp",
+          domains: ["fixture-pin.example.com"],
+          mcp: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+          credentialSchema: { type: "oauth", scopes: ["read"] },
+          tools: [],
+        },
+      };
+      mkdirSync(draftsDir, { recursive: true });
+      writeFileSync(join(draftsDir, `${spec}.draft.json`), JSON.stringify(draft, null, 2) + "\n");
+
+      const catalogBrowser = adminToolDefinitions(h.store, {
+        audit: h.audit,
+        registry: h.extensionRegistry,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        devEgressConfigPath: devEgressPath,
+        egressConfigPath: egressPath,
+      }).find((t) => t.name === "catalog_browser")!;
+      // The journey's pin params: OAuth credential schema (issue #195 —
+      // hosted OAuth is the preferred binding; the api_key variant the
+      // older hermetic test pins does NOT exercise the oauth_token
+      // regeneration path this journey runs).
+      const params = {
+        action: "pin",
+        spec,
+        binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+        credential_schema: { type: "oauth", scopes: ["read"] },
+        vendor_official: true,
+      } as const;
+
+      const refused = await catalogBrowser.execute("tc1", params, undefined, undefined, toolCtxFor(h, spaceId));
+      expect(refused.isError).toBe(true);
+      const pinned = await catalogBrowser.execute(
+        "tc2",
+        { ...params, confirm: true },
+        undefined,
+        undefined,
+        toolCtxFor(h, spaceId),
+      );
+      expect(pinned.isError).not.toBe(true);
+      const body = JSON.parse((pinned.content[0] as { text: string }).text) as {
+        reviewed?: unknown;
+        live_registry?: unknown;
+        egress_regenerated?: unknown[];
+      };
+      expect(body.reviewed).toBe(true);
+      expect(body.live_registry).toBe("registered");
+      expect(body.egress_regenerated).toEqual([egressPath, devEgressPath]);
+      // The strict egress config regenerated with the fixture's oauth_token
+      // entry (the proxy mints its access token at egress — issue #208).
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain("- name: oauth_token");
+      expect(egress).toContain('token_endpoint: "https://fixture-pin.example.com/token"');
+      expect(egress).toContain('- host: "fixture-pin.example.com"');
+      expect(readFileSync(devEgressPath, "utf8")).toContain("- name: oauth_token");
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => {
@@ -599,6 +733,48 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
       expect(h.store.getOAuthFlow(state!)).not.toBeNull();
       expect(h.store.consumeOAuthFlow(state!).ok).toBe(true);
       expect(h.store.consumeOAuthFlow(state!).ok).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("the journey's state extraction round-trips the minted flow token from the Slack-rendered authorize URL (#212)", async () => {
+    // Live finding (run msyggnjh-123m): the mcp-oauth journey failed on the
+    // state check. Slack renders URLs in POSTED message text as <url>, and
+    // the journey reads the URL back from history — the extraction must
+    // stop the URL and the state at the `>` (and at whitespace/&) or the
+    // captured state carries a trailing `>` and the callback's flow consume
+    // (the single-use gate) never matches the minted row. The connector
+    // mints the state (the flow token) into the authorize URL; this test
+    // drives the journey's extraction over the exact Slack-rendered reply
+    // shape and asserts the parsed state consumes the minted flow exactly
+    // once (the callback path the journey uses).
+    const h = await bootHarness({ registry: createCanaryRegistry() });
+    try {
+      const dm = h.slack.dmChannelId;
+      const spaceId = `slack:${dm}`;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: dm });
+      const connector = canaryMcpOAuthConnector(() => h.store);
+      const start = await connector.start({
+        extension: CANARY_OAUTH_EXTENSION_ID,
+        provider: CANARY_OAUTH_EXTENSION_ID,
+        label: "Fixture OAuth MCP",
+        scope: "personal",
+        actor: "U-owner",
+        spaceId,
+      });
+      expect(start.ok).toBe(true);
+      const authorizationUrl = start.ok ? start.authorizationUrl : "";
+      // Slack's message text stores every URL as <url> — the reply the
+      // journey's history poll reads back.
+      const slackReply =
+        `Open this link to authorize Fixture OAuth MCP: <${authorizationUrl}> — ` +
+        "after you authorize in the browser, Fixture OAuth MCP is connected.";
+      const state = oauthAuthorizeStateFrom(slackReply);
+      expect(state).toBeDefined();
+      const flowStore = new OAuthFlowStore(h.store);
+      expect(flowStore.consume(state!).ok).toBe(true);
+      expect(flowStore.consume(state!).ok).toBe(false);
     } finally {
       await h.cleanup();
     }
@@ -648,6 +824,27 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
     } finally {
       await h.cleanup();
     }
+  });
+
+  test("the journey's upload-URL extraction stops at the relay copy and Slack's angle brackets (#212)", () => {
+    // Live finding (run msyggnjh-123m): the mint reply text was
+    //   <http://127.0.0.1:64204/upload/<token>\nRelay this upload link
+    //   exactly as written — never construct, reformat, or substitute the
+    //   URL.
+    // Slack wraps the URL in <>, and the mint tool appends the relay-copy
+    // line (uploadLinkRelayText) — the journey captured the WHOLE thing as
+    // "malformed upload URL". The extraction must return only the link.
+    const token = "A1b2C3d4E5f6G7h8I9j0K1l2";
+    const expected = `http://127.0.0.1:64204/upload/${token}`;
+    const liveReply =
+      `<${expected}\n` + "Relay this upload link exactly as written — never construct, reformat, or substitute the URL.";
+    expect(uploadLinkUrlFrom(liveReply)).toBe(expected);
+    // The unwrapped tool-result shape (what the journey reads directly from
+    // the mint tool) extracts the same link.
+    const toolResult = `${expected}\nRelay this upload link exactly as written — never construct, reformat, or substitute the URL.`;
+    expect(uploadLinkUrlFrom(toolResult)).toBe(expected);
+    // A genuinely malformed reply (no loopback link) still fails closed.
+    expect(uploadLinkUrlFrom("no link here")).toBeUndefined();
   });
 });
 
