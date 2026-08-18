@@ -26,54 +26,45 @@ function freshEnv(): NodeJS.ProcessEnv {
   return {};
 }
 
-describe("seedBootSecretsFromVault precedence (issue #201)", () => {
+describe("seedBootSecretsFromVault precedence (issue #201, shrunk #208)", () => {
   test("a vault row seeds the env BEFORE the SDK constructs providers", async () => {
     const env = freshEnv();
     const vault = new Map<string, string>([
       ["slack-app", "xapp-vault"],
       ["slack-bot", "xoxb-vault"],
-      ["opencode", "sk-opencode-vault"],
-      ["near", "near-vault-key"],
-      ["openai", "sk-openai-vault"],
-      ["anthropic", "sk-anthropic-vault"],
       ["github-webhook", "gh-webhook-vault"],
     ]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
     expect(env.SLACK_APP_TOKEN).toBe("xapp-vault");
     expect(env.SLACK_BOT_TOKEN).toBe("xoxb-vault");
-    expect(env.OPENCODE_API_KEY).toBe("sk-opencode-vault");
-    expect(env.NEAR_API_KEY).toBe("near-vault-key");
-    expect(env.OPENAI_API_KEY).toBe("sk-openai-vault");
-    expect(env.ANTHROPIC_API_KEY).toBe("sk-anthropic-vault");
     expect(env.GITHUB_WEBHOOK_SECRET).toBe("gh-webhook-vault");
   });
 
   test("vault beats env — the source of truth moved to the vault", async () => {
-    const env = { NEAR_API_KEY: "env-key" };
-    const vault = new Map([["near", "vault-key"]]);
+    const env = { SLACK_APP_TOKEN: "xapp-env" };
+    const vault = new Map([["slack-app", "xapp-vault"]]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
-    expect(env.NEAR_API_KEY).toBe("vault-key");
+    expect(env.SLACK_APP_TOKEN).toBe("xapp-vault");
   });
 
   test("env wins as the fallback when the vault has no row", async () => {
-    const env = { NEAR_API_KEY: "env-key", SLACK_APP_TOKEN: "xapp-env" };
+    const env = { SLACK_APP_TOKEN: "xapp-env" };
     await seedBootSecretsFromVault({ env, fetchVault: NO_VAULT, readKeychain: NO_KEYCHAIN, log: SILENT });
-    expect(env.NEAR_API_KEY).toBe("env-key");
     expect(env.SLACK_APP_TOKEN).toBe("xapp-env");
   });
 
   test("Keychain is the last leg before fail closed (local dev)", async () => {
     const env = freshEnv();
-    const keychain = new Map([["bottega-near", "keychain-near"]]);
+    const keychain = new Map([["bottega-slack-app", "xapp-keychain"]]);
     await seedBootSecretsFromVault({
       env,
       fetchVault: NO_VAULT,
       readKeychain: async (service) => keychain.get(service) ?? null,
       log: SILENT,
     });
-    expect(env.NEAR_API_KEY).toBe("keychain-near");
-    // The opencode row exists in the table but has no Keychain entry → unset.
-    expect(env.OPENCODE_API_KEY).toBeUndefined();
+    expect(env.SLACK_APP_TOKEN).toBe("xapp-keychain");
+    // The slack-bot row exists in the table but has no Keychain entry → unset.
+    expect(env.SLACK_BOT_TOKEN).toBeUndefined();
   });
 
   test("missing everywhere leaves the env unset — the existing boot guards fail closed", async () => {
@@ -85,9 +76,9 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
   });
 
   test("empty-string env values are treated as unset (fall through to Keychain)", async () => {
-    const env = { NEAR_API_KEY: "" };
-    await seedBootSecretsFromVault({ env, fetchVault: NO_VAULT, readKeychain: async () => "kc-key", log: SILENT });
-    expect(env.NEAR_API_KEY).toBe("kc-key");
+    const env = { SLACK_BOT_TOKEN: "" };
+    await seedBootSecretsFromVault({ env, fetchVault: NO_VAULT, readKeychain: async () => "xoxb-kc", log: SILENT });
+    expect(env.SLACK_BOT_TOKEN).toBe("xoxb-kc");
   });
 
   test("the default Keychain reader is gated on BOTTEGA_KEYCHAIN_SEED=1 (tests never read a real Keychain)", async () => {
@@ -102,39 +93,43 @@ describe("seedBootSecretsFromVault precedence (issue #201)", () => {
   });
 
   test("an empty vault api_key row is treated as absent", async () => {
-    const env = { NEAR_API_KEY: "env-key" };
-    const vault = new Map([["near", ""]]);
+    const env = { SLACK_APP_TOKEN: "xapp-env" };
+    const vault = new Map([["slack-app", ""]]);
     await seedBootSecretsFromVault({ env, fetchVault: () => Promise.resolve(vault), readKeychain: NO_KEYCHAIN, log: SILENT });
-    expect(env.NEAR_API_KEY).toBe("env-key");
+    expect(env.SLACK_APP_TOKEN).toBe("xapp-env");
   });
 });
 
-describe("boot secret identity table (issue #201)", () => {
+describe("boot secret identity table (issue #201, shrunk #208)", () => {
   test("every vault provider id maps back to its secret", () => {
     const providers = BOOT_SECRETS.map((s) => s.vaultProvider);
     expect(providers).toEqual([
       "slack-app",
       "slack-bot",
+      "github-webhook",
       "opencode",
       "near",
       "openai",
       "anthropic",
-      "github-webhook",
     ]);
     for (const provider of providers) {
       expect(bootSecretForProvider(provider)?.vaultProvider).toBe(provider);
     }
     expect(bootSecretForProvider("github")).toBeUndefined();
+    // Model provider identities remain provisionable through the upload-link
+    // path, but are explicitly excluded from app-environment seeding.
+    expect(bootSecretForProvider("near")?.seedAtBoot).toBe(false);
+    expect(bootSecretForProvider("opencode")?.seedAtBoot).toBe(false);
   });
 
   test("Keychain services follow the dev.sh pattern: bottega-<provider>", () => {
-    expect(keychainServiceFor(bootSecretForProvider("near")!)).toBe("bottega-near");
-    expect(keychainServiceFor(bootSecretForProvider("opencode")!)).toBe("bottega-opencode");
     expect(keychainServiceFor(bootSecretForProvider("slack-app")!)).toBe("bottega-slack-app");
+    expect(keychainServiceFor(bootSecretForProvider("slack-bot")!)).toBe("bottega-slack-bot");
+    expect(keychainServiceFor(bootSecretForProvider("github-webhook")!)).toBe("bottega-github-webhook");
   });
 });
 
-describe("live boot with the secrets in the vault (issue #201)", () => {
+describe("live boot with the secrets in the vault (issue #201, shrunk #208)", () => {
   /** A schema-valid broker snapshot (GET /v1/snapshot, wire schemas are strict). */
   function snapshotResponse(entries: unknown[]): string {
     return JSON.stringify({
@@ -146,7 +141,9 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
     });
   }
 
-  /** Fake broker: serves every boot secret as an api_key vault row. */
+  /** Fake broker: serves every boot secret as an api_key vault row (the
+   * model provider keys are NOT boot secrets since #208 — the proxy holds
+   * them, src/extensions/proxy-seed). */
   function fakeBroker() {
     const server = Bun.serve({
       port: 0,
@@ -156,10 +153,6 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
           snapshotResponse([
             { id: 1, provider: "slack-app", credential: { type: "api_key", key: "xapp-vault" }, identityKey: null, rotatesInMs: null },
             { id: 2, provider: "slack-bot", credential: { type: "api_key", key: "xoxb-vault" }, identityKey: null, rotatesInMs: null },
-            { id: 3, provider: "opencode", credential: { type: "api_key", key: "sk-opencode-vault" }, identityKey: null, rotatesInMs: null },
-            { id: 4, provider: "near", credential: { type: "api_key", key: "near-vault-key" }, identityKey: null, rotatesInMs: null },
-            { id: 5, provider: "openai", credential: { type: "api_key", key: "sk-openai-vault" }, identityKey: null, rotatesInMs: null },
-            { id: 6, provider: "anthropic", credential: { type: "api_key", key: "sk-anthropic-vault" }, identityKey: null, rotatesInMs: null },
             { id: 7, provider: "github-webhook", credential: { type: "api_key", key: "gh-webhook-vault" }, identityKey: null, rotatesInMs: null },
           ]),
           { headers: { "content-type": "application/json" } },
@@ -254,18 +247,18 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
   const MODEL_AGENT_YML =
     "providers:\n" +
     "  opencode-go:\n" +
-    "    apiKey: OPENCODE_API_KEY\n" +
+    "    apiKey: bottega-proxy-placeholder\n" +
     "  near:\n" +
     "    api: openai-completions\n" +
     "    baseUrl: \"https://cloud-api.near.ai/v1\"\n" +
-    "    apiKey: NEAR_API_KEY\n" +
+    "    apiKey: bottega-proxy-placeholder\n" +
     "    models:\n" +
     "      - id: zai-org/GLM-5.1-FP8\n" +
     "        name: GLM 5.1 FP8 via NEAR AI Cloud\n" +
     "        contextWindow: 128000\n" +
     "        maxTokens: 8192\n";
 
-  test("main() boots with every secret in the vault and none in env — the seed ran before the SDK constructed providers", async () => {
+  test("main() boots with the secrets in the vault + the placeholder models.yml and NO provider keys — the #80 guard passes on the placeholders (issue #208)", async () => {
     const broker = fakeBroker();
     const env = tempEnv(broker.url);
     try {
@@ -274,15 +267,18 @@ describe("live boot with the secrets in the vault (issue #201)", () => {
       writeFileSync(join(agentDir, "models.yml"), MODEL_AGENT_YML);
       const server = await main({ agentDir });
       try {
-        // The Slack guard passed AND the #80 model-key guard passed with
-        // NOTHING in env before the boot — the vault seeded everything.
+        // The Slack guard passed with NOTHING in env before the boot — the
+        // vault seeded the channel secrets…
         expect(process.env.SLACK_APP_TOKEN).toBe("xapp-vault");
         expect(process.env.SLACK_BOT_TOKEN).toBe("xoxb-vault");
-        expect(process.env.OPENCODE_API_KEY).toBe("sk-opencode-vault");
-        expect(process.env.NEAR_API_KEY).toBe("near-vault-key");
-        expect(process.env.OPENAI_API_KEY).toBe("sk-openai-vault");
-        expect(process.env.ANTHROPIC_API_KEY).toBe("sk-anthropic-vault");
         expect(process.env.GITHUB_WEBHOOK_SECRET).toBe("gh-webhook-vault");
+        // …and the #80 model-key guard passed on the PROXY PLACEHOLDERS:
+        // the model provider env keys are NOT boot secrets anymore (#208)
+        // — the app process never holds a live key; the proxy does.
+        expect(process.env.NEAR_API_KEY).toBeUndefined();
+        expect(process.env.OPENCODE_API_KEY).toBeUndefined();
+        expect(process.env.OPENAI_API_KEY).toBeUndefined();
+        expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
       } finally {
         await server.stop();
       }

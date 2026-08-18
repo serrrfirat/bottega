@@ -58,6 +58,7 @@ transforms:
       domains:
         - "cloud-api.near.ai"
         - "*.completions.near.ai"
+        - "opencode.ai"
         - "api.openai.com"
         - "api.anthropic.com"
         - "raw.githubusercontent.com"
@@ -66,8 +67,6 @@ transforms:
         - "mcp.attio.com"
         - "api.githubcopilot.com"
         - "mcp.linear.app"
-        - "api.notion.com"
-        - "notion.com"
 
   # 2. Judge: LLM policy gate. Fires on every request that passed the
   #    allowlist. Independent circuit breaker + timeout per instance.
@@ -99,27 +98,24 @@ transforms:
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
-  # 3. Secrets: boundary credential injection (issue #53). Extension calls
-  #    carry no credential — the runtime resolves the caller's credential
-  #    at call time and writes it to the extension's secret file on the
-  #    shared data volume (mode 0600, write-temp + rename); this transform
-  #    INJECTS it as the Authorization header for the extension's
-  #    allowlisted domains before egress. The file source re-reads on
-  #    config reload and on ttl expiry, so the credential rotates on a
-  #    running proxy. Judge runs BEFORE secrets so the LLM judge never sees
-  #    real credentials (iron-proxy README's recommended ordering).
+  # 3. Secrets: boundary credential injection (issue #53 + #208). Extension
+  #    calls carry no credential — the runtime resolves the caller's
+  #    credential at call time and writes it to the extension's secret file
+  #    on the shared data volume (mode 0600, write-temp + rename); this
+  #    transform INJECTS it as the Authorization header for the extension's
+  #    allowlisted domains before egress. The MODEL GATEWAY entries below
+  #    do the same for the providers config/omp/models.yml declares: the
+  #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
+  #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
+  #    (seeded at boot by src/extensions/proxy-seed). require: true — a
+  #    missing key rejects the request (502) instead of letting the
+  #    placeholder reach the gateway. File sources re-read on config reload
+  #    and on ttl expiry, so credentials rotate on a running proxy. Judge
+  #    runs BEFORE secrets so the LLM judge never sees real credentials
+  #    (iron-proxy README's recommended ordering).
   - name: secrets
     config:
       secrets:
-        - source:
-            type: file
-            path: "/data/proxy-secrets/attio.secret"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-          rules:
-            - host: "mcp.attio.com"
         - source:
             type: file
             path: "/data/proxy-secrets/github.secret"
@@ -131,23 +127,87 @@ transforms:
             - host: "api.githubcopilot.com"
         - source:
             type: file
-            path: "/data/proxy-secrets/linear.secret"
+            path: "/data/proxy-secrets/near.secret"
             ttl: "30s"
           inject:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
+            require: true
           rules:
-            - host: "mcp.linear.app"
+            - host: "cloud-api.near.ai"
         - source:
             type: file
-            path: "/data/proxy-secrets/notion.secret"
+            path: "/data/proxy-secrets/opencode.secret"
             ttl: "30s"
           inject:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
+            require: true
           rules:
-            - host: "api.notion.com"
-            - host: "notion.com"
+            - host: "opencode.ai"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/openai.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "api.openai.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/anthropic.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "api.anthropic.com"
+
+  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send
+  #    the placeholder bearer; this transform holds each provider's refresh
+  #    token + client credentials (the sync's JSON blob,
+  #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
+  #    tokens at egress, and stubs inbound requests to each configured
+  #    token_endpoint with a synthetic token so the SDK's own token dance
+  #    completes against the proxy. require: true — a missing/unmintable
+  #    credential rejects the request (502), never an unauthenticated
+  #    upstream call.
+  - name: oauth_token
+    config:
+      tokens:
+        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "/data/proxy-secrets/attio-oauth.json"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "/data/proxy-secrets/attio-oauth.json"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "https://app.attio.com/oidc/token"
+          require: true
+          rules:
+            - host: "mcp.attio.com"
+        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "/data/proxy-secrets/linear-oauth.json"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "/data/proxy-secrets/linear-oauth.json"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "https://mcp.linear.app/token"
+          require: true
+          rules:
+            - host: "mcp.linear.app"
 
 log:
   level: "info"

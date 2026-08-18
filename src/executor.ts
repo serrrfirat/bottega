@@ -80,6 +80,7 @@ import {
 } from "./server/drivers/agent-driver";
 import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
 import { seedBootSecretsFromVault } from "./server/boot-secrets";
+import { syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "./extensions/boundary";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -264,11 +265,15 @@ export async function bootExecutorRuntime(opts: {
    */
   boundary?: SecretFileBoundaryOpts;
 } = {}): Promise<ExecutorBoot> {
-  // Issue #201: seed the provider keys from the auth-broker vault before
-  // the SDK constructs providers — the executor's sessions resolve the
-  // same models.yml env names as the server, and the #80 model-key guard
-  // below needs the seeded env. Same call as the server and MCP roots.
+  // Issue #201: seed the boot secrets (Slack tokens + webhook secret) from
+  // the auth-broker vault before the SDK constructs providers — the
+  // executor's sessions resolve the same models.yml as the server, and the
+  // #80 model-key guard below needs the seeded env. Same call as the
+  // server and MCP roots. Issue #208: then push the provider credentials
+  // into the proxy (the app process never holds them — models.yml carries
+  // the placeholder, the proxy injects the real key at egress).
   await seedBootSecretsFromVault();
+  await syncProxyCredentialsFromEnv();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),

@@ -1,28 +1,27 @@
 /**
- * Boot-time secret seeding (issue #201): the boot resolves the secrets the
- * Slack adapter and the OMP SDK's providers read — the Slack tokens and the
- * provider keys referenced BY NAME in models.yml (`providers.*.apiKey`) —
- * from the auth-broker vault BEFORE the SDK constructs providers, with
- * precedence **vault → env → Keychain (local dev, opt-in) → fail closed**,
- * and seeds `process.env` so the SDK's env-name resolution and the Slack
- * adapter see ONE source of truth. The models.yml env-name references stay
- * (the SDK is unchanged); only the source of truth moves.
+ * Boot-time secret seeding (issue #201, shrunk #208): the boot resolves the
+ * secrets the Slack adapter and the GitHub webhook verifier read — the
+ * Slack tokens + the webhook shared secret — from the auth-broker vault
+ * BEFORE the SDK constructs providers, with precedence **vault → env →
+ * Keychain (local dev, opt-in) → fail closed**, and seeds `process.env`
+ * so the Slack adapter sees ONE source of truth. The model provider keys
+ * are NOT boot secrets anymore: since #208 the app's models.yml carries
+ * only the proxy placeholder and iron-proxy injects the real keys at
+ * egress (src/extensions/proxy-seed.ts seeds them into the proxy).
  *
  * The vault row identity is the broker's provider key: each secret maps to
- * a stable provider id (`slack-app`, `slack-bot`, `opencode`, `near`,
- * `openai`, `anthropic`) — the SAME ids the `connect_upload_link`
- * provisioning path stores (src/extensions/upload-link.ts) and the same
- * shape as the Keychain services (`bottega-<provider>`, the dev.sh
- * pattern: `bottega-near`, `bottega-opencode`).
+ * a stable provider id (`slack-app`, `slack-bot`, `github-webhook`) — the
+ * SAME ids the `connect_upload_link` provisioning path stores
+ * (src/extensions/upload-link.ts) and the same shape as the Keychain
+ * services (`bottega-<provider>`, the dev.sh pattern).
  *
  * Precedence per secret:
  *   1. **vault** — an api_key row for the provider in the auth-broker
  *      snapshot (`OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN` — the same
  *      env contract as the #190 secret resolver). A configured-but-
  *      unreachable broker logs a warning and falls through: the boot
- *      guards (the Slack "required" check, the #80 model-key guard) still
- *      fail the boot per secret, so a missing-everywhere secret is never a
- *      half boot.
+ *      guards (the Slack "required" check) still fail the boot per
+ *      secret, so a missing-everywhere secret is never a half boot.
  *   2. **env** — the value already set (`.env`, dev.sh's Keychain load).
  *   3. **Keychain** — macOS `security` lookup of `bottega-<provider>`,
  *      ONLY when `BOTTEGA_KEYCHAIN_SEED=1` opts in (bare local runs
@@ -33,7 +32,9 @@
  *
  * Every composition root (src/server/index.ts, src/executor.ts,
  * src/mcp/server.ts — the #172 parity set) calls this before constructing
- * anything else. Secret VALUES are never logged — only names + source.
+ * anything else, then the proxy credential sync
+ * (src/extensions/proxy-seed.ts). Secret VALUES are never logged — only
+ * names + source.
  */
 import { execFileSync } from "node:child_process";
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
@@ -46,21 +47,23 @@ export interface BootSecret {
   vaultProvider: string;
   /** Human label for provisioning feedback and the upload form. */
   label: string;
+  /** False when the id is provisionable here but consumed by iron-proxy. */
+  seedAtBoot?: boolean;
 }
 
 /**
- * The boot secrets (issue #201): the Slack tokens + every provider key
- * models.yml references. The vaultProvider doubles as the
- * `connect_upload_link` extension id for provisioning.
+ * Provisionable secret identities. Slack and the webhook secret seed the
+ * app environment. Model keys remain provisionable through the same
+ * upload-link path but are consumed by the iron-proxy sync instead.
  */
 export const BOOT_SECRETS: readonly BootSecret[] = [
   { envName: "SLACK_APP_TOKEN", vaultProvider: "slack-app", label: "Slack app-level token" },
   { envName: "SLACK_BOT_TOKEN", vaultProvider: "slack-bot", label: "Slack bot token" },
-  { envName: "OPENCODE_API_KEY", vaultProvider: "opencode", label: "OpenCode provider key" },
-  { envName: "NEAR_API_KEY", vaultProvider: "near", label: "NEAR AI Cloud key" },
-  { envName: "OPENAI_API_KEY", vaultProvider: "openai", label: "OpenAI key" },
-  { envName: "ANTHROPIC_API_KEY", vaultProvider: "anthropic", label: "Anthropic key" },
   { envName: "GITHUB_WEBHOOK_SECRET", vaultProvider: "github-webhook", label: "GitHub webhook shared secret" },
+  { envName: "OPENCODE_API_KEY", vaultProvider: "opencode", label: "OpenCode model key", seedAtBoot: false },
+  { envName: "NEAR_API_KEY", vaultProvider: "near", label: "NEAR model key", seedAtBoot: false },
+  { envName: "OPENAI_API_KEY", vaultProvider: "openai", label: "OpenAI model key", seedAtBoot: false },
+  { envName: "ANTHROPIC_API_KEY", vaultProvider: "anthropic", label: "Anthropic model key", seedAtBoot: false },
 ];
 
 /** The boot secret with the given vault provider identity, if any. */
@@ -167,6 +170,7 @@ export async function seedBootSecretsFromVault(opts: BootSecretSeedOpts = {}): P
   const readKeychain = opts.readKeychain ?? keychainReaderFromEnv(env);
   const vault = await fetchVault();
   for (const secret of BOOT_SECRETS) {
+    if (secret.seedAtBoot === false) continue;
     // 1. Vault (the source of truth): beats env/Keychain when a row exists.
     const fromVault = vault.get(secret.vaultProvider);
     if (fromVault !== undefined && fromVault !== "") {
@@ -183,7 +187,9 @@ export async function seedBootSecretsFromVault(opts: BootSecretSeedOpts = {}): P
       env[secret.envName] = keychain;
       log(`bottega boot: ${secret.envName} seeded from the macOS Keychain (${keychainServiceFor(secret)})`);
     }
-    // 4. Unset → the existing boot guards (Slack "required", #80 model-key
-    //    guard) fail the boot with their unchanged messages.
+    // 4. Unset → the existing boot guards (Slack "required") fail the
+    //    boot with their unchanged messages. (The #80 model guard is
+    //    unaffected: models.yml carries the placeholder, so the SDK's
+    //    available-model count never depends on these secrets.)
   }
 }

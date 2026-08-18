@@ -48,9 +48,10 @@ describe("config/omp templates (issue #9 secrets & models)", () => {
     expect(near["api"]).toBe("openai-completions");
     // Live NEAR AI Cloud gateway (issue #36); api.near.ai was retired.
     expect(near["baseUrl"]).toBe("https://cloud-api.near.ai/v1");
-    // apiKey is an env-var reference, resolved by the SDK at runtime — the
-    // key value itself never appears in the template.
-    expect(near["apiKey"]).toBe("NEAR_API_KEY");
+    // apiKey is the proxy placeholder (issue #208): the SDK sends it and
+    // iron-proxy swaps the real key at egress — the key value itself never
+    // appears in the template or the app process.
+    expect(near["apiKey"]).toBe("bottega-proxy-placeholder");
   });
 });
 

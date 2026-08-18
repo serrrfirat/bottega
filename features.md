@@ -392,12 +392,15 @@ is protected on the way out:
   allowlisted request is judged by a policy LLM ("deny unless clearly
   required by the task and safe"), and DNS is sinkholed so nothing leaks
   around the proxy.
-- **Credentials never travel with the call** — the per-turn caller selects
-  a credential through the org/me/auto ladder (#152). The configured
-  resolver fetches it from `omp-broker` or 1Password Connect (#190), the
-  boundary writes a mode-0600 file, and iron-proxy injects the
-  `Authorization` header only for the extension's allowlisted domains.
-  Agent env, transcripts, and audit receive identifiers, never the secret.
+- **Credentials attach only at the egress boundary** — model providers send
+  `bottega-proxy-placeholder`; iron-proxy replaces it from provider-specific
+  mode-0600 files and refuses missing files. API-key extensions use the same
+  boundary. Active OAuth extension snapshots use iron-proxy's native token
+  transform, which refreshes, caches, single-flight deduplicates, and injects
+  short-lived access tokens. The vault remains the source of truth; provider
+  env fallbacks are cleared after boot synchronization. Agent env,
+  transcripts, and audit receive identifiers or placeholders, never the
+  retained live value.
 - **Obvious pasted credentials are refused at typed write boundaries**
   (#121/#196). `connect_extension` rejects recognized credential shapes
   before policy, broker, registry, or audit work and directs the agent to
@@ -408,9 +411,8 @@ is protected on the way out:
   the server boots. The dev proxy runs the generated DEV config
   (`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge), so
   testing passes for web search, GitHub, Slack, and model endpoints alike;
-  the strict `config/egress.yml` (default-deny allowlist + LLM judge) stays
-  the deployment contract, unchanged. The extension credential boundary
-  (secret-file write + proxy reload) is the injection path in BOTH.
+  the strict `config/egress.yml` retains default-deny + the LLM judge.
+  Static-secret and OAuth-token transforms are identical in both configs.
 
 **Dev vs deployment (issue #126):** the strict config's judge rules denied
 the server's own model calls (a context-free LLM denies bare model/API

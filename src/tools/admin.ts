@@ -90,7 +90,7 @@ import {
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
-import { proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
 import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
@@ -230,9 +230,6 @@ function envValue(name: string): string | null {
   return /replace|\.\.\./i.test(value) ? null : value;
 }
 
-function placeholderFix(envName: string, source: string): string {
-  return `set ${envName} in .env (${source}); it must not be a placeholder`;
-}
 
 // ---------------------------------------------------------------------------
 // Catalog browser
@@ -562,7 +559,11 @@ export function runWizardChecks(
 ): WizardCheck[] {
   const slackApp = envValue("SLACK_APP_TOKEN");
   const slackBot = envValue("SLACK_BOT_TOKEN");
-  const modelKey = envValue("OPENCODE_API_KEY") ?? envValue("NEAR_API_KEY");
+  const proxySecretsDir = process.env.BOTTEGA_PROXY_SECRETS_DIR ?? PROXY_SECRETS_DIR;
+  const modelKey = ["opencode.secret", "near.secret"].some((file) => {
+    const path = resolve(proxySecretsDir, file);
+    return existsSync(path) && statSync(path).size > 0;
+  });
   const brokerToken = envValue("OMP_AUTH_BROKER_TOKEN");
   const settings = store.getOrgSettings();
   const tokenFile = opts.gitTokenFile ?? process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
@@ -576,15 +577,12 @@ export function runWizardChecks(
           fix: "create the Slack app from slack-app-manifest.yml, then provision the tokens into the auth-broker vault (connect_upload_link: slack-app / slack-bot) or set them in .env",
         },
     modelKey
-      ? { name: "model_key", ok: true, detail: "a model key is resolvable (OPENCODE_API_KEY or NEAR_API_KEY)", fix: "none" }
+      ? { name: "model_key", ok: true, detail: "iron-proxy has a model gateway credential", fix: "none" }
       : {
           name: "model_key",
           ok: false,
-          detail: "neither OPENCODE_API_KEY nor NEAR_API_KEY is set (or they are placeholders)",
-          fix: placeholderFix(
-            "OPENCODE_API_KEY or NEAR_API_KEY",
-            "the auth-broker vault seeds it at boot (connect_upload_link: opencode / near), or the macOS Keychain (service: bottega-opencode / bottega-near) loads it for local dev",
-          ),
+          detail: "iron-proxy has neither opencode.secret nor near.secret",
+          fix: "provision the auth-broker vault (connect_upload_link: opencode / near) or configure the macOS Keychain fallback, then restart so the proxy boundary is seeded",
         },
     brokerToken
       ? { name: "broker_token", ok: true, detail: "OMP_AUTH_BROKER_TOKEN is set", fix: "none" }

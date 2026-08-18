@@ -106,9 +106,9 @@ WAL and `busy_timeout`, migrated idempotently at boot.
 
 ## Egress: the iron-proxy boundary
 
-All outbound traffic passes three transforms, in order — allowlist first,
-then judge, then secret injection. The judge runs **before** secrets so the
-policy LLM never sees real credentials.
+Outbound traffic passes allowlist, judge, static-secret injection, and optional
+OAuth-token minting. The judge runs **before** credentials are attached, so
+the policy LLM never sees real values.
 
 ```mermaid
 flowchart TD
@@ -120,11 +120,18 @@ flowchart TD
         direction TB
         T1["1. allowlist — static domains<br/>(model endpoints, extension domains)"]
         T2["2. judge — LLM policy gate<br/>'deny unless clearly required & safe';<br/>fallback deny (fail closed)"]
-        T3["3. secrets — inject Authorization<br/>from 0600 secret files, allowlisted<br/>domains only"]
-        T1 --> T2 --> T3
+        T3["3. secrets — replace placeholder Authorization<br/>from 0600 files; model and API-key hosts only"]
+        T4["4. oauth_token — refresh, cache, deduplicate,<br/>and inject access tokens for active OAuth extensions"]
+        T1 --> T2 --> T3 --> T4
     end
-    T3 --> UP["upstream (allowlisted only)"]
+    T4 --> UP["upstream (allowlisted only)"]
 ```
+
+The deployment currently runs one shared iron-proxy instance, so its native
+OAuth single-flight coordination serializes refreshes across every server,
+worker, and session. A separate `iron-token-broker` is only required when the
+deployment adds multiple proxy instances; the current single-host topology
+explicitly keeps that as its scaling ceiling.
 
 ```mermaid
 flowchart LR
@@ -142,9 +149,10 @@ rules denied the server's own model calls (a context-free LLM denies bare
 model/API requests) and Slack domains weren't allowlisted at all, which
 broke the bot under the dev proxy. Instead of loosening the deployment
 contract, local dev now loads the generated **dev-permissive config**
-(`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge, secrets +
-management kept; mounted only by docker-compose.dev.yml) — so ALL dev
-traffic passes the proxy and the secret-injection path stays intact. The
+(`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge; static-secret,
+OAuth-token, and management paths retained; mounted only by
+`docker-compose.dev.yml`) — so ALL dev traffic passes the proxy while the
+credential boundary stays identical.
 temporary #126 `NO_PROXY` bypass in `scripts/dev.sh` is reverted (the dev
 proxy passes everything; routing through it is harmless). `NEARAI_JUDGE_API_KEY`
 is a deployment concern only. The compose topology above still routes

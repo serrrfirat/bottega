@@ -5,7 +5,7 @@
  * and a recording approval router. Nothing touches the network, Slack, or
  * a transcript.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,9 +30,15 @@ import {
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-upload-link-"));
 const stores: Store[] = [];
+const callbackPort = process.env.BOTTEGA_CALLBACK_PORT;
+beforeAll(() => {
+  process.env.BOTTEGA_CALLBACK_PORT = "0";
+});
 afterAll(() => {
   for (const store of stores) store.close();
   rmSync(dir, { recursive: true, force: true });
+  if (callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+  else process.env.BOTTEGA_CALLBACK_PORT = callbackPort;
 });
 
 function freshStore(): Store {

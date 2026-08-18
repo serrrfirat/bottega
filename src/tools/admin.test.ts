@@ -238,6 +238,7 @@ const ENV_KEYS = [
   "EXECUTOR_GIT_TOKEN_FILE",
   "BOTTEGA_PROXY_CONTROL_URL",
   "BOTTEGA_PROXY_CONTROL_TOKEN",
+  "BOTTEGA_PROXY_SECRETS_DIR",
 ];
 
 function backupEnv(): EnvBackup {
@@ -1136,6 +1137,7 @@ describe("first_run_wizard (issue #73)", () => {
     const { store, dir, cleanup } = freshStore();
     try {
       for (const key of ENV_KEYS) delete process.env[key];
+      process.env.BOTTEGA_PROXY_SECRETS_DIR = join(dir, "data", "proxy-secrets");
       const tool = findTool(
         loadTools(store, {
           gitTokenFile: join(dir, "data", "secrets", "github-pat"),
@@ -1180,7 +1182,10 @@ describe("first_run_wizard (issue #73)", () => {
     try {
       process.env.SLACK_APP_TOKEN = "xapp-1-real";
       process.env.SLACK_BOT_TOKEN = "xoxb-real";
-      process.env.OPENCODE_API_KEY = "sk-real";
+      const proxySecretsDir = join(dir, "data", "proxy-secrets");
+      mkdirSync(proxySecretsDir, { recursive: true });
+      writeFileSync(join(proxySecretsDir, "opencode.secret"), "proxy-key", { mode: 0o600 });
+      process.env.BOTTEGA_PROXY_SECRETS_DIR = proxySecretsDir;
       process.env.OMP_AUTH_BROKER_TOKEN = "bt-real";
       process.env.OMP_AUTH_BROKER_URL = "http://auth-broker:8765";
       const dataDir = join(dir, "data", "secrets");

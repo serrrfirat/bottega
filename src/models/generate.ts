@@ -13,7 +13,10 @@
  * primary, NEAR fallback, plus the openai/anthropic custom gateways) and
  * lists the configured model ids (models.default/fast/reasoning, deduped,
  * order-stable) under the NEAR provider — the catalog the SDK can hand to
- * sessions. Role selection (which id a session uses for default/fast/
+ * sessions. Since issue #208 every provider's apiKey is the proxy
+ * placeholder (`bottega-proxy-placeholder`): the SDK sends it and
+ * iron-proxy swaps the real key at egress; the app process never holds a
+ * live key. Role selection (which id a session uses for default/fast/
  * reasoning) is the session driver's concern (issue #64 model_settings),
  * not this file's.
  */
@@ -67,24 +70,27 @@ export function renderModelsConfig(settings: ModelCatalogSettings): string | nul
 # edit settings (the settings tool) to change this file. Model ids are
 # quoted because org-chosen ids may contain characters outside the YAML
 # subset's plain scalars.
+# CREDENTIALS LIVE AT iron-proxy (issue #208): every provider sends the
+# placeholder bearer (bottega-proxy-placeholder) and the proxy swaps the
+# real key at egress — the app process never holds a live key.
 providers:
   # Primary model (issue #37, pinned #78): deepseek-v4-flash via the
-  # built-in opencode-go provider. Key from env/Keychain (service:
-  # bottega-opencode). The entry is KEY-ONLY: opencode-go is a built-in
-  # SDK catalog provider (deepseek-v4-flash ships there with its transport
-  # metadata), and the SDK's models.yml validation treats any provider
-  # declaration as CUSTOM — redeclaring its models without a baseUrl fails
-  # the boot guard. The pin lives in config.yml (modelRoles.default), so
-  # the session can never silently shift to the catalog default
-  # (kimi-k2.7-code).
+  # built-in opencode-go provider. The entry is KEY-ONLY: opencode-go is a
+  # built-in SDK catalog provider (deepseek-v4-flash ships there with its
+  # transport metadata), and the SDK's models.yml validation treats any
+  # provider declaration as CUSTOM — redeclaring its models without a
+  # baseUrl fails the boot guard. The pin lives in config.yml
+  # (modelRoles.default), so the session can never silently shift to the
+  # catalog default (kimi-k2.7-code). The key is the proxy placeholder
+  # (#208): the proxy injects the real opencode key at egress.
   opencode-go:
-    apiKey: OPENCODE_API_KEY
+    apiKey: bottega-proxy-placeholder
   # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key
   # is configured.
   near:
     api: openai-completions
     baseUrl: "https://cloud-api.near.ai/v1"
-    apiKey: NEAR_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
 ${modelLines}
   # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Declared anchor +
@@ -92,7 +98,7 @@ ${modelLines}
   openai:
     api: openai-completions
     baseUrl: "https://api.openai.com/v1"
-    apiKey: OPENAI_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
       - id: "gpt-5-mini"
         name: "gpt-5-mini"
@@ -103,7 +109,7 @@ ${modelLines}
   anthropic:
     api: openai-completions
     baseUrl: "https://api.anthropic.com/v1"
-    apiKey: ANTHROPIC_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
       - id: "claude-sonnet-4-5"
         name: "claude-sonnet-4-5"

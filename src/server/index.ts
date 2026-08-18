@@ -8,6 +8,7 @@ import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
+import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
@@ -16,6 +17,7 @@ import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { loadKbConfig } from "../kb/config";
+import { z } from "zod";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
@@ -175,13 +177,19 @@ export interface BottegaServerOpts {
 }
 
 export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer> {
-  // Issue #201: seed the boot secrets (Slack tokens + provider keys) from
+  // Issue #201: seed the boot secrets (Slack tokens + webhook secret) from
   // the auth-broker vault BEFORE the SDK constructs providers and before
   // the Slack guard below — precedence vault → env → Keychain (local dev)
-  // → fail closed (this guard + the #80 model-key guard stay the last
-  // word). The executor and MCP roots make the same call first (#172
-  // parity: every root resolves the same secret source).
+  // → fail closed (this guard stays the last word). The executor and MCP
+  // roots make the same call first (#172 parity: every root resolves the
+  // same secret source).
   await seedBootSecretsFromVault();
+  // Issue #208: right after the seed, push the LIVE provider credentials
+  // (model keys + OAuth refresh tokens) into iron-proxy's secret files
+  // and reload it — the app process never holds them; models.yml carries
+  // only the placeholder and the proxy injects the real credential at
+  // egress. Same call in the executor and MCP roots (#172 parity).
+  await syncProxyCredentialsFromEnv();
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {
@@ -201,8 +209,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   let deliveryActionHandler: (a: SlackAction) => Promise<void>;
   const wiring = await bootstrapRuntime({
     router: () => approvalRouter,
-    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
-    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : {}),
+    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : undefined),
+    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
     // Issue #193: extension-tool steps reach the space's turn presenter
     // too — late-bound, same pattern as the driver gate below.
     onToolStep: (step) => spaceService.routeToolStep(step),
@@ -693,8 +701,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         },
       });
       offMessage = sideSession.on("message", (data) => {
-        const text = (data as { text?: unknown } | null)?.text;
-        if (typeof text === "string" && text.trim()) reply = text;
+        // The driver emits { spaceId, text } payloads; parse at the event boundary so
+        // only string text is captured (defensive against other message shapes).
+        const text = z.object({ text: z.string().optional() }).safeParse(data);
+        if (text.success && text.data.text && text.data.text.trim()) reply = text.data.text;
       });
       // ACP v1 has no system-prompt field, so carry the instructions in-band
       // on that driver while OMP receives them through appendSystemPrompt.

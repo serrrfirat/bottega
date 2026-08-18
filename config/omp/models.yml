@@ -1,36 +1,42 @@
-# Model catalog for a bottega deployment (issue #9, fixed #36).
+# Model catalog for a bottega deployment (issue #9, fixed #36, #208).
 # Loaded by the OMP SDK from the agent dir (data/omp-agent); this file is
 # the per-deployment template, mounted from config/omp/ by compose.
+#
+# CREDENTIALS LIVE AT iron-proxy (issue #208): every provider below sends
+# the SAME placeholder bearer (bottega-proxy-placeholder) and points its
+# baseUrl at the real gateway; iron-proxy (config/egress.yml — the
+# generated `secrets` transform) swaps the real key at egress. The app
+# process never holds a live key. The proxy's keys are seeded at boot by
+# the credential sync (src/extensions/proxy-seed.ts) from the vault /
+# env / the macOS Keychain (dev.sh), and a missing proxy key fails the
+# call closed (502) — the placeholder never reaches a gateway.
 #
 # NEAR AI Cloud (OpenAI-compatible gateway):
 #   https://docs.near.ai/cloud/guides/openai-compatibility/
 # NOTE: api.near.ai (Developer Hub / Completions) was retired 2025-10-31;
-# the live gateway is cloud-api.near.ai/v1. The key is referenced by env
-# var name: the SDK resolves NEAR_API_KEY from the server process env
-# (set in .env or via the Keychain dev loader). The key value never appears
-# in this file, agent config, or transcripts.
-# The openai + anthropic entries below are the same shape: custom
-# openai-completions providers keyed by env var name (OPENAI_API_KEY /
-# ANTHROPIC_API_KEY), each declaring one anchor model and probed for its
-# full live catalog by listAvailableModels (issue #194 pattern).
+# the live gateway is cloud-api.near.ai/v1. The openai + anthropic entries
+# below are the same shape: custom openai-completions providers, each
+# declaring one anchor model and probed for its full live catalog by
+# listAvailableModels (issue #194 pattern).
 providers:
   # Primary model (issue #37, pinned #78): deepseek-v4-flash via the
-  # built-in opencode-go provider. Key from env/Keychain (service:
-  # bottega-opencode). The entry is deliberately KEY-ONLY: opencode-go is a
-  # built-in SDK catalog provider (deepseek-v4-flash ships there with its
-  # transport metadata), and the SDK's models.yml validation treats any
-  # provider declaration as CUSTOM — redeclaring its models without a
-  # baseUrl fails the boot guard. The pin lives in config.yml
-  # (modelRoles.default), so the session can never silently shift to the
-  # provider catalog default (kimi-k2.7-code).
+  # built-in opencode-go provider. The entry is deliberately KEY-ONLY:
+  # opencode-go is a built-in SDK catalog provider (deepseek-v4-flash
+  # ships there with its transport metadata), and the SDK's models.yml
+  # validation treats any provider declaration as CUSTOM — redeclaring
+  # its models without a baseUrl fails the boot guard. The pin lives in
+  # config.yml (modelRoles.default), so the session can never silently
+  # shift to the provider catalog default (kimi-k2.7-code). The key is
+  # the proxy placeholder (#208): the proxy injects the real opencode key
+  # at egress.
   opencode-go:
-    apiKey: OPENCODE_API_KEY
+    apiKey: bottega-proxy-placeholder
   # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key
   # is configured.
   near:
     api: openai-completions
     baseUrl: "https://cloud-api.near.ai/v1"
-    apiKey: NEAR_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
       - id: zai-org/GLM-5.1-FP8
         name: GLM 5.1 FP8 via NEAR AI Cloud
@@ -43,7 +49,7 @@ providers:
   openai:
     api: openai-completions
     baseUrl: "https://api.openai.com/v1"
-    apiKey: OPENAI_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
       - id: gpt-5-mini
         name: GPT-5 Mini
@@ -55,7 +61,7 @@ providers:
   anthropic:
     api: openai-completions
     baseUrl: "https://api.anthropic.com/v1"
-    apiKey: ANTHROPIC_API_KEY
+    apiKey: bottega-proxy-placeholder
     models:
       - id: claude-sonnet-4-5
         name: Claude Sonnet 4.5

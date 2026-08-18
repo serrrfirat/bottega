@@ -83,11 +83,11 @@ a human says otherwise.
 You need Docker, a Slack workspace, and about fifteen minutes:
 
 1. Create the Slack app from the included manifest.
-2. Fill in `.env` (tokens + model key). The Slack tokens and provider keys
-   are vault-backed (#201): provision them into the auth-broker vault with
+2. Provision Slack and model credentials in the auth-broker vault with
    `connect_upload_link` (ids `slack-app`, `slack-bot`, `opencode`, `near`,
-   `openai`, `anthropic`, `github-webhook`) and the boot seeds them — `.env`
-   is the fallback.
+   `openai`, `anthropic`, `github-webhook`). `.env` is the local fallback.
+   Model credentials are synchronized into iron-proxy's secret boundary;
+   SDK requests carry placeholders, not provider keys.
 3. `docker compose --profile executor up -d --build`
 
 The full walkthrough — including local development, credentials, the

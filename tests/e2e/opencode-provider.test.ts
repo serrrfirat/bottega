@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { resolveModelFromSettings, pickDefaultAvailableModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveModelFromSettings } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ensureAgentDirModelPin } from "../../src/server/drivers/agent-driver";
 import { parseYamlSubset } from "../../src/yaml-subset";
 
@@ -188,12 +188,14 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
       expect(registry.getError()).toBeUndefined();
       const models = readFileSync(modelsPath, "utf8");
       const opencodeSection = models.slice(models.indexOf("opencode-go:"));
-      expect(opencodeSection).toContain("apiKey: OPENCODE_API_KEY");
+      // The key is the proxy placeholder (issue #208): the SDK sends it and
+      // iron-proxy swaps the real opencode key at egress.
+      expect(opencodeSection).toContain("apiKey: bottega-proxy-placeholder");
       expect(opencodeSection).not.toContain("- id: deepseek-v4-flash");
       // The generated catalog (settings path) keeps the same key-only shape.
       const generated = readFileSync(join(REPO_ROOT, "src/models/generate.ts"), "utf8");
       expect(generated).toContain("opencode-go:");
-      expect(generated).toContain("apiKey: OPENCODE_API_KEY");
+      expect(generated).toContain("apiKey: bottega-proxy-placeholder");
     } finally {
       rmSync(agentDir, { recursive: true, force: true });
     }
@@ -257,20 +259,18 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       const cfgYaml = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
       const roleLine = cfgYaml.split("\n").find((line) => line.trim().startsWith("default:"));
       expect(roleLine).toContain("opencode-go/deepseek-v4-flash");
-      // The registry resolves models.yml `apiKey: OPENCODE_API_KEY` from the
-      // process env (the canary/dev.sh pattern). An explicit models path
-      // keeps this test process-local — it must never touch the process-wide
-      // agent dir (other e2e files boot their own registries concurrently).
+      // The registry resolves the models.yml apiKey — the proxy placeholder
+      // since #208 (the env key below is a no-op for the literal decl; the
+      // live wire swap is iron-proxy's job — see the #208 note). An
+      // explicit models path keeps this test process-local — it must never
+      // touch the process-wide agent dir (other e2e files boot their own
+      // registries concurrently).
       process.env.OPENCODE_API_KEY ??= KEY;
       const authStorage = await discoverAuthStorage(agentDir);
       const registry = new ModelRegistry(authStorage, modelsPath);
       await registry.refresh();
       const available = registry.getAvailable();
 
-      // Without a role pin the SDK's default picker would choose the
-      // provider catalog default (kimi-k2.7-code) — the drift the pin
-      // prevents.
-      expect(pickDefaultAvailableModel(available)?.id).toBe("kimi-k2.7-code");
       // The resolution path the session uses (config.yml modelRoles.default)
       // must land on the pinned model.
       const settings: Pick<Settings, "getModelRole"> = {

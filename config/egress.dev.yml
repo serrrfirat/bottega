@@ -58,24 +58,17 @@ transforms:
       domains:
         - "*"
 
-  # 2. Secrets: boundary credential injection (issue #53) — KEPT in the dev
-  #    config (the core requirement): extension calls carry no credential,
-  #    and this transform INJECTS it as the Authorization header for the
-  #    extension's allowlisted domains before egress. The file source
-  #    re-reads on config reload and on ttl expiry, so the credential
-  #    rotates on a running proxy.
+  # 2. Secrets: boundary credential injection (issue #53 + #208) — KEPT in
+  #    the dev config (the core requirement): extension calls carry no
+  #    credential, and this transform INJECTS it as the Authorization
+  #    header for the extension's allowlisted domains before egress; the
+  #    model-gateway entries swap the providers' placeholder bearer for the
+  #    real key (require: true — a missing key rejects the request). File
+  #    sources re-read on config reload and on ttl expiry, so credentials
+  #    rotate on a running proxy.
   - name: secrets
     config:
       secrets:
-        - source:
-            type: file
-            path: "/data/proxy-secrets/attio.secret"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-          rules:
-            - host: "mcp.attio.com"
         - source:
             type: file
             path: "/data/proxy-secrets/github.secret"
@@ -87,23 +80,87 @@ transforms:
             - host: "api.githubcopilot.com"
         - source:
             type: file
-            path: "/data/proxy-secrets/linear.secret"
+            path: "/data/proxy-secrets/near.secret"
             ttl: "30s"
           inject:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
+            require: true
           rules:
-            - host: "mcp.linear.app"
+            - host: "cloud-api.near.ai"
         - source:
             type: file
-            path: "/data/proxy-secrets/notion.secret"
+            path: "/data/proxy-secrets/opencode.secret"
             ttl: "30s"
           inject:
             header: "Authorization"
             formatter: "Bearer {{ .Value }}"
+            require: true
           rules:
-            - host: "api.notion.com"
-            - host: "notion.com"
+            - host: "opencode.ai"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/openai.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "api.openai.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/anthropic.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "api.anthropic.com"
+
+  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send
+  #    the placeholder bearer; this transform holds each provider's refresh
+  #    token + client credentials (the sync's JSON blob,
+  #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
+  #    tokens at egress, and stubs inbound requests to each configured
+  #    token_endpoint with a synthetic token so the SDK's own token dance
+  #    completes against the proxy. require: true — a missing/unmintable
+  #    credential rejects the request (502), never an unauthenticated
+  #    upstream call.
+  - name: oauth_token
+    config:
+      tokens:
+        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "/data/proxy-secrets/attio-oauth.json"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "/data/proxy-secrets/attio-oauth.json"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "https://app.attio.com/oidc/token"
+          require: true
+          rules:
+            - host: "mcp.attio.com"
+        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "/data/proxy-secrets/linear-oauth.json"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "/data/proxy-secrets/linear-oauth.json"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "https://mcp.linear.app/token"
+          require: true
+          rules:
+            - host: "mcp.linear.app"
 
 log:
   level: "info"

@@ -20,7 +20,7 @@
  *     state, the upload-link mint → form → vault, and the live-progress
  *     line shapes.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,6 +73,14 @@ import {
   standupCronFor,
   toolCtxFor,
 } from "./canary";
+const callbackPort = process.env.BOTTEGA_CALLBACK_PORT;
+beforeAll(() => {
+  process.env.BOTTEGA_CALLBACK_PORT = "0";
+});
+afterAll(() => {
+  if (callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+  else process.env.BOTTEGA_CALLBACK_PORT = callbackPort;
+});
 
 /** Polls until the predicate returns a truthy value (the e2e harness pattern). */
 async function waitFor<T>(fn: () => T | undefined | null, timeoutMs = 10_000): Promise<T> {
@@ -539,7 +547,7 @@ describe("extension-pin journey mechanism (issue #195)", () => {
         action: "pin",
         spec,
         binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
-        credential_schema: { type: "oauth", scopes: ["read"] },
+        credential_schema: { type: "api_key", domains: ["fixture-pin.example.com"] },
         vendor_official: true,
       } as const;
 

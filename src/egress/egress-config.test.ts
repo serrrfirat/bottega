@@ -125,24 +125,61 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(prompt).toMatch(/clearly required by the\s+current task/i);
   });
 
-  test("secrets transform (issue #53) runs AFTER judge and injects auth per extension", () => {
+  test("secrets transform (issue #53 + #208) runs AFTER judge and injects auth per api_key extension + model gateway", () => {
     const secrets = transforms.find((t) => asRecord(t)["name"] === "secrets")!;
     expect(secrets).toBeDefined();
-    // Ordering: allowlist, judge, secrets — the LLM judge must never see
-    // real credentials (iron-proxy README's recommended ordering).
+    // Ordering: allowlist, judge, secrets, oauth_token — the LLM judge
+    // must never see real credentials (iron-proxy README's recommended
+    // ordering), and oauth_token runs last (the proxy's minted bearer is
+    // the final word for the OAuth extensions).
     const names = transforms.map((t) => asString(asRecord(t)["name"]));
-    expect(names).toEqual(["allowlist", "judge", "secrets"]);
+    expect(names).toEqual(["allowlist", "judge", "secrets", "oauth_token"]);
     const cfg = asRecord(secrets["config"]);
     const entries = asRecordArray(cfg["secrets"]);
-    expect(entries).toHaveLength(4); // attio, github, linear, notion
+    // api_key extensions (github) + the four model-gateway keys (#208).
+    // The OAuth extensions (linear/attio) moved to oauth_token — no file
+    // entries for them.
+    expect(entries).toHaveLength(5); // github + near/opencode/openai/anthropic
     for (const entry of entries) {
       const source = asRecord(entry["source"]);
       expect(source["type"]).toBe("file");
-      expect(asString(source["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z]+\.secret$/);
+      expect(asString(source["path"])).toMatch(/^\/data\/proxy-secrets\/([a-z]+)\.secret$/);
       const inject = asRecord(entry["inject"]);
       expect(inject["header"]).toBe("Authorization");
       expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
       const rules = asRecordArray(entry["rules"]);
+      expect(rules.length).toBeGreaterThanOrEqual(1);
+      for (const rule of rules) {
+        expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
+      }
+    }
+    // The model-gateway entries are REQUIRED (fail closed — issue #208).
+    for (const provider of ["near", "opencode", "openai", "anthropic"]) {
+      const entry = entries.find((e) => asString(asRecord(e["source"])["path"]).includes(`${provider}.secret`));
+      expect(entry, `${provider} gateway entry`).toBeDefined();
+      expect(asString(asRecord(entry!["inject"])["require"])).toBe("true");
+    }
+  });
+
+  test("oauth_token transform (issue #208) mints the OAuth extensions' access tokens from the sync's JSON blobs", () => {
+    const oauth = transforms.find((t) => asRecord(t)["name"] === "oauth_token")!;
+    expect(oauth).toBeDefined();
+    const tokens = asRecordArray(asRecord(oauth["config"])["tokens"]);
+    expect(tokens).toHaveLength(2); // linear + attio (the #198 OAuth providers)
+    for (const token of tokens) {
+      expect(asString(token["grant"])).toBe("refresh_token");
+      expect(asString(token["token_endpoint"])).toMatch(/^https:\/\//);
+      expect(asString(token["require"])).toBe("true");
+      const refresh = asRecord(token["refresh_token"]);
+      const clientId = asRecord(token["client_id"]);
+      expect(refresh["type"]).toBe("file");
+      expect(clientId["type"]).toBe("file");
+      expect(asString(refresh["json_key"])).toBe("refresh_token");
+      expect(asString(clientId["json_key"])).toBe("client_id");
+      // Both fields come from the SAME per-provider JSON blob.
+      expect(asString(refresh["path"])).toBe(asString(clientId["path"]));
+      expect(asString(refresh["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z]+-oauth\.json$/);
+      const rules = asRecordArray(token["rules"]);
       expect(rules.length).toBeGreaterThanOrEqual(1);
       for (const rule of rules) {
         expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));

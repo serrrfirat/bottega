@@ -27,12 +27,14 @@ import { readPinnedSnapshots } from "../extensions/registry";
 import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
- * #36, #37ee2bf) plus the example KB host (issue #91), Slack file
- * downloads (issue #124), and the GitHub API for the ingest poller
- * (issue #57, mentions search). */
+ * #36, #37ee2bf) plus the opencode-go gateway (issue #208 — the pinned
+ * deepseek-v4-flash routes to opencode.ai/zen/go/v1), the example KB host
+ * (issue #91), Slack file downloads (issue #124), and the GitHub API for
+ * the ingest poller (issue #57, mentions search). */
 export const BASE_EGRESS_DOMAINS = [
   "cloud-api.near.ai",
   "*.completions.near.ai",
+  "opencode.ai",
   "api.openai.com",
   "api.anthropic.com",
   "raw.githubusercontent.com",
@@ -125,11 +127,45 @@ export interface OAuthTokenEntry {
 export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
   linear: "https://mcp.linear.app/token",
   attio: "https://app.attio.com/oidc/token",
+  notion: "https://mcp.notion.com/token",
 };
 
 /** The proxy-side OAuth credential blob for a provider (the `tokens` entry's json_key file). */
 export function oauthTokenBlobFileName(extensionId: string): string {
   return `${extensionId}-oauth.json`;
+}
+
+/**
+ * The file-injection entries for the pinned snapshots: ONLY the api_key
+ * extensions (issue #208 — the OAuth extensions move to the oauth_token
+ * transform and get no `.secret` file entry).
+ */
+export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): ExtensionEgressEntry[] {
+  return snapshots
+    .filter((s) => s.manifest.credentialSchema.type !== "oauth")
+    .map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
+}
+
+/**
+ * The oauth_token entries for the pinned snapshots' OAuth extensions
+ * (issue #208): each needs a VERIFIED token endpoint (OAUTH_TOKEN_ENDPOINTS
+ * — RFC 8414 discovery metadata); an OAuth extension without one fails
+ * generation closed (never a guessed URL).
+ */
+export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): OAuthTokenEntry[] {
+  return snapshots
+    .filter((s) => s.manifest.credentialSchema.type === "oauth")
+    .map((s): OAuthTokenEntry => {
+      const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
+      if (tokenEndpoint === undefined) {
+        throw new Error(
+          `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
+            "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
+            "before regenerating",
+        );
+      }
+      return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
+    });
 }
 
 /** Static blocks shared verbatim by the strict and dev renderers (dns, proxy, tls, management). */
@@ -467,23 +503,8 @@ export function regenerateEgressConfig(
   // OAuth extensions (#198) move to the oauth_token transform (issue
   // #208): they get NO file-injection entry — the proxy mints their
   // access token. api_key extensions keep the file-injection entry.
-  const oauthExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type === "oauth");
-  const apiKeyExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type !== "oauth");
-  const extensionEntries = apiKeyExtensions.map((s) => ({
-    extensionId: s.manifest.id,
-    domains: s.manifest.domains,
-  }));
-  const oauthEntries = oauthExtensions.map((s): OAuthTokenEntry => {
-    const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
-    if (tokenEndpoint === undefined) {
-      throw new Error(
-        `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
-          "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
-          "before regenerating",
-      );
-    }
-    return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
-  });
+  const extensionEntries = apiKeyExtensionEntries(snapshots);
+  const oauthEntries = oauthTokenEntries(snapshots);
   const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
@@ -502,23 +523,8 @@ export function regenerateDevEgressConfig(
   outPath: string = DEV_EGRESS_CONFIG_PATH,
 ): string {
   const snapshots = readPinnedSnapshots(snapshotsDir);
-  const oauthExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type === "oauth");
-  const apiKeyExtensions = snapshots.filter((s) => s.manifest.credentialSchema.type !== "oauth");
-  const extensionEntries = apiKeyExtensions.map((s) => ({
-    extensionId: s.manifest.id,
-    domains: s.manifest.domains,
-  }));
-  const oauthEntries = oauthExtensions.map((s): OAuthTokenEntry => {
-    const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
-    if (tokenEndpoint === undefined) {
-      throw new Error(
-        `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
-          "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
-          "before regenerating",
-      );
-    }
-    return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
-  });
+  const extensionEntries = apiKeyExtensionEntries(snapshots);
+  const oauthEntries = oauthTokenEntries(snapshots);
   const yaml = renderDevEgressConfig(extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;

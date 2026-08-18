@@ -35,17 +35,20 @@ describe("renderModelsConfig (issue #67)", () => {
     expect(yaml).not.toBeNull();
     const text = yaml!;
     expect(text).toContain("opencode-go:");
-    expect(text).toContain('apiKey: OPENCODE_API_KEY');
+    expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain("baseUrl: \"https://cloud-api.near.ai/v1\"");
     expect(text).toContain('id: "zai-org/GLM-5.1-FP8"');
     expect(text).toContain('id: "acme/chat"');
     // The openai/anthropic gateway skeleton survives settings regeneration.
     expect(text).toContain("baseUrl: \"https://api.openai.com/v1\"");
-    expect(text).toContain('apiKey: OPENAI_API_KEY');
+    expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain('id: "gpt-5-mini"');
     expect(text).toContain("baseUrl: \"https://api.anthropic.com/v1\"");
-    expect(text).toContain('apiKey: ANTHROPIC_API_KEY');
+    expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain('id: "claude-sonnet-4-5"');
+    // The placeholder literal is the ONLY key shape (issue #208) — never an
+    // env-name reference (the unset-env fail-open is dead).
+    expect(text).not.toMatch(/apiKey: [A-Z][A-Z0-9_]+$/m);
     // Dedup: reasoning repeats default → listed once under near (the
     // openai/anthropic anchors add their own id lines, which is expected).
     const yaml2 = renderModelsConfig({

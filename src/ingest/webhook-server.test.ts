@@ -338,6 +338,8 @@ describe("the webhook route joins the OAuth callback's surface (issue #57)", () 
   test("startOAuthCallbackServer serves /webhooks/github on the same Bun.serve", async () => {
     const h = freshHarness();
     await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const callbackPort = process.env.BOTTEGA_CALLBACK_PORT;
+    process.env.BOTTEGA_CALLBACK_PORT = "0";
     const surface = startOAuthCallbackServer({ store: h.store, audit: h.deps.audit, webhooks: h.deps });
     try {
       const res = await fetch(`${surface.baseUrl}/webhooks/github`, {
@@ -356,6 +358,8 @@ describe("the webhook route joins the OAuth callback's surface (issue #57)", () 
       expect((await fetch(`${surface.baseUrl}/other`)).status).toBe(404);
     } finally {
       surface.stop();
+      if (callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = callbackPort;
     }
   });
 });

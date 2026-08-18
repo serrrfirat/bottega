@@ -94,6 +94,9 @@ function configureEverything(dir: string): void {
   const secretsDir = join(dir, "data", "secrets");
   mkdirSync(secretsDir, { recursive: true });
   writeFileSync(join(secretsDir, "github-pat"), "github_pat_boot_test", { mode: 0o600 });
+  const proxySecretsDir = join(dir, "data", "proxy-secrets");
+  mkdirSync(proxySecretsDir, { recursive: true });
+  writeFileSync(join(proxySecretsDir, "opencode.secret"), "proxy-key", { mode: 0o600 });
   const egressDir = join(dir, "config");
   mkdirSync(egressDir, { recursive: true });
   writeFileSync(join(egressDir, "egress.yml"), 'domains:\n  - "cloud-api.near.ai"\n');
