@@ -527,6 +527,11 @@ async function handleUpload(
             actor: consumed.row.actor,
             spaceId: consumed.row.space_id ?? undefined,
             apiKey: secret,
+            // Issue #222: this is the one-time-upload seam — the secret
+            // came from the user's browser (never chat), and the consumed
+            // token IS the authorization. The connect paste guard stays
+            // on for every chat/MCP/intent caller; only this POST opts out.
+            fromUpload: true,
           },
           deps,
         );

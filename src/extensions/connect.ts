@@ -140,7 +140,24 @@ export const SECRET_PASTE_REDIRECT =
  * row.
  */
 export async function connectExtension(
-  input: { extension: string; scope: ConnectScope; actor: string; spaceId?: string; apiKey?: string },
+  input: {
+    extension: string;
+    scope: ConnectScope;
+    actor: string;
+    spaceId?: string;
+    apiKey?: string;
+    /**
+     * Browser-upload opt-out (issue #222): true ONLY when the api_key came
+     * from the one-time upload POST (src/extensions/upload-link.ts) — the
+     * secret went straight from the user's browser into this call, never
+     * through chat or a transcript, and the single-use token consumption
+     * IS the authorization. Every other surface (chat tool, MCP, Slack
+     * connect intent) omits this, so the paste guard stays on by default:
+     * a credential-shaped api_key is refused fail-closed unless this exact
+     * browser seam opted in.
+     */
+    fromUpload?: boolean;
+  },
   deps: ConnectExtensionDeps,
 ): Promise<ConnectOutcome> {
   const resolved = deps.registry.resolve(input.extension);
@@ -155,8 +172,11 @@ export async function connectExtension(
   // BEFORE anything runs — no gate request, no broker call, no audit row —
   // so the value never reaches a transcript (mirrors #121's memory.save
   // rejection). The safe path is the one-time upload link: the secret goes
-  // straight from the user's browser into the vault.
-  if (input.apiKey !== undefined && looksLikeObviousSecret(input.apiKey)) {
+  // straight from the user's browser into the vault. Issue #222: the
+  // upload POST is that exact path — its api_key arrives via
+  // `fromUpload` (see the flag's doc) and skips the guard; every chat/
+  // MCP/intent caller omits the flag, so the guard is unchanged there.
+  if (input.apiKey !== undefined && !input.fromUpload && looksLikeObviousSecret(input.apiKey)) {
     return { ok: false, message: SECRET_PASTE_REDIRECT };
   }
 

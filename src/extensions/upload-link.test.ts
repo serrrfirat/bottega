@@ -187,6 +187,46 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
     }
   });
 
+  // Issue #222 regression: the browser upload is the sanctioned secret path
+  // — a REAL-shaped credential (GitHub classic/fine-grained PATs, OpenAI
+  // keys) posted through the form must store, NOT hit the chat paste-guard
+  // redirect. Pre-fix, connectExtension's looksLikeObviousSecret fired on
+  // the upload api_key too (the canary's fixture secret never matched the
+  // patterns, so only the 400 redirected here).
+  test.each([
+    "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
+    "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+  ])("a real-shaped %s pasted through the upload POST is stored, not redirected", async (secret) => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "fixture.weather",
+        scope: "personal",
+        actor: "UADA",
+        label: "Fixture Weather",
+      });
+      expect(minted.ok).toBe(true);
+      const url = `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`;
+
+      const upload = await postSecret(url, secret);
+      expect(upload.status).toBe(200);
+      expect(await upload.text()).toContain("Saved to the vault");
+
+      // The broker saw the real value and the vault row landed — the same
+      // connect path as any other upload, minus the chat paste guard.
+      expect(h.broker.calls).toEqual([
+        { provider: "fixture.weather", credentialType: "api_key", apiKey: secret },
+      ]);
+      const rows = await rowsFor(h.store, "fixture.weather");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.owner).toBe("UADA");
+    } finally {
+      endpoint.stop();
+    }
+  });
+
   test("an org-scope upload crosses the policy gate and records the org row", async () => {
     const router = new RecordingRouter({ approved: true });
     const h = makeDeps({ policy: allowedPolicy(), router });

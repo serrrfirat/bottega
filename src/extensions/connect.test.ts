@@ -477,6 +477,23 @@ describe("connectExtension paste guard (issue #196)", () => {
     expect(outcome.ok).toBe(true);
     expect(h.broker.calls[0]!.apiKey).toBe("attio-secret-key");
   });
+
+  // Issue #222: the guard's ONLY opt-out is the browser-upload seam —
+  // fromUpload: true stores credential-shaped keys (the one-time upload
+  // POST, where the secret never touched chat and token consumption is the
+  // authorization); every other caller omits it, so the guard is unchanged.
+  test("fromUpload: true is the explicit upload opt-out — secret-shaped keys store", async () => {
+    const h = makeDeps();
+    const outcome = await connectExtension(
+      { extension: "fixture.weather", scope: "personal", actor: "UADA", apiKey: "ghp_abcdefghijklmnopqrstuvwxyz123456", fromUpload: true },
+      h.deps,
+    );
+    expect(outcome).toMatchObject({ ok: true });
+    expect(h.broker.calls).toEqual([
+      { provider: "fixture.weather", credentialType: "api_key", apiKey: "ghp_abcdefghijklmnopqrstuvwxyz123456" },
+    ]);
+    expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(1);
+  });
 });
 
 describe("connectExtensionToolDefinition", () => {
