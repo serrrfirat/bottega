@@ -49,6 +49,18 @@ export interface SlackApiMessage {
   blocks?: unknown[];
 }
 
+/**
+ * A posted message's identity: its own ts plus the thread root it joined
+ * (thread_ts present only when Slack posted the message as a reply). The
+ * canary polls conversations.replies, which REQUIRES the ROOT ts — a
+ * reply's own ts errors invalid_arguments (issue #212 follow-up) — so the
+ * post must report the thread membership for the journey to derive it.
+ */
+export interface PostedSlackMessage {
+  ts: string;
+  thread_ts?: string;
+}
+
 interface SlackUserRow {
   user_id: string;
   name: string;
@@ -122,8 +134,8 @@ export interface LiveSlackHandle {
    * history — the thread poll is the journey's second eye (issue #212).
    */
   replies(channelId: string, threadTs: string): Promise<SlackApiMessage[]>;
-  /** Post a message AS the QA user; resolves with the message ts. */
-  postAsUser(channelId: string, text: string): Promise<string>;
+  /** Post a message AS the QA user; resolves with the posted message's identity. */
+  postAsUser(channelId: string, text: string): Promise<PostedSlackMessage>;
   /** Permalink for a message (bot token, chat.getPermalink). */
   permalink(channelId: string, ts: string): Promise<string | undefined>;
   // --- SlackHandle-shaped sync surface (cached) ---------------------------
@@ -278,12 +290,15 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
       return res.messages;
     },
     async postAsUser(channelId, text) {
-      const res = await qa.call<{ ts: string }>("chat.postMessage", {
+      const res = await qa.call<{ ts: string; message?: { ts?: string; thread_ts?: string } }>("chat.postMessage", {
         channel: channelId,
         text,
         as_user: true,
       });
-      return res.ts;
+      return {
+        ts: res.ts,
+        ...(res.message?.thread_ts !== undefined ? { thread_ts: res.message.thread_ts } : undefined),
+      };
     },
     async permalink(channelId, ts) {
       try {

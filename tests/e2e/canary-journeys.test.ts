@@ -72,6 +72,8 @@ import {
   canaryFixtureMcpTransport,
   createCanaryRegistry,
   oauthAuthorizeStateFrom,
+  oauthAuthorizeUrlFrom,
+  postAndWait,
   PROGRESS_LINE_RE,
   standupCronFor,
   toolCtxFor,
@@ -216,6 +218,53 @@ describe("channel chat-reply thread polling (issue #212)", () => {
       timeoutMs: 2_000,
     });
     expect(reply.text).toBe("in-thread bot reply");
+  });
+
+  test("postAndWait(thread: true) polls conversations.replies with the THREAD ROOT ts — a reply's own ts errors invalid_arguments (#212 follow-up)", async () => {
+    // Live finding (run msyi15gi-iwa): the channel journey's replies()
+    // poll failed with `slack api conversations.replies:
+    // invalid_arguments`. Slack REQUIRES the ROOT message ts — a reply's
+    // own ts is rejected — while the manual QA-token call with the ROOT
+    // ts (the ping's ts from the previous run) returned both messages.
+    // The stub mirrors Slack's rejection exactly: replies() throws
+    // invalid_arguments for any ts that is not the thread root. The ping
+    // lands INSIDE the thread (its own ts is a reply ts); the journey
+    // must poll the root ts it carries (thread_ts), never the ping's own
+    // ts. Asserting the polled param value is the contract: the stub
+    // throws for a wrong ts, so the journey only resolves by passing the
+    // root.
+    const rootTs = "1787000000.000100";
+    const pingTs = "1787000000.000200"; // the ping's OWN ts — posted as a reply in the thread
+    const botReply: SlackApiMessage = {
+      ts: "1787000000.000900",
+      channel: "C1",
+      bot_id: "B-bot",
+      text: "in-thread bot reply",
+      thread_ts: rootTs,
+    };
+    const polled: string[] = [];
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        postAsUser: async () => ({ ts: pingTs, thread_ts: rootTs }),
+        replies: async (_channelId: string, ts: string) => {
+          polled.push(ts);
+          if (ts !== rootTs) throw new Error("slack api conversations.replies: invalid_arguments");
+          return [
+            { ts: rootTs, channel: "C1", user: "U-qa", text: "canary ping", thread_ts: rootTs },
+            botReply,
+          ];
+        },
+      },
+    } as unknown as Harness;
+    const { inboundTs, reply } = await postAndWait(h, "C1", "canary ping", {
+      label: "channel ping",
+      thread: true,
+    });
+    expect(reply.text).toBe("in-thread bot reply");
+    expect(inboundTs).toBe(pingTs);
+    expect(polled.every((ts) => ts === rootTs)).toBe(true);
   });
 });
 
@@ -778,6 +827,26 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
     } finally {
       await h.cleanup();
     }
+  });
+
+  test("the state extraction decodes Slack's &amp; entity — the EXACT live reply from run msyi15gi-iwa (#212 follow-up)", () => {
+    // Live finding (run msyi15gi-iwa): the mcp-oauth journey failed with
+    // "authorization URL carries no state". The posted reply's URL carries
+    // Slack's entity rendering — `&amp;state=` — so the #212 extraction
+    // (a raw `[?&]state=` regex over the URL) never matches and the
+    // journey reports no state. The manual live reply is reproduced
+    // VERBATIM below (state UGthrC1Ewux1UrUg9lAZlkYD is the actual minted
+    // flow token from that run). The fix decodes the entity before query
+    // parsing; the full URL must also extract (the journey's detail line
+    // shows it) with the entity decoded to the real separator.
+    const liveReply =
+      "Open this link to authorize Fixture OAuth MCP: " +
+      "<https://oauth.fixture.test/authorize?client_id=canary-fixture&amp;state=UGthrC1Ewux1UrUg9lAZlkYD> " +
+      "— after you authorize in the browser, Fixture OAuth MCP is connected.";
+    expect(oauthAuthorizeStateFrom(liveReply)).toBe("UGthrC1Ewux1UrUg9lAZlkYD");
+    expect(oauthAuthorizeUrlFrom(liveReply)).toBe(
+      "https://oauth.fixture.test/authorize?client_id=canary-fixture&state=UGthrC1Ewux1UrUg9lAZlkYD",
+    );
   });
 
   test("mint → form → POST stores the secret through the same connect path; the link is single-use", async () => {

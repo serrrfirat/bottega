@@ -362,19 +362,45 @@ export function canaryMcpOAuthConnector(store: () => OAuthFlowStoreSlice): McpOA
 }
 
 /**
+ * Slack renders `&` in message text as `&amp;` (the live canary reply's
+ * exact shape, issue #212 follow-up): a URL in the text carries entity
+ * separators, so query parsing must run against the decoded form.
+ */
+function decodeSlackEntities(text: string): string {
+  return text.replaceAll("&amp;", "&");
+}
+
+/**
+ * The full authorize URL from the journey's reply text (issue #198): the
+ * connector mints the URL and the journey reads it back from the POSTED
+ * Slack message — where Slack renders URLs as `<url>` in the message text
+ * AND escapes `&` as `&amp;`. The extraction stops the URL at the `>`
+ * (the #212 finding) and decodes the `&amp;` entity (the follow-up
+ * finding), so the returned URL is the real, query-parseable authorize
+ * URL. Exported for the hermetic journey-mechanism tests.
+ */
+export function oauthAuthorizeUrlFrom(replyText: string): string | undefined {
+  const url = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s<>]+/.exec(replyText)?.[0];
+  return url === undefined ? undefined : decodeSlackEntities(url);
+}
+
+/**
  * The OAuth `state` from the authorize URL in the journey's reply text
- * (issue #212): the connector mints the URL with the single-use flow token
- * as its state param, and the journey reads the URL back from the POSTED
- * Slack message — where Slack renders URLs as `<url>` in the message text.
- * The extraction must therefore stop the URL and the state at the `>`
- * (and at whitespace/`&`), or the captured state carries a trailing `>`
- * and the callback's flow consume never matches the minted row (the #212
- * finding). Exported for the hermetic journey-mechanism tests.
+ * (issue #212 + follow-up): the connector mints the URL with the single-use
+ * flow token as its state param, and the journey reads the URL back from
+ * the POSTED Slack message — where Slack renders URLs as `<url>` in the
+ * message text and escapes `&` as `&amp;`. The extraction must therefore
+ * stop the URL at the `>` (the #212 finding, or the captured state carries
+ * a trailing `>`) AND decode the `&amp;` entity before query parsing (the
+ * follow-up finding: on the live reply the separator renders `&amp;state=`,
+ * so a raw `&state=` regex never matches and the journey reports
+ * "authorization URL carries no state"). Exported for the hermetic
+ * journey-mechanism tests.
  */
 export function oauthAuthorizeStateFrom(replyText: string): string | undefined {
-  const url = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s<>]+/.exec(replyText)?.[0];
+  const url = oauthAuthorizeUrlFrom(replyText);
   if (url === undefined) return undefined;
-  return /[?&]state=([^&\s>]+)/.exec(url)?.[1];
+  return new URL(url).searchParams.get("state") ?? undefined;
 }
 
 /** The canary's broker seam (issues #196/#198): records the upload with a
@@ -551,21 +577,34 @@ export async function waitForBotReply(
   }
 }
 
-/** Posts as the QA user and waits for the bot's reply; returns both ts values. */
-async function postAndWait(
+/**
+ * Posts as the QA user and waits for the bot's reply; returns both ts values.
+ *
+ * Threaded polls (postAndWait(thread: true) — the channel journeys) read
+ * conversations.replies for the thread: Slack REQUIRES the ROOT message ts
+ * there — a reply's own ts errors invalid_arguments (issue #212 follow-up:
+ * run msyi15gi-iwa failed with `slack api conversations.replies:
+ * invalid_arguments` while the manual QA-token call with the ROOT ts, the
+ * ping's ts, returned both messages). The ping may land INSIDE a thread
+ * (its own ts is then a reply ts); the thread root it carries is
+ * `thread_ts`, falling back to its own ts for a top-level post. Exported
+ * for the hermetic journey-mechanism tests (issue #212).
+ */
+export async function postAndWait(
   h: Harness,
   channelId: string,
   text: string,
   opts: { label: string; thread?: boolean },
 ): Promise<{ inboundTs: string; reply: SlackApiMessage }> {
   const live = h.liveSlack!;
-  const inboundTs = await live.postAsUser(channelId, text);
+  const inbound = await live.postAsUser(channelId, text);
+  const rootTs = inbound.thread_ts ?? inbound.ts;
   const reply = await waitForBotReply(h, channelId, {
-    afterTs: inboundTs,
-    ...(opts.thread ? { threadTs: inboundTs } : undefined),
+    afterTs: inbound.ts,
+    ...(opts.thread ? { threadTs: rootTs } : undefined),
     label: opts.label,
   });
-  return { inboundTs, reply };
+  return { inboundTs: inbound.ts, reply };
 }
 
 function snippet(text: string, max = 140): string {
@@ -1090,16 +1129,16 @@ async function journeySemanticPickup(h: Harness, channelId: string, runId: strin
   const fixture = `canary pickup fixture ${runId}`;
   try {
     const before = (await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT })).length;
-    const inboundTs = await live.postAsUser(
+    const inboundTs = (await live.postAsUser(
       channelId,
       `implement a ${fixture}: add a docstring to the project README explaining the canary, then propose it as a work item for confirmation`,
-    );
+    )).ts;
     // The draft ask: the agent posts a confirmable draft and waits. The
     // reply itself is the human-visible half; the gate is the created item.
     await waitForBotReply(h, channelId, { afterTs: inboundTs, label: "pickup draft ask" });
     // The human's in-channel confirmation (the directive's explicit-confirm
     // gate — never created without it).
-    const confirmTs = await live.postAsUser(channelId, "confirmed — create the work item now");
+    const confirmTs = (await live.postAsUser(channelId, "confirmed — create the work item now")).ts;
     const rows = await waitFor(
       async () => {
         const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
@@ -1537,8 +1576,8 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
       label: "MCP OAuth connect mint",
     });
     const permalink = await live.permalink(channelId, reply.ts);
-    const urlMatch = /https:\/\/oauth\.fixture\.test\/authorize\?[^\s<>]+/.exec(reply.text);
-    if (!reply.text.includes("Open this link to authorize") || !urlMatch) {
+    const url = oauthAuthorizeUrlFrom(reply.text);
+    if (!reply.text.includes("Open this link to authorize") || url === undefined) {
       throw new Error(`connect did not mint + show the authorization URL: "${snippet(reply.text)}"`);
     }
     const state = oauthAuthorizeStateFrom(reply.text);
@@ -1560,7 +1599,7 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
       name: "mcp-oauth-connect",
       status: "pass",
       details: [
-        `connect ${CANARY_OAUTH_EXTENSION_ID} minted a single-use flow and showed the URL in Slack: ${snippet(urlMatch[0], 80)}`,
+        `connect ${CANARY_OAUTH_EXTENSION_ID} minted a single-use flow and showed the URL in Slack: ${snippet(url, 80)}`,
         skipEvidence,
       ],
       permalink,
@@ -1677,10 +1716,12 @@ export { PROGRESS_LINE_RE };
 async function journeyLiveProgress(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
   try {
-    const inboundTs = await live.postAsUser(
-      channelId,
-      `canary ${runId} (live-progress): think step by step and reply with the numbers from 1 to 10`,
-    );
+    const inboundTs = (
+      await live.postAsUser(
+        channelId,
+        `canary ${runId} (live-progress): think step by step and reply with the numbers from 1 to 10`,
+      )
+    ).ts;
     const after = parseFloat(inboundTs);
     const progress = await waitFor(
       async () => {
