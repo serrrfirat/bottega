@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAudit } from "../policy/audit";
+import { createAudit, type AuditModule } from "../policy/audit";
 import { isKnownTool, resolveTier } from "../policy/config";
 import {
   SCHEDULER_JOB_CREATED_EVENT,
@@ -17,6 +17,7 @@ import {
   deleteSchedulerJobArgsSchema,
   schedulerToolDefinitions,
 } from "./scheduler-tools";
+import type { SchedulerActionRegistry, SchedulerJob } from "./types";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-scheduler-store-"));
 const stores: Store[] = [];
@@ -30,6 +31,38 @@ function freshStore(): Store {
   const store = createStore(join(dir, `${stores.length}.db`));
   stores.push(store);
   return store;
+}
+
+/** The session-file → space-id ctx seam (issue #220): the file name IS the space id. */
+function ctxFor(spaceId: string | undefined): ExtensionContext {
+  // SAFETY: create_scheduler_job reads only sessionManager.getSessionFile();
+  // the rest of ExtensionContext is never touched, so the widened cast is safe.
+  return {
+    sessionManager: {
+      getSessionFile: (): string | undefined =>
+        spaceId === undefined ? undefined : join("/tmp/sessions", `${spaceId}.jsonl`),
+    },
+  } as ExtensionContext;
+}
+
+function createToolFor(
+  store: Store,
+  audit: AuditModule,
+  registry: SchedulerActionRegistry,
+): ToolDefinition<typeof createSchedulerJobArgsSchema> {
+  const create = schedulerToolDefinitions(store, audit, registry).find(
+    (definition) => definition.name === "create_scheduler_job",
+  ) as ToolDefinition<typeof createSchedulerJobArgsSchema> | undefined;
+  if (!create) throw new Error("create_scheduler_job definition missing");
+  return create;
+}
+
+function textOf(result: AgentToolResult): string {
+  return result.content.find((block) => block.type === "text")?.text ?? "";
+}
+
+function jobBody(result: AgentToolResult): SchedulerJob & { summary: string } {
+  return JSON.parse(textOf(result)) as SchedulerJob & { summary: string };
 }
 
 describe("scheduler job store (issue #86)", () => {
@@ -173,5 +206,131 @@ describe("scheduler job store (issue #86)", () => {
       space_id: "slack:C1",
     });
     expect(JSON.parse(rows[1]!.payload)).toEqual({ id: job!.id });
+  });
+});
+
+describe("create_scheduler_job surface (issue #220)", () => {
+  test("defaults a space-scoped job's destination to the conversation space from the tool ctx", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "recurring_work", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-derive",
+      {
+        action: "recurring_work",
+        cron: "0 10 * * *",
+        description: "Daily repository digest",
+        schedule: "every day at 10:00",
+      },
+      new AbortController().signal,
+      () => {},
+      ctxFor("slack:C1"),
+    );
+
+    expect(result.isError).not.toBe(true);
+    const body = jobBody(result);
+    expect(body.spaceId).toBe("slack:C1");
+    expect(body.params.space).toBe("slack:C1");
+    expect(body.params.description).toBe("Daily repository digest");
+    expect(body.summary).toBe("every day at 10:00 → this conversation: Daily repository digest");
+    expect(await store.getSchedulerJob(body.id)).toMatchObject({ spaceId: "slack:C1" });
+  });
+
+  test("honors an explicit space and presents it in the summary without any ctx", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "standup_digest", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-explicit",
+      { action: "standup_digest", cron: "0 9 * * 1-5", description: "Monday standup", space: "slack:C42" },
+      new AbortController().signal,
+      () => {},
+      ctxFor(undefined),
+    );
+
+    expect(result.isError).not.toBe(true);
+    const body = jobBody(result);
+    expect(body.spaceId).toBe("slack:C42");
+    expect(body.summary).toBe("weekdays at 09:00 UTC → space slack:C42: Monday standup");
+  });
+
+  test("renders the schedule label from the cron when no schedule hint is given", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "recurring_work", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-cron-label",
+      { action: "recurring_work", cron: "*/5 * * * *", description: "Health check" },
+      new AbortController().signal,
+      () => {},
+      ctxFor("slack:C1"),
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(jobBody(result).summary).toBe("every 5 minutes → this conversation: Health check");
+  });
+
+  test("fails closed with a clear remedy when the destination is underivable", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "reflection", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-underivable",
+      { action: "reflection", cron: "0 0 * * *" },
+      new AbortController().signal,
+      () => {},
+      ctxFor(undefined),
+    );
+
+    expect(result.isError).toBe(true);
+    const text = textOf(result);
+    expect(text).toMatch(/without a destination/);
+    expect(text).toMatch(/space/);
+    expect(await store.listSchedulerJobs()).toEqual([]);
+    expect(await audit.listAudit()).toEqual([]);
+  });
+
+  test("keeps org_pulse org-wide even when a space is passed", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "org_pulse", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-pulse",
+      { action: "org_pulse", cron: "0 9 * * 1", space: "slack:C1" },
+      new AbortController().signal,
+      () => {},
+      ctxFor(undefined),
+    );
+
+    expect(result.isError).not.toBe(true);
+    const body = jobBody(result);
+    expect(body.spaceId).toBeNull();
+    expect(body.params.space).toBeUndefined();
+    expect(body.summary).toBe("Mondays at 09:00 UTC → org-wide: org_pulse");
   });
 });

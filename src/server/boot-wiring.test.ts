@@ -204,16 +204,21 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       const actions = ["standup_digest", "reflection", "org_pulse"] as const;
       const created: Array<{ action: string; cron: string }> = [];
       for (const action of actions) {
+        // Issue #220: space-scoped actions (standup_digest, reflection)
+        // fail closed without a destination, and the boot harness has no
+        // session ctx to derive one from — bind an explicit target space.
+        // org_pulse ignores the space and stays org-wide.
         const result = await createJob!.execute(
           "boot-1",
-          { action, cron: "0 9 * * 1-5" },
+          { action, cron: "0 9 * * 1-5", space: "slack:C-boot" },
           undefined,
           undefined,
           unusedContext,
         );
         expect(result.isError).not.toBe(true);
-        // SAFETY: create_scheduler_job returns JSON.stringify(job) — a
-        // SchedulerJob row whose identifying fields are action + cron.
+        // SAFETY: create_scheduler_job returns JSON.stringify({...job,
+        // summary}) — a SchedulerJob row (plus user-facing summary) whose
+        // identifying fields are action + cron.
         created.push(JSON.parse(textOf(result)) as SchedulerJob);
       }
       expect(created.map((job) => job.action).sort()).toEqual([...actions].sort());

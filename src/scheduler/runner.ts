@@ -119,7 +119,15 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
 
     let result: "ok" | "error" = "ok";
     try {
-      await withTimeout(action.run(job.params, context), deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS);
+      // Issue #220: the job's bound space is the fallback target for
+      // space-scoped actions — thread it into the params so handlers read
+      // params.space even when the row carries no params.space of its own
+      // (e.g. a DB-patched legacy job). An explicit params.space always wins.
+      const jobParams = { ...job.params };
+      if (jobParams.space === undefined && job.spaceId !== null) {
+        jobParams.space = job.spaceId;
+      }
+      await withTimeout(action.run(jobParams, context), deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS);
     } catch (err) {
       result = "error";
       await auditError(deps, job, errorMessage(err));

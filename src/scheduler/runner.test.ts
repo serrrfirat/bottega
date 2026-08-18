@@ -8,10 +8,12 @@ import {
   SCHEDULER_ERROR_EVENT,
   SCHEDULER_FIRE_EVENT,
   SCHEDULER_MISSED_EVENT,
+  WORK_ITEM_CREATED_EVENT,
 } from "../store/audit-events";
 import { createStore, type AuditRow, type Store } from "../store/db";
 import { buildRegistry } from "./actions";
 import { nextCronFire } from "./cron";
+import { recurringWorkAction } from "./recurring-work";
 import { startScheduler, tickScheduler, type SchedulerTickDeps } from "./runner";
 import type { SchedulerAction, SchedulerActionRegistry } from "./types";
 import { z } from "zod";
@@ -183,6 +185,41 @@ describe("scheduler runner (issue #86)", () => {
     const errors = payloads(await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT }));
     expect(errors).toHaveLength(1);
     expect(errors[0]?.error).toMatch(/timed out/i);
+  });
+
+  test("threads the job's bound space into recurring_work without params.space (issue #220)", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const fireTime = Date.UTC(2026, 7, 17, 12, 0);
+    const registry = buildRegistry([recurringWorkAction]);
+    // The work_items row references the space row (FK); recurring-work
+    // relies on the scheduler's existing space binding, so create it here.
+    await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const job = await store.createSchedulerJob({
+      action: "recurring_work",
+      cron: "* * * * *",
+      params: { description: "Prepare the weekly ops report" },
+      spaceId: "slack:C1",
+      createdBy: "U1",
+    });
+    await store.updateSchedulerNextFire(job.id, fireTime);
+
+    await tickScheduler(deps(store, audit, registry, fireTime));
+
+    const rows = await audit.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.space_id).toBe("slack:C1");
+    const created = JSON.parse(rows[0]!.payload) as { id: string; requester: string };
+    expect(created.requester).toBe("scheduler");
+    const item = await store.getWorkItem(created.id);
+    expect(item).toMatchObject({
+      space_id: "slack:C1",
+      requester: "scheduler",
+      description: "Prepare the weekly ops report",
+      delivery: "extension",
+    });
+    expect((await store.getSchedulerJob(job.id))?.lastResult).toBe("ok");
+    expect(await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT })).toEqual([]);
   });
 
   test("start and stop run the immediate pass without leaving a timer", async () => {
