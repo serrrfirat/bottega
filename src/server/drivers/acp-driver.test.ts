@@ -160,6 +160,23 @@ describe("acp driver", () => {
     }
   });
 
+  test("an empty completion still emits a message event so the turn is never silent (issue #226)", async () => {
+    const h = await launch("empty");
+    try {
+      const events = h.events;
+      await h.session.prompt("hi there");
+      expect(events.error).toEqual([]);
+      expect(events.turn_start).toHaveLength(1);
+      expect(events.turn_end).toHaveLength(1);
+      // The empty message rides the event channel: the presenter turns it
+      // into the visible retry note. Pre-fix nothing was emitted here.
+      expect(events.message).toEqual([{ spaceId: "slack:C1", text: "" }]);
+    } finally {
+      await h.session.dispose();
+      h.cleanup();
+    }
+  });
+
   test("unknown notifications and inbound requests are tolerated", async () => {
     const h = await launch("noisy");
     try {

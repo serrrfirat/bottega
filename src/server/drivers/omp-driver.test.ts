@@ -543,7 +543,10 @@ describe("OmpSessionDriver error surfacing through the factory (issue #78)", () 
       });
       stub.emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "" }] } });
 
-      expect(messages).toHaveLength(0); // empty content is never delivered
+      // Issue #226: the empty completion IS delivered (with its cause) so
+      // the presenter can surface the visible retry note — never a silent
+      // no-reply. Pre-fix this was `toHaveLength(0)`.
+      expect(messages).toEqual([{ spaceId: "slack:C1", text: "", error: CAUSE }]);
       expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: CAUSE }]);
       await session.dispose();
     } finally {

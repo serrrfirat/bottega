@@ -18,7 +18,10 @@ import type { ExtensionRuntime } from "../../extensions/runtime";
 import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
-import { createStore, type ExtensionCredential, type SpaceModelSettings } from "../../store/db";
+import { createStore, type ExtensionCredential, type SpaceModelSettings, type Store } from "../../store/db";
+import type { OrgSettings } from "../../store/org-settings";
+import type { SlackAdapter } from "../adapters/slack";
+import { SlackTurnPresenter } from "../services/slack-turn-presenter";
 import { EXTENSION_CALL_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-events";
 import {
   assertAgentDirModelAvailable,
@@ -1051,7 +1054,7 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
     };
   }
 
-  test("a provider-error message_end (empty content) carries its cause on the turn_end payload", async () => {
+  test("an empty provider-error completion delivers an empty message carrying its cause (issue #226)", async () => {
     const { session, emit } = stubSession();
     const turnEnds: unknown[] = [];
     const messages: unknown[] = [];
@@ -1073,7 +1076,10 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
     });
     emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "" }] } });
 
-    expect(messages).toHaveLength(0); // empty content is never delivered
+    // Issue #226: the empty completion IS delivered (with its cause) so the
+    // presenter can surface the visible retry note — never a silent no-reply.
+    // Pre-fix this was `toHaveLength(0)`: the empty turn was invisible.
+    expect(messages).toEqual([{ spaceId: "slack:C1", text: "", error: CAUSE }]);
     expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: CAUSE }]);
   });
 
@@ -1124,6 +1130,127 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
 
     expect(errors).toEqual([{ spaceId: "slack:C1", message: "background flush failed" }]);
     expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: "background flush failed" }]);
+  });
+});
+
+describe("empty completions surface at the presenter (issue #226)", () => {
+  /** Stub SDK session exposing the subscribe listener for event injection. */
+  function stubSession() {
+    let listener: ((event: StubSessionEvent) => void) | undefined;
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (subscribe + lifecycle); the rest of AgentSession is never
+    // touched by these tests.
+    const session = {
+      subscribe: (cb: (event: StubSessionEvent) => void) => {
+        listener = cb;
+        return () => {
+          listener = undefined;
+        };
+      },
+      beginDispose: () => {},
+      dispose: async () => {},
+      isStreaming: false,
+      prompt: async () => {},
+      steer: async () => {},
+      followUp: async () => {},
+      abort: async () => {},
+      getAvailableModels: () => [],
+    } as never;
+    return {
+      session,
+      emit: (event: StubSessionEvent) => listener?.(event),
+    };
+  }
+
+  /** The presenter's Slack surface as a recording double (no network). */
+  function recordingSurface() {
+    const posts: Array<{ text: string }> = [];
+    const updates: Array<{ ts: string; text: string }> = [];
+    let tsSeq = 0;
+    const adapter = {
+      async postMessage(_spaceId: string, text: string) {
+        posts.push({ text });
+        tsSeq += 1;
+        return `post-${tsSeq}`;
+      },
+      async updateMessage(_spaceId: string, ts: string, text: string) {
+        updates.push({ ts, text });
+      },
+      async downloadFile() {
+        throw new Error("not used");
+      },
+      async uploadFile() {
+        return undefined;
+      },
+      async addReaction() {},
+      async removeReaction() {},
+      async startStream() {
+        throw new Error("not used");
+      },
+      async appendText() {},
+      async appendTask() {},
+      async stopStream() {},
+      streamingSupported: () => false,
+      async start() {},
+      async stop() {},
+    } as SlackAdapter;
+    const store = {
+      appendAudit: async (_entry: { space_id: string | null; actor: string; event_type: string; payload: string }) => 1,
+      getOrgSettings: (): OrgSettings | null => null,
+    } as Store;
+    return { adapter, store, posts, updates };
+  }
+
+  /** Flushes the presenter's fire-and-forget promise chains (phrase post, reactions, audits). */
+  async function flush(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  test("a session whose model returns an empty completion produces a visible retry note at the Slack surface", async () => {
+    const { session, emit } = stubSession();
+    const { adapter, store, posts, updates } = recordingSurface();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("turn_start", () => presenter.onTurnStart());
+    driver.on("message", (data) => presenter.onMessage(data));
+    driver.on("turn_end", (data) => presenter.onTurnEnd(data));
+
+    // The turn opens the way a real channel turn does: receipt phrase, then
+    // the SDK's turn events. The model completes with EMPTY content.
+    presenter.onInbound({ spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" });
+    await flush();
+    expect(posts.map((p) => p.text)).toEqual(["Thinking…"]);
+
+    const CAUSE = "400 No tool output found for tool call call_repro_1";
+    emit({ type: "turn_start" });
+    await flush();
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "error",
+        errorMessage: CAUSE,
+      },
+    });
+    await flush();
+    emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "" }] } });
+    await flush();
+
+    // The visible retry note replaced the phrase IN PLACE and names the
+    // cause — the empty turn is never a silent no-reply. Pre-fix the driver
+    // dropped the empty completion, so only the phrase rotation was visible
+    // and this assertion failed (nothing emitted).
+    const visible = updates.at(-1)!.text;
+    expect(visible).toContain("empty response");
+    expect(visible).toContain(CAUSE);
   });
 });
 
@@ -1181,7 +1308,14 @@ describe("OmpSessionDriver live thinking (issue #193)", () => {
     // A following text-only message emits no thinking (per-message reset).
     emit({ type: "message_update", message: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } });
     emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
-    expect(messages).toEqual([{ spaceId: "slack:C1", text: "hi" }]);
+    // Issue #226: the thinking-only message_end above is an empty completion
+    // (reasoning without deliverable text — the #60 root cause) and now
+    // still delivers an empty message event so the presenter surfaces the
+    // retry note; the text message delivers normally.
+    expect(messages).toEqual([
+      { spaceId: "slack:C1", text: "" },
+      { spaceId: "slack:C1", text: "hi" },
+    ]);
     expect(thinking).toHaveLength(3);
   });
 

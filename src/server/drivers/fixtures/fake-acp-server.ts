@@ -31,6 +31,9 @@ const logfile = process.argv[3] ?? "";
 //            behaves like "happy". argv[4], when given, is JSON overriding
 //            {toolCall, options} so tests exercise the whole tool mapping.
 //  - silent: never responds to anything (exercises client-side timeouts).
+//  - empty:  answers session/prompt with NO text chunks — the model's
+//            completion is empty, so the turn ends with no output
+//            (exercises the issue #226 empty-completion surface).
 
 function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -129,6 +132,11 @@ async function handle(msg: { id?: number; method?: string; params?: unknown }): 
 
     case "session/prompt": {
       if (scenario === "silent") return;
+      if (scenario === "empty") {
+        // The model completes with NO text chunks: an empty completion.
+        send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+        return;
+      }
       if (scenario === "crash") {
         send({
           jsonrpc: "2.0",

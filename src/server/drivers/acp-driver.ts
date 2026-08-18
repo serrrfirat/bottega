@@ -392,6 +392,10 @@ class AcpSessionDriver implements AgentSessionDriver {
   /** Accumulated agent text per messageId (chunks sharing a messageId join up). */
   #buffers = new Map<string, string>();
   #currentMessageId: string | null = null;
+  /** The current turn already delivered a visible message (issue #226). */
+  #turnDelivered = false;
+  /** An error event already surfaced this turn (issue #226: the retry note must not overwrite it). */
+  #turnErrored = false;
 
   constructor(deps: {
     spaceId: string;
@@ -546,6 +550,8 @@ class AcpSessionDriver implements AgentSessionDriver {
     // and drop the binding when the turn completes (issue #152).
     this.#turnPrincipal = principal;
     this.#silentTurn = silent ?? false;
+    this.#turnDelivered = false;
+    this.#turnErrored = false;
     this.#emitter.emit("turn_start", { spaceId: this.#spaceId });
     // appendSystemPrompt (issue #55/#173): ACP v1 has no system-prompt
     // transport field, so the directive rides the FIRST prompt's text —
@@ -564,6 +570,13 @@ class AcpSessionDriver implements AgentSessionDriver {
         // Deliver the buffered message BEFORE clearing the silent flag so a
         // silent turn never reaches the space surface (issue #173).
         this.#flushBufferedMessage();
+        if (!this.#turnDelivered && !this.#turnErrored) {
+          // Issue #226: an empty completion must never be a silent no-reply —
+          // the presenter surfaces the visible retry note for this event.
+          // Skipped when an error event already surfaced the turn (e.g. the
+          // child died): the retry note must not overwrite the error text.
+          this.#emitter.emit("message", { spaceId: this.#spaceId, text: "" });
+        }
         this.#silentTurn = false;
         this.#emitter.emit("turn_end", { spaceId: this.#spaceId });
       });
@@ -584,6 +597,9 @@ class AcpSessionDriver implements AgentSessionDriver {
   /** Mark the child dead, surface an error event, and settle every in-flight request. */
   #failChild(err: Error): void {
     this.#dead = true;
+    // The error event IS the visible surface for this turn; the empty
+    // completion must not overwrite it with the generic retry note (#226).
+    this.#turnErrored = true;
     this.#emitter.emit("error", { spaceId: this.#spaceId, message: err.message });
     this.#failPending(err);
   }
@@ -778,6 +794,9 @@ class AcpSessionDriver implements AgentSessionDriver {
   #deliver(text: string): void {
     const trimmed = text.trim();
     if (!trimmed) return;
+    // A real message means the turn produced output: the empty-completion
+    // fallback at turn end must not fire (issue #226).
+    this.#turnDelivered = true;
     // Silent turns (digest, #42) skip the output callback but still emit,
     // so the caller can capture the text without posting it to the space
     // (issue #173: honored, matching the OMP driver).

@@ -295,7 +295,7 @@ export interface DriverEventData {
   message?: string;
   /** Accumulated reasoning text (`thinking` events). */
   thinking?: string;
-  /** Turn failure cause (`turn_end` events carrying one). */
+  /** Turn failure cause (`turn_end` events, and empty-completion `message` events, carrying one — issue #226). */
   error?: string;
 }
 
@@ -1429,10 +1429,8 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // inbound text — without the role gate their content would be
           // delivered back to the channel as if it were the model's
           // reply.
-          const contentText =
-            message !== null && "role" in message && message.role === "assistant"
-              ? collectTextBlocks(message)
-              : [];
+          const isAssistant = message !== null && "role" in message && message.role === "assistant";
+          const contentText = isAssistant ? collectTextBlocks(message) : [];
           const deltaText = [...this.#textByIndex.entries()]
             .sort(([a], [b]) => a - b)
             .map(([, part]) => part)
@@ -1440,7 +1438,18 @@ export class OmpSessionDriver implements AgentSessionDriver {
             .trim();
           this.#textByIndex.clear();
           const text = contentText.join("\n").trim() || deltaText;
-          if (text) this.#deliver(text);
+          // Issue #226: an empty ASSISTANT completion still reaches the
+          // presenter (which surfaces the visible retry note, or the churn
+          // error once EMPTY_TURN_LIMIT trips) — never a silent no-reply.
+          // The SDK's agent loop turns failed requests into empty assistant
+          // messages; dropping them here made the #60 churn guard count
+          // empties it never saw and the turn ended invisible. The cause
+          // rides the empty payload so the note names it (#78). Non-assistant
+          // message_end events (user/toolResult) carry no model text and
+          // never deliver.
+          if (isAssistant || text) {
+            this.#deliver(text, isAssistant && text === "" ? this.#lastError : undefined);
+          }
           break;
         }
         case "turn_start":
@@ -1780,11 +1789,11 @@ export class OmpSessionDriver implements AgentSessionDriver {
     this.#emitter.emit("thinking", { spaceId: this.#spaceId, thinking });
   }
 
-  #deliver(text: string): void {
+  #deliver(text: string, error?: string): void {
     // onOutput and the "message" event are the same signal: consume one channel.
     // Silent turns (digest, #42) skip the output callback but still emit, so
     // the caller can capture the text without posting it to the space.
     if (!this.#silentTurn) this.#onOutput(this.#spaceId, text);
-    this.#emitter.emit("message", { spaceId: this.#spaceId, text });
+    this.#emitter.emit("message", { spaceId: this.#spaceId, text, error });
   }
 }
