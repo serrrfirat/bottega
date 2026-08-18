@@ -345,6 +345,11 @@ const thinkingBlockSchema = z.object({
   thinking: z.string(),
 });
 
+const textBlockSchema = z.object({
+  type: z.string(),
+  text: z.string(),
+});
+
 /**
  * The thinking text of an SDK message's content blocks (issue #193).
  * `{type:"thinking"}` blocks carry the model's reasoning; unknown block
@@ -364,6 +369,28 @@ export function collectThinkingBlocks(message: { content?: unknown } | null): st
     const parsed = thinkingBlockSchema.safeParse(block);
     if (!parsed.success || parsed.data.type !== "thinking" || !parsed.data.thinking.trim()) continue;
     parts.push(parsed.data.thinking.trim());
+  }
+  return parts;
+}
+
+/**
+ * The text of an SDK message's content blocks, in content order. This is
+ * the DISPLAY copy: for assistant `message_end` events the SDK deobfuscates
+ * secret placeholders in text blocks before emitting to subscribers (issue
+ * #221) — the streamed `text_delta` deltas carry the RAW provider text, so
+ * the final message's content blocks are the authoritative, restored text.
+ * Unknown block shapes (thinking, toolCall, image, …) are ignored. Empty
+ * when the message carries no text blocks.
+ */
+export function collectTextBlocks(message: { content?: unknown } | null): string[] {
+  if (!(message instanceof Object) || !("content" in message)) return [];
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  const parts: string[] = [];
+  for (const block of content) {
+    const parsed = textBlockSchema.safeParse(block);
+    if (!parsed.success || parsed.data.type !== "text") continue;
+    parts.push(parsed.data.text);
   }
   return parts;
 }
@@ -1363,21 +1390,43 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // the final message instead. Prefer the content blocks (they
           // are the full text); the accumulated deltas remain the
           // fallback when a provider redacts thinking from content.
-          const contentThinking = collectThinkingBlocks(
-            event.message instanceof Object && "content" in event.message ? event.message : null,
-          );
+          const message =
+            event.message instanceof Object && "content" in event.message ? event.message : null;
+          const contentThinking = collectThinkingBlocks(message);
           if (contentThinking.length > 0) {
             this.#thinkingByIndex.clear();
             contentThinking.forEach((part, index) => this.#thinkingByIndex.set(index, part));
           }
           this.#emitThinking();
           this.#thinkingByIndex.clear();
-          const text = [...this.#textByIndex.entries()]
+          // Issue #221: the SDK obfuscates secrets in provider-bound
+          // traffic (the SDK's env-name scanner treats
+          // BOTTEGA_OAUTH_CALLBACK_BASE_URL's tunnel URL as a secret, so
+          // the minted upload-link URL's base becomes a `$$HASH$$`
+          // placeholder before the model sees it) and deobfuscates ONLY
+          // the message_end display event — streamed text_delta deltas
+          // carry the RAW provider text. The model relays the placeholder
+          // verbatim, so the deltas would leak `$$…$$` into the Slack
+          // reply. Prefer the message's content text blocks (the
+          // deobfuscated display copy) for the delivered text; the
+          // accumulated deltas remain the fallback for paths where the
+          // message carries no text blocks. Only ASSISTANT messages carry
+          // model-authored text: the SDK emits message_end for
+          // user/toolResult messages too, whose content blocks hold the
+          // inbound text — without the role gate their content would be
+          // delivered back to the channel as if it were the model's
+          // reply.
+          const contentText =
+            message !== null && "role" in message && message.role === "assistant"
+              ? collectTextBlocks(message)
+              : [];
+          const deltaText = [...this.#textByIndex.entries()]
             .sort(([a], [b]) => a - b)
             .map(([, part]) => part)
             .join("\n")
             .trim();
           this.#textByIndex.clear();
+          const text = contentText.join("\n").trim() || deltaText;
           if (text) this.#deliver(text);
           break;
         }

@@ -20,6 +20,9 @@ import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
 import { createStore } from "../../store/db";
+import { createFixtureRegistry, FIXTURE_EXTENSION_ID } from "../../extensions/fixture";
+import { mintUploadLinkToolDefinition, UploadLinkStore } from "../../extensions/upload-link";
+import { buildSecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/index";
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
@@ -44,9 +47,16 @@ import {
 /** The SDK event shapes the error-surfacing test injects through the stub's emit seam. */
 type InjectedSdkEvent =
   | {
+      type: "message_update";
+      message: unknown;
+      assistantMessageEvent:
+        | { type: "text_delta"; contentIndex: number; delta: string }
+        | { type: "text_end"; contentIndex: number; content: string };
+    }
+  | {
       type: "message_end";
       message: {
-        role: "assistant";
+        role: "assistant" | "user";
         content: Array<{ type: "text"; text: string }>;
         stopReason: string;
         errorMessage?: string;
@@ -568,6 +578,142 @@ describe("createOmpSdkDriver concurrency invariant", () => {
       expect(registries[1]).toBeInstanceOf(AgentRegistry);
       expect(registries[0]).not.toBe(registries[1]);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("upload-link reply survives SDK secret obfuscation (issue #221)", () => {
+  /**
+   * Issue #221 regression: the minted upload-link URL must reach the user's
+   * Slack post verbatim with a REAL host — never a `$$…$$` fragment.
+   *
+   * Root cause (proven): the OMP SDK's SecretObfuscator registers every
+   * env var whose NAME matches its secret pattern as an obfuscate-mode
+   * secret — `BOTTEGA_OAUTH_CALLBACK_BASE_URL` matches (`OAUTH_`), so the
+   * tunnel URL VALUE (which the minted link embeds as its base) becomes a
+   * secret. Outbound tool results are obfuscated before the model sees
+   * them (the base is replaced by a `$$HASH:L$$` placeholder), the model
+   * relays the placeholder verbatim (issue #210's instruction), and the
+   * streamed text_delta deltas carry the RAW provider text. The SDK
+   * deobfuscates ONLY the message_end display event; the driver must
+   * deliver that deobfuscated copy, not the raw deltas.
+   *
+   * Caller surface: real mint tool execute -> the obfuscated reply text
+   * (built with the REAL SDK obfuscator, same construction the SDK uses)
+   * -> the driver loop -> the delivered Slack post text. The model relays
+   * verbatim, so the deltas carry the obfuscated text; the message_end
+   * display event carries the deobfuscated copy.
+   */
+  test("the minted URL's real host survives the SDK obfuscation round trip to the delivered reply", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omp-driver-uploadlink-"));
+    // A tunnel-shaped public base — the same env the mint resolves at
+    // runtime (issue #211 anchor policy: reachable public base wins).
+    const TUNNEL_BASE = "https://across-sbjct-insulin-lessons.trycloudflare.com";
+    const prevBase = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = TUNNEL_BASE;
+    try {
+      // 1. The real mint tool's execute produces the reply text the model
+      //    would relay (issue #210's anchored URL + relay instruction).
+      const store = createStore(join(dir, "test.db"));
+      const linkStore = new UploadLinkStore(store);
+      const tool = mintUploadLinkToolDefinition({
+        registry: createFixtureRegistry(),
+        store: linkStore,
+        baseUrl: () => "http://127.0.0.1:64204",
+        resolvePublicBase: async () => ({ base: TUNNEL_BASE, warning: undefined }),
+      });
+      const minted = await tool.execute(
+        "call-1",
+        { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+        undefined,
+        undefined,
+        // SAFETY: the mint tool reads only ctx.sessionManager.getSessionFile().
+        { sessionManager: { getSessionFile: () => null } } as never,
+      );
+      const mintedText =
+        (minted.content as Array<{ type: "text"; text: string }>).find((c) => c.type === "text")?.text ?? "";
+      expect(mintedText.split("\n")[0]).toContain(`${TUNNEL_BASE}/upload/`);
+
+      // 2. The SDK obfuscates provider-bound traffic with an obfuscator
+      //    built from secret-shaped env names + secrets.yml + built-in
+      //    credential patterns. The env var set above registers the tunnel
+      //    base URL as a secret, so the minted URL's base becomes a
+      //    `$$HASH:L$$` placeholder — the exact `$$3QYJYOMAV0DQ:L$$`
+      //    mangling from the live incident.
+      const agentDir = join(dir, "agent");
+      const obfuscator = await buildSecretObfuscator(dir, agentDir, agentDir);
+      expect(obfuscator?.hasSecrets()).toBe(true);
+      const modelSees = obfuscator!.obfuscate(mintedText);
+      expect(modelSees).toMatch(/\$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$/); // the placeholder shape
+      expect(modelSees).not.toContain(TUNNEL_BASE); // the real host never reaches the model
+      expect(modelSees).toContain("/upload/"); // the token path still rides along
+
+      // 3. The model relays the tool result verbatim (issue #210). The
+      //    streamed deltas carry the RAW provider text; the SDK's
+      //    message_end DISPLAY event carries the deobfuscated copy.
+      const stub = stubSdkSession();
+      const extensions: Extension[] = [];
+      const extensionErrors: LoadExtensionsResult["errors"] = [];
+      const driver = createOmpSdkDriver({
+        agentDir,
+        createSession: async () =>
+          ({
+            session: stub.session,
+            extensionsResult: { extensions, errors: extensionErrors, runtime: {} },
+            setToolUIContext: (_uiContext: ExtensionUIContext, _hasUI: boolean) => {},
+            eventBus: {},
+          }) as CreateAgentSessionResult,
+      });
+      let delivered = "";
+      const session = await driver.createSession({
+        spaceId: "slack:C1",
+        transcriptDir: join(dir, "sessions"),
+        onOutput: (_spaceId, text) => {
+          delivered = text;
+        },
+      });
+      // The SDK also emits message_end for USER messages (the inbound
+      // text). Their content blocks must never be delivered back to the
+      // channel as the model's reply — the content-prefer branch is
+      // assistant-only (without the role gate, "hello bot" would post).
+      stub.emit({
+        type: "message_end",
+        message: { role: "user", content: [{ type: "text", text: "hello bot" }], stopReason: "end_turn" },
+      });
+      expect(delivered).toBe("");
+      const split = Math.floor(modelSees.length / 2);
+      stub.emit({
+        type: "message_update",
+        message: {},
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: modelSees.slice(0, split) },
+      });
+      stub.emit({
+        type: "message_update",
+        message: {},
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: modelSees.slice(split) },
+      });
+      stub.emit({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: obfuscator!.deobfuscate(modelSees) }],
+          stopReason: "end_turn",
+        },
+      });
+
+      // 4. The Slack post carries the full anchored URL with the REAL host
+      //    — never the $$…$$ fragment the raw deltas carry (pre-fix code
+      //    delivers the deltas verbatim and FAILS this assertion).
+      expect(delivered).toBe(obfuscator!.deobfuscate(modelSees));
+      expect(delivered.split("\n")[0]).toMatch(
+        new RegExp(`^${TUNNEL_BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/upload/[A-Za-z0-9_-]+$`),
+      );
+      expect(delivered).not.toMatch(/\$\$/);
+      await session.dispose();
+    } finally {
+      if (prevBase === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = prevBase;
       rmSync(dir, { recursive: true, force: true });
     }
   });
