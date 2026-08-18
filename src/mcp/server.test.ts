@@ -196,6 +196,8 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
     mcpTransport?: (binding: McpBinding) => Transport;
     /** Issue #196: wire the one-time upload-link mint (shared store + fake base URL). */
     uploadLink?: boolean;
+    /** Issue #210: the wired mint's base URL (default the loopback fixture). */
+    uploadLinkBaseUrl?: string;
     /**
      * Issue #206: wire the internal tool surface (work items, model
      * settings, scheduler, KB). Default true — the production surface.
@@ -281,7 +283,12 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
           gate: { loadPolicy: () => Promise.resolve(policy), router: DenyRouter, timeoutMs: 1_000 },
         },
         ...(opts.uploadLink
-          ? { uploadLink: { store: new UploadLinkStore(store), baseUrl: () => "http://127.0.0.1:9999" } }
+          ? {
+              uploadLink: {
+                store: new UploadLinkStore(store),
+                baseUrl: () => opts.uploadLinkBaseUrl ?? "http://127.0.0.1:9999",
+              },
+            }
           : undefined),
       },
     });
@@ -873,7 +880,8 @@ describe("MCP server extension surface (in-process deps)", () => {
 
       const res = await callTool(h.client, "connect_upload_link", { extension: FIXTURE_EXTENSION_ID, scope: "personal" });
       expect(res.isError).toBeUndefined();
-      const url = res.content[0]?.text ?? "";
+      // Issue #210: the result carries the URL verbatim on its own line.
+      const url = (res.content[0]?.text ?? "").split("\n")[0]!;
       expect(url.startsWith("http://127.0.0.1:9999/upload/")).toBe(true);
 
       // The minted token is real: the SHARED store (the endpoint's) consumes it.
@@ -886,6 +894,30 @@ describe("MCP server extension surface (in-process deps)", () => {
       await expect(
         h.client.callTool({ name: "connect_upload_link", arguments: { scope: "personal" } }),
       ).rejects.toThrow(/extension/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_upload_link anchors its reply to the minted public URL (issue #210)", async () => {
+    const h = await makeInProcessHarness({ uploadLink: true, uploadLinkBaseUrl: "https://upload.example.com" });
+    try {
+      const res = await callTool(h.client, "connect_upload_link", { extension: FIXTURE_EXTENSION_ID, scope: "personal" });
+      expect(res.isError).toBeUndefined();
+      const text = res.content[0]?.text ?? "";
+      // The minted URL is anchored verbatim (first line) with the same
+      // relay contract as the session tool…
+      const url = text.split("\n")[0]!;
+      expect(url.startsWith("https://upload.example.com/upload/")).toBe(true);
+      expect(text).toContain("exactly as written");
+      // …and no loopback base can leak into the reply.
+      expect(text).not.toMatch(/127\.0\.0\.1|localhost/);
+
+      // The minted token is real: the SHARED store consumes it.
+      const token = url.slice("https://upload.example.com/upload/".length);
+      const consumed = h.store.consumeUploadToken(token);
+      expect(consumed.ok).toBe(true);
+      if (consumed.ok) expect(consumed.row.actor).toBe("U123");
     } finally {
       await h.cleanup();
     }

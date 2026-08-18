@@ -458,15 +458,68 @@ describe("upload link minting (issue #196)", () => {
       expect(result.isError).toBeUndefined();
       // SAFETY: the tool replies with a single text content block carrying the upload URL.
       const text = (result.content[0] as { text: string }).text;
-      expect(text.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+      // Issue #210: the result carries the URL verbatim on its own line.
+      const url = text.split("\n")[0]!;
+      expect(url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
 
       // The minted token is real: the endpoint's store consumes it.
-      const token = text.slice(endpoint.baseUrl.length + "/upload/".length);
+      const token = url.slice(endpoint.baseUrl.length + "/upload/".length);
       const consumed = endpoint.store.consume(token);
       expect(consumed.ok).toBe(true);
       if (consumed.ok) {
         expect(consumed.row.actor).toBe("UADA");
         expect(consumed.row.space_id).toBe("slack:C1");
+      }
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("the mint tool anchors its reply to the minted public URL — never a loopback (issue #210)", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      // The exact wiring expression server/index.ts uses: the deployment's
+      // public base when BOTTEGA_OAUTH_CALLBACK_BASE_URL is set, else the
+      // in-process loopback URL. A configured public base is the bug's
+      // trigger: the agent re-emitted the token with a loopback base
+      // pattern-copied from older context, rendering a dead link.
+      const baseUrl = () => uploadLinkPublicBase() ?? endpoint.baseUrl;
+      const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
+      try {
+        const tool = mintUploadLinkToolDefinition({
+          registry: h.deps.registry,
+          store: endpoint.store,
+          baseUrl,
+          getPrincipal: () => "UADA",
+        });
+        const result = await tool.execute(
+          "t1",
+          { extension: "fixture.weather", scope: "personal" },
+          undefined,
+          undefined,
+          // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
+          { sessionManager: { getSessionFile: () => null } } as never,
+        );
+        expect(result.isError).toBeUndefined();
+        const text = (result.content[0] as { text: string }).text;
+        // The minted URL is anchored verbatim (first line)…
+        const url = text.split("\n")[0]!;
+        expect(url.startsWith("https://upload.example.com/upload/")).toBe(true);
+        // …with an explicit relay contract the agent must follow…
+        expect(text).toContain("exactly as written");
+        // …and no loopback base can leak into the reply.
+        expect(text).not.toMatch(/127\.0\.0\.1|localhost/);
+
+        // The token is real: the SHARED endpoint store consumes it.
+        const token = url.slice("https://upload.example.com/upload/".length);
+        const consumed = endpoint.store.consume(token);
+        expect(consumed.ok).toBe(true);
+        if (consumed.ok) expect(consumed.row.actor).toBe("UADA");
+      } finally {
+        if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+        else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
       }
     } finally {
       endpoint.stop();

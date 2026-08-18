@@ -100,7 +100,13 @@ import {
   CONNECT_EXTENSION_TOOL,
   type ConnectExtensionDeps,
 } from "../extensions/connect";
-import { mintUploadLink, MINT_UPLOAD_LINK_TOOL, UploadLinkStore } from "../extensions/upload-link";
+import {
+  mintUploadLink,
+  MINT_UPLOAD_LINK_TOOL,
+  UploadLinkStore,
+  uploadLinkRelayText,
+  UPLOAD_LINK_RELAY_GUIDANCE,
+} from "../extensions/upload-link";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import type { ExtensionRegistry } from "../extensions/registry";
 import type { ExtensionRuntime } from "../extensions/runtime";
@@ -631,7 +637,10 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       { registry: extensions.connect.registry, store: extensions.uploadLink.store, baseUrl: extensions.uploadLink.baseUrl },
     );
     if (!outcome.ok) return { content: [{ type: "text", text: outcome.message }], isError: true };
-    return { content: [{ type: "text", text: outcome.url }] };
+    // Issue #210: same canonical reply as the session tool — the exact
+    // minted URL plus the relay contract, never a bare URL the agent may
+    // reconstruct from context.
+    return { content: [{ type: "text", text: uploadLinkRelayText(outcome.url) }] };
   };
 
   /**
@@ -755,7 +764,8 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
                     description:
                       `Mints a single-use, expiring HTTPS link for an api_key-type extension. ` +
                       `The user opens the link in a browser and pastes the secret there; the server stores it ` +
-                      `DIRECTLY into the vault — never through chat or a transcript.`,
+                      `DIRECTLY into the vault — never through chat or a transcript. ` +
+                      UPLOAD_LINK_RELAY_GUIDANCE,
                     inputSchema: mintUploadLinkJsonSchema,
                   },
                 ]

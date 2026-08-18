@@ -221,6 +221,23 @@ export function mintUploadLink(
   return { ok: true, url: `${deps.baseUrl()}/upload/${minted.token}` };
 }
 
+/**
+ * The canonical mint result text (issue #210): the exact URL on its own
+ * line plus an explicit relay instruction. Anchors the agent's reply to
+ * the minted URL — the model must relay it verbatim, never reconstruct,
+ * reformat, or substitute it (a pattern-copied loopback base renders a
+ * dead `http://127.0.0.1:<port>/upload/<token>` link for a remote user).
+ * Shared by the session tool and the MCP surface so both reply
+ * identically.
+ */
+export function uploadLinkRelayText(url: string): string {
+  return `${url}\nRelay this upload link exactly as written — never construct, reformat, or substitute the URL.`;
+}
+
+/** Issue #210: description guidance for both mint surfaces — the returned link is final. */
+export const UPLOAD_LINK_RELAY_GUIDANCE =
+  "The returned link is final: relay it to the user exactly as returned — never reconstruct, reformat, or substitute it.";
+
 const MINT_UPLOAD_LINK_PARAMS_SCHEMA = z.object({
   extension: z.string().describe("Extension id from the registry (e.g. the provider id)"),
   scope: z.enum(["org", "personal"]).describe("org = shared org account; personal = your own account"),
@@ -254,7 +271,8 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
       `Boot secrets (issue #201) mint the same way by their provider id: the Slack tokens ` +
       `(slack-app / slack-bot), the model provider keys (opencode / near / openai / anthropic), ` +
       `and the GitHub webhook shared secret (github-webhook — issue #57) ` +
-      `— the value lands in the vault row the server boot seeds from.`,
+      `— the value lands in the vault row the server boot seeds from. ` +
+      UPLOAD_LINK_RELAY_GUIDANCE,
     parameters: MINT_UPLOAD_LINK_PARAMS_SCHEMA,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -265,7 +283,9 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
         deps,
       );
       if (!outcome.ok) return toolError(outcome.message);
-      return { content: [{ type: "text", text: outcome.url }] };
+      // Issue #210: the reply anchors to the exact minted URL — never a
+      // reconstructed base (a loopback rewrite renders a dead link).
+      return { content: [{ type: "text", text: uploadLinkRelayText(outcome.url) }] };
     },
   };
 }
