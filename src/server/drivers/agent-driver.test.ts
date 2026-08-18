@@ -573,6 +573,60 @@ describe("session default model resolution (issue #199)", () => {
       delete process.env.OPENCODE_API_KEY;
     }
   });
+
+  test("the org-wide default beats a stale agent-dir pin in session resolution (#207)", async () => {
+    process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-org207-"));
+    try {
+      // The #207 evidence shape: the agent-dir config.yml pins a DEAD model
+      // (near/zai-org/GLM-5.1-FP8 — the stale value), the space has NO
+      // per-space settings, and the org_settings row carries the operator's
+      // choice (models.default = openai-codex/gpt-5.6-luna). The catalog
+      // serves the org default, so the only question is which source the
+      // session resolves — the org default must WIN.
+      writeFileSync(
+        join(dir, "config.yml"),
+        "modelRoles:\n  default: near/zai-org/GLM-5.1-FP8\n",
+      );
+      writeFileSync(
+        join(dir, "models.yml"),
+        `providers:
+  near:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:1"
+    apiKey: BOTTEGA_TEST_NEAR_API_KEY
+    models:
+      - id: "openai-codex/gpt-5.6-luna"
+        name: "gpt-5.6-luna"
+        contextWindow: 128000
+        maxTokens: 8192
+`,
+      );
+      const store = createStore(join(dir, "store.db"));
+      store.setOrgSettings({ models: { default: "openai-codex/gpt-5.6-luna" } });
+      const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C207" });
+      let receivedOptions: CreateAgentSessionOptions | undefined;
+      const driver = createOmpSdkDriver({
+        agentDir: dir,
+        // The composition-root wiring (issue #207): effective settings =
+        // space settings with the org-wide default filling unset slots.
+        getModelSettings: (spaceId) => store.getEffectiveSpaceSettings(spaceId),
+        createSession: async (options) => {
+          receivedOptions = options;
+          throw new Error("factory stub: no real session");
+        },
+      });
+      await expect(
+        driver.createSession({ spaceId: space.id, transcriptDir: join(dir, "sessions"), onOutput: () => {} }),
+      ).rejects.toThrow("factory stub: no real session");
+      // The session's explicit default is the ORG value (provider-qualified
+      // through the catalog), never the stale pin's dead GLM provider.
+      expect(receivedOptions?.modelPattern).toEqual(["near/openai-codex/gpt-5.6-luna"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+    }
+  });
 });
 
 describe("resolveRoleTarget (issue #64)", () => {

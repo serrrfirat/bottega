@@ -282,12 +282,17 @@ export async function bootExecutorRuntime(opts: {
   const { store, audit, orgPolicy } = runtime;
   const agentDir = opts.agentDir ?? "data/omp-agent";
   mkdirSync(agentDir, { recursive: true });
-  // Boot-time pin sync (issue #78 recurrence): the SDK reads modelRoles from
-  // the agent dir's config.yml; host-dev agent dirs are never re-synced from
-  // config/omp, so a stale copy without the pin silently falls back to the
-  // provider catalog default (kimi-k2.7-code) — the Console Go 400 path.
-  const pinSync = ensureAgentDirModelPin(agentDir);
-  if (pinSync === "created" || pinSync === "patched") {
+  // Boot-time pin sync (issue #78 recurrence, staleness #207): the SDK
+  // reads modelRoles from the agent dir's config.yml; host-dev agent dirs
+  // are never re-synced from config/omp, so a stale copy without the pin
+  // silently falls back to the provider catalog default (kimi-k2.7-code) —
+  // the Console Go 400 path. A stale existing pin is corrected in place,
+  // unless the org settings override the default (#125: the operator's own
+  // agent-dir pin is then inert and must not be clobbered).
+  const pinSync = ensureAgentDirModelPin(agentDir, OMP_CONFIG_TEMPLATE, {
+    orgDefault: runtime.store.getOrgSettings()?.models?.default,
+  });
+  if (pinSync === "created" || pinSync === "patched" || pinSync === "updated") {
     console.log(
       `bottega executor: agent-dir config.yml ${pinSync} — modelRoles pin synced from ${OMP_CONFIG_TEMPLATE}`,
     );
@@ -849,7 +854,10 @@ async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string,
  * runs on its agent-dir default unless a pin applies.
  */
 async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Promise<SpaceModelSettings> {
-  const settings = await store.getSpaceSettings(item.space_id);
+  // Issue #207: the EFFECTIVE settings (space overrides, org-wide
+  // models.default fallback) so the executor's sessions resolve the same
+  // default the space sessions do — never the stale agent-dir pin.
+  const settings = await store.getEffectiveSpaceSettings(item.space_id);
   if (item.model === null && item.reasoning_effort === null) return settings;
   return {
     ...settings,

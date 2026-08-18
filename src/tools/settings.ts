@@ -46,8 +46,10 @@ import { loadOrgPolicy, loadSpacePolicy, type PolicyConfig } from "../policy/con
 import type { ApprovalRouter } from "../policy/approval-router";
 import { evaluatePolicyGate } from "../policy/gate";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
+import { regenerateModelsConfig } from "../models/generate";
 import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
+import { join } from "node:path";
 
 /**
  * Synthetic exec-tier tool name for the org-write approver gate (issue
@@ -81,6 +83,14 @@ export interface SettingsToolsExtensionOpts {
     /** Executor-session scope (issue #11); see decidePolicyCall. */
     preApproved?: boolean;
   };
+  /**
+   * The deployment agent dir (issue #207): when set, every successful
+   * org-scope write regenerates the agent-dir models.yml catalog from the
+   * updated settings, so a fresh session resolves the new default model
+   * instead of a boot-stale catalog. Unset → no regeneration (the boot
+   * still regenerates; catalog staleness is bounded by the next boot).
+   */
+  agentDir?: string;
 }
 
 /** Org-scope settable knobs — snake_case, mirrors the stored blob (OrgSettingsInput). */
@@ -426,6 +436,13 @@ async function handleOrg(
   const before = current !== null ? orgSettingsToInput(current) : {};
   const merged = mergeSettingsInput(before, params.set);
   const after = store.setOrgSettings(merged);
+  // Issue #207: keep the SDK catalog in lockstep with the settings — the
+  // agent-dir models.yml is boot-generated, so an org-scope update would
+  // otherwise leave a fresh session resolving against a boot-stale catalog
+  // and fail closed onto the stale pin. Idempotent: no model ids → null.
+  if (opts.agentDir !== undefined) {
+    regenerateModelsConfig(after, join(opts.agentDir, "models.yml"));
+  }
   await opts.audit.appendAudit({
     actor,
     event_type: SETTINGS_CHANGED_EVENT,

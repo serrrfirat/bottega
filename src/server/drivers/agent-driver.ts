@@ -834,22 +834,33 @@ export async function assertAgentDirModelAvailable(agentDir: string): Promise<nu
  */
 export const OMP_CONFIG_TEMPLATE = "config/omp/config.yml";
 
+/** What the boot-time pin sync did to the agent-dir config.yml (issue #78/#207). */
+export type AgentDirPinSyncResult = "created" | "patched" | "updated" | "unchanged" | "skipped";
+
 /**
  * Guarantees the SDK's agent-dir config.yml carries the `modelRoles` pin
- * from the committed template (issue #78 recurrence). The SDK reads the
- * agent dir's config.yml at session creation; when it lacks the pin, the
- * session silently falls back to the provider catalog default
+ * from the committed template (issue #78 recurrence, staleness #207). The
+ * SDK reads the agent dir's config.yml at session creation; when it lacks
+ * the pin, the session silently falls back to the provider catalog default
  * (kimi-k2.7-code for opencode-go) instead of the pinned deepseek-v4-flash
  * — the "OMP repository fallback" — and the Console Go gateway 400s that
  * path (dotted tool names) into empty completions.
  *
- * Operator customizations are never overwritten: a config that already
- * defines `modelRoles` (or that this parser cannot read) is left untouched,
- * and only the pin block is appended to a stale file. When the agent-dir
- * config is missing entirely, the template is copied (the compose-equivalent
- * first boot). Returns what was done for boot logging and tests.
+ * Operator customizations are never overwritten (the #125 clobber fix):
+ * a config this parser cannot read is left untouched, and a stale pin is
+ * corrected IN PLACE — only the `modelRoles.default` value line changes,
+ * every other block (disabledProviders, secrets, …) stays byte-identical.
+ * When the org settings override the default model (`opts.orgDefault` set),
+ * the pin is inert for sessions — the operator's own agent-dir pin is left
+ * alone rather than clobbered. When the agent-dir config is missing
+ * entirely, the template is copied (the compose-equivalent first boot).
+ * Returns what was done for boot logging and tests.
  */
-export function ensureAgentDirModelPin(agentDir: string, templatePath: string = OMP_CONFIG_TEMPLATE): "created" | "patched" | "unchanged" | "skipped" {
+export function ensureAgentDirModelPin(
+  agentDir: string,
+  templatePath: string = OMP_CONFIG_TEMPLATE,
+  opts: { orgDefault?: string } = {},
+): AgentDirPinSyncResult {
   const agentConfigPath = join(agentDir, "config.yml");
   let existing: string | null = null;
   try {
@@ -867,30 +878,99 @@ export function ensureAgentDirModelPin(agentDir: string, templatePath: string = 
     writeFileSync(agentConfigPath, template);
     return "created";
   }
-  // Already pinned, or an unparseable file: leave the operator's config alone.
+  // An unparseable operator config is never guessed at.
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = parseYamlSubset(existing);
-    if (parsed.modelRoles !== undefined) return "unchanged";
+    parsed = parseYamlSubset(existing);
   } catch {
     return "skipped";
   }
-  // Render the template's modelRoles block (e.g. `default: <provider>/<model>`).
-  let roleBlock: string | null = null;
+  // The template's modelRoles block: a mapping of role → model id; anything
+  // else means there is nothing to sync.
+  let templateDefault: string | undefined;
   try {
     const templateParsed = parseYamlSubset(template);
-    // The template's modelRoles block is a mapping of role → model id; anything else leaves the file untouched.
     const roles = z.record(z.string(), z.unknown()).safeParse(templateParsed.modelRoles);
-    if (!roles.success) return "unchanged";
-    const lines = Object.entries(roles.data)
-      .filter((entry): entry is [string, string] => z.string().safeParse(entry[1]).success)
-      .map(([key, value]) => `  ${key}: ${value}`);
-    if (lines.length === 0) return "unchanged";
-    roleBlock = `\nmodelRoles:\n${lines.join("\n")}\n`;
+    const defaultRole = roles.success ? z.string().safeParse(roles.data.default) : undefined;
+    templateDefault = defaultRole?.success ? defaultRole.data : undefined;
   } catch {
     return "skipped";
   }
-  appendFileSync(agentConfigPath, roleBlock);
-  return "patched";
+  if (templateDefault === undefined) return "unchanged";
+  if (parsed.modelRoles === undefined) {
+    // No pin at all: append ONLY the template's modelRoles block (never a
+    // rewrite of the operator's own blocks).
+    appendFileSync(agentConfigPath, `\nmodelRoles:\n  default: ${templateDefault}\n`);
+    return "patched";
+  }
+  // A pin exists: leave it alone when it already matches the template, when
+  // the org settings override the default (the operator's pin is inert and
+  // must not be clobbered — #125), or when the existing pin is unreadable.
+  const agentRoles = z.record(z.string(), z.unknown()).safeParse(parsed.modelRoles);
+  if (!agentRoles.success) return "unchanged";
+  const agentDefault = z.string().safeParse(agentRoles.data.default).success ? (agentRoles.data.default as string) : undefined;
+  if (agentDefault === templateDefault || opts.orgDefault !== undefined) return "unchanged";
+  // Stale pin (issue #207): correct the `default` value IN PLACE — the
+  // rest of the operator's config stays byte-identical.
+  updateAgentDirModelDefault(agentConfigPath, templateDefault);
+  return "updated";
+}
+
+/** Line-level in-place correction of the `modelRoles.default` value (issue #207). */
+function updateAgentDirModelDefault(agentConfigPath: string, value: string): void {
+  const lines = readFileSync(agentConfigPath, "utf8").split("\n");
+  let inModelRoles = false;
+  let modelRolesLine = -1;
+  let blockIndent = -1;
+  let defaultLine = -1;
+  let lastBlockLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!;
+    // Comment stripping mirrors the YAML-subset tokenizer (double-quoted
+    // `#` is not a comment; `#` preceded by space/tab/start is).
+    let cut = raw.length;
+    let inDouble = false;
+    for (let j = 0; j < raw.length; j++) {
+      const c = raw[j]!;
+      if (c === '"') inDouble = !inDouble;
+      else if (c === "#" && !inDouble && (j === 0 || raw[j - 1] === " " || raw[j - 1] === "\t")) {
+        cut = j;
+        break;
+      }
+    }
+    const text = raw.slice(0, cut).trim();
+    if (text === "") continue;
+    const indent = raw.length - raw.trimStart().length;
+    if (!inModelRoles) {
+      if (indent === 0 && text === "modelRoles:") {
+        inModelRoles = true;
+        modelRolesLine = i;
+      }
+      continue;
+    }
+    if (blockIndent === -1) {
+      if (indent === 0) break; // empty modelRoles block
+      blockIndent = indent;
+    } else if (indent < blockIndent) {
+      break; // block ended
+    }
+    lastBlockLine = i;
+    const sep = text.indexOf(":");
+    if (sep > 0 && text.slice(0, sep).trim() === "default" && defaultLine === -1) {
+      defaultLine = i;
+    }
+  }
+  const indentation = defaultLine !== -1 ? lines[defaultLine]!.slice(0, lines[defaultLine]!.length - lines[defaultLine]!.trimStart().length) : "  ";
+  if (defaultLine !== -1) {
+    lines[defaultLine] = `${indentation}default: ${value}`;
+  } else if (lastBlockLine !== -1) {
+    // The block has no `default` key: append one inside it.
+    lines.splice(lastBlockLine + 1, 0, `${indentation}default: ${value}`);
+  } else {
+    // An empty `modelRoles:` block: insert the default directly under it.
+    lines.splice(modelRolesLine + 1, 0, `${indentation}default: ${value}`);
+  }
+  writeFileSync(agentConfigPath, lines.join("\n"));
 }
 
 /**

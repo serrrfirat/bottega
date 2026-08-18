@@ -11,7 +11,7 @@
  * - space-scope proactive knobs set/read/merge (issue #150).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -453,6 +453,29 @@ describe("org scope (issue #67)", () => {
       const body = JSON.parse(res.text) as { policy: { always_approve: string[] } };
       // The policy view includes the tightened knobs (issue #151).
       expect(body.policy.always_approve).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an org-scope model update regenerates the agent-dir catalog — a fresh session sees the new default (#207)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const agentDir = join(dir, "omp-agent");
+      mkdirSync(agentDir, { recursive: true });
+      // A boot-stale catalog: the old default is all the SDK would see.
+      writeFileSync(join(agentDir, "models.yml"), "providers: {}\n");
+      const [tool] = loadTools(store, { audit: fakeAudit().audit, gate: approveGate(store), agentDir });
+      const res = await call(tool, {
+        scope: "org",
+        set: { models: { default: "openai-codex/gpt-5.6-luna" } },
+      });
+      expect(res.isError).toBe(false);
+      // The org default is now resolvable from the catalog the sessions
+      // read (the boot-time-only generation would have left it stale).
+      const catalog = readFileSync(join(agentDir, "models.yml"), "utf8");
+      expect(catalog).toContain("openai-codex/gpt-5.6-luna");
+      expect(store.getOrgSettings()?.models?.default).toBe("openai-codex/gpt-5.6-luna");
     } finally {
       cleanup();
     }

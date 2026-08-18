@@ -187,6 +187,41 @@ describe("spaces", () => {
     expect(parseSpaceSettings('{"model":"  m  ","reasoning_effort":"ultra"}')).toEqual({ model: "m" });
     expect(parseSpaceSettings('{"reasoning_effort":"high"}')).toEqual({ reasoning_effort: "high" });
   });
+
+  test("getEffectiveSpaceSettings: the org-wide default fills unset slots, per-space settings win (issue #207)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C207A" });
+    // No org row → effective == space settings.
+    expect(await s.getEffectiveSpaceSettings(space.id)).toEqual({});
+
+    s.setOrgSettings({ models: { default: "openai-codex/gpt-5.6-luna", effort: "high" } });
+    // Empty space settings → the org default becomes the session default.
+    expect(await s.getEffectiveSpaceSettings(space.id)).toEqual({
+      model: "openai-codex/gpt-5.6-luna",
+      reasoning_effort: "high",
+    });
+
+    // Per-space knobs win over the org-wide values for their own slots;
+    // unset slots still take the org fallback.
+    await s.updateSpaceSettings(space.id, { model: "near/deepseek-ai/DeepSeek-V4-Flash" });
+    expect(await s.getEffectiveSpaceSettings(space.id)).toEqual({
+      model: "near/deepseek-ai/DeepSeek-V4-Flash",
+      reasoning_effort: "high",
+    });
+    await s.updateSpaceSettings(space.id, { model: "space-chosen", reasoning_effort: "low" });
+    expect(await s.getEffectiveSpaceSettings(space.id)).toEqual({
+      model: "space-chosen",
+      reasoning_effort: "low",
+    });
+
+    // A missing space has no per-space row: the org-wide default still
+    // applies (the operator's choice is deployment-wide — it must never
+    // silently fall to the stale agent-dir pin).
+    expect(await s.getEffectiveSpaceSettings("slack:missing")).toEqual({
+      model: "openai-codex/gpt-5.6-luna",
+      reasoning_effort: "high",
+    });
+  });
 });
 
 describe("objects", () => {

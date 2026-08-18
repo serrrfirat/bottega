@@ -54,6 +54,15 @@ config files or server restart:
   before each fresh turn (#189). A settings change therefore reaches an
   already-live space session; an explicit `use_model` override still wins
   for the turn it targets.
+- **Session-default precedence** (#207): a space session's default model
+  resolves 1) the space's `model` slot (`model_settings`), 2) the
+  org-wide `settings models.default` (the `settings` tool) when the space
+  leaves the slot unset, 3) the agent-dir `config.yml modelRoles.default`
+  pin (boot-synced from `config/omp`; a stale pin is corrected in place
+  unless the org settings override it), 4) the provider catalog default
+  (never intended). The org-wide choice therefore reaches every session
+  without per-space configuration, and an org update is visible to the
+  next fresh session (the agent-dir catalog is regenerated on the write).
 
 Both model tools are write-tier, so they prompt for approval in non-yolo
 policy modes. Live switching and work-item pins use the OMP driver's

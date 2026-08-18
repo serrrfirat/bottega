@@ -342,16 +342,72 @@ describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
     }
   });
 
-  test("ensureAgentDirModelPin never rewrites an operator config that already pins modelRoles (unchanged)", () => {
+  test("a stale existing pin is updated IN PLACE from the template when no org settings override (updated, #207)", () => {
     const { dir, templatePath } = tempTemplate();
     try {
       const agentDir = join(dir, "agent");
       mkdirSync(agentDir, { recursive: true });
-      // The operator's own pin wins over the template — byte-identical file.
+      // The #207 regression: a stale pin (a dead GLM provider) survived
+      // every boot because the old sync treated ANY existing modelRoles as
+      // operator-owned and returned "unchanged".
+      const stale =
+        "# stale pin from before the re-pin\nmodelRoles:\n  default: near/zai-org/GLM-5.1-FP8\ndisabledProviders:\n  - opencode-go\n";
+      writeFileSync(join(agentDir, "config.yml"), stale);
+      expect(ensureAgentDirModelPin(agentDir, templatePath)).toBe("updated");
+      const updated = readFileSync(join(agentDir, "config.yml"), "utf8");
+      // Only the default VALUE line changed: the operator's other blocks
+      // and the surrounding text survive byte-for-byte.
+      const parsed = parseYamlSubset(updated);
+      expect(parsed.modelRoles).toEqual({ default: PIN_ROLE });
+      expect(parsed.disabledProviders).toEqual(["opencode-go"]);
+      expect(updated).toContain("# stale pin from before the re-pin");
+      expect(updated).not.toContain("GLM-5.1-FP8");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a modelRoles block WITHOUT a default key gains the template default in place (updated, #207)", () => {
+    const { dir, templatePath } = tempTemplate();
+    try {
+      const agentDir = join(dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      const rolesOnly = "modelRoles:\n  fast: opencode-go/deepseek-v4-flash\nsecrets:\n  enabled: true\n";
+      writeFileSync(join(agentDir, "config.yml"), rolesOnly);
+      expect(ensureAgentDirModelPin(agentDir, templatePath)).toBe("updated");
+      const parsed = parseYamlSubset(readFileSync(join(agentDir, "config.yml"), "utf8"));
+      expect(parsed.modelRoles).toEqual({ fast: "opencode-go/deepseek-v4-flash", default: PIN_ROLE });
+      expect(parsed.secrets).toEqual({ enabled: "true" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an operator-pinned agent-dir config is UNTOUCHED when org settings override the default (#125 no-clobber, #207)", () => {
+    const { dir, templatePath } = tempTemplate();
+    try {
+      const agentDir = join(dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      // The operator's own pin is inert once the org settings override the
+      // default — clobbering it would regress #125.
       const operatorPinned = "# operator pin wins\nmodelRoles:\n  default: operator-chosen/model\nsecrets:\n  enabled: false\n";
       writeFileSync(join(agentDir, "config.yml"), operatorPinned);
-      expect(ensureAgentDirModelPin(agentDir, templatePath)).toBe("unchanged");
+      expect(ensureAgentDirModelPin(agentDir, templatePath, { orgDefault: PIN_ROLE })).toBe("unchanged");
       expect(readFileSync(join(agentDir, "config.yml"), "utf8")).toBe(operatorPinned);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a pin that already matches the template is left byte-identical (unchanged)", () => {
+    const { dir, templatePath } = tempTemplate();
+    try {
+      const agentDir = join(dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      const current = "# in sync\nmodelRoles:\n  default: " + PIN_ROLE + "\nsecrets:\n  enabled: false\n";
+      writeFileSync(join(agentDir, "config.yml"), current);
+      expect(ensureAgentDirModelPin(agentDir, templatePath)).toBe("unchanged");
+      expect(readFileSync(join(agentDir, "config.yml"), "utf8")).toBe(current);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

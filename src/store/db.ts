@@ -207,6 +207,15 @@ export interface Store {
   updatePolicy(id: string, policyJson: string): Promise<Space>;
   /** Per-space model settings (issue #64): the parsed `spaces.settings` column, {} when unset/invalid. */
   getSpaceSettings(id: string): Promise<SpaceModelSettings>;
+  /**
+   * The space's EFFECTIVE model settings (issue #207): the per-space
+   * settings with the org-wide model defaults (org_settings.models) filling
+   * any unset slot — the operator's per-org choice (#185/#189/#199) is the
+   * session default unless the space overrides it. Precedence: space >
+   * org > agent-dir pin (the driver's last-resort fallback). A space with
+   * no settings and no org row yields {}.
+   */
+  getEffectiveSpaceSettings(id: string): Promise<SpaceModelSettings>;
   /** Replaces the space's model settings JSON; throws when the space does not exist. */
   updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space>;
   createObject(input: {
@@ -643,6 +652,27 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   async function getSpaceSettings(id: string): Promise<SpaceModelSettings> {
     const space = await getSpace(id);
     return space ? parseSpaceSettings(space.settings) : {};
+  }
+
+  async function getEffectiveSpaceSettings(id: string): Promise<SpaceModelSettings> {
+    const space = await getSpaceSettings(id);
+    const orgModels = getOrgSettings()?.models;
+    if (!orgModels) return space;
+    const effective: SpaceModelSettings = { ...space };
+    // The org-wide defaults fill only the slots the space left unset; a
+    // space that sets ANY knob keeps its own value for that knob.
+    if (effective.model === undefined && orgModels.default !== undefined) effective.model = orgModels.default;
+    if (effective.fast_model === undefined && orgModels.fast !== undefined) effective.fast_model = orgModels.fast;
+    if (effective.reasoning_model === undefined && orgModels.reasoning !== undefined) {
+      effective.reasoning_model = orgModels.reasoning;
+    }
+    if (effective.reasoning_effort === undefined && orgModels.effort !== undefined) {
+      // Defensive narrowing: the org blob validates effort as a string, but
+      // only the enum levels are meaningful for role resolution.
+      const level = MODEL_THINKING_LEVEL_SCHEMA.safeParse(orgModels.effort);
+      if (level.success) effective.reasoning_effort = level.data;
+    }
+    return effective;
   }
 
   async function updateSpaceSettings(id: string, settings: SpaceModelSettings): Promise<Space> {
@@ -1260,6 +1290,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getSpace,
     updatePolicy,
     getSpaceSettings,
+    getEffectiveSpaceSettings,
     updateSpaceSettings,
     createObject,
     listObjects,
