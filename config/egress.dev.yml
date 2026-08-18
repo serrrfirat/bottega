@@ -119,9 +119,11 @@ transforms:
           rules:
             - host: "api.anthropic.com"
 
-  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send
-  #    the placeholder bearer; this transform holds each provider's refresh
-  #    token + client credentials (the sync's JSON blob,
+  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) and
+  #    the openai-codex model provider (issue #214 — the ChatGPT subscription
+  #    credential, data/proxy-secrets/openai-codex-oauth.json) send the placeholder
+  #    bearer; this transform holds each provider's refresh token + client
+  #    credentials (the sync's JSON blob,
   #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
   #    tokens at egress, and stubs inbound requests to each configured
   #    token_endpoint with a synthetic token so the SDK's own token dance
@@ -161,6 +163,21 @@ transforms:
           require: true
           rules:
             - host: "mcp.linear.app"
+        - grant: refresh_token
+          refresh_token:
+            type: file
+            path: "/data/proxy-secrets/openai-codex-oauth.json"
+            ttl: "30s"
+            json_key: "refresh_token"
+          client_id:
+            type: file
+            path: "/data/proxy-secrets/openai-codex-oauth.json"
+            ttl: "30s"
+            json_key: "client_id"
+          token_endpoint: "https://auth.openai.com/oauth/token"
+          require: true
+          rules:
+            - host: "chatgpt.com"
 
 log:
   level: "info"

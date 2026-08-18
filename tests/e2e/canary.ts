@@ -74,6 +74,7 @@ import { buildRegistry } from "../../src/scheduler/actions";
 import { startScheduler, type Scheduler } from "../../src/scheduler/runner";
 import { standupDigestAction } from "../../src/scheduler/standup";
 import { createSecretFileBoundary, type CredentialBoundary } from "../../src/extensions/boundary";
+import { codexAuthFilePathFromEnv, readCodexAuthTokens } from "../../src/extensions/proxy-seed";
 import {
   createFixtureRegistry,
   FIXTURE_EXTENSION_ID,
@@ -188,10 +189,13 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
 
 /**
  * The real model's key (issue #71 semantics), env first then Keychain:
- * CANARY_MODEL_REF overrides everything; NEAR is preferred over
- * opencode-go — the NEAR gateway accepts the space agent's dotted tool
- * names (memory.save, ...), the opencode-go gateway rejects them (live
- * finding, issue #71). Null when nothing is available.
+ * CANARY_MODEL_REF overrides everything; Codex (issue #214) — the ChatGPT
+ * subscription credential, a FILESYSTEM source: the Codex CLI auth file at
+ * CODEX_AUTH_PATH (default ~/.codex/auth.json; unset under the test
+ * runner) — beats NEAR when resolvable; NEAR is preferred over opencode-go
+ * — the NEAR gateway accepts the space agent's dotted tool names
+ * (memory.save, ...), the opencode-go gateway rejects them (live finding,
+ * issue #71). Null when nothing is available.
  */
 export function resolveModelKey(deps: TokenDeps): string | null {
   const read = (envKey: string, service: string): string | undefined => {
@@ -201,6 +205,8 @@ export function resolveModelKey(deps: TokenDeps): string | null {
     return fromKeychain && fromKeychain.trim() ? fromKeychain : undefined;
   };
   if (deps.env.CANARY_MODEL_REF?.trim()) return deps.env.CANARY_MODEL_REF.trim()!;
+  const codexAuthPath = codexAuthFilePathFromEnv(deps.env);
+  if (codexAuthPath !== null && readCodexAuthTokens(codexAuthPath) !== null) return codexAuthPath;
   return (
     read("NEAR_API_KEY", "bottega-near") ??
     read("OPENCODE_API_KEY", "bottega-opencode") ??
@@ -1957,8 +1963,9 @@ export async function runCanary(
         status: "failed",
         message:
           "live-slack canary FAILED in CI-strict mode — no model key " +
-          "(set NEAR_API_KEY or CANARY_MODEL_REF as a GitHub Actions repository secret; prefer NEAR — " +
-          "the opencode-go gateway rejects the agent's dotted tool names, issue #71; issue #175)",
+          "(set NEAR_API_KEY, CODEX_AUTH_PATH (a Codex CLI auth file, issue #214), or CANARY_MODEL_REF as a " +
+          "GitHub Actions repository secret; prefer NEAR — the opencode-go gateway rejects the agent's dotted " +
+          "tool names, issue #71; issue #175)",
         journeys: [],
       };
     }
@@ -1966,15 +1973,23 @@ export async function runCanary(
       status: "skipped",
       message:
         "live-slack canary skipped — no model key (set NEAR_API_KEY or OPENCODE_API_KEY in env, " +
-        "or store it: security add-generic-password -s bottega-near -a \"$(whoami)\" -w '<key>'; " +
+        "set CODEX_AUTH_PATH to a Codex CLI auth file (issue #214), or store a key: " +
+        "security add-generic-password -s bottega-near -a \"$(whoami)\" -w '<key>'; " +
         "prefer NEAR — the opencode-go gateway rejects the agent's dotted tool names, issue #71)",
       journeys: [],
     };
   }
   // The harness resolves the model ref from env (pickRealModelRef) and the
   // deployment catalog reads the key from env too — when the key came from
-  // the Keychain, surface it into the process env first.
-  if (!deps.env.NEAR_API_KEY?.trim() && !deps.env.OPENCODE_API_KEY?.trim() && !deps.env.CANARY_MODEL_REF?.trim()) {
+  // the Keychain, surface it into the process env first. The codex source
+  // (issue #214) is a FILE, not a Keychain key — CODEX_AUTH_PATH needs no
+  // surfacing; when it is set, no Keychain key is consulted.
+  if (
+    !deps.env.NEAR_API_KEY?.trim() &&
+    !deps.env.OPENCODE_API_KEY?.trim() &&
+    !deps.env.CODEX_AUTH_PATH?.trim() &&
+    !deps.env.CANARY_MODEL_REF?.trim()
+  ) {
     const near = deps.keychain("bottega-near");
     if (near) deps.env.NEAR_API_KEY = near;
     else {

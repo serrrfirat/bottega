@@ -10,7 +10,8 @@
  * and reloads the proxy. Missing credentials delete stale files so
  * `require: true` rejects the request.
  */
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
@@ -71,6 +72,67 @@ export function proxyKeyFileName(provider: string): string {
 /** The proxy-side OAuth blob for a provider (the tokens entry's json_key file). */
 export function proxyOAuthBlobFileName(provider: string): string {
   return oauthTokenBlobFileName(provider);
+}
+
+/**
+ * The codex provider's filesystem credential (issue #214): the ChatGPT
+ * subscription OAuth tokens come from the Codex CLI's auth file — the
+ * default `~/.codex/auth.json`, overridable with `CODEX_AUTH_PATH` (the
+ * same env var the canary resolution gates on). Only the ACCESS + REFRESH
+ * tokens are read; the id_token and other fields never enter the app.
+ */
+export const CODEX_AUTH_FILE_ENV = "CODEX_AUTH_PATH";
+export const CODEX_AUTH_FILE_DEFAULT = "~/.codex/auth.json";
+/**
+ * The Codex public OAuth client id (the openai/codex CLI's login client —
+ * verified from the OAuth flow; the refresh grant at
+ * https://auth.openai.com/oauth/token uses it, see OAUTH_TOKEN_ENDPOINTS).
+ */
+export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/** The Codex CLI auth file's token shape: { tokens: { access_token, refresh_token } }. */
+export interface CodexAuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+/**
+ * Resolves the Codex auth file path from env: `CODEX_AUTH_PATH` when set,
+ * else the default `~/.codex/auth.json`. Under the test runner an UNSET
+ * path yields null — the sync and the canary resolution must never read a
+ * real developer's home auth file hermetically (the #191 isolation rule);
+ * an explicit `CODEX_AUTH_PATH` (a fixture) is always honored.
+ */
+export function codexAuthFilePathFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env[CODEX_AUTH_FILE_ENV];
+  if (explicit !== undefined && explicit.trim() !== "") return explicit;
+  if (process.env.NODE_ENV === "test") return null;
+  return CODEX_AUTH_FILE_DEFAULT.replace(/^~/, homedir());
+}
+
+/**
+ * Reads + parses the Codex CLI auth file: `{ tokens: { access_token,
+ * refresh_token } }` (both non-empty). Returns null on a missing file,
+ * unparseable JSON, or missing tokens — the fail-closed signal (the
+ * caller deletes the boundary blob).
+ */
+export function readCodexAuthTokens(authFilePath: string): CodexAuthTokens | null {
+  let raw: string;
+  try {
+    raw = readFileSync(authFilePath, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { tokens?: { access_token?: unknown; refresh_token?: unknown } };
+    const accessToken = parsed.tokens?.access_token;
+    const refreshToken = parsed.tokens?.refresh_token;
+    if (typeof accessToken !== "string" || accessToken === "") return null;
+    if (typeof refreshToken !== "string" || refreshToken === "") return null;
+    return { accessToken, refreshToken };
+  } catch {
+    return null;
+  }
 }
 
 export interface ProxyCredentialSyncOpts {
@@ -222,6 +284,35 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
     delete env[credential.clientIdEnv];
     if (credential.clientSecretEnv !== undefined) delete env[credential.clientSecretEnv];
     log(`bottega boot: proxy ${fileName} seeded (${credential.provider} OAuth refresh token)`);
+  }
+
+  // 2.5. Codex subscription blob (issue #214): the ChatGPT subscription
+  // OAuth tokens come from the Codex CLI auth file (CODEX_AUTH_PATH, default
+  // ~/.codex/auth.json) — a FILESYSTEM credential, never env/Keychain/vault.
+  // The tokens (access + refresh) land in the proxy's openai-codex-oauth.json
+  // boundary blob (the egress oauth_token transform mints the live bearer
+  // at egress); nothing enters the app env. A missing/unparseable auth
+  // file DELETES the blob (fail closed — require: true 502s the codex
+  // provider until the user logs in with the Codex CLI).
+  {
+    const codexFileName = proxyOAuthBlobFileName("openai-codex");
+    const codexAuthPath = codexAuthFilePathFromEnv(env);
+    const codexTokens = codexAuthPath === null ? null : readCodexAuthTokens(codexAuthPath);
+    if (codexTokens === null) {
+      deleteSecretFile(secretsDir, codexFileName);
+      log(
+        `bottega boot: proxy ${codexFileName} REMOVED — no Codex auth file ` +
+          `(set ${CODEX_AUTH_FILE_ENV} or log in with the Codex CLI to create ~/.codex/auth.json; fail closed)`,
+      );
+    } else {
+      const blob = {
+        access_token: codexTokens.accessToken,
+        refresh_token: codexTokens.refreshToken,
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      };
+      writeSecretFile(secretsDir, codexFileName, JSON.stringify(blob));
+      log(`bottega boot: proxy ${codexFileName} seeded (Codex subscription OAuth tokens)`);
+    }
   }
 
   // 3. Reload: a running proxy re-reads the file sources (ttl + reload).

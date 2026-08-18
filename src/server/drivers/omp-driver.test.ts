@@ -296,7 +296,7 @@ describe("createOmpSdkDriver toolset contract", () => {
 });
 
 describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
-  const PIN_ROLE = "near/deepseek-ai/DeepSeek-V4-Flash";
+  const PIN_ROLE = "openai-codex/gpt-5.6-luna";
 
   function tempTemplate(role = PIN_ROLE) {
     const dir = mkdtempSync(join(tmpdir(), "omp-pin-"));
@@ -397,7 +397,7 @@ describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
       mkdirSync(agentDir, { recursive: true });
       expect(ensureAgentDirModelPin(agentDir)).toBe("created");
       const parsed = parseYamlSubset(readFileSync(join(agentDir, "config.yml"), "utf8"));
-      expect(parsed.modelRoles).toEqual({ default: "near/deepseek-ai/DeepSeek-V4-Flash" });
+      expect(parsed.modelRoles).toEqual({ default: "openai-codex/gpt-5.6-luna" });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

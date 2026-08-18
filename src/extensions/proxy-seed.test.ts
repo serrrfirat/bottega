@@ -6,13 +6,16 @@
  * real Keychain, no live proxy.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CODEX_AUTH_FILE_ENV,
+  CODEX_OAUTH_CLIENT_ID,
   MODEL_PROXY_KEYS,
   proxyKeyFileName,
   proxyOAuthBlobFileName,
+  readCodexAuthTokens,
   syncProxyCredentialsFromEnv,
 } from "./proxy-seed";
 
@@ -211,6 +214,142 @@ describe("OAuth blobs (issue #208)", () => {
     } finally {
       s.cleanup();
     }
+  });
+});
+
+describe("codex subscription blob (issue #214)", () => {
+  /** A Codex CLI auth.json fixture in a temp dir (never a real home file). */
+  function codexAuthFile(auth: unknown): { dir: string; path: string; cleanup(): void } {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-codex-auth-"));
+    const path = join(dir, "auth.json");
+    writeFileSync(path, JSON.stringify(auth));
+    return { dir, path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  test("a Codex CLI auth file seeds the codex-oauth.json blob (mode 0600, access + refresh + client id)", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1", id_token: "never-read" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+      });
+      const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      const blob = JSON.parse(readFileSync(blobPath, "utf8"));
+      expect(blob).toEqual({
+        access_token: "codex-access-1",
+        refresh_token: "codex-refresh-1",
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      });
+      expect(statSync(blobPath).mode & 0o777).toBe(0o600);
+      // The credential never enters the app env (the path is a setting, not the secret).
+      expect(env[CODEX_AUTH_FILE_ENV]).toBe(auth.path);
+      expect(Object.values(env)).not.toContain("codex-access-1");
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("a missing auth file DELETES the blob (fail closed — require: true 502s)", async () => {
+    const s = tempSecretsDir();
+    try {
+      const stale = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      writeFileSync(stale, "{}", { mode: 0o600 });
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: join(s.dir, "does-not-exist.json") },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+      });
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("an unparseable auth file or missing tokens DELETES the blob (fail closed)", async () => {
+    const s = tempSecretsDir();
+    const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+    try {
+      // Invalid JSON.
+      const bad = codexAuthFile("not json at all");
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: bad.path },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+      });
+      expect(existsSync(blobPath)).toBe(false);
+      bad.cleanup();
+      // Valid JSON, no tokens.access_token.
+      const noAccess = codexAuthFile({ tokens: { refresh_token: "codex-refresh-1" } });
+      writeFileSync(blobPath, "{}", { mode: 0o600 });
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: noAccess.path },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+      });
+      expect(existsSync(blobPath)).toBe(false);
+      noAccess.cleanup();
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("under the test runner, an UNSET CODEX_AUTH_PATH never reads a real home auth file (fail closed)", async () => {
+    // The #191 isolation rule: with NODE_ENV=test and no explicit path, the
+    // sync must NOT touch ~/.codex/auth.json on the dev machine — it treats
+    // the source as absent and deletes the blob.
+    const s = tempSecretsDir();
+    try {
+      const stale = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      writeFileSync(stale, "{}", { mode: 0o600 });
+      const log: string[] = [];
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: (line) => log.push(line),
+      });
+      expect(existsSync(stale)).toBe(false);
+      expect(log.join("\n")).toContain("openai-codex-oauth.json REMOVED");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("readCodexAuthTokens parses the Codex CLI shape and rejects malformed files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-codex-parse-"));
+    try {
+      const path = join(dir, "auth.json");
+      writeFileSync(path, JSON.stringify({ tokens: { access_token: "at", refresh_token: "rt" } }));
+      expect(readCodexAuthTokens(path)).toEqual({ accessToken: "at", refreshToken: "rt" });
+      writeFileSync(path, "not json");
+      expect(readCodexAuthTokens(path)).toBeNull();
+      writeFileSync(path, JSON.stringify({ tokens: { access_token: "at" } }));
+      expect(readCodexAuthTokens(path)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // Missing file → null.
+    expect(readCodexAuthTokens("/nonexistent/codex-auth.json")).toBeNull();
   });
 });
 

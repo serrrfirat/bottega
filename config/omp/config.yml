@@ -3,18 +3,22 @@
 # file is the per-deployment template, mounted from config/omp/ by compose.
 secrets:
   enabled: true
-# Default model role (issue #78, re-pinned #213): pinned so the session
-# never silently shifts to a provider catalog default (kimi-k2.7-code)
-# when the catalog updates. The default is the NEAR AI Cloud gateway's
-# deepseek-ai/DeepSeek-V4-Flash — served WITHOUT reasoning_content
-# (verified live, 0.8-2.0s per trivial completion; GLM-5.1-FP8's verbose
-# chain-of-thought was 3.5-18s). opencode-go/deepseek-v4-flash stays the
-# preferred primary once its monthly quota recovers (#213): the key-only
-# models.yml entry and the SDK catalog resolution are untouched, so the
-# operator re-pins `default: opencode-go/deepseek-v4-flash` when the
-# quota resets.
+# Default model role (issue #78, re-pinned #213, re-pinned #214): pinned so
+# the session never silently shifts to a provider catalog default
+# (kimi-k2.7-code) when the catalog updates. The default is the ChatGPT
+# subscription Codex provider's CHEAP model — openai-codex/gpt-5.6-luna
+# ($0.2 in / $1.2 out per M tokens vs gpt-5.4's $2.5/$15; the user's
+# subscription OAuth token from the Codex CLI auth file, see features.md →
+# "BYO Codex (ChatGPT subscription)"). The NEAR fallback
+# (near/deepseek-ai/DeepSeek-V4-Flash — served without reasoning_content,
+# verified live) and the opencode-go primary stay in the catalog as
+# documented fallbacks: the operator re-pins `default:`
+# near/deepseek-ai/DeepSeek-V4-Flash or opencode-go/deepseek-v4-flash when
+# no Codex credential is provisioned (missing credential → the codex
+# provider 502s fail-closed at the proxy until the user logs in with the
+# Codex CLI).
 modelRoles:
-  default: near/deepseek-ai/DeepSeek-V4-Flash
+  default: openai-codex/gpt-5.6-luna
 # approvalMode is deliberately unset: the policy extension (issue #6) owns
 # tool-call gating (tier x space policy -> allow | deny | ask-human), so
 # OMP's own approval prompts stay off.

@@ -84,9 +84,11 @@ describe("egress config generation", () => {
     // providers die in compose (default-deny egress 403s them).
     expect(BASE_EGRESS_DOMAINS).toContain("api.openai.com");
     expect(BASE_EGRESS_DOMAINS).toContain("api.anthropic.com");
+    expect(BASE_EGRESS_DOMAINS).toContain("chatgpt.com");
     const domains = allowlistDomains(COMMITTED_EGRESS);
     expect(domains).toContain("api.openai.com");
     expect(domains).toContain("api.anthropic.com");
+    expect(domains).toContain("chatgpt.com");
     expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("api.anthropic.com");
   });
 
@@ -96,12 +98,15 @@ describe("egress config generation", () => {
 
   test("rendering without extensions still emits the model-gateway secrets entries (base config is unchanged)", () => {
     // Issue #208: the model-gateway static-key entries are base config —
-    // only the extension entries are optional. No oauth transform without
-    // oauth entries.
+    // only the extension entries are optional. The codex oauth_token entry
+    // (issue #214) is base config too: the model-provider OAuth transform
+    // is emitted even with no extension entries.
     const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS);
     expect(yaml).toContain("- name: secrets");
     expect(yaml).toContain('path: "/data/proxy-secrets/near.secret"');
-    expect(yaml).not.toContain("- name: oauth_token");
+    expect(yaml).toContain("- name: oauth_token");
+    expect(yaml).toContain('path: "/data/proxy-secrets/openai-codex-oauth.json"');
+    expect(yaml).toContain('token_endpoint: "https://auth.openai.com/oauth/token"');
     expect(secretsEntries(yaml)?.length).toBe(4); // near/opencode/openai/anthropic
   });
 
@@ -140,6 +145,7 @@ describe("egress config generation", () => {
       "cloud-api.near.ai",
       "*.completions.near.ai",
       "opencode.ai",
+      "chatgpt.com",
       "api.openai.com",
       "api.anthropic.com",
       "raw.githubusercontent.com",
@@ -205,6 +211,7 @@ describe("egress config generation", () => {
         "cloud-api.near.ai",
         "*.completions.near.ai",
         "opencode.ai",
+        "chatgpt.com",
         "api.openai.com",
         "api.anthropic.com",
         "raw.githubusercontent.com",

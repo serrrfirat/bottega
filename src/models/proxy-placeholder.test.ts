@@ -43,17 +43,34 @@ interface WireRecord {
   provider: string;
   auth: string;
   path: string;
+  body: string;
 }
 
 const stubs: Array<{ stop: () => void }> = [];
 const dirs: string[] = [];
 const records: WireRecord[] = [];
 
+/** The minimal Responses-API SSE stream the SDK resolves to a message (issue #214). */
+function responsesSse(): string {
+  const item = { id: "msg_1", type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] };
+  return [
+    `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress" } })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [item] } })}\n\n`,
+  ].join("");
+}
+
 function stubGateway(): { baseUrl: string } {
   const server = Bun.serve({
     port: 0,
     fetch: async (req) => {
-      records.push({ provider: "", auth: req.headers.get("authorization") ?? "", path: new URL(req.url).pathname });
+      const body = await req.text();
+      records.push({ provider: "", auth: req.headers.get("authorization") ?? "", path: new URL(req.url).pathname, body });
+      if (new URL(req.url).pathname.endsWith("/codex/responses")) {
+        // The openai-codex provider (issue #214) posts to
+        // {baseUrl}/codex/responses and expects the Responses-API SSE shape.
+        return new Response(responsesSse(), { headers: { "Content-Type": "text/event-stream" } });
+      }
       return Response.json({
         id: "stub-completion",
         object: "chat.completion",
@@ -79,9 +96,12 @@ afterAll(() => {
 
 /** A temp agent dir whose models.yml mirrors the committed file with every
  * gateway baseUrl redirected at the recording stub (the committed file
- * itself keeps the real hosts). Returns the DECLARED anchor model ids per
- * provider (opencode-go's key-only decl carries none — the pinned
- * deepseek-v4-flash, config.yml modelRoles.default). */
+ * itself keeps the real hosts). Returns the anchor model ids per provider:
+ * the DECLARED models of the custom gateways, plus the key-only
+ * declarations' bundled anchors — opencode-go's pinned deepseek-v4-flash
+ * (the pre-#214 config.yml pin) and openai-codex's gpt-5.6-luna (issue
+ * #214, the default role — config.yml modelRoles.default — and the SDK
+ * catalog entry under the key-only decl). */
 function stubAgentDir(): { agentDir: string; declaredAnchors: Array<{ provider: string; id: string }> } {
   const stub = stubGateway();
   const parsed = parseYamlSubset(COMMITTED_MODELS_YML);
@@ -108,17 +128,21 @@ function stubAgentDir(): { agentDir: string; declaredAnchors: Array<{ provider: 
         lines.push(`    ${key}: ${value}`);
       }
     }
-    // The key-only opencode-go decl has no baseUrl in the committed file
-    // (its transport metadata is baked into the SDK catalog) — the test
-    // copy redirects it at the recording stub so the wire proof never
-    // touches the real gateway.
+    // The key-only decls (opencode-go, openai-codex — issue #214) have no
+    // baseUrl in the committed file (their transport metadata is baked
+    // into the SDK catalog) — the test copy redirects them at the
+    // recording stub so the wire proof never touches the real gateway.
     if (!emitted.has("baseUrl")) {
       lines.push(`    baseUrl: "${stub.baseUrl}"`);
     }
   }
   // opencode-go's key-only decl declares no models — the pinned anchor
-  // (config.yml modelRoles.default) is the wire shape under test.
+  // (config.yml modelRoles.default) is the wire shape under test. Same for
+  // openai-codex (issue #214): the anchor is the default role
+  // (config.yml modelRoles.default) — the SDK catalog's gpt-5.6-luna under
+  // the key-only placeholder decl.
   declaredAnchors.push({ provider: "opencode-go", id: "deepseek-v4-flash" });
+  declaredAnchors.push({ provider: "openai-codex", id: "gpt-5.6-luna" });
   const dir = mkdtempSync(join(tmpdir(), "bottega-placeholder-"));
   writeFileSync(join(dir, "models.yml"), `${lines.join("\n")}\n`);
   writeFileSync(join(dir, "config.yml"), "secrets:\n  enabled: true\n");
@@ -134,7 +158,7 @@ describe("proxy placeholder on the wire (issue #208)", () => {
     // fail-open by construction: the placeholder is a literal.
     const parsed = parseYamlSubset(COMMITTED_MODELS_YML);
     const providers = parsed["providers"] as Record<string, Record<string, unknown>>;
-    expect(Object.keys(providers).sort()).toEqual(["anthropic", "near", "openai", "opencode-go"]);
+    expect(Object.keys(providers).sort()).toEqual(["anthropic", "near", "openai", "openai-codex", "opencode-go"]);
     for (const config of Object.values(providers)) {
       expect(config["apiKey"]).toBe(PLACEHOLDER);
       expect(String(config["apiKey"])).not.toMatch(/^[A-Z][A-Z0-9_]+$/); // never an env NAME
@@ -173,6 +197,20 @@ describe("proxy placeholder on the wire (issue #208)", () => {
       expect(record.auth).toBe(`Bearer ${PLACEHOLDER}`);
       expect(record.auth).not.toMatch(/Bearer (NEAR|OPENAI|ANTHROPIC|OPENCODE)_API_KEY/);
     }
+
+    // The openai-codex provider (issue #214) uses the SDK's NATIVE Codex
+    // transport: the request hits {baseUrl}/codex/responses and carries the
+    // codex wire contract the backend demands (stream:true + store:false
+    // REQUIRED, max_output_tokens REJECTED, input a list) — with the
+    // placeholder bearer, never a live token.
+    const codexRecord = records.find((r) => r.path.endsWith("/codex/responses"));
+    expect(codexRecord, "an openai-codex /codex/responses request reached the stub").toBeDefined();
+    const codexBody = JSON.parse(codexRecord!.body);
+    expect(codexBody["model"]).toBe("gpt-5.6-luna");
+    expect(codexBody["stream"]).toBe(true);
+    expect(codexBody["store"]).toBe(false);
+    expect(Array.isArray(codexBody["input"])).toBe(true);
+    expect("max_output_tokens" in codexBody).toBe(false);
   }, 60_000);
 
   test("with NO provider keys in env, the SDK still resolves the placeholder (never the env NAME)", async () => {

@@ -65,6 +65,7 @@ import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps }
 import type { McpOAuthConnector } from "../../src/extensions/mcp-oauth";
 import type { UploadLinkStore } from "../../src/extensions/upload-link";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
+import { codexAuthFilePathFromEnv, readCodexAuthTokens } from "../../src/extensions/proxy-seed";
 import { bootLiveSlack, type LiveSlackHandle, type LiveSlackTokens } from "./slack-live";
 import type { JsonObject, McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -490,6 +491,8 @@ export type HarnessApprovalRouter = ApprovalRouter & {
 
 /** The canary model refs (issue #71): the deployment template's providers (config/omp/models.yml). */
 export const CANARY_MODEL_REFS = {
+  /** ChatGPT subscription Codex (issue #214): the CHEAP gpt-5.6-luna via the native openai-codex provider (chatgpt.com/backend-api/codex/responses; the default role, config.yml modelRoles.default). */
+  codex: "openai-codex/gpt-5.6-luna",
   /** Preferred primary (issue #37): deepseek-v4-flash via the built-in opencode-go provider (quota-limited, #213). */
   opencode: "opencode-go/deepseek-v4-flash",
   /** Default (issue #213): NEAR AI Cloud gateway serves DeepSeek-V4-Flash without reasoning_content. */
@@ -499,16 +502,25 @@ export const CANARY_MODEL_REFS = {
 /**
  * Picks the canary default model from the environment:
  *   - `CANARY_MODEL_REF`, when set, wins (explicit override);
- *   - else the NEAR default (`near/deepseek-ai/DeepSeek-V4-Flash`).
- * The NEAR provider remains the default because it is the exercise-the-
- * canary-JOURNEYS model; the opencode-go primary (issue #37) is usable
- * too — the driver flattens dotted tool names at the session boundary
- * (issue #78), and the opencode gateway accepts the flat names, so
+ *   - else Codex (issue #214) when the ChatGPT subscription credential
+ *     resolves — the Codex CLI auth file (CODEX_AUTH_PATH, default
+ *     ~/.codex/auth.json; unset under the test runner so hermetic tests
+ *     never read a real home file) exists and carries access+refresh
+ *     tokens, the same filesystem source the boot proxy-seed syncs
+ *     (src/extensions/proxy-seed);
+ *   - else the NEAR fallback (`near/deepseek-ai/DeepSeek-V4-Flash`).
+ * The NEAR provider remains the fallback when no codex credential exists
+ * because it is the exercise-the-canary-JOURNEYS fallback; the opencode-go
+ * primary (issue #37) is usable too — the driver flattens dotted tool
+ * names at the session boundary (issue #78), and the opencode gateway
+ * accepts the flat names, so
  * `CANARY_MODEL_REF=opencode-go/deepseek-v4-flash bun run canary` passes.
  * Returns null when no key is available.
  */
 export function pickRealModelRef(env: Record<string, string | undefined> = process.env): string | null {
   if (env.CANARY_MODEL_REF) return env.CANARY_MODEL_REF;
+  const codexAuthPath = codexAuthFilePathFromEnv(env);
+  if (codexAuthPath !== null && readCodexAuthTokens(codexAuthPath) !== null) return CANARY_MODEL_REFS.codex;
   if (env.NEAR_API_KEY) return CANARY_MODEL_REFS.near;
   if (env.OPENCODE_API_KEY) return CANARY_MODEL_REFS.opencode;
   return null;
@@ -688,8 +700,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     const realModelRef = cfg.realModelRef ?? pickRealModelRef();
     if (realModelRef === null) {
       throw new Error(
-        "canary harness: no model key in env — set OPENCODE_API_KEY or NEAR_API_KEY " +
-          "(`bun run canary` loads both from the Keychain, the dev.sh pattern)",
+        "canary harness: no model credential in env — set CODEX_AUTH_PATH (a Codex CLI auth file), " +
+          "OPENCODE_API_KEY, or NEAR_API_KEY " +
+          "(`bun run canary` loads the keys from the Keychain, the dev.sh pattern)",
       );
     }
     modelRef = realModelRef;

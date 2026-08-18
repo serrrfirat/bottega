@@ -60,6 +60,53 @@ policy modes. Live switching and work-item pins use the OMP driver's
 per-session hooks. ACP v1 has no model-switch message: it rejects unsupported
 settings or narrowing instead of pretending to apply them (#173).
 
+## BYO Codex (ChatGPT subscription) — issue #214
+
+Bring your own **ChatGPT subscription** (Plus/Pro/Team) as a model provider:
+the `openai-codex` provider routes `gpt-5.6-luna` turns (the DEFAULT model role, config.yml modelRoles.default) to the ChatGPT Codex
+endpoint (`chatgpt.com/backend-api/codex/responses`) authenticated with the
+**Codex CLI's** subscription OAuth tokens — no OpenAI API key, no separate
+billing.
+
+- **Filesystem credential** — the access + refresh tokens come from the
+  Codex CLI auth file, `~/.codex/auth.json` by default (`CODEX_AUTH_PATH`
+  overrides the path). Create it by logging in with the Codex CLI
+  (`codex login`). The server never reads the token into its env: the boot
+  credential sync (issue #214) copies `tokens.access_token` +
+  `tokens.refresh_token` into the proxy's mode-0600 boundary blob
+  (`data/proxy-secrets/openai-codex-oauth.json`, atomic write-temp +
+  rename) and iron-proxy mints/attaches the live bearer at egress — the
+  app process only ever sends the placeholder.
+- **Model** — `gpt-5.6-luna` (the CHEAP ChatGPT-account model — $0.2 in /
+  $1.2 out per M tokens vs gpt-5.4's $2.5/$15 — with the full gpt-5.x
+  family, `gpt-5.4`/`gpt-5.5`/..., available alongside; the flat ids are
+  what ChatGPT accounts are served, the
+  `gpt-5.x-codex` marketing ids are rejected). The provider is a KEY-ONLY
+  catalog declaration (the `opencode-go` pattern): the native SDK Codex
+  transport supplies the endpoint + the wire contract.
+- **Wire contract handled by the transport** — `stream: true` and
+  `store: false` are required by the Codex backend and enforced by the
+  native transport; `max_output_tokens` is rejected by the backend and
+  never sent (the transport strips it). `input` is always a list.
+- **Refresh semantics** — the proxy's `oauth_token` transform holds the
+  refresh token + the Codex public OAuth client id
+  (`app_EMoamEEZ73f0CkXaXp7hrann`) and mints fresh access tokens at egress
+  via the Codex CLI's OAuth refresh endpoint
+  (`https://auth.openai.com/oauth/token`, verified from the openai/codex
+  OAuth flow; the exact grant acceptance for every account plan is
+  validated on the first real deployment). `require: true` — a missing or
+  unmintable credential 502s instead of forwarding unauthenticated.
+- **Egress** — `chatgpt.com` is allowlisted (the Codex responses host) and
+  the codex entry joins the `oauth_token` transform in the generated
+  `config/egress.yml` + `config/egress.dev.yml`.
+- **Fail closed** — when the auth file is missing or unparseable, the sync
+  DELETES the boundary blob, so the provider's requests 502 until the user
+  logs in with the Codex CLI. `dev.sh` does NOT export the codex token
+  into env: the seed reads the file directly at boot.
+- **Catalog + pins** — `openai-codex/gpt-5.6-luna` resolves in the available
+  catalog (listAvailableModels), so `model_settings`, `use_model`, and
+  per-work-item pins can target it by name.
+
 ## Settings (issues #67, #150, #151, #190)
 
 Runtime configuration lives in the database, not in agent-editable YAML.
@@ -468,6 +515,7 @@ with repository secrets:
 | `SLACK_QA_USER_ID` | no | skips the users.list name lookup |
 | `SLACK_QA_CHANNEL` | no | defaults to `bottega-qa` |
 | `NEAR_API_KEY` | one of | the model key (preferred — the NEAR gateway accepts the agent's dotted tool names, issue #71) |
+| `CODEX_AUTH_PATH` | one of | path to a Codex CLI auth file (issue #214 — the ChatGPT subscription provider, `openai-codex/gpt-5.6-luna`, the default model; wins over `NEAR_API_KEY` when set and resolvable) |
 | `CANARY_MODEL_REF` | one of | overrides the model ref entirely |
 
 On failure the workflow posts the per-journey report + permalinks + the
@@ -524,9 +572,13 @@ pattern) and the harness installs the deployment model catalog
 (`config/omp/models.yml`). **Prefer the NEAR key** — the NEAR gateway
 accepts the space agent's dotted tool names (`memory.save`,
 `memory.search`); the opencode-go gateway rejects them and journeys fail
-loudly on it (live finding, issue #71). `CANARY_MODEL_REF` overrides the
-model ref entirely. The QA user must have opened a DM with the bot once (or
-the canary opens it via `conversations.open`).
+loudly on it (live finding, issue #71). The ChatGPT subscription Codex
+provider (issue #214) wins over NEAR when a Codex CLI auth file is
+provisioned: `CODEX_AUTH_PATH` (or the default `~/.codex/auth.json`) must
+point at a file carrying `tokens.access_token` + `tokens.refresh_token`.
+`CANARY_MODEL_REF` overrides the model ref entirely. The QA user must have
+opened a DM with the bot once (or the canary opens it via
+`conversations.open`).
 
 ## Known limitations (v1)
 

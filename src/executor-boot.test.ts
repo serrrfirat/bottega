@@ -59,7 +59,7 @@ function tempEnv(): ExecutorEnv {
     copyFileSync(join(EXTENSIONS_DIR, name), join(dir, "config", "extensions", name));
   }
   mkdirSync(join(dir, "config", "omp"), { recursive: true });
-  writeFileSync(join(dir, "config", "omp", "config.yml"), "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n");
+  writeFileSync(join(dir, "config", "omp", "config.yml"), "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n");
   // The credential-boundary guard (issue #9): the PAT lives in a file.
   mkdirSync(join(dir, "data", "secrets"), { recursive: true });
   writeFileSync(join(dir, "data", "secrets", "github-pat"), "pat-placeholder\n", { mode: 0o600 });
@@ -152,12 +152,12 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       expect(cfg.gitBaseUrl).toBe("https://github.com");
       expect(cfg.askpassScript).toBe("data/secrets/git-askpass.sh");
 
-      // Agent-dir pin (issue #78, re-pinned #213): a fresh agent dir gets
+      // Agent-dir pin (issue #78, re-pinned #213, #214): a fresh agent dir gets
       // the modelRoles pin from config/omp — the session can never silently
       // drift to the provider catalog default.
       const agentConfig = readFileSync(join(env.agentDir, "config.yml"), "utf8");
       expect(agentConfig).toContain("modelRoles");
-      expect(agentConfig).toContain("near/deepseek-ai/DeepSeek-V4-Flash");
+      expect(agentConfig).toContain("openai-codex/gpt-5.6-luna");
 
       // Worker toolset: memory tools ride the driver's policy gate; the
       // extension half carries the DISCOVERED github surface (issue #167 —

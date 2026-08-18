@@ -48,6 +48,25 @@ providers:
         name: DeepSeek V4 Flash via NEAR AI Cloud
         contextWindow: 128000
         maxTokens: 8192
+  # Codex (ChatGPT subscription, issue #214): the ChatGPT Codex endpoint
+  # (chatgpt.com/backend-api/codex/responses) authenticated with the
+  # SUBSCRIPTION OAuth access token from the Codex CLI auth file
+  # (~/.codex/auth.json, CODEX_AUTH_PATH override — the filesystem
+  # credential is seeded to the proxy at boot, src/extensions/proxy-seed).
+  # The entry is deliberately KEY-ONLY, the opencode-go pattern: openai-codex
+  # is a BUILT-IN SDK catalog provider (gpt-5.6-luna — the default role,
+  # config.yml modelRoles.default — plus gpt-5.4/gpt-5.5/... ship there
+  # with their transport metadata — api openai-codex-responses, baseUrl
+  # https://chatgpt.com/backend-api, and the native wire contract the codex
+  # backend demands: stream:true + store:false REQUIRED, max_output_tokens
+  # REJECTED, input MUST be a list — the transport enforces all of it), and
+  # the SDK's models.yml validation treats any provider declaration as
+  # CUSTOM — redeclaring its models without a baseUrl fails the boot guard.
+  # The key is the proxy placeholder (#208): the proxy mints the live bearer
+  # from data/proxy-secrets/openai-codex-oauth.json at egress (the
+  # oauth_token transform; the app process never holds the live token).
+  openai-codex:
+    apiKey: bottega-proxy-placeholder
   # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Same pattern as
   # near — one declared anchor model for the boot guard + fail-closed
   # fallback; listAvailableModels probes GET /v1/models with the provider's

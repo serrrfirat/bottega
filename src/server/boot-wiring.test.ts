@@ -166,7 +166,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
       writeFileSync(
         join(env.dir, "config", "omp", "config.yml"),
-        "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n",
+        "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n",
       );
       const agentDir = join(env.dir, "agent");
       let toolset: ToolDefinition[] | undefined;
@@ -276,7 +276,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
       writeFileSync(
         join(env.dir, "config", "omp", "config.yml"),
-        "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n",
+        "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n",
       );
 
       // GitHub's hosted MCP server is reachable (tools/list served by an
@@ -344,7 +344,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
       writeFileSync(
         join(env.dir, "config", "omp", "config.yml"),
-        "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n",
+        "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n",
       );
 
       // The hosted GitHub server's real wire surface — the #148 live leg

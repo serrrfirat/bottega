@@ -92,6 +92,14 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(domains).toContain("api.anthropic.com");
   });
 
+  test("allowlist contains the ChatGPT Codex gateway (issue #214)", () => {
+    const domains = asStringArray(allowlistCfg["domains"]);
+    // The codex provider (config/omp/models.yml) posts to
+    // chatgpt.com/backend-api/codex/responses; without the host in the
+    // allowlist the provider dies in compose (403 at the HTTP layer).
+    expect(domains).toContain("chatgpt.com");
+  });
+
   test("judge policy gate is configured after the allowlist", () => {
     expect(judge).toBeDefined();
     expect(asString(judgeCfg["name"])).toBe("egress-policy");
@@ -161,11 +169,13 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     }
   });
 
-  test("oauth_token transform (issue #208) mints the OAuth extensions' access tokens from the sync's JSON blobs", () => {
+  test("oauth_token transform (issue #208 + #214) mints the OAuth extensions' AND the codex model provider's access tokens from the sync's JSON blobs", () => {
     const oauth = transforms.find((t) => asRecord(t)["name"] === "oauth_token")!;
     expect(oauth).toBeDefined();
     const tokens = asRecordArray(asRecord(oauth["config"])["tokens"]);
-    expect(tokens).toHaveLength(2); // linear + attio (the #198 OAuth providers)
+    // linear + attio (the #198 OAuth providers) + codex (issue #214 — the
+    // ChatGPT subscription credential, a model provider not an extension).
+    expect(tokens).toHaveLength(3);
     for (const token of tokens) {
       expect(asString(token["grant"])).toBe("refresh_token");
       expect(asString(token["token_endpoint"])).toMatch(/^https:\/\//);
@@ -178,12 +188,21 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(asString(clientId["json_key"])).toBe("client_id");
       // Both fields come from the SAME per-provider JSON blob.
       expect(asString(refresh["path"])).toBe(asString(clientId["path"]));
-      expect(asString(refresh["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z]+-oauth\.json$/);
+      expect(asString(refresh["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z-]+-oauth\.json$/);
       const rules = asRecordArray(token["rules"]);
       expect(rules.length).toBeGreaterThanOrEqual(1);
       for (const rule of rules) {
         expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
       }
     }
+    // The codex entry's specific contract (issue #214): the blob is the
+    // sync's codex-oauth.json (seeded from the Codex CLI auth file), the
+    // refresh grant targets the openai/codex OAuth refresh endpoint, and
+    // the injected bearer covers chatgpt.com.
+    const codex = tokens.find((t) => asString(asRecord(t["refresh_token"])["path"]).includes("openai-codex-oauth.json"));
+    expect(codex).toBeDefined();
+    expect(asString(asRecord(codex!["token_endpoint"]))).toBe("https://auth.openai.com/oauth/token");
+    const codexRules = asRecordArray(codex!["rules"]);
+    expect(codexRules.map((r) => String(r["host"]))).toEqual(["chatgpt.com"]);
   });
 });

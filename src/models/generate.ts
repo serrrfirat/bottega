@@ -93,6 +93,16 @@ providers:
     apiKey: bottega-proxy-placeholder
     models:
 ${modelLines}
+  # Codex (ChatGPT subscription, issue #214): the ChatGPT Codex endpoint
+  # with the subscription OAuth access token (a filesystem credential —
+  # ~/.codex/auth.json — seeded to the proxy at boot; the placeholder is
+  # the only key the app env ever sees, #208). KEY-ONLY, the opencode-go
+  # pattern: openai-codex is a built-in SDK catalog provider (gpt-5.4
+  # ships with its transport metadata + native codex wire contract —
+  # stream:true + store:false REQUIRED, max_output_tokens REJECTED), and a
+  # redeclared models list without a baseUrl would fail the boot guard.
+  openai-codex:
+    apiKey: bottega-proxy-placeholder
   # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Declared anchor +
   # gateway probe (listAvailableModels) for the full live list.
   openai:

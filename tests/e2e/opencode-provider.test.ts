@@ -147,7 +147,7 @@ function gatewayProbeStatus(): Promise<number | "unreachable"> {
 async function liveSkipReason(): Promise<string | undefined> {
   // 1. The runtime agent-dir config (data/omp-agent, gitignored) is where
   //    the #78 band-aid lives: opencode-go disabled, or the pin moved off
-  //    opencode-go (e.g. the #213 near/deepseek-ai/DeepSeek-V4-Flash default).
+  //    opencode-go (e.g. the #214 openai-codex/gpt-5.6-luna default).
   const runtime = readAgentDirConfig(RUNTIME_AGENT_CONFIG);
   const disabled = runtime?.disabledProviders;
   if (disabled !== undefined) {
@@ -205,13 +205,14 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     }
   });
 
-  test("config.yml pins the default model role to near/deepseek-ai/DeepSeek-V4-Flash (issue #213)", () => {
+  test("config.yml pins the default model role to openai-codex/gpt-5.6-luna (issue #214)", () => {
     const config = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
     expect(config).toContain("modelRoles:");
-    expect(config).toContain("default: near/deepseek-ai/DeepSeek-V4-Flash");
-    // opencode-go stays the documented preferred primary (quota recovery);
-    // the key-only models.yml entry is untouched.
+    expect(config).toContain("default: openai-codex/gpt-5.6-luna");
+    // near + opencode-go stay in the catalog as documented fallbacks; the
+    // key-only models.yml entries are untouched.
     expect(config).toContain("opencode-go");
+    expect(config).toContain("near/deepseek-ai/DeepSeek-V4-Flash");
   });
 
   test("ensureAgentDirModelPin syncs the pin into a stale agent-dir config (issue #78 recurrence)", () => {
@@ -221,7 +222,7 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     // provider catalog default (kimi-k2.7-code). The boot sync must patch
     // such a file without touching operator customizations.
     const dir = mkdtempSync(join(tmpdir(), "bottega-pin-"));
-    const template = "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n";
+    const template = "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n";
     try {
       // Stale config (pre-#78 copy): no pin, operator customizations intact.
       const stale = "# OMP agent settings\nsecrets:\n  enabled: true\n";
@@ -231,7 +232,7 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
       expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("patched");
       const patched = readFileSync(join(dir, "config.yml"), "utf8");
       expect(patched).toContain("secrets:\n  enabled: true");
-      expect(patched).toContain("modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash");
+      expect(patched).toContain("modelRoles:\n  default: openai-codex/gpt-5.6-luna");
       // Second run: already pinned → untouched.
       expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("unchanged");
       // Missing agent-dir config → template copy (compose-equivalent first boot).
@@ -376,7 +377,7 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       );
       expect(ensureAgentDirModelPin(agentDir)).toBe("patched");
       const patched = readFileSync(join(agentDir, "config.yml"), "utf8");
-      expect(patched).toContain("modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash");
+      expect(patched).toContain("modelRoles:\n  default: openai-codex/gpt-5.6-luna");
 
       process.env.OPENCODE_API_KEY ??= KEY;
       const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);

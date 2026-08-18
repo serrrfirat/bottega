@@ -8,7 +8,7 @@
  * installs the deployment model catalog (config/omp/models.yml) into the
  * temp agent dir, so agent turns hit the real gateway instead of the
  * scripted stub. The default model is the NEAR one
- * (near/deepseek-ai/DeepSeek-V4-Flash, issue #213).
+ * (openai-codex/gpt-5.6-luna, the ChatGPT subscription Codex provider, issue #214).
  * The opencode-go primary is usable too since the driver flattens dotted
  * tool names at the session boundary (issue #78); both paths pass, and
  * CANARY_MODEL_REF overrides to switch providers.

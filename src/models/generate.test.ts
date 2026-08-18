@@ -39,7 +39,11 @@ describe("renderModelsConfig (issue #67)", () => {
     expect(text).toContain("baseUrl: \"https://cloud-api.near.ai/v1\"");
     expect(text).toContain('id: "deepseek-ai/DeepSeek-V4-Flash"');
     expect(text).toContain('id: "acme/chat"');
-    // The openai/anthropic gateway skeleton survives settings regeneration.
+    // The codex (issue #214) + openai/anthropic gateway skeleton survives
+    // settings regeneration. openai-codex is KEY-ONLY (the opencode-go
+    // pattern — the models + transport metadata ship in the SDK catalog).
+    expect(text).toContain("openai-codex:");
+    expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain("baseUrl: \"https://api.openai.com/v1\"");
     expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain('id: "gpt-5-mini"');

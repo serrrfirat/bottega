@@ -109,7 +109,7 @@ function tempEnv(restoreCwd: string): CaptureEnv {
     copyFileSync(join(EXTENSIONS_DIR, name), join(dir, "config", "extensions", name));
   }
   mkdirSync(join(dir, "config", "omp"), { recursive: true });
-  writeFileSync(join(dir, "config", "omp", "config.yml"), "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n");
+  writeFileSync(join(dir, "config", "omp", "config.yml"), "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n");
   writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
   process.env.SLACK_APP_TOKEN = "xapp-1-test";
   process.env.SLACK_BOT_TOKEN = "xoxb-test";

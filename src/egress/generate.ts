@@ -28,13 +28,16 @@ import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions
 
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
  * #36, #37ee2bf) plus the opencode-go gateway (issue #208 — the pinned
- * deepseek-v4-flash routes to opencode.ai/zen/go/v1), the example KB host
+ * deepseek-v4-flash routes to opencode.ai/zen/go/v1), the ChatGPT Codex
+ * gateway (issue #214 — the openai-codex provider's
+ * chatgpt.com/backend-api/codex/responses), the example KB host
  * (issue #91), Slack file downloads (issue #124), and the GitHub API for
  * the ingest poller (issue #57, mentions search). */
 export const BASE_EGRESS_DOMAINS = [
   "cloud-api.near.ai",
   "*.completions.near.ai",
   "opencode.ai",
+  "chatgpt.com",
   "api.openai.com",
   "api.anthropic.com",
   "raw.githubusercontent.com",
@@ -133,7 +136,38 @@ export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
   linear: "https://mcp.linear.app/token",
   attio: "https://app.attio.com/oidc/token",
   notion: "https://mcp.notion.com/token",
+  // Issue #214 (the openai-codex model provider): the ChatGPT subscription OAuth
+  // refresh endpoint the Codex CLI uses — the openai/codex public client
+  // (app_EMoamEEZ73f0CkXaXp7hrann) exchanges the refresh grant at
+  // https://auth.openai.com/oauth/token (verified from the openai/codex
+  // OAuth flow 2026-08-18; CODEX_REFRESH_TOKEN_URL_OVERRIDE in the CLI).
+  // The exact acceptance of the grant for every account plan cannot be
+  // verified hermetically — the transform stays require: true, so an
+  // unmintable grant 502s instead of forwarding unauthenticated; the live
+  // leg is validated on the first real deployment.
+  codex: "https://auth.openai.com/oauth/token",
 };
+
+/**
+ * The model-provider OAuth token entries (issue #214): the openai-codex
+ * provider (config/omp/models.yml — the key-only placeholder decl) talks
+ * to chatgpt.com/backend-api/codex with the ChatGPT SUBSCRIPTION OAuth
+ * access token — NOT a static API key — so it joins the `oauth_token`
+ * transform like the #198 OAuth extensions: the proxy mints the access
+ * token from the refresh grant at egress, sourcing the credential from ONE
+ * JSON blob (`data/proxy-secrets/openai-codex-oauth.json`, seeded by the
+ * sync from the Codex CLI auth file). require: true — a missing/unmintable
+ * credential rejects the request (502), never an unauthenticated upstream
+ * call. BASE config (like the model-gateway keys above): the sync deletes
+ * the blob when the filesystem credential is missing (fail closed).
+ */
+export const MODEL_OAUTH_TOKEN_ENTRIES: readonly OAuthTokenEntry[] = [
+  {
+    extensionId: "openai-codex",
+    domains: ["chatgpt.com"],
+    tokenEndpoint: OAUTH_TOKEN_ENDPOINTS.codex,
+  },
+] as const;
 
 /**
  * The canary's OAuth fixture id prefix (issue #212): test-only extensions
@@ -306,13 +340,15 @@ ${extensionBlock}${gatewayEntries}
 
 /**
  * Renders the `oauth_token` transform (iron-proxy v0.49.0, issue #208):
- * one refresh_token-grant entry per OAuth extension (#198 providers). The
- * proxy holds the provider's refresh token + client credentials (from the
- * sync's JSON blob) and mints the access token at egress; inbound requests
- * to the configured token_endpoint are stubbed with a synthetic token so
- * the app's SDK can complete its own OAuth dance against the proxy (the
- * GCP stub pattern). require: true — an unmintable credential rejects the
- * request (502), never an unauthenticated upstream call.
+ * one refresh_token-grant entry per OAuth extension (#198 providers) plus
+ * the model-provider entries (issue #214 — openai-codex: the ChatGPT subscription
+ * OAuth credential from the Codex CLI auth file). The proxy holds the
+ * provider's refresh token + client credentials (from the sync's JSON
+ * blob) and mints the access token at egress; inbound requests to the
+ * configured token_endpoint are stubbed with a synthetic token so the app's
+ * SDK can complete its own OAuth dance against the proxy (the GCP stub
+ * pattern). require: true — an unmintable credential rejects the request
+ * (502), never an unauthenticated upstream call.
  */
 export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
   const tokenBlocks = entries
@@ -336,9 +372,11 @@ export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): 
 ${hostLines}`;
     })
     .join("\n");
-  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send
-  #    the placeholder bearer; this transform holds each provider's refresh
-  #    token + client credentials (the sync's JSON blob,
+  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) and
+  #    the openai-codex model provider (issue #214 — the ChatGPT subscription
+  #    credential, data/proxy-secrets/openai-codex-oauth.json) send the placeholder
+  #    bearer; this transform holds each provider's refresh token + client
+  #    credentials (the sync's JSON blob,
   #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
   #    tokens at egress, and stubs inbound requests to each configured
   #    token_endpoint with a synthetic token so the SDK's own token dance
@@ -367,7 +405,10 @@ export function renderEgressConfig(
   // entries (issue #208) are base config — only the extension entries are
   // optional.
   const secretsTransform = `${renderSecretsTransform(extensions)}\n`;
-  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
+  // The model-provider OAuth entry (issue #214, openai-codex) is base config —
+  // emitted even without extension entries; extension oauth entries append.
+  const oauthEntries = [...oauthTokens, ...MODEL_OAUTH_TOKEN_ENTRIES];
+  const oauthTransform = oauthEntries.length > 0 ? `${renderOAuthTokenTransform(oauthEntries)}\n` : "";
   return `# iron-proxy egress policy for bottega (issue #8).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -476,7 +517,10 @@ export function renderDevEgressConfig(
   // entries (issue #208) are base config — only the extension entries are
   // optional.
   const secretsTransform = `${renderDevSecretsTransform(extensions)}\n`;
-  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
+  // The model-provider OAuth entry (issue #214, openai-codex) is base config —
+  // emitted even without extension entries; extension oauth entries append.
+  const oauthEntries = [...oauthTokens, ...MODEL_OAUTH_TOKEN_ENTRIES];
+  const oauthTransform = oauthEntries.length > 0 ? `${renderOAuthTokenTransform(oauthEntries)}\n` : "";
   return `# iron-proxy egress policy for bottega — LOCAL DEV (permissive, issue #126).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
