@@ -127,10 +127,21 @@ export const CANARY_ORG_CONFIG = [
   "",
 ].join("\n");
 
-/** Per-journey timeout: the live model + live Slack are slow by design. */
-const JOURNEY_TIMEOUT_MS = 120_000;
-/** How long the canary waits for deterministic store-side effects. */
-const STORE_TIMEOUT_MS = 60_000;
+/**
+ * Per-journey timeout: the live model + live Slack are slow by design —
+ * real codex/luna tool-loop turns through iron-proxy legitimately exceed
+ * 120s (issue #215: run msykwxhj-155u timed every complex journey out at
+ * 120s while the turn was still streaming), so the reply window is 5
+ * minutes. Exported for the hermetic journey-mechanism tests.
+ */
+export const JOURNEY_TIMEOUT_MS = 300_000;
+/**
+ * How long the canary waits for deterministic store-side effects: raised
+ * with the reply window so store checks that follow a slow model turn
+ * (approval prompts, pickup items, audit rows) keep headroom. Exported
+ * for the hermetic journey-mechanism tests.
+ */
+export const STORE_TIMEOUT_MS = 90_000;
 
 export interface JourneyResult {
   name: string;
@@ -540,12 +551,20 @@ function isBotMessage(h: Harness, m: SlackApiMessage): boolean {
  * Transient history errors retry; only a timeout fails the journey.
  *
  * Threaded polls (postAndWait(thread: true) — the channel journeys) read
- * conversations.replies for the thread instead of history: Slack's
- * conversations.history returns ONLY top-level messages, so an in-thread
- * bot reply (the channel answer shape, #40) would never appear to the
- * poll — the #212 finding (the bot replied 0.8s after the ping but the
- * journey reported "no bot reply"). Exported for the hermetic
- * journey-mechanism tests (issue #212).
+ * conversations.replies for the thread: Slack's conversations.history
+ * returns ONLY top-level messages, so an in-thread bot reply (the channel
+ * answer shape, #40) would never appear to the poll — the #212 finding
+ * (the bot replied 0.8s after the ping but the journey reported "no bot
+ * reply"). The real live shape (issue #215, run msykwxhj-155u): the QA
+ * ping posts TOP-LEVEL (postAsUser sends no thread_ts) and Slack's real
+ * conversations.replies REJECTS a non-thread ts with invalid_arguments —
+ * the inbound is a plain top-level message until the bot's phrase lands
+ * in its thread, and a STEERED inbound (no phrase of its own) never
+ * becomes a root. The poll therefore falls back to conversations.history
+ * for any iteration where replies() rejects with invalid_arguments, so a
+ * top-level-shaped reply still surfaces while the replies() probe keeps
+ * retrying each iteration (the root appears once the bot posts its
+ * phrase). Exported for the hermetic journey-mechanism tests (#212/#215).
  */
 export async function waitForBotReply(
   h: Harness,
@@ -559,15 +578,33 @@ export async function waitForBotReply(
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      const messages =
-        opts.threadTs !== undefined ? await live.replies(channelId, opts.threadTs) : await live.history(channelId);
+      let messages: SlackApiMessage[] | undefined;
+      let requireThread = false;
+      if (opts.threadTs !== undefined) {
+        try {
+          messages = await live.replies(channelId, opts.threadTs);
+          requireThread = true;
+        } catch (err) {
+          // Slack's real rejection of a non-thread ts (issue #215): the
+          // ts is the inbound's own top-level ts until the bot's phrase
+          // makes it a thread root — scan history this iteration instead
+          // of erroring into a timeout. Other errors keep retrying as
+          // before (auth/ratelimit are transient, not shape signals).
+          if (!errorMessage(err).includes("invalid_arguments")) throw err;
+        }
+      }
+      if (messages === undefined) {
+        // No thread poll (DM shape), or Slack rejected the thread ts: the
+        // top-level eye. History rows are top-level, so no thread filter.
+        messages = await live.history(channelId);
+      }
       const hit = messages.find(
         (m) =>
           isBotMessage(h, m) &&
           m.text.trim().length > 0 &&
           !THINKING_PHRASES.includes(m.text.trim()) &&
           parseFloat(m.ts) > after &&
-          (opts.threadTs === undefined || m.thread_ts === opts.threadTs),
+          (!requireThread || m.thread_ts === opts.threadTs),
       );
       if (hit) return hit;
     } catch (err) {
@@ -587,14 +624,16 @@ export async function waitForBotReply(
  * Posts as the QA user and waits for the bot's reply; returns both ts values.
  *
  * Threaded polls (postAndWait(thread: true) — the channel journeys) read
- * conversations.replies for the thread: Slack REQUIRES the ROOT message ts
- * there — a reply's own ts errors invalid_arguments (issue #212 follow-up:
- * run msyi15gi-iwa failed with `slack api conversations.replies:
- * invalid_arguments` while the manual QA-token call with the ROOT ts, the
- * ping's ts, returned both messages). The ping may land INSIDE a thread
- * (its own ts is then a reply ts); the thread root it carries is
- * `thread_ts`, falling back to its own ts for a top-level post. Exported
- * for the hermetic journey-mechanism tests (issue #212).
+ * conversations.replies for the thread: conversations.replies requires the
+ * ts of the message the thread hangs under — the POSTED message's own ts
+ * when it posts top-level (the real live shape, issue #215: postAsUser
+ * sends no thread_ts, so the QA ping is a top-level message and the bot's
+ * threaded reply makes THAT ts the thread root). The `thread_ts` fallback
+ * only matters when the post itself lands inside a thread (its own ts is
+ * then a reply ts and the root it carries is `thread_ts`). Slack rejects a
+ * non-thread ts with invalid_arguments; waitForBotReply falls back to
+ * history for those iterations (see its doc). Exported for the hermetic
+ * journey-mechanism tests (issues #212/#215).
  */
 export async function postAndWait(
   h: Harness,

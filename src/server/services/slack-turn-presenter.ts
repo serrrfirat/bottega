@@ -499,8 +499,23 @@ export class SlackTurnPresenter {
     });
   }
 
-  /** Marks the current turn as a streaming (steer) turn (issue #120); called by SpaceService. */
+  /**
+   * Marks the current turn as a streaming (steer) turn (issue #120); called
+   * by SpaceService. Issue #215: a message STEERED into a running turn must
+   * be visible to any poller filtering by the steer's own ts — the original
+   * turn's phrase (ts older than the steer inbound) can never carry the
+   * combined turn's final reply. Every steer posts a FRESH phrase on the
+   * steer message's own line (new ts, threaded under the steer inbound),
+   * which becomes the pending final-reply target: the steered user sees
+   * their own progress line and the reply edits a message newer than their
+   * message. The stream renderer (alwaysStream) skips this — its open
+   * stream IS the steer's line and a second stream can never open
+   * mid-turn.
+   */
   setSteered(streaming: boolean): void {
+    if (streaming && !this.alwaysStream) {
+      this.#postSteerPhrase();
+    }
     this.streamingTurns = streaming;
   }
 
@@ -748,6 +763,41 @@ export class SlackTurnPresenter {
       })
       .catch((err) => {
         console.error(`[slack-turn-presenter] failed to post thinking phrase to ${this.spaceId}:`, err);
+      })
+      .finally(() => {
+        this.#phrasePosting = false;
+      });
+  }
+
+  /**
+   * Issue #215: posts a FRESH thinking phrase for a message steered into a
+   * running turn. The original turn's phrase predates the steer inbound, so
+   * a final reply editing it is invisible to any poller filtering by the
+   * steer's ts — the steer must own a new line. The fresh phrase threads
+   * under the STEER message (lastInboundTs, set by its onInbound) and
+   * supersedes the old phrase as the final-reply target (pendingTs). While
+   * the post is in flight the old pending ts is CLEARED, so a streamed
+   * reply racing the post falls back to the fresh-post edge (issue #120)
+   * instead of editing the OLD — invisible — phrase.
+   */
+  #postSteerPhrase(): void {
+    if (this.digesting || this.#churnActive) return;
+    if (this.#phrasePosting) return; // a phrase post is in flight — it becomes the pending phrase
+    this.#phrasePosting = true;
+    // The steer's fresh phrase supersedes the original turn's phrase as the
+    // final-reply target: drop the old pending ts now so a coalesced update
+    // or streamed reply can never edit the OLD (invisible) phrase.
+    this.cancelStreamUpdate();
+    this.pendingTs = undefined;
+    void this.openTurn(this.#nextPhrase())
+      .then((ts) => {
+        if (ts !== undefined) {
+          this.pendingTs = ts;
+          console.log(`presenter: steer phrase posted ${this.spaceId} ${ts}`);
+        }
+      })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] failed to post steer phrase to ${this.spaceId}:`, err);
       })
       .finally(() => {
         this.#phrasePosting = false;

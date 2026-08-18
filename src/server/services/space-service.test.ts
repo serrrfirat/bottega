@@ -1336,12 +1336,14 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
     vi.useFakeTimers();
     try {
       // Cold start, then steer the running (streaming) session. The receipt
-      // phrase (issue #119) and the steer rotation settle before we measure.
+      // phrase (issue #119), the steer's in-place rotation, and the steer's
+      // FRESH phrase (issue #215) settle before we measure.
       await service.handleInboundMessage(msg({ ts: "1.1" }));
       const session = driver.last();
       session.streaming = true;
       await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
-      await Promise.resolve();
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      expect(posts).toHaveLength(2); // receipt phrase + the steer's own phrase (#215)
       const base = updates.length;
 
       // Burst of stream chunks inside one turn: coalesced, nothing sent yet.
@@ -1354,7 +1356,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
       vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS); // one cadence tick
       await Promise.resolve();
       expect(updates).toHaveLength(base + 1); // at most one update per tick
-      expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "The quick brown fox" }); // latest text only
+      expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-2", text: "The quick brown fox" }); // latest text only
 
       // More chunks, turn ends before the next tick: the final text still lands.
       session.emit("message", { spaceId: "slack:C1", text: "The quick brown fox jumps" });
@@ -1365,18 +1367,19 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
       expect(updates).toHaveLength(base + 2); // tick update + final flush
       expect(updates.at(-1)).toEqual({
         spaceId: "slack:C1",
-        ts: "ts-1",
+        ts: "ts-2", // the steer's phrase — the reply target newer than the steer inbound (#215)
         text: "The quick brown fox jumps over the lazy dog", // the full reply
       });
-      expect(posts).toHaveLength(1); // one message, replaced in place throughout (#40/#60)
+      expect(posts).toHaveLength(2); // receipt + steer phrase; the reply edits the steer's line
     } finally {
       vi.useRealTimers();
     }
   });
 
   test("a rate-limited interim update is logged and skipped, but the final text still lands (issue #120)", async () => {
-    // Two failures: the steer rotation and the interim stream flush both 429;
-    // the final flush (turn_end) succeeds and must still land.
+    // Three updateMessage calls: the steer's in-place rotation, the interim
+    // stream flush, and the final flush — the first two 429; the final
+    // flush (turn_end) succeeds and must still land.
     const { adapter, posts, updates } = fakeAdapter({ failUpdateCalls: 2 });
     const { store } = fakeStore();
     const driver = new FakeDriver();
@@ -1387,7 +1390,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
       const session = driver.last();
       session.streaming = true;
       await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
-      await Promise.resolve();
+      for (let i = 0; i < 3; i++) await Promise.resolve();
 
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       try {
@@ -1403,11 +1406,11 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
         session.emit("message", { spaceId: "slack:C1", text: "final full reply" });
         session.emit("turn_end", { spaceId: "slack:C1" });
         await Promise.resolve();
-        expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "final full reply" }]);
+        expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-2", text: "final full reply" }]); // the steer's line
       } finally {
         errorSpy.mockRestore();
       }
-      expect(posts).toHaveLength(1); // still one message, replaced in place
+      expect(posts).toHaveLength(2); // receipt + the steer's own phrase (#215)
     } finally {
       vi.useRealTimers();
     }
@@ -1429,6 +1432,46 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
 
     expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "the answer" }]); // immediate, exactly once
     expect(posts).toHaveLength(1); // phrase only; replaced in place
+  });
+});
+
+describe("SpaceService steer visibility (issue #215)", () => {
+  test("a steered message gets a FRESH phrase (threaded under the steer, newer than it) and the final reply edits THAT phrase", async () => {
+    // Live finding (run msykwxhj-155u): a message steered into a running
+    // turn reuses the ORIGINAL turn's phrase — the final reply edits a
+    // message OLDER than the steer inbound, so any poller filtering by the
+    // steer's ts never sees it (no-reply stalls). The steer must post its
+    // OWN phrase (new ts, on the steer message's own thread) and the final
+    // reply must edit that message.
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Open turn 1 (fresh): the receipt phrase posts and is captured (ts-1).
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    await Promise.resolve(); // the phrase post settles (pendingTs = ts-1)
+
+    // Steer message 2.2 into the running turn: the service marks the turn
+    // streaming — the steer must post a FRESH phrase on the steer's own
+    // line, threaded under the steer inbound (2.2) and NEWER than it.
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve(); // rotation + steer phrase post settle
+
+    expect(posts).toEqual([
+      { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } },
+      { spaceId: "slack:C1", text: "Give me a second…", opts: { threadTs: "2.2" } },
+    ]);
+
+    // The combined turn's reply: it must EDIT the steer phrase (ts-2, the
+    // message posted AFTER the steer inbound), never the original phrase
+    // (ts-1, older than the steer inbound).
+    session.emit("message", { spaceId: "slack:C1", text: "the combined reply" });
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-2", text: "the combined reply" });
   });
 });
 
@@ -1458,13 +1501,14 @@ describe("SpaceService run settlement after a stream/panel turn (issue #183)", (
 
     // A THIRD message after the stream turn must run a FRESH turn (never a
     // busy timeout, never a silent steer into a dead run) and its reply
-    // must land — the phrase/reply always arrive.
+    // must land — the phrase/reply always arrive. The reply keeps editing
+    // the steer's own phrase (ts-2), the newest visible line (#215).
     session.autoReply = "reply to the third";
     await service.handleInboundMessage(msg({ text: "third", ts: "3.3" }));
     expect(session.prompts[2].opts?.streamingBehavior).toBeUndefined(); // fresh turn, not a steer
     await Promise.resolve();
-    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-1", text: "reply to the third" });
-    expect(posts).toHaveLength(1); // one visible message, replaced in place — never a silent no-reply
+    expect(updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: "ts-2", text: "reply to the third" });
+    expect(posts).toHaveLength(2); // receipt phrase + the steer's own phrase — never a silent no-reply
   });
 });
 

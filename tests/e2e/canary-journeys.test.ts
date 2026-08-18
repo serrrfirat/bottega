@@ -71,11 +71,13 @@ import {
   CANARY_ORG_CONFIG,
   canaryFixtureMcpTransport,
   createCanaryRegistry,
+  JOURNEY_TIMEOUT_MS,
   oauthAuthorizeStateFrom,
   oauthAuthorizeUrlFrom,
   postAndWait,
   PROGRESS_LINE_RE,
   standupCronFor,
+  STORE_TIMEOUT_MS,
   toolCtxFor,
   uploadLinkUrlFrom,
   waitForBotReply,
@@ -182,6 +184,19 @@ describe("scheduled-standup journey mechanism (issue #175)", () => {
   });
 });
 
+describe("canary journey windows (issue #215)", () => {
+  test("the reply window gives live codex/luna tool-loop turns headroom, and the store window follows it", () => {
+    // Live finding (run msykwxhj-155u): complex real-model turns (tool
+    // loops through iron-proxy) legitimately exceed the old 120s window —
+    // every journey that hit one timed out while the turn was still
+    // streaming. The window is the journey's polling contract; the store
+    // window is raised with it so store checks that follow a slow turn
+    // keep headroom.
+    expect(JOURNEY_TIMEOUT_MS).toBe(300_000);
+    expect(STORE_TIMEOUT_MS).toBeGreaterThan(60_000); // raised with the reply window
+  });
+});
+
 describe("channel chat-reply thread polling (issue #212)", () => {
   test("waitForBotReply finds an IN-THREAD bot reply via conversations.replies when history only has top-level messages", async () => {
     // Live finding (run msyggnjh-123m): in channels the bot answered the
@@ -220,39 +235,35 @@ describe("channel chat-reply thread polling (issue #212)", () => {
     expect(reply.text).toBe("in-thread bot reply");
   });
 
-  test("postAndWait(thread: true) polls conversations.replies with the THREAD ROOT ts — a reply's own ts errors invalid_arguments (#212 follow-up)", async () => {
-    // Live finding (run msyi15gi-iwa): the channel journey's replies()
-    // poll failed with `slack api conversations.replies:
-    // invalid_arguments`. Slack REQUIRES the ROOT message ts — a reply's
-    // own ts is rejected — while the manual QA-token call with the ROOT
-    // ts (the ping's ts from the previous run) returned both messages.
-    // The stub mirrors Slack's rejection exactly: replies() throws
-    // invalid_arguments for any ts that is not the thread root. The ping
-    // lands INSIDE the thread (its own ts is a reply ts); the journey
-    // must poll the root ts it carries (thread_ts), never the ping's own
-    // ts. Asserting the polled param value is the contract: the stub
-    // throws for a wrong ts, so the journey only resolves by passing the
-    // root.
-    const rootTs = "1787000000.000100";
-    const pingTs = "1787000000.000200"; // the ping's OWN ts — posted as a reply in the thread
+  test("postAndWait(thread: true) polls conversations.replies with the POSTED message's ts — the thread root the bot threads under (#215 live shape)", async () => {
+    // Live finding (run msykwxhj-155u after #212): the QA ping posts
+    // TOP-LEVEL — postAsUser sends no thread_ts — and the bot answers
+    // IN-THREAD under the ping's own ts, which makes THAT ts the thread
+    // root. The journey must pass the posted message's ts to
+    // conversations.replies (the only API that returns in-thread
+    // messages). The stub mirrors Slack's real rejection — invalid_
+    // arguments for any ts that is not the root — so the journey only
+    // resolves by polling the right ts. Asserting the polled ts is the
+    // contract: the stub throws for a wrong ts.
+    const pingTs = "1787000000.000100"; // top-level post; its own ts becomes the root
     const botReply: SlackApiMessage = {
       ts: "1787000000.000900",
       channel: "C1",
       bot_id: "B-bot",
       text: "in-thread bot reply",
-      thread_ts: rootTs,
+      thread_ts: pingTs,
     };
     const polled: string[] = [];
     const h = {
       liveSlack: {
         botUserId: "B-bot",
         qaUserId: "U-qa",
-        postAsUser: async () => ({ ts: pingTs, thread_ts: rootTs }),
+        postAsUser: async () => ({ ts: pingTs }), // real live shape: no thread_ts on a top-level post
         replies: async (_channelId: string, ts: string) => {
           polled.push(ts);
-          if (ts !== rootTs) throw new Error("slack api conversations.replies: invalid_arguments");
+          if (ts !== pingTs) throw new Error("slack api conversations.replies: invalid_arguments");
           return [
-            { ts: rootTs, channel: "C1", user: "U-qa", text: "canary ping", thread_ts: rootTs },
+            { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
             botReply,
           ];
         },
@@ -264,7 +275,55 @@ describe("channel chat-reply thread polling (issue #212)", () => {
     });
     expect(reply.text).toBe("in-thread bot reply");
     expect(inboundTs).toBe(pingTs);
-    expect(polled.every((ts) => ts === rootTs)).toBe(true);
+    expect(polled.every((ts) => ts === pingTs)).toBe(true);
+  });
+
+  test("a conversations.replies invalid_arguments rejection (non-thread ts) falls back to conversations.history and still finds the reply (issue #215)", async () => {
+    // Live finding (run msykwxhj-155u): the ping posts top-level and
+    // Slack's real conversations.replies REJECTS its ts with
+    // invalid_arguments while the inbound is not (yet) a thread root — a
+    // steered ping (no phrase of its own) never becomes one. The journey
+    // must not error into a timeout: it falls back to conversations.
+    // history for that iteration, which sees a top-level-shaped reply.
+    // The stub mirrors Slack's real rejection exactly: replies() throws
+    // invalid_arguments for the non-thread ts. Red on the pre-fix code:
+    // without the fallback the rejection is recorded and the poll times
+    // out.
+    const pingTs = "1787000000.000100";
+    const topLevelReply: SlackApiMessage = {
+      ts: "1787000000.000900",
+      channel: "C1",
+      bot_id: "B-bot",
+      text: "top-level bot reply",
+    };
+    const calls: string[] = [];
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        postAsUser: async () => ({ ts: pingTs }),
+        replies: async (_channelId: string, ts: string) => {
+          calls.push(`replies:${ts}`);
+          throw new Error("slack api conversations.replies: invalid_arguments");
+        },
+        history: async () => {
+          calls.push("history");
+          return [
+            { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
+            topLevelReply,
+          ];
+        },
+      },
+    } as unknown as Harness;
+    const reply = await waitForBotReply(h, "C1", {
+      afterTs: pingTs,
+      threadTs: pingTs,
+      label: "channel ping",
+      timeoutMs: 2_000,
+    });
+    expect(reply.text).toBe("top-level bot reply");
+    expect(calls[0]).toBe(`replies:${pingTs}`); // conversations.replies is the first eye
+    expect(calls).toContain("history"); // its rejection falls back to history
   });
 });
 

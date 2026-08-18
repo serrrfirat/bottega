@@ -188,6 +188,11 @@ reactions and records reply and phrase latency.
 - **Updates coalesce every 400 ms** and the latest text wins (#120). Turn
   end flushes immediately, with bounded final retries, so interim update
   failures do not drop the final answer.
+- **A message steered into a running turn gets its own line** (#215): the
+  steer posts a fresh phrase on the steer message's own thread, and the
+  combined turn's final reply edits THAT phrase — never the original
+  turn's older line — so the steer's author sees their own progress and
+  any poller watching the steer's message sees the reply.
 
 ## Policy & approvals (user-facing)
 
@@ -498,8 +503,10 @@ Skip-gated locally (issue #79): without `--live-slack`/`LIVE_SLACK=1`, in
 ad-hoc CI, or with missing tokens it prints a clear skip message and exits
 0. CI-strict (`--ci`/`CANARY_CI=1`, the scheduled workflow): missing
 tokens or model key FAIL the job — a canary that silently skips in CI is
-worse than none. Generous per-journey timeouts (120s+; the standup waits
-for the minute boundary) — it waits for a real model and a real workspace.
+worse than none. Generous per-journey timeouts (300s reply window, 90s
+store window — issue #215: real codex/luna tool-loop turns legitimately
+exceed 120s; the standup waits for the minute boundary) — it waits for a
+real model and a real workspace.
 
 ### Scheduled in CI + the release gate (issue #175)
 

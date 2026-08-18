@@ -52,9 +52,10 @@ export interface SlackApiMessage {
 /**
  * A posted message's identity: its own ts plus the thread root it joined
  * (thread_ts present only when Slack posted the message as a reply). The
- * canary polls conversations.replies, which REQUIRES the ROOT ts — a
- * reply's own ts errors invalid_arguments (issue #212 follow-up) — so the
- * post must report the thread membership for the journey to derive it.
+ * canary's channel journeys poll conversations.replies with the ts of the
+ * message the thread hangs under — the post's own ts for a top-level post
+ * (the real QA-ping shape, issue #215); a reply-shaped post reports its
+ * `thread_ts` so the journey can derive the root instead.
  */
 export interface PostedSlackMessage {
   ts: string;
@@ -282,10 +283,16 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
       return res.messages;
     },
     async replies(channelId, threadTs) {
+      // Issue #215: the call must match the shape the live API verifiably
+      // accepts — the manual QA-token call (no limit) returned the thread
+      // while the canary's call with limit: 50 was rejected with
+      // invalid_arguments (conversations.replies' limit was reduced to 15
+      // for some app tiers, 2025-05-29 API change). The default page is
+      // plenty for a chat thread; the parameter is the difference between
+      // the rejected and the proven call.
       const res = await qa.call<{ messages: SlackApiMessage[] }>("conversations.replies", {
         channel: channelId,
         ts: threadTs,
-        limit: 50,
       });
       return res.messages;
     },
