@@ -25,14 +25,18 @@
  * `policy.decision` / `approval.requested` / `approval.resolved` rows, so
  * the trail for a privileged connect is complete.
  *
- * Issue #232: an UNREGISTERED extension id no longer dies with "unknown
- * extension" when the catalog seam is wired ({@link ConnectExtensionDeps.catalogRegister}):
+ * Issue #232/#233: an UNREGISTERED extension id no longer dies with
+ * "unknown extension" when the catalog seam is wired ({@link ConnectExtensionDeps.catalogRegister}):
  * the connect drives the deterministic integrations.sh catalog flow —
  * lookup → draft (official hosted MCP endpoint discovery + auth
- * classification) → mandatory review gate (register_extension; a pin is a
- * repo-level change with egress implications, never silent) → pin + egress
- * regen + hot-register → the connect continues in the same turn. The model
- * is never the driver, so a stalled agent cannot block a catalog connect.
+ * classification) → the connect's OWN approval (issue #233: the
+ * register_extension gate is GONE from this path; org connects cross the
+ * existing connect_extension exec gate BEFORE anything registers, so a
+ * denied connect registers NOTHING; personal connects are direct) →
+ * REGISTER AT RUNTIME (store-backed registry + egress regen merged with
+ * the runtime set + hot-register + proxy reload — NO config/extensions
+ * file, NO commit) → the connect continues in the same turn. The model is
+ * never the driver, so a stalled agent cannot block a catalog connect.
  *
  * The broker seam: callers inject a {@link BrokerConnector};
  * {@link connectViaAuthBroker} is the production implementation (the
@@ -60,7 +64,11 @@ import { looksLikeObviousSecret } from "../tools/memory";
 import type { McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
-import { registerExtensionFromCatalog, type CatalogRegisterDeps } from "./catalog-register";
+import {
+  lookupCatalogExtension,
+  registerExtensionAtRuntime,
+  type CatalogRegisterDeps,
+} from "./catalog-register";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -117,13 +125,15 @@ export interface ConnectExtensionDeps {
    */
   mcpOAuth?: McpOAuthConnector;
   /**
-   * Catalog registration seam (issue #232): when wired, an UNREGISTERED
-   * extension id routes to the deterministic integrations.sh catalog flow —
-   * lookup → draft (official hosted MCP endpoint discovery + auth
-   * classification) → mandatory review gate (register_extension through
-   * the approval router; a pin is a repo-level change with egress
-   * implications and NEVER happens silently) → pin + egress regen +
-   * hot-register — and the connect continues in the same turn. Absent
+   * Catalog registration seam (issue #232/#233): when wired, an
+   * UNREGISTERED extension id routes to the deterministic integrations.sh
+   * catalog flow — lookup → draft (official hosted MCP endpoint discovery
+   * + auth classification) → the connect's own approval covers org scope
+   * (the register_extension gate is REMOVED from this path; a denied org
+   * connect registers NOTHING, personal connects are direct) → register
+   * AT RUNTIME (store-backed registry + egress regen merged with the
+   * runtime set + hot-register + proxy reload — no config file, no
+   * commit) — and the connect continues in the same turn. Absent
    * (headless/executor contexts) → the fail-closed unknown-extension error.
    */
   catalogRegister?: CatalogRegisterDeps;
@@ -200,40 +210,84 @@ export async function connectExtension(
   }
 
   let resolved = deps.registry.resolve(input.extension);
-  // Issue #232: an UNREGISTERED extension no longer dies here — when the
-  // catalog seam is wired, the connect drives the deterministic
-  // integrations.sh catalog flow itself (lookup → draft → mandatory review
-  // gate → pin + egress regen + hot-register) and CONTINUES in the same
-  // turn. The model is never the driver: the routing is deterministic, so
-  // a stalled agent can never block a catalog extension connect.
+  // Issue #232/#233: an UNREGISTERED extension no longer dies here — when
+  // the catalog seam is wired, the connect drives the deterministic
+  // integrations.sh catalog flow itself (lookup → draft → the connect's
+  // own approval → register at runtime + egress regen + hot-register) and
+  // CONTINUES in the same turn. The model is never the driver: the routing
+  // is deterministic, so a stalled agent can never block a catalog
+  // extension connect.
   if (!resolved) {
     if (deps.catalogRegister === undefined) {
       return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
     }
-    const registration = await registerExtensionFromCatalog({
+    // LOOKUP + DRAFT (read-only; fails loudly with the browse path).
+    const lookup = await lookupCatalogExtension(input.extension, deps.catalogRegister);
+    if (!lookup.ok) return { ok: false, message: lookup.message };
+    // Issue #233: the register_extension gate is REMOVED from this path —
+    // the connect's OWN approval covers org scope (the egress-add step
+    // rides the connect_extension approval, whose payload carries the
+    // draft facts: vendor, domains, MCP endpoint). The org gate fires
+    // BEFORE anything registers, so a DENIED connect registers nothing.
+    // Personal connects are direct — any principal registers their own
+    // connect, exactly like the registered-extension path below.
+    if (input.scope === "org") {
+      const outcome = await evaluatePolicyGate(
+        {
+          loadPolicy: deps.gate.loadPolicy,
+          audit: deps.audit,
+          router: deps.gate.router,
+          timeoutMs: deps.gate.timeoutMs,
+          preApproved: deps.gate.preApproved,
+        },
+        {
+          tool: CONNECT_EXTENSION_TOOL,
+          args: {
+            extension: input.extension,
+            scope: input.scope,
+            registering_from_catalog: true,
+            vendor: lookup.facts.label,
+            domains: lookup.facts.domains,
+            mcpEndpoint: lookup.facts.mcpEndpoint,
+          },
+          spaceId: input.spaceId,
+          actor: input.actor,
+        },
+      );
+      if (!outcome.allowed) return { ok: false, message: outcome.blockReason };
+    }
+    // REGISTER AT RUNTIME (store write → egress regen merged with the
+    // runtime set → hot-register → proxy reload). A store failure fails
+    // the registration closed; a live-registry miss fails the connect
+    // closed (the server must see the extension to continue).
+    const registration = await registerExtensionAtRuntime(lookup.snapshot, lookup.facts.label, {
       ...deps.catalogRegister,
-      extensionId: input.extension,
       actor: input.actor,
       spaceId: input.spaceId,
       registry: deps.registry,
       audit: deps.audit,
-      gate: deps.gate,
     });
     if (!registration.ok) return { ok: false, message: registration.message };
-    resolved = deps.registry.resolve(input.extension);
+    // Resolve by the CANONICAL registered id (issue #233): the intent
+    // token may be a name/alias ("docs" → the "google-docs" catalog
+    // entry), but the registry is keyed by the manifest id the
+    // registration wrote.
+    resolved = deps.registry.resolve(registration.extensionId);
     if (!resolved) {
-      // Fail closed: the pin landed (approved) but the live registry does
-      // not see it — the connect cannot continue until the server reloads.
+      // Fail closed: the registration landed (approved) but the live
+      // registry does not see it — the connect cannot continue until the
+      // server reloads.
       return {
         ok: false,
         message:
-          `${registration.message} The running server still cannot resolve "${input.extension}" — ` +
+          `${registration.message} The running server still cannot resolve "${registration.extensionId}" — ` +
           "restart the server and retry the connect.",
       };
     }
     // api_key extensions need the key to connect; the chat/intent path has
-    // none (and pasting one is refused), so after the pin the honest next
-    // step is the #196 one-time upload link — never a silent stall.
+    // none (and pasting one is refused), so after the registration the
+    // honest next step is the #196 one-time upload link — never a silent
+    // stall.
     if (
       resolved.manifest.credentialSchema.type === "api_key" &&
       input.apiKey === undefined &&
@@ -246,15 +300,11 @@ export async function connectExtension(
           "upload, or re-run connect with the key — never paste a live key in chat.",
       };
     }
-  }
-  const manifest = resolved.manifest;
-  const provider = manifest.id;
-  const label = manifest.label;
-
-  // Org-scope connects are privileged: they cross the shared policy gate as
-  // an exec-tier tool call (deny → blocked, allow → ask-human). Personal
-  // connects are unprivileged — any principal connects their own account.
-  if (input.scope === "org") {
+  } else if (input.scope === "org") {
+    // Registered extensions: org-scope connects are privileged — they
+    // cross the shared policy gate as an exec-tier tool call (deny →
+    // blocked, allow → ask-human). Personal connects are unprivileged —
+    // any principal connects their own account.
     const outcome = await evaluatePolicyGate(
       {
         loadPolicy: deps.gate.loadPolicy,
@@ -267,6 +317,9 @@ export async function connectExtension(
     );
     if (!outcome.allowed) return { ok: false, message: outcome.blockReason };
   }
+  const manifest = resolved.manifest;
+  const provider = manifest.id;
+  const label = manifest.label;
 
   // Hosted OAuth MCPs (issue #198) connect through the GENERIC MCP OAuth
   // flow, never the broker's provider-registry login (the broker knows no
@@ -288,7 +341,10 @@ export async function connectExtension(
     let oauthStart: McpOAuthStartResult;
     try {
       oauthStart = await deps.mcpOAuth.start({
-        extension: input.extension,
+        // The CANONICAL manifest id (issue #233): the intent token may be
+        // a name/alias ("docs" → "google-docs"), and the OAuth connector
+        // re-resolves `extension` against the registry (keyed by id).
+        extension: manifest.id,
         provider,
         label,
         scope: input.scope,

@@ -269,11 +269,11 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
   test("an auth-gated tools-less provider never fails the boot — skipped, reachable providers discover eagerly (issue #166)", async () => {
     const env = tempEnv();
     try {
-      // Ship the committed tools-less snapshots (linear/github/attio/notion)
+      // Ship the committed tools-less snapshots (linear/github/attio)
       // into the temp deployment root so the registry resolves the REAL
       // manifests — the empty-registry path would make the test vacuous.
       mkdirSync(join(env.dir, "config", "extensions"), { recursive: true });
-      for (const name of ["attio.json", "github.json", "linear.json", "notion.json"]) {
+      for (const name of ["attio.json", "github.json", "linear.json"]) {
         copyFileSync(join(EXTENSIONS_DIR, name), join(env.dir, "config", "extensions", name));
       }
       // Ship the agent-config template so the boot-time pin sync (issue
@@ -321,16 +321,14 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       await server.stop();
 
       // The boot threaded only the RESOLVED surfaces: github discovered
-      // eagerly at boot, linear/attio/notion skipped (absent → the
-      // runtime's lazy per-call path fails closed if a call is attempted;
-      // notion's MCP is OAuth-gated — tools/list 401s without a
-      // credential, issue #231).
+      // eagerly at boot, linear/attio skipped (absent → the runtime's
+      // lazy per-call path fails closed if a call is attempted — their
+      // MCPs are OAuth-gated, so tools/list 401s without a credential).
       expect(surfaces).toBeDefined();
       expect(surfaces!.has("github")).toBe(true);
       expect(surfaces!.get("github")!.map((tool) => tool.name)).toEqual(["github.search_issues"]);
       expect(surfaces!.has("linear")).toBe(false);
       expect(surfaces!.has("attio")).toBe(false);
-      expect(surfaces!.has("notion")).toBe(false);
       expect(seen.list).toBe(1); // one tools/list at boot, cached
     } finally {
       env.cleanup();
@@ -340,11 +338,11 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
   test("a boot-resolved github surface reaches the session toolset in FULL — all 44 discovered tools, wire names intact (issue #167)", async () => {
     const env = tempEnv();
     try {
-      // Ship the committed tools-less snapshots (linear/github/attio/notion)
+      // Ship the committed tools-less snapshots (linear/github/attio)
       // into the temp deployment root so the registry resolves the REAL
       // manifests — the empty-registry path would make the test vacuous.
       mkdirSync(join(env.dir, "config", "extensions"), { recursive: true });
-      for (const name of ["attio.json", "github.json", "linear.json", "notion.json"]) {
+      for (const name of ["attio.json", "github.json", "linear.json"]) {
         copyFileSync(join(EXTENSIONS_DIR, name), join(env.dir, "config", "extensions", name));
       }
       // Ship the agent-config template so the boot-time pin sync (issue

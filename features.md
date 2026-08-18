@@ -20,7 +20,7 @@ do, and why it matters. For how it works under the hood, see
 | **Org settings** | Runtime configuration in the database, with approver-gated org writes and tighten-only space overlays. |
 | **Memory** | The agent remembers facts per user or per org and uses them across conversations. |
 | **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
-| **Extensions** | Discover, review, pin, and connect provider-official tools from chat; every agent uses them through one safe pipe. |
+| **Extensions** | Connect provider-official tools from chat — any integrations.sh catalog extension registers at runtime (no config file, no commit); every agent uses them through one safe pipe. |
 | **Proactive scheduler** | Standups, reflections, weekly pulse, knowledge ingestion, and recurring connected-service work on a schedule. |
 | **Work items** | One queue delivers repository, connected-extension, or in-channel work, with optional model pins and semantic pickup. |
 | **Department personas** | Give each space role guidance and a minimum visible toolset without weakening policy. |
@@ -284,25 +284,34 @@ clients.
   reviewed snapshot declares an `api_key`/PAT credential; iron-proxy injects
   it as a bearer value. There is no local `github-mcp-server` binary.
 - **Connect from chat** — exact `connect <extension>`,
-  `connect <extension> as org`, or `connect <extension> as me` messages
-  route directly to the connect capability (issue #61). Bare / `as me`
-  connects the sender's personal account; `as org` crosses the Slack
-  approval route. Other wording remains an ordinary agent turn.
-- **Connect any catalog extension** (#232) — `connect <X>` for an
-  UNREGISTERED hosted-MCP id drives the integrations.sh catalog flow
-  deterministically (the model is never the driver): catalog lookup →
-  draft (the official `mcp.<vendor>` endpoint discovered from the catalog
-  record + the vendor's RFC 8414 OAuth metadata — OAuth-gated servers pin
-  tools-less, the #231 notion shape) → a MANDATORY review gate
-  (`register_extension` through the approval router — "Register <X> from
-  the catalog? (id, vendor, domains, MCP endpoint)" [Approve/Deny]; a pin
-  is a repo-level change with egress implications, never silent) → on
-  approve: pin `config/extensions/<id>.json` + regenerate both egress
-  configs (byte-pinned) + hot-register into the live registry → the
-  connect continues in the same turn (OAuth mint via #198, or the #196
+  `connect <extension> as org`, `connect <extension> as me`, and the
+  natural `connect my <extension>` phrasing route directly to the connect
+  capability (issue #61, #233). Bare / `as me` connects the sender's
+  personal account; `as org` crosses the Slack approval route. Other
+  wording remains an ordinary agent turn.
+- **Connect any catalog extension — registers at runtime** (#232/#233) —
+  `connect <X>` for an UNREGISTERED hosted-MCP id drives the integrations.sh
+  catalog flow deterministically (the model is never the driver): catalog
+  lookup (semantic: exact id OR name/alias — "connect my docs" resolves the
+  Google Docs entry; never a substring guess) → draft (the official
+  `mcp.<vendor>` endpoint discovered from the catalog record + the vendor's
+  RFC 8414 OAuth metadata — OAuth-gated servers register tools-less, the
+  #231 notion shape) → the connect's OWN approval (org scope: the existing
+  `connect_extension` gate, whose payload carries the draft facts — vendor,
+  domains, MCP endpoint — so the "add a domain" egress step rides the
+  connect approval; personal connects are direct; the `register_extension`
+  gate is GONE from this path, and a DENIED connect registers nothing) →
+  REGISTER AT RUNTIME: the manifest persists to the STORE-backed runtime
+  registry (machine state — NO `config/extensions/<id>.json` file, NO
+  commit), both egress configs regenerate with the merged runtime set
+  (byte-pinned for the seed fixtures; the runtime set is injected), the
+  snapshot hot-registers into the live registry, and the proxy reloads →
+  the connect continues in the same turn (OAuth mint via #198, or the #196
   upload link for api_key extensions). An unknown id fails loudly with the
-  catalog browse path; a second `connect X` after the pin takes the normal
-  registered path.
+  catalog browse path; a second `connect X` after the runtime registration
+  takes the normal registered path. The committed pins (github/linear/
+  attio) stay ONLY as the boot seed; the notion pin (#231) is removed —
+  notion connects via the runtime path like any catalog extension.
 - **API keys get a browser upload path** (#196).
   `connect_upload_link` is exec-tier and mints a 15-minute, single-use URL
   for an `api_key` extension. The browser form stores the value through the
@@ -315,13 +324,16 @@ clients.
   health-checked at mint time (#211): a reachable URL wins, a stale one
   (rotated/dead tunnel) falls back to the loopback URL with a loud warning
   in the reply — the .env value must be refreshed when the tunnel rotates.
-- **Draft and pin from chat** — `catalog_browser` writes an unreviewed
+- **Draft and pin from chat (non-MCP / manual bindings)** — `catalog_browser`
+  writes an unreviewed
   draft outside the registry, tells the agent to use `web_search` for the
   vendor's official binding (#146), and refuses to pin until a human
   confirms the completed summary in-channel (#195). Confirmation marks the
   snapshot reviewed, writes `config/extensions/<id>.json`, regenerates both
   egress configs, and audits the pin. Hosted streamable-HTTP + OAuth is
   preferred; stdio/CLI requires an explicit `no_hosted_variant: true`.
+  The catalog connect path (above) is the runtime alternative — hosted MCP
+  extensions never need a file.
 - **Tools can be pinned or discovered** — manifest `tools` is optional
   (#158). Present tools are the reviewed surface; absent MCP tools come from
   the provider's paginated `tools/list`. Generation namespaces model-facing
@@ -378,7 +390,9 @@ Registry internals (snapshots, discovery, runtime wiring, credentials, and
 the CLI spawn path) are in
 [architecture.md](architecture.md#extension-runtime-the-safety-spine).
 
-Production snapshots currently describe Attio, GitHub, and Linear. The
+Production snapshots currently describe Attio, GitHub, and Linear (the
+boot SEED — issue #233). Notion was unpinned (#231): it connects through
+the runtime registry like any catalog extension. The
 test-only fixture proves registration, tool surfacing, execution, and merged
 egress domains end to end.
 
@@ -489,6 +503,22 @@ is protected on the way out:
   allowlisted request is judged by a policy LLM ("deny unless clearly
   required by the task and safe"), and DNS is sinkholed so nothing leaks
   around the proxy.
+- **Runtime registration moves the "add a domain" step to the connect
+  approval** (issue #233 security note) — the egress allowlist was the
+  fail-closed extension gate: a new domain only became reachable through a
+  committed, reviewed pin. With the runtime registry, the egress-add step
+  rides the connect's own approval: an ORG connect's existing
+  `connect_extension` approval (whose payload shows the vendor, domains,
+  and MCP endpoint being added) authorizes the egress change; personal
+  connects are direct (the requester's own account, like every other
+  personal connect). Fail-closed is preserved: unknown domains stay denied
+  until a connect registers them, the egress config regenerates only with
+  the persisted runtime set, and an unreachable/5xx discovery probe never
+  guesses an endpoint or auth mode. The repo-review step (the old pin
+  commit) becomes the connect approval. A multi-admin org that wants a
+  registration gate back can re-enable one as a policy option (the
+  `register_extension` exec tier is retained for exactly that) — never a
+  silent default.
 - **Credentials attach only at the egress boundary** — model providers send
   `bottega-proxy-placeholder`; iron-proxy replaces it from provider-specific
   mode-0600 files and refuses missing files. API-key extensions use the same

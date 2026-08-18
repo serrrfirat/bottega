@@ -118,6 +118,22 @@ export type ExtensionCredential = {
 };
 
 /**
+ * Runtime extension registry row (issue #233): a runtime-registered
+ * extension's PinnedSnapshot document (machine state — never a repo file).
+ * `snapshot` is the JSON PinnedSnapshot (schema/extensionId/pinnedAt/
+ * source/manifest); the registry's fail-closed parse validates it on read.
+ * Field names mirror the table columns.
+ */
+export type RuntimeExtensionRow = {
+  id: string;
+  snapshot: string;
+  registered_by: string;
+  space_id: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+/**
  * One-time upload link row (issue #196): a single-use, short-TTL token the
  * browser upload endpoint consumes to store an api_key secret DIRECTLY into
  * the vault — the row is deleted on first consume, so an expired or replayed
@@ -305,6 +321,21 @@ export interface Store {
     brokerCredentialId: number;
   }): Promise<ExtensionCredential>;
   listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
+  /**
+   * Runtime extension registry (issue #233): persists one runtime-registered
+   * extension's PinnedSnapshot document (machine state — never a repo file).
+   * Idempotent upsert by extension id: re-registering refreshes the row.
+   * `snapshot` is the JSON PinnedSnapshot (schema/extensionId/pinnedAt/
+   * source/manifest) the registry's fail-closed parse accepts.
+   */
+  upsertRuntimeExtension(input: {
+    extensionId: string;
+    snapshot: string;
+    registeredBy: string;
+    spaceId?: string | null;
+  }): Promise<RuntimeExtensionRow>;
+  /** Every runtime-registered extension, in registration order. */
+  listRuntimeExtensions(): Promise<RuntimeExtensionRow[]>;
   /**
    * Mints a one-time upload token (issue #196): an opaque single-use row the
    * browser upload endpoint consumes. The token is the only credential the
@@ -1090,6 +1121,40 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .all(provider) as ExtensionCredential[];
   }
 
+  async function upsertRuntimeExtension(input: {
+    extensionId: string;
+    snapshot: string;
+    registeredBy: string;
+    spaceId?: string | null;
+  }): Promise<RuntimeExtensionRow> {
+    const extensionId = input.extensionId.trim();
+    const registeredBy = input.registeredBy.trim();
+    if (!extensionId || !registeredBy) {
+      throw new Error("runtime extension registration needs an extension id and a registering actor");
+    }
+    if (!input.snapshot.trim()) throw new Error("runtime extension registration needs a snapshot document");
+    const t = Date.now();
+    // Idempotent upsert by extension id: a re-register (the same catalog
+    // connect running again after a restart) refreshes the row, never
+    // duplicates it.
+    return db
+      .query(
+        `INSERT INTO extension_registry (id, snapshot, registered_by, space_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot,
+                                       registered_by = excluded.registered_by,
+                                       space_id = excluded.space_id,
+                                       updated_at = excluded.updated_at
+         RETURNING *`,
+      )
+      .get(extensionId, input.snapshot, registeredBy, input.spaceId ?? null, t, t) as RuntimeExtensionRow;
+  }
+
+  async function listRuntimeExtensions(): Promise<RuntimeExtensionRow[]> {
+    // SAFETY: SELECT * returns one row per extension_registry match, each with RuntimeExtensionRow's column shape.
+    return db.query("SELECT * FROM extension_registry ORDER BY created_at").all() as RuntimeExtensionRow[];
+  }
+
   function createUploadToken(input: {
     extension: string;
     scope: CredentialScope;
@@ -1442,6 +1507,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     markUnclaimedJobs,
     upsertExtensionCredential,
     listExtensionCredentials,
+    upsertRuntimeExtension,
+    listRuntimeExtensions,
     createUploadToken,
     getUploadToken,
     consumeUploadToken,

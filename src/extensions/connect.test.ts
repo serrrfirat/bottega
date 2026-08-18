@@ -25,8 +25,7 @@ import {
 } from "./connect";
 import { fixtureManifest } from "./fixture";
 import type { ExtensionManifest } from "./manifest";
-import { createExtensionRegistry, parsePinnedSnapshot, type ExtensionRegistry } from "./registry";
-import { CATALOG_REGISTER_TOOL } from "./catalog-register";
+import { createExtensionRegistry, type ExtensionRegistry, type PinnedSnapshot } from "./registry";
 import { DEFAULT_CATALOG_URL } from "./fetch-catalog";
 import type { McpOAuthStartResult } from "./mcp-oauth";
 
@@ -568,7 +567,7 @@ describe("pure helpers", () => {
   });
 });
 
-describe("connectExtension catalog fallback (issue #232)", () => {
+describe("connectExtension catalog fallback (issue #232/#233) — register at runtime, no register gate", () => {
   const NOTION_RECORD = {
     id: "mcp/notion",
     slug: "notion",
@@ -601,10 +600,22 @@ describe("connectExtension catalog fallback (issue #232)", () => {
     }) as typeof fetch;
   }
 
+  /** In-memory store-backed runtime registry (issue #233). */
+  class MemoryRuntimeRegistry {
+    readonly rows: PinnedSnapshot[] = [];
+    async upsert(snapshot: PinnedSnapshot): Promise<void> {
+      this.rows.push(snapshot);
+    }
+    async list(): Promise<PinnedSnapshot[]> {
+      return [...this.rows];
+    }
+  }
+
   interface CatalogHarness extends Harness {
     snapshotsDir: string;
     egressPath: string;
     devEgressPath: string;
+    runtimeRegistry: MemoryRuntimeRegistry;
     dir: string;
   }
 
@@ -616,13 +627,17 @@ describe("connectExtension catalog fallback (issue #232)", () => {
   } = {}): CatalogHarness {
     const base = makeDeps({
       router: opts.router,
-      policy: opts.policy ?? parseOrgConfigYaml("tools:\n  register_extension: allow\n"),
+      // Issue #233: the org connect approval covers the registration — the
+      // org gate is the connect_extension gate (the register_extension
+      // policy name is no longer consulted on this path).
+      policy: opts.policy ?? parseOrgConfigYaml("tools:\n  connect_extension: allow\n"),
     });
     const dir = mkdtempSync(join(tmpdir(), "bottega-connect-catalog-"));
     const snapshotsDir = join(dir, "extensions");
     const egressPath = join(dir, "egress.yml");
     const devEgressPath = join(dir, "egress.dev.yml");
     const registry = createExtensionRegistry(snapshotsDir); // empty: notion/acme-key unregistered
+    const runtimeRegistry = new MemoryRuntimeRegistry();
     return {
       ...base,
       deps: {
@@ -633,11 +648,13 @@ describe("connectExtension catalog fallback (issue #232)", () => {
           snapshotsDir,
           egressPath,
           devEgressPath,
+          runtimeRegistry,
         },
       },
       snapshotsDir,
       egressPath,
       devEgressPath,
+      runtimeRegistry,
       dir,
     };
   }
@@ -647,7 +664,7 @@ describe("connectExtension catalog fallback (issue #232)", () => {
     for (const dir of catalogDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  test("an unregistered catalog extension routes through lookup → gate → pin → connect continuation", async () => {
+  test("a PERSONAL connect of an unregistered catalog extension registers at runtime with NO gate and continues the connect", async () => {
     const h = makeCatalogHarness();
     catalogDirs.push(h.dir);
 
@@ -655,56 +672,82 @@ describe("connectExtension catalog fallback (issue #232)", () => {
 
     expect(outcome.ok).toBe(true);
     if (outcome.ok) expect(outcome.message).toBe("Open this link to authorize");
-    // The mandatory register gate ran with the draft payload.
-    expect(h.router.requests).toHaveLength(1);
-    expect(h.router.requests[0]!.tool).toBe(CATALOG_REGISTER_TOOL);
-    expect(h.router.requests[0]!.args).toMatchObject({
-      extension: "notion",
-      vendor: "Notion",
-      mcpEndpoint: "https://mcp.notion.com/mcp",
-      credentialSchema: { type: "oauth" },
-    });
-    // Pinned + egress regenerated + hot-registered — the connect continued
-    // in the same turn (the OAuth mint fired).
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
-    expect(snapshot.extensionId).toBe("notion");
-    expect(snapshot.source.reviewed).toBe(true);
+    // Issue #233: personal connects are DIRECT — no register gate, no
+    // connect gate (the org gate only fires for org scope).
+    expect(h.router.requests).toHaveLength(0);
+    // Registered AT RUNTIME: store row (the durable evidence) + egress
+    // regen + hot-register — and NO config/extensions file.
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
     expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
     expect(h.mcpOAuth.calls).toHaveLength(1);
     expect(h.mcpOAuth.calls[0]!.extension).toBe("notion");
     expect(h.deps.registry.resolve("notion")).toBeDefined();
+    // The registered manifest is the #231 notion shape: reviewed (the
+    // connect authorizes it), OAuth, tools-less.
+    const persisted = h.runtimeRegistry.rows[0]!;
+    expect(persisted.extensionId).toBe("notion");
+    expect(persisted.source.reviewed).toBe(true);
+    expect(persisted.manifest.credentialSchema).toEqual({ type: "oauth" });
   });
 
-  test("a denied register gate pins nothing and never mints", async () => {
-    const h = makeCatalogHarness({ router: new RecordingRouter({ approved: false }) });
+  test("an ORG connect of an unregistered catalog extension crosses ONE gate — the connect approval covers the registration; a denied connect registers nothing", async () => {
+    // Allowed policy: the org connect gate fires ONCE, carrying the draft
+    // facts (vendor, domains, MCP endpoint) — the "add a domain" egress
+    // step rides this approval (issue #233's security note).
+    const h = makeCatalogHarness();
     catalogDirs.push(h.dir);
 
-    const outcome = await connect(h, "notion", "personal", "UADA");
+    const outcome = await connect(h, "notion", "org", "UADA");
 
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok === false) expect(outcome.message).toContain("policy: approval denied");
-    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
-    expect(h.mcpOAuth.calls).toHaveLength(0);
-    expect(h.deps.registry.resolve("notion")).toBeUndefined();
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.message).toBe("Open this link to authorize");
+    expect(h.router.requests).toHaveLength(1);
+    const request = h.router.requests[0]!;
+    expect(request.tool).toBe(CONNECT_EXTENSION_TOOL);
+    expect(request.args).toMatchObject({
+      extension: "notion",
+      scope: "org",
+      registering_from_catalog: true,
+      vendor: "Notion",
+      domains: ["notion.com", "mcp.notion.com"],
+      mcpEndpoint: "https://mcp.notion.com/mcp",
+    });
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+
+    // DENIED: nothing registers — no store row, no egress, no mint, no
+    // hot-register.
+    const denied = makeCatalogHarness({ router: new RecordingRouter({ approved: false }) });
+    catalogDirs.push(denied.dir);
+    const deniedOutcome = await connect(denied, "notion", "org", "UADA");
+
+    expect(deniedOutcome.ok).toBe(false);
+    if (deniedOutcome.ok === false) expect(deniedOutcome.message).toContain("policy: approval denied");
+    expect(denied.runtimeRegistry.rows).toHaveLength(0);
+    expect(existsSync(join(denied.snapshotsDir, "notion.json"))).toBe(false);
+    expect(existsSync(denied.egressPath)).toBe(false);
+    expect(denied.mcpOAuth.calls).toHaveLength(0);
+    expect(denied.deps.registry.resolve("notion")).toBeUndefined();
   });
 
-  test("an api_key catalog extension pins then directs the key to the one-time upload link", async () => {
+  test("an api_key catalog extension registers at runtime then directs the key to the one-time upload link", async () => {
     const h = makeCatalogHarness({ records: [ACME_KEY_RECORD], wellKnownStatus: 404 });
     catalogDirs.push(h.dir);
 
     const outcome = await connect(h, "acme-key", "personal", "UADA");
 
-    // The pin landed (gate approved) — but the connect cannot proceed
-    // without the key, and the message points at the #196 safe path.
+    // The registration landed — but the connect cannot proceed without the
+    // key, and the message points at the #196 safe path.
     expect(outcome.ok).toBe(false);
     if (outcome.ok === false) {
-      expect(outcome.message).toContain('Pinned "Acme Key" from the catalog');
+      expect(outcome.message).toContain('Registered "Acme Key" from the catalog at runtime');
       expect(outcome.message).toContain("connect_upload_link");
       // The guidance never asks for a pasted key in chat.
       expect(outcome.message).toContain("never paste a live key in chat");
     }
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "acme-key.json"), "utf8"));
-    expect(snapshot.manifest.credentialSchema).toEqual({ type: "api_key" });
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(h.runtimeRegistry.rows[0]!.manifest.credentialSchema).toEqual({ type: "api_key" });
     expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.acme.example.com"');
     expect(h.mcpOAuth.calls).toHaveLength(0);
   });

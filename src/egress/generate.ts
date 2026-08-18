@@ -2,7 +2,11 @@
  * Egress config generation (issue #50): config/egress.yml is a generated
  * artifact — the static iron-proxy template plus the allowlist merged from
  * the extension registry's pinned snapshots (extension `domains` entries)
- * and the secrets transform for boundary credential injection (issue #53).
+ * AND the runtime-registered set (issue #233: the store-backed runtime
+ * registry — machine state, never a repo file; `regenerateEgressConfig`
+ * takes it as a parameter and the committed byte-pin tests stay hermetic
+ * on the seed fixtures with an empty runtime set) and the secrets
+ * transform for boundary credential injection (issue #53).
  *
  * Issue #208 (proxy-only credentials) adds two blocks to the pipeline:
  * the model-gateway static-key entries in the secrets transform (the
@@ -27,7 +31,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { readPinnedSnapshots } from "../extensions/registry";
+import { readPinnedSnapshots, type PinnedSnapshot } from "../extensions/registry";
 import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
@@ -563,20 +567,23 @@ ${secretsTransform}${oauthTransform}log:
 }
 
 /**
- * Reads pinned snapshots from `snapshotsDir`, merges their domains into the
- * allowlist and their credential-injection entries into the secrets
- * transform (issue #53), writes config/egress.yml, and returns the
- * rendered text. OAuth extensions (#198 providers) move from file
- * injection to the `oauth_token` transform (issue #208): their access
- * tokens are minted by the proxy, so they get no `.secret` file entry.
- * Defaults are the deployment paths; CLI:
- * `bun run src/egress/generate.ts`.
+ * Reads pinned snapshots from `snapshotsDir`, merges the RUNTIME set
+ * (issue #233: the store-backed runtime-registered extensions — machine
+ * state, never a repo file) into the allowlist and the credential-injection
+ * entries (issue #53), writes config/egress.yml, and returns the rendered
+ * text. OAuth extensions (#198 providers) move from file injection to the
+ * `oauth_token` transform (issue #208): their access tokens are minted by
+ * the proxy, so they get no `.secret` file entry. Defaults are the
+ * deployment paths; CLI: `bun run src/egress/generate.ts`. The committed
+ * byte-pin tests stay hermetic on the seed fixtures: they regenerate with
+ * an empty runtime set.
  */
 export function regenerateEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = EGRESS_CONFIG_PATH,
+  runtimeSnapshots: readonly PinnedSnapshot[] = [],
 ): string {
-  const snapshots = readPinnedSnapshots(snapshotsDir);
+  const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   // mergedEgressDomains prepends the base domains and dedupes, so the raw
   // per-snapshot domains pass through as-is (order-stable).
   const extensionDomains = snapshots.flatMap((s) => s.manifest.domains);
@@ -591,18 +598,20 @@ export function regenerateEgressConfig(
 }
 
 /**
- * Reads pinned snapshots from `snapshotsDir` and renders the dev-permissive
- * config (allow-all + no judge + secrets + management, issue #126) into
- * `outPath` (default config/egress.dev.yml), returning the rendered text.
- * The dev config carries the same injection entries as the strict one, so
- * regenerating both keeps them in lockstep. CLI:
+ * Reads pinned snapshots from `snapshotsDir`, merges the RUNTIME set
+ * (issue #233), and renders the dev-permissive config (allow-all + no
+ * judge + secrets + management, issue #126) into `outPath` (default
+ * config/egress.dev.yml), returning the rendered text. The dev config
+ * carries the same injection entries as the strict one, so regenerating
+ * both keeps them in lockstep. CLI:
  * `bun run src/egress/generate.ts`.
  */
 export function regenerateDevEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = DEV_EGRESS_CONFIG_PATH,
+  runtimeSnapshots: readonly PinnedSnapshot[] = [],
 ): string {
-  const snapshots = readPinnedSnapshots(snapshotsDir);
+  const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   const extensionEntries = apiKeyExtensionEntries(snapshots);
   const oauthEntries = oauthTokenEntries(snapshots);
   const yaml = renderDevEgressConfig(extensionEntries, oauthEntries);

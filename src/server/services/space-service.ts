@@ -118,6 +118,11 @@ export interface ConnectIntent {
  * shapes only — everything else is natural-language agent territory:
  *
  *   `connect <extension>`         → scope "personal" (the sender's account)
+ *   `connect my <extension>`      → scope "personal" (issue #233: the
+ *                                   natural phrasing "connect my docs"
+ *                                   routes to the docs tool; the token
+ *                                   resolves semantically by name/alias in
+ *                                   the catalog lookup)
  *   `connect <extension> as org`  → scope "org" (privileged: policy gate +
  *                                   approval via the space's router)
  *   `connect <extension> as me`   → scope "personal"
@@ -128,7 +133,7 @@ export interface ConnectIntent {
  * null and stays with the agent.
  */
 export function parseConnectIntent(text: string): ConnectIntent | null {
-  const match = /^connect\s+([A-Za-z0-9._-]+)(?:\s+as\s+(org|me))?$/i.exec(text.trim());
+  const match = /^connect\s+(?:my\s+)?([A-Za-z0-9._-]+)(?:\s+as\s+(org|me))?$/i.exec(text.trim());
   if (!match) return null;
   return { extension: match[1]!, scope: match[2]?.toLowerCase() === "org" ? "org" : "personal" };
 }

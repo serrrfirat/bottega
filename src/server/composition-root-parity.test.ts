@@ -105,7 +105,7 @@ function tempEnv(restoreCwd: string): CaptureEnv {
   // pin sync needs the config/omp template, every root reads the same
   // committed extension snapshots.
   mkdirSync(join(dir, "config", "extensions"), { recursive: true });
-  for (const name of ["attio.json", "github.json", "linear.json", "notion.json"]) {
+  for (const name of ["attio.json", "github.json", "linear.json"]) {
     copyFileSync(join(EXTENSIONS_DIR, name), join(dir, "config", "extensions", name));
   }
   mkdirSync(join(dir, "config", "omp"), { recursive: true });
@@ -259,7 +259,9 @@ describe("composition-root parity (issue #172)", () => {
 
   test("all three roots register the same extension registry contents", async () => {
     const { server, executor, mcp } = await captureWirings({});
-    const expected = ["attio", "github", "linear", "notion"];
+    // The committed SEED (issue #233: notion is not pinned — its runtime
+    // registration is store state, and a fresh temp DB has no runtime rows).
+    const expected = ["attio", "github", "linear"];
     expect(registryIds(server)).toEqual(expected);
     expect(registryIds(executor.runtime)).toEqual(expected);
     expect(registryIds(mcp.runtime)).toEqual(expected);

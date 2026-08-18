@@ -94,6 +94,38 @@ describe("fetch-catalog helper (issue #54)", () => {
     expect(byId.slug).toBe("linear");
   });
 
+  test("fetchCatalogEntry resolves semantically by NAME and ALIASES, not just exact ids (issue #233)", async () => {
+    const doc = {
+      version: 1,
+      data: [
+        ...CATALOG.data,
+        {
+          id: "mcp/google-docs",
+          slug: "google-docs",
+          kind: "mcp",
+          name: "Google Docs",
+          aliases: ["docs", "gdocs"],
+          domain: "docs.google.com",
+          url: "https://docs.google.com/mcp",
+        },
+      ],
+    };
+    const fetchImpl = stubFetch(doc);
+    // The intent token "docs" ("connect my docs") resolves by ALIAS.
+    const byAlias = await fetchCatalogEntry("docs", { fetchImpl });
+    expect(byAlias.slug).toBe("google-docs");
+    // An exact NAME match resolves too (case-insensitive).
+    const byName = await fetchCatalogEntry("google docs", { fetchImpl });
+    expect(byName.slug).toBe("google-docs");
+    // Exact ids still work (case-insensitive).
+    const byId = await fetchCatalogEntry("MCP/Google-Docs", { fetchImpl });
+    expect(byId.slug).toBe("google-docs");
+    // Never a substring guess: "google-doc" (a prefix of the id/name) must
+    // not resolve — ambiguous partial tokens fail loudly.
+    await expect(fetchCatalogEntry("google-doc", { fetchImpl })).rejects.toThrow(CatalogError);
+    await expect(fetchCatalogEntry("doc", { fetchImpl })).rejects.toThrow(CatalogError);
+  });
+
   test("fetchCatalogEntry fails closed on unknown specs and broken catalogs", async () => {
     await expect(fetchCatalogEntry("not-a-provider", { fetchImpl: stubFetch() })).rejects.toThrow(
       CatalogError,

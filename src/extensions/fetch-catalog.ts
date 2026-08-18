@@ -230,14 +230,34 @@ function parseListableRecord(record: JsonObject): CatalogEntry {
   };
 }
 
+/**
+ * Semantic record matching (issue #233): a connect's extension token
+ * resolves by exact slug/id OR by name/alias — "connect my docs" →
+ * extension token "docs" → the catalog entry named "Docs" (or carrying a
+ * "docs" alias) — case-insensitive, never a substring guess (substring
+ * matching would make ambiguous connects resolve arbitrarily). Aliases are
+ * an optional per-record array (some catalog entries publish them).
+ */
+function recordMatchesSpec(record: JsonObject, specId: string): boolean {
+  const needle = specId.toLowerCase();
+  if (optionalString(record["slug"])?.toLowerCase() === needle) return true;
+  if (optionalString(record["id"])?.toLowerCase() === needle) return true;
+  if (optionalString(record["name"])?.toLowerCase() === needle) return true;
+  const aliases = record["aliases"];
+  if (Array.isArray(aliases)) {
+    for (const alias of aliases) {
+      if (optionalString(alias)?.toLowerCase() === needle) return true;
+    }
+  }
+  return false;
+}
+
 export async function fetchCatalogEntry(
   specId: string,
   opts: FetchCatalogOptions = {},
 ): Promise<CatalogEntry> {
   const catalogUrl = opts.catalogUrl ?? process.env.INTEGRATIONS_CATALOG_URL ?? DEFAULT_CATALOG_URL;
-  const entry = (await fetchCatalogDoc(opts)).find(
-    (record) => record["slug"] === specId || record["id"] === specId,
-  );
+  const entry = (await fetchCatalogDoc(opts)).find((record) => recordMatchesSpec(record, specId));
   if (entry === undefined) {
     throw new CatalogError(`spec "${specId}" not found in ${catalogUrl}`);
   }

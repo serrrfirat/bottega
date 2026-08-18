@@ -187,12 +187,14 @@ const TIER_BY_TOOL: ToolTiers = {
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.
   connect_extension: "exec",
-  // Catalog registration (issue #232): the deterministic "connect X" flow
-  // for UNREGISTERED extensions crosses this name through the shared
-  // decision table BEFORE any pin — a repo-level change with egress
-  // implications, so it routes ask-human through the approval router like
-  // every exec-tier tool; a pin never happens silently. Only reachable
-  // from the connect capability's catalog seam; never a user-visible tool.
+  // Catalog registration policy surface (issue #232/#233): the catalog
+  // connect path no longer GATES on this name — the connect's own
+  // approval (connect_extension, org scope) covers the runtime
+  // registration and the egress-add step; personal connects are direct.
+  // The tier stays so a multi-admin org can RE-ENABLE a registration gate
+  // as policy (issue #233's security note — never a silent default); only
+  // reachable from the connect capability's catalog seam, never a
+  // user-visible tool.
   register_extension: "exec",
   // Memory tools (issue #22): save mutates durable state (write — prompts
   // in non-yolo modes), search only queries (read).

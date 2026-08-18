@@ -73,8 +73,6 @@ transforms:
         - "mcp.attio.com"
         - "api.githubcopilot.com"
         - "mcp.linear.app"
-        - "notion.com"
-        - "mcp.notion.com"
 
   # 2. Judge: LLM policy gate. Fires on every request that passed the
   #    allowlist. Independent circuit breaker + timeout per instance.
@@ -232,22 +230,6 @@ transforms:
           require: true
           rules:
             - host: "mcp.linear.app"
-        - grant: refresh_token
-          refresh_token:
-            type: file
-            path: "/data/proxy-secrets/notion-oauth.json"
-            ttl: "30s"
-            json_key: "refresh_token"
-          client_id:
-            type: file
-            path: "/data/proxy-secrets/notion-oauth.json"
-            ttl: "30s"
-            json_key: "client_id"
-          token_endpoint: "https://mcp.notion.com/token"
-          require: true
-          rules:
-            - host: "notion.com"
-            - host: "mcp.notion.com"
 
 log:
   level: "info"

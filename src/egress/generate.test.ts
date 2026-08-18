@@ -16,7 +16,7 @@ import {
   apiKeyExtensionEntries,
   oauthTokenEntries,
 } from "./generate";
-import { readPinnedSnapshots, SNAPSHOT_SCHEMA } from "../extensions/registry";
+import { readPinnedSnapshots, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "../extensions/registry";
 import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID } from "../extensions/fixture";
 
 const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
@@ -75,12 +75,15 @@ describe("egress config generation", () => {
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
-    expect(EXTENSION_DOMAINS.sort()).toEqual([
+    // The committed SEED fixtures (issue #233): github/linear/attio pins —
+    // notion is gone (its registration is a runtime connect, merged into
+    // the egress only when registered at runtime). Copy before sorting:
+    // EXTENSION_DOMAINS is a module-level constant later byte-pin tests
+    // render with (in-place sort would corrupt the registration order).
+    expect([...EXTENSION_DOMAINS].sort()).toEqual([
       "api.githubcopilot.com",
       "mcp.attio.com",
       "mcp.linear.app",
-      "mcp.notion.com",
-      "notion.com",
     ]);
   });
 
@@ -331,5 +334,87 @@ describe("dev-permissive egress config (issue #126)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("runtime registry merge (issue #233)", () => {
+  /** A runtime-registered notion-shaped snapshot (the catalog connect's
+   * durable record — store state, never a repo file). */
+  function runtimeSnapshot(extensionId: string, domains: string[], credentialType: "oauth" | "api_key"): PinnedSnapshot {
+    return {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId,
+      pinnedAt: "2026-08-18T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api", specId: extensionId, vendorOfficial: true, reviewed: true },
+      manifest: {
+        id: extensionId,
+        label: extensionId,
+        vendor: extensionId,
+        kind: "mcp",
+        mcp: { serverUrl: `https://mcp.${extensionId}.example.com/mcp`, transport: "streamable-http" },
+        credentialSchema: { type: credentialType },
+        domains,
+      },
+    };
+  }
+
+  test("regenerateEgressConfig merges the RUNTIME set (domains + oauth_token entries) into the emitted config", () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-runtime-"));
+    try {
+      const outPath = join(dir, "egress.yml");
+      // The OAuth runtime extension uses a "fixture."-prefixed id (the
+      // canary's synthesized-endpoint seam — there is no real authorization
+      // server behind a fixture domain); the api_key one is a plain id.
+      const runtime = [
+        runtimeSnapshot("fixture.runtime-oauth", ["fixture-runtime.example.com"], "oauth"),
+        runtimeSnapshot("runtime-key", ["runtime-key.example.com", "mcp.runtime-key.example.com"], "api_key"),
+      ];
+      const yaml = regenerateEgressConfig(join(dir, "missing-snapshots"), outPath, runtime);
+      expect(readFileSync(outPath, "utf8")).toBe(yaml);
+      // Runtime domains join the allowlist (after the base set).
+      const domains = allowlistDomains(yaml);
+      expect(domains).toContain("fixture-runtime.example.com");
+      expect(domains).toContain("runtime-key.example.com");
+      // The OAuth runtime extension gets an oauth_token entry (the #198
+      // mint shape; the endpoint is synthesized from its own allowlisted
+      // host — a fixture id, never a guessed production URL)…
+      expect(yaml).toContain("fixture.runtime-oauth-oauth.json");
+      expect(yaml).toContain('token_endpoint: "https://fixture-runtime.example.com/token"');
+      // …and the api_key runtime extension gets a secrets file entry.
+      expect(yaml).toContain('path: "/data/proxy-secrets/runtime-key.secret"');
+      // The base config stays intact around the merge.
+      expect(yaml).toContain('fallback: "deny"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("regenerateDevEgressConfig merges the same runtime set", () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-runtime-"));
+    try {
+      const outPath = join(dir, "egress.dev.yml");
+      const runtime = [runtimeSnapshot("runtime-key", ["runtime-key.example.com"], "api_key")];
+      const yaml = regenerateDevEgressConfig(join(dir, "missing-snapshots"), outPath, runtime);
+      expect(readFileSync(outPath, "utf8")).toBe(yaml);
+      expect(yaml).toContain('path: "/data/proxy-secrets/runtime-key.secret"');
+      expect(allowlistDomains(yaml)).toEqual(["*"]); // dev stays allow-all
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the committed byte-pin tests stay hermetic on the SEED fixtures: an empty runtime set reproduces the committed configs", () => {
+    // Issue #233's hermeticity contract: the runtime set is INJECTED via
+    // fixtures; the committed configs are byte-pinned to the seed only.
+    // Re-read the pinned seed fresh (the module-level EXTENSION_DOMAINS is
+    // registration-ordered but some tests copy-sort it; a fresh read keeps
+    // this pin independent of sibling test order).
+    const committedDev = readFileSync(resolve(import.meta.dir, `../../${DEV_EGRESS_CONFIG_PATH}`), "utf8");
+    const seed = readPinnedSnapshots(SNAPSHOTS_DIR);
+    const seedDomains = seed.flatMap((s) => s.manifest.domains);
+    const seedEntries = apiKeyExtensionEntries(seed);
+    const seedOAuth = oauthTokenEntries(seed);
+    expect(renderEgressConfig(mergedEgressDomains(seedDomains), seedEntries, seedOAuth)).toBe(COMMITTED_EGRESS);
+    expect(renderDevEgressConfig(seedEntries, seedOAuth)).toBe(committedDev);
   });
 });

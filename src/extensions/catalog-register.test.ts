@@ -1,31 +1,34 @@
 /**
- * Issue #232 acceptance (seam tier): the catalog registration seam the
+ * Issue #232/#233 acceptance (seam tier): the catalog registration seam the
  * connect path invokes for an UNREGISTERED extension — deterministic
  * lookup → draft (catalog record + official hosted MCP endpoint discovery
- * + auth classification) → review gate (register_extension) → pin +
- * egress regen + hot-register. Red on pre-fix: the seam does not exist
- * before #232 (the connect path had no catalog fallback).
+ * + auth classification) → REGISTER AT RUNTIME (store-backed registry +
+ * egress regen merged with the runtime set + hot-register + proxy reload).
+ * Red on pre-fix: the seam does not exist before #232 (the connect path
+ * had no catalog fallback).
  *
- * The gateway tests (caller surface) live in space-service.test.ts /
- * connect.test.ts — this file pins the seam's own contracts: the auth
- * classification never guesses, an unknown spec fails loudly with the
- * browse path, the review gate is MANDATORY (a denied gate pins nothing),
- * and an approved gate pins a parsePinnedSnapshot-valid snapshot, lands
- * the domains in the regenerated (byte-pinned) egress configs, and
- * hot-registers into the live registry.
+ * Issue #233: the register_extension review gate is REMOVED from the seam —
+ * the connect's own approval covers org scope in connect.ts; this file
+ * pins the seam's own contracts: the auth classification never guesses, an
+ * unknown spec fails loudly with the browse path, the lookup is READ-ONLY
+ * (nothing registers, no gate), the runtime register persists the
+ * snapshot to the store (machine state — no config file), the egress regen
+ * MERGES the persisted runtime set, and an approved registration
+ * hot-registers into the live registry. A denied/never-approved connect
+ * registers nothing (the gate lives at the caller surface — space-service/
+ * connect tests).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatalogError, DEFAULT_CATALOG_URL, type CatalogEntry } from "./fetch-catalog";
-import { createExtensionRegistry, parsePinnedSnapshot, type ExtensionRegistry } from "./registry";
-import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../policy/approval-router";
-import { parseOrgConfigYaml } from "../policy/config";
+import { createExtensionRegistry, parsePinnedSnapshot, type ExtensionRegistry, type PinnedSnapshot } from "./registry";
+import { type CatalogRegisterRuntimeDeps, type RuntimeRegistrySeam } from "./catalog-register";
 import {
-  CATALOG_REGISTER_TOOL,
   discoverCatalogMcp,
-  registerExtensionFromCatalog,
+  lookupCatalogExtension,
+  registerExtensionAtRuntime,
 } from "./catalog-register";
 
 const CATALOG_URL = DEFAULT_CATALOG_URL;
@@ -60,6 +63,18 @@ const OAUTH_ONLY_RECORD = {
   domain: "oauth-only.example.com",
 };
 
+/** A catalog record with a name/alias that differs from its slug (issue #233 semantic lookup). */
+const DOCS_RECORD = {
+  id: "mcp/google-docs",
+  slug: "google-docs",
+  kind: "mcp",
+  name: "Google Docs",
+  aliases: ["docs", "gdocs"],
+  description: "Google Docs MCP",
+  url: "https://docs.google.com/mcp",
+  domain: "docs.google.com",
+};
+
 function catalogDoc(records: unknown[]): string {
   return JSON.stringify({ version: 1, generatedAt: "2026-08-18T00:00:00.000Z", data: records });
 }
@@ -88,19 +103,34 @@ function throwingFetch(): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
-class RecordingRouter implements ApprovalRouter {
-  readonly requests: ApprovalRequest[] = [];
-  constructor(private resolution: ApprovalResolution = { approved: true }) {}
-  async request(d: ApprovalRequest): Promise<ApprovalResolution> {
-    this.requests.push(d);
-    return this.resolution;
+/**
+ * In-memory runtime registry seam (issue #233): persists runtime-registered
+ * snapshots exactly like the store-backed seam, with failure switches for
+ * the fail-closed paths.
+ */
+class MemoryRuntimeRegistry implements RuntimeRegistrySeam {
+  readonly rows: PinnedSnapshot[] = [];
+  readonly upsertCalls: Array<{ snapshot: PinnedSnapshot; actor: string; spaceId: string | null }> = [];
+  failUpsert = false;
+  failList = false;
+  async upsert(snapshot: PinnedSnapshot, actor: string, spaceId?: string | null): Promise<void> {
+    if (this.failUpsert) throw new Error("store write failed (disk full)");
+    this.upsertCalls.push({ snapshot, actor, spaceId: spaceId ?? null });
+    this.rows.push(snapshot);
+  }
+  async list(): Promise<PinnedSnapshot[]> {
+    if (this.failList) throw new Error("store read failed");
+    return [...this.rows];
   }
 }
 
 interface Harness {
-  deps: Parameters<typeof registerExtensionFromCatalog>[0];
-  router: RecordingRouter;
-  snapshotsDir: string;
+  deps: Omit<CatalogRegisterRuntimeDeps, "actor" | "spaceId"> & {
+    snapshotsDir: string;
+    egressPath: string;
+    devEgressPath: string;
+  };
+  runtimeRegistry: MemoryRuntimeRegistry;
   egressPath: string;
   devEgressPath: string;
   registry: ExtensionRegistry;
@@ -108,15 +138,11 @@ interface Harness {
   dir: string;
 }
 
-function makeHarness(opts: { router?: ApprovalRouter; records?: unknown[]; wellKnownStatus?: number } = {}): Harness {
+function makeHarness(opts: { records?: unknown[]; wellKnownStatus?: number } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), "bottega-catalog-register-"));
   const snapshotsDir = join(dir, "extensions");
   const egressPath = join(dir, "egress.yml");
   const devEgressPath = join(dir, "egress.dev.yml");
-  // The RECORDING router is always present (the gate's effective router is
-  // the override when one is given — e.g. DenyRouter for the deny tests).
-  const recording = new RecordingRouter();
-  const router: ApprovalRouter = opts.router ?? recording;
   const auditRows: Array<{ actor: string; event_type: string; payload: unknown }> = [];
   const audit = {
     appendAudit: async (entry: { actor: string; event_type: string; payload: unknown }) => {
@@ -126,23 +152,17 @@ function makeHarness(opts: { router?: ApprovalRouter; records?: unknown[]; wellK
     listAudit: async () => [],
   };
   const registry = createExtensionRegistry(snapshotsDir);
-  const deps = {
-    extensionId: "notion",
-    actor: "UADA",
-    spaceId: undefined as string | undefined,
+  const runtimeRegistry = new MemoryRuntimeRegistry();
+  const deps: Harness["deps"] = {
     registry,
     audit,
-    gate: {
-      loadPolicy: () =>
-        Promise.resolve(parseOrgConfigYaml("tools:\n  register_extension: allow\n")),
-      router,
-    },
+    runtimeRegistry,
     catalog: { fetchImpl: stubFetch(opts.records ?? [NOTION_RECORD], opts.wellKnownStatus ?? 200) },
     snapshotsDir,
     egressPath,
     devEgressPath,
   };
-  return { deps, router: recording, snapshotsDir, egressPath, devEgressPath, registry, auditRows, dir };
+  return { deps, runtimeRegistry, egressPath, devEgressPath, registry, auditRows, dir };
 }
 
 // The harness dirs are tracked after creation so cleanup is deterministic.
@@ -209,137 +229,89 @@ describe("discoverCatalogMcp (issue #232) — deterministic official MCP endpoin
   });
 });
 
-describe("registerExtensionFromCatalog (issue #232) — lookup → draft → gate → pin → egress → hot-register", () => {
+describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ONLY", () => {
   function harness(opts: Parameters<typeof makeHarness>[0] = {}): Harness {
     const h = makeHarness(opts);
     tracked.push(h);
     return h;
   }
 
-  test("an unknown spec fails loudly with the catalog browse path and pins nothing", async () => {
+  test("an unknown spec fails loudly with the catalog browse path and registers NOTHING", async () => {
     const h = harness({ records: [] });
-    const result = await registerExtensionFromCatalog({ ...h.deps, extensionId: "nope.xyz" });
+    const result = await lookupCatalogExtension("nope.xyz", h.deps);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.message).toContain('unknown extension "nope.xyz"');
       expect(result.message).toContain("no extension or catalog entry");
       expect(result.message).toContain("catalog_browser");
     }
-    // The lookup failed BEFORE the review gate: no approval was requested
-    // and nothing was written.
-    expect(h.router.requests).toHaveLength(0);
-    expect(existsSync(join(h.snapshotsDir, "nope.xyz.json"))).toBe(false);
+    // The lookup failed BEFORE any gate/register: nothing written, nothing
+    // hot-registered, no egress output, no store row.
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
     expect(h.registry.resolve("nope.xyz")).toBeUndefined();
+    expect(existsSync(h.egressPath)).toBe(false);
+    expect(h.auditRows).toHaveLength(0);
   });
 
-  test("the review gate is MANDATORY — a denied gate pins nothing", async () => {
-    const h = harness({ router: DenyRouter });
-    const result = await registerExtensionFromCatalog(h.deps);
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.message).toContain("policy: approval denied");
-    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
-    expect(h.registry.resolve("notion")).toBeUndefined();
+  test("semantic lookup resolves by NAME and ALIASES, not just exact ids (issue #233)", async () => {
+    // "connect my docs" → the intent token is "docs" → the catalog entry
+    // named "Google Docs" (or carrying the "docs" alias) must resolve.
+    const h = harness({ records: [DOCS_RECORD], wellKnownStatus: 404 });
+    const byAlias = await lookupCatalogExtension("docs", h.deps);
+    expect(byAlias.ok).toBe(true);
+    if (byAlias.ok) {
+      expect(byAlias.facts.label).toBe("Google Docs");
+      expect(byAlias.snapshot.extensionId).toBe("google-docs");
+    }
+    const byName = await lookupCatalogExtension("Google Docs", h.deps);
+    expect(byName.ok).toBe(true);
+    if (byName.ok) expect(byName.snapshot.extensionId).toBe("google-docs");
+    // An exact id match is case-insensitive.
+    const byId = await lookupCatalogExtension("MCP/Google-Docs", h.deps);
+    expect(byId.ok).toBe(true);
+    if (byId.ok) expect(byId.snapshot.extensionId).toBe("google-docs");
+    // Never a substring guess: "google-doc" (a prefix of the id) resolves
+    // nothing — ambiguous partial tokens fail loudly.
+    const bySubstring = await lookupCatalogExtension("google-doc", h.deps);
+    expect(bySubstring.ok).toBe(false);
   });
 
-  test("the gate request surfaces the draft: id, vendor, kind, domains, MCP endpoint", async () => {
+  test("the draft facts carry the discovered endpoint, domains, and auth classification", async () => {
     const h = harness();
-    await registerExtensionFromCatalog(h.deps);
-    expect(h.router.requests).toHaveLength(1);
-    const request = h.router.requests[0]!;
-    expect(request.tool).toBe(CATALOG_REGISTER_TOOL);
-    expect(request.spaceId).toBe("");
-    expect(request.args).toEqual({
-      action: "register_from_catalog",
-      extension: "notion",
-      vendor: "Notion",
+    const result = await lookupCatalogExtension("notion", h.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facts).toEqual({
+      extensionId: "notion",
+      label: "Notion",
       kind: "mcp",
       domains: ["notion.com", "mcp.notion.com"],
       mcpEndpoint: "https://mcp.notion.com/mcp",
       credentialSchema: { type: "oauth" },
+      oauthGated: true,
     });
-  });
-
-  test("approve pins a parsePinnedSnapshot-valid snapshot, regenerates egress, and hot-registers", async () => {
-    const h = harness();
-    const result = await registerExtensionFromCatalog(h.deps);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.extensionId).toBe("notion");
-      expect(result.liveRegistry).toBe("registered");
-      expect(result.oauthGated).toBe(true);
-      expect(result.credentialType).toBe("oauth");
-      expect(result.message).toContain('Pinned "Notion" from the catalog');
-      expect(result.pinnedPath).toBe(join(h.snapshotsDir, "notion.json"));
-    }
-
-    // The pinned snapshot is registry-valid and reviewed (the human
+    // The draft snapshot is registry-valid and reviewed (the connect's own
     // approval IS the review — the #231 notion shape: OAuth + tools-less).
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
-    expect(snapshot.extensionId).toBe("notion");
-    expect(snapshot.source.reviewed).toBe(true);
-    expect(snapshot.source.vendorOfficial).toBe(true);
-    expect(snapshot.source.catalog).toBe(CATALOG_URL);
-    expect(snapshot.source.specId).toBe("notion");
-    expect(snapshot.manifest.kind).toBe("mcp");
-    expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
-    expect(snapshot.manifest.credentialSchema).toEqual({ type: "oauth" });
+    expect(result.snapshot.extensionId).toBe("notion");
+    expect(result.snapshot.source.reviewed).toBe(true);
+    expect(result.snapshot.source.vendorOfficial).toBe(true);
+    expect(result.snapshot.source.catalog).toBe(CATALOG_URL);
+    expect(result.snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
+    expect(result.snapshot.manifest.credentialSchema).toEqual({ type: "oauth" });
     // Tools-less (issue #158): the surface is discovered at runtime from
     // the provider's tools/list with conservative tiers.
-    expect(snapshot.manifest.tools).toBeUndefined();
-    expect(snapshot.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
-
-    // Egress regenerated (byte-pinned): the vendor host AND the MCP host
-    // are allowlisted.
-    const egress = readFileSync(h.egressPath, "utf8");
-    expect(egress).toContain('"mcp.notion.com"');
-    expect(egress).toContain('"notion.com"');
-    expect(existsSync(h.devEgressPath)).toBe(true);
-    expect(readFileSync(h.devEgressPath, "utf8")).toContain("mcp.notion.com");
-
-    // Hot-registered: the LIVE registry resolves the extension immediately.
-    expect(h.registry.resolve("notion")?.manifest.id).toBe("notion");
+    expect(result.snapshot.manifest.tools).toBeUndefined();
+    expect(result.snapshot.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
   });
 
-  test("an api_key-gated extension pins api_key (the #196 upload path supplies the key)", async () => {
-    const h = harness({ records: [ACME_KEY_RECORD], wellKnownStatus: 404 });
-    const result = await registerExtensionFromCatalog({ ...h.deps, extensionId: "acme-key" });
+  test("the lookup is READ-ONLY — no store row, no egress, no hot-register, no audit", async () => {
+    const h = harness();
+    const result = await lookupCatalogExtension("notion", h.deps);
     expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.oauthGated).toBe(false);
-      expect(result.credentialType).toBe("api_key");
-    }
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "acme-key.json"), "utf8"));
-    expect(snapshot.manifest.credentialSchema).toEqual({ type: "api_key" });
-    expect(snapshot.manifest.domains).toEqual(["acme.example.com", "mcp.acme.example.com"]);
-    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.acme.example.com"');
-    expect(h.registry.resolve("acme-key")).toBeDefined();
-  });
-
-  test("an OAuth extension without a verified token endpoint pins but surfaces the egress failure loudly", async () => {
-    // OAUTH_TOKEN_ENDPOINTS (src/egress/generate.ts) has no "oauth-only"
-    // entry → regeneration fails closed (never a guessed token endpoint).
-    // The pin still lands (the approved durable change), and the failure is
-    // LOUD in the result — never silent drift.
-    const h = harness({ records: [OAUTH_ONLY_RECORD], wellKnownStatus: 200 });
-    const result = await registerExtensionFromCatalog({ ...h.deps, extensionId: "oauth-only" });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.warnings.some((w) => w.includes("EGRESS REGEN FAILED"))).toBe(true);
-      expect(result.liveRegistry).toBe("registered");
-    }
-    expect(existsSync(join(h.snapshotsDir, "oauth-only.json"))).toBe(true);
-    expect(h.registry.resolve("oauth-only")).toBeDefined();
-  });
-
-  test("a denied gate records the ask-human trail and never touches egress", async () => {
-    const h = harness({ router: DenyRouter });
-    await registerExtensionFromCatalog(h.deps);
-    const decision = h.auditRows.find((row) => row.event_type === "policy.decision");
-    expect(decision?.payload).toMatchObject({ tool: CATALOG_REGISTER_TOOL, decision: "ask-human" });
-    expect(h.auditRows.some((row) => row.event_type === "approval.requested")).toBe(true);
-    const resolved = h.auditRows.find((row) => row.event_type === "approval.resolved");
-    expect(resolved?.payload).toMatchObject({ approved: false });
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
     expect(existsSync(h.egressPath)).toBe(false);
+    expect(h.registry.resolve("notion")).toBeUndefined();
+    expect(h.auditRows).toHaveLength(0);
   });
 
   test("a non-mcp catalog entry is refused deterministically (hosted MCP only)", async () => {
@@ -352,28 +324,172 @@ describe("registerExtensionFromCatalog (issue #232) — lookup → draft → gat
       domain: "acme.example.com",
     };
     const h = harness({ records: [cliRecord], wellKnownStatus: 404 });
-    const result = await registerExtensionFromCatalog({ ...h.deps, extensionId: "acme-cli" });
+    const result = await lookupCatalogExtension("acme-cli", h.deps);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.message).toContain("kind \"cli\"");
       expect(result.message).toContain("catalog_browser");
     }
-    expect(h.router.requests).toHaveLength(0);
-    expect(existsSync(join(h.snapshotsDir, "acme-cli.json"))).toBe(false);
-  });
-
-  test("the pin audit row records the egress configs and the live-registry outcome", async () => {
-    const h = harness();
-    const result = await registerExtensionFromCatalog(h.deps);
-    expect(result.ok).toBe(true);
-    const pinRow = h.auditRows.find((row) => row.event_type === "admin.catalog_browser");
-    expect(pinRow?.payload).toMatchObject({
-      action: "pin",
-      spec: "notion",
-      via: "connect",
-      egress_config: h.egressPath,
-      live_registry: "registered",
-    });
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
   });
 });
 
+describe("registerExtensionAtRuntime (issue #233) — store write → egress regen (merged runtime set) → hot-register → reload", () => {
+  async function lookup(h: Harness, extensionId = "notion") {
+    const result = await lookupCatalogExtension(extensionId, h.deps);
+    if (!result.ok) throw new Error(result.message);
+    return result;
+  }
+
+  test("the approved registration persists to the runtime registry, merges egress, and hot-registers", async () => {
+    const h = makeHarness();
+    tracked.push(h);
+    const draft = await lookup(h);
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, {
+      ...h.deps,
+      actor: "UADA",
+      spaceId: "slack:C1",
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.extensionId).toBe("notion");
+      expect(result.liveRegistry).toBe("registered");
+      expect(result.oauthGated).toBe(true);
+      expect(result.credentialType).toBe("oauth");
+      expect(result.message).toContain('Registered "Notion" from the catalog at runtime');
+      expect(result.message).not.toContain("config/extensions"); // no pin file, no commit
+      expect(result.warnings).toEqual([]);
+    }
+
+    // The STORE holds the durable snapshot (machine state — the egress
+    // regen merges it; NO config/extensions file was written).
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    const persisted = parsePinnedSnapshot(JSON.stringify(h.runtimeRegistry.rows[0]));
+    expect(persisted.extensionId).toBe("notion");
+    expect(persisted.source.reviewed).toBe(true);
+    expect(persisted.source.vendorOfficial).toBe(true);
+    expect(existsSync(join(h.deps.snapshotsDir, "notion.json"))).toBe(false);
+
+    // Egress regenerated (byte-pinned) with the runtime set merged: the
+    // vendor host AND the MCP host are allowlisted, the oauth_token entry
+    // is emitted for the OAuth extension.
+    const egress = readFileSync(h.egressPath, "utf8");
+    expect(egress).toContain('"mcp.notion.com"');
+    expect(egress).toContain('"notion.com"');
+    expect(egress).toContain("notion-oauth.json");
+    expect(existsSync(h.devEgressPath)).toBe(true);
+    expect(readFileSync(h.devEgressPath, "utf8")).toContain("mcp.notion.com");
+
+    // Hot-registered: the LIVE registry resolves the extension immediately.
+    expect(h.registry.resolve("notion")?.manifest.id).toBe("notion");
+  });
+
+  test("the egress regen merges the FULL persisted runtime set — earlier registrations survive (issue #233)", async () => {
+    const h = makeHarness({ records: [NOTION_RECORD, ACME_KEY_RECORD], wellKnownStatus: 404 });
+    tracked.push(h);
+    const notion = await lookup(h, "notion");
+    await registerExtensionAtRuntime(notion.snapshot, notion.facts.label, { ...h.deps, actor: "UADA" });
+    const acme = await lookup(h, "acme-key");
+    const second = await registerExtensionAtRuntime(acme.snapshot, acme.facts.label, { ...h.deps, actor: "UADA" });
+
+    expect(second.ok).toBe(true);
+    // The SECOND regen still contains the FIRST registration's domains —
+    // the runtime set is the whole persisted set, never just the new row.
+    const egress = readFileSync(h.egressPath, "utf8");
+    expect(egress).toContain('"mcp.notion.com"');
+    expect(egress).toContain('"mcp.acme.example.com"');
+    expect(readFileSync(h.devEgressPath, "utf8")).toContain("mcp.acme.example.com");
+  });
+
+  test("a failed store write fails the registration closed — nothing registers", async () => {
+    const h = makeHarness();
+    tracked.push(h);
+    h.runtimeRegistry.failUpsert = true;
+    const draft = await lookup(h);
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA" });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("FAILED — nothing was registered");
+      expect(result.message).toContain("store write failed");
+    }
+    // Fail closed: no egress output, no hot-register, no audit row.
+    expect(existsSync(h.egressPath)).toBe(false);
+    expect(h.registry.resolve("notion")).toBeUndefined();
+    expect(h.auditRows).toHaveLength(0);
+  });
+
+  test("without a runtime registry seam the registration is ephemeral but still regenerates egress + hot-registers", async () => {
+    const h = makeHarness();
+    tracked.push(h);
+    const draft = await lookup(h);
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, {
+      catalog: h.deps.catalog,
+      snapshotsDir: h.deps.snapshotsDir,
+      egressPath: h.deps.egressPath,
+      devEgressPath: h.deps.devEgressPath,
+      registry: h.deps.registry,
+      audit: h.deps.audit,
+      actor: "UADA",
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.message).toContain('Registered "Notion" from the catalog at runtime');
+    // The egress regen still ran with the new snapshot (the #232
+    // ephemeral mechanics); the live registry still hot-registers.
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
+    expect(h.registry.resolve("notion")).toBeDefined();
+  });
+
+  test("an api_key-gated extension registers api_key (the #196 upload path supplies the key)", async () => {
+    const h = makeHarness({ records: [ACME_KEY_RECORD], wellKnownStatus: 404 });
+    tracked.push(h);
+    const draft = await lookup(h, "acme-key");
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.oauthGated).toBe(false);
+      expect(result.credentialType).toBe("api_key");
+    }
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.acme.example.com"');
+    expect(h.registry.resolve("acme-key")).toBeDefined();
+  });
+
+  test("an OAuth extension without a verified token endpoint registers but surfaces the egress failure loudly", async () => {
+    // OAUTH_TOKEN_ENDPOINTS (src/egress/generate.ts) has no "oauth-only"
+    // entry → regeneration fails closed (never a guessed token endpoint).
+    // The runtime registration still lands (the approved durable change),
+    // and the failure is LOUD in the result — never silent drift.
+    const h = makeHarness({ records: [OAUTH_ONLY_RECORD], wellKnownStatus: 200 });
+    tracked.push(h);
+    const draft = await lookup(h, "oauth-only");
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.warnings.some((w) => w.includes("EGRESS REGEN FAILED"))).toBe(true);
+      expect(result.liveRegistry).toBe("registered");
+    }
+    // The registration is persisted and live — only the egress failed.
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(h.registry.resolve("oauth-only")).toBeDefined();
+  });
+
+  test("the registration audit row records the runtime store + egress + live-registry outcome", async () => {
+    const h = makeHarness();
+    tracked.push(h);
+    const draft = await lookup(h);
+    await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA", spaceId: "slack:C1" });
+    const row = h.auditRows.find((r) => r.event_type === "admin.catalog_browser");
+    expect(row?.payload).toMatchObject({
+      action: "register",
+      spec: "notion",
+      via: "connect",
+      runtime_registry: "store",
+      egress_config: h.egressPath,
+      live_registry: "registered",
+    });
+    expect(row?.actor).toBe("UADA");
+  });
+});

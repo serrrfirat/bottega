@@ -69,6 +69,26 @@ CREATE TABLE IF NOT EXISTS extension_credentials (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
 
+-- Runtime extension registry (issue #233): the STORE-backed registry for
+-- runtime-registered extension manifests (the catalog connect path's durable
+-- record). MACHINE STATE — never a repo file: boot merges the pinned seeds
+-- (config/extensions snapshots) + this persisted runtime set into the live
+-- registry, and the egress generator merges the same set into the emitted
+-- configs. The snapshot column holds the full PinnedSnapshot document
+-- (schema/extensionId/pinnedAt/source/manifest — the registry's fail-closed
+-- parse validates it on read).
+CREATE TABLE IF NOT EXISTS extension_registry (
+  id            TEXT PRIMARY KEY,      -- extension id (the manifest id)
+  snapshot      TEXT NOT NULL,         -- JSON: the PinnedSnapshot document
+  registered_by TEXT NOT NULL,         -- the connect principal who registered it
+  space_id      TEXT,                  -- space the connect ran in (nullable: MCP/headless)
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+-- One org-scoped credential per provider; one personal credential per (provider, owner).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
+
 -- One-time upload tokens (issue #196): the no-secrets-in-chat path for
 -- api_key-type extensions. The agent mints a single-use, short-TTL link;
 -- the user opens it in a browser and pastes the secret, and the upload

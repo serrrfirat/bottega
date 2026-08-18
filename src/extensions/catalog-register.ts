@@ -1,7 +1,7 @@
 /**
- * Catalog registration seam (issue #232): the deterministic route that lets
- * "connect <X>" work for ANY integrations.sh catalog extension, not just the
- * pinned ones.
+ * Catalog registration seam (issue #232 + #233): the deterministic route
+ * that lets "connect <X>" work for ANY integrations.sh catalog extension,
+ * not just the pinned ones.
  *
  * Before #232, an unregistered extension id failed the connect path with
  * "unknown extension — register it before connecting" and went to the agent
@@ -9,42 +9,44 @@
  * This seam is the connect capability's fallback, fully deterministic — the
  * MODEL is never the driver:
  *
- *   1. LOOKUP — fetchCatalogEntry (the fetch-catalog seam, same fail-closed
- *      CatalogError); an unknown spec fails loudly with the browse path.
- *   2. DRAFT — the catalog record's scaffold + the OFFICIAL hosted MCP
- *      endpoint discovery ({@link discoverCatalogMcp}: the vendor's own
- *      `mcp.<domain>` host + RFC 8414 OAuth metadata — never a guessed
- *      endpoint or auth mode) + the auth classification (OAuth-gated →
- *      tools-less manifest, the #231 notion pattern; api_key otherwise).
- *   3. REVIEW GATE — MANDATORY for every pin, personal or org scope: the
- *      draft surfaces through the approval router as the exec-tier
- *      `register_extension` tool ("Register <X> from the catalog? (id,
- *      vendor, domains, MCP endpoint)" [Approve/Deny]). A denied gate pins
- *      nothing; a pin never happens silently.
- *   4. PIN — the reviewed draft writes config/extensions/<id>.json via the
- *      fetch-catalog pin flow (parsePinnedSnapshot-validated, fail closed),
- *      then the egress configs regenerate (byte-pinned) and the snapshot
- *      HOT-REGISTERS into the live registry (the canary's extension-pin
- *      journey mechanics, issue #197) — new sessions see the extension
- *      immediately, and the connect continues in the same turn.
+ *   1. LOOKUP + DRAFT — {@link lookupCatalogExtension}: fetchCatalogEntry
+ *      (the fetch-catalog seam, same fail-closed CatalogError; unknown
+ *      specs fail loudly with the browse path) + the catalog record's
+ *      scaffold + the OFFICIAL hosted MCP endpoint discovery
+ *      ({@link discoverCatalogMcp}: the vendor's own `mcp.<domain>` host +
+ *      RFC 8414 OAuth metadata — never a guessed endpoint or auth mode) +
+ *      the auth classification (OAuth-gated → tools-less manifest, the
+ *      #231 notion pattern; api_key otherwise). Read-only: nothing
+ *      registers, no side effects, no gate.
+ *   2. THE CONNECT'S OWN APPROVAL covers org scope (issue #233): the
+ *      register_extension gate is REMOVED from this path. connect.ts gates
+ *      an org-scope connect BEFORE the register step (the existing
+ *      connect_extension exec gate — the "add a domain" egress step rides
+ *      that approval, so a DENIED connect registers nothing); personal
+ *      connects are direct. No registration ever happens silently: org
+ *      approvals carry the draft facts (vendor, domains, MCP endpoint).
+ *   3. REGISTER AT RUNTIME — {@link registerExtensionAtRuntime}: the
+ *      approved/authorized draft persists to the STORE-backed runtime
+ *      registry (machine state — NO config/extensions file, NO commit),
+ *      the egress configs regenerate with the merged runtime set
+ *      (byte-pinned for the seed fixtures; the runtime set is injected),
+ *      the snapshot HOT-REGISTERS into the live registry (the canary's
+ *      extension-pin journey mechanics, issue #197) — new sessions see the
+ *      extension immediately — and the proxy reloads. The connect then
+ *      continues in the same turn.
  *
  * The egress regeneration fails closed for an OAuth extension without a
  * VERIFIED token endpoint (OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts
- * — never a guessed URL): the pin still lands (the approved durable
- * change) and the failure is LOUD in the result.
+ * — never a guessed URL): the runtime registration still lands (the
+ * approved durable change) and the failure is LOUD in the result.
  */
-import { mkdirSync } from "node:fs";
-import type { ApprovalRouter } from "../policy/approval-router";
 import type { AuditModule } from "../policy/audit";
-import type { PolicyConfig } from "../policy/config";
-import { evaluatePolicyGate } from "../policy/gate";
 import { errorMessage } from "../tools/helpers";
 import { proxyBoundaryControlFromEnv } from "./boundary";
 import {
   buildSnapshotDraft,
   CatalogError,
   fetchCatalogEntry,
-  pinSnapshotDraft,
   type CatalogEntry,
   type FetchCatalogOptions,
   type SnapshotDraft,
@@ -59,24 +61,6 @@ import {
   regenerateEgressConfig,
 } from "../egress/generate";
 import { ADMIN_CATALOG_BROWSER_EVENT } from "../store/audit-events";
-
-/** The exec-tier policy tool name for the catalog review gate (issue #232). */
-export const CATALOG_REGISTER_TOOL = "register_extension";
-
-/**
- * The gate args payload a human approves: the "Register <X> from the
- * catalog?" summary — id, vendor, kind, domains, and the discovered MCP
- * endpoint (the Slack router renders these redacted + capped).
- */
-export interface CatalogRegisterGateArgs {
-  action: "register_from_catalog";
-  extension: string;
-  vendor: string;
-  kind: string;
-  domains: string[];
-  mcpEndpoint: string;
-  credentialSchema: CredentialSchema;
-}
 
 /** What the deterministic endpoint discovery resolved for one catalog entry. */
 export interface DiscoveredCatalogMcp {
@@ -153,77 +137,88 @@ export interface CatalogRegisterDeps {
   catalog?: FetchCatalogOptions;
   /** Official MCP endpoint + auth-mode discovery; default {@link discoverCatalogMcp}. */
   discoverMcp?: CatalogMcpDiscoverer;
-  /** Where the pin lands; default SNAPSHOTS_DIR ("config/extensions"). */
+  /** Where the PINNED seed snapshots live (the egress regen's seed source); default SNAPSHOTS_DIR. */
   snapshotsDir?: string;
   /** Strict egress output; default EGRESS_CONFIG_PATH ("config/egress.yml"). */
   egressPath?: string;
   /** Dev egress output; default DEV_EGRESS_CONFIG_PATH. */
   devEgressPath?: string;
+  /**
+   * The store-backed runtime registry seam (issue #233): persists the
+   * runtime-registered manifest (machine state — never a repo file) and
+   * feeds the egress regen the full persisted set. Absent (headless
+   * contexts, hermetic tests) → the registration is ephemeral: the egress
+   * regen still runs with the new snapshot and the live registry still
+   * hot-registers, but nothing persists across a restart.
+   */
+  runtimeRegistry?: RuntimeRegistrySeam;
 }
 
-/** The policy-gate pieces the review gate needs (the connect gate's shape). */
-export interface CatalogRegisterGate {
-  loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
-  router: ApprovalRouter;
-  /** Ask-human timeout in ms; defaults to the policy's `approvals.timeout_minutes`. */
-  timeoutMs?: number;
-  /** Executor-session scope (issue #11); see decidePolicyCall. */
-  preApproved?: boolean;
+/** The store-backed runtime registry persistence seam (issue #233). */
+export interface RuntimeRegistrySeam {
+  /** Persists one runtime-registered extension's snapshot (idempotent upsert by extension id). */
+  upsert(snapshot: PinnedSnapshot, actor: string, spaceId?: string | null): Promise<void>;
+  /** The full persisted runtime set (the egress regen's merge input), in registration order. */
+  list(): Promise<PinnedSnapshot[]>;
 }
 
 /** Everything the seam needs at call time (assembled by the connect path). */
 export interface CatalogRegisterRuntimeDeps extends CatalogRegisterDeps {
-  extensionId: string;
-  actor: string;
-  spaceId?: string;
-  /** The LIVE registry — hot-register target AND the resolve-after-pin proof. */
+  /** The LIVE registry — hot-register target AND the resolve-after-register proof. */
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  /** The policy gate's audit module (the gate audits its own trail). */
+  /** The audit module (the registration audits its own durable trail). */
   audit: AuditModule;
-  gate: CatalogRegisterGate;
+  /** The connect principal who registered it. */
+  actor: string;
+  /** The space the connect ran in (audit + the registry row's provenance). */
+  spaceId?: string;
 }
 
-export type RegisterFromCatalogResult =
-  | {
-      ok: true;
-      message: string;
-      extensionId: string;
-      label: string;
-      pinnedPath: string;
-      liveRegistry: "registered" | "failed" | "absent";
-      oauthGated: boolean;
-      credentialType: "oauth" | "api_key";
-      /** Loud warnings (egress regen failure, live-registry failure). */
-      warnings: string[];
-    }
+/** The lookup+draft step's facts (read-only; the org approval renders these). */
+export interface CatalogDraftFacts {
+  extensionId: string;
+  /** The catalog entry's display name (e.g. "Notion"). */
+  label: string;
+  /** Catalog kind ("mcp" — the deterministic route registers hosted MCP only). */
+  kind: string;
+  /** The egress allowlist domains the registration would add. */
+  domains: string[];
+  /** The discovered official hosted MCP endpoint. */
+  mcpEndpoint: string;
+  credentialSchema: CredentialSchema;
+  oauthGated: boolean;
+}
+
+export type CatalogLookupResult =
+  | { ok: true; facts: CatalogDraftFacts; snapshot: PinnedSnapshot }
   | { ok: false; message: string };
 
 /**
- * The deterministic catalog flow (issue #232): lookup → draft → review gate
- * → pin + egress regen + hot-register. Every failure is loud; nothing pins
- * without the gate's approval. Returns the outcome the connect path posts
- * in-channel; on success the caller re-resolves the extension and continues
- * the connect in the same turn.
+ * The deterministic lookup + draft (issue #232 mechanics, issue #233
+ * shape): catalog lookup → draft (official hosted MCP endpoint discovery +
+ * auth classification) → validation. READ-ONLY: nothing registers, no
+ * gate, no side effects — the connect path uses the facts to render the
+ * org approval (the connect's own approval covers the registration) and
+ * passes the snapshot to {@link registerExtensionAtRuntime}. Every failure
+ * is loud; an unknown spec carries the browse path.
  */
-export async function registerExtensionFromCatalog(
-  deps: CatalogRegisterRuntimeDeps,
-): Promise<RegisterFromCatalogResult> {
+export async function lookupCatalogExtension(
+  extensionId: string,
+  deps: CatalogRegisterDeps,
+): Promise<CatalogLookupResult> {
   const catalogOpts = deps.catalog ?? {};
   const discoverMcp = deps.discoverMcp ?? discoverCatalogMcp;
-  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
-  const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
-  const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
 
   // 1. LOOKUP — the catalog is the only source of truth; an unknown spec
   // (or an unreachable catalog) fails loudly with the browse path.
   let entry: CatalogEntry;
   try {
-    entry = await fetchCatalogEntry(deps.extensionId, catalogOpts);
+    entry = await fetchCatalogEntry(extensionId, catalogOpts);
   } catch (err) {
     return {
       ok: false,
       message:
-        `unknown extension "${deps.extensionId}" — no extension or catalog entry for it ` +
+        `unknown extension "${extensionId}" — no extension or catalog entry for it ` +
         `(${errorMessage(err)}). Browse the integrations.sh catalog with catalog_browser ` +
         `(or "bun run src/extensions/fetch-catalog.ts") to find the right id, then "connect <id>" again.`,
     };
@@ -236,15 +231,15 @@ export async function registerExtensionFromCatalog(
     return {
       ok: false,
       message:
-        `catalog entry "${deps.extensionId}" is kind "${entry.kind}" — the deterministic catalog connect ` +
+        `catalog entry "${extensionId}" is kind "${entry.kind}" — the deterministic catalog connect ` +
         "registers hosted MCP extensions only. Use catalog_browser (action=draft/pin) to register a " +
         "non-MCP extension with the vendor binding facts.",
     };
   }
 
   // 2. DRAFT — the catalog scaffold + the discovered official endpoint +
-  // the auth classification. Fail closed BEFORE the gate: a manifest that
-  // cannot pin must never reach the human's confirmation.
+  // the auth classification. Fail closed BEFORE anything registers: a
+  // manifest that cannot register must never reach the human's approval.
   let discovered: DiscoveredCatalogMcp;
   try {
     discovered = await discoverMcp(entry, catalogOpts);
@@ -252,7 +247,7 @@ export async function registerExtensionFromCatalog(
     return {
       ok: false,
       message:
-        `cannot register "${deps.extensionId}" from the catalog: ${errorMessage(err)} — nothing was pinned. ` +
+        `cannot register "${extensionId}" from the catalog: ${errorMessage(err)} — nothing was registered. ` +
         "Fix the discovery failure (the vendor's hosted MCP endpoint or OAuth metadata) and retry.",
     };
   }
@@ -266,88 +261,134 @@ export async function registerExtensionFromCatalog(
     domains: [...new Set<string>([...scaffold.manifest.domains, discovered.host])],
   };
   const completed: SnapshotDraft = { ...scaffold, manifest };
+  let manifestValidated: ReturnType<typeof validateManifest>;
   try {
-    validateManifest(JSON.parse(JSON.stringify(manifest)));
+    manifestValidated = validateManifest(JSON.parse(JSON.stringify(manifest)));
   } catch (err) {
-    return { ok: false, message: `cannot register "${deps.extensionId}" from the catalog: ${errorMessage(err)}` };
+    return { ok: false, message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}` };
   }
 
-  // 3. THE REVIEW GATE — MANDATORY, personal or org scope: a pin is a
-  // repo-level change with egress implications, so it rides the approval
-  // router as an exec-tier tool call. Denied → nothing pins.
-  const gateArgs: CatalogRegisterGateArgs = {
-    action: "register_from_catalog",
-    extension: deps.extensionId,
-    vendor: entry.name,
-    kind: entry.kind,
-    domains: manifest.domains,
-    mcpEndpoint: discovered.serverUrl,
-    credentialSchema: discovered.credentialSchema,
-  };
-  const gateOutcome = await evaluatePolicyGate(
-    {
-      loadPolicy: deps.gate.loadPolicy,
-      audit: deps.audit,
-      router: deps.gate.router,
-      timeoutMs: deps.gate.timeoutMs,
-      preApproved: deps.gate.preApproved,
-    },
-    { tool: CATALOG_REGISTER_TOOL, args: gateArgs, spaceId: deps.spaceId, actor: deps.actor },
-  );
-  if (!gateOutcome.allowed) return { ok: false, message: gateOutcome.blockReason };
-
-  // 4. PIN — the human approval IS the review (the canary's pin journey
-  // shape): the snapshot records reviewed: true and the endpoint came from
-  // the vendor's own host (vendorOfficial: true).
+  // The approval IS the review (issue #233): the connect's own approval
+  // (org scope) or the direct personal connect authorizes the runtime
+  // registration — the snapshot records reviewed: true and the endpoint
+  // came from the vendor's own host (vendorOfficial: true).
   const reviewed: SnapshotDraft = {
     ...completed,
     source: { ...completed.source, reviewed: true, vendorOfficial: true },
   };
-  let pinnedPath: string;
-  try {
-    mkdirSync(snapshotsDir, { recursive: true });
-    pinnedPath = await pinSnapshotDraft(reviewed, snapshotsDir, catalogOpts);
-  } catch (err) {
-    return {
-      ok: false,
-      message: `pinning "${deps.extensionId}" from the catalog failed: ${errorMessage(err)} — nothing was pinned`,
-    };
+  const snapshot: PinnedSnapshot = {
+    schema: reviewed.schema,
+    extensionId: reviewed.extensionId,
+    pinnedAt: reviewed.pinnedAt,
+    source: reviewed.source,
+    manifest: manifestValidated,
+  };
+  return {
+    ok: true,
+    facts: {
+      extensionId,
+      label: entry.name,
+      kind: entry.kind,
+      domains: manifest.domains,
+      mcpEndpoint: discovered.serverUrl,
+      credentialSchema: discovered.credentialSchema,
+      oauthGated: discovered.oauthGated,
+    },
+    snapshot,
+  };
+}
+
+export type RegisterFromCatalogResult =
+  | {
+      ok: true;
+      message: string;
+      extensionId: string;
+      label: string;
+      liveRegistry: "registered" | "failed" | "absent";
+      oauthGated: boolean;
+      credentialType: "oauth" | "api_key";
+      /** Loud warnings (store failure, egress regen failure, live-registry failure, proxy reload failure). */
+      warnings: string[];
+    }
+  | { ok: false; message: string };
+
+/**
+ * The runtime register step (issue #233): the approved/authorized draft
+ * from {@link lookupCatalogExtension} persists to the STORE-backed runtime
+ * registry (machine state — NO config/extensions file, NO commit), the
+ * egress configs regenerate with the merged runtime set (byte-pinned for
+ * the seed fixtures; the runtime set is injected), the snapshot
+ * HOT-REGISTERS into the live registry, and the proxy reloads. Every
+ * failure is loud; a store-write failure fails the registration closed
+ * (nothing durable, no egress, no hot-register).
+ */
+export async function registerExtensionAtRuntime(
+  snapshot: PinnedSnapshot,
+  label: string,
+  deps: CatalogRegisterRuntimeDeps,
+): Promise<RegisterFromCatalogResult> {
+  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
+  const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
+  const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
+
+  // 3. REGISTER AT RUNTIME — the durable store write comes FIRST: a failed
+  // persistence fails the registration closed (the egress regen reads the
+  // store; a non-persisted registration would be dropped by the next
+  // regen). Without a runtimeRegistry seam (headless contexts, hermetic
+  // tests) the registration is ephemeral: egress + hot-register still run
+  // with just this snapshot.
+  if (deps.runtimeRegistry !== undefined) {
+    try {
+      await deps.runtimeRegistry.upsert(snapshot, deps.actor, deps.spaceId ?? null);
+    } catch (err) {
+      return {
+        ok: false,
+        message:
+          `runtime registration of "${snapshot.extensionId}" FAILED — nothing was registered: ` +
+          `${errorMessage(err)}. The store write is the durable evidence of a runtime registration; ` +
+          "retry the connect.",
+      };
+    }
   }
 
-  // 5. EGRESS REGEN (byte-pinned) + HOT-REGISTER (issue #197) + proxy
-  // reload — the canary's extension-pin journey mechanics. Failures are
-  // LOUD in the result; the approved snapshot stays on disk.
+  // 4. EGRESS REGEN (merged runtime set) + HOT-REGISTER (issue #197) +
+  // proxy reload — the canary's extension-pin journey mechanics. Failures
+  // are LOUD in the result; the approved registration stays persisted.
   const warnings: string[] = [];
+  let runtimeSet: PinnedSnapshot[] = [snapshot];
+  if (deps.runtimeRegistry !== undefined) {
+    try {
+      runtimeSet = await deps.runtimeRegistry.list();
+    } catch (err) {
+      warnings.push(
+        `RUNTIME REGISTRY READ FAILED — regenerating egress with only the new registration: ` +
+          `${errorMessage(err)}. Fix the store read and re-run "bun run src/egress/generate.ts".`,
+      );
+    }
+  }
   try {
-    regenerateEgressConfig(snapshotsDir, egressPath);
-    regenerateDevEgressConfig(snapshotsDir, devEgressPath);
+    regenerateEgressConfig(snapshotsDir, egressPath, runtimeSet);
+    regenerateDevEgressConfig(snapshotsDir, devEgressPath, runtimeSet);
   } catch (err) {
     warnings.push(
-      `EGRESS REGEN FAILED — "${deps.extensionId}" is pinned but ${egressPath} was NOT regenerated: ` +
-        `${errorMessage(err)}. Fix the cause (e.g. a verified OAuth token endpoint in OAUTH_TOKEN_ENDPOINTS, ` +
-        `src/egress/generate.ts) and run "bun run src/egress/generate.ts" — until then the new domains are NOT allowlisted.`,
+      `EGRESS REGEN FAILED — "${snapshot.extensionId}" is registered at runtime but ${egressPath} was NOT ` +
+        `regenerated: ${errorMessage(err)}. Fix the cause (e.g. a verified OAuth token endpoint in ` +
+        `OAUTH_TOKEN_ENDPOINTS, src/egress/generate.ts) and run "bun run src/egress/generate.ts" — until ` +
+        `then the new domains are NOT allowlisted.`,
     );
   }
   let liveRegistry: "registered" | "failed" | "absent" = "absent";
-  if (deps.registry.resolve(deps.extensionId) !== undefined) {
+  if (deps.registry.resolve(snapshot.extensionId) !== undefined) {
     liveRegistry = "registered";
   } else {
     try {
-      const manifestValidated = validateManifest(JSON.parse(JSON.stringify(reviewed.manifest)));
-      const snapshot: PinnedSnapshot = {
-        schema: reviewed.schema,
-        extensionId: reviewed.extensionId,
-        pinnedAt: reviewed.pinnedAt,
-        source: reviewed.source,
-        manifest: manifestValidated,
-      };
-      deps.registry.register(manifestValidated, snapshot);
+      deps.registry.register(snapshot.manifest, snapshot);
       liveRegistry = "registered";
     } catch (err) {
       liveRegistry = "failed";
       warnings.push(
-        `LIVE REGISTRY REGISTRATION FAILED — "${deps.extensionId}" is pinned but this server's runtime won't ` +
-          `see it until a restart: ${errorMessage(err)}`,
+        `LIVE REGISTRY REGISTRATION FAILED — "${snapshot.extensionId}" is registered in the store but this ` +
+          `server's runtime won't see it until a restart: ${errorMessage(err)}`,
       );
     }
   }
@@ -379,10 +420,10 @@ export async function registerExtensionFromCatalog(
     actor: deps.actor,
     event_type: ADMIN_CATALOG_BROWSER_EVENT,
     payload: {
-      action: "pin",
+      action: "register",
       via: "connect",
-      spec: deps.extensionId,
-      written_to: pinnedPath,
+      spec: snapshot.extensionId,
+      runtime_registry: deps.runtimeRegistry !== undefined ? "store" : "ephemeral",
       egress_config: egressPath,
       hosted_variant: true,
       vendor_official: true,
@@ -391,17 +432,16 @@ export async function registerExtensionFromCatalog(
   });
 
   const message =
-    `Pinned "${entry.name}" from the catalog (${pinnedPath}) — egress regenerated (${egressPath}, ` +
+    `Registered "${label}" from the catalog at runtime — egress regenerated (${egressPath}, ` +
     `${devEgressPath}), live in the running server.`;
   return {
     ok: true,
     message: warnings.length > 0 ? `${message} WARNING: ${warnings.join(" ")}` : message,
-    extensionId: deps.extensionId,
-    label: entry.name,
-    pinnedPath,
+    extensionId: snapshot.extensionId,
+    label,
     liveRegistry,
-    oauthGated: discovered.oauthGated,
-    credentialType: discovered.credentialSchema.type,
+    oauthGated: snapshot.manifest.credentialSchema.type === "oauth",
+    credentialType: snapshot.manifest.credentialSchema.type,
     warnings,
   };
 }

@@ -12,13 +12,11 @@ import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
-import { createExtensionRegistry } from "../../extensions/registry";
-import { parsePinnedSnapshot } from "../../extensions/registry";
-import { CATALOG_REGISTER_TOOL } from "../../extensions/catalog-register";
+import { createExtensionRegistry, type PinnedSnapshot } from "../../extensions/registry";
 import { DEFAULT_CATALOG_URL } from "../../extensions/fetch-catalog";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
 import { createAudit } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, APPROVAL_REQUESTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
@@ -2064,6 +2062,11 @@ describe("parseConnectIntent (issue #61)", () => {
     // Case-insensitive keyword + scope, whole-phrase match.
     expect(parseConnectIntent("Connect GitHub as Org")).toEqual({ extension: "GitHub", scope: "org" });
     expect(parseConnectIntent("  connect linear as me  ")).toEqual({ extension: "linear", scope: "personal" });
+    // Issue #233: the natural "connect my X" phrasing routes to X (the
+    // token resolves semantically by name/alias in the catalog lookup).
+    expect(parseConnectIntent("connect my docs")).toEqual({ extension: "docs", scope: "personal" });
+    expect(parseConnectIntent("connect my notion as org")).toEqual({ extension: "notion", scope: "org" });
+    expect(parseConnectIntent("connect my docs as me")).toEqual({ extension: "docs", scope: "personal" });
 
     // Any deviation stays agent territory.
     expect(parseConnectIntent("connect github please")).toBeNull();
@@ -2071,6 +2074,8 @@ describe("parseConnectIntent (issue #61)", () => {
     expect(parseConnectIntent("connect github as org now")).toBeNull();
     expect(parseConnectIntent("connect github with key 123")).toBeNull();
     expect(parseConnectIntent("connect github, please")).toBeNull();
+    expect(parseConnectIntent("connect my github please")).toBeNull();
+    expect(parseConnectIntent("connect my two extensions")).toBeNull();
     expect(parseConnectIntent("connect")).toBeNull();
     expect(parseConnectIntent("")).toBeNull();
     expect(parseConnectIntent("connection github")).toBeNull();
@@ -2265,7 +2270,7 @@ describe("SpaceService connect intent (issue #61)", () => {
   });
 });
 
-describe("SpaceService connect intent catalog fallback (issue #232)", () => {
+describe("SpaceService connect intent catalog fallback (issue #232/#233) — register at runtime, no register gate", () => {
   const NOTION_RECORD = {
     id: "mcp/notion",
     slug: "notion",
@@ -2298,6 +2303,17 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     }
   }
 
+  /** In-memory store-backed runtime registry (issue #233). */
+  class MemoryRuntimeRegistry {
+    readonly rows: PinnedSnapshot[] = [];
+    async upsert(snapshot: PinnedSnapshot): Promise<void> {
+      this.rows.push(snapshot);
+    }
+    async list(): Promise<PinnedSnapshot[]> {
+      return [...this.rows];
+    }
+  }
+
   interface CatalogHarness {
     deps: ConnectExtensionDeps;
     adapter: SlackAdapter;
@@ -2309,6 +2325,7 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     snapshotsDir: string;
     egressPath: string;
     devEgressPath: string;
+    runtimeRegistry: MemoryRuntimeRegistry;
     oauthStarts: Array<{ extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }>;
     dir: string;
   }
@@ -2333,6 +2350,7 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     // The LIVE registry — seeded from the (empty) temp snapshots dir, so
     // "notion" is UNREGISTERED here no matter what the repo pins.
     const registry = createExtensionRegistry(snapshotsDir);
+    const runtimeRegistry = new MemoryRuntimeRegistry();
     const oauthStarts: CatalogHarness["oauthStarts"] = [];
     const deps: ConnectExtensionDeps = {
       registry,
@@ -2362,22 +2380,24 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
         },
       },
       gate: {
-        // Both gates: the register gate (mandatory) and the org connect
-        // gate (org scope only) must reach ask-human for the router.
-        loadPolicy: () =>
-          Promise.resolve(parseOrgConfigYaml("tools:\n  connect_extension: allow\n  register_extension: allow\n")),
+        // Issue #233: the register gate is GONE — the org connect gate is
+        // the connect_extension gate, and it covers the runtime
+        // registration (the "add a domain" egress step).
+        loadPolicy: () => Promise.resolve(parseOrgConfigYaml("tools:\n  connect_extension: allow\n")),
         router,
       },
-      // The deterministic catalog seam (issue #232): lookup + discovery
-      // stubbed hermetically; pin/egress/hot-register run the REAL paths.
+      // The deterministic catalog seam (issue #232/#233): lookup + discovery
+      // stubbed hermetically; runtime register + egress regen + hot-register
+      // run the REAL paths, persisted into the in-memory runtime registry.
       catalogRegister: {
         catalog: { fetchImpl: stubCatalogFetch(opts.records ?? [NOTION_RECORD], opts.wellKnownStatus ?? 200) },
         snapshotsDir,
         egressPath,
         devEgressPath,
+        runtimeRegistry,
       },
     };
-    return { deps, adapter, posts, store, driver, router: recording, audit, snapshotsDir, egressPath, devEgressPath, oauthStarts, dir };
+    return { deps, adapter, posts, store, driver, router: recording, audit, snapshotsDir, egressPath, devEgressPath, runtimeRegistry, oauthStarts, dir };
   }
 
   const catalogDirs: string[] = [];
@@ -2385,7 +2405,7 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     for (const dir of catalogDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  test("connect <unregistered catalog extension> reaches the review gate with a valid draft", async () => {
+  test("connect <unregistered catalog extension> as me registers at runtime DIRECTLY (no gate) and continues the connect", async () => {
     const h = makeCatalogHarness();
     catalogDirs.push(h.dir);
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
@@ -2395,30 +2415,21 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     // No session, no agent tool call: the deterministic route answered.
     expect(h.driver.created).toHaveLength(0);
 
-    // The review gate fired with the DRAFT: id, vendor, kind, domains, and
-    // the discovered official MCP endpoint — the "Register <X> from the
-    // catalog?" payload the human approves.
-    expect(h.router.requests).toHaveLength(1);
-    expect(h.router.requests[0]!.tool).toBe(CATALOG_REGISTER_TOOL);
-    expect(h.router.requests[0]!.args).toEqual({
-      action: "register_from_catalog",
-      extension: "notion",
-      vendor: "Notion",
-      kind: "mcp",
-      domains: ["notion.com", "mcp.notion.com"],
-      mcpEndpoint: "https://mcp.notion.com/mcp",
-      credentialSchema: { type: "oauth" },
-    });
+    // Issue #233: personal connects are direct — NO approval was asked.
+    expect(h.router.requests).toHaveLength(0);
 
-    // The pin landed (the approval was the review): parsePinnedSnapshot-
-    // valid, reviewed, tools-less OAuth — the #231 notion shape.
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
-    expect(snapshot.extensionId).toBe("notion");
-    expect(snapshot.source.reviewed).toBe(true);
-    expect(snapshot.source.vendorOfficial).toBe(true);
-    expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
-    expect(snapshot.manifest.credentialSchema).toEqual({ type: "oauth" });
-    expect(snapshot.manifest.tools).toBeUndefined();
+    // Registered AT RUNTIME: the store row is the durable evidence (NO
+    // config/extensions file), the egress config regenerated with the
+    // runtime set, the live registry hot-registered the snapshot.
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
+    const persisted = h.runtimeRegistry.rows[0]!;
+    expect(persisted.extensionId).toBe("notion");
+    expect(persisted.source.reviewed).toBe(true);
+    expect(persisted.source.vendorOfficial).toBe(true);
+    expect(persisted.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
+    expect(persisted.manifest.credentialSchema).toEqual({ type: "oauth" });
+    expect(persisted.manifest.tools).toBeUndefined();
 
     // Egress regenerated (byte-pinned) with the MCP host allowlisted.
     expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
@@ -2437,28 +2448,28 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
       },
     ]);
     expect(h.posts[0]!.text).toBe("Open this link to authorize Notion from the catalog");
-
-    // The register gate's trail is complete (policy decision + approval).
-    const decisions = h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT);
-    expect(decisions.some((d) => d.payload && typeof d.payload === "object" && "tool" in d.payload && (d.payload as { tool?: string }).tool === CATALOG_REGISTER_TOOL)).toBe(true);
-    expect(h.audit.some((e) => e.event_type === APPROVAL_REQUESTED_EVENT)).toBe(true);
-    expect(h.audit.some((e) => e.event_type === APPROVAL_RESOLVED_EVENT && (e.payload as { approved?: boolean }).approved === true)).toBe(true);
+    // No register gate → no register_extension policy/approval trail (the
+    // direct personal connect audits only the registration itself).
+    expect(h.audit.some((e) => e.event_type === APPROVAL_REQUESTED_EVENT)).toBe(false);
   });
 
-  test("the review gate is MANDATORY — a denied register pins nothing and posts the denial", async () => {
+  test("a denied ORG connect registers NOTHING and posts the denial", async () => {
     const h = makeCatalogHarness({ router: DenyRouter });
     catalogDirs.push(h.dir);
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
-    await service.handleInboundMessage(msg({ text: "connect notion as me" }));
+    await service.handleInboundMessage(msg({ text: "connect notion as org" }));
 
     expect(h.driver.created).toHaveLength(0);
     expect(h.posts[0]!.text).toBe("policy: approval denied");
+    // Issue #233: a denied connect registers nothing — no store row, no
+    // egress output, no mint, no hot-register.
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
     expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
     expect(h.oauthStarts).toHaveLength(0);
-    // No silent pin and no egress drift: a denied gate never regenerated.
     expect(existsSync(h.egressPath)).toBe(false);
     expect(existsSync(h.devEgressPath)).toBe(false);
+    expect(h.deps.registry.resolve("notion")).toBeUndefined();
   });
 
   test("unknown X fails loudly with the catalog browse path", async () => {
@@ -2473,10 +2484,11 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     expect(h.posts[0]!.text).toContain("no extension or catalog entry");
     expect(h.posts[0]!.text).toContain("catalog_browser");
     expect(h.router.requests).toHaveLength(0);
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
     expect(h.oauthStarts).toHaveLength(0);
   });
 
-  test("a second connect after the pin takes the normal registered path (idempotent)", async () => {
+  test("a second connect after the runtime registration takes the normal registered path (idempotent)", async () => {
     const h = makeCatalogHarness();
     catalogDirs.push(h.dir);
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
@@ -2484,18 +2496,18 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     await service.handleInboundMessage(msg({ text: "connect notion as me" }));
     await service.handleInboundMessage(msg({ text: "connect notion as me", ts: "4.4" }));
 
-    // The first connect pinned notion; the second resolves it REGISTERED
-    // and skips the register gate entirely — no new approval request.
-    expect(h.router.requests).toHaveLength(1);
+    // The first connect registered notion; the second resolves it REGISTERED
+    // and skips the registration entirely — no new store row.
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
     expect(h.oauthStarts).toHaveLength(2);
     expect(h.posts).toHaveLength(2);
     expect(h.posts[1]!.text).toBe("Open this link to authorize Notion from the catalog");
-    // The pin is byte-identical after the second connect (no re-pin drift).
-    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
-    expect(snapshot.extensionId).toBe("notion");
+    // The persisted snapshot is byte-identical after the second connect (no
+    // re-registration drift).
+    expect(h.runtimeRegistry.rows[0]!.extensionId).toBe("notion");
   });
 
-  test("connect <catalog extension> as org crosses BOTH gates — register then connect", async () => {
+  test("connect <catalog extension> as org crosses the ONE connect gate — the approval covers the registration (issue #233)", async () => {
     const h = makeCatalogHarness();
     catalogDirs.push(h.dir);
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
@@ -2503,11 +2515,48 @@ describe("SpaceService connect intent catalog fallback (issue #232)", () => {
     await service.handleInboundMessage(msg({ text: "connect notion as org" }));
 
     expect(h.driver.created).toHaveLength(0);
-    // Register gate (mandatory) + org connect gate (privileged) — two
-    // approvals, in order: register_extension first, then connect_extension.
-    expect(h.router.requests.map((r) => r.tool)).toEqual([CATALOG_REGISTER_TOOL, "connect_extension"]);
+    // ONE approval, the connect_extension gate — with the registration
+    // facts (vendor, domains, MCP endpoint) in the payload, so the human
+    // approves the egress-add step in the same breath (the register gate
+    // is GONE from this path).
+    expect(h.router.requests.map((r) => r.tool)).toEqual(["connect_extension"]);
+    expect(h.router.requests[0]!.args).toMatchObject({
+      extension: "notion",
+      scope: "org",
+      registering_from_catalog: true,
+      vendor: "Notion",
+      domains: ["notion.com", "mcp.notion.com"],
+      mcpEndpoint: "https://mcp.notion.com/mcp",
+    });
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
     expect(h.posts[0]!.text).toBe("Open this link to authorize Notion from the catalog");
     expect(h.oauthStarts[0]!.scope).toBe("org");
+  });
+
+  test("connect my docs routes the semantic token to the catalog lookup by name/alias (issue #233)", async () => {
+    const DOCS_RECORD = {
+      id: "mcp/google-docs",
+      slug: "google-docs",
+      kind: "mcp",
+      name: "Google Docs",
+      aliases: ["docs", "gdocs"],
+      description: "Google Docs MCP",
+      url: "https://docs.google.com/mcp",
+      domain: "docs.google.com",
+    };
+    const h = makeCatalogHarness({ records: [DOCS_RECORD], wellKnownStatus: 200 });
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    // "connect my docs" → intent token "docs" → the catalog entry named
+    // "Google Docs" (alias "docs") registers at runtime and connects.
+    await service.handleInboundMessage(msg({ text: "connect my docs" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(h.runtimeRegistry.rows[0]!.extensionId).toBe("google-docs");
+    expect(h.oauthStarts[0]!.extension).toBe("google-docs");
+    expect(h.oauthStarts[0]!.scope).toBe("personal");
   });
 });
 

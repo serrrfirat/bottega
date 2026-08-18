@@ -120,28 +120,22 @@ describe("extension registry", () => {
     expect(registry.list()).toEqual([]);
   });
 
-  test("the committed pinned snapshots resolve the notion manifest (issue #231)", () => {
-    // The "connect my notion" entry point resolves the pinned notion
-    // snapshot from config/extensions (the boot's registry source). The
-    // resolved manifest must carry the official OAuth MCP binding — a
-    // missing pin (the issue: notion was unregistered) leaves
-    // resolve("notion") undefined and the connect flow cannot mint the
-    // #198 authorize URL.
+  test("the committed seed resolves the pinned providers (github/linear/attio) — notion is NOT pinned (issue #233)", () => {
+    // Issue #233: the notion pin is removed — notion registers at RUNTIME
+    // (the store-backed runtime registry, merged at boot) like any other
+    // catalog connect. The committed seed stays github/linear/attio (the
+    // providers with live credentials).
     const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
-    const notion = registry.resolve("notion");
-    expect(notion).toBeDefined();
-    expect(notion!.manifest.id).toBe("notion");
-    expect(notion!.manifest.kind).toBe("mcp");
-    expect(notion!.manifest.mcp).toEqual({
-      serverUrl: "https://mcp.notion.com/mcp",
+    expect(registry.resolve("notion")).toBeUndefined();
+    const linear = registry.resolve("linear");
+    expect(linear).toBeDefined();
+    expect(linear!.manifest.kind).toBe("mcp");
+    expect(linear!.manifest.mcp).toEqual({
+      serverUrl: "https://mcp.linear.app/mcp",
       transport: "streamable-http",
     });
-    // OAuth (not api_key): the generic MCP OAuth flow (#198) mints the
-    // authorize link at connect time; the vault row is oauth-shaped.
-    expect(notion!.manifest.credentialSchema.type).toBe("oauth");
-    // Egress allowlist hosts: the vendor host + the official MCP host.
-    expect(notion!.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
-    expect(notion!.snapshot?.source.vendorOfficial).toBe(true);
+    expect(linear!.manifest.credentialSchema.type).toBe("oauth");
+    expect(linear!.snapshot?.source.vendorOfficial).toBe(true);
   });
 
   test("every committed pinned snapshot registers (issue #231)", () => {
@@ -150,7 +144,7 @@ describe("extension registry", () => {
     // connect/extension tools key off registry.resolve.
     const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
     const ids = registry.list().map((entry) => entry.manifest.id);
-    expect(ids).toEqual(["attio", "github", "linear", "notion"]);
+    expect(ids).toEqual(["attio", "github", "linear"]);
     for (const id of ids) {
       expect(registry.resolve(id)).toBeDefined();
     }

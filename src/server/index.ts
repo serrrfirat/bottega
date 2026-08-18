@@ -33,6 +33,7 @@ import { regenerateModelsConfig } from "../models/generate";
 import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import type { CatalogRegisterDeps } from "../extensions/catalog-register";
+import { storeRuntimeRegistrySeam } from "../extensions/runtime-registry";
 import { mountUploadLink, uploadLinkPublicBase } from "../extensions/upload-link";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import { callbackPort, startOAuthCallbackServer } from "../extensions/oauth-callback";
@@ -466,15 +467,20 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     audit,
     callbackBaseUrl: () => uploadPublicBase ?? oauthCallback.baseUrl,
   });
-  // Issue #232: the deterministic catalog seam for UNREGISTERED extension
-  // connects — "connect X" drives lookup → draft → review gate → pin +
-  // egress regen + hot-register, then the connect continues in the same
-  // turn. Shared by the space-service intent path and the per-session
-  // connect tool; the pin lands where the boot registry reads
-  // (BOTTEGA_EXTENSIONS_DIR, matching bootstrapRuntime's seed) and the
-  // egress defaults regenerate config/egress.yml + config/egress.dev.yml.
+  // Issue #232/#233: the deterministic catalog seam for UNREGISTERED
+  // extension connects — "connect X" drives lookup → draft → the connect's
+  // own approval (org scope; the register gate is gone) → REGISTER AT
+  // RUNTIME (store-backed registry + egress regen merged with the runtime
+  // set + hot-register + proxy reload — no config file, no commit) and the
+  // connect continues in the same turn. Shared by the space-service intent
+  // path and the per-session connect tool; the egress defaults regenerate
+  // config/egress.yml + config/egress.dev.yml from the pinned seed
+  // (BOTTEGA_EXTENSIONS_DIR, matching bootstrapRuntime's seed) merged with
+  // the persisted runtime set (the store — machine state, never a repo
+  // file).
   const catalogRegisterDeps: CatalogRegisterDeps = {
     snapshotsDir: process.env.BOTTEGA_EXTENSIONS_DIR ?? SNAPSHOTS_DIR,
+    runtimeRegistry: storeRuntimeRegistrySeam(store),
   };
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
@@ -688,9 +694,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // OAuth flow (mint → browser callback → vault via the broker
           // upload path — no broker provider registration).
           mcpOAuth: mcpOAuthConnector,
-          // Issue #232: the per-session connect tool gets the deterministic
-          // catalog fallback too — the agent path ("connect my notion")
-          // drives lookup → draft → review gate → pin → connect.
+          // Issue #232/#233: the per-session connect tool gets the
+          // deterministic catalog fallback too — the agent path ("connect
+          // my notion") drives lookup → draft → register at runtime →
+          // connect.
           catalogRegister: catalogRegisterDeps,
           // Issue #196: the per-session mint tool shares the endpoint's
           // token store (the upload mount's), so links minted in any
@@ -817,10 +824,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       // through the generic MCP OAuth flow — no broker provider
       // registration; the broker stays a vault.
       mcpOAuth: mcpOAuthConnector,
-      // Issue #232: "connect X" for an UNREGISTERED extension drives the
-      // deterministic catalog flow (lookup → draft → review gate → pin +
-      // egress regen + hot-register) and continues the connect in the same
-      // turn — the model is never the driver.
+      // Issue #232/#233: "connect X" for an UNREGISTERED extension drives
+      // the deterministic catalog flow (lookup → draft → register at
+      // runtime + egress regen + hot-register) and continues the connect
+      // in the same turn — the model is never the driver.
       catalogRegister: catalogRegisterDeps,
       gate: {
         loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),

@@ -50,6 +50,7 @@ import {
   type SecretFileBoundaryOpts,
 } from "../extensions/boundary";
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
+import { mergeRuntimeRegistry } from "../extensions/runtime-registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
 import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
 import type { McpBinding } from "../extensions/manifest";
@@ -117,6 +118,12 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   const registry = createExtensionRegistry(
     deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
   );
+  // Issue #233: the runtime extension registry is STORE state — boot merges
+  // the pinned seeds + the persisted runtime-registered set into the LIVE
+  // registry, so resolve/list surfaces include both. A pinned id wins; a
+  // malformed runtime row is a loud skip, never a boot failure (the #205
+  // posture).
+  await mergeRuntimeRegistry(store, registry);
   // Effective tool surfaces (issues #158/#166), resolved once: pinned
   // manifest tools, or the provider's tools/list for tools-less manifests
   // (a per-provider failure is skipped — the runtime's lazy per-call path

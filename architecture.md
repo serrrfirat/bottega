@@ -420,19 +420,28 @@ user-facing view is in
    `config/egress.dev.yml`; the binding host joins the domain set. Hosted
    streamable-HTTP + OAuth is preferred. A stdio/CLI binding requires both
    `no_hosted_variant: true` and human confirmation.
-2b. **Connect drives the same flow** — issue #232: when `connect <X>`
+2b. **Connect registers at runtime** — issue #232/#233: when `connect <X>`
    names an UNREGISTERED hosted-MCP id, `connectExtension` (with the
    `catalogRegister` seam wired) runs the deterministic route in
-   `src/extensions/catalog-register.ts` — catalog lookup → draft (the
-   official `mcp.<vendor-domain>` endpoint derived from the catalog record
-   + the vendor's RFC 8414 OAuth metadata; OAuth-gated servers pin
-   tools-less, the #231 notion shape) → a MANDATORY `register_extension`
-   review gate through the approval router (a pin never happens silently)
-   → on approve: pin + egress regen + hot-register into the live registry
-   (the canary's pin-journey mechanics, #197) → the connect continues in
-   the same turn (OAuth mint #198 / upload link #196). Unknown ids fail
-   loudly with the catalog browse path; the routing is deterministic — the
-   model is never the driver.
+   `src/extensions/catalog-register.ts` — catalog lookup (semantic:
+   exact id OR name/alias — issue #233) → draft (the official
+   `mcp.<vendor-domain>` endpoint derived from the catalog record + the
+   vendor's RFC 8414 OAuth metadata; OAuth-gated servers register
+   tools-less, the #231 notion shape) → the connect's OWN approval covers
+   org scope (the `register_extension` gate is REMOVED from this path; the
+   `connect_extension` approval payload carries the draft facts — vendor,
+   domains, MCP endpoint — so the egress-add step rides it; a denied
+   connect registers NOTHING; personal connects are direct) → REGISTER AT
+   RUNTIME: the manifest persists to the store-backed runtime registry
+   (`extension_registry` — machine state, never a repo file; boot merges
+   pins + the persisted runtime set into the live registry,
+   `src/extensions/runtime-registry.ts`), the egress configs regenerate
+   with the merged runtime set (byte-pinned for the seed fixtures), the
+   snapshot hot-registers into the live registry (the canary's
+   extension-pin journey mechanics, #197), and the proxy reloads → the
+   connect continues in the same turn (OAuth mint #198 / upload link
+   #196). Unknown ids fail loudly with the catalog browse path; the
+   routing is deterministic — the model is never the driver.
 3. **Effective tools** — `tools` is optional (#158). Present tools,
    including `[]`, are the reviewed pinned surface. An absent MCP surface
    comes from paginated provider `tools/list`. `generate-tools.ts` can pin
@@ -474,8 +483,10 @@ user-facing view is in
 
 GitHub's production snapshot is the hosted streamable-HTTP endpoint
 `https://api.githubcopilot.com/mcp/`; no local GitHub MCP binary is installed
-(#145). Production snapshots also cover Attio, Linear, and Notion
-(`https://mcp.notion.com/mcp`, OAuth via #198, #231).
+(#145). Production snapshots also cover Attio and Linear (OAuth via #198);
+Notion is NOT pinned (issue #233) — it registers through the runtime
+registry when a connect targets it (the #231 mechanics now run on the
+store-backed path).
 
 ```mermaid
 sequenceDiagram

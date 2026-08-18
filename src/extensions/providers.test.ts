@@ -49,32 +49,26 @@ import { resetToolSurfaceCache, resolveExtensionSurfaces, type ExtensionSurfaces
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
-const PROVIDERS = ["linear", "github", "attio", "notion"] as const;
+const PROVIDERS = ["linear", "github", "attio"] as const;
 
 /** The WIRE tool surface per provider (issue #148): the names the hosted
  * servers expose (github live-verified; attio per official docs; linear
- * unprefixed; notion per Notion's official supported-tools docs — every
- * wire name carries the "notion-" prefix). The hermetic transports below
- * serve these from tools/list, so discovery yields the namespaced manifest
- * names with these wire providerNames. */
+ * unprefixed). The hermetic transports below serve these from tools/list,
+ * so discovery yields the namespaced manifest names with these wire
+ * providerNames. */
 const WIRE_SURFACE = {
   linear: ["search_issues", "create_issue", "update_status"],
   github: ["search_issues", "issue_write", "add_issue_comment"],
   attio: ["search-records", "create-record", "update-record"],
-  notion: ["notion-search", "notion-create-pages", "notion-update-page"],
 } as const;
 
 /** The conservative tiers the #157 heuristic assigns each provider's wire
  * surface (the discovery test pins them): the search/create/update wire
- * names classify read/write/write EXCEPT notion's — every notion tool is
- * prefixed "notion-", so the verb heuristic sees no read verb and lands
- * every tool on `write` (approval) — the safe direction for an
- * unguessable prefix (a read-guess failure must never under-approve). */
+ * names classify read/write/write. */
 const WIRE_TIERS = {
   linear: ["read", "write", "write"],
   github: ["read", "write", "write"],
   attio: ["read", "write", "write"],
-  notion: ["write", "write", "write"],
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
@@ -128,7 +122,6 @@ function stubTransports(seen?: { tool: string[] }) {
     const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
     if (url.includes("linear.app")) return stubMcpTransport("linear", seen)(binding);
     if (url.includes("attio.com")) return stubMcpTransport("attio", seen)(binding);
-    if (url.includes("mcp.notion.com")) return stubMcpTransport("notion", seen)(binding);
     return stubMcpTransport("github", seen)(binding);
   };
 }
@@ -238,10 +231,8 @@ describe("issue #54 pinned providers", () => {
     // The server-boot step: discovery through the hermetic transport seam
     // restores the v1 search/create/update surface — namespaced manifest
     // names, wire providerNames (issue #148), the per-provider conservative
-    // tiers pinned in WIRE_TIERS (notion's "notion-"-prefixed wire names
-    // classify write/write/write — the verb heuristic cannot see a read
-    // verb behind the prefix, and under-approving is the unsafe direction),
-    // and non-empty descriptions. Never a silent empty set.
+    // tiers pinned in WIRE_TIERS, and non-empty descriptions. Never a
+    // silent empty set.
     const surfaces = await resolveExtensionSurfaces(registry.list(), { mcpTransport: stubTransports() });
     for (const id of PROVIDERS) {
       const tools = [...(surfaces.get(id) ?? [])];
@@ -256,13 +247,13 @@ describe("issue #54 pinned providers", () => {
 
   test("the egress allowlist contains the pinned providers' domains", () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
-    // Snapshot files load in sorted order (attio, github, linear, notion).
+    // Snapshot files load in sorted order (attio, github, linear) — the
+    // committed SEED (issue #233: notion's pin is gone; its domains land
+    // via the runtime registry when a connect registers it).
     expect(registry.egressDomains()).toEqual([
       "mcp.attio.com",
       "api.githubcopilot.com",
       "mcp.linear.app",
-      "notion.com",
-      "mcp.notion.com",
     ]);
   });
 
