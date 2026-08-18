@@ -8,10 +8,12 @@
  * {tool, reason}); delivery announcements use `delivery.requested`
  * (payload {id, pr_url, summary}) — the two never share an event name.
  */
-/** Work item created (payload {id, requester}). */
+/** Work item created (payload {id, requester, assignee}). */
 export const WORK_ITEM_CREATED_EVENT = "work_item.created";
 /** Work item state transition (payload {from, to, by}). */
 export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
+/** Queue read (payload {state?, count}; space_id top-level). */
+export const WORK_ITEM_LIST_EVENT = "work_item.list";
 /** Executor failure landing an item in blocked (payload {id, error}). */
 export const WORK_ITEM_FAILED_EVENT = "work_item.failed";
 /** Executor marker: PR open, delivery approval pending (payload {id, pr_url, summary}). */

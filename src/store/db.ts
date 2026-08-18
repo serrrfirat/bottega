@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
+import { postOutboxRow } from "./outbox";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { WorkerJob, WorkerJobKind, WorkerJobStatus } from "../worker/envelope";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -66,6 +67,8 @@ export type WorkItem = {
   id: string;
   space_id: string;
   requester: string;
+  /** Who owns the item (issue #159): the requester at creation, the executor's identity once claimed. */
+  assignee: string | null;
   description: string;
   repo: string | null;
   /** Existing-PR conflict-resolution shape (issue #186): non-null on a git item switches the executor to rebase/resolve/push. */
@@ -181,6 +184,8 @@ export type AuditEntry = {
 export type CreatedWorkItemAuditPayload = {
   id: string;
   requester: string;
+  /** The requester owns the item at creation (issue #159). */
+  assignee: string;
   model?: string;
   reasoning_effort?: ModelThinkingLevel;
 };
@@ -248,10 +253,15 @@ export interface Store {
     evidence?: Array<{ kind: string; url: string }>;
   }): Promise<WorkItem>;
   /** Atomic open -> claimed for a SPECIFIC item (the worker claims by the job payload). Null when the item is not open. */
-  claimWorkItemById(id: string): Promise<WorkItem | null>;
+  claimWorkItemById(id: string, assignee?: string): Promise<WorkItem | null>;
   /** Throws unless the row exists and is in `from`. */
   transitionWorkItem(id: string, from: WorkItemState, to: WorkItemState, opts?: TransitionOpts): Promise<WorkItem>;
   getWorkItem(id: string): Promise<WorkItem | null>;
+  /**
+   * The visible queue (issue #159): work items of a space (or org-wide when
+   * no space filter), newest first, optionally narrowed by state.
+   */
+  listWorkItems(filter?: { space_id?: string; state?: WorkItemState }): Promise<WorkItem[]>;
   /** Moves items idle in `from` for longer than olderThanMs to blocked; returns count. */
   markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number>;
   /**
@@ -600,6 +610,46 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       "ALTER TABLE work_items ADD COLUMN reasoning_effort TEXT CHECK (reasoning_effort IN ('off','low','medium','high'))",
     );
   }
+  // Idempotent migration (issue #159): the assignee column (who owns the
+  // item). Nullable for legacy rows; the one-shot backfill makes the
+  // requester the owner of every pre-#159 item — ownership starts as the
+  // requester, exactly like fresh creates.
+  const assigneeColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
+  if (!assigneeColumns.includes("assignee")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN assignee TEXT");
+    db.exec("UPDATE work_items SET assignee = requester WHERE assignee IS NULL");
+  }
+  // Idempotent migration (issue #159): the outbox CHECK gained the
+  // 'work_item' notification kind (blocked/review landings). SQLite cannot
+  // ALTER a CHECK constraint, so rebuild the table when its definition
+  // predates the kind; fresh databases get the widened CHECK from
+  // schema.sql directly. The rebuild preserves every row (the rename keeps
+  // the old table's data until the copy completes).
+  // SAFETY: sqlite_master.sql always exists for tables; a missing row (no
+  // outbox yet) skips the rebuild entirely.
+  const outboxSql =
+    (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as
+      | { sql: string }
+      | null)?.sql ?? "";
+  if (!outboxSql.includes("'work_item'")) {
+    db.exec(`
+      ALTER TABLE outbox RENAME TO outbox_old;
+      CREATE TABLE outbox (
+        id         TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item')),
+        payload    TEXT NOT NULL,
+        space      TEXT,
+        status     TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','posted','failed')),
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        posted_at  INTEGER
+      );
+      INSERT INTO outbox SELECT id, kind, payload, space, status, attempts, created_at, posted_at FROM outbox_old;
+      DROP TABLE outbox_old;
+      CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
+    `);
+  }
   // Idempotent migration (issue #64): databases created before the model
   // settings column existed keep their spaces table (CREATE TABLE IF NOT
   // EXISTS is a no-op), so add the column explicitly when it is missing.
@@ -748,12 +798,15 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     const delivery = input.delivery ?? "git";
+    // Ownership (issue #159): the requester owns the item at creation; the
+    // executor's claim reassigns it later.
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
+      `INSERT INTO work_items (id, space_id, requester, assignee, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
     ).run(
       id,
       input.space_id,
+      input.requester,
       input.requester,
       input.description,
       input.repo ?? null,
@@ -769,7 +822,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     );
     // SAFETY: the INSERT above guarantees a row with this id exists; SELECT returns its full shape.
     const item = getWorkItemStmt.get(id) as WorkItem;
-    const createdPayload: CreatedWorkItemAuditPayload = { id, requester: input.requester };
+    const createdPayload: CreatedWorkItemAuditPayload = { id, requester: input.requester, assignee: input.requester };
     if (input.model !== undefined) createdPayload.model = input.model;
     if (input.reasoning_effort !== undefined) createdPayload.reasoning_effort = input.reasoning_effort;
     appendAudit({
@@ -788,11 +841,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return item;
   }
 
-  async function claimWorkItemById(id: string): Promise<WorkItem | null> {
+  /**
+   * Atomic open -> claimed for a SPECIFIC item (the worker claims by the job
+   * payload). Null when the item is not open. The claim stamps the
+   * assignee (issue #159): ownership passes to the claiming worker, whose
+   * identity is "executor" everywhere on the audit trail.
+   */
+  async function claimWorkItemById(id: string, assignee = "executor"): Promise<WorkItem | null> {
     // SAFETY: UPDATE ... RETURNING * returns the claimed row, or undefined when the item is not open.
     const row = db
-      .query(`UPDATE work_items SET state = 'claimed', updated_at = ? WHERE id = ? AND state = 'open' RETURNING *`)
-      .get(Date.now(), id) as WorkItem | null;
+      .query(
+        `UPDATE work_items SET state = 'claimed', assignee = ?, updated_at = ? WHERE id = ? AND state = 'open' RETURNING *`,
+      )
+      .get(assignee, Date.now(), id) as WorkItem | null;
     return row ?? null;
   }
 
@@ -938,6 +999,20 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       event_type: WORK_ITEM_TRANSITION_EVENT,
       payload: JSON.stringify({ from, to, by }),
     });
+    // Blocked/review landings are human-visible queue events (issue #159):
+    // the executor's transition sites funnel here, so this single write
+    // posts the one-line notification through the outbox — the same
+    // worker→server channel the delivery results ride. The row id is
+    // item+state so a repeated transition to the same state can never
+    // double-post (INSERT OR IGNORE dedupes).
+    if (to === "blocked" || to === "review") {
+      postOutboxRow(store, {
+        id: `${row.id}:${to}`,
+        kind: "work_item",
+        payload: { state: to, workItemId: row.id, description: row.description, ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}) },
+        space: row.space_id,
+      });
+    }
     return row;
   }
 
@@ -1209,10 +1284,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
     const t = Date.now();
     const cutoff = t - olderThanMs;
-    // SAFETY: SELECT id, space_id returns rows with exactly those two string columns.
+    // SAFETY: SELECT id, space_id, description returns rows with exactly those columns.
     const stale = db
-      .query("SELECT id, space_id FROM work_items WHERE state = ? AND updated_at < ?")
-      .all(from, cutoff) as { id: string; space_id: string }[];
+      .query("SELECT id, space_id, description FROM work_items WHERE state = ? AND updated_at < ?")
+      .all(from, cutoff) as { id: string; space_id: string; description: string }[];
     if (stale.length === 0) return 0;
     db.query(
       `UPDATE work_items
@@ -1226,6 +1301,15 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         actor: "system",
         event_type: WORK_ITEM_TRANSITION_EVENT,
         payload: JSON.stringify({ from, to: "blocked", by: "system" }),
+      });
+      // Stale recovery is a blocked landing too (issue #159): the boot-time
+      // sweep posts the same one-line notification as any other blocked
+      // transition, so a restarted item is never silently stuck.
+      postOutboxRow(store, {
+        id: `${row.id}:blocked`,
+        kind: "work_item",
+        payload: { state: "blocked", workItemId: row.id, description: row.description, evidence: "interrupted by restart" },
+        space: row.space_id,
       });
     }
     return stale.length;
@@ -1285,7 +1369,27 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return db.query(sql).all(...params) as AuditRow[];
   }
 
-  return {
+  /**
+   * The visible queue (issue #159): work items of a space (or every space
+   * when no space filter), newest first, optionally narrowed by state.
+   */
+  async function listWorkItems(filter: { space_id?: string; state?: WorkItemState } = {}): Promise<WorkItem[]> {
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (filter.space_id !== undefined) {
+      clauses.push("space_id = ?");
+      params.push(filter.space_id);
+    }
+    if (filter.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(filter.state);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    // SAFETY: SELECT * returns one row per work_items match, each with WorkItem's column shape.
+    return db.query(`SELECT * FROM work_items ${where} ORDER BY created_at DESC`).all(...params) as WorkItem[];
+  }
+
+  const store: Store = {
     getOrCreateSpace,
     getSpace,
     updatePolicy,
@@ -1300,6 +1404,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     claimWorkItemById,
     transitionWorkItem,
     getWorkItem,
+    listWorkItems,
     markStaleWorkItems,
     enqueueJob,
     claimNextJob,
@@ -1332,6 +1437,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getDb: () => db,
     close: () => db.close(),
   };
+  return store;
 }
 
 /**

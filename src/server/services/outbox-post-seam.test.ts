@@ -123,6 +123,21 @@ describe("renderOutboxMessage", () => {
     };
     expect(renderOutboxMessage(row)).toBe("Blocked");
   });
+
+  test("a work_item notification row renders the one-line landing (issue #159)", () => {
+    const row: OutboxRow = {
+      id: "wi_x:blocked", kind: "work_item",
+      payload: JSON.stringify({ state: "blocked", workItemId: "wi_x", description: "do the thing", evidence: "no repo" }),
+      space: SPACE, status: "posted", attempts: 0, created_at: T0, posted_at: T0,
+    };
+    expect(renderOutboxMessage(row)).toBe("Blocked: do the thing — no repo");
+    const review: OutboxRow = {
+      id: "wi_y:review", kind: "work_item",
+      payload: JSON.stringify({ state: "review", workItemId: "wi_y", description: "check the PR" }),
+      space: SPACE, status: "posted", attempts: 0, created_at: T0, posted_at: T0,
+    };
+    expect(renderOutboxMessage(review)).toBe("Review: check the PR");
+  });
 });
 
 // --- One pass (postPendingOutboxRows) ---------------------------------------
@@ -163,6 +178,32 @@ describe("postPendingOutboxRows", () => {
     const restarted = await postPendingOutboxRows(store, adapter, { now: t.now });
     expect(restarted.posted).toBe(0);
     expect(adapter.posted).toHaveLength(1);
+  });
+
+  test("a blocked/review completion row is superseded by its transition notification (issue #159)", async () => {
+    const store = freshStore();
+    const adapter = new FakeAdapter();
+    const t = clock();
+    // The executor writes the notification row when the item LANDS in
+    // blocked; the job-completion row (state blocked) follows later.
+    postOutboxRow(
+      store,
+      { id: "wi_x:blocked", kind: "work_item", payload: { state: "blocked", workItemId: "wi_x", description: "do the thing", evidence: "no repo" }, space: SPACE },
+      { now: t.now },
+    );
+    postOutboxRow(store, { id: "wi_x", kind: "git", payload: { state: "blocked", result: null }, space: SPACE }, { now: t.now });
+
+    const result = await postPendingOutboxRows(store, adapter, { now: t.now });
+    // Exactly ONE post: the notification line — the completion row's bare
+    // "Blocked" would duplicate it and is never posted.
+    expect(result.posted).toBe(1);
+    expect(adapter.posted).toEqual([{ spaceId: SPACE, text: "Blocked: do the thing — no repo" }]);
+    expect(outboxRow(store, "wi_x:blocked")!.status).toBe("posted");
+    expect(outboxRow(store, "wi_x")!.status).toBe("posted");
+    // Only the notification row's post is audited outbox.posted.
+    const posted = await store.listAudit({ event_type: OUTBOX_POSTED_EVENT });
+    expect(posted).toHaveLength(1);
+    expect(JSON.parse(posted[0]!.payload)).toEqual({ id: "wi_x:blocked", kind: "work_item", space: SPACE });
   });
 
   test("a failing post audits outbox.failed and retries within bounds, then fails terminal", async () => {

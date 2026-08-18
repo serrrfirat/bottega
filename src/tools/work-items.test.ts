@@ -48,11 +48,12 @@ function resultText(res: Awaited<ReturnType<ToolDefinition["execute"]>>): string
 }
 
 describe("workItemsExtension registration", () => {
-  test("registers create, cancel, and chat completion tools with their approval tiers", () => {
+  test("registers create, list, cancel, and chat completion tools with their approval tiers", () => {
     const tools = loadTools(freshStore());
     expect(tools.map((t) => t.name).sort()).toEqual([
       "complete_work_item",
       "create_work_item",
+      "list_work_items",
       "work_item_cancel",
     ]);
     for (const t of tools) {
@@ -63,6 +64,7 @@ describe("workItemsExtension registration", () => {
     expect(tools.find((t) => t.name === "create_work_item")?.approval).toBe("exec");
     expect(tools.find((t) => t.name === "work_item_cancel")?.approval).toBe("exec");
     expect(tools.find((t) => t.name === "complete_work_item")?.approval).toBe("write");
+    expect(tools.find((t) => t.name === "list_work_items")?.approval).toBe("read");
   });
 
   test("describes all delivery kinds without requiring a repo for non-git work (issue #128)", () => {
@@ -153,13 +155,14 @@ describe("create_work_item", () => {
     const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
     expect(item?.state).toBe("open");
     expect(item?.requester).toBe("agent");
+    expect(item?.assignee).toBe("agent"); // ownership defaults to the requester (issue #159)
     expect(item?.description).toBe("ship the queue");
     expect(item?.delivery).toBe("git");
 
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
     expect(rows).toHaveLength(1);
     expect(rows[0]!.actor).toBe("agent");
-    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent", assignee: "agent" });
   });
 
   test("uses the requester param and the configured actor when given", async () => {
@@ -176,6 +179,7 @@ describe("create_work_item", () => {
     expect(res.isError).not.toBe(true);
     const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
     expect(item?.requester).toBe("U123");
+    expect(item?.assignee).toBe("U123"); // requester becomes the assignee at creation (issue #159)
 
     const res2 = await createTool.execute("tc1", { description: "defaulted" }, undefined, undefined, ctxFor(space.id));
     expect(res2.isError).not.toBe(true);
@@ -404,6 +408,7 @@ describe("create_work_item model pin (issue #185)", () => {
     expect(JSON.parse(rows[0]!.payload)).toEqual({
       id: item!.id,
       requester: "agent",
+      assignee: "agent",
       model: "fast",
       reasoning_effort: "low",
     });
@@ -531,7 +536,7 @@ describe("create_work_item model pin (issue #185)", () => {
     expect(item?.model).toBeNull();
     expect(item?.reasoning_effort).toBeNull();
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
-    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item!.id, requester: "agent", assignee: "agent" });
   });
 });
 
@@ -781,6 +786,78 @@ describe("complete_work_item", () => {
       expect(resultText(res)).toContain(`state ${state}`);
       expect((await s.getWorkItem(id))?.state).toBe(state);
     }
+  });
+});
+
+describe("list_work_items", () => {
+  function listTool(s: Store, opts?: { actor?: string }): ToolDefinition {
+    return loadTools(s, opts).find((t) => t.name === "list_work_items")!;
+  }
+
+  test("lists the session space's queue with id, description, state, assignee, and created; filters by state; audits", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "LIST1" });
+    const open = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "ship the queue" });
+    const blocked = await s.createWorkItem({ space_id: space.id, requester: "U2", description: "blocked task" });
+    await s.transitionWorkItem(blocked.id, "open", "claimed", { by: "setup" });
+    await s.transitionWorkItem(blocked.id, "claimed", "working", { by: "setup" });
+    await s.transitionWorkItem(blocked.id, "working", "blocked", { by: "setup", evidence: "no repo" });
+    // A foreign space's queue is never visible from this session's space.
+    const otherSpace = await s.getOrCreateSpace({ platform: "slack", channel_id: "LIST-OTHER" });
+    await s.createWorkItem({ space_id: otherSpace.id, requester: "U3", description: "other space" });
+
+    const res = await listTool(s).execute("tc-list", {}, undefined, undefined, ctxFor(space.id));
+    expect(res.isError).not.toBe(true);
+    const payload = JSON.parse(resultText(res)) as {
+      count: number;
+      items: Array<{ id: string; description: string; state: string; assignee: string; created: number }>;
+    };
+    expect(payload.count).toBe(2);
+    expect(payload.items.map((i) => i.id).sort()).toEqual([open.id, blocked.id].sort());
+    for (const i of payload.items) {
+      expect(typeof i.id).toBe("string");
+      expect(typeof i.description).toBe("string");
+      expect(typeof i.state).toBe("string");
+      expect(typeof i.assignee).toBe("string");
+      expect(typeof i.created).toBe("number");
+    }
+    expect(payload.items.find((i) => i.id === open.id)).toMatchObject({ state: "open", assignee: "U1" });
+    expect(payload.items.find((i) => i.id === blocked.id)).toMatchObject({ state: "blocked" });
+
+    // The state filter narrows the visible queue.
+    const filtered = await listTool(s).execute("tc-list", { state: "blocked" }, undefined, undefined, ctxFor(space.id));
+    const filteredPayload = JSON.parse(resultText(filtered)) as { count: number; items: Array<{ id: string }> };
+    expect(filteredPayload.count).toBe(1);
+    expect(filteredPayload.items[0]!.id).toBe(blocked.id);
+
+    // Every invocation appends an audited work_item.list row.
+    const audited = await s.listAudit({ space: space.id, event_type: "work_item.list" });
+    expect(audited).toHaveLength(2);
+    expect(audited[1]!.actor).toBe("agent");
+    expect(JSON.parse(audited[1]!.payload)).toMatchObject({ state: "blocked", count: 1 });
+  });
+
+  test("an explicit space param lists another space's queue", async () => {
+    const s = freshStore();
+    const spaceA = await s.getOrCreateSpace({ platform: "slack", channel_id: "LIST2" });
+    const spaceB = await s.getOrCreateSpace({ platform: "slack", channel_id: "LIST3" });
+    await s.createWorkItem({ space_id: spaceA.id, requester: "U1", description: "in A" });
+    await s.createWorkItem({ space_id: spaceB.id, requester: "U1", description: "in B" });
+
+    const res = await listTool(s).execute("tc-list", { space: spaceB.id }, undefined, undefined, ctxFor(spaceA.id));
+    expect(res.isError).not.toBe(true);
+    const payload = JSON.parse(resultText(res)) as { count: number; items: Array<{ description: string }> };
+    expect(payload.count).toBe(1);
+    expect(payload.items[0]!.description).toBe("in B");
+  });
+
+  test("fails closed without a space session", async () => {
+    const s = freshStore();
+    const res = await listTool(s).execute("tc-list", {}, undefined, undefined, {
+      sessionManager: { getSessionFile: () => undefined },
+    } as ExtensionContext);
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toMatch(/space session/);
   });
 });
 

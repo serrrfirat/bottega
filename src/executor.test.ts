@@ -28,10 +28,12 @@ import {
   JOB_FAILED_EVENT,
   JOB_UNCLAIMED_EVENT,
   MEMORY_WRITE_EVENT,
+  OUTBOX_POSTED_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "./store/audit-events";
 import { consumeOutboxWatermarked } from "./store/outbox";
+import type { OutboxRow } from "./store/outbox";
 import type { WorkerJob } from "./worker/envelope";
 import {
   EXECUTOR_TOOLS,
@@ -45,6 +47,7 @@ import {
 } from "./executor";
 import { resolveDeliveryAction } from "./server/adapters/delivery-router";
 import { pollPendingDeliveries } from "./server/services/delivery-poller";
+import { postPendingOutboxRows } from "./server/services/outbox-post-seam";
 import {
   DELIVERY_APPROVE_ACTION_ID,
   DELIVERY_DENY_ACTION_ID,
@@ -1395,6 +1398,9 @@ describe("worker job envelope (epic #170)", () => {
       await runUntil(fx, item.id, "done", makeDeps(fx));
       await waitForJobStatus(fx.store, item.id, "completed");
 
+      // The executor's claim stamped its identity as the assignee (issue #159).
+      expect((await fx.store.getWorkItem(item.id))?.assignee).toBe("executor");
+
       // Claim + completion are both on the audit trail, keyed by the envelope id.
       const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
       expect(claimed.map((row) => JSON.parse(row.payload))).toContainEqual(
@@ -1406,14 +1412,19 @@ describe("worker job envelope (epic #170)", () => {
       );
 
       // The outbox row is the worker→server signal: consumable, watermarked,
-      // keyed by the same id, carrying the delivery result.
+      // keyed by the same id, carrying the delivery result. The review
+      // landing also wrote its one-line notification row (issue #159).
       const { rows, watermark } = consumeOutboxWatermarked(fx.store);
-      expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ id: item.id, kind: "git", space: space.id });
-      const payload = JSON.parse(rows[0].payload) as { state: string; result: { pr_url: string; summary: string } };
+      expect(rows.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
+      const completion = rows.find((r) => r.kind === "git")!;
+      expect(completion).toMatchObject({ id: item.id, kind: "git", space: space.id });
+      const payload = JSON.parse(completion.payload) as { state: string; result: { pr_url: string; summary: string } };
       expect(payload.state).toBe("done");
       expect(payload.result.pr_url).toContain("/acme/sandbox/pull/1");
       expect(payload.result.summary).toBe("implemented the requested change");
+      const reviewNotify = rows.find((r) => r.kind === "work_item")!;
+      expect(reviewNotify.id).toBe(`${item.id}:review`);
+      expect(JSON.parse(reviewNotify.payload)).toMatchObject({ state: "review", workItemId: item.id });
       // Consumed rows are never re-read: the watermark advanced past the row.
       expect(consumeOutboxWatermarked(fx.store, { watermark })).toEqual({ rows: [], watermark });
     } finally {
@@ -1470,6 +1481,55 @@ describe("worker job envelope (epic #170)", () => {
       const { rows } = consumeOutboxWatermarked(fx.store);
       const payload = JSON.parse(rows[0].payload) as { state: string };
       expect(payload.state).toBe("blocked");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a blocked landing posts exactly one notification line through the outbox (issue #159)", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.failure = new Error("agent crashed: exit code 42");
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do the thing",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "blocked", makeDeps(fx));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      // The transition notification row rides the outbox (the worker's only
+      // channel to the server): one row per landing, keyed by item id +
+      // state, carrying the description for the one-line post. Inspect the
+      // pending rows directly — the seam pass below consumes them.
+      // SAFETY: SELECT * returns the outbox column shape (OutboxRow).
+      const pending = fx.store.getDb().query("SELECT * FROM outbox ORDER BY created_at").all() as OutboxRow[];
+      expect(pending.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
+      const notify = pending.find((r) => r.kind === "work_item")!;
+      expect(notify).toMatchObject({ id: `${item.id}:blocked`, space: space.id });
+      expect(JSON.parse(notify.payload)).toMatchObject({
+        state: "blocked",
+        workItemId: item.id,
+        description: "do the thing",
+      });
+
+      // The post seam posts exactly ONE line: the notification, never the
+      // bare "Blocked" state line from the job-completion row (superseded).
+      const posted: Array<{ spaceId: string; text: string }> = [];
+      const adapter = { postMessage: async (spaceId: string, text: string) => void posted.push({ spaceId, text }) };
+      const pass = await postPendingOutboxRows(fx.store, adapter);
+      expect(pass.posted).toBe(1);
+      // The one-line notification carries the landing's evidence ("executor
+      // failed: ...") — the why, in the #219 short-line style.
+      expect(posted).toEqual([
+        { spaceId: space.id, text: "Blocked: do the thing — executor failed: agent crashed: exit code 42" },
+      ]);
+      // No audit claim that a bare completion row posted: only the
+      // notification row's outbox.posted audit exists.
+      expect(await fx.store.listAudit({ event_type: OUTBOX_POSTED_EVENT })).toHaveLength(1);
     } finally {
       fx.cleanup();
     }
@@ -1851,7 +1911,10 @@ describe("worker job envelope (epic #170)", () => {
       // The reclaim bumped attempts to 2 — the full lifecycle is on the trail.
       const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
       expect(JSON.parse(claimed[0].payload)).toMatchObject({ id: item.id, attempts: 2 });
-      expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(1);
+      // The review notification row (issue #159) + the completion row.
+      const { rows } = consumeOutboxWatermarked(fx.store);
+      expect(rows.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
+      expect(rows.find((r) => r.kind === "work_item")!.id).toBe(`${item.id}:review`);
     } finally {
       fx.cleanup();
     }

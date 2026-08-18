@@ -399,8 +399,8 @@ export function collectTextBlocks(message: { content?: unknown } | null): string
  * Space agent tool allowlist: conversation/read-only tools + `task` for
  * delegating to work executors. Deliberately no bash/write/edit — the space
  * agent is a participant, not an executor. The work item queue tools
- * (issue #10) are listed so the agent can create and cancel work items, and
- * (issue #22) so it can save and search memory. The connect capability
+ * (issue #10) are listed so the agent can create, cancel, and list work
+ * items (issue #159), and (issue #22) so it can save and search memory. The connect capability
  * (issue #52) rides the custom-tools path
  * (createOmpSdkDriver builds its definition per session) and is listed here
  * so the allowlist documents it — keep in sync with PROJECT_TOOL_NAMES.
@@ -418,6 +418,7 @@ export const SPACE_AGENT_TOOLS = [
   "task",
   "create_work_item",
   "work_item_cancel",
+  "list_work_items",
   "connect_extension",
   "memory.save",
   "memory.search",

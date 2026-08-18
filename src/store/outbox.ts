@@ -19,8 +19,13 @@
 import { JOB_UNCLAIMED_EVENT } from "./audit-events";
 import type { Store } from "./db";
 
-/** The job kinds that can ride the outbox (epic #170). */
-export type OutboxKind = "git" | "extension" | "kb" | "scheduled";
+/**
+ * The job kinds that can ride the outbox (epic #170) plus the
+ * `work_item` transition-notification kind (issue #159): a short line the
+ * executor writes when an item lands in blocked/review, posted by the
+ * server seam like any other row.
+ */
+export type OutboxKind = "git" | "extension" | "kb" | "scheduled" | "work_item";
 
 /** A row's lifecycle state; mirrors the outbox.status CHECK. */
 export type OutboxStatus = "pending" | "posted" | "failed";
@@ -64,7 +69,7 @@ export const DEFAULT_OUTBOX_BATCH_SIZE = 50;
  */
 export const DEFAULT_UNCLAIMED_TTL_MS = 5 * 60 * 1000;
 
-const OUTBOX_KINDS: readonly OutboxKind[] = ["git", "extension", "kb", "scheduled"];
+const OUTBOX_KINDS: readonly OutboxKind[] = ["git", "extension", "kb", "scheduled", "work_item"];
 
 /**
  * Worker-side writer (epic #170): records one completed job for the server

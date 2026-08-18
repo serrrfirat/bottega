@@ -3,7 +3,9 @@
  *
  * Creation and cancellation are exec-tier: they cross human approval before
  * running. Chat completion is write-tier because the visible answer already
- * happened in-channel; the tool only records completion.
+ * happened in-channel; the tool only records completion. Listing is
+ * read-tier (issue #159): the human-facing queue, state-filterable, with
+ * the assignee (who owns each item).
  *
  * Pickup is explicit: the agent creates a work item when asked (e.g.
  * "@agent handle this"). The tools are identical in every space; cancel
@@ -14,6 +16,7 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { channelFromSpaceId } from "../server/adapters/slack";
 import { loadSpacePolicy, type PolicyConfig } from "../policy/config";
+import { WORK_ITEM_LIST_EVENT } from "../store/audit-events";
 import {
   DEFAULT_MODEL_CATALOG_DIR,
   listAvailableModels,
@@ -75,6 +78,12 @@ export const cancelWorkItemArgsSchema = z.object({ id: z.string() });
 export const completeWorkItemArgsSchema = z.object({
   id: z.string(),
   summary: z.string(),
+});
+export const listWorkItemsArgsSchema = z.object({
+  /** Narrow the queue to one state (open/claimed/working/review/done/blocked/aborted). */
+  state: z.enum(["open", "claimed", "working", "review", "done", "blocked", "aborted"]).optional(),
+  /** Space id ("slack:C123") whose queue to read; defaults to this conversation's space. */
+  space: z.string().optional(),
 });
 
 /**
@@ -256,7 +265,43 @@ export function workItemToolDefinitions(
     },
   };
 
-  return [create, cancel, complete];
+  const list: ToolDefinition<typeof listWorkItemsArgsSchema> = {
+    name: "list_work_items",
+    label: "List work items",
+    description:
+      "Lists the space's visible work-item queue (issue #159): every item with its id, description, state, " +
+      "assignee (who owns it), and creation time, newest first. Optional `state` narrows the queue to one state " +
+      "(open/claimed/working/review/done/blocked/aborted); optional `space` (\"slack:C123\") reads another space's " +
+      "queue, defaulting to this conversation's space. Read-only — use it to answer \"what are you working on\", " +
+      "\"is my task done\", or \"what's blocked\".",
+    parameters: listWorkItemsArgsSchema,
+    approval: "read",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const spaceId = params.space?.trim() || sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      if (!spaceId) return toolError("work items require a space session");
+      try {
+        const items = await store.listWorkItems({ space_id: spaceId, state: params.state });
+        const visible = items.map((item) => ({
+          id: item.id,
+          description: item.description,
+          state: item.state,
+          assignee: item.assignee,
+          created: item.created_at,
+        }));
+        await store.appendAudit({
+          space_id: spaceId,
+          actor,
+          event_type: WORK_ITEM_LIST_EVENT,
+          payload: JSON.stringify({ ...(params.state !== undefined ? { state: params.state } : {}), count: visible.length }),
+        });
+        return { content: [{ type: "text", text: JSON.stringify({ count: visible.length, items: visible }) }] };
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+    },
+  };
+
+  return [create, list, cancel, complete];
 }
 
 export function workItemsExtension(store: Store, opts: WorkItemsExtensionOpts): ExtensionFactory {

@@ -1088,7 +1088,7 @@ describe("work items", () => {
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.created" });
     expect(rows).toHaveLength(1);
     expect(rows[0]!.actor).toBe("U7");
-    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item.id, requester: "U7" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item.id, requester: "U7", assignee: "U7" });
   });
 });
 

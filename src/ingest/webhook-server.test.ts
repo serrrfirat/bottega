@@ -127,7 +127,11 @@ describe("webhook route — dispatch on a valid mention (issue #57)", () => {
     // The SHARED dispatch created the work item through the store's existing path.
     expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(1);
     const created = await h.store.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
-    expect(JSON.parse(created[0]!.payload)).toEqual({ id: expect.any(String), requester: "ingest:github" });
+    expect(JSON.parse(created[0]!.payload)).toEqual({
+      id: expect.any(String),
+      requester: "ingest:github",
+      assignee: "ingest:github",
+    });
     // …and the item row exists with the mention's evidence.
     // SAFETY: WORK_ITEM_CREATED_EVENT rows carry the created item's id (see src/store/db.ts).
     const itemId = (JSON.parse(created[0]!.payload) as { id: string }).id;

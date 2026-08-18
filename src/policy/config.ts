@@ -179,6 +179,7 @@ const TIER_BY_TOOL: ToolTiers = {
   create_work_item: "exec",
   work_item_cancel: "exec",
   complete_work_item: "write",
+  list_work_items: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

@@ -263,6 +263,7 @@ describe("omp sdk agent driver", () => {
         "task",
         "create_work_item",
         "work_item_cancel",
+        "list_work_items",
         "connect_extension",
         "memory.save",
         "memory.search",

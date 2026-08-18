@@ -79,6 +79,7 @@ describe("tier resolution", () => {
       "session_search",
       "object.list",
       "object.get",
+      "list_work_items",
     ]) {
       expect(resolveTier(t)).toBe("read");
       expect(isKnownTool(t)).toBe(true);

@@ -88,6 +88,19 @@ const resultSummarySchema = z
   })
   .passthrough();
 
+/**
+ * The work_item notification payload (issue #159): the executor writes one
+ * outbox row per blocked/review landing; the seam posts it as a short line.
+ */
+const workItemNotificationSchema = z
+  .object({
+    state: z.enum(["blocked", "review"]),
+    workItemId: z.string(),
+    description: z.string(),
+    evidence: z.string().optional(),
+  })
+  .passthrough();
+
 function parsePayload(raw: string): { state?: string; result?: unknown } | null {
   try {
     const parsed = outboxPayloadSchema.safeParse(JSON.parse(raw));
@@ -98,11 +111,46 @@ function parsePayload(raw: string): { state?: string; result?: unknown } | null 
 }
 
 /**
+ * The payload boundary check for the post seam (issue #159): a work_item
+ * row must carry the notification shape — anything else is a worker
+ * contract violation and fails closed like a malformed payload.
+ */
+function parseRowPayload(row: OutboxRow): { state?: string; result?: unknown } | null {
+  if (row.kind === "work_item") {
+    // The notification fields are stripped by the generic completion
+    // schema, so validate the raw payload against the notification shape.
+    try {
+      const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+  return parsePayload(row.payload);
+}
+
+/**
  * The one-line Slack post for a consumed row — display only, never a
  * correctness gate: unknown payloads/results fall back to a state line
  * instead of throwing, so a future worker result shape still posts.
  */
 export function renderOutboxMessage(row: OutboxRow): string {
+  if (row.kind === "work_item") {
+    // The notification fields (workItemId, description) are stripped by the
+    // generic completion schema, so parse the raw payload here.
+    let payload: z.infer<typeof workItemNotificationSchema> | null = null;
+    try {
+      const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
+      payload = parsed.success ? parsed.data : null;
+    } catch {
+      payload = null;
+    }
+    if (payload === null) return row.kind;
+    const label = payload.state === "blocked" ? "Blocked" : "Review";
+    const bits = [payload.description];
+    if (payload.evidence) bits.push(payload.evidence);
+    return `${label}: ${bits.join(" — ")}`;
+  }
   const payload = parsePayload(row.payload);
   const state = payload?.state ?? "completed";
   const stateText = state === "done" ? "Done" : state === "blocked" ? "Blocked" : state;
@@ -118,6 +166,21 @@ export function renderOutboxMessage(row: OutboxRow): string {
     if (r.count !== undefined) bits.push(`${r.count} item(s)`);
   }
   return bits.length > 0 ? `${kindLabel}${stateText}: ${bits.join(" — ")}` : `${kindLabel}${stateText}`;
+}
+
+/**
+ * The message for one consumed row — null when there is nothing to post.
+ * A job-completion row whose state is blocked/review is SUPERSEDED by its
+ * transition notification row (issue #159): the executor writes the
+ * notification when the item lands, so the bare state line would duplicate
+ * it. The row is still consumed (marked posted by the watermarked
+ * consumer); it just never posts a second line.
+ */
+function messageForRow(row: OutboxRow): string | null {
+  if (row.kind === "work_item") return renderOutboxMessage(row);
+  const payload = parsePayload(row.payload);
+  if (payload?.state === "blocked" || payload?.state === "review") return null;
+  return renderOutboxMessage(row);
 }
 
 export interface OutboxPostPass {
@@ -178,7 +241,7 @@ async function postRow(
   now: (() => number) | undefined,
   log: (line: string) => void,
 ): Promise<boolean> {
-  if (row.space === null || parsePayload(row.payload) === null) {
+  if (row.space === null || parseRowPayload(row) === null) {
     // Fail closed: a row with no target space or a malformed payload is
     // never posted and never retried — it is a worker contract violation.
     const reason = row.space === null ? "no space on the outbox row" : "malformed outbox payload";
@@ -188,8 +251,18 @@ async function postRow(
     log(`outbox post seam: row ${row.id} failed closed (${reason})`);
     return false;
   }
+  const text = messageForRow(row);
+  if (text === null) {
+    // Superseded by the transition notification row (issue #159): the
+    // blocked/review state line would duplicate the notification the
+    // executor already wrote. The row is consumed (marked posted) with no
+    // outbox.posted audit — the diagnosable gap documented in the module
+    // header (posted_at without a matching audit row) — and never counts
+    // as a posted message.
+    return false;
+  }
   try {
-    await adapter.postMessage(row.space, renderOutboxMessage(row));
+    await adapter.postMessage(row.space, text);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     const attempts = row.attempts + 1;

@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   id           TEXT PRIMARY KEY,         -- "wi_<uuid>"
   space_id     TEXT NOT NULL REFERENCES spaces(id),
   requester    TEXT NOT NULL,            -- principal (slack user id)
+  assignee     TEXT,                     -- who owns the item (issue #159): the requester at creation,
+                                         -- the executor's identity once claimed; NULL only on pre-#159 rows
   description  TEXT NOT NULL,
   repo         TEXT,                     -- owner/repo the agent derived from the conversation (issue #47);
                                          -- null = not specified (executor blocks and asks the requester)
@@ -173,7 +175,7 @@ END;
 -- restarts (one id threads enqueue → claim → run → outbox → post).
 CREATE TABLE IF NOT EXISTS outbox (
   id         TEXT PRIMARY KEY,              -- the job id (one id across the whole lifecycle)
-  kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+  kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item')),
   payload    TEXT NOT NULL,                 -- JSON payload (never secrets; the worker has none)
   space      TEXT,                          -- space id the result belongs to (nullable)
   status     TEXT NOT NULL DEFAULT 'pending'
