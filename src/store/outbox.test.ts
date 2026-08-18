@@ -27,7 +27,7 @@ afterAll(() => {
 const T0 = Date.UTC(2026, 7, 18, 10, 0, 0);
 
 /** Injectable clock (ms epoch) so TTL tests never sleep. */
-function clock(start = T0): { now: () => number; advance: (ms: number) => void } {
+function clock(start = T0) {
   let t = start;
   return {
     now: () => t,
@@ -37,9 +37,9 @@ function clock(start = T0): { now: () => number; advance: (ms: number) => void }
   };
 }
 
-// SAFETY: SELECT * returns the outbox column shape (OutboxRow); a missing
-// row maps to null below.
 function outboxRow(store: Store, id: string): OutboxRow | null {
+  // SAFETY: SELECT * returns the outbox column shape (OutboxRow); a missing
+  // row yields undefined, mapped to null below.
   const row = store.getDb().query("SELECT * FROM outbox WHERE id = ?").get(id) as OutboxRow | null;
   return row ?? null;
 }
@@ -75,6 +75,9 @@ describe("outbox writer (postOutboxRow)", () => {
 
   test("unknown kind fails closed (no row written)", () => {
     const store = freshStore();
+    // SAFETY: `chat` is deliberately outside the outbox kind union — the
+    // never assertion bypasses the literal constraint to exercise the
+    // fail-closed unknown-kind branch.
     expect(() => postOutboxRow(store, { id: "job_x", kind: "chat" as never, payload: {} })).toThrow(/unknown outbox kind/);
     expect(outboxRow(store, "job_x")).toBeNull();
   });

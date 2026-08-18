@@ -10,7 +10,7 @@ import {
 import type { Store } from "../store/db";
 import { errorMessage, toolError } from "../tools/helpers";
 import { parseCron } from "./cron";
-import type { SchedulerActionName, SchedulerActionRegistry } from "./types";
+import type { SchedulerActionRegistry } from "./types";
 
 export const createSchedulerJobArgsSchema = z.object({
   action: z.enum(["standup_digest", "reflection", "org_pulse", "recurring_work", "ingest_poll", "kb_ingest", "send_message"]),
@@ -26,7 +26,7 @@ export const listSchedulerJobsArgsSchema = z.object({});
 export const deleteSchedulerJobArgsSchema = z.object({ id: z.string() });
 
 /** True for actions that target a space; org_pulse is the only org-wide (space-less) action. */
-const SPACE_SCOPED_ACTIONS: Record<SchedulerActionName, boolean> = {
+const SPACE_SCOPED_ACTIONS = {
   standup_digest: true,
   reflection: true,
   org_pulse: false,
@@ -127,7 +127,7 @@ export function schedulerToolDefinitions(
             derivedSpace = true;
           }
         }
-        const jobParams: Record<string, string> = { ...(params.params ?? {}) };
+        const jobParams = { ...(params.params ?? {}) };
         if (params.description !== undefined) jobParams.description = params.description;
         if (params.schedule !== undefined) jobParams.schedule = params.schedule;
         if (spaceScoped && spaceId !== null) jobParams.space = spaceId;

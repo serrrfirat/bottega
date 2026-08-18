@@ -137,7 +137,12 @@ export interface OAuthTokenEntry {
  * domain in {@link oauthTokenEntries} — they never appear in
  * config/extensions, so the production map stays fake-domain-free.
  */
-export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
+/** Verified token endpoints keyed by OAuth extension id (the #198 providers + codex, issue #214). */
+interface VerifiedTokenEndpoints {
+  [extensionId: string]: string;
+}
+
+export const OAUTH_TOKEN_ENDPOINTS: VerifiedTokenEndpoints = {
   linear: "https://mcp.linear.app/token",
   attio: "https://app.attio.com/oidc/token",
   notion: "https://mcp.notion.com/token",

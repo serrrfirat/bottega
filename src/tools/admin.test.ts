@@ -325,6 +325,8 @@ describe("catalog_browser (issue #73)", () => {
       const [tool] = tools;
       const res = await call(tool, { action: "list", query: "linear" });
       expect(res.isError).toBe(false);
+      // SAFETY: catalog_browser list serializes its result as JSON with
+      // pinned/catalog/catalog_truncated (the exact shape asserted below).
       const body = JSON.parse(res.text) as {
         pinned: Array<{ id: string }>;
         catalog: Array<{ slug: string; url: string }>;
@@ -336,6 +338,7 @@ describe("catalog_browser (issue #73)", () => {
       expect(body.catalog_truncated).toBe(false);
 
       const all = await call(tool, { action: "list" });
+      // SAFETY: the list result's pinned/catalog arrays are JSON (lengths asserted below).
       const allBody = JSON.parse(all.text) as { pinned: unknown[]; catalog: unknown[] };
       expect(allBody.pinned).toHaveLength(2);
       expect(allBody.catalog).toHaveLength(2);
@@ -365,6 +368,7 @@ describe("catalog_browser (issue #73)", () => {
       };
       const tools = loadTools(store, { catalog: { fetchImpl: stubFetch(many) } });
       const res = await call(tools[0], { action: "list", query: "spec" });
+      // SAFETY: the capped list result carries catalog + catalog_truncated (asserted below).
       const body = JSON.parse(res.text) as { catalog: unknown[]; catalog_truncated: boolean };
       expect(body.catalog).toHaveLength(50);
       expect(body.catalog_truncated).toBe(true);
@@ -391,6 +395,7 @@ describe("catalog_browser (issue #73)", () => {
       const tools = loadTools(store, { catalog: { fetchImpl: stubFetch({ version: 1, data }) } });
       const res = await call(tools[0], { action: "list" });
       expect(res.isError).toBe(false);
+      // SAFETY: the tolerant list result carries catalog + catalog_skipped (asserted below).
       const body = JSON.parse(res.text) as {
         catalog: Array<{ slug: string; url?: string }>;
         catalog_skipped: { count: number; examples: Array<{ spec_id: string }> };
@@ -442,6 +447,8 @@ describe("catalog_browser (issue #73)", () => {
       });
       const res = await call(tools[0], { action: "draft", spec: "linear" });
       expect(res.isError).toBe(false);
+      // SAFETY: draft serializes its result as JSON with written_to/reviewed/
+      // binding_missing/note/draft (the exact shape asserted below).
       const body = JSON.parse(res.text) as {
         written_to: string;
         reviewed: boolean;
@@ -461,6 +468,8 @@ describe("catalog_browser (issue #73)", () => {
       expect(body.draft.source.reviewed).toBe(false);
       expect(existsSync(join(draftsDir, "linear.draft.json"))).toBe(true);
 
+      // SAFETY: the draft file is this test's own writeCompletedDraft
+      // serialization — JSON with extensionId/source/manifest (asserted below).
       const written = JSON.parse(readFileSync(join(draftsDir, "linear.draft.json"), "utf8")) as {
         extensionId: string;
         source: { reviewed: boolean };
@@ -516,6 +525,8 @@ describe("catalog_browser pin (issue #195)", () => {
       });
       const res = await call(tools[0], { action: "pin", spec: "linear" });
       expect(res.isError).toBe(true);
+      // SAFETY: the review-gated pin serializes confirm_required/hosted_variant/
+      // summary/note (the exact shape asserted below).
       const body = JSON.parse(res.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
@@ -556,6 +567,7 @@ describe("catalog_browser pin (issue #195)", () => {
       });
       const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
       expect(res.isError).toBe(false);
+      // SAFETY: a completed pin serializes written_to/reviewed/egress_regenerated (asserted below).
       const body = JSON.parse(res.text) as { written_to: string; reviewed: boolean; egress_regenerated: string[] };
       expect(body.written_to).toBe(join(snapshotsDir, "linear.json"));
       expect(body.reviewed).toBe(true);
@@ -705,6 +717,7 @@ describe("catalog_browser pin (issue #195)", () => {
         vendor_official: true,
       });
       expect(refused.isError).toBe(true);
+      // SAFETY: the refused pin serializes the same review-gate summary shape (asserted below).
       const refusedBody = JSON.parse(refused.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
@@ -727,6 +740,7 @@ describe("catalog_browser pin (issue #195)", () => {
         vendor_official: true,
       });
       expect(pinned.isError).toBe(false);
+      // SAFETY: the completed notion pin serializes written_to/reviewed/note (asserted below).
       const pinnedBody = JSON.parse(pinned.text) as { written_to: string; reviewed: boolean; note: string };
       expect(pinnedBody.written_to).toBe(join(snapshotsDir, "notion.json"));
       expect(pinnedBody.reviewed).toBe(true);
@@ -835,6 +849,7 @@ describe("catalog_browser pin (issue #195)", () => {
 
       const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
       expect(res.isError).toBe(false);
+      // SAFETY: the hot-reload pin result serializes live_registry/proxy_reload/note (asserted below).
       const body = JSON.parse(res.text) as { live_registry: string; proxy_reload: string; note: string };
       expect(body.live_registry).toBe("registered");
       expect(body.proxy_reload).toBe("unset");
@@ -854,6 +869,7 @@ describe("catalog_browser pin (issue #195)", () => {
       // re-pinning the same extension is idempotent: still live, no error
       const repin = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
       expect(repin.isError).toBe(false);
+      // SAFETY: the repin result is the same hot-reload pin shape; only live_registry is read.
       expect((JSON.parse(repin.text) as { live_registry: string }).live_registry).toBe("registered");
     } finally {
       cleanup();
@@ -873,6 +889,8 @@ describe("catalog_browser pin (issue #195)", () => {
       const devEgressPath = join(dir, "egress.dev.yml");
       writeCompletedDraft(draftsDir);
       const reloadCalls: Array<{ url: string; method?: string; authorization?: string }> = [];
+      // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+      // the pin path calls it exactly once for the /v1/reload POST (asserted below).
       globalThis.fetch = (async (
         input: string | URL | Request,
         init?: { method?: string; headers?: Record<string, string> },
@@ -896,6 +914,7 @@ describe("catalog_browser pin (issue #195)", () => {
       });
       const res = await call(tools[0], { action: "pin", spec: "linear", confirm: true, vendor_official: true });
       expect(res.isError).toBe(false);
+      // SAFETY: the proxy-reload pin result serializes proxy_reload/egress_regenerated (asserted below).
       const body = JSON.parse(res.text) as { proxy_reload: string; egress_regenerated: string[] };
       expect(body.proxy_reload).toBe("ok");
       expect(body.egress_regenerated).toContain(egressPath);
@@ -923,6 +942,7 @@ describe("catalog_browser pin (issue #195)", () => {
       const devEgressPath = join(dir, "egress.dev.yml");
       writeCompletedDraft(draftsDir);
       const { audit, rows } = fakeAudit();
+      // SAFETY: the failing stub implements fetch's call contract — only the status differs.
       globalThis.fetch = (async (
         _input: string | URL | Request,
         _init?: { method?: string; headers?: Record<string, string> },
@@ -963,6 +983,7 @@ describe("stack_health (issue #73)", () => {
       const tool = findTool(loadTools(store, { audit, health: allUpProbes() }), "stack_health");
       const res = await call(tool, {});
       expect(res.isError).toBe(false);
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
       const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
       expect(body.ok).toBe(true);
       expect(body.services.map((s) => s.service).sort()).toEqual([
@@ -1002,6 +1023,7 @@ describe("stack_health (issue #73)", () => {
       const tool = findTool(loadTools(store, { health: probes }), "stack_health");
       const res = await call(tool, {});
       expect(res.isError).toBe(true);
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
       const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
       expect(body.ok).toBe(false);
       const mem0 = body.services.find((s) => s.service === "mem0");
@@ -1033,6 +1055,7 @@ describe("stack_health (issue #73)", () => {
       const tool = findTool(loadTools(store, { health: probes }), "stack_health");
       const res = await call(tool, {});
       expect(res.isError).toBe(true);
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
       const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
       const byService = new Map(body.services.map((s) => [s.service, s]));
       expect(byService.get("broker")!.status).toBe("up");
@@ -1051,6 +1074,7 @@ describe("stack_health (issue #73)", () => {
     try {
       const tool = findTool(loadTools(store, { health: allUpProbes() }), "stack_health");
       const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
       const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
       expect(body.ok).toBe(true);
       const executor = body.services.find((s) => s.service === "executor");
@@ -1100,6 +1124,7 @@ describe("deploy_info (issue #73)", () => {
       );
       const res = await call(tool, {});
       expect(res.isError).toBe(false);
+      // SAFETY: deploy_info serializes image_tag/commit/uptime_seconds/config_dir (asserted below).
       const body = JSON.parse(res.text) as { image_tag: string; commit: string; uptime_seconds: number; config_dir: string };
       expect(body.image_tag).toBe("2026.08.16-abc1234");
       expect(body.commit).toBe("deadbeef".repeat(5));
@@ -1121,6 +1146,7 @@ describe("deploy_info (issue #73)", () => {
       delete process.env.BOTTEGA_IMAGE_TAG;
       const tool = findTool(loadTools(store, { gitCommit: () => null }), "deploy_info");
       const res = await call(tool, {});
+      // SAFETY: with no image tag/commit the tool reports null for both (asserted below).
       const body = JSON.parse(res.text) as { image_tag: string | null; commit: string | null };
       expect(body.image_tag).toBeNull();
       expect(body.commit).toBeNull();
@@ -1147,6 +1173,7 @@ describe("first_run_wizard (issue #73)", () => {
       );
       const res = await call(tool, {});
       expect(res.isError).toBe(true);
+      // SAFETY: first_run_wizard serializes ok/passed/total/checks with fix instructions (asserted below).
       const body = JSON.parse(res.text) as {
         ok: boolean;
         passed: number;
@@ -1205,6 +1232,7 @@ describe("first_run_wizard (issue #73)", () => {
       );
       const res = await call(tool, {});
       expect(res.isError).toBe(false);
+      // SAFETY: the passing wizard result serializes ok/passed/checks (asserted below).
       const body = JSON.parse(res.text) as { ok: boolean; passed: number; checks: Array<{ name: string; ok: boolean }> };
       expect(body.ok).toBe(true);
       expect(body.passed).toBe(6);
@@ -1227,12 +1255,14 @@ describe("first_run_wizard (issue #73)", () => {
       chmodSync(tokenFile, 0o644); // explicit — writeFileSync mode is umask-masked (0077 here)
       const tool = findTool(loadTools(store, { gitTokenFile: tokenFile, egressConfigPath: join(dir, "missing.yml") }), "first_run_wizard");
       const res = await call(tool, {});
+      // SAFETY: the wizard result serializes the per-check ok flags (asserted below).
       const body = JSON.parse(res.text) as { checks: Array<{ name: string; ok: boolean }> };
       const pat = body.checks.find((c) => c.name === "git_pat");
       expect(pat!.ok).toBe(false);
 
       store.setOrgSettings({ allow_loose_pat: true });
       const loose = await call(tool, {});
+      // SAFETY: the allow_loose_pat rerun serializes the same checks shape (asserted below).
       const looseBody = JSON.parse(loose.text) as { checks: Array<{ name: string; ok: boolean }> };
       expect(looseBody.checks.find((c) => c.name === "git_pat")!.ok).toBe(true);
     } finally {
@@ -1255,6 +1285,7 @@ describe("first_run_wizard (issue #73)", () => {
         "first_run_wizard",
       );
       const res = await call(tool, {});
+      // SAFETY: the wizard result's checks carry detail evidence (asserted below).
       const body = JSON.parse(res.text) as { checks: Array<{ name: string; ok: boolean; detail: string }> };
       const memory = body.checks.find((c) => c.name === "memory_backend");
       expect(memory!.ok).toBe(true);
@@ -1278,6 +1309,7 @@ describe("runWizardChecks extraction (issue #116)", () => {
       expect(direct).toHaveLength(6);
       const tool = findTool(loadTools(store, { gitTokenFile, egressConfigPath }), "first_run_wizard");
       const res = await call(tool, {});
+      // SAFETY: the wizard tool surfaces the same checks runWizardChecks returns (asserted below).
       const body = JSON.parse(res.text) as { checks: WizardCheck[] };
       expect(direct).toEqual(body.checks);
     } finally {

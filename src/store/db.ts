@@ -405,8 +405,28 @@ function isKnownSchedulerAction(action: string): action is SchedulerActionName {
   return KNOWN_ACTIONS.some((known) => known === action);
 }
 
+/** The state machine's legal moves per source state (issue #10). */
+interface LegalTransitions {
+  open: readonly WorkItemState[];
+  claimed: readonly WorkItemState[];
+  working: readonly WorkItemState[];
+  review: readonly WorkItemState[];
+  done: readonly WorkItemState[];
+  blocked: readonly WorkItemState[];
+  aborted: readonly WorkItemState[];
+}
+
+/** The outbox work_item notification payload (issue #159): the landing state + the queue row. */
+interface WorkItemNotificationPayload {
+  state: string;
+  workItemId: string;
+  description: string;
+  /** Present only when the transition carries evidence (blocked landings). */
+  evidence?: string;
+}
+
 /** Allowed state machine moves (issue #10). The atomic claim implements open -> claimed. */
-const ALLOWED_TRANSITIONS: Record<WorkItemState, readonly WorkItemState[]> = {
+const ALLOWED_TRANSITIONS: LegalTransitions = {
   open: ["claimed", "aborted"],
   claimed: ["working", "open", "aborted"],
   working: ["review", "blocked", "aborted"],
@@ -614,6 +634,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   // item). Nullable for legacy rows; the one-shot backfill makes the
   // requester the owner of every pre-#159 item — ownership starts as the
   // requester, exactly like fresh creates.
+  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
   const assigneeColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
   if (!assigneeColumns.includes("assignee")) {
     db.exec("ALTER TABLE work_items ADD COLUMN assignee TEXT");
@@ -1006,10 +1027,16 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // item+state so a repeated transition to the same state can never
     // double-post (INSERT OR IGNORE dedupes).
     if (to === "blocked" || to === "review") {
+      const notification: WorkItemNotificationPayload = {
+        state: to,
+        workItemId: row.id,
+        description: row.description,
+      };
+      if (opts?.evidence !== undefined) notification.evidence = opts.evidence;
       postOutboxRow(store, {
         id: `${row.id}:${to}`,
         kind: "work_item",
-        payload: { state: to, workItemId: row.id, description: row.description, ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}) },
+        payload: notification,
         space: row.space_id,
       });
     }

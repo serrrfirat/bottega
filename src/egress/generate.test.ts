@@ -142,6 +142,8 @@ describe("egress config generation", () => {
     const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
     // 4 model-gateway keys (issue #208) + the fixture extension.
     expect(entries).toHaveLength(5);
+    // SAFETY: every rendered secrets entry's `source` is a block mapping
+    // carrying a `path` scalar (renderSecretsTransform emits it).
     const fixture = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(FIXTURE_EXTENSION_ID));
     expect(fixture).toMatchObject({
       source: { type: "file", path: `/data/proxy-secrets/${FIXTURE_EXTENSION_ID}.secret` },
@@ -152,8 +154,10 @@ describe("egress config generation", () => {
     expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
     // The gateway entries are REQUIRED (fail closed — issue #208).
     for (const provider of ["near", "opencode", "openai", "anthropic"]) {
+      // SAFETY: each gateway entry's `source` is a block mapping with a `path` scalar.
       const entry = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(`${provider}.secret`));
       expect(entry, `${provider} gateway entry`).toBeDefined();
+      // SAFETY: each gateway entry's `inject` is a block mapping with a `require` scalar.
       expect(String((entry!["inject"] as Record<string, YamlNode>)["require"])).toBe("true");
     }
   });

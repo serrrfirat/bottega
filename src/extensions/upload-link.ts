@@ -497,10 +497,14 @@ async function handleUpload(
     });
   }
   const form = await req.formData();
-  const secret = form.get("secret");
-  if (typeof secret !== "string" || secret.trim() === "") {
+  // The secret field is a plain-text input: the domain value is a non-blank
+  // string; anything else (a file, null, whitespace-only) is rejected at the
+  // boundary before the value is stored.
+  const secretField = z.string().safeParse(form.get("secret"));
+  if (!secretField.success || secretField.data.trim() === "") {
     return new Response("no secret provided — paste the key into the field", { status: 400 });
   }
+  const secret = secretField.data;
   try {
     // Issue #201: boot secrets (Slack tokens + provider keys) store
     // straight into the vault as the provider's api_key row — the row the

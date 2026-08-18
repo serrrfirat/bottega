@@ -1418,6 +1418,8 @@ describe("worker job envelope (epic #170)", () => {
       expect(rows.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
       const completion = rows.find((r) => r.kind === "git")!;
       expect(completion).toMatchObject({ id: item.id, kind: "git", space: space.id });
+      // SAFETY: the completion outbox payload is the executor's own JSON
+      // serialization of the git delivery result (state + pr_url/summary).
       const payload = JSON.parse(completion.payload) as { state: string; result: { pr_url: string; summary: string } };
       expect(payload.state).toBe("done");
       expect(payload.result.pr_url).toContain("/acme/sandbox/pull/1");
@@ -1451,6 +1453,8 @@ describe("worker job envelope (epic #170)", () => {
       const { rows } = consumeOutboxWatermarked(fx.store);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ id: item.id, kind: "extension" });
+      // SAFETY: the extension outbox payload is the executor's own JSON
+      // serialization of the delivery result (state + url/summary).
       const payload = JSON.parse(rows[0].payload) as { state: string; result: { url: string; summary: string } };
       expect(payload).toEqual({
         state: "done",
@@ -1479,6 +1483,8 @@ describe("worker job envelope (epic #170)", () => {
       const completed = await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT });
       expect(JSON.parse(completed[0].payload)).toMatchObject({ id: item.id, kind: "git", state: "blocked" });
       const { rows } = consumeOutboxWatermarked(fx.store);
+      // SAFETY: the blocked outbox payload is the executor's own JSON
+      // serialization carrying the terminal state.
       const payload = JSON.parse(rows[0].payload) as { state: string };
       expect(payload.state).toBe("blocked");
     } finally {
@@ -1599,7 +1605,7 @@ describe("worker job envelope (epic #170)", () => {
   afterAll(() => kbSourceStub.stop(true));
 
   /** Writes a temp config/kb.yml declaring one source; returns the temp root. */
-  function declaredKbConfig(): { dir: string; cleanup: () => void } {
+  function declaredKbConfig() {
     const dir = mkdtempSync(join(tmpdir(), "bottega-kb-job-"));
     mkdirSync(join(dir, "config"));
     writeFileSync(

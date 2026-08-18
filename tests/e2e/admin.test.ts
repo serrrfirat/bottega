@@ -11,10 +11,12 @@
  * draft file the catalog browser writes.
  */
 import { afterAll, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bootHarness, type Harness, type StubTurn } from "./harness";
+import { bootHarness, type EmulatorMessage, type Harness, type StubTurn } from "./harness";
+import type { JsonValue } from "../../src/extensions/manifest";
 import {
   ADMIN_CATALOG_BROWSER_EVENT,
   ADMIN_DEPLOY_INFO_EVENT,
@@ -49,7 +51,9 @@ async function harness(turns: StubTurn[], orgConfigYaml: string): Promise<Harnes
         },
         // Hermetic catalog: the journey must not hit integrations.sh.
         catalog: {
-          fetchImpl: (async () =>
+          // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+          // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
+          fetchImpl: (async (_input: string | URL | Request, _init?: RequestInit) =>
             new Response(
               JSON.stringify({
                 version: 1,
@@ -66,7 +70,7 @@ async function harness(turns: StubTurn[], orgConfigYaml: string): Promise<Harnes
                 ],
               }),
               { status: 200 },
-            )) as unknown as typeof fetch,
+            )) as typeof fetch,
         },
       }),
   });
@@ -77,11 +81,13 @@ async function harness(turns: StubTurn[], orgConfigYaml: string): Promise<Harnes
 /** Audit rows for one event type, payload parsed. */
 async function auditRows(h: Harness, eventType: string) {
   const rows = (await h.audit.listAudit({})).filter((r) => r.event_type === eventType);
-  return rows.map((row) => JSON.parse(row.payload) as Record<string, unknown>);
+  // SAFETY: audit payloads are JSON documents (the tools serialize flat
+  // objects via JSON.stringify); the parsed rows carry JsonValue members.
+  return rows.map((row) => JSON.parse(row.payload) as Record<string, JsonValue>);
 }
 
 /** Polls the emulator for an outbound message (posts land a beat after the turn). */
-async function waitForReply(h: Harness, text: string, timeoutMs = 5_000): Promise<unknown> {
+async function waitForReply(h: Harness, text: string, timeoutMs = 5_000): Promise<EmulatorMessage | undefined> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const reply = h.messages(h.slack.dmChannelId).find((m) => m.text === text);
@@ -157,10 +163,13 @@ describe("journey 5: admin setup/onboarding tools live in a restricted session (
         const rows = await auditRows(h, ADMIN_CATALOG_BROWSER_EVENT);
         expect(rows).toHaveLength(1);
         expect(rows[0].action).toBe("draft");
-        const writtenTo = rows[0].written_to;
-        expect(typeof writtenTo).toBe("string");
-        expect(existsSync(writtenTo as string)).toBe(true);
-        const draft = JSON.parse(readFileSync(writtenTo as string, "utf8")) as {
+        // The audit payload's written_to is the absolute draft path the
+        // tool reported — parsed at the boundary; a non-string fails loudly.
+        const writtenTo = z.string().parse(rows[0].written_to);
+        expect(existsSync(writtenTo)).toBe(true);
+        // SAFETY: the draft file is the catalog browser's own serialized
+        // draft JSON (source/manifest asserted below).
+        const draft = JSON.parse(readFileSync(writtenTo, "utf8")) as {
           source: { reviewed: boolean };
           manifest: { id: string };
         };
@@ -195,8 +204,8 @@ describe("journey 5: admin setup/onboarding tools live in a restricted session (
 
         const rows = await auditRows(h, ADMIN_DEPLOY_INFO_EVENT);
         expect(rows).toHaveLength(1);
-        expect(typeof rows[0].uptime_seconds).toBe("number");
-        expect(typeof rows[0].config_dir).toBe("string");
+        expect(rows[0].uptime_seconds).toBeTypeOf("number");
+        expect(rows[0].config_dir).toBeTypeOf("string");
 
         const reply = await waitForReply(h, "identity");
         expect(reply).toBeDefined();
@@ -243,7 +252,9 @@ describe("journey 5: admin setup/onboarding tools live in a restricted session (
           const rows = await auditRows(h, ADMIN_FIRST_RUN_EVENT);
           expect(rows).toHaveLength(1);
           expect(rows[0].ok).toBe(false);
-          const checks = rows[0].checks as Array<{ name: string; ok: boolean }>;
+          // The wizard's checks array is parsed at the boundary; a malformed
+          // payload fails the test loudly instead of being narrowed blindly.
+          const checks = z.array(z.object({ name: z.string(), ok: z.boolean() })).parse(rows[0].checks);
           expect(checks).toHaveLength(6);
           expect(checks.find((c) => c.name === "slack_tokens")!.ok).toBe(false);
 

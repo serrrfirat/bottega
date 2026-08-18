@@ -123,7 +123,7 @@ export function postOutboxRow(
 export function consumeOutboxWatermarked(
   store: Store,
   opts: { limit?: number; watermark?: OutboxWatermark | null; now?: () => number } = {},
-): { rows: OutboxRow[]; watermark: OutboxWatermark | null } {
+) {
   const limit = opts.limit ?? DEFAULT_OUTBOX_BATCH_SIZE;
   const now = opts.now?.() ?? Date.now();
   const watermark = opts.watermark ?? null;

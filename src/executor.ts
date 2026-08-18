@@ -84,7 +84,7 @@ import { syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "./extensions/boundary";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { McpBinding } from "./extensions/manifest";
+import type { McpBinding, JsonValue } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
@@ -574,7 +574,7 @@ async function runWorkItemJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: Work
 }
 
 /** Parses a work item's result JSON column; null when absent or corrupt. */
-function safeParseJson(text: string | null): unknown {
+function safeParseJson(text: string | null): JsonValue {
   if (text === null) return null;
   try {
     return JSON.parse(text);

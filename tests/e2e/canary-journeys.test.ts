@@ -60,7 +60,7 @@ import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import { adminToolDefinitions } from "../../src/tools/admin";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
 import { classifyPickupIntent, buildAutoPickupDirective } from "../../src/tools/work-item-pickup";
-import type { McpBinding } from "../../src/extensions/manifest";
+import type { JsonValue, McpBinding } from "../../src/extensions/manifest";
 import { bootHarness, AutoApproveRouter, type Harness, type StubTurn } from "./harness";
 import { opencodeSafeToolName } from "../../src/server/drivers/agent-driver";
 import {
@@ -267,10 +267,10 @@ describe("channel chat-reply thread polling (issue #212)", () => {
       liveSlack: {
         botUserId: "B-bot",
         qaUserId: "U-qa",
-        history: async () => [{ ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" }],
-        replies: async () => [botReply],
+        history: async (_channelId: string) => [{ ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" }],
+        replies: async (_channelId: string, _threadTs: string) => [botReply],
       },
-    } as unknown as Harness;
+    } as Harness;
     const reply = await waitForBotReply(h, "C1", {
       afterTs: pingTs,
       threadTs: pingTs,
@@ -299,11 +299,14 @@ describe("channel chat-reply thread polling (issue #212)", () => {
       thread_ts: pingTs,
     };
     const polled: string[] = [];
+    // SAFETY: the stub only exposes the live-Slack members postAndWait
+    // reads (postAsUser/replies for the thread poll, botUserId/qaUserId
+    // for isBotMessage); the rest of the Harness surface is unused here.
     const h = {
       liveSlack: {
         botUserId: "B-bot",
         qaUserId: "U-qa",
-        postAsUser: async () => ({ ts: pingTs }), // real live shape: no thread_ts on a top-level post
+        postAsUser: async (_channelId: string, _text: string) => ({ ts: pingTs }), // real live shape: no thread_ts on a top-level post
         replies: async (_channelId: string, ts: string) => {
           polled.push(ts);
           if (ts !== pingTs) throw new Error("slack api conversations.replies: invalid_arguments");
@@ -313,7 +316,7 @@ describe("channel chat-reply thread polling (issue #212)", () => {
           ];
         },
       },
-    } as unknown as Harness;
+    } as Harness;
     const { inboundTs, reply } = await postAndWait(h, "C1", "canary ping", {
       label: "channel ping",
       thread: true,
@@ -342,16 +345,19 @@ describe("channel chat-reply thread polling (issue #212)", () => {
       text: "top-level bot reply",
     };
     const calls: string[] = [];
+    // SAFETY: the stub only exposes the live-Slack members waitForBotReply
+    // reads (replies/history for the poll fallback, botUserId/qaUserId);
+    // the rest of the Harness surface is unused in this mechanism test.
     const h = {
       liveSlack: {
         botUserId: "B-bot",
         qaUserId: "U-qa",
-        postAsUser: async () => ({ ts: pingTs }),
-        replies: async (_channelId: string, ts: string) => {
+        postAsUser: async (_channelId: string, _text: string) => ({ ts: pingTs }),
+        replies: async (_channelId: string, ts: string): Promise<SlackApiMessage[]> => {
           calls.push(`replies:${ts}`);
           throw new Error("slack api conversations.replies: invalid_arguments");
         },
-        history: async () => {
+        history: async (_channelId: string) => {
           calls.push("history");
           return [
             { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
@@ -359,7 +365,7 @@ describe("channel chat-reply thread polling (issue #212)", () => {
           ];
         },
       },
-    } as unknown as Harness;
+    } as Harness;
     const reply = await waitForBotReply(h, "C1", {
       afterTs: pingTs,
       threadTs: pingTs,
@@ -396,11 +402,14 @@ describe("channel chat-reply thread polling (issue #212)", () => {
       text: "ok — the actual reply",
     };
     let polls = 0;
+    // SAFETY: the stub only exposes the live-Slack members waitForBotReply
+    // reads (history for the poll, botUserId/qaUserId for isBotMessage);
+    // the rest of the Harness surface is unused in this mechanism test.
     const h = {
       liveSlack: {
         botUserId: "B-bot",
         qaUserId: "U-qa",
-        history: async () => {
+        history: async (_channelId: string) => {
           polls += 1;
           return [
             { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
@@ -409,7 +418,7 @@ describe("channel chat-reply thread polling (issue #212)", () => {
           ];
         },
       },
-    } as unknown as Harness;
+    } as Harness;
     const reply = await waitForBotReply(h, "C1", {
       afterTs: pingTs,
       label: "progress false pass",
@@ -480,6 +489,8 @@ describe("extension-call journey mechanism (issue #175)", () => {
 
       const rows = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CALL_EVENT });
       expect(rows.length).toBeGreaterThan(before);
+      // SAFETY: the extension-call audit payload carries the tool name + the
+      // gate decision (the runtime's own serialization, asserted below).
       const payload = JSON.parse(rows[rows.length - 1]!.payload) as { tool?: string; decision?: string };
       expect(payload.tool).toBe(FIXTURE_EXTENSION_TOOL);
       expect(payload.decision).toBe("allow");
@@ -562,6 +573,8 @@ describe("model-role-switch journey mechanism (issue #175)", () => {
 
       const rows = await h.store.listAudit({ space: spaceId, event_type: MODEL_SWITCHED_EVENT });
       expect(rows.length).toBeGreaterThan(before);
+      // SAFETY: the model-switched audit payload carries the resolved role
+      // (the runtime's own serialization, asserted below).
       const payload = JSON.parse(rows[rows.length - 1]!.payload) as { role?: string };
       expect(payload.role).toBe("fast");
     } finally {
@@ -757,6 +770,8 @@ describe("model hot-swap + catalog surface mechanisms (issues #189/#192)", () =>
       )!;
       const get = await settings.execute("tc1", {}, undefined, undefined, toolCtxFor(h, spaceId));
       expect(get.isError).not.toBe(true);
+      // SAFETY: model_settings serializes its result as JSON with a single
+      // text block carrying available_models (asserted below).
       const body = JSON.parse((get.content[0] as { text: string }).text) as {
         available_models?: Array<{ provider: string; models: unknown[] }>;
       };
@@ -772,7 +787,9 @@ describe("model hot-swap + catalog surface mechanisms (issues #189/#192)", () =>
       expect(set.isError).not.toBe(true);
       expect(await h.store.getSpaceSettings(spaceId)).toMatchObject({ model: "stub-v1", reasoning_effort: "high" });
       const changed = await h.store.listAudit({ space: spaceId, event_type: MODEL_SETTINGS_CHANGED_EVENT });
-      const payload = JSON.parse(changed[changed.length - 1]!.payload) as { after?: Record<string, unknown> };
+      // SAFETY: the settings-changed audit payload carries the new settings
+      // object under `after` (the runtime's own JSON serialization).
+      const payload = JSON.parse(changed[changed.length - 1]!.payload) as { after?: Record<string, JsonValue> };
       expect(payload.after).toMatchObject({ model: "stub-v1", reasoning_effort: "high" });
     } finally {
       await h.cleanup();
@@ -844,11 +861,15 @@ describe("extension-pin journey mechanism (issue #195)", () => {
 
       const refused = await catalogBrowser.execute("tc1", params, undefined, undefined, toolCtxFor(h, spaceId));
       expect(refused.isError).toBe(true);
+      // SAFETY: the pin tool replies with a single text content block whose
+      // text carries the review-gate confirmation demand (asserted below).
       expect((refused.content[0] as { text: string }).text).toContain("confirm");
       expect(h.extensionRegistry.resolve(spec)).toBeUndefined();
 
       const pinned = await catalogBrowser.execute("tc2", { ...params, confirm: true }, undefined, undefined, toolCtxFor(h, spaceId));
       expect(pinned.isError).not.toBe(true);
+      // SAFETY: the pin tool replies with a single text block whose JSON
+      // carries reviewed/live_registry (the tool's own serialization).
       const body = JSON.parse((pinned.content[0] as { text: string }).text) as {
         reviewed?: unknown;
         live_registry?: unknown;
@@ -858,6 +879,8 @@ describe("extension-pin journey mechanism (issue #195)", () => {
       expect(h.extensionRegistry.resolve(spec)).toBeDefined();
       const audit = await h.store.listAudit({ event_type: ADMIN_CATALOG_BROWSER_EVENT });
       const pinRow = audit.find((r) => {
+        // SAFETY: the admin audit payload carries the action + spec fields
+        // (the tool's own serialization); the filter reads only those.
         const p = JSON.parse(r.payload) as { action?: unknown; spec?: unknown };
         return p.action === "pin" && p.spec === spec;
       });
@@ -937,6 +960,8 @@ describe("extension-pin journey mechanism (issue #195)", () => {
         toolCtxFor(h, spaceId),
       );
       expect(pinned.isError).not.toBe(true);
+      // SAFETY: the pin tool replies with a single text block whose JSON
+      // carries reviewed/live_registry/egress_regenerated (its own serialization).
       const body = JSON.parse((pinned.content[0] as { text: string }).text) as {
         reviewed?: unknown;
         live_registry?: unknown;

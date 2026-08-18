@@ -19,19 +19,20 @@ import {
   syncProxyCredentialsFromEnv,
   writeCodexAuthTokens,
 } from "./proxy-seed";
+import type { JsonValue } from "./manifest";
 
 const NO_VAULT = (): Promise<Map<string, string>> => Promise.resolve(new Map());
 const NO_KEYCHAIN = (): Promise<string | null> => Promise.resolve(null);
 const NO_ROWS = (): Promise<Array<{ refresh?: string }>> => Promise.resolve([]);
 const SILENT = (): void => {};
 
-function tempSecretsDir(): { dir: string; cleanup(): void } {
+function tempSecretsDir() {
   const dir = mkdtempSync(join(tmpdir(), "bottega-proxy-seed-"));
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 /** A Codex CLI auth.json fixture in a temp dir (never a real home file). */
-function codexAuthFile(auth: unknown): { dir: string; path: string; cleanup(): void } {
+function codexAuthFile(auth: JsonValue) {
   const dir = mkdtempSync(join(tmpdir(), "bottega-codex-auth-"));
   const path = join(dir, "auth.json");
   writeFileSync(path, JSON.stringify(auth));
@@ -56,15 +57,15 @@ describe("model gateway keys (issue #208)", () => {
         readOAuthRows: NO_ROWS,
         log: SILENT,
       });
-      const expected: Record<string, string> = {
-        near: "near-env",
-        opencode: "opencode-env",
-        openai: "openai-env",
-        anthropic: "anthropic-env",
-      };
+      const expected = new Map<string, string>([
+        ["near", "near-env"],
+        ["opencode", "opencode-env"],
+        ["openai", "openai-env"],
+        ["anthropic", "anthropic-env"],
+      ]);
       for (const key of MODEL_PROXY_KEYS) {
         const path = join(s.dir, proxyKeyFileName(key.provider));
-        expect(readFileSync(path, "utf8")).toBe(expected[key.provider]);
+        expect(readFileSync(path, "utf8")).toBe(expected.get(key.provider)!);
         expect(statSync(path).mode & 0o777).toBe(0o600);
         expect(env[key.envName]).toBeUndefined();
       }

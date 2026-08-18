@@ -221,7 +221,7 @@ describe("live-slack canary skip gates (issue #79)", () => {
 describe("harness model ref resolution (issue #214)", () => {
   test("pickRealModelRef precedence: CANARY_MODEL_REF > codex > near > opencode", async () => {
     await withScrubbedEnv(() => {
-      const env = (): Record<string, string | undefined> => ({ ...process.env });
+      const env = () => ({ ...process.env });
       expect(pickRealModelRef(env())).toBeNull();
 
       const dir = mkdtempSync(join(tmpdir(), "bottega-codex-ref-"));

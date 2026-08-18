@@ -808,6 +808,8 @@ describe("list_work_items", () => {
 
     const res = await listTool(s).execute("tc-list", {}, undefined, undefined, ctxFor(space.id));
     expect(res.isError).not.toBe(true);
+    // SAFETY: list_work_items serializes count + the visible items
+    // (id/description/state/assignee/created) as its single text block.
     const payload = JSON.parse(resultText(res)) as {
       count: number;
       items: Array<{ id: string; description: string; state: string; assignee: string; created: number }>;
@@ -815,17 +817,18 @@ describe("list_work_items", () => {
     expect(payload.count).toBe(2);
     expect(payload.items.map((i) => i.id).sort()).toEqual([open.id, blocked.id].sort());
     for (const i of payload.items) {
-      expect(typeof i.id).toBe("string");
-      expect(typeof i.description).toBe("string");
-      expect(typeof i.state).toBe("string");
-      expect(typeof i.assignee).toBe("string");
-      expect(typeof i.created).toBe("number");
+      expect(i.id).toBeTypeOf("string");
+      expect(i.description).toBeTypeOf("string");
+      expect(i.state).toBeTypeOf("string");
+      expect(i.assignee).toBeTypeOf("string");
+      expect(i.created).toBeTypeOf("number");
     }
     expect(payload.items.find((i) => i.id === open.id)).toMatchObject({ state: "open", assignee: "U1" });
     expect(payload.items.find((i) => i.id === blocked.id)).toMatchObject({ state: "blocked" });
 
     // The state filter narrows the visible queue.
     const filtered = await listTool(s).execute("tc-list", { state: "blocked" }, undefined, undefined, ctxFor(space.id));
+    // SAFETY: the filtered list serializes count + each item's id (the tool's own JSON).
     const filteredPayload = JSON.parse(resultText(filtered)) as { count: number; items: Array<{ id: string }> };
     expect(filteredPayload.count).toBe(1);
     expect(filteredPayload.items[0]!.id).toBe(blocked.id);
@@ -846,6 +849,7 @@ describe("list_work_items", () => {
 
     const res = await listTool(s).execute("tc-list", { space: spaceB.id }, undefined, undefined, ctxFor(spaceA.id));
     expect(res.isError).not.toBe(true);
+    // SAFETY: the other-space list serializes count + each item's description (the tool's own JSON).
     const payload = JSON.parse(resultText(res)) as { count: number; items: Array<{ description: string }> };
     expect(payload.count).toBe(1);
     expect(payload.items[0]!.description).toBe("in B");
@@ -853,6 +857,8 @@ describe("list_work_items", () => {
 
   test("fails closed without a space session", async () => {
     const s = freshStore();
+    // SAFETY: the list tool reads only ctx.sessionManager.getSessionFile();
+    // the stub returns undefined to exercise the no-space fail-closed branch.
     const res = await listTool(s).execute("tc-list", {}, undefined, undefined, {
       sessionManager: { getSessionFile: () => undefined },
     } as ExtensionContext);

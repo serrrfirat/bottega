@@ -13,6 +13,7 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
 import { OAUTH_TOKEN_ENDPOINTS, oauthTokenBlobFileName } from "../egress/generate";
@@ -20,6 +21,7 @@ import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { fetchVaultApiKeysFromEnv, keychainReaderFromEnv, keychainServiceFor } from "../server/boot-secrets";
 import type { BootSecret } from "../server/boot-secrets";
+import type { JsonValue } from "./manifest";
 
 /**
  * The model-gateway keys the sync writes (issue #208): one `<provider>.secret`
@@ -63,6 +65,14 @@ export const OAUTH_PROXY_CREDENTIALS: readonly OAuthProxyCredential[] = [
   { provider: "attio", clientIdEnv: "ATTIO_OAUTH_CLIENT_ID", clientSecretEnv: "ATTIO_OAUTH_CLIENT_SECRET" },
   { provider: "notion", clientIdEnv: "NOTION_OAUTH_CLIENT_ID", clientSecretEnv: "NOTION_OAUTH_CLIENT_SECRET" },
 ] as const;
+
+/** The proxy oauth_token blob's file shape: the refresh grant + client credentials (issue #208). */
+interface ProxyOAuthBlob {
+  refresh_token: string;
+  client_id: string;
+  /** Present only when the deployment configures a client secret (public clients omit it). */
+  client_secret?: string;
+}
 
 /** The proxy-side secret file for a model gateway key. */
 export function proxyKeyFileName(provider: string): string {
@@ -179,6 +189,12 @@ export type CodexMintProbe = (input: CodexMintProbeInput) => Promise<CodexMintOu
  * tests never touch the network (the #191 isolation rule); the probe's own
  * tests inject the seam.
  */
+/**
+ * The Codex token endpoint's 2xx response (RFC 6749 §5.1): `refresh_token`
+ * is present only when the endpoint rotates it, and is a non-empty string.
+ */
+const codexTokenResponseSchema = z.object({ refresh_token: z.string().min(1).optional() });
+
 async function probeCodexMint(input: CodexMintProbeInput): Promise<CodexMintOutcome> {
   if (process.env.NODE_ENV === "test") return { minted: true, refreshToken: input.refreshToken };
   let res: Response;
@@ -198,9 +214,9 @@ async function probeCodexMint(input: CodexMintProbeInput): Promise<CodexMintOutc
   if (!res.ok) return { minted: false, status: res.status, refreshToken: input.refreshToken };
   let rotated = input.refreshToken;
   try {
-    const parsed = (await res.json()) as { refresh_token?: unknown };
-    if (typeof parsed.refresh_token === "string" && parsed.refresh_token !== "") {
-      rotated = parsed.refresh_token;
+    const parsed = codexTokenResponseSchema.safeParse(await res.json());
+    if (parsed.success && parsed.data.refresh_token !== undefined) {
+      rotated = parsed.data.refresh_token;
     }
   } catch {
     // A 2xx with a non-JSON body still minted; keep the probed token.
@@ -227,13 +243,19 @@ export function writeCodexAuthTokens(authFilePath: string, refreshToken: string)
   } catch {
     return;
   }
-  let parsed: Record<string, unknown>;
+  let parsed: Record<string, JsonValue>;
   try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
+    // SAFETY: the auth file is the Codex CLI's own JSON serialization — a
+    // JSON document; the parse target types member access on it, and a
+    // non-object payload fails the same property paths as before.
+    parsed = JSON.parse(raw) as Record<string, JsonValue>;
   } catch {
     return;
   }
-  const tokens = (parsed.tokens ??= {}) as Record<string, unknown>;
+  // SAFETY: `tokens` is the document's tokens member — an object in the
+  // CLI's serialization (the sync's own read requires it); the assertion
+  // only types the refresh_token read/write below.
+  const tokens = (parsed.tokens ??= {}) as Record<string, JsonValue>;
   if (tokens.refresh_token === refreshToken) return;
   tokens.refresh_token = refreshToken;
   let mode = 0o600;
@@ -257,6 +279,11 @@ export function writeCodexAuthTokens(authFilePath: string, refreshToken: string)
  * unparseable JSON, or missing tokens — the fail-closed signal (the
  * caller deletes the boundary blob).
  */
+/** The Codex CLI auth file's token shape (the fields the sync reads; other fields are preserved verbatim on write-back). */
+const codexAuthFileSchema = z.object({
+  tokens: z.object({ access_token: z.string().min(1), refresh_token: z.string().min(1) }).optional(),
+});
+
 export function readCodexAuthTokens(authFilePath: string): CodexAuthTokens | null {
   let raw: string;
   try {
@@ -265,12 +292,10 @@ export function readCodexAuthTokens(authFilePath: string): CodexAuthTokens | nul
     return null;
   }
   try {
-    const parsed = JSON.parse(raw) as { tokens?: { access_token?: unknown; refresh_token?: unknown } };
-    const accessToken = parsed.tokens?.access_token;
-    const refreshToken = parsed.tokens?.refresh_token;
-    if (typeof accessToken !== "string" || accessToken === "") return null;
-    if (typeof refreshToken !== "string" || refreshToken === "") return null;
-    return { accessToken, refreshToken };
+    const parsed = codexAuthFileSchema.parse(JSON.parse(raw));
+    const tokens = parsed.tokens;
+    if (tokens === undefined) return null;
+    return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
   } catch {
     return null;
   }
@@ -387,6 +412,8 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
     const fromEnv = env[key.envName];
     const fromVault = vault.get(key.provider);
     const fromKeychain = await readKeychain(
+      // SAFETY: keychainServiceFor reads only secret.vaultProvider
+      // (boot-secrets.ts); the sync object carries it under `provider`.
       keychainServiceFor({ envName: key.envName, vaultProvider: key.provider, label: key.provider } as BootSecret),
     );
     const value = fromVault ?? fromEnv ?? fromKeychain ?? null;
@@ -426,7 +453,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
       );
       continue;
     }
-    const blob: Record<string, string> = { refresh_token: refresh, client_id: clientId };
+    const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId };
     const clientSecret = credential.clientSecretEnv !== undefined ? env[credential.clientSecretEnv] : undefined;
     if (clientSecret !== undefined && clientSecret !== "") blob.client_secret = clientSecret;
     writeSecretFile(secretsDir, fileName, JSON.stringify(blob));

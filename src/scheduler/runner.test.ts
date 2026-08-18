@@ -209,6 +209,8 @@ describe("scheduler runner (issue #86)", () => {
     const rows = await audit.listAudit({ event_type: WORK_ITEM_CREATED_EVENT });
     expect(rows).toHaveLength(1);
     expect(rows[0]?.space_id).toBe("slack:C1");
+    // SAFETY: the work_item.created audit payload is the store's own JSON
+    // serialization (id + requester, asserted below).
     const created = JSON.parse(rows[0]!.payload) as { id: string; requester: string };
     expect(created.requester).toBe("scheduler");
     const item = await store.getWorkItem(created.id);

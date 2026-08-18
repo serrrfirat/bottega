@@ -26,6 +26,12 @@ import {
 import { errorMessage, toolError } from "./helpers";
 import type { Store } from "../store/db";
 
+/** The list_work_items audit payload: the optional state filter + the returned count (issue #159). */
+interface WorkItemListAuditPayload {
+  state?: string;
+  count: number;
+}
+
 export interface WorkItemsExtensionOpts {
   /** Actor for tool calls (requester default, audit rows, cancel authorization). Default "agent". */
   actor?: string;
@@ -288,11 +294,13 @@ export function workItemToolDefinitions(
           assignee: item.assignee,
           created: item.created_at,
         }));
+        const auditPayload: WorkItemListAuditPayload = { count: visible.length };
+        if (params.state !== undefined) auditPayload.state = params.state;
         await store.appendAudit({
           space_id: spaceId,
           actor,
           event_type: WORK_ITEM_LIST_EVENT,
-          payload: JSON.stringify({ ...(params.state !== undefined ? { state: params.state } : {}), count: visible.length }),
+          payload: JSON.stringify(auditPayload),
         });
         return { content: [{ type: "text", text: JSON.stringify({ count: visible.length, items: visible }) }] };
       } catch (err) {

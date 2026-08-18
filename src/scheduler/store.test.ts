@@ -50,6 +50,8 @@ function createToolFor(
   audit: AuditModule,
   registry: SchedulerActionRegistry,
 ): ToolDefinition<typeof createSchedulerJobArgsSchema> {
+  // SAFETY: schedulerToolDefinitions always registers create_scheduler_job
+  // (the surface under test); the find + assertion narrows to that entry.
   const create = schedulerToolDefinitions(store, audit, registry).find(
     (definition) => definition.name === "create_scheduler_job",
   ) as ToolDefinition<typeof createSchedulerJobArgsSchema> | undefined;
@@ -62,6 +64,8 @@ function textOf(result: AgentToolResult): string {
 }
 
 function jobBody(result: AgentToolResult): SchedulerJob & { summary: string } {
+  // SAFETY: the create tool serializes the created job + summary as its
+  // single text block (the tool's own JSON).
   return JSON.parse(textOf(result)) as SchedulerJob & { summary: string };
 }
 

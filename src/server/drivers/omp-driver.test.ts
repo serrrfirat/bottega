@@ -634,6 +634,8 @@ describe("upload-link reply survives SDK secret obfuscation (issue #221)", () =>
         // SAFETY: the mint tool reads only ctx.sessionManager.getSessionFile().
         { sessionManager: { getSessionFile: () => null } } as never,
       );
+      // SAFETY: the mint tool's result content is the SDK's text-block
+      // array (the tool-result contract); the first text block is the URL.
       const mintedText =
         (minted.content as Array<{ type: "text"; text: string }>).find((c) => c.type === "text")?.text ?? "";
       expect(mintedText.split("\n")[0]).toContain(`${TUNNEL_BASE}/upload/`);
@@ -661,6 +663,9 @@ describe("upload-link reply survives SDK secret obfuscation (issue #221)", () =>
       const driver = createOmpSdkDriver({
         agentDir,
         createSession: async () =>
+          // SAFETY: the driver's createSession seam reads only session +
+          // extensionsResult for the session it creates here; the stub's
+          // remaining members are inert in this test.
           ({
             session: stub.session,
             extensionsResult: { extensions, errors: extensionErrors, runtime: {} },

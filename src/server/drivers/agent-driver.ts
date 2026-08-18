@@ -14,7 +14,7 @@ import {
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
 import { setAgentDir } from "@oh-my-pi/pi-utils";
-import { parseYamlSubset } from "../../yaml-subset";
+import { parseYamlSubset, type YamlNode } from "../../yaml-subset";
 import {
   DEFAULT_MODEL_CATALOG_DIR,
   listAvailableModels,
@@ -919,7 +919,7 @@ export function ensureAgentDirModelPin(
     return "created";
   }
   // An unparseable operator config is never guessed at.
-  let parsed: Record<string, unknown>;
+  let parsed: Record<string, YamlNode>;
   try {
     parsed = parseYamlSubset(existing);
   } catch {
@@ -948,7 +948,8 @@ export function ensureAgentDirModelPin(
   // must not be clobbered — #125), or when the existing pin is unreadable.
   const agentRoles = z.record(z.string(), z.unknown()).safeParse(parsed.modelRoles);
   if (!agentRoles.success) return "unchanged";
-  const agentDefault = z.string().safeParse(agentRoles.data.default).success ? (agentRoles.data.default as string) : undefined;
+  const agentDefaultParsed = z.string().safeParse(agentRoles.data.default);
+  const agentDefault = agentDefaultParsed.success ? agentDefaultParsed.data : undefined;
   if (agentDefault === templateDefault || opts.orgDefault !== undefined) return "unchanged";
   // Stale pin (issue #207): correct the `default` value IN PLACE — the
   // rest of the operator's config stays byte-identical.

@@ -29,11 +29,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ModelRegistry, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { completeSimple } from "@oh-my-pi/pi-ai";
-import { parseYamlSubset } from "../yaml-subset";
+import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 import { assertAgentDirModelAvailable } from "../server/drivers/agent-driver";
 
 /** The proxy placeholder every provider must send (issue #208). */
 const PLACEHOLDER = "bottega-proxy-placeholder";
+
+/** One provider's config block in the committed models.yml (a YAML-subset mapping). */
+type ProviderConfig = Record<string, YamlNode>;
 
 /** The committed model catalog (the source of truth for the provider shapes). */
 const COMMITTED_MODELS_YML = readFileSync(resolve(import.meta.dir, "../../config/omp/models.yml"), "utf8");
@@ -60,7 +63,7 @@ function responsesSse(): string {
   ].join("");
 }
 
-function stubGateway(): { baseUrl: string } {
+function stubGateway() {
   const server = Bun.serve({
     port: 0,
     fetch: async (req) => {
@@ -102,20 +105,24 @@ afterAll(() => {
  * (the pre-#214 config.yml pin) and openai-codex's gpt-5.6-luna (issue
  * #214, the default role — config.yml modelRoles.default — and the SDK
  * catalog entry under the key-only decl). */
-function stubAgentDir(): { agentDir: string; declaredAnchors: Array<{ provider: string; id: string }> } {
+function stubAgentDir() {
   const stub = stubGateway();
   const parsed = parseYamlSubset(COMMITTED_MODELS_YML);
-  const providers = parsed["providers"] as Record<string, Record<string, unknown>>;
+  // SAFETY: the committed models.yml declares `providers` as a mapping of
+  // provider → config block (the fixture's own shape, read-only here).
+  const providers = parsed["providers"] as Record<string, ProviderConfig>;
   const lines: string[] = ["providers:"];
   const declaredAnchors: Array<{ provider: string; id: string }> = [];
   for (const [provider, config] of Object.entries(providers)) {
     lines.push(`  ${provider}:`);
     const emitted = new Set<string>();
-    for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+    for (const [key, value] of Object.entries(config)) {
       emitted.add(key);
       if (key === "models") {
         lines.push("    models:");
-        for (const model of value as Array<Record<string, unknown>>) {
+        // SAFETY: the `models` key is an array of model mappings in the
+        // committed models.yml (id/name/contextWindow/maxTokens).
+        for (const model of value as Array<Record<string, YamlNode>>) {
           lines.push(`      - id: ${model["id"]}`);
           lines.push(`        name: ${model["name"]}`);
           lines.push(`        contextWindow: ${model["contextWindow"]}`);
@@ -157,7 +164,9 @@ describe("proxy placeholder on the wire (issue #208)", () => {
     // unset — `Bearer NEAR_API_KEY` on the wire. The wave kills that
     // fail-open by construction: the placeholder is a literal.
     const parsed = parseYamlSubset(COMMITTED_MODELS_YML);
-    const providers = parsed["providers"] as Record<string, Record<string, unknown>>;
+    // SAFETY: the committed models.yml declares `providers` as a mapping of
+    // provider → config block (the fixture's own shape, read-only here).
+    const providers = parsed["providers"] as Record<string, ProviderConfig>;
     expect(Object.keys(providers).sort()).toEqual(["anthropic", "near", "openai", "openai-codex", "opencode-go"]);
     for (const config of Object.values(providers)) {
       expect(config["apiKey"]).toBe(PLACEHOLDER);

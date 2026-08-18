@@ -38,7 +38,7 @@ afterAll(() => {
 const T0 = Date.UTC(2026, 7, 18, 10, 0, 0);
 
 /** Injectable clock (ms epoch) so TTL/retry tests never sleep. */
-function clock(start = T0): { now: () => number; advance: (ms: number) => void } {
+function clock(start = T0) {
   let t = start;
   return {
     now: () => t,
@@ -48,9 +48,9 @@ function clock(start = T0): { now: () => number; advance: (ms: number) => void }
   };
 }
 
-// SAFETY: SELECT * returns the outbox column shape (OutboxRow); a missing
-// row maps to null below.
 function outboxRow(store: Store, id: string): OutboxRow | null {
+  // SAFETY: SELECT * returns the outbox column shape (OutboxRow); a missing
+  // row yields undefined, mapped to null below.
   const row = store.getDb().query("SELECT * FROM outbox WHERE id = ?").get(id) as OutboxRow | null;
   return row ?? null;
 }
@@ -221,6 +221,8 @@ describe("postPendingOutboxRows", () => {
     const audits = await store.listAudit({ event_type: OUTBOX_FAILED_EVENT });
     expect(audits).toHaveLength(DEFAULT_OUTBOX_MAX_POST_ATTEMPTS);
     for (const [i, audit] of audits.entries()) {
+      // SAFETY: the outbox.failed audit payload is the seam's own JSON
+      // serialization (attempts + error, asserted below).
       const payload = JSON.parse(audit.payload) as { attempts: number; error: string };
       failedAudits.push(payload);
       expect(payload.attempts).toBe(i + 1);

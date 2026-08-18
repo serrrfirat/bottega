@@ -556,6 +556,8 @@ describe("upload link minting (issue #196)", () => {
           { sessionManager: { getSessionFile: () => null } } as never,
         );
         expect(result.isError).toBeUndefined();
+        // SAFETY: the mint tool replies with a single text content block
+        // (the SDK tool-result contract); text is that block.
         const text = (result.content[0] as { text: string }).text;
         // The minted URL is anchored verbatim (first line)…
         const url = text.split("\n")[0]!;
@@ -744,6 +746,8 @@ describe("upload link public base liveness (issue #211)", () => {
           { sessionManager: { getSessionFile: () => null } } as never,
         );
         expect(result.isError).toBeUndefined();
+        // SAFETY: the mint tool replies with a single text content block
+        // (the SDK tool-result contract); text is that block.
         const text = (result.content[0] as { text: string }).text;
         // The warning is LOUD and actionable: it names the env var, says
         // the tunnel URL is stale, and flags the link as loopback-only.
