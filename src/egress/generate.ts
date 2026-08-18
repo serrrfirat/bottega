@@ -122,13 +122,28 @@ export interface OAuthTokenEntry {
  *   linear — https://mcp.linear.app/.well-known/oauth-authorization-server
  *   attio  — https://mcp.attio.com/.well-known/oauth-authorization-server
  * An oauth-type extension without an endpoint here FAILS config generation
- * (never a guessed URL — a wrong token endpoint would mint garbage).
+ * (never a guessed URL — a wrong token endpoint would mint garbage). The
+ * canary's test fixtures (issue #212) are the exception: `fixture.`-
+ * prefixed ids (tests/e2e/canary.ts — fixture.pin, fixture.oauth) are
+ * test-only and synthesize their endpoint from their own allowlisted
+ * domain in {@link oauthTokenEntries} — they never appear in
+ * config/extensions, so the production map stays fake-domain-free.
  */
 export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
   linear: "https://mcp.linear.app/token",
   attio: "https://app.attio.com/oidc/token",
   notion: "https://mcp.notion.com/token",
 };
+
+/**
+ * The canary's OAuth fixture id prefix (issue #212): test-only extensions
+ * (fixture.pin, fixture.oauth — tests/e2e/canary.ts) with reserved testing
+ * domains (fixture-pin.example.com, oauth.fixture.test). Their egress
+ * regeneration must not demand a verified RFC 8414 token endpoint — there
+ * is no real authorization server behind a fixture domain, so the endpoint
+ * is synthesized from the fixture's own allowlisted host instead.
+ */
+const CANARY_OAUTH_FIXTURE_ID_PREFIX = "fixture.";
 
 /** The proxy-side OAuth credential blob for a provider (the `tokens` entry's json_key file). */
 export function oauthTokenBlobFileName(extensionId: string): string {
@@ -150,12 +165,26 @@ export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSn
  * The oauth_token entries for the pinned snapshots' OAuth extensions
  * (issue #208): each needs a VERIFIED token endpoint (OAUTH_TOKEN_ENDPOINTS
  * — RFC 8414 discovery metadata); an OAuth extension without one fails
- * generation closed (never a guessed URL).
+ * generation closed (never a guessed URL). The canary's `fixture.`-prefixed
+ * OAuth fixtures (issue #212) are test-only: their endpoint is synthesized
+ * from the fixture's own allowlisted domain (there is no real
+ * authorization server behind a fixture domain), so the #195 extension-pin
+ * journey's egress regeneration runs deterministically.
  */
 export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): OAuthTokenEntry[] {
   return snapshots
     .filter((s) => s.manifest.credentialSchema.type === "oauth")
     .map((s): OAuthTokenEntry => {
+      if (s.manifest.id.startsWith(CANARY_OAUTH_FIXTURE_ID_PREFIX)) {
+        const host = s.manifest.domains.find((domain) => domain !== "*");
+        if (host === undefined) {
+          throw new Error(
+            `egress config generation: the OAuth fixture "${s.manifest.id}" has no allowlisted domain to ` +
+              "synthesize its token endpoint from",
+          );
+        }
+        return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint: `https://${host}/token` };
+      }
       const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
       if (tokenEndpoint === undefined) {
         throw new Error(
