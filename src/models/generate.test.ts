@@ -31,13 +31,13 @@ describe("renderModelsConfig (issue #67)", () => {
   });
 
   test("keeps the template provider skeleton and lists the configured ids", () => {
-    const yaml = renderModelsConfig({ models: { default: "zai-org/GLM-5.1-FP8", fast: "acme/chat" } });
+    const yaml = renderModelsConfig({ models: { default: "deepseek-ai/DeepSeek-V4-Flash", fast: "acme/chat" } });
     expect(yaml).not.toBeNull();
     const text = yaml!;
     expect(text).toContain("opencode-go:");
     expect(text).toContain("apiKey: bottega-proxy-placeholder");
     expect(text).toContain("baseUrl: \"https://cloud-api.near.ai/v1\"");
-    expect(text).toContain('id: "zai-org/GLM-5.1-FP8"');
+    expect(text).toContain('id: "deepseek-ai/DeepSeek-V4-Flash"');
     expect(text).toContain('id: "acme/chat"');
     // The openai/anthropic gateway skeleton survives settings regeneration.
     expect(text).toContain("baseUrl: \"https://api.openai.com/v1\"");
@@ -52,9 +52,9 @@ describe("renderModelsConfig (issue #67)", () => {
     // Dedup: reasoning repeats default → listed once under near (the
     // openai/anthropic anchors add their own id lines, which is expected).
     const yaml2 = renderModelsConfig({
-      models: { default: "zai-org/GLM-5.1-FP8", reasoning: "zai-org/GLM-5.1-FP8" },
+      models: { default: "deepseek-ai/DeepSeek-V4-Flash", reasoning: "deepseek-ai/DeepSeek-V4-Flash" },
     })!;
-    expect(yaml2.match(/id: "zai-org\/GLM-5\.1-FP8"/g)?.length).toBe(1);
+    expect(yaml2.match(/id: "deepseek-ai\/DeepSeek-V4-Flash"/g)?.length).toBe(1);
   });
 });
 
@@ -64,7 +64,7 @@ describe("regenerateModelsConfig (issue #67)", () => {
     try {
       const outPath = join(dir, "models.yml");
       const rendered = regenerateModelsConfig(
-        { models: { default: "zai-org/GLM-5.1-FP8" } },
+        { models: { default: "deepseek-ai/DeepSeek-V4-Flash" } },
         outPath,
       );
       expect(rendered).not.toBeNull();

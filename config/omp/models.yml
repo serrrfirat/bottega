@@ -31,15 +31,21 @@ providers:
   # at egress.
   opencode-go:
     apiKey: bottega-proxy-placeholder
-  # Fallback: NEAR AI Cloud gateway (issue #36). Used when no opencode key
-  # is configured.
+  # Default model (issue #213): the NEAR AI Cloud gateway serves
+  # deepseek-ai/DeepSeek-V4-Flash WITHOUT reasoning_content (fast, verified
+  # live) — GLM-5.1-FP8's verbose chain-of-thought was the latency problem
+  # this swap fixes. opencode-go stays the preferred primary once its
+  # monthly quota recovers (#213); only the default role moved. The entry
+  # keeps its shape: one anchor + live-catalog probe via listAvailableModels
+  # (issue #194) — no reasoning/thinking config here (the gateway serves
+  # this model without a thinking block).
   near:
     api: openai-completions
     baseUrl: "https://cloud-api.near.ai/v1"
     apiKey: bottega-proxy-placeholder
     models:
-      - id: zai-org/GLM-5.1-FP8
-        name: GLM 5.1 FP8 via NEAR AI Cloud
+      - id: deepseek-ai/DeepSeek-V4-Flash
+        name: DeepSeek V4 Flash via NEAR AI Cloud
         contextWindow: 128000
         maxTokens: 8192
   # OpenAI (ChatGPT): direct OpenAI-compatible gateway. Same pattern as

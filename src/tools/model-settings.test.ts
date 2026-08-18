@@ -27,8 +27,7 @@ afterAll(() => {
 const catalogFixture: ModelCatalogEntry[] = [
   { id: "gpt-sol-5.6", name: "GPT-Sol 5.6", provider: "opencode-go" },
   { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },
-  { id: "zai-org/GLM-5.1-FP8", name: "GLM 5.1 FP8", provider: "near" },
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "near" },
+  { id: "deepseek-ai/DeepSeek-V4-Flash", name: "DeepSeek V4 Flash", provider: "near" },
 ];
 
 function loadTools(
@@ -219,10 +218,7 @@ describe("model catalog surface (issue #192)", () => {
     expect(JSON.parse(resultText(res)).available_models).toEqual([
       {
         provider: "near",
-        models: [
-          { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
-          { id: "zai-org/GLM-5.1-FP8", name: "GLM 5.1 FP8" },
-        ],
+        models: [{ id: "deepseek-ai/DeepSeek-V4-Flash", name: "DeepSeek V4 Flash" }],
       },
       {
         provider: "opencode-go",
@@ -246,20 +242,21 @@ describe("model catalog surface (issue #192)", () => {
   });
 
   test("exact provider/id and friendly provider-aware names resolve against the listed ids (#185 pin)", () => {
-    // "zai-org/GLM-5.1-FP8" — the exact id the catalog lists.
-    expect(resolveModelPin("zai-org/GLM-5.1-FP8", catalogFixture)).toEqual({
+    // "deepseek-ai/DeepSeek-V4-Flash" — the exact id the catalog lists.
+    expect(resolveModelPin("deepseek-ai/DeepSeek-V4-Flash", catalogFixture)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "zai-org/GLM-5.1-FP8" },
+      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
     });
-    // "use the near GLM" → the NEAR provider's GLM (opencode-go has none).
-    expect(resolveModelPin("near glm", catalogFixture)).toEqual({
-      ok: true,
-      pin: { kind: "id", modelId: "zai-org/GLM-5.1-FP8" },
-    });
-    // "the near deepseek" → resolves to near's deepseek.
+    // "use the near deepseek" → the NEAR provider's deepseek (never
+    // opencode-go's same-named bare id).
     expect(resolveModelPin("near deepseek", catalogFixture)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
+    });
+    // "the near deepseek" → resolves to near's deepseek.
+    expect(resolveModelPin("the near deepseek", catalogFixture)).toEqual({
+      ok: true,
+      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
     });
     // The provider-UNQUALIFIED "deepseek v4" also resolves — near wins the
     // tie (issue #194): near is the WORKING provider, so an unqualified
@@ -267,7 +264,7 @@ describe("model catalog surface (issue #192)", () => {
     // default. A tie without near still fails closed as ambiguous.
     expect(resolveModelPin("deepseek v4", catalogFixture)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
     });
     const stillAmbiguous = resolveModelPin("deepseek v4", [
       { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },

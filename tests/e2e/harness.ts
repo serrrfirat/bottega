@@ -490,18 +490,18 @@ export type HarnessApprovalRouter = ApprovalRouter & {
 
 /** The canary model refs (issue #71): the deployment template's providers (config/omp/models.yml). */
 export const CANARY_MODEL_REFS = {
-  /** Primary (issue #37): deepseek-v4-flash via the built-in opencode-go provider. */
+  /** Preferred primary (issue #37): deepseek-v4-flash via the built-in opencode-go provider (quota-limited, #213). */
   opencode: "opencode-go/deepseek-v4-flash",
-  /** Fallback (issue #36): NEAR AI Cloud gateway. */
-  near: "near/zai-org/GLM-5.1-FP8",
+  /** Default (issue #213): NEAR AI Cloud gateway serves DeepSeek-V4-Flash without reasoning_content. */
+  near: "near/deepseek-ai/DeepSeek-V4-Flash",
 } as const;
 
 /**
  * Picks the canary default model from the environment:
  *   - `CANARY_MODEL_REF`, when set, wins (explicit override);
- *   - else the NEAR fallback (`near/zai-org/GLM-5.1-FP8`).
+ *   - else the NEAR default (`near/deepseek-ai/DeepSeek-V4-Flash`).
  * The NEAR provider remains the default because it is the exercise-the-
- * canary-JOURNEYS model; the opencode-go primary (issue #37) is now usable
+ * canary-JOURNEYS model; the opencode-go primary (issue #37) is usable
  * too — the driver flattens dotted tool names at the session boundary
  * (issue #78), and the opencode gateway accepts the flat names, so
  * `CANARY_MODEL_REF=opencode-go/deepseek-v4-flash bun run canary` passes.

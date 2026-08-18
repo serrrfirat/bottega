@@ -296,7 +296,7 @@ describe("createOmpSdkDriver toolset contract", () => {
 });
 
 describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
-  const PIN_ROLE = "opencode-go/deepseek-v4-flash";
+  const PIN_ROLE = "near/deepseek-ai/DeepSeek-V4-Flash";
 
   function tempTemplate(role = PIN_ROLE) {
     const dir = mkdtempSync(join(tmpdir(), "omp-pin-"));
@@ -385,18 +385,19 @@ describe("agent-dir model pin + boot guard (issue #78/#80)", () => {
     }
   });
 
-  test("the committed template pins the documented modelRoles default (#78 recurrence fix)", () => {
+  test("the committed template pins the documented modelRoles default (#78 recurrence fix, re-pinned #213)", () => {
     // The #78 regression: a stale agent-dir config let the session silently
     // fall back to the provider catalog default (kimi-k2.7-code) and the
     // Console Go gateway 400'd into empty completions. The committed
-    // template carries the pin; reverting it fails this named test.
+    // template carries the pin — now the NEAR default (#213); reverting it
+    // fails this named test.
     const dir = mkdtempSync(join(tmpdir(), "omp-pin-"));
     try {
       const agentDir = join(dir, "agent");
       mkdirSync(agentDir, { recursive: true });
       expect(ensureAgentDirModelPin(agentDir)).toBe("created");
       const parsed = parseYamlSubset(readFileSync(join(agentDir, "config.yml"), "utf8"));
-      expect(parsed.modelRoles).toEqual({ default: "opencode-go/deepseek-v4-flash" });
+      expect(parsed.modelRoles).toEqual({ default: "near/deepseek-ai/DeepSeek-V4-Flash" });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

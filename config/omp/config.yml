@@ -3,13 +3,18 @@
 # file is the per-deployment template, mounted from config/omp/ by compose.
 secrets:
   enabled: true
-# Default model role (issue #78): pinned so the session never silently
-# shifts to the opencode-go provider's catalog default (kimi-k2.7-code)
-# when the catalog updates. When no opencode key is configured the model
-# is unavailable and the SDK falls back to the first available provider
-# (NEAR AI Cloud) — the #36 fallback design is preserved.
+# Default model role (issue #78, re-pinned #213): pinned so the session
+# never silently shifts to a provider catalog default (kimi-k2.7-code)
+# when the catalog updates. The default is the NEAR AI Cloud gateway's
+# deepseek-ai/DeepSeek-V4-Flash — served WITHOUT reasoning_content
+# (verified live, 0.8-2.0s per trivial completion; GLM-5.1-FP8's verbose
+# chain-of-thought was 3.5-18s). opencode-go/deepseek-v4-flash stays the
+# preferred primary once its monthly quota recovers (#213): the key-only
+# models.yml entry and the SDK catalog resolution are untouched, so the
+# operator re-pins `default: opencode-go/deepseek-v4-flash` when the
+# quota resets.
 modelRoles:
-  default: opencode-go/deepseek-v4-flash
+  default: near/deepseek-ai/DeepSeek-V4-Flash
 # approvalMode is deliberately unset: the policy extension (issue #6) owns
 # tool-call gating (tier x space policy -> allow | deny | ask-human), so
 # OMP's own approval prompts stay off.

@@ -16,7 +16,7 @@ function freshDirs() {
   const templateDir = join(root, "templates");
   mkdirSync(agentDir);
   mkdirSync(templateDir);
-  writeFileSync(join(templateDir, "config.yml"), "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n");
+  writeFileSync(join(templateDir, "config.yml"), "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n");
   writeFileSync(join(templateDir, "models.yml"), "providers: {}\n");
   writeFileSync(join(templateDir, "secrets.yml"), "secrets: {}\n");
   return { agentDir, templateDir, cleanup: () => rmSync(root, { recursive: true, force: true }) };
@@ -40,7 +40,7 @@ describe("seedAgentDir (issue #24, regression #78)", () => {
     try {
       writeFileSync(
         join(agentDir, "config.yml"),
-        "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n\ndisabledProviders:\n  - opencode-go\n",
+        "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n\ndisabledProviders:\n  - opencode-go\n",
       );
       const { seeded, kept } = seedAgentDir(agentDir, templateDir);
       expect(seeded.sort()).toEqual(["models.yml", "secrets.yml"]);

@@ -58,7 +58,7 @@ describe("boot-time models.yml generation (issue #67)", () => {
     try {
       // Pre-seed the store main() will open (data/bottega.db in the temp cwd).
       const store = createStore("data/bottega.db");
-      store.setOrgSettings({ models: { default: "zai-org/GLM-5.1-FP8", fast: "acme/chat" } });
+      store.setOrgSettings({ models: { default: "deepseek-ai/DeepSeek-V4-Flash", fast: "acme/chat" } });
       store.close();
 
       // The generated catalog references NEAR_API_KEY by env name; the boot
@@ -70,7 +70,7 @@ describe("boot-time models.yml generation (issue #67)", () => {
       await server.stop();
 
       const generated = readFileSync(join(agentDir, "models.yml"), "utf8");
-      expect(generated).toContain('id: "zai-org/GLM-5.1-FP8"');
+      expect(generated).toContain('id: "deepseek-ai/DeepSeek-V4-Flash"');
       expect(generated).toContain('id: "acme/chat"');
     } finally {
       delete process.env.NEAR_API_KEY;

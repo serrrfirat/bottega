@@ -450,8 +450,8 @@ describe("omp sdk agent driver", () => {
 
 describe("session default model resolution (issue #199)", () => {
   /**
-   * Agent dir with BOTH deepseek providers declared (the live shape): near
-   * serves deepseek-ai/DeepSeek-V4-Flash + the GLM; opencode-go serves the
+   * Agent dir with BOTH deepseek providers declared (the #213 live shape):
+   * near serves deepseek-ai/DeepSeek-V4-Flash; opencode-go serves the
    * same-named bare deepseek-v4-flash (#78-broken). The near gateway probe
    * targets a dead loopback port so it fails fast and the declared set
    * stands — hermetic, no network.
@@ -466,10 +466,6 @@ describe("session default model resolution (issue #199)", () => {
     baseUrl: "http://127.0.0.1:1"
     apiKey: BOTTEGA_TEST_NEAR_API_KEY
     models:
-      - id: "zai-org/GLM-5.1-FP8"
-        name: "GLM 5.1 FP8"
-        contextWindow: 128000
-        maxTokens: 8192
       - id: "deepseek-ai/DeepSeek-V4-Flash"
         name: "DeepSeek V4 Flash"
         contextWindow: 128000

@@ -391,12 +391,13 @@ const APPROVAL_OUTCOME_PREFIX = "Approval resolved";
 
 /**
  * The deployable model id the space's default should pin to (issue #189):
- * the bare id of the harness's model ref (near's declared GLM id, or the
- * opencode-go deepseek id) — both resolve against the session's live
- * catalog, so the turn-start re-apply can apply the swap.
+ * the bare id of the harness's model ref (near's declared
+ * deepseek-ai/DeepSeek-V4-Flash id, or the opencode-go deepseek id) —
+ * both resolve against the session's live catalog, so the turn-start
+ * re-apply can apply the swap.
  */
 export function defaultModelIdFor(modelRef: string): string {
-  if (modelRef.includes("near")) return "zai-org/GLM-5.1-FP8";
+  if (modelRef.includes("near")) return "deepseek-ai/DeepSeek-V4-Flash";
   if (modelRef.includes("opencode")) return "deepseek-v4-flash";
   const slash = modelRef.lastIndexOf("/");
   return slash >= 0 ? modelRef.slice(slash + 1) : modelRef;
@@ -1381,7 +1382,7 @@ async function journeyCatalogSurface(h: Harness, channelId: string): Promise<Jou
     const { reply } = await postAndWait(h, channelId, `which models can you use? list them briefly`, {
       label: "catalog surface",
     });
-    const named = /deepseek|GLM|model/i.test(reply.text);
+    const named = /deepseek|model/i.test(reply.text);
     const permalink = await live.permalink(channelId, reply.ts);
     return {
       name: "model-catalog-surface",

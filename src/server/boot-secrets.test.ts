@@ -253,8 +253,8 @@ describe("live boot with the secrets in the vault (issue #201, shrunk #208)", ()
     "    baseUrl: \"https://cloud-api.near.ai/v1\"\n" +
     "    apiKey: bottega-proxy-placeholder\n" +
     "    models:\n" +
-    "      - id: zai-org/GLM-5.1-FP8\n" +
-    "        name: GLM 5.1 FP8 via NEAR AI Cloud\n" +
+    "      - id: deepseek-ai/DeepSeek-V4-Flash\n" +
+    "        name: DeepSeek V4 Flash via NEAR AI Cloud\n" +
     "        contextWindow: 128000\n" +
     "        maxTokens: 8192\n";
 

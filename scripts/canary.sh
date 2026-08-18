@@ -58,7 +58,7 @@ fi
 if [[ -n "${CANARY_MODEL_REF:-}" ]]; then
   echo "canary: model ${CANARY_MODEL_REF} (CANARY_MODEL_REF override)"
 elif [[ -n "${NEAR_API_KEY:-}" ]]; then
-  echo "canary: model near/zai-org/GLM-5.1-FP8 (NEAR — accepts the space agent's tool names)"
+  echo "canary: model near/deepseek-ai/DeepSeek-V4-Flash (NEAR — accepts the space agent's tool names)"
 elif [[ -n "${OPENCODE_API_KEY:-}" ]]; then
   echo "canary: model opencode-go/deepseek-v4-flash (opencode; the driver flattens dotted tool names for its gateway, issue #78)"
 fi

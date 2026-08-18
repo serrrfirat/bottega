@@ -126,9 +126,9 @@ export function modelToolsDefinitions(
       "deployment's available model catalog grouped by provider ([{provider, models: [{id, " +
       "name}]}]), the same catalog create_work_item model pins resolve against (issue #185). " +
       "Call it first when asked what models can be used or when a request names a provider or " +
-      "model: provider-aware asks resolve to THAT provider's model (a \"near deepseek\" ask is " +
+      "provider-aware asks resolve to THAT provider's model (a \"near deepseek\" ask is " +
       "the near provider's deepseek, not opencode-go's) and exact ids like " +
-      "\"zai-org/GLM-5.1-FP8\" resolve as-is. `set` writes a partial update: " +
+      "\"deepseek-ai/DeepSeek-V4-Flash\" resolve as-is. `set` writes a partial update: " +
       "`model` (the space's default model id), `reasoning_effort` (off|low|medium|high — the " +
       "thinking effort for the reasoning role and the space's default effort), `fast_model` " +
       "and `reasoning_model` (model ids for the fast/reasoning roles; unset slots fall back to " +

@@ -11,7 +11,11 @@
  * (kimi-k2.7-code) instead of the intended deepseek-v4-flash — fixed by
  * pinning modelRoles.default in config.yml to
  * opencode-go/deepseek-v4-flash (the model ships in the SDK catalog with
- * its transport metadata). models.yml keeps the opencode-go entry
+ * its transport metadata). Issue #213 re-pinned the default to the NEAR
+ * gateway's deepseek-ai/DeepSeek-V4-Flash (opencode-go's monthly quota is
+ * exhausted); the opencode-go path below stays regression-tested because
+ * it remains the documented preferred primary once the quota recovers.
+ * models.yml keeps the opencode-go entry
  * KEY-ONLY: the SDK validates any models.yml provider declaration as a
  * CUSTOM provider (baseUrl required), so redeclaring catalog models there
  * fails the boot guard (issue #80) instead of pinning anything.
@@ -143,7 +147,7 @@ function gatewayProbeStatus(): Promise<number | "unreachable"> {
 async function liveSkipReason(): Promise<string | undefined> {
   // 1. The runtime agent-dir config (data/omp-agent, gitignored) is where
   //    the #78 band-aid lives: opencode-go disabled, or the pin moved off
-  //    opencode-go (e.g. the local near/GLM pin).
+  //    opencode-go (e.g. the #213 near/deepseek-ai/DeepSeek-V4-Flash default).
   const runtime = readAgentDirConfig(RUNTIME_AGENT_CONFIG);
   const disabled = runtime?.disabledProviders;
   if (disabled !== undefined) {
@@ -201,10 +205,13 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     }
   });
 
-  test("config.yml pins the default model role to opencode-go/deepseek-v4-flash", () => {
+  test("config.yml pins the default model role to near/deepseek-ai/DeepSeek-V4-Flash (issue #213)", () => {
     const config = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
     expect(config).toContain("modelRoles:");
-    expect(config).toContain("default: opencode-go/deepseek-v4-flash");
+    expect(config).toContain("default: near/deepseek-ai/DeepSeek-V4-Flash");
+    // opencode-go stays the documented preferred primary (quota recovery);
+    // the key-only models.yml entry is untouched.
+    expect(config).toContain("opencode-go");
   });
 
   test("ensureAgentDirModelPin syncs the pin into a stale agent-dir config (issue #78 recurrence)", () => {
@@ -214,7 +221,7 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     // provider catalog default (kimi-k2.7-code). The boot sync must patch
     // such a file without touching operator customizations.
     const dir = mkdtempSync(join(tmpdir(), "bottega-pin-"));
-    const template = "modelRoles:\n  default: opencode-go/deepseek-v4-flash\n";
+    const template = "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n";
     try {
       // Stale config (pre-#78 copy): no pin, operator customizations intact.
       const stale = "# OMP agent settings\nsecrets:\n  enabled: true\n";
@@ -224,7 +231,7 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
       expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("patched");
       const patched = readFileSync(join(dir, "config.yml"), "utf8");
       expect(patched).toContain("secrets:\n  enabled: true");
-      expect(patched).toContain("modelRoles:\n  default: opencode-go/deepseek-v4-flash");
+      expect(patched).toContain("modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash");
       // Second run: already pinned → untouched.
       expect(ensureAgentDirModelPin(dir, join(dir, "template.yml"))).toBe("unchanged");
       // Missing agent-dir config → template copy (compose-equivalent first boot).
@@ -253,10 +260,16 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
   test("the pinned default role resolves deepseek-v4-flash — not the catalog default", async () => {
     const agentDir = mkdtempSync(join(tmpdir(), "bottega-opencode-"));
     try {
-      // The deployment template pair: models.yml + config.yml with the role pin.
+      // The deployment template pair: models.yml + a config.yml with the
+      // opencode-go role pin. The COMMITTED default now targets the NEAR
+      // gateway (#213); this leg writes a local opencode-go pin because
+      // opencode-go stays the documented preferred primary — when the
+      // operator re-pins it (quota recovery), resolution must still land
+      // on deepseek-v4-flash, not the catalog default.
       const modelsPath = join(agentDir, "models.yml");
       writeFileSync(modelsPath, readFileSync(join(REPO_ROOT, "config/omp/models.yml"), "utf8"));
-      const cfgYaml = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
+      const cfgYaml = "# opencode-go pin (the #213 preferred-primary path)\nmodelRoles:\n  default: opencode-go/deepseek-v4-flash\n";
+      writeFileSync(join(agentDir, "config.yml"), cfgYaml);
       const roleLine = cfgYaml.split("\n").find((line) => line.trim().startsWith("default:"));
       expect(roleLine).toContain("opencode-go/deepseek-v4-flash");
       // The registry resolves the models.yml apiKey — the proxy placeholder
@@ -342,8 +355,11 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
   test("the boot pin lands in the agent dir and the fixed path returns non-empty text (recurrence regression)", async () => {
     // Regression for the recurrence: the pin must reach the RUNTIME agent
     // dir (ensureAgentDirModelPin), not just the committed template, so the
-    // SDK resolves deepseek-v4-flash — and the resolved endpoint answers
-    // with non-empty text on the text path.
+    // SDK resolves the pinned model — and the resolved endpoint answers
+    // with non-empty text on the text path. The committed template now
+    // pins the NEAR default (#213); the opencode-go resolution below
+    // proves the preferred-primary path still resolves deepseek-v4-flash
+    // when the operator re-pins it (quota recovery).
     const skipReason = await liveSkipReason();
     if (skipReason !== undefined) {
       console.log(`[opencode live leg] SKIP: ${skipReason}`);
@@ -360,7 +376,7 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       );
       expect(ensureAgentDirModelPin(agentDir)).toBe("patched");
       const patched = readFileSync(join(agentDir, "config.yml"), "utf8");
-      expect(patched).toContain("modelRoles:\n  default: opencode-go/deepseek-v4-flash");
+      expect(patched).toContain("modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash");
 
       process.env.OPENCODE_API_KEY ??= KEY;
       const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);

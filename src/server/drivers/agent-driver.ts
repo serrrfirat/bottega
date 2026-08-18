@@ -533,8 +533,8 @@ export function markToolDefinition<TDef extends ToolDefinition>(def: TDef): TDef
  * gateway validates tool names against `^[a-zA-Z0-9_-]+$` and 400s every
  * request carrying a dotted name (memory.save, memory.search, the
  * namespace extension tools — attio.* / github.* / linear.*), which is why
- * opencode sessions returned empty completions. NEAR/GLM accept dotted
- * names; flat names are accepted by BOTH gateways, so the session's
+ * opencode sessions returned empty completions. The NEAR gateway accepts
+ * dotted names; flat names are accepted by BOTH gateways, so the session's
  * model-facing tool names are flattened at the driver boundary. The
  * canonical dotted names survive everywhere that matters: the policy gate
  * and tool implementations close over the ORIGINAL definition (audit rows
