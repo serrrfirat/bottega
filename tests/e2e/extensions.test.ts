@@ -309,7 +309,9 @@ describe("journey 3: connect as me / as org (space-service connect intent)", () 
     const prompt = posts[0]!;
     expect(prompt).toMatchObject({
       spaceId: "slack:C1",
-      text: "Approval required for connect_extension",
+      // Issue #160: the prompt carries the payload (the connect args), not
+      // just the tool name — an informed approval decision.
+      text: 'Approval required for connect_extension — {"extension":"fixture.weather","scope":"org"}',
     });
     // The interactive prompt carries the approval blocks (the router posts
     // to the channel, not threaded — the threaded reply comes with the

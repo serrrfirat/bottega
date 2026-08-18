@@ -53,14 +53,30 @@ export interface SlackApprovalRouterDeps {
 }
 
 /**
+ * Redacted, capped args summary shared by the prompt's block and text
+ * surfaces (issue #160): the payload a human approves, never the raw args.
+ */
+export function approvalArgsSummary(d: ApprovalRequest): string {
+  const argsText = redact(JSON.stringify(d.args) ?? "");
+  return argsText.length > ARGS_SUMMARY_MAX_CHARS ? `${argsText.slice(0, ARGS_SUMMARY_MAX_CHARS)}...[truncated]` : argsText;
+}
+
+/**
+ * Plain-text form of the approval prompt (the fallback under the blocks):
+ * tool name + the redacted payload, so an approval decides the actual call,
+ * not the tool name alone (issue #160).
+ */
+export function approvalPromptText(d: ApprovalRequest): string {
+  return `Approval required for ${d.tool} — ${approvalArgsSummary(d)}`;
+}
+
+/**
  * Renders the interactive approval prompt blocks: tool + reason + redacted
  * args summary, then Approve/Deny buttons carrying the request id. Pure so
  * the outbound rendering is testable without Slack.
  */
 export function buildApprovalBlocks(d: ApprovalRequest, id: string): unknown[] {
-  const argsText = redact(JSON.stringify(d.args) ?? "");
-  const args =
-    argsText.length > ARGS_SUMMARY_MAX_CHARS ? `${argsText.slice(0, ARGS_SUMMARY_MAX_CHARS)}...[truncated]` : argsText;
+  const args = approvalArgsSummary(d);
   return [
     {
       type: "section",
@@ -156,7 +172,7 @@ export class SlackApprovalRouter implements ApprovalRouter {
     entry.timer.unref?.();
     this.pending.set(id, entry);
     try {
-      const messageTs = await this.adapter.postMessage(d.spaceId, `Approval required for ${d.tool}`, {
+      const messageTs = await this.adapter.postMessage(d.spaceId, approvalPromptText(d), {
         blocks: buildApprovalBlocks(d, id),
       });
       if (messageTs === undefined) {

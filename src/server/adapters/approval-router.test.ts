@@ -166,6 +166,43 @@ describe("SlackApprovalRouter request", () => {
   });
 });
 
+describe("approval prompt payload preview (issue #160)", () => {
+  test("a create_work_item prompt shows the item's args in the posted message — the payload, not just the tool name", async () => {
+    const { adapter, posted } = fakeAdapter();
+    const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
+
+    void router.request({
+      tool: "create_work_item",
+      args: {
+        title: "Fix the flaky login test",
+        repo: "acme/sandbox",
+        description: "The session cookie is never set on first load",
+      },
+      reason: "exec-tier tool requires human approval",
+      spaceId: "slack:C1",
+      actor: "agent",
+    });
+
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.text).toContain("Approval required for create_work_item");
+    expect(posted[0]!.text).toContain("Fix the flaky login test");
+    expect(posted[0]!.text).toContain("The session cookie is never set on first load");
+    expect(posted[0]!.text).toContain("acme/sandbox");
+  });
+
+  test("a prompt whose args carry a secret-shaped value redacts it in the posted message", async () => {
+    const { adapter, posted } = fakeAdapter();
+    const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
+
+    void router.request({ ...REQUEST, args: { api_key: "AKIA1234567890ABCDEF", command: "ls" } });
+
+    expect(posted[0]!.text).toContain("[REDACTED]");
+    expect(posted[0]!.text).not.toContain("AKIA1234567890ABCDEF");
+    // Non-secret payload stays visible so the approval is still informed.
+    expect(posted[0]!.text).toContain("ls");
+  });
+});
+
 describe("SlackApprovalRouter resolution", () => {
   test("approve resolves approved with the clicking user as approver and rewrites the message", async () => {
     const { adapter, posted, updated } = fakeAdapter();
