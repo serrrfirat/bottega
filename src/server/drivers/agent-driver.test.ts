@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type AgentToolUpdateCallback, type CreateAgentSessionOptions, type ExtensionContext, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, ModelRegistry, SessionManager, createAgentSession, discoverAuthStorage, z, type AgentToolUpdateCallback, type CreateAgentSessionOptions, type ExtensionContext, type TodoPhase, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -273,6 +273,10 @@ describe("omp sdk agent driver", () => {
         "session_search",
         "model_settings",
         "use_model",
+        // Todo tooling (issue #228): the planning scaffold + the read-tier
+        // snapshot of the space's live state.
+        "todo",
+        "list_todos",
         "settings",
         // Admin tools (issue #73): catalog browser, stack health, deploy
         // info, first-run wizard.
@@ -1130,6 +1134,112 @@ describe("OmpSessionDriver error surfacing (issue #78)", () => {
 
     expect(errors).toEqual([{ spaceId: "slack:C1", message: "background flush failed" }]);
     expect(turnEnds).toEqual([{ spaceId: "slack:C1", error: "background flush failed" }]);
+  });
+});
+
+describe("OmpSessionDriver todo read seam (issue #228)", () => {
+  /** Stub SDK session exposing the subscribe listener + a scripted todo plan. */
+  function stubSession(phases: TodoPhase[]) {
+    let listener: ((event: StubSessionEvent) => void) | undefined;
+    // SAFETY: the stub implements exactly the members OmpSessionDriver
+    // calls (subscribe + getTodoPhases + lifecycle); the rest of
+    // AgentSession is never touched by these tests.
+    const session = {
+      subscribe: (cb: (event: StubSessionEvent) => void) => {
+        listener = cb;
+        return () => {
+          listener = undefined;
+        };
+      },
+      getTodoPhases: () => phases,
+      beginDispose: () => {},
+      dispose: async () => {},
+      isStreaming: false,
+      prompt: async () => {},
+      steer: async () => {},
+      followUp: async () => {},
+      abort: async () => {},
+      getAvailableModels: () => [],
+    } as never;
+    return {
+      session,
+      emit: (event: StubSessionEvent) => listener?.(event),
+    };
+  }
+
+  /** The SDK's todo tool result shape: TodoToolDetails under result.details. */
+  function todoResult(phases: TodoPhase[]): JsonObject {
+    return {
+      content: [{ type: "text", text: "ok" }],
+      details: { op: "init", phases, storage: "session" },
+    } as unknown as JsonObject;
+  }
+
+  const PLAN: TodoPhase[] = [
+    {
+      name: "Research",
+      tasks: [{ content: "Read the repo", status: "completed" }, { content: "Draft the section", status: "in_progress" }],
+    },
+    { name: "Land", tasks: [{ content: "Push + PR", status: "pending" }] },
+  ];
+
+  test("getTodoPhases returns the SDK session's live plan (pull path)", async () => {
+    const { session } = stubSession(PLAN);
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+
+    expect(driver.getTodoPhases()).toBe(PLAN);
+  });
+
+  test("a todo tool_execution_end pushes the result's phases as a todo_phases driver event", async () => {
+    const { session, emit } = stubSession([]);
+    const todoEvents: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("todo_phases", (data) => todoEvents.push(data));
+
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "todo",
+      result: todoResult(PLAN),
+      isError: false,
+    });
+
+    expect(todoEvents).toEqual([{ spaceId: "slack:C1", phases: PLAN }]);
+  });
+
+  test("non-todo and malformed tool executions never emit todo_phases", async () => {
+    const { session, emit } = stubSession([]);
+    const todoEvents: unknown[] = [];
+    const driver = new OmpSessionDriver({ spaceId: "slack:C1", session, onOutput: () => {} });
+    driver.on("todo_phases", (data) => todoEvents.push(data));
+
+    // Another tool's result: no details.phases, must be ignored.
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "file contents" }] },
+      isError: false,
+    });
+    // The todo tool with a malformed result (no phases array): skipped, never thrown.
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "call_2",
+      toolName: "todo",
+      result: { content: [{ type: "text", text: "error" }], isError: true },
+      isError: true,
+    });
+    // The todo tool carrying an empty plan: an EMPTY snapshot is still a
+    // snapshot (the presenter's empty-tolerant "no active plan" path).
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "call_3",
+      toolName: "todo",
+      result: todoResult([]),
+      isError: false,
+    });
+
+    expect(todoEvents).toEqual([{ spaceId: "slack:C1", phases: [] }]);
   });
 });
 

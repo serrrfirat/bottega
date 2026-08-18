@@ -737,3 +737,268 @@ describe("Codex mint-failure surface (issue #218)", () => {
     expect(rec.updates.at(-1)!.text).toBe("model exploded");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Live todo tiers (issue #228): the phrase line's "🛠 N/M — current step"
+// indicator for multi-step turns, and the in-place "🛠 Agent's plan"
+// message for long turns (>= 3 steps across >= 2 phases), edited as steps
+// complete and LEFT as the turn's record at turn end (boring option).
+// ---------------------------------------------------------------------------
+
+describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
+  function plainPresenter(rec: RecordedAdapter): SlackTurnPresenter {
+    const { store } = recordingStore();
+    return new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+  }
+
+  /** A long plan: 3 steps across 2 phases, step 1 completed, step 2 in progress. */
+  const LONG_PLAN = [
+    {
+      name: "Research",
+      tasks: [
+        { content: "Read the repo", status: "completed" as const },
+        { content: "Draft the section", status: "in_progress" as const },
+      ],
+    },
+    { name: "Land", tasks: [{ content: "Push + PR", status: "pending" as const }] },
+  ];
+
+  test("a multi-step plan adds the 🛠 N/M progress indicator to the phrase line (issue #228)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toHaveLength(1);
+
+    // A 3-step plan in ONE phase: the phrase line gains the indicator, but
+    // no plan message posts (not multi-stage — the indicator tier only).
+    const singlePhase = [
+      {
+        name: "All",
+        tasks: [
+          { content: "Read the repo", status: "completed" as const },
+          { content: "Draft the section", status: "in_progress" as const },
+          { content: "Push + PR", status: "pending" as const },
+        ],
+      },
+    ];
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: singlePhase });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s · 🛠 2\/3 — Draft the section$/);
+    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+
+    // Step 2 completes, step 3 runs: the indicator advances in place.
+    const advanced = [
+      {
+        name: "All",
+        tasks: [
+          { content: "Read the repo", status: "completed" as const },
+          { content: "Draft the section", status: "completed" as const },
+          { content: "Push + PR", status: "in_progress" as const },
+        ],
+      },
+    ];
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: advanced });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toMatch(/🛠 3\/3 — Push \+ PR$/);
+
+    // One phrase message only — the indicator edited it in place.
+    expect(rec.posts).toHaveLength(1);
+  });
+
+  test("a short plan (<= 1 step) shows nothing extra on the phrase line (issue #228)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+
+    presenter.onTodoPhases({
+      spaceId: "slack:C1",
+      phases: [{ name: "One", tasks: [{ content: "Just one step", status: "in_progress" }] }],
+    });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+
+    expect(rec.updates.some((u) => u.text.includes("🛠"))).toBe(false);
+    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+  });
+
+  test("a long turn posts the in-place plan message and edits it as steps complete (issue #228)", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toHaveLength(1); // the thinking phrase
+
+    // First qualifying snapshot: the plan message posts under the inbound.
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: LONG_PLAN });
+    await flush();
+    expect(rec.posts).toHaveLength(2);
+    expect(rec.posts[1]!.text).toBe(
+      "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ⏳ 2. Draft the section\n  ⏳ 3. Push + PR",
+    );
+    expect(rec.posts[1]!.opts).toEqual({ threadTs: "1.1" });
+    const planTs = "post-2";
+
+    // A later snapshot EDITS the same message in place — never a second post.
+    const advanced = [
+      {
+        name: "Research",
+        tasks: [
+          { content: "Read the repo", status: "completed" as const },
+          { content: "Draft the section", status: "completed" as const },
+        ],
+      },
+      { name: "Land", tasks: [{ content: "Push + PR", status: "in_progress" as const }] },
+    ];
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: advanced });
+    await flush();
+    expect(rec.posts).toHaveLength(2);
+    expect(rec.updates).toContainEqual({
+      spaceId: "slack:C1",
+      ts: planTs,
+      text: "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ✅ 2. Draft the section\n  ⏳ 3. Push + PR",
+    });
+  });
+
+  test("a non-long plan (3 steps in ONE phase) posts no plan message (issue #228)", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+
+    presenter.onTodoPhases({
+      spaceId: "slack:C1",
+      phases: [
+        {
+          name: "All",
+          tasks: [
+            { content: "One", status: "completed" },
+            { content: "Two", status: "in_progress" },
+            { content: "Three", status: "pending" },
+          ],
+        },
+      ],
+    });
+    await flush();
+
+    expect(rec.posts).toHaveLength(1); // phrase only — no plan message
+    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+  });
+
+  test("empty phases are normal: no indicator, no plan message, never an error (issue #228)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: [] });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.updates.some((u) => u.text.includes("🛠"))).toBe(false);
+  });
+
+  test("turn end leaves the plan message as the turn's record; the next long turn reuses it in place (issue #228)", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: LONG_PLAN });
+    await flush();
+    expect(rec.posts).toHaveLength(2);
+    const planTs = "post-2";
+
+    // The turn ends: the plan message is LEFT — its final state is the
+    // turn's record (the chosen end-of-turn cleanup; no delete call).
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.posts).toHaveLength(2); // phrase edited to the reply; plan untouched
+    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(true);
+
+    // A SECOND turn that plans again REUSES the same message (phrase+edit
+    // mechanics): no stacked plan messages in the thread.
+    presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    const secondPlan = [
+      {
+        name: "A",
+        tasks: [
+          { content: "Plan again step one", status: "completed" as const },
+          { content: "Plan again step two", status: "in_progress" as const },
+          { content: "Plan again step three", status: "pending" as const },
+        ],
+      },
+      { name: "B", tasks: [{ content: "Plan again step four", status: "pending" as const }] },
+    ];
+    presenter.onTodoPhases({ spaceId: "slack:C1", phases: secondPlan });
+    await flush();
+
+    // Posts: turn 1's phrase, the plan message, turn 2's fresh phrase —
+    // the plan was NOT posted again; the second plan edited the existing
+    // message in place (phrase+edit mechanics).
+    expect(rec.posts).toHaveLength(3);
+    expect(rec.posts.some((p) => p.text.includes("Plan again step"))).toBe(false);
+    expect(rec.updates).toContainEqual({
+      spaceId: "slack:C1",
+      ts: planTs,
+      text: "🛠 Agent's plan:\n  ✅ 1. Plan again step one\n  ⏳ 2. Plan again step two\n  ⏳ 3. Plan again step three\n  ⏳ 4. Plan again step four",
+    });
+  });
+});
+
+describe("StreamTurnPresenter: live todo (issue #228)", () => {
+  test("a long turn posts the plan message while the panel stays clean — no progress-line appends (issue #228)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+
+    presenter.onTodoPhases({
+      spaceId: "slack:C1",
+      phases: [
+        {
+          name: "Research",
+          tasks: [
+            { content: "Read the repo", status: "completed" },
+            { content: "Draft the section", status: "in_progress" },
+          ],
+        },
+        { name: "Land", tasks: [{ content: "Push + PR", status: "pending" }] },
+      ],
+    });
+    await flush();
+
+    // The plan message posts (a separate surface); nothing appends to the stream.
+    expect(rec.posts).toEqual([
+      { spaceId: "slack:C1", text: "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ⏳ 2. Draft the section\n  ⏳ 3. Push + PR", opts: { threadTs: "1.1" } },
+    ]);
+    expect(rec.texts).toHaveLength(0);
+  });
+});

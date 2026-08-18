@@ -137,6 +137,16 @@ export class SlackApprovalRouter implements ApprovalRouter {
     return this.pending.size;
   }
 
+  /**
+   * The unresolved prompts (issue #228): one entry per outstanding
+   * approval, carrying the request's space and tool. The `list_todos`
+   * snapshot reads this to report pending approvals; a settled or expired
+   * request is never listed.
+   */
+  pendingPrompts(): ReadonlyArray<{ spaceId: string; tool: string }> {
+    return [...this.pending.values()].map((entry) => ({ spaceId: entry.spaceId, tool: entry.tool }));
+  }
+
   async request(d: ApprovalRequest): Promise<ApprovalResolution> {
     const id = randomUUID();
     if (this.pending.size >= this.maxPending) {

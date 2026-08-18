@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import type { MemoryEntry, MemoryProvider, MemorySaveInput } from "../../memory/types";
 import { createAudit } from "../../policy/audit";
 import { defaultPolicy } from "../../policy/config";
@@ -45,6 +46,8 @@ class FakeSession implements AgentSessionDriver {
 
   async abort(): Promise<void> {}
   isStreaming(): boolean { return this.streaming; }
+  /** No todo plan (issue #228): the learning side-sessions have none. */
+  getTodoPhases(): TodoPhase[] { return []; }
   on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: SessionEventData) => void): () => void {
     let listeners = this.listeners.get(event);
     if (!listeners) {

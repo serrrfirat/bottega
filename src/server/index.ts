@@ -16,6 +16,7 @@ import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
+import { listTodosToolDefinition } from "../tools/list-todos";
 import { loadKbConfig } from "../kb/config";
 import { z } from "zod";
 import { buildRegistry } from "../scheduler/actions";
@@ -517,6 +518,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
     ...schedulerToolDefinitions(store, audit, schedulerRegistry),
     ...kbToolDefinitions(kbDeps),
+    // Todo snapshot (issue #228): read-tier assembly of the space's live
+    // state — work items (same query as list_work_items), pending
+    // approvals (the router's outstanding prompts), scheduled jobs (same
+    // query as list_scheduler_jobs), and the session's live plan (the
+    // driver's getTodoPhases pull seam). spaceService is late-bound
+    // (constructed after the toolset) — the closure reads it only at call
+    // time, the same pattern as onToolStep.
+    listTodosToolDefinition(store, {
+      pendingApprovals: (spaceId) =>
+        (approvalRouter.pendingPrompts?.() ?? []).filter((prompt) => prompt.spaceId === spaceId),
+      getTodoPhases: (spaceId) => spaceService.getTodoPhases(spaceId),
+    }),
   ];
   opts.onSessionToolset?.(sessionToolset);
   // Issue #167: the extension half of the space agent's session toolset.

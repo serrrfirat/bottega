@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { SessionManager, type TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import type { AuditModule } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
@@ -498,6 +498,15 @@ class AcpSessionDriver implements AgentSessionDriver {
   /** The principal of the current turn (issue #152); undefined between turns. */
   getTurnPrincipal(): string | undefined {
     return this.#turnPrincipal;
+  }
+
+  /**
+   * The session's live todo plan (issue #228): ACP v1 has no todo
+   * transport, so the plan is always empty — no active plan is normal,
+   * never an error (the interface contract).
+   */
+  getTodoPhases(): TodoPhase[] {
+    return [];
   }
 
   async abort(): Promise<void> {

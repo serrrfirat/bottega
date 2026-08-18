@@ -38,6 +38,7 @@
  * so secret-shaped values never reach Slack.
  */
 import { z } from "zod";
+import type { TodoPhase, TodoStatus } from "@oh-my-pi/pi-coding-agent";
 import type { Store } from "../../store/db";
 import {
   ADMIN_ONBOARDING_NUDGE_EVENT,
@@ -86,6 +87,31 @@ export const ThinkingEventSchema = z.object({
   thinking: z.string().optional(),
 });
 export type ThinkingEvent = z.infer<typeof ThinkingEventSchema>;
+
+/**
+ * The driver's live todo snapshot (issue #228): the `todo_phases` event —
+ * the phases the SDK's todo tool reported on the tool_execution_end push
+ * (or the pull read through getTodoPhases, same shape). Empty-tolerant: no
+ * phases means "no active plan", which is normal, never an error.
+ */
+export const TodoPhasesEventSchema = z.object({
+  spaceId: z.string().optional(),
+  phases: z
+    .array(
+      z.object({
+        name: z.string(),
+        tasks: z.array(
+          z.object({
+            content: z.string(),
+            status: z.enum(["pending", "in_progress", "completed", "abandoned", "blocked"]),
+            blocker: z.string().optional(),
+          }),
+        ),
+      }),
+    )
+    .optional(),
+});
+export type TodoPhasesEvent = z.infer<typeof TodoPhasesEventSchema>;
 
 /**
  * Rotating status phrases posted on message receipt (issue #119) and updated
@@ -236,6 +262,103 @@ export function emitToolStep(sink: ToolStepSink | undefined, step: ToolStepEvent
 }
 
 // ---------------------------------------------------------------------------
+// Live todo rendering (issue #228): the session's todo plan rendered two
+// ways — a one-line progress indicator that rides the thinking phrase
+// (multi-step turns) and the in-place "🛠 Agent's plan" message (long
+// turns). Both are pure over the SDK's TodoPhase[] shape, shared by the
+// presenter (live path) and the list_todos tool (snapshot path) so the two
+// surfaces never drift.
+// ---------------------------------------------------------------------------
+
+/** A plan line's content cap; longer task text head-truncates. */
+export const PLAN_LINE_MAX = 200;
+
+/** Status icon per todo task status (the issue #228 plan rendering). */
+export function todoStatusIcon(status: TodoStatus): string {
+  switch (status) {
+    case "completed":
+      return "✅";
+    case "blocked":
+      return "⛔";
+    case "abandoned":
+      return "⊘";
+    default:
+      return "⏳"; // pending + in_progress share the "not done yet" marker
+  }
+}
+
+/** Head-caps a plan line; long task text keeps its start. */
+function capPlanLine(text: string): string {
+  if (text.length <= PLAN_LINE_MAX) return text;
+  return `${text.slice(0, PLAN_LINE_MAX - 1)}…`;
+}
+
+/**
+ * The "🛠 Agent's plan" message body: one numbered line per task across
+ * the phases, status-icon prefixed (the issue #228 shape). Empty-tolerant:
+ * an empty plan renders the explicit "no active plan" line — normal, never
+ * an error. Blocked tasks carry their blocker note.
+ */
+export function renderTodoPlan(phases: readonly TodoPhase[]): string {
+  const tasks = phases.flatMap((phase) => phase.tasks);
+  const lines =
+    tasks.length === 0
+      ? ["no active plan"]
+      : tasks.map((task, index) => {
+          const line = `${todoStatusIcon(task.status)} ${index + 1}. ${capPlanLine(task.content)}`;
+          return task.status === "blocked" && task.blocker ? `${line} — ${task.blocker}` : line;
+        });
+  return `🛠 Agent's plan:\n${lines.map((line) => `  ${line}`).join("\n")}`;
+}
+
+/**
+ * The long-turn heuristic (issue #228): a plan qualifies for the in-place
+ * plan message when it has >= 3 steps AND spans >= 2 phases with tasks —
+ * a heuristic on the todo state, never wall-clock.
+ */
+export function isLongPlan(phases: readonly TodoPhase[]): boolean {
+  const phasesWithTasks = phases.filter((phase) => phase.tasks.length > 0);
+  const totalTasks = phasesWithTasks.reduce((sum, phase) => sum + phase.tasks.length, 0);
+  return totalTasks >= 3 && phasesWithTasks.length >= 2;
+}
+
+/**
+ * The current (next actionable) step of the flattened plan (issue #228):
+ * the first in_progress task, or the first pending/blocked one when
+ * nothing is running yet. `index` is 1-based over the flattened plan.
+ * Undefined when the plan has < 2 steps or everything is done/abandoned —
+ * short turns show nothing extra. Shared by the phrase indicator and the
+ * list_todos snapshot.
+ */
+export function todoProgress(
+  phases: readonly TodoPhase[],
+): { index: number; total: number; current: string } | undefined {
+  const tasks = phases.flatMap((phase) => phase.tasks);
+  if (tasks.length < 2) return undefined;
+  const order: readonly TodoStatus[] = ["in_progress", "pending", "blocked"];
+  let found: { task: (typeof tasks)[number]; index: number } | undefined;
+  for (const status of order) {
+    const index = tasks.findIndex((task) => task.status === status);
+    if (index !== -1) {
+      found = { task: tasks[index]!, index };
+      break;
+    }
+  }
+  if (found === undefined) return undefined; // all completed/abandoned
+  return { index: found.index + 1, total: tasks.length, current: capPlanLine(found.task.content) };
+}
+
+/**
+ * The multi-step phrase indicator (issue #228): "🛠 2/3 — drafting the PR"
+ * for the current step — see {@link todoProgress}. Undefined when the plan
+ * has < 2 steps or nothing is actionable — short turns show nothing extra.
+ */
+export function todoProgressLine(phases: readonly TodoPhase[]): string | undefined {
+  const progress = todoProgress(phases);
+  return progress === undefined ? undefined : `🛠 ${progress.index}/${progress.total} — ${progress.current}`;
+}
+
+// ---------------------------------------------------------------------------
 // Presenter
 // ---------------------------------------------------------------------------
 
@@ -376,6 +499,28 @@ export class SlackTurnPresenter {
   protected toolStepInFlight = false;
   /** Messages queued behind the running turn (issue #219); the visible "+N waiting" count. */
   #waitingCount = 0;
+  /**
+   * The session's live todo plan (issue #228): the latest snapshot the
+   * driver pushed (tool_execution_end). Survives turns — the SDK's todo
+   * state is per-session and persists across turns — and is cleared only
+   * on dispose. Drives the phrase's "🛠 N/M" indicator and the in-place
+   * plan message.
+   */
+  #todoPhases: TodoPhase[] = [];
+  /**
+   * ts of the in-place "🛠 Agent's plan" message (issue #228): one per
+   * space, posted on the first qualifying snapshot of a turn and EDITED in
+   * place as steps complete — the same phrase+edit mechanics as the
+   * thinking phrase. End-of-turn cleanup decision: LEAVE the final state
+   * as the turn's record (boring option) — deleting would need an extra
+   * Slack call + permission and would destroy the record; the left-behind
+   * message shows the CURRENT final state, never a stale one.
+   */
+  #planTs: string | undefined;
+  /** The plan message's post is still in flight (ts not yet known). */
+  #planPosting = false;
+  /** The last rendered plan body; identical snapshots skip the edit. */
+  #lastPlanText: string | undefined;
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -598,13 +743,46 @@ export class SlackTurnPresenter {
   }
 
   /**
-   * A live thinking chunk from the driver (issue #193): the phrase renderer
+  /** A live thinking chunk from the driver (issue #193): the phrase renderer
    * shows the latest reasoning snippet in place while the turn runs. The
    * streaming renderer ignores it (the panel renders steps, not phrases).
    */
   onThinking(data: ThinkingEvent): void {
     if (this.digesting) return;
     this.renderThinking(data);
+  }
+
+  /**
+   * A live todo snapshot from the driver (issue #228): the phrase renderer
+   * appends the "🛠 N/M — current step" indicator to the progress line and
+   * keeps the in-place plan message current for long turns. Digest turns
+   * skip the rendering (their output is memory, #42).
+   */
+  onTodoPhases(data: TodoPhasesEvent): void {
+    if (this.digesting) return;
+    this.renderTodoPhases(data);
+  }
+
+  /**
+   * Render seam (issue #228): the base renderer stores the snapshot, then
+   * re-renders the live progress line and the plan message. The streaming
+   * renderer overrides this to keep the plan message but never touch the
+   * panel surface (mirrors renderThinking).
+   */
+  protected renderTodoPhases(data: TodoPhasesEvent): void {
+    this.updateTodoSnapshot(data.phases ?? []);
+    this.#renderProgressNow();
+  }
+
+  /**
+   * Stores the snapshot and re-renders the in-place plan message when the
+   * plan qualifies (long turns). Shared by both renderers — the plan
+   * message is a separate posted message, independent of the turn's phrase
+   * or stream surface.
+   */
+  protected updateTodoSnapshot(phases: readonly TodoPhase[]): void {
+    this.#todoPhases = [...phases];
+    this.#renderPlanMessage();
   }
 
   /** DMs read naturally as a plain message — no thread. Team channels (C/G) keep replies threaded. */
@@ -634,6 +812,14 @@ export class SlackTurnPresenter {
     this.toolStepInFlight = false;
     this.#waitingCount = 0;
     this.#nudged = undefined;
+    // Issue #228: the todo snapshot and plan message die with the session —
+    // the next cold start re-hydrates the plan from the transcript (the
+    // SDK's getTodoPhases) and re-posts the plan message on the next
+    // qualifying snapshot.
+    this.#todoPhases = [];
+    this.#planTs = undefined;
+    this.#planPosting = false;
+    this.#lastPlanText = undefined;
   }
 
   // -------------------------------------------------------------------------
@@ -709,13 +895,18 @@ export class SlackTurnPresenter {
   // at a frozen phrase.
   // -------------------------------------------------------------------------
 
-  /** The current progress line: step > thinking snippet > elapsed phrase. */
+  /** The current progress line: step > thinking snippet > elapsed phrase, each carrying the live todo indicator when the plan has >= 2 steps (issue #228). */
   #progressLine(): string {
     const step = this.#currentStepTitle;
-    if (step !== undefined) return this.#decorate(`⚙️ ${this.#headSnippet(step)}`);
-    const thinking = this.#latestThinking;
-    if (thinking !== undefined) return this.#decorate(`🧠 ${thinking}`);
-    return this.#decorate(this.#elapsedPhrase());
+    const base =
+      step !== undefined
+        ? `⚙️ ${this.#headSnippet(step)}`
+        : this.#latestThinking !== undefined
+          ? `🧠 ${this.#latestThinking}`
+          : this.#elapsedPhrase();
+    const todo = todoProgressLine(this.#todoPhases);
+    const line = todo === undefined ? base : `${base} · ${todo}`;
+    return this.#decorate(line);
   }
 
   /**
@@ -886,6 +1077,47 @@ export class SlackTurnPresenter {
   /** Rotates an already-pending phrase in place; streaming keeps its opening, so it does nothing. */
   protected rotateTurnOpening(pendingTs: string): Promise<void> {
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
+  }
+
+  /**
+   * The in-place "🛠 Agent's plan" message (issue #228, long turns): posted
+   * under the inbound message when a qualifying plan first appears (>= 3
+   * steps across >= 2 phases), then EDITED in place on every snapshot as
+   * steps complete — one message per space, the same phrase+edit mechanics
+   * as the thinking phrase. End-of-turn cleanup: the final state is LEFT as
+   * the turn's record (boring option — no delete call, no lost record; the
+   * message never shows a stale plan, only the current snapshot). A non-
+   * qualifying plan (or none) posts nothing — empty-tolerant. Fail-soft:
+   * a posting/editing failure is logged, never thrown into the turn path.
+   */
+  #renderPlanMessage(): void {
+    if (!isLongPlan(this.#todoPhases)) return;
+    const text = renderTodoPlan(this.#todoPhases);
+    if (text === this.#lastPlanText) return;
+    this.#lastPlanText = text;
+    const planTs = this.#planTs;
+    if (planTs !== undefined) {
+      void this.adapter.updateMessage(this.spaceId, planTs, text).catch((err) => {
+        console.error(`[slack-turn-presenter] failed to update plan message in ${this.spaceId}:`, err);
+      });
+      return;
+    }
+    if (this.#planPosting) return; // in flight — it becomes the plan message
+    this.#planPosting = true;
+    void this.adapter
+      .postMessage(this.spaceId, text, this.replyOpts())
+      .then((ts) => {
+        if (ts !== undefined) {
+          this.#planTs = ts;
+          console.log(`presenter: plan message posted ${this.spaceId} ${ts}`);
+        }
+      })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] failed to post plan message to ${this.spaceId}:`, err);
+      })
+      .finally(() => {
+        this.#planPosting = false;
+      });
   }
 
   /** Next rotating phrase (queue-decorated, issue #219); advances the shared rotation. */
@@ -1314,6 +1546,17 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
    * reasoning snippet must not pollute the stream, so it renders nothing.
    */
   protected renderThinking(_data: ThinkingEvent): void {}
+
+  /**
+   * Live todo (issue #228): the panel owns the turn's live surface, so the
+   * phrase renderer's "🛠 N/M" progress line must never append to it
+   * (mirrors renderThinking). The in-place plan MESSAGE is a separate
+   * posted message and still renders for long turns via the shared
+   * snapshot update.
+   */
+  protected renderTodoPhases(data: TodoPhasesEvent): void {
+    this.updateTodoSnapshot(data.phases ?? []);
+  }
 
   /**
    * The panel owns the stream surface: the phrase renderer's elapsed tick

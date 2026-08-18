@@ -120,6 +120,9 @@ export const PROJECT_TOOL_NAMES = [
   "create_work_item",
   "work_item_cancel",
   "list_work_items",
+  // Todo snapshot (issue #228): read-tier assembly of the space's live
+  // state; rides the custom-tools bridge like the work-item tools.
+  "list_todos",
   // Connect capability (issue #52): the per-session connect tool rides the
   // custom-tools path (see SPACE_AGENT_TOOLS) — manifest tools must not
   // shadow it.

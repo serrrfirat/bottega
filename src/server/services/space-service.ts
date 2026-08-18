@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
@@ -389,6 +390,20 @@ export class SpaceService {
   }
 
   /**
+   * The live session's todo plan (issue #228, pull path): the `list_todos`
+   * tool reads the space agent's plan through this seam — the driver's
+   * getTodoPhases on the space's LIVE session (the SDK rehydrates the
+   * state from the transcript at cold start). No live session → an empty
+   * plan ("no active plan" is normal, never an error). Late-bound from the
+   * boot's sessionToolset closure like routeToolStep.
+   */
+  getTodoPhases(spaceId: string): TodoPhase[] {
+    const live = this.#sessions.get(spaceId);
+    if (!live || live.disposing) return [];
+    return live.session.getTodoPhases();
+  }
+
+  /**
    * Principal of the space's CURRENT turn (issue #152): captured when a
    * fresh turn starts and bound until that turn ends (the driver binds it
    * atomically with the fresh-turn decision, so a steer — another user's
@@ -667,6 +682,10 @@ export class SpaceService {
     // Issue #193: live reasoning chunks render as the in-place progress
     // phrase on the plain path (the panel path ignores them).
     session.on("thinking", (data) => this.#presenterFor(spaceId).onThinking(data));
+    // Issue #228: live todo snapshots (the SDK's todo tool push) render
+    // the "🛠 N/M" phrase indicator and the in-place plan message for
+    // long turns.
+    session.on("todo_phases", (data) => this.#presenterFor(spaceId).onTodoPhases(data));
     const detachLearning = this.#learning?.attachSession(spaceId, session) ?? (() => {});
     const live: LiveSession = {
       spaceId,

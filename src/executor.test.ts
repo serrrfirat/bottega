@@ -64,7 +64,7 @@ import { extensionToolDefinitions } from "./extensions/tools";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./extensions/fixture";
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { memoryToolDefinitions } from "./tools/memory";
-import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ToolDefinition, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, DriverEvent, DriverEventData, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
 import { z } from "zod";
 
@@ -122,6 +122,10 @@ class FakeSession implements AgentSessionDriver {
   async abort(): Promise<void> {}
   isStreaming(): boolean {
     return false;
+  }
+  /** No todo plan (issue #228): the executor's item sessions stay internal. */
+  getTodoPhases(): TodoPhase[] {
+    return [];
   }
   on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void {
     const set = (this.listeners[event] ??= new Set());

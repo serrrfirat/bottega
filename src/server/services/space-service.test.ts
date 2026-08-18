@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test, vi } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionContext, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store, type ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
@@ -30,7 +30,8 @@ type FakeSessionEventData =
   | { spaceId: string; text: string }
   | { spaceId: string }
   | { spaceId: string; message: string }
-  | { spaceId: string; error: string };
+  | { spaceId: string; error: string }
+  | { spaceId: string; phases: TodoPhase[] };
 
 class FakeSession implements AgentSessionDriver {
   readonly spaceId: string;
@@ -49,6 +50,8 @@ class FakeSession implements AgentSessionDriver {
   turnPrincipal: string | undefined;
   /** reapplyDefaultModelRole invocations (issue #189): the service must call the seam before each fresh turn. */
   reapplyCalls = 0;
+  /** The session's live todo plan (issue #228); tests script it for the pull seam. */
+  todoPhases: TodoPhase[] = [];
 
   private readonly listeners = new Map<string, Set<(data: FakeSessionEventData) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
@@ -95,7 +98,10 @@ class FakeSession implements AgentSessionDriver {
     return this.streaming;
   }
 
-  on(event: "message" | "turn_start" | "turn_end" | "error", cb: (data: FakeSessionEventData) => void): () => void {
+  on(
+    event: "message" | "turn_start" | "turn_end" | "error" | "thinking" | "todo_phases",
+    cb: (data: FakeSessionEventData) => void,
+  ): () => void {
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
@@ -105,11 +111,19 @@ class FakeSession implements AgentSessionDriver {
     return () => set.delete(cb);
   }
 
-  emit(event: "message" | "turn_start" | "turn_end" | "error", data: FakeSessionEventData): void {
+  emit(
+    event: "message" | "turn_start" | "turn_end" | "error" | "thinking" | "todo_phases",
+    data: FakeSessionEventData,
+  ): void {
     // The turn's principal binding dies with the turn (issue #152) — the
     // next fresh turn rebinds from its own prompt's principal.
     if (event === "turn_end") this.turnPrincipal = undefined;
     for (const cb of this.listeners.get(event) ?? []) cb(data);
+  }
+
+  /** The session's live todo plan (issue #228); the fake starts plan-less. */
+  getTodoPhases(): TodoPhase[] {
+    return this.todoPhases;
   }
 
   async dispose(): Promise<void> {
@@ -2616,5 +2630,89 @@ describe("classifyCorrection marker table (issue #219)", () => {
     expect(classifyCorrection("nonsense aside, do X")).toBe("ambiguous");
     expect(classifyCorrection("useful summary please")).toBe("ambiguous");
     expect(classifyCorrection("i am waiting for the build")).toBe("ambiguous");
+  });
+});
+
+describe("SpaceService live todo (issue #228, caller surface)", () => {
+  /** A long plan: 3 steps across 2 phases, step 1 completed, step 2 in progress. */
+  const LONG_PLAN: TodoPhase[] = [
+    {
+      name: "Research",
+      tasks: [
+        { content: "Read the repo", status: "completed" },
+        { content: "Draft the section", status: "in_progress" },
+      ],
+    },
+    { name: "Land", tasks: [{ content: "Push + PR", status: "pending" }] },
+  ];
+
+  test("a live todo_phases push from the session renders the in-place plan message and edits it as steps complete", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    await Promise.resolve(); // the receipt phrase post settles (ts-1)
+
+    // The driver's push: the todo tool's tool_execution_end snapshot.
+    session.emit("todo_phases", { spaceId: "slack:C1", phases: LONG_PLAN });
+    await Promise.resolve();
+
+    expect(posts).toEqual([
+      { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "1.1" } },
+      {
+        spaceId: "slack:C1",
+        text: "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ⏳ 2. Draft the section\n  ⏳ 3. Push + PR",
+        opts: { threadTs: "1.1" },
+      },
+    ]);
+
+    // Step 2 completes: the SAME plan message is edited in place.
+    session.emit("todo_phases", {
+      spaceId: "slack:C1",
+      phases: [
+        {
+          name: "Research",
+          tasks: [
+            { content: "Read the repo", status: "completed" },
+            { content: "Draft the section", status: "completed" },
+          ],
+        },
+        { name: "Land", tasks: [{ content: "Push + PR", status: "in_progress" }] },
+      ],
+    });
+    await Promise.resolve();
+    expect(posts).toHaveLength(2); // never a second plan message
+    expect(updates).toContainEqual({
+      spaceId: "slack:C1",
+      ts: "ts-2",
+      text: "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ✅ 2. Draft the section\n  ⏳ 3. Push + PR",
+    });
+
+    await service.stop();
+  });
+
+  test("getTodoPhases pulls the live session's plan; no session → an empty plan (normal, not an error)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // No live session yet: empty plan.
+    expect(service.getTodoPhases("slack:C1")).toEqual([]);
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.todoPhases = LONG_PLAN;
+
+    // The list_todos wiring reads exactly this (the driver's pull seam).
+    expect(service.getTodoPhases("slack:C1")).toBe(LONG_PLAN);
+
+    // A disposed session's plan is gone with it — the next cold start
+    // rehydrates from the transcript (the SDK's getTodoPhases).
+    await service.stop();
+    expect(service.getTodoPhases("slack:C1")).toEqual([]);
   });
 });

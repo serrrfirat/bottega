@@ -208,6 +208,7 @@ class RecordingDriver implements AgentDriver {
       isStreaming: () => false,
       on: () => () => {},
       async dispose() {},
+      getTodoPhases: () => [],
     };
   }
 }

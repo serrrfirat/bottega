@@ -24,6 +24,13 @@ export interface ApprovalResolution {
 
 export interface ApprovalRouter {
   request(d: ApprovalRequest): Promise<ApprovalResolution>;
+  /**
+   * Outstanding (unresolved) prompts (issue #228): the read side of the
+   * router, used by `list_todos` to report pending approvals. Optional —
+   * headless routers (DenyRouter) deny immediately and never hold a
+   * pending prompt, so they omit it and callers see an empty list.
+   */
+  pendingPrompts?(): ReadonlyArray<{ spaceId: string; tool: string }>;
 }
 
 /** No-op router for headless contexts: every ask-human request is denied. */

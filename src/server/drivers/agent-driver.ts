@@ -11,6 +11,7 @@ import {
   type CreateAgentSessionOptions,
   type CreateAgentSessionResult,
   type ExtensionFactory,
+  type TodoPhase,
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
 import { setAgentDir } from "@oh-my-pi/pi-utils";
@@ -142,6 +143,16 @@ export interface AgentSessionDriver {
   isStreaming(): boolean;
   on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void;
   dispose(): Promise<void>;
+  /**
+   * The session's live todo plan (issue #228): the pull half of the todo
+   * read seam. OMP sessions delegate to the SDK's AgentSession
+   * (getTodoPhases — the state the `todo` tool writes, restored from the
+   * transcript across cold starts). ACP v1 has no todo transport: the ACP
+   * driver returns an empty plan (no active plan is normal, never an
+   * error). The push half is the `todo_phases` driver event, emitted when
+   * the SDK finishes a todo operation.
+   */
+  getTodoPhases(): TodoPhase[];
   /**
    * Optional per-session model-role switch (issue #64): applies the role for
    * the NEXT turn. Optional on purpose — the interface stays
@@ -280,7 +291,13 @@ export function resolveRoleTarget(
 type SdkThinkingLevel = NonNullable<Parameters<AgentSession["setModel"]>[2]>["thinkingLevel"];
 
 /** Events the session drivers emit; both drivers share this vocabulary. */
-export type DriverEvent = "message" | "thinking" | "turn_start" | "turn_end" | "error";
+export type DriverEvent =
+  | "message"
+  | "thinking"
+  | "turn_start"
+  | "turn_end"
+  | "error"
+  | "todo_phases";
 
 /**
  * Payloads the session drivers emit per event. Consumers key off the event
@@ -297,6 +314,14 @@ export interface DriverEventData {
   thinking?: string;
   /** Turn failure cause (`turn_end` events, and empty-completion `message` events, carrying one — issue #226). */
   error?: string;
+  /**
+   * The session's live todo snapshot (`todo_phases` events, issue #228):
+   * emitted when the SDK's todo tool finishes an operation (the push path
+   * of the driver's todo read seam). The OMP driver carries the phases the
+   * tool result reported; the ACP driver never emits it (ACP v1 has no
+   * todo transport — its getTodoPhases returns an empty plan).
+   */
+  phases?: TodoPhase[];
 }
 
 /**
@@ -425,6 +450,15 @@ export const SPACE_AGENT_TOOLS = [
   "session_search",
   "model_settings",
   "use_model",
+  // Todo tool (issue #228): the session's planning scaffold — the WRITE
+  // path of the todo state the driver reads (getTodoPhases + the
+  // todo_phases push event). The SDK nudges the model to keep the plan
+  // current (todo_reminder) like the CLI.
+  "todo",
+  // Todo snapshot (issue #228): read-tier assembly of the space's current
+  // state — work items, pending approvals, scheduled jobs, in-progress
+  // count, and the live "🛠 Agent's plan".
+  "list_todos",
   // Settings tool (issue #67): get/set the durable org/space settings.
   "settings",
   // Admin tools (issue #73): catalog browser, stack health, deploy info
@@ -1286,6 +1320,31 @@ export function createOmpSdkDriver(
 }
 
 /**
+ * The todo tool's result snapshot (issue #228): the SDK's TodoToolDetails
+ * rides `result.details.phases` on `tool_execution_end`. Structural parse —
+ * a malformed result (or another tool's result shape) is skipped, never
+ * thrown into the turn path.
+ */
+const todoResultPhasesSchema = z.object({
+  details: z
+    .object({
+      phases: z.array(
+        z.object({
+          name: z.string(),
+          tasks: z.array(
+            z.object({
+              content: z.string(),
+              status: z.enum(["pending", "in_progress", "completed", "abandoned", "blocked"]),
+              blocker: z.string().optional(),
+            }),
+          ),
+        }),
+      ),
+    })
+    .passthrough(),
+}).passthrough();
+
+/**
  * The OMP driver's session implementation. Exported so driver-level tests
  * can pin setModelRole against a stubbed SDK session (the factory path
  * exercises it with a real SDK session elsewhere).
@@ -1467,6 +1526,25 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // resolution is the true turn end (issue #178).
           this.#emitter.emit("turn_end", { spaceId: deps.spaceId, error: this.#lastError });
           break;
+        case "tool_execution_end": {
+          // Issue #228 (push path): the todo tool's result carries the
+          // authoritative phase snapshot (TodoToolDetails.phases); re-emit
+          // it as a driver event so the presenter can render live progress
+          // and the in-place plan message. Only the todo tool produces
+          // result.details.phases — other tools' results are ignored, and a
+          // malformed/absent snapshot is skipped (no active plan is normal,
+          // never an error).
+          if (event.toolName === "todo") {
+            const parsed = todoResultPhasesSchema.safeParse(event.result);
+            if (parsed.success) {
+              this.#emitter.emit("todo_phases", {
+                spaceId: deps.spaceId,
+                phases: parsed.data.details.phases,
+              });
+            }
+          }
+          break;
+        }
         case "notice":
           if (event.level === "error") {
             this.#lastError = event.message;
@@ -1671,6 +1749,15 @@ export class OmpSessionDriver implements AgentSessionDriver {
 
   on(event: DriverEvent, cb: (data: DriverEventData) => void): () => void {
     return this.#emitter.on(event, cb);
+  }
+
+  /**
+   * The session's live todo plan (issue #228, pull path): delegates to the
+   * SDK session — the state the `todo` tool writes, rehydrated from the
+   * transcript when the session cold-starts.
+   */
+  getTodoPhases(): TodoPhase[] {
+    return this.#session.getTodoPhases();
   }
 
   /**

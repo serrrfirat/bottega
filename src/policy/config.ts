@@ -180,6 +180,9 @@ const TIER_BY_TOOL: ToolTiers = {
   work_item_cancel: "exec",
   complete_work_item: "write",
   list_work_items: "read",
+  // Todo snapshot (issue #228): read-only assembly of the space's live
+  // state — work items, approvals, scheduled jobs, and the agent's plan.
+  list_todos: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

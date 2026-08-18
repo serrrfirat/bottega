@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, TodoPhase, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
 import { MODEL_SETTINGS_CHANGED_EVENT, MODEL_SWITCHED_EVENT } from "../store/audit-events";
 import { SessionModelRoleRegistry, type AgentSessionDriver, type ModelRole, type ModelRoleSwitchResult } from "../server/drivers/agent-driver";
@@ -74,6 +74,10 @@ class FakeModelSession implements AgentSessionDriver {
   async abort(): Promise<void> {}
   isStreaming(): boolean {
     return false;
+  }
+  /** No todo plan (issue #228): the model tools never read it. */
+  getTodoPhases(): TodoPhase[] {
+    return [];
   }
   on(): () => void {
     return () => {};
@@ -334,6 +338,7 @@ describe("use_model", () => {
       isStreaming: () => false,
       on: () => () => {},
       dispose: async () => {},
+      getTodoPhases: () => [],
     };
     registry.set(space.id, plain);
     const tool = loadTools(s, { modelRoles: registry }).find((t) => t.name === "use_model")!;

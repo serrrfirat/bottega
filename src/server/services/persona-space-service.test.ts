@@ -22,6 +22,7 @@ class CapturingDriver implements AgentDriver {
       isStreaming: () => false,
       on: () => () => {},
       async dispose(): Promise<void> {},
+      getTodoPhases: () => [],
     };
   }
 }
