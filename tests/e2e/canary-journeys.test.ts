@@ -20,7 +20,7 @@
  *     state, the upload-link mint → form → vault, and the live-progress
  *     line shapes.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -72,6 +72,7 @@ import {
   canaryFixtureMcpTransport,
   createCanaryRegistry,
   JOURNEY_TIMEOUT_MS,
+  memorySavePromptFor,
   oauthAuthorizeStateFrom,
   oauthAuthorizeUrlFrom,
   postAndWait,
@@ -194,6 +195,50 @@ describe("canary journey windows (issue #215)", () => {
     // keep headroom.
     expect(JOURNEY_TIMEOUT_MS).toBe(300_000);
     expect(STORE_TIMEOUT_MS).toBeGreaterThan(60_000); // raised with the reply window
+  });
+});
+
+describe("memory journey scope pin (issue #224)", () => {
+  test("the memory save prompt names the ORG scope explicitly — the text the journey posts to the model", () => {
+    // Live finding (run msypizpb-qt3): the journey asked the model to
+    // "store the canary code word in memory" then polled
+    // h.memory.search(scope: "org"). The model (luna) saved with
+    // scope: "user" (natural for a DM — proven in run msymugpa's
+    // surviving transcript: memory_save executed with {scope: "user"}),
+    // the org-scope search never found the fact, and the journey timed
+    // out ("timed out after 90000ms waiting for the remembered fact").
+    // The tool did NOT fail; the contract was ambiguous. The fix pins the
+    // scope in the posted prompt. Red on the pre-fix code: the prompt was
+    // "… — store it in memory" with no scope, so this assertion fails.
+    const prompt = memorySavePromptFor("probe-run");
+    expect(prompt).toContain("canary-probe-run");
+    expect(prompt).toContain("ORG memory");
+    expect(prompt).toContain("scope: org");
+  });
+
+  test("the ORG-scope search is the journey's deterministic round-trip proof, and the prompt's word must round-trip through it", async () => {
+    // The journey's assertion is a REAL memory round-trip: the posted word
+    // must survive a save → org-scope store search. The prompt builder is
+    // the posted text; the search the journey runs is the org store. This
+    // test drives both halves against the REAL SQLite memory provider: the
+    // word from the prompt is saved to org scope and found by the exact
+    // search the journey runs (memory.search, scope org, limit 5).
+    const h = await bootHarness({ registry: createCanaryRegistry() });
+    try {
+      const prompt = memorySavePromptFor("round-trip-run");
+      const word = /canary code word is (canary-[A-Za-z0-9-]+)/.exec(prompt)?.[1];
+      expect(word).toBeDefined();
+      await h.memory.save({ scope: "org", content: `the canary code word is ${word}`, metadata: {} });
+      const found = await h.memory.search({ query: word!, scope: "org", limit: 5 });
+      expect(found.some((e) => e.content.includes(word!))).toBe(true);
+      // A user-scope save (the pre-fix model's choice) must NOT satisfy the
+      // org-scope proof — that asymmetry is the bug #224 fixes.
+      await h.memory.save({ scope: "user", principal: "U-owner", content: `user-only ${word}`, metadata: {} });
+      const orgOnly = await h.memory.search({ query: word!, scope: "org", limit: 5 });
+      expect(orgOnly.some((e) => e.content.includes("user-only"))).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
   });
 });
 
@@ -325,6 +370,54 @@ describe("channel chat-reply thread polling (issue #212)", () => {
     expect(calls[0]).toBe(`replies:${pingTs}`); // conversations.replies is the first eye
     expect(calls).toContain("history"); // its rejection falls back to history
   });
+
+  test("a live-progress line is never the reply — the poll keeps waiting for the real text (issue #224)", async () => {
+    // Live finding (run msypizpb-qt3): the live model returned empty
+    // completions for the ping turns. The DM turn's phrase was edited to
+    // the elapsed progress line "Thinking… 0s" (the plain presenter's
+    // progress tick) and the DM journey MATCHED it as the reply — a false
+    // pass that hid the no-reply — while the channel turn (stream
+    // presenter: no progress tick) honestly timed out. A progress line is
+    // turn decoration; a real reply replaces the phrase in place. The stub
+    // posts the progress line first; the poll must skip it and only
+    // resolve on the real reply. Red on the pre-fix code: the poll matched
+    // "Thinking… 0s" immediately and never saw the real reply.
+    const pingTs = "1787000000.000100";
+    const progressLine: SlackApiMessage = {
+      ts: "1787000000.000300",
+      channel: "C1",
+      bot_id: "B-bot",
+      text: "Thinking… 0s",
+    };
+    const realReply: SlackApiMessage = {
+      ts: "1787000000.000900",
+      channel: "C1",
+      bot_id: "B-bot",
+      text: "ok — the actual reply",
+    };
+    let polls = 0;
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        history: async () => {
+          polls += 1;
+          return [
+            { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
+            // The progress line stays until the real reply replaces it.
+            ...(polls > 1 ? [realReply] : [progressLine]),
+          ];
+        },
+      },
+    } as unknown as Harness;
+    const reply = await waitForBotReply(h, "C1", {
+      afterTs: pingTs,
+      label: "progress false pass",
+      timeoutMs: 5_000,
+    });
+    expect(reply.text).toBe("ok — the actual reply");
+    expect(polls).toBeGreaterThan(1); // the progress line was skipped, not matched
+  });
 });
 
 describe("extension-call journey mechanism (issue #175)", () => {
@@ -396,6 +489,50 @@ describe("extension-call journey mechanism (issue #175)", () => {
         h.slack.store.messages.all().find((m) => m.text.includes("sunny in canary-test")),
       );
       expect(reply).toBeDefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("tool-execution observability (issue #224)", () => {
+  test("a gated tool call logs its RESULT at INFO through the harness seam (the driver's withPolicyGate wrapper)", async () => {
+    // The canary's tool-event seam (issue #224): under restrictToolNames
+    // the SDK's extension tool events are inert, so every live tool call
+    // crosses the driver's withPolicyGate wrapper — the harness path. The
+    // pre-#224 run (msypizpb-qt3) could not attribute the "timed out
+    // waiting for the store effect" failures: no tool results/errors were
+    // logged and the temp transcripts were deleted at cleanup. The seam
+    // must log toolName + outcome at INFO. Driving a real gated memory.save
+    // call through the harness and capturing console output proves the
+    // line fires exactly where a live run's stdout would show it.
+    const modelToolName = opencodeSafeToolName("memory.save");
+    const turns: StubTurn[] = [
+      {
+        type: "tool_calls",
+        calls: [{ name: modelToolName, args: { content: "canary-observability-probe", scope: "org" } }],
+      },
+      { type: "text", text: "remembered" },
+    ];
+    const h = await bootHarness({
+      orgConfigYaml: CANARY_ORG_CONFIG,
+      modelTurns: turns,
+      registry: createCanaryRegistry(),
+    });
+    try {
+      const dm = h.slack.dmChannelId;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: dm });
+      const lines: string[] = [];
+      const spy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      });
+      try {
+        await h.deliverMessage(dm, "remember the probe word in org memory");
+        await h.modelStub.waitForRequests(2, 20_000);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(lines.some((l) => /\[tool\] memory\.save → ok/.test(l))).toBe(true);
     } finally {
       await h.cleanup();
     }
@@ -981,6 +1118,32 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
     expect(uploadLinkUrlFrom(toolResult)).toBe(expected);
     // A genuinely malformed reply (no loopback link) still fails closed.
     expect(uploadLinkUrlFrom("no link here")).toBeUndefined();
+  });
+
+  test("the extraction stops at the first newline after a BARE public-base URL — the EXACT live reply from run msypizpb-qt3 (#224)", () => {
+    // Live finding (run msypizpb-qt3): with a public base configured
+    // (BOTTEGA_OAUTH_CALLBACK_BASE_URL — the deployment's cloudflared
+    // tunnel), the mint returns a REAL https URL, and the journey failed
+    // with "mint returned a malformed upload URL: <the URL + the relay
+    // copy>". The #212 fix covered only the <url>-wrapped LOOPBACK shape;
+    // the live shape is a BARE url + newline + relay copy. The reply below
+    // is the run's failure text reproduced VERBATIM. The extraction must
+    // return ONLY the URL. Red on the pre-fix code: the loopback-only
+    // regex matched nothing, so this assertion fails (undefined).
+    const liveReply =
+      "https://across-sbjct-insulin-lessons.trycloudflare.com/upload/9n-QApeWOmi3gvuw62E94qk9\n" +
+      "Relay this upload link exactly as written — never construct, reformat, or substitute the URL.";
+    expect(uploadLinkUrlFrom(liveReply)).toBe(
+      "https://across-sbjct-insulin-lessons.trycloudflare.com/upload/9n-QApeWOmi3gvuw62E94qk9",
+    );
+    // The wrapped-Slack shape with a PUBLIC base extracts the same way
+    // (the #212 angle-bracket stop still holds for https hosts).
+    expect(
+      uploadLinkUrlFrom(
+        "<https://across-sbjct-insulin-lessons.trycloudflare.com/upload/9n-QApeWOmi3gvuw62E94qk9>\n" +
+          "Relay this upload link exactly as written — never construct, reformat, or substitute the URL.",
+      ),
+    ).toBe("https://across-sbjct-insulin-lessons.trycloudflare.com/upload/9n-QApeWOmi3gvuw62E94qk9");
   });
 });
 

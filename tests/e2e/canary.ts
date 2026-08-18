@@ -547,8 +547,12 @@ function isBotMessage(h: Harness, m: SlackApiMessage): boolean {
  * Polls live history for the bot's reply to an inbound message: any
  * bot-authored message with non-empty text, newer than the inbound ts
  * (and threaded under it in channels — DMs reply plain, #40). Thinking
- * phrases are excluded: the real adapter replaces them in place (#40/#60).
- * Transient history errors retry; only a timeout fails the journey.
+ * phrases AND live-progress lines are excluded: the real adapter replaces
+ * them in place (#40/#60), so a progress line ("⚙️ …", "🧠 …",
+ * "Thinking… Ns") that outlives an empty turn is decoration, never a
+ * reply (#224 — a false pass would hide the exact no-reply failure this
+ * journey exists to catch). Transient history errors retry; only a
+ * timeout fails the journey.
  *
  * Threaded polls (postAndWait(thread: true) — the channel journeys) read
  * conversations.replies for the thread: Slack's conversations.history
@@ -603,6 +607,12 @@ export async function waitForBotReply(
           isBotMessage(h, m) &&
           m.text.trim().length > 0 &&
           !THINKING_PHRASES.includes(m.text.trim()) &&
+          // Live-progress lines (issue #224) are turn DECORATION, never a
+          // reply: a real reply replaces the phrase in place, so a poll
+          // that matches "⚙️ …" / "🧠 …" / "Thinking… Ns" false-passes on
+          // an empty turn (run msypizpb-qt3: the DM journey "passed" on
+          // the elapsed line while the channel turn honestly timed out).
+          !PROGRESS_LINE_RE.test(m.text.trim()) &&
           parseFloat(m.ts) > after &&
           (!requireThread || m.thread_ts === opts.threadTs),
       );
@@ -689,13 +699,29 @@ async function journeyChatReply(
   }
 }
 
+/**
+ * The memory-save prompt the journey posts (issue #224): the scope is
+ * pinned EXPLICITLY ("ORG memory", "scope: org") because the journey's
+ * deterministic proof polls the ORG store. The pre-#224 prompt ("store it
+ * in memory") was ambiguous — the live model (luna) saved with
+ * scope: "user" (natural for a DM, run msymugpa's surviving transcript:
+ * memory_save executed with {scope: "user"}), the org-scope search never
+ * found the fact, and the journey timed out. The model sees this text
+ * verbatim, so the explicit scope is the contract. Exported for the
+ * hermetic journey-mechanism tests.
+ */
+export function memorySavePromptFor(runId: string): string {
+  return `remember that the canary code word is canary-${runId} — store it in ORG memory (memory.save scope: org), shared with the whole organization`;
+}
+
 async function journeyMemory(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
   const word = `canary-${runId}`;
   try {
-    // Save leg: the real model must call memory.save; the deterministic
-    // proof is the SQLite store finding the fact afterwards.
-    await postAndWait(h, channelId, `remember that the canary code word is ${word} — store it in memory`, {
+    // Save leg: the real model must call memory.save with scope org — the
+    // prompt pins the scope explicitly (#224); the deterministic proof is
+    // the SQLite store finding the fact in the org scope afterwards.
+    await postAndWait(h, channelId, memorySavePromptFor(runId), {
       label: "memory save",
     });
     const stored = await waitFor(
@@ -1655,17 +1681,23 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
 }
 
 /**
- * The minted upload URL from the connect_upload_link result text (issue
- * #212): the mint tool returns the URL on its own line followed by the
- * relay-copy instruction (uploadLinkRelayText — the model must relay the
- * link verbatim), and Slack renders URLs as <url> in message text. The
- * journey reads the URL back from that text, so the extraction stops at
- * the newline / `>` / whitespace — the relay line and the angle brackets
- * are the tool's/chat's copy, never part of the link. Exported for the
- * hermetic journey-mechanism tests.
+ * The minted upload URL from the connect_upload_link result text (issues
+ * #212 + #224): the mint tool returns the URL on its own line followed by
+ * the relay-copy instruction (uploadLinkRelayText — the model must relay
+ * the link verbatim), and Slack renders URLs as <url> in message text.
+ * The journey reads the URL back from that text, so the extraction stops
+ * at the first whitespace/newline/`>` after the URL — the relay line and
+ * the angle brackets are the tool's/chat's copy, never part of the link.
+ * The host is deliberately NOT pinned to the loopback shape: a deployment
+ * with a public base (BOTTEGA_OAUTH_CALLBACK_BASE_URL) mints a real
+ * https URL (the #224 live shape — the #212 fix covered only the
+ * <url>-wrapped loopback shape, and the bare
+ * `https://<host>/upload/<token>` + newline + relay-copy reply captured
+ * the relay line as "malformed upload URL"). Exported for the hermetic
+ * journey-mechanism tests.
  */
 export function uploadLinkUrlFrom(text: string): string | undefined {
-  return /http:\/\/127\.0\.0\.1:\d+\/upload\/[A-Za-z0-9_-]+/.exec(text.trim())?.[0];
+  return /https?:\/\/[^\s<>]+\/upload\/[A-Za-z0-9_-]+/.exec(text.trim())?.[0];
 }
 
 /**

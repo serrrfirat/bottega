@@ -696,6 +696,11 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
           status: "complete",
           output: stepArgs,
         });
+        // Tool-outcome INFO (issue #224): the canary's tool-event seam —
+        // under restrictToolNames the SDK's extension events are inert, so
+        // every live call crosses this wrapper; a denied call is an
+        // attributable outcome, never a silent no-reply.
+        console.log(`[tool] ${def.name} → denied (${tier})`);
         throw new Error(outcome.blockReason);
       }
       if (outcome.decision === "ask-human") {
@@ -729,6 +734,12 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
             output: stepArgs,
           });
         }
+        // Tool-outcome INFO (issue #224): the canary's tool-event seam —
+        // log the tool name + outcome so a live run attributes a store
+        // effect that never landed (tool failure vs stall vs model
+        // behavior). The pre-#224 run could not: no tool results/errors
+        // were logged and the temp transcripts were deleted at cleanup.
+        console.log(`[tool] ${def.name} → ok`);
         return result;
       } catch (err) {
         if (outcome.decision !== "ask-human") {
@@ -740,6 +751,7 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
             output: stepArgs,
           });
         }
+        console.log(`[tool] ${def.name} → error: ${err instanceof Error ? err.message : String(err)}`);
         throw err;
       }
     },
