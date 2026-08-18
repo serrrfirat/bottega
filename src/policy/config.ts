@@ -187,6 +187,13 @@ const TIER_BY_TOOL: ToolTiers = {
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.
   connect_extension: "exec",
+  // Catalog registration (issue #232): the deterministic "connect X" flow
+  // for UNREGISTERED extensions crosses this name through the shared
+  // decision table BEFORE any pin — a repo-level change with egress
+  // implications, so it routes ask-human through the approval router like
+  // every exec-tier tool; a pin never happens silently. Only reachable
+  // from the connect capability's catalog seam; never a user-visible tool.
+  register_extension: "exec",
   // Memory tools (issue #22): save mutates durable state (write — prompts
   // in non-yolo modes), search only queries (read).
   "memory.save": "write",

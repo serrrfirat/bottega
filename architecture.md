@@ -420,6 +420,19 @@ user-facing view is in
    `config/egress.dev.yml`; the binding host joins the domain set. Hosted
    streamable-HTTP + OAuth is preferred. A stdio/CLI binding requires both
    `no_hosted_variant: true` and human confirmation.
+2b. **Connect drives the same flow** — issue #232: when `connect <X>`
+   names an UNREGISTERED hosted-MCP id, `connectExtension` (with the
+   `catalogRegister` seam wired) runs the deterministic route in
+   `src/extensions/catalog-register.ts` — catalog lookup → draft (the
+   official `mcp.<vendor-domain>` endpoint derived from the catalog record
+   + the vendor's RFC 8414 OAuth metadata; OAuth-gated servers pin
+   tools-less, the #231 notion shape) → a MANDATORY `register_extension`
+   review gate through the approval router (a pin never happens silently)
+   → on approve: pin + egress regen + hot-register into the live registry
+   (the canary's pin-journey mechanics, #197) → the connect continues in
+   the same turn (OAuth mint #198 / upload link #196). Unknown ids fail
+   loudly with the catalog browse path; the routing is deterministic — the
+   model is never the driver.
 3. **Effective tools** — `tools` is optional (#158). Present tools,
    including `[]`, are the reviewed pinned surface. An absent MCP surface
    comes from paginated provider `tools/list`. `generate-tools.ts` can pin

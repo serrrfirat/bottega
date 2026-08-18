@@ -32,6 +32,7 @@ import {
   type BrokerConnector,
 } from "../../extensions/connect";
 import type { McpOAuthConnector } from "../../extensions/mcp-oauth";
+import type { CatalogRegisterDeps } from "../../extensions/catalog-register";
 import { mintUploadLinkToolDefinition, type UploadLinkStore } from "../../extensions/upload-link";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
@@ -66,7 +67,7 @@ export interface MemoryContextDriverOpts {
  * (personal connects record owner = actor).
  */
 export interface ConnectExtensionDriverOpts {
-  registry: Pick<ExtensionRegistry, "resolve">;
+  registry: Pick<ExtensionRegistry, "resolve" | "register">;
   store: Pick<Store, "upsertExtensionCredential">;
   audit: AuditModule;
   loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
@@ -75,6 +76,13 @@ export interface ConnectExtensionDriverOpts {
   timeoutMs?: number;
   /** Broker seam; defaults to the production auth-broker connector. */
   broker?: BrokerConnector;
+  /**
+   * Catalog registration seam (issue #232): when wired, the per-session
+   * connect tool routes an UNREGISTERED extension through the deterministic
+   * catalog flow (lookup → draft → review gate → pin → connect) instead of
+   * failing with "unknown extension".
+   */
+  catalogRegister?: CatalogRegisterDeps;
   /**
    * Generic MCP OAuth seam (issue #198): hosted OAuth MCPs connect through
    * it — the connect tool mints the authorization URL (shown in Slack),
@@ -1156,6 +1164,9 @@ export function createOmpSdkDriver(
               store: opts.connectExtension.store,
               audit: opts.connectExtension.audit,
               broker: opts.connectExtension.broker ?? connectViaAuthBroker,
+              ...(opts.connectExtension.catalogRegister !== undefined
+                ? { catalogRegister: opts.connectExtension.catalogRegister }
+                : undefined),
               ...(opts.connectExtension.mcpOAuth !== undefined
                 ? { mcpOAuth: opts.connectExtension.mcpOAuth }
                 : undefined),

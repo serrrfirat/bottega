@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAudit } from "../policy/audit";
@@ -25,7 +25,9 @@ import {
 } from "./connect";
 import { fixtureManifest } from "./fixture";
 import type { ExtensionManifest } from "./manifest";
-import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
+import { createExtensionRegistry, parsePinnedSnapshot, type ExtensionRegistry } from "./registry";
+import { CATALOG_REGISTER_TOOL } from "./catalog-register";
+import { DEFAULT_CATALOG_URL } from "./fetch-catalog";
 import type { McpOAuthStartResult } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-connect-"));
@@ -563,5 +565,155 @@ describe("pure helpers", () => {
   test("apiKeyIdentityKey is stable and scope-aware", () => {
     expect(apiKeyIdentityKey("github", "org", null)).toBe("api-key:github");
     expect(apiKeyIdentityKey("github", "personal", "UADA")).toBe("api-key:UADA");
+  });
+});
+
+describe("connectExtension catalog fallback (issue #232)", () => {
+  const NOTION_RECORD = {
+    id: "mcp/notion",
+    slug: "notion",
+    kind: "mcp",
+    name: "Notion",
+    description: "Notion's official MCP server",
+    url: "https://notion.com/docs/mcp",
+    domain: "notion.com",
+  };
+  const ACME_KEY_RECORD = {
+    id: "mcp/acme-key",
+    slug: "acme-key",
+    kind: "mcp",
+    name: "Acme Key",
+    description: "An api_key-gated hosted MCP",
+    url: "https://acme.example.com/docs/mcp",
+    domain: "acme.example.com",
+  };
+
+  /** Catalog doc + well-known probe routing: hermetic, no network. */
+  function stubCatalogFetch(records: unknown[], wellKnownStatus: number): typeof fetch {
+    // SAFETY: the stub implements fetch's call contract; Bun's fetch also
+    // exposes fetch.preconnect, which the catalog client never calls.
+    return (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === DEFAULT_CATALOG_URL) {
+        return new Response(JSON.stringify({ version: 1, data: records }), { status: 200 });
+      }
+      return new Response("", { status: wellKnownStatus });
+    }) as typeof fetch;
+  }
+
+  interface CatalogHarness extends Harness {
+    snapshotsDir: string;
+    egressPath: string;
+    devEgressPath: string;
+    dir: string;
+  }
+
+  function makeCatalogHarness(opts: {
+    router?: RecordingRouter;
+    records?: unknown[];
+    wellKnownStatus?: number;
+    policy?: PolicyConfig;
+  } = {}): CatalogHarness {
+    const base = makeDeps({
+      router: opts.router,
+      policy: opts.policy ?? parseOrgConfigYaml("tools:\n  register_extension: allow\n"),
+    });
+    const dir = mkdtempSync(join(tmpdir(), "bottega-connect-catalog-"));
+    const snapshotsDir = join(dir, "extensions");
+    const egressPath = join(dir, "egress.yml");
+    const devEgressPath = join(dir, "egress.dev.yml");
+    const registry = createExtensionRegistry(snapshotsDir); // empty: notion/acme-key unregistered
+    return {
+      ...base,
+      deps: {
+        ...base.deps,
+        registry,
+        catalogRegister: {
+          catalog: { fetchImpl: stubCatalogFetch(opts.records ?? [NOTION_RECORD], opts.wellKnownStatus ?? 200) },
+          snapshotsDir,
+          egressPath,
+          devEgressPath,
+        },
+      },
+      snapshotsDir,
+      egressPath,
+      devEgressPath,
+      dir,
+    };
+  }
+
+  const catalogDirs: string[] = [];
+  afterAll(() => {
+    for (const dir of catalogDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an unregistered catalog extension routes through lookup → gate → pin → connect continuation", async () => {
+    const h = makeCatalogHarness();
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "notion", "personal", "UADA");
+
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.message).toBe("Open this link to authorize");
+    // The mandatory register gate ran with the draft payload.
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.router.requests[0]!.tool).toBe(CATALOG_REGISTER_TOOL);
+    expect(h.router.requests[0]!.args).toMatchObject({
+      extension: "notion",
+      vendor: "Notion",
+      mcpEndpoint: "https://mcp.notion.com/mcp",
+      credentialSchema: { type: "oauth" },
+    });
+    // Pinned + egress regenerated + hot-registered — the connect continued
+    // in the same turn (the OAuth mint fired).
+    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
+    expect(snapshot.extensionId).toBe("notion");
+    expect(snapshot.source.reviewed).toBe(true);
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+    expect(h.mcpOAuth.calls[0]!.extension).toBe("notion");
+    expect(h.deps.registry.resolve("notion")).toBeDefined();
+  });
+
+  test("a denied register gate pins nothing and never mints", async () => {
+    const h = makeCatalogHarness({ router: new RecordingRouter({ approved: false }) });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "notion", "personal", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) expect(outcome.message).toContain("policy: approval denied");
+    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+    expect(h.deps.registry.resolve("notion")).toBeUndefined();
+  });
+
+  test("an api_key catalog extension pins then directs the key to the one-time upload link", async () => {
+    const h = makeCatalogHarness({ records: [ACME_KEY_RECORD], wellKnownStatus: 404 });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "acme-key", "personal", "UADA");
+
+    // The pin landed (gate approved) — but the connect cannot proceed
+    // without the key, and the message points at the #196 safe path.
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      expect(outcome.message).toContain('Pinned "Acme Key" from the catalog');
+      expect(outcome.message).toContain("connect_upload_link");
+      // The guidance never asks for a pasted key in chat.
+      expect(outcome.message).toContain("never paste a live key in chat");
+    }
+    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "acme-key.json"), "utf8"));
+    expect(snapshot.manifest.credentialSchema).toEqual({ type: "api_key" });
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.acme.example.com"');
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+  });
+
+  test("without the catalog seam an unknown extension keeps the fail-closed error", async () => {
+    // Headless/executor contexts wire no seam: the old error stands.
+    const h = makeDeps();
+    const outcome = await connect(h, "com.nope", "personal", "UADA");
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) expect(outcome.message).toContain("unknown extension");
   });
 });

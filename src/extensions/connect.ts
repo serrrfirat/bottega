@@ -25,6 +25,15 @@
  * `policy.decision` / `approval.requested` / `approval.resolved` rows, so
  * the trail for a privileged connect is complete.
  *
+ * Issue #232: an UNREGISTERED extension id no longer dies with "unknown
+ * extension" when the catalog seam is wired ({@link ConnectExtensionDeps.catalogRegister}):
+ * the connect drives the deterministic integrations.sh catalog flow —
+ * lookup → draft (official hosted MCP endpoint discovery + auth
+ * classification) → mandatory review gate (register_extension; a pin is a
+ * repo-level change with egress implications, never silent) → pin + egress
+ * regen + hot-register → the connect continues in the same turn. The model
+ * is never the driver, so a stalled agent cannot block a catalog connect.
+ *
  * The broker seam: callers inject a {@link BrokerConnector};
  * {@link connectViaAuthBroker} is the production implementation (the
  * server's default). Known limitation: the broker's vault keeps ONE api_key
@@ -51,6 +60,7 @@ import { looksLikeObviousSecret } from "../tools/memory";
 import type { McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
+import { registerExtensionFromCatalog, type CatalogRegisterDeps } from "./catalog-register";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -84,8 +94,13 @@ export type BrokerConnector = (input: {
 }) => Promise<BrokerConnectResult>;
 
 export interface ConnectExtensionDeps {
-  /** Extension registry (provider manifests: id, label, credential schema). */
-  registry: Pick<ExtensionRegistry, "resolve">;
+  /**
+   * Extension registry (provider manifests: id, label, credential schema).
+   * `register` is the hot-register target of the catalog seam (issue #232):
+   * a freshly pinned extension lands here so the connect continues in the
+   * same turn.
+   */
+  registry: Pick<ExtensionRegistry, "resolve" | "register">;
   store: Pick<Store, "upsertExtensionCredential">;
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
@@ -101,6 +116,17 @@ export interface ConnectExtensionDeps {
    * provider-registry login, which would fail anyway).
    */
   mcpOAuth?: McpOAuthConnector;
+  /**
+   * Catalog registration seam (issue #232): when wired, an UNREGISTERED
+   * extension id routes to the deterministic integrations.sh catalog flow —
+   * lookup → draft (official hosted MCP endpoint discovery + auth
+   * classification) → mandatory review gate (register_extension through
+   * the approval router; a pin is a repo-level change with egress
+   * implications and NEVER happens silently) → pin + egress regen +
+   * hot-register — and the connect continues in the same turn. Absent
+   * (headless/executor contexts) → the fail-closed unknown-extension error.
+   */
+  catalogRegister?: CatalogRegisterDeps;
   /** Policy gate used for org-scope connects (the exec/ask-human flow). */
   gate: {
     loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
@@ -160,25 +186,70 @@ export async function connectExtension(
   },
   deps: ConnectExtensionDeps,
 ): Promise<ConnectOutcome> {
-  const resolved = deps.registry.resolve(input.extension);
+  // Paste guard (issue #196): refuse credential-shaped api_key values
+  // BEFORE anything runs — no gate request, no broker call, no audit row,
+  // and for an unregistered extension no catalog lookup — so the value
+  // never reaches a transcript (mirrors #121's memory.save rejection).
+  // The safe path is the one-time upload link: the secret goes straight
+  // from the user's browser into the vault. Issue #222: the upload POST is
+  // that exact path — its api_key arrives via `fromUpload` (see the flag's
+  // doc) and skips the guard; every chat/MCP/intent caller omits the flag,
+  // so the guard is unchanged there.
+  if (input.apiKey !== undefined && !input.fromUpload && looksLikeObviousSecret(input.apiKey)) {
+    return { ok: false, message: SECRET_PASTE_REDIRECT };
+  }
+
+  let resolved = deps.registry.resolve(input.extension);
+  // Issue #232: an UNREGISTERED extension no longer dies here — when the
+  // catalog seam is wired, the connect drives the deterministic
+  // integrations.sh catalog flow itself (lookup → draft → mandatory review
+  // gate → pin + egress regen + hot-register) and CONTINUES in the same
+  // turn. The model is never the driver: the routing is deterministic, so
+  // a stalled agent can never block a catalog extension connect.
   if (!resolved) {
-    return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
+    if (deps.catalogRegister === undefined) {
+      return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
+    }
+    const registration = await registerExtensionFromCatalog({
+      ...deps.catalogRegister,
+      extensionId: input.extension,
+      actor: input.actor,
+      spaceId: input.spaceId,
+      registry: deps.registry,
+      audit: deps.audit,
+      gate: deps.gate,
+    });
+    if (!registration.ok) return { ok: false, message: registration.message };
+    resolved = deps.registry.resolve(input.extension);
+    if (!resolved) {
+      // Fail closed: the pin landed (approved) but the live registry does
+      // not see it — the connect cannot continue until the server reloads.
+      return {
+        ok: false,
+        message:
+          `${registration.message} The running server still cannot resolve "${input.extension}" — ` +
+          "restart the server and retry the connect.",
+      };
+    }
+    // api_key extensions need the key to connect; the chat/intent path has
+    // none (and pasting one is refused), so after the pin the honest next
+    // step is the #196 one-time upload link — never a silent stall.
+    if (
+      resolved.manifest.credentialSchema.type === "api_key" &&
+      input.apiKey === undefined &&
+      !input.fromUpload
+    ) {
+      return {
+        ok: false,
+        message:
+          `${registration.message} Now connect its API key: use connect_upload_link for a one-time browser ` +
+          "upload, or re-run connect with the key — never paste a live key in chat.",
+      };
+    }
   }
   const manifest = resolved.manifest;
   const provider = manifest.id;
   const label = manifest.label;
-
-  // Paste guard (issue #196): refuse credential-shaped api_key values
-  // BEFORE anything runs — no gate request, no broker call, no audit row —
-  // so the value never reaches a transcript (mirrors #121's memory.save
-  // rejection). The safe path is the one-time upload link: the secret goes
-  // straight from the user's browser into the vault. Issue #222: the
-  // upload POST is that exact path — its api_key arrives via
-  // `fromUpload` (see the flag's doc) and skips the guard; every chat/
-  // MCP/intent caller omits the flag, so the guard is unchanged there.
-  if (input.apiKey !== undefined && !input.fromUpload && looksLikeObviousSecret(input.apiKey)) {
-    return { ok: false, message: SECRET_PASTE_REDIRECT };
-  }
 
   // Org-scope connects are privileged: they cross the shared policy gate as
   // an exec-tier tool call (deny → blocked, allow → ask-human). Personal

@@ -1,5 +1,5 @@
-import { afterAll, describe, expect, test, vi } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, test, vi } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext, TodoPhase } from "@oh-my-pi/pi-coding-agent";
@@ -12,9 +12,13 @@ import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
 import type { ConnectExtensionDeps } from "../../extensions/connect";
 import { createFixtureRegistry } from "../../extensions/fixture";
+import { createExtensionRegistry } from "../../extensions/registry";
+import { parsePinnedSnapshot } from "../../extensions/registry";
+import { CATALOG_REGISTER_TOOL } from "../../extensions/catalog-register";
+import { DEFAULT_CATALOG_URL } from "../../extensions/fetch-catalog";
 import { DenyRouter, type ApprovalRequest, type ApprovalResolution, type ApprovalRouter } from "../../policy/approval-router";
 import { createAudit } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, POLICY_DECISION_EVENT, APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
@@ -2258,6 +2262,252 @@ describe("SpaceService connect intent (issue #61)", () => {
     expect(driver.created).toHaveLength(1);
     expect(driver.last().prompts[0]!.text).toBe("connect fixture.weather as me");
     await service.stop();
+  });
+});
+
+describe("SpaceService connect intent catalog fallback (issue #232)", () => {
+  const NOTION_RECORD = {
+    id: "mcp/notion",
+    slug: "notion",
+    kind: "mcp",
+    name: "Notion",
+    description: "Notion's official MCP server",
+    url: "https://notion.com/docs/mcp",
+    domain: "notion.com",
+  };
+
+  /** Catalog + well-known probe stub: hermetic, no network. */
+  function stubCatalogFetch(records: unknown[], wellKnownStatus: number): typeof fetch {
+    // SAFETY: the stub implements fetch's call contract; Bun's fetch also
+    // exposes fetch.preconnect, which the catalog client never calls.
+    return (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === DEFAULT_CATALOG_URL) {
+        return new Response(JSON.stringify({ version: 1, data: records }), { status: 200 });
+      }
+      return new Response("", { status: wellKnownStatus });
+    }) as typeof fetch;
+  }
+
+  /** Recording router that approves; the default DenyRouter denies. */
+  class ApprovingRouter implements ApprovalRouter {
+    readonly requests: ApprovalRequest[] = [];
+    async request(d: ApprovalRequest): Promise<ApprovalResolution> {
+      this.requests.push(d);
+      return { approved: true, approver: "U-APPROVER" };
+    }
+  }
+
+  interface CatalogHarness {
+    deps: ConnectExtensionDeps;
+    adapter: SlackAdapter;
+    posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
+    store: Store;
+    driver: FakeDriver;
+    router: ApprovingRouter;
+    audit: Array<{ space_id?: string | null; actor: string; event_type: string; payload: unknown }>;
+    snapshotsDir: string;
+    egressPath: string;
+    devEgressPath: string;
+    oauthStarts: Array<{ extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }>;
+    dir: string;
+  }
+
+  function makeCatalogHarness(opts: {
+    router?: ApprovalRouter;
+    records?: unknown[];
+    wellKnownStatus?: number;
+  } = {}): CatalogHarness {
+    const { adapter, posts } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const audit: Array<{ space_id?: string | null; actor: string; event_type: string; payload: unknown }> = [];
+    const dir = mkdtempSync(join(tmpdir(), "bottega-space-catalog-"));
+    const snapshotsDir = join(dir, "extensions");
+    const egressPath = join(dir, "egress.yml");
+    const devEgressPath = join(dir, "egress.dev.yml");
+    // The RECORDING router is always present (the gate's effective router is
+    // the override when one is given — e.g. DenyRouter for the deny tests).
+    const recording = new ApprovingRouter();
+    const router: ApprovalRouter = opts.router ?? recording;
+    // The LIVE registry — seeded from the (empty) temp snapshots dir, so
+    // "notion" is UNREGISTERED here no matter what the repo pins.
+    const registry = createExtensionRegistry(snapshotsDir);
+    const oauthStarts: CatalogHarness["oauthStarts"] = [];
+    const deps: ConnectExtensionDeps = {
+      registry,
+      store: {
+        upsertExtensionCredential: async () => {
+          throw new Error("hosted OAuth connects record at the callback, never here");
+        },
+      } as ConnectExtensionDeps["store"],
+      audit: {
+        appendAudit: async (entry) => {
+          audit.push(entry);
+          return audit.length;
+        },
+        listAudit: async () => [],
+      },
+      broker: async () => {
+        throw new Error("hosted OAuth must not use the broker login path");
+      },
+      mcpOAuth: {
+        start: async (input) => {
+          oauthStarts.push(input);
+          return {
+            ok: true,
+            authorizationUrl: "https://auth.example/authorize?state=catalog-notion",
+            message: "Open this link to authorize Notion from the catalog",
+          };
+        },
+      },
+      gate: {
+        // Both gates: the register gate (mandatory) and the org connect
+        // gate (org scope only) must reach ask-human for the router.
+        loadPolicy: () =>
+          Promise.resolve(parseOrgConfigYaml("tools:\n  connect_extension: allow\n  register_extension: allow\n")),
+        router,
+      },
+      // The deterministic catalog seam (issue #232): lookup + discovery
+      // stubbed hermetically; pin/egress/hot-register run the REAL paths.
+      catalogRegister: {
+        catalog: { fetchImpl: stubCatalogFetch(opts.records ?? [NOTION_RECORD], opts.wellKnownStatus ?? 200) },
+        snapshotsDir,
+        egressPath,
+        devEgressPath,
+      },
+    };
+    return { deps, adapter, posts, store, driver, router: recording, audit, snapshotsDir, egressPath, devEgressPath, oauthStarts, dir };
+  }
+
+  const catalogDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of catalogDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("connect <unregistered catalog extension> reaches the review gate with a valid draft", async () => {
+    const h = makeCatalogHarness();
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect notion as me" }));
+
+    // No session, no agent tool call: the deterministic route answered.
+    expect(h.driver.created).toHaveLength(0);
+
+    // The review gate fired with the DRAFT: id, vendor, kind, domains, and
+    // the discovered official MCP endpoint — the "Register <X> from the
+    // catalog?" payload the human approves.
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.router.requests[0]!.tool).toBe(CATALOG_REGISTER_TOOL);
+    expect(h.router.requests[0]!.args).toEqual({
+      action: "register_from_catalog",
+      extension: "notion",
+      vendor: "Notion",
+      kind: "mcp",
+      domains: ["notion.com", "mcp.notion.com"],
+      mcpEndpoint: "https://mcp.notion.com/mcp",
+      credentialSchema: { type: "oauth" },
+    });
+
+    // The pin landed (the approval was the review): parsePinnedSnapshot-
+    // valid, reviewed, tools-less OAuth — the #231 notion shape.
+    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
+    expect(snapshot.extensionId).toBe("notion");
+    expect(snapshot.source.reviewed).toBe(true);
+    expect(snapshot.source.vendorOfficial).toBe(true);
+    expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
+    expect(snapshot.manifest.credentialSchema).toEqual({ type: "oauth" });
+    expect(snapshot.manifest.tools).toBeUndefined();
+
+    // Egress regenerated (byte-pinned) with the MCP host allowlisted.
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
+    expect(existsSync(h.devEgressPath)).toBe(true);
+
+    // The connect CONTINUED in the same turn: the OAuth mint fired and its
+    // message was posted to the space.
+    expect(h.oauthStarts).toEqual([
+      {
+        extension: "notion",
+        provider: "notion",
+        label: "Notion",
+        scope: "personal",
+        actor: "U1",
+        spaceId: "slack:C1",
+      },
+    ]);
+    expect(h.posts[0]!.text).toBe("Open this link to authorize Notion from the catalog");
+
+    // The register gate's trail is complete (policy decision + approval).
+    const decisions = h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT);
+    expect(decisions.some((d) => d.payload && typeof d.payload === "object" && "tool" in d.payload && (d.payload as { tool?: string }).tool === CATALOG_REGISTER_TOOL)).toBe(true);
+    expect(h.audit.some((e) => e.event_type === APPROVAL_REQUESTED_EVENT)).toBe(true);
+    expect(h.audit.some((e) => e.event_type === APPROVAL_RESOLVED_EVENT && (e.payload as { approved?: boolean }).approved === true)).toBe(true);
+  });
+
+  test("the review gate is MANDATORY — a denied register pins nothing and posts the denial", async () => {
+    const h = makeCatalogHarness({ router: DenyRouter });
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect notion as me" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("policy: approval denied");
+    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
+    expect(h.oauthStarts).toHaveLength(0);
+    // No silent pin and no egress drift: a denied gate never regenerated.
+    expect(existsSync(h.egressPath)).toBe(false);
+    expect(existsSync(h.devEgressPath)).toBe(false);
+  });
+
+  test("unknown X fails loudly with the catalog browse path", async () => {
+    const h = makeCatalogHarness({ records: [] });
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect nope.xyz as me" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    expect(h.posts[0]!.text).toContain('unknown extension "nope.xyz"');
+    expect(h.posts[0]!.text).toContain("no extension or catalog entry");
+    expect(h.posts[0]!.text).toContain("catalog_browser");
+    expect(h.router.requests).toHaveLength(0);
+    expect(h.oauthStarts).toHaveLength(0);
+  });
+
+  test("a second connect after the pin takes the normal registered path (idempotent)", async () => {
+    const h = makeCatalogHarness();
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect notion as me" }));
+    await service.handleInboundMessage(msg({ text: "connect notion as me", ts: "4.4" }));
+
+    // The first connect pinned notion; the second resolves it REGISTERED
+    // and skips the register gate entirely — no new approval request.
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.oauthStarts).toHaveLength(2);
+    expect(h.posts).toHaveLength(2);
+    expect(h.posts[1]!.text).toBe("Open this link to authorize Notion from the catalog");
+    // The pin is byte-identical after the second connect (no re-pin drift).
+    const snapshot = parsePinnedSnapshot(readFileSync(join(h.snapshotsDir, "notion.json"), "utf8"));
+    expect(snapshot.extensionId).toBe("notion");
+  });
+
+  test("connect <catalog extension> as org crosses BOTH gates — register then connect", async () => {
+    const h = makeCatalogHarness();
+    catalogDirs.push(h.dir);
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect notion as org" }));
+
+    expect(h.driver.created).toHaveLength(0);
+    // Register gate (mandatory) + org connect gate (privileged) — two
+    // approvals, in order: register_extension first, then connect_extension.
+    expect(h.router.requests.map((r) => r.tool)).toEqual([CATALOG_REGISTER_TOOL, "connect_extension"]);
+    expect(h.posts[0]!.text).toBe("Open this link to authorize Notion from the catalog");
+    expect(h.oauthStarts[0]!.scope).toBe("org");
   });
 });
 

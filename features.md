@@ -288,6 +288,21 @@ clients.
   route directly to the connect capability (issue #61). Bare / `as me`
   connects the sender's personal account; `as org` crosses the Slack
   approval route. Other wording remains an ordinary agent turn.
+- **Connect any catalog extension** (#232) — `connect <X>` for an
+  UNREGISTERED hosted-MCP id drives the integrations.sh catalog flow
+  deterministically (the model is never the driver): catalog lookup →
+  draft (the official `mcp.<vendor>` endpoint discovered from the catalog
+  record + the vendor's RFC 8414 OAuth metadata — OAuth-gated servers pin
+  tools-less, the #231 notion shape) → a MANDATORY review gate
+  (`register_extension` through the approval router — "Register <X> from
+  the catalog? (id, vendor, domains, MCP endpoint)" [Approve/Deny]; a pin
+  is a repo-level change with egress implications, never silent) → on
+  approve: pin `config/extensions/<id>.json` + regenerate both egress
+  configs (byte-pinned) + hot-register into the live registry → the
+  connect continues in the same turn (OAuth mint via #198, or the #196
+  upload link for api_key extensions). An unknown id fails loudly with the
+  catalog browse path; a second `connect X` after the pin takes the normal
+  registered path.
 - **API keys get a browser upload path** (#196).
   `connect_upload_link` is exec-tier and mints a 15-minute, single-use URL
   for an `api_key` extension. The browser form stores the value through the

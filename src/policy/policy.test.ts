@@ -92,7 +92,7 @@ describe("tier resolution", () => {
     }
   });
   test("exec-tier tools", () => {
-    for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension"]) {
+    for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension", "register_extension"]) {
       expect(resolveTier(t)).toBe("exec");
     }
   });
