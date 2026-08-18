@@ -96,6 +96,24 @@ describe("egress config generation", () => {
     expect(BASE_EGRESS_DOMAINS).toContain("files.slack.com");
   });
 
+  test("the base allowlist permits the server's own Slack traffic (issue #126)", () => {
+    // The Socket Mode adapter (src/server/adapters/slack.ts) calls the Web
+    // API at slack.com/api/* (@slack/web-api's default slackApiUrl — also
+    // served on api.slack.com) and opens the Socket Mode websocket on
+    // *.slack.com (wss-primary/wss-secondary from apps.connections.open).
+    // Without these the strict allowlist default-denies the server's own
+    // Slack traffic in deployment; the dev config is allow-all, so dev
+    // never sees the 403s.
+    expect(BASE_EGRESS_DOMAINS).toContain("slack.com");
+    expect(BASE_EGRESS_DOMAINS).toContain("api.slack.com");
+    expect(BASE_EGRESS_DOMAINS).toContain("*.slack.com");
+    const domains = allowlistDomains(COMMITTED_EGRESS);
+    expect(domains).toContain("slack.com");
+    expect(domains).toContain("api.slack.com");
+    expect(domains).toContain("*.slack.com");
+    expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("*.slack.com");
+  });
+
   test("rendering without extensions still emits the model-gateway secrets entries (base config is unchanged)", () => {
     // Issue #208: the model-gateway static-key entries are base config —
     // only the extension entries are optional. The codex oauth_token entry
@@ -150,6 +168,9 @@ describe("egress config generation", () => {
       "api.anthropic.com",
       "raw.githubusercontent.com",
       "files.slack.com",
+      "slack.com",
+      "api.slack.com",
+      "*.slack.com",
       "api.github.com",
       "a.example.com",
       "b.example.com",
@@ -216,6 +237,9 @@ describe("egress config generation", () => {
         "api.anthropic.com",
         "raw.githubusercontent.com",
         "files.slack.com",
+        "slack.com",
+        "api.slack.com",
+        "*.slack.com",
         "api.github.com",
         FIXTURE_EXTENSION_DOMAIN,
       ]);
