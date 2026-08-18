@@ -46,6 +46,7 @@ import {
 } from "../../store/audit-events";
 import { redact } from "../../policy/audit";
 import { onboardingGuideText, type WizardCheck } from "../../tools/admin";
+import { codexMintFailureText } from "../../extensions/proxy-seed";
 import {
   channelFromSpaceId,
   isDmChannel,
@@ -158,18 +159,26 @@ export const CHURN_MESSAGE = "I keep getting empty responses — check the model
  * {@link EMPTY_RESPONSE_FALLBACK} carrying the real provider/session cause
  * (issue #78): when the empty completion is a swallowed provider error (e.g.
  * the replay-ordering 400), the fallback names the cause instead of guessing.
+ * A Codex mint failure (issue #218) supersedes BOTH — the visible reply is
+ * the recovery path, never the generic retry phrase.
  * Fail closed: no cause → the exact legacy phrase.
  */
 export function emptyResponseFallback(cause: string | undefined): string {
+  const remedy = codexMintFailureText(cause);
+  if (remedy !== null) return remedy;
   return cause && cause.trim() ? `Hmm — I got an empty response: ${cause.trim()} — retrying…` : EMPTY_RESPONSE_FALLBACK;
 }
 
 /**
  * {@link CHURN_MESSAGE} carrying the real provider/session cause (issue #78):
  * the cause supersedes the "check the model key?" guess when one exists.
+ * A Codex mint failure (issue #218) supersedes BOTH — the churn message is
+ * the recovery path, never the guess.
  * Fail closed: no cause → the exact legacy phrase.
  */
 export function churnMessageText(cause: string | undefined): string {
+  const remedy = codexMintFailureText(cause);
+  if (remedy !== null) return remedy;
   return cause && cause.trim() ? `I keep getting empty responses — ${cause.trim()}` : CHURN_MESSAGE;
 }
 
@@ -459,7 +468,9 @@ export class SlackTurnPresenter {
     // An error is a visible outcome: it breaks the empty streak and re-arms phrases.
     this.#emptyTurnCount = 0;
     this.#churnActive = false;
-    const base = data.message ?? "Something went wrong while thinking.";
+    // A Codex mint failure (issue #218) maps to the recovery path — the raw
+    // proxy error string would read as an empty-response rerun, not a fix.
+    const base = codexMintFailureText(data.message) ?? data.message ?? "Something went wrong while thinking.";
     console.log(`presenter: turn error ${this.spaceId} ${base.replaceAll("\n", " ")}`);
     // A setup-blocked failure (provider/session) appends the one-line
     // onboarding pointer (issue #116) — bounded by the per-space dedupe.

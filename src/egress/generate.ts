@@ -142,9 +142,11 @@ export const OAUTH_TOKEN_ENDPOINTS: Readonly<Record<string, string>> = {
   // https://auth.openai.com/oauth/token (verified from the openai/codex
   // OAuth flow 2026-08-18; CODEX_REFRESH_TOKEN_URL_OVERRIDE in the CLI).
   // The exact acceptance of the grant for every account plan cannot be
-  // verified hermetically — the transform stays require: true, so an
-  // unmintable grant 502s instead of forwarding unauthenticated; the live
-  // leg is validated on the first real deployment.
+  // verified hermetically — the boot sync now PROBES the refresh grant
+  // before seeding (issue #218: a dead token fails the boot loudly with
+  // the remedy instead of being written silently), and the transform stays
+  // require: true, so an unmintable grant still 502s instead of forwarding
+  // unauthenticated.
   codex: "https://auth.openai.com/oauth/token",
 };
 

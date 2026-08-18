@@ -983,6 +983,58 @@ describe("SpaceService output routing", () => {
     expect(posts).toHaveLength(1); // phrase only; error replaced it
   });
 
+  test("a turn whose model call errors with the proxy mint string produces a visible error reply naming the remedy (issue #218)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    // The driver surfaces the proxy's 502 body (oauth_token failed to
+    // mint) as the session error — the exact live failure from issue #218.
+    session.emit("error", {
+      spaceId: "slack:C1",
+      message: '{"error":"oauth_token failed to mint an access token","grant":"refresh_token"}',
+    });
+    await Promise.resolve();
+
+    const visible = updates.at(-1)!.text;
+    expect(visible).toContain("codex login"); // the remedy, not the raw error
+    expect(visible).toContain("restart the server");
+    expect(visible).not.toContain("oauth_token failed to mint");
+    expect(posts).toHaveLength(1); // phrase only; the remedy replaced it
+    await service.stop();
+  });
+
+  test("an empty reply whose cause is a bare 403 maps to the mint remedy at the churn boundary (issue #218)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i <= EMPTY_TURN_LIMIT; i++) {
+      session.emit("turn_start", { spaceId: "slack:C1" });
+      await Promise.resolve();
+      session.emit("message", { spaceId: "slack:C1", text: "", error: "403" });
+      await Promise.resolve();
+    }
+
+    // The per-turn fallback and the churn message both carry the remedy.
+    for (const u of updates) {
+      if (u.text.includes("codex login")) {
+        expect(u.text).toContain("restart the server");
+      }
+    }
+    expect(updates.at(-1)!.text).toContain("codex login");
+    expect(updates.at(-1)!.text).not.toContain("check the model key?");
+    await service.stop();
+  });
+
   test("a reply that lands while the phrase post is in flight falls back to posting fresh", async () => {
     const { adapter, posts, updates, releasePost } = fakeAdapter({ deferPost: true });
     const { store } = fakeStore();

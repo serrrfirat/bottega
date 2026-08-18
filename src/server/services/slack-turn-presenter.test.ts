@@ -671,3 +671,69 @@ describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => 
     expect(line).not.toContain(head);
   });
 });
+
+describe("Codex mint-failure surface (issue #218)", () => {
+  /** The proxy's actual 502 body (verified from iron-proxy v0.49.0), as the SDK surfaces it. */
+  const MINT_502 = '{"error":"oauth_token failed to mint an access token","grant":"refresh_token"}';
+
+  function plainPresenter(rec: RecordedAdapter): SlackTurnPresenter {
+    const { store } = recordingStore();
+    return new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+  }
+
+  test("an empty completion whose cause is the proxy's mint failure surfaces the remedy, not the generic fallback", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onMessage({ spaceId: "slack:C1", text: "", error: MINT_502 });
+    await flush();
+
+    const visible = rec.updates.at(-1)!.text;
+    expect(visible).toContain("codex login");
+    expect(visible).toContain("restart the server");
+    expect(visible).not.toContain("Hmm — I got an empty response");
+  });
+
+  test("a session error carrying the proxy's mint failure maps to the remedy", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onError({ spaceId: "slack:C1", message: MINT_502 });
+    await flush();
+
+    const visible = rec.updates.at(-1)!.text;
+    expect(visible).toContain("codex login");
+    expect(visible).toContain("restart the server");
+  });
+
+  test("the 403-no-body family (a bare 403 in the message) maps to the same remedy", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onMessage({ spaceId: "slack:C1", text: "", error: "Request failed with status code 403" });
+    await flush();
+
+    const visible = rec.updates.at(-1)!.text;
+    expect(visible).toContain("codex login");
+    expect(visible).toContain("restart the server");
+  });
+
+  test("a non-mint error keeps its exact text (no false mapping)", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onError({ spaceId: "slack:C1", message: "model exploded" });
+    await flush();
+
+    expect(rec.updates.at(-1)!.text).toBe("model exploded");
+  });
+});

@@ -17,6 +17,7 @@ import {
   proxyOAuthBlobFileName,
   readCodexAuthTokens,
   syncProxyCredentialsFromEnv,
+  writeCodexAuthTokens,
 } from "./proxy-seed";
 
 const NO_VAULT = (): Promise<Map<string, string>> => Promise.resolve(new Map());
@@ -27,6 +28,14 @@ const SILENT = (): void => {};
 function tempSecretsDir(): { dir: string; cleanup(): void } {
   const dir = mkdtempSync(join(tmpdir(), "bottega-proxy-seed-"));
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+/** A Codex CLI auth.json fixture in a temp dir (never a real home file). */
+function codexAuthFile(auth: unknown): { dir: string; path: string; cleanup(): void } {
+  const dir = mkdtempSync(join(tmpdir(), "bottega-codex-auth-"));
+  const path = join(dir, "auth.json");
+  writeFileSync(path, JSON.stringify(auth));
+  return { dir, path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 describe("model gateway keys (issue #208)", () => {
@@ -218,14 +227,6 @@ describe("OAuth blobs (issue #208)", () => {
 });
 
 describe("codex subscription blob (issue #214)", () => {
-  /** A Codex CLI auth.json fixture in a temp dir (never a real home file). */
-  function codexAuthFile(auth: unknown): { dir: string; path: string; cleanup(): void } {
-    const dir = mkdtempSync(join(tmpdir(), "bottega-codex-auth-"));
-    const path = join(dir, "auth.json");
-    writeFileSync(path, JSON.stringify(auth));
-    return { dir, path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
-  }
-
   test("a Codex CLI auth file seeds the codex-oauth.json blob (mode 0600, access + refresh + client id)", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
@@ -350,6 +351,157 @@ describe("codex subscription blob (issue #214)", () => {
     }
     // Missing file → null.
     expect(readCodexAuthTokens("/nonexistent/codex-auth.json")).toBeNull();
+  });
+});
+
+describe("codex mint probe + rotation write-back (issue #218)", () => {
+  const OK_PROBE = (refreshToken: string) => async () => ({ minted: true, refreshToken });
+
+  test("a dead refresh token (mint probe 401) makes the seed THROW with the remedy and never writes the blob", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
+    });
+    try {
+      // A stale blob from a previous boot must not survive a dead token.
+      const blobPath = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      writeFileSync(blobPath, "{}", { mode: 0o600 });
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await expect(
+        syncProxyCredentialsFromEnv({
+          env,
+          secretsDir: s.dir,
+          fetchVault: NO_VAULT,
+          readKeychain: NO_KEYCHAIN,
+          readOAuthRows: NO_ROWS,
+          log: SILENT,
+          mintCodexRefreshToken: async () => ({ minted: false, status: 401, refreshToken: "codex-refresh-1" }),
+        }),
+      ).rejects.toThrow(/codex login/); // the boot error names the remedy
+      await expect(
+        syncProxyCredentialsFromEnv({
+          env,
+          secretsDir: s.dir,
+          fetchVault: NO_VAULT,
+          readKeychain: NO_KEYCHAIN,
+          readOAuthRows: NO_ROWS,
+          log: SILENT,
+          mintCodexRefreshToken: async () => ({ minted: false, status: 401, refreshToken: "codex-refresh-1" }),
+        }),
+      ).rejects.toThrow(/restart the server/);
+      expect(existsSync(blobPath)).toBe(false); // never a silent write of a dead token
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("a verified refresh token (mint probe 200) writes the blob with the file tokens", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+        mintCodexRefreshToken: OK_PROBE("codex-refresh-1"),
+      });
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
+      expect(blob).toEqual({
+        access_token: "codex-access-1",
+        refresh_token: "codex-refresh-1",
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      });
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("the endpoint's rotated refresh token is written back to the blob AND the auth file (fields + mode preserved)", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1", id_token: "keep-me" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: SILENT,
+        // The token endpoint rotated the refresh token on the probe mint.
+        mintCodexRefreshToken: OK_PROBE("codex-refresh-2-rotated"),
+      });
+      // The proxy blob carries the LIVE (rotated) token.
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
+      expect(blob.refresh_token).toBe("codex-refresh-2-rotated");
+      // The CLI auth file was patched in place: rotated token, everything
+      // else preserved (issue #214: only tokens.* ever enter the app).
+      const written = JSON.parse(readFileSync(auth.path, "utf8"));
+      expect(written.tokens.refresh_token).toBe("codex-refresh-2-rotated");
+      expect(written.tokens.access_token).toBe("codex-access-1");
+      expect(written.tokens.id_token).toBe("keep-me");
+      expect(statSync(auth.path).mode & 0o777).toBe(0o644); // mode preserved (fixture 0644)
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("an unverifiable probe (endpoint unreachable) warns and still writes the blob (transient ≠ dead)", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1" },
+    });
+    try {
+      const log: string[] = [];
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: NO_ROWS,
+        log: (line) => log.push(line),
+        mintCodexRefreshToken: async () => ({ minted: false, refreshToken: "codex-refresh-1" }),
+      });
+      expect(existsSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")))).toBe(true);
+      expect(log.join("\n")).toContain("could not verify the refresh token");
+      expect(readFileSync(auth.path, "utf8")).toContain("codex-refresh-1"); // auth file untouched
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("writeCodexAuthTokens preserves unknown top-level fields and skips unchanged tokens", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-codex-writeback-"));
+    try {
+      const path = join(dir, "auth.json");
+      writeFileSync(path, JSON.stringify({ oauth_account: "acct", tokens: { access_token: "at", refresh_token: "rt" } }), { mode: 0o644 });
+      writeCodexAuthTokens(path, "rt"); // unchanged → no rewrite
+      expect(JSON.parse(readFileSync(path, "utf8")).tokens.refresh_token).toBe("rt");
+      writeCodexAuthTokens(path, "rt-rotated");
+      const written = JSON.parse(readFileSync(path, "utf8"));
+      expect(written.tokens.refresh_token).toBe("rt-rotated");
+      expect(written.tokens.access_token).toBe("at");
+      expect(written.oauth_account).toBe("acct");
+      expect(statSync(path).mode & 0o777).toBe(0o644);
+      // A missing file is a no-op (the blob still carries the rotated token).
+      writeCodexAuthTokens(join(dir, "missing.json"), "rt-rotated");
+      expect(existsSync(join(dir, "missing.json"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
