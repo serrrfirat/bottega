@@ -281,6 +281,11 @@ export class SpaceService {
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
     try {
+      // Turn-lifecycle INFO (issue #212 follow-up): the adapter's accepted
+      // line plus this entry line let a live run's stdout attribute every
+      // no-reply stall to a stage — dropped before the service, stalled in
+      // the session, or lost in delivery.
+      console.log(`[space-service] inbound ${msg.spaceId} ${msg.ts}`);
       // Connect intent seam (issue #61): exact `connect X` / `connect X as
       // org|me` shapes route straight to the connect capability — no agent
       // tool call, no session cold-start. Non-matching messages (anything
@@ -491,10 +496,16 @@ export class SpaceService {
       // (issue #152).
       getPrincipal: () => this.getTurnPrincipal(spaceId),
     });
-    session.on("turn_start", () => this.#presenterFor(spaceId).onTurnStart());
+    session.on("turn_start", () => {
+      console.log(`[space-service] turn_start ${spaceId}`);
+      this.#presenterFor(spaceId).onTurnStart();
+    });
     session.on("message", (data) => this.#presenterFor(spaceId).onMessage(data));
     session.on("error", (data) => this.#presenterFor(spaceId).onError(data));
-    session.on("turn_end", (data) => this.#presenterFor(spaceId).onTurnEnd(data));
+    session.on("turn_end", (data) => {
+      console.log(`[space-service] turn_end ${spaceId}`);
+      this.#presenterFor(spaceId).onTurnEnd(data);
+    });
     // Issue #193: live reasoning chunks render as the in-place progress
     // phrase on the plain path (the panel path ignores them).
     session.on("thinking", (data) => this.#presenterFor(spaceId).onThinking(data));

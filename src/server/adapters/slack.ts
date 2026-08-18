@@ -282,6 +282,39 @@ export function normalizeMessage(
   };
 }
 
+/**
+ * Discriminates why a message event is dropped — bot-authored vs
+ * unparseable — mirroring {@link normalizeMessage}'s null logic exactly:
+ * zod failure or an event with neither text nor files is "unparseable";
+ * the adapter's own bot posts (echo loop protection, issue #204) are
+ * "bot-authored". `null` means the event is an acceptable inbound message.
+ * Pure, so the drop-reason contract is unit-testable: a silent no-turn is
+ * attributable from the log line alone (issue #212 follow-up — the legacy
+ * combined log could not tell a bot echo from a malformed payload).
+ */
+export function messageDropReason(
+  event: RawSlackMessageEvent | null | string | number | undefined,
+  botUserId?: string,
+): "bot-authored" | "unparseable" | null {
+  const parsed = slackMessageEventSchema.safeParse(event);
+  if (!parsed.success) return "unparseable";
+  const { text, subtype, bot_id, user, files } = parsed.data;
+  if (isBotMessage({ bot_id, subtype, user }, botUserId)) return "bot-authored";
+  if (text === undefined && !(files !== undefined && files.length > 0)) return "unparseable";
+  return null;
+}
+
+/** The unparseable drop detail: the zod failure path, or the empty-message
+ * shape when the schema passed (no text and no files). */
+function messageDropDetail(event: RawSlackMessageEvent | null | string | number | undefined): string {
+  const parsed = slackMessageEventSchema.safeParse(event);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    return issue !== undefined ? issue.path.join(".") || "unknown" : "unknown";
+  }
+  return "no text or files";
+}
+
 /** Raw Bolt block-action element — the clicked button; runtime-validated before use. */
 interface RawSlackActionElement {
   type?: unknown;
@@ -625,7 +658,15 @@ export function registerMessageHandler(
   app.event("message", async ({ event, logger }) => {
     const message = normalizeMessage(event, opts.botUserId?.());
     if (!message) {
-      logger.info("slack: dropping message event (unparseable or bot-authored)");
+      // The drop reason tells a bot echo from a malformed payload — a
+      // silent no-turn is attributable from the log line alone (issue #212
+      // follow-up; the legacy combined line could not).
+      const drop = messageDropReason(event, opts.botUserId?.());
+      logger.info(
+        drop === "bot-authored"
+          ? "slack: dropping message event (bot-authored)"
+          : `slack: dropping message event (unparseable: ${messageDropDetail(event)})`,
+      );
       return;
     }
     const mode = (await opts.responseModeFor?.(message.spaceId)) ?? "always";
@@ -636,6 +677,7 @@ export function registerMessageHandler(
       logger.info("slack: dropping unmentioned channel message (response_mode=mention)");
       return;
     }
+    logger.info(`slack: inbound ${message.spaceId} ${message.ts} text=${message.text.slice(0, 60)}`);
     await onMessage(message);
   });
 }

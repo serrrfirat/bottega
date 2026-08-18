@@ -460,6 +460,7 @@ export class SlackTurnPresenter {
     this.#emptyTurnCount = 0;
     this.#churnActive = false;
     const base = data.message ?? "Something went wrong while thinking.";
+    console.log(`presenter: turn error ${this.spaceId} ${base.replaceAll("\n", " ")}`);
     // A setup-blocked failure (provider/session) appends the one-line
     // onboarding pointer (issue #116) — bounded by the per-space dedupe.
     this.#replaceOrPost(this.#nudgeText(base));
@@ -568,6 +569,9 @@ export class SlackTurnPresenter {
    * the receipt/rotation tests' single `await` depends on.
    */
   protected openTurn(openingText: string): Promise<string | undefined> {
+    // Turn-lifecycle INFO (issue #212 follow-up): an inbound that never
+    // opens a turn is attributable — adapter drop, service entry, or here.
+    console.log(`presenter: openTurn ${this.spaceId}`);
     return this.adapter.postMessage(this.spaceId, openingText, this.replyOpts());
   }
 
@@ -737,6 +741,7 @@ export class SlackTurnPresenter {
       .then((ts) => {
         if (ts !== undefined) {
           this.pendingTs = ts;
+          console.log(`presenter: phrase posted ${this.spaceId} ${ts}`);
           const receivedAt = this.#receivedAt;
           if (receivedAt !== undefined) this.#phrasePostedMs = Date.now() - receivedAt;
         }
@@ -854,14 +859,20 @@ export class SlackTurnPresenter {
     const pendingTs = this.pendingTs;
     if (pendingTs !== undefined) {
       this.pendingTs = undefined;
+      console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
       void this.sendTextChunk(pendingTs, text).catch((err) => {
         console.error(`[slack-turn-presenter] failed to update reply in ${this.spaceId}:`, err);
       });
       return;
     }
-    void this.adapter.postMessage(this.spaceId, text, this.replyOpts()).catch((err) => {
-      console.error(`[slack-turn-presenter] failed to post reply to ${this.spaceId}:`, err);
-    });
+    void this.adapter
+      .postMessage(this.spaceId, text, this.replyOpts())
+      .then((ts) => {
+        if (ts !== undefined) console.log(`presenter: final reply posted/edited ${this.spaceId} ${ts}`);
+      })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] failed to post reply to ${this.spaceId}:`, err);
+      });
   }
 
   /**

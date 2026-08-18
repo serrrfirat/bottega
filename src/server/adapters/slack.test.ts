@@ -19,6 +19,7 @@ import {
   isDmChannel,
   isStreamingCapabilityError,
   markdownChunk,
+  messageDropReason,
   normalizeActionEvent,
   isMentionedMessage,
   normalizeMessage,
@@ -212,6 +213,49 @@ describe("normalizeMessage", () => {
     expect(normalizeMessage("nope")).toBeNull();
     expect(normalizeMessage(42)).toBeNull();
     expect(normalizeMessage(undefined)).toBeNull();
+  });
+});
+
+describe("messageDropReason (drop-reason discrimination, issue #212 follow-up)", () => {
+  const channelEvent = {
+    type: "message",
+    channel: "C123ABC",
+    user: "U456",
+    text: "hello bottega",
+    ts: "1723700000.000100",
+  };
+
+  test("bot-authored events are 'bot-authored' — the echo-loop drop, attributable by identity", () => {
+    // The exact live shapes from the canary's own channel: the bot's reply
+    // event (own user id) and Slack's bot_message subtype.
+    expect(messageDropReason({ ...channelEvent, bot_id: "B999", user: "U0BOT" }, "U0BOT")).toBe("bot-authored");
+    expect(messageDropReason({ ...channelEvent, subtype: "bot_message", user: "U0BOT" }, "U0BOT")).toBe("bot-authored");
+    // Unknown bot identity fails closed: the event is still dropped as bot-authored.
+    expect(messageDropReason({ ...channelEvent, bot_id: "B999" })).toBe("bot-authored");
+  });
+
+  test("a real user's API-posted message carrying bot_id is accepted (null) — the canary as_user shape (issue #204)", () => {
+    expect(
+      messageDropReason(
+        { ...channelEvent, channel: "C0BQFD757NZ", user: "U0B9QUPCTJ5", bot_id: "B0BQNN4CLAY", text: "canary ping" },
+        "U0BQCUUHYMB",
+      ),
+    ).toBeNull();
+  });
+
+  test("malformed payloads are 'unparseable'", () => {
+    // Missing required fields, a missing ts, and no text AND no files.
+    expect(messageDropReason({ type: "message", channel: "C123ABC" })).toBe("unparseable");
+    expect(messageDropReason({ ...channelEvent, text: undefined })).toBe("unparseable");
+    expect(messageDropReason(null)).toBe("unparseable");
+    expect(messageDropReason("nope")).toBe("unparseable");
+    expect(messageDropReason(42)).toBe("unparseable");
+    expect(messageDropReason(undefined)).toBe("unparseable");
+  });
+
+  test("an acceptable inbound message is null — the reason never drops an accepted message", () => {
+    expect(messageDropReason(channelEvent)).toBeNull();
+    expect(messageDropReason({ ...channelEvent, thread_ts: "1723700000.000050" })).toBeNull();
   });
 });
 
