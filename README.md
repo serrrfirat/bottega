@@ -69,6 +69,16 @@ task calls for, never silently dropped.
 - **Pick your model per task.** Fast model for quick things, reasoning
   model for hard ones — switched from chat, per space, no restarts.
 
+## How the executor delivers approved work
+
+The executor claims approved work items from the durable queue so each item
+has an accountable worker. For repository work, it clones the allowlisted
+repository into a fresh, isolated workspace, runs the work there, and delivers
+the result without sharing a checkout with another item. It records the claim,
+delivery result, and approval in the audit trail; failures, denied delivery,
+or missing prerequisites move the item to `blocked` with evidence instead of
+dropping it silently.
+
 ## Why trust it
 
 bottega is built fail-closed. The agent can only reach the internet through
