@@ -54,9 +54,10 @@ task calls for, never silently dropped.
 - **A memory your org owns.** It learns your repos, conventions, and
   decisions — per person or org-wide — and uses them in every later
   conversation. Point it at your docs and it ingests them too.
-- **Your tools, one safe pipe.** Connect GitHub, Linear, or Attio from chat
-  (`connect github as me`). Credentials live in a vault and are injected at
-  the network edge — they never touch the agent, the chat, or the logs.
+- **Your tools, one safe pipe.** Connect GitHub, Linear, Attio, or Notion
+  from chat (`connect github as me`). Credentials live in a vault and are
+  injected at the network edge — they never touch the agent, the chat, or
+  the logs.
 - **Policies, enforced.** Every action crosses a policy gate you configure.
   Risky actions post an Approve/Deny button in the channel and wait for a
   human. Anything unknown or misconfigured is denied by default.

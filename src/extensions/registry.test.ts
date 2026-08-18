@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   SNAPSHOT_SCHEMA,
   createExtensionRegistry,
@@ -118,6 +118,42 @@ describe("extension registry", () => {
   test("a missing snapshot directory yields an empty registry", () => {
     const registry = createExtensionRegistry(join(tmpdir(), "does-not-exist-50"));
     expect(registry.list()).toEqual([]);
+  });
+
+  test("the committed pinned snapshots resolve the notion manifest (issue #231)", () => {
+    // The "connect my notion" entry point resolves the pinned notion
+    // snapshot from config/extensions (the boot's registry source). The
+    // resolved manifest must carry the official OAuth MCP binding — a
+    // missing pin (the issue: notion was unregistered) leaves
+    // resolve("notion") undefined and the connect flow cannot mint the
+    // #198 authorize URL.
+    const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
+    const notion = registry.resolve("notion");
+    expect(notion).toBeDefined();
+    expect(notion!.manifest.id).toBe("notion");
+    expect(notion!.manifest.kind).toBe("mcp");
+    expect(notion!.manifest.mcp).toEqual({
+      serverUrl: "https://mcp.notion.com/mcp",
+      transport: "streamable-http",
+    });
+    // OAuth (not api_key): the generic MCP OAuth flow (#198) mints the
+    // authorize link at connect time; the vault row is oauth-shaped.
+    expect(notion!.manifest.credentialSchema.type).toBe("oauth");
+    // Egress allowlist hosts: the vendor host + the official MCP host.
+    expect(notion!.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
+    expect(notion!.snapshot?.source.vendorOfficial).toBe(true);
+  });
+
+  test("every committed pinned snapshot registers (issue #231)", () => {
+    // A dropped or malformed snapshot must not silently shrink the seeded
+    // registry: the boot resolves the whole committed set, and the
+    // connect/extension tools key off registry.resolve.
+    const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
+    const ids = registry.list().map((entry) => entry.manifest.id);
+    expect(ids).toEqual(["attio", "github", "linear", "notion"]);
+    for (const id of ids) {
+      expect(registry.resolve(id)).toBeDefined();
+    }
   });
 });
 

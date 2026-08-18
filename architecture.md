@@ -461,7 +461,8 @@ user-facing view is in
 
 GitHub's production snapshot is the hosted streamable-HTTP endpoint
 `https://api.githubcopilot.com/mcp/`; no local GitHub MCP binary is installed
-(#145). Production snapshots also cover Attio and Linear.
+(#145). Production snapshots also cover Attio, Linear, and Notion
+(`https://mcp.notion.com/mcp`, OAuth via #198, #231).
 
 ```mermaid
 sequenceDiagram

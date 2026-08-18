@@ -182,10 +182,10 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     const oauth = transforms.find((t) => asRecord(t)["name"] === "oauth_token")!;
     expect(oauth).toBeDefined();
     const tokens = asRecordArray(asRecord(oauth["config"])["tokens"]);
-    // linear + attio (the #198 OAuth providers) only — the codex model
+    // linear + attio + notion (the #198 OAuth providers) — the codex model
     // provider is a STATIC secrets entry now (issue #230: the seed owns
     // the refresh; the proxy never mints for codex).
-    expect(tokens).toHaveLength(2);
+    expect(tokens).toHaveLength(3);
     for (const token of tokens) {
       expect(asString(token["grant"])).toBe("refresh_token");
       expect(asString(token["token_endpoint"])).toMatch(/^https:\/\//);

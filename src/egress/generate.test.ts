@@ -75,7 +75,13 @@ describe("egress config generation", () => {
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
-    expect(EXTENSION_DOMAINS.sort()).toEqual(["api.githubcopilot.com", "mcp.attio.com", "mcp.linear.app"]);
+    expect(EXTENSION_DOMAINS.sort()).toEqual([
+      "api.githubcopilot.com",
+      "mcp.attio.com",
+      "mcp.linear.app",
+      "mcp.notion.com",
+      "notion.com",
+    ]);
   });
 
   test("the base allowlist permits the OpenAI and Anthropic model gateways (#37ee2bf)", () => {

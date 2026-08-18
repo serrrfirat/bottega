@@ -1,8 +1,8 @@
 /**
- * Issue #54 acceptance: the three pinned provider snapshots (Linear, GitHub,
- * Attio) validate against the #50 validator, resolve through the registry,
- * feed the egress allowlist, and execute end-to-end through the tool bridge
- * against a stub MCP transport — no live calls in tests.
+ * Issue #54 acceptance: the pinned provider snapshots (Linear, GitHub,
+ * Attio, Notion) validate against the #50 validator, resolve through the
+ * registry, feed the egress allowlist, and execute end-to-end through the
+ * tool bridge against a stub MCP transport — no live calls in tests.
  *
  * Runtime seam (#53, not landed when #54 shipped): the registry seeds from
  * config/extensions/ at server boot (server/index.ts) and the tool bridge
@@ -13,9 +13,11 @@
  * surface (e.g. linear.search_issues), while the official servers expose
  * their own wire names (github → search_issues live-verified; attio →
  * search-records per official docs; linear → unprefixed per the official
- * server's tool list) — the bridge forwards `providerName ?? name`, so the
- * provider call carries the wire name while the manifest name stays the
- * SDK/policy/audit surface.
+ * server's tool list; notion → notion-search / notion-create-pages /
+ * notion-update-page per Notion's official docs, which prefix EVERY wire
+ * name with "notion-") — the bridge forwards `providerName ?? name`, so
+ * the provider call carries the wire name while the manifest name stays
+ * the SDK/policy/audit surface.
  *
  * The committed manifests are TOOLS-LESS (issue #158): the pinned
  * hand-authored 3-tool subsets are gone, so the runtime discovers each
@@ -47,17 +49,32 @@ import { resetToolSurfaceCache, resolveExtensionSurfaces, type ExtensionSurfaces
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
-const PROVIDERS = ["linear", "github", "attio"] as const;
+const PROVIDERS = ["linear", "github", "attio", "notion"] as const;
 
 /** The WIRE tool surface per provider (issue #148): the names the hosted
  * servers expose (github live-verified; attio per official docs; linear
- * unprefixed). The hermetic transports below serve these from tools/list,
- * so discovery yields the namespaced manifest names with these wire
- * providerNames. */
+ * unprefixed; notion per Notion's official supported-tools docs — every
+ * wire name carries the "notion-" prefix). The hermetic transports below
+ * serve these from tools/list, so discovery yields the namespaced manifest
+ * names with these wire providerNames. */
 const WIRE_SURFACE = {
   linear: ["search_issues", "create_issue", "update_status"],
   github: ["search_issues", "issue_write", "add_issue_comment"],
   attio: ["search-records", "create-record", "update-record"],
+  notion: ["notion-search", "notion-create-pages", "notion-update-page"],
+} as const;
+
+/** The conservative tiers the #157 heuristic assigns each provider's wire
+ * surface (the discovery test pins them): the search/create/update wire
+ * names classify read/write/write EXCEPT notion's — every notion tool is
+ * prefixed "notion-", so the verb heuristic sees no read verb and lands
+ * every tool on `write` (approval) — the safe direction for an
+ * unguessable prefix (a read-guess failure must never under-approve). */
+const WIRE_TIERS = {
+  linear: ["read", "write", "write"],
+  github: ["read", "write", "write"],
+  attio: ["read", "write", "write"],
+  notion: ["write", "write", "write"],
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
@@ -111,6 +128,7 @@ function stubTransports(seen?: { tool: string[] }) {
     const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
     if (url.includes("linear.app")) return stubMcpTransport("linear", seen)(binding);
     if (url.includes("attio.com")) return stubMcpTransport("attio", seen)(binding);
+    if (url.includes("mcp.notion.com")) return stubMcpTransport("notion", seen)(binding);
     return stubMcpTransport("github", seen)(binding);
   };
 }
@@ -182,7 +200,7 @@ describe("issue #54 pinned providers", () => {
     // an earlier test (or a skip-gated live leg) in the same process.
     resetToolSurfaceCache();
   });
-  test("all three snapshots parse against the #50 validator as vendor-official, reviewed", () => {
+  test("all pinned snapshots parse against the #50 validator as vendor-official, reviewed", () => {
     const snapshots = readPinnedSnapshots(SNAPSHOTS_DIR);
     expect(snapshots.map((s) => s.extensionId).sort()).toEqual([...PROVIDERS].sort());
     for (const snapshot of snapshots) {
@@ -192,7 +210,7 @@ describe("issue #54 pinned providers", () => {
     }
   });
 
-  test("the registry resolves all three providers from the committed snapshots", () => {
+  test("the registry resolves every pinned provider from the committed snapshots", () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
     expect(registry.list()).toHaveLength(PROVIDERS.length);
     for (const id of PROVIDERS) {
@@ -219,24 +237,33 @@ describe("issue #54 pinned providers", () => {
 
     // The server-boot step: discovery through the hermetic transport seam
     // restores the v1 search/create/update surface — namespaced manifest
-    // names, wire providerNames (issue #148), conservative read/write/write
-    // tiers, and non-empty descriptions. Never a silent empty set.
+    // names, wire providerNames (issue #148), the per-provider conservative
+    // tiers pinned in WIRE_TIERS (notion's "notion-"-prefixed wire names
+    // classify write/write/write — the verb heuristic cannot see a read
+    // verb behind the prefix, and under-approving is the unsafe direction),
+    // and non-empty descriptions. Never a silent empty set.
     const surfaces = await resolveExtensionSurfaces(registry.list(), { mcpTransport: stubTransports() });
     for (const id of PROVIDERS) {
       const tools = [...(surfaces.get(id) ?? [])];
       expect(tools.map((t) => t.name)).toEqual([...WIRE_SURFACE[id]].map((wire) => `${id}.${wire}`));
       expect(tools.map((t) => t.providerName)).toEqual([...WIRE_SURFACE[id]]);
-      expect(tools.map((t) => t.tier)).toEqual(["read", "write", "write"]);
+      expect(tools.map((t) => t.tier)).toEqual([...WIRE_TIERS[id]]);
       for (const tool of tools) {
         expect(tool.description.length).toBeGreaterThan(0);
       }
     }
   });
 
-  test("the egress allowlist contains the three provider domains", () => {
+  test("the egress allowlist contains the pinned providers' domains", () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
-    // Snapshot files load in sorted order (attio, github, linear).
-    expect(registry.egressDomains()).toEqual(["mcp.attio.com", "api.githubcopilot.com", "mcp.linear.app"]);
+    // Snapshot files load in sorted order (attio, github, linear, notion).
+    expect(registry.egressDomains()).toEqual([
+      "mcp.attio.com",
+      "api.githubcopilot.com",
+      "mcp.linear.app",
+      "notion.com",
+      "mcp.notion.com",
+    ]);
   });
 
   test("linear executes end-to-end through the tool bridge against a stub transport (discovered surface)", async () => {

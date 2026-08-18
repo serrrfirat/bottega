@@ -105,7 +105,7 @@ function tempEnv(restoreCwd: string): CaptureEnv {
   // pin sync needs the config/omp template, every root reads the same
   // committed extension snapshots.
   mkdirSync(join(dir, "config", "extensions"), { recursive: true });
-  for (const name of ["attio.json", "github.json", "linear.json"]) {
+  for (const name of ["attio.json", "github.json", "linear.json", "notion.json"]) {
     copyFileSync(join(EXTENSIONS_DIR, name), join(dir, "config", "extensions", name));
   }
   mkdirSync(join(dir, "config", "omp"), { recursive: true });
@@ -259,7 +259,7 @@ describe("composition-root parity (issue #172)", () => {
 
   test("all three roots register the same extension registry contents", async () => {
     const { server, executor, mcp } = await captureWirings({});
-    const expected = ["attio", "github", "linear"];
+    const expected = ["attio", "github", "linear", "notion"];
     expect(registryIds(server)).toEqual(expected);
     expect(registryIds(executor.runtime)).toEqual(expected);
     expect(registryIds(mcp.runtime)).toEqual(expected);
