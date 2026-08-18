@@ -366,6 +366,16 @@ export class SlackTurnPresenter {
   #latestThinking: string | undefined;
   #lastProgressText: string | undefined;
   #progressTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * A gated tool call is IN FLIGHT (issue #219): the safe window — the
+   * only phase where a correction may steer the running turn — excludes
+   * mid-tool interrupts. Tracked on the base so the streaming renderer
+   * (which overrides renderToolStep for panel cards) reports the same
+   * gate; see {@link canSteer}.
+   */
+  protected toolStepInFlight = false;
+  /** Messages queued behind the running turn (issue #219); the visible "+N waiting" count. */
+  #waitingCount = 0;
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -530,6 +540,48 @@ export class SlackTurnPresenter {
     this.streamingTurns = streaming;
   }
 
+  /**
+   * Issue #219 safe-window gate: a correction may steer the running turn
+   * ONLY while the turn is still in reasoning/phrase state — no final
+   * reply committed (a message or error already landed) and no gated tool
+   * call in flight (a side-effecting call must never be interrupted).
+   * Past that window, even corrections queue; the next turn sees them
+   * (near-equivalent, no risk of corrupting a half-done tool action).
+   */
+  canSteer(): boolean {
+    return !this.digesting && !this.#turnDelivered && !this.toolStepInFlight;
+  }
+
+  /**
+   * Issue #219 (queue-by-default): SpaceService reports the per-space queue
+   * length; the CURRENT live line carries a visible "+N waiting" suffix
+   * while messages wait, and the suffix drops as the queue drains. The
+   * indicator rides the phrase/progress line only — never the final reply
+   * text (turnDelivered lines are left untouched; the next turn's phrase
+   * re-decorates).
+   */
+  setQueueLength(count: number): void {
+    this.#waitingCount = Math.max(0, count);
+    if (this.digesting) return;
+    if (this.#turnDelivered) return; // the final reply owns the line; the next phrase re-decorates
+    this.#renderProgressNow();
+  }
+
+  /**
+   * Issue #219: a queued message's turn starts. The running turn's reply
+   * already landed; this opens the drained turn's OWN visible line (fresh
+   * phrase, threaded under the drained message) and re-arms the live
+   * progress. The receipt reaction and message.in audit already happened
+   * at queue time (onInbound), so neither repeats here.
+   */
+  onQueueDrain(msgTs: string): void {
+    this.lastInboundTs = msgTs;
+    this.#currentStepTitle = undefined;
+    this.#latestThinking = undefined;
+    this.#lastProgressText = undefined;
+    this.#postThinkingPhrase();
+  }
+
   /** Digest turns are invisible to the channel (their output is memory, #42). */
   beginDigest(): void {
     this.digesting = true;
@@ -579,6 +631,8 @@ export class SlackTurnPresenter {
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
     this.streamingTurns = false;
+    this.toolStepInFlight = false;
+    this.#waitingCount = 0;
     this.#nudged = undefined;
   }
 
@@ -632,6 +686,8 @@ export class SlackTurnPresenter {
   protected renderToolStep(step: ToolStepEvent): void {
     // A completion clears the current step: the line falls back to the
     // latest thinking snippet or the elapsed phrase until the next step.
+    // The in-flight flag (issue #219) gates the steer safe window.
+    this.toolStepInFlight = step.status === "in_progress";
     this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
     this.#renderProgressNow();
   }
@@ -656,10 +712,22 @@ export class SlackTurnPresenter {
   /** The current progress line: step > thinking snippet > elapsed phrase. */
   #progressLine(): string {
     const step = this.#currentStepTitle;
-    if (step !== undefined) return `⚙️ ${this.#headSnippet(step)}`;
+    if (step !== undefined) return this.#decorate(`⚙️ ${this.#headSnippet(step)}`);
     const thinking = this.#latestThinking;
-    if (thinking !== undefined) return `🧠 ${thinking}`;
-    return this.#elapsedPhrase();
+    if (thinking !== undefined) return this.#decorate(`🧠 ${thinking}`);
+    return this.#decorate(this.#elapsedPhrase());
+  }
+
+  /**
+   * Appends the queue indicator (issue #219): every visible phrase or
+   * progress line carries "+N waiting" while messages queue behind the
+   * running turn, so the user knows their message was received and is
+   * next. The final reply text never carries it — {@link #replaceOrPost}
+   * posts/edits raw text, and the next turn's phrase re-decorates with
+   * the remaining count.
+   */
+  #decorate(line: string): string {
+    return this.#waitingCount > 0 ? `${line} — +${this.#waitingCount} waiting` : line;
   }
 
   /** "Thinking… Ns" — the fallback while no step or thinking has arrived. */
@@ -820,9 +888,9 @@ export class SlackTurnPresenter {
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
   }
 
-  /** Next rotating phrase; advances the shared rotation. */
+  /** Next rotating phrase (queue-decorated, issue #219); advances the shared rotation. */
   #nextPhrase(): string {
-    return this.#phraseRotation.next();
+    return this.#decorate(this.#phraseRotation.next());
   }
 
   /**
@@ -1218,6 +1286,9 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
 
   /** One thinking-step card per gated tool call (issue #168). */
   protected renderToolStep(step: ToolStepEvent): void {
+    // The in-flight flag (issue #219) mirrors the base: a mid-tool steer
+    // must never interrupt a side-effecting call.
+    this.toolStepInFlight = step.status === "in_progress";
     if (!this.#streamMode || this.#streamTs === undefined) return; // no panel in fallback mode
     const ts = this.#streamTs;
     void this.adapter

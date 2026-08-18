@@ -97,6 +97,13 @@ export interface SpaceServiceDeps {
   onboardingChecks?: () => WizardCheck[];
   /** Persona config root override; defaults to BOTTEGA_CONFIG_DIR or process.cwd() (issue #130). */
   personaDir?: string;
+  /**
+   * Mid-turn message classifier (issue #219): corrections may steer the
+   * running turn within the safe window; everything else queues behind it.
+   * Default: deterministic-only ({@link CorrectionClassifier} with no
+   * model seam) — ambiguous input ALWAYS queues (fail-safe).
+   */
+  classifier?: CorrectionClassifier;
 }
 
 /** A connect-intent message parsed by {@link parseConnectIntent}. */
@@ -123,6 +130,106 @@ export function parseConnectIntent(text: string): ConnectIntent | null {
   const match = /^connect\s+([A-Za-z0-9._-]+)(?:\s+as\s+(org|me))?$/i.exec(text.trim());
   if (!match) return null;
   return { extension: match[1]!, scope: match[2]?.toLowerCase() === "org" ? "org" : "personal" };
+}
+
+// ---------------------------------------------------------------------------
+// Mid-turn message classifier (issue #219): queue-by-default, steer only
+// corrections. Corrections are terse conversational redirections; the
+// deterministic marker table below catches the common shapes with HIGH
+// precision (a false "correction" would wrongly merge an independent
+// message into the running turn — the exact UX #219 removes), and
+// everything else resolves to the queue (fail-safe: unclassifiable NEVER
+// interrupts). An injectable cheap model seam may promote only
+// AMBIGUOUS input to "correction"; the default classifier is
+// deterministic-only.
+// ---------------------------------------------------------------------------
+
+/** A mid-turn message's disposition (issue #219). */
+export type MessageClass = "correction" | "independent";
+
+/** Three-way verdict of the deterministic marker table (issue #219). */
+export type CorrectionVerdict = MessageClass | "ambiguous";
+
+/** A model seam for the ambiguous tail of the table (issue #219); the default classifier has none. */
+export type CorrectionModelSeam = (text: string) => MessageClass | Promise<MessageClass>;
+
+/**
+ * Deterministic correction markers (issue #219). Prefix forms interrupt
+ * the turn ("wait", "hold on", "actually", "no", "use X", …); anywhere
+ * forms are strong retraction words even mid-sentence ("instead",
+ * "don't", "scratch that", …). Word boundaries keep "no" from matching
+ * "not that" and "use" from matching "useful".
+ */
+const CORRECTION_PREFIXES = [
+  "wait", "hold on", "hold up", "actually", "no", "nope", "stop", "instead",
+  "don't", "dont", "never mind", "scratch that", "change that", "change it",
+  "ignore that", "ignore this", "ignore it", "forget that", "forget it",
+  "let me rephrase", "let me correct", "what i meant", "i meant", "correction",
+  "rephrase", "try again", "not that", "wrong", "that's not", "thats not",
+  "use", "switch to", "try",
+];
+
+/** Strong retraction words counted anywhere in the message. */
+const CORRECTION_ANYWHERE = [
+  "actually", "instead", "don't", "dont", "scratch that", "never mind",
+  "ignore that", "forget it", "change that", "what i meant", "i meant",
+  "let me rephrase", "rephrase", "correction",
+];
+
+/** Clear non-corrections (questions, requests, acknowledgments) skip the model seam. */
+const INDEPENDENT_PREFIXES = [
+  "what", "why", "how", "when", "where", "who", "whose", "which", "can you",
+  "could you", "would you", "will you", "do you", "does", "did", "please",
+  "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "sure", "yes",
+  "yep", "good", "great",
+];
+
+/** Word-boundary prefix match over the whole trimmed, lowercased message. */
+function matchesPrefix(text: string, prefixes: readonly string[]): boolean {
+  const joined = prefixes.join("|");
+  return new RegExp(`^(?:${joined})\\b`, "i").test(text);
+}
+
+/**
+ * The pure marker table (issue #219): "correction" for clear redirects,
+ * "independent" for clear non-corrections (the model seam is skipped),
+ * "ambiguous" for everything else (the seam may decide; fail-safe queues).
+ * Exported for direct unit tests.
+ */
+export function classifyCorrection(text: string): CorrectionVerdict {
+  const trimmed = text.trim();
+  if (!trimmed) return "ambiguous";
+  // Corrections first (high precision): a prefix marker or a strong
+  // retraction word anywhere.
+  if (matchesPrefix(trimmed, CORRECTION_PREFIXES)) return "correction";
+  for (const marker of CORRECTION_ANYWHERE) {
+    if (new RegExp(`\\b${marker}\\b`, "i").test(trimmed)) return "correction";
+  }
+  if (matchesPrefix(trimmed, INDEPENDENT_PREFIXES)) return "independent";
+  return "ambiguous";
+}
+
+/**
+ * The injectable classifier (issue #219). Deterministic markers first;
+ * only AMBIGUOUS input may reach the cheap model seam, and a seam "no"
+ * (or no seam at all) resolves to independent — QUEUE, never interrupt.
+ */
+export class CorrectionClassifier {
+  readonly #seam: CorrectionModelSeam | undefined;
+
+  constructor(seam?: CorrectionModelSeam) {
+    this.#seam = seam;
+  }
+
+  async classify(text: string): Promise<MessageClass> {
+    const verdict = classifyCorrection(text);
+    if (verdict !== "ambiguous") return verdict;
+    if (this.#seam) {
+      const promoted = await this.#seam(text);
+      if (promoted === "correction") return "correction";
+    }
+    return "independent"; // fail-safe: ambiguous queues
+  }
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -156,6 +263,16 @@ interface LiveSession {
   disposing: boolean;
 }
 
+/** One queued mid-turn message waiting for its own turn (issue #219). */
+interface PendingTurn {
+  /** The full turn text (attachments already ingested at queue time). */
+  text: string;
+  /** The sender; binds the drain turn's principal (issue #152). */
+  principal: string;
+  /** Slack ts; the drain turn's phrase/reply thread under this message. */
+  ts: string;
+}
+
 /**
  * One long-lived agent session per active space. Sessions are created lazily
  * on the first message, disposed after an idle timeout (cache eviction only —
@@ -179,8 +296,18 @@ export class SpaceService {
   readonly #learning: LearningService | undefined;
   readonly #onboardingChecks: () => WizardCheck[];
   readonly #personaDir: string | undefined;
+  readonly #classifier: CorrectionClassifier;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
+  /**
+   * Per-space pending queue (issue #219): independent mid-turn messages
+   * wait here while the running turn finishes, then drain ONE per fresh
+   * turn in arrival order. IN-MEMORY by design (boring option): the
+   * messages are still in Slack history, so a crash/restart leaves them
+   * for the next cold start / a natural re-send via the transcript trail —
+   * only the pending ORDER is lost, never the messages themselves.
+   */
+  readonly #queues = new Map<string, PendingTurn[]>();
   /**
    * One turn presenter per space (issue #153/#168): owns the thinking
    * phrase, the receipt reactions, the stream coalescing, the latency
@@ -211,6 +338,7 @@ export class SpaceService {
     this.#learning = deps.learning;
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
     this.#personaDir = deps.personaDir;
+    this.#classifier = deps.classifier ?? new CorrectionClassifier();
   }
 
   /**
@@ -320,19 +448,45 @@ export class SpaceService {
       // createSession is never silent. Each is fire-and-forget: the turn
       // path never blocks on Slack latency or a missing reactions:write
       // scope. The space's turn presenter owns all of it.
-      this.#presenterFor(msg.spaceId).onInbound(msg);
+      const presenter = this.#presenterFor(msg.spaceId);
+      // Issue #219 safe-window snapshot: taken BEFORE the receipt resets
+      // turn-rendering state (onInbound re-arms the phrase and clears the
+      // delivered flag), so it reflects the RUNNING turn as this message
+      // arrived — a message landing after the final reply committed or
+      // while a tool call is in flight can never steer. Only consulted on
+      // the streaming branch; fresh turns ignore it.
+      const steerSafe = presenter.canSteer();
+      presenter.onInbound(msg);
       const turnText = await this.#ingestAttachments(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
       this.#learning?.recordInput(msg);
-      const presenter = this.#presenterFor(msg.spaceId);
       if (live.session.isStreaming()) {
-        // Streaming turn (issue #120): phrase updates coalesce on the cadence.
-        // The steer inherits the RUNNING turn's principal (issue #152) — the
-        // driver only binds on a fresh turn — so user B steering into user
-        // A's turn never re-identifies A's in-flight extension calls.
-        presenter.setSteered(true);
-        await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
+        // Streaming turn (issue #219): QUEUE by default — only a message
+        // the classifier reads as a CORRECTION, arriving inside the safe
+        // window (turn still reasoning, no final output, no tool in
+        // flight), steers the running turn. Everything else — independent
+        // messages AND corrections past the window — queues, and each
+        // queued message runs its OWN fresh turn in arrival order after
+        // turn_end. Unclassifiable ALWAYS queues (fail-safe: never
+        // interrupt). The steer inherits the RUNNING turn's principal
+        // (issue #152) — the driver only binds on a fresh turn — so user B
+        // steering into user A's turn never re-identifies A's in-flight
+        // extension calls.
+        const isCorrection = await this.#classifier.classify(turnText);
+        if (isCorrection === "correction" && steerSafe) {
+          presenter.setSteered(true);
+          await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
+          return;
+        }
+        // Queued: the receipt (phrase rotation, 👀 reaction, message.in
+        // audit) already happened above via onInbound, so the user knows
+        // the message was received; the "+N waiting" indicator makes
+        // "and is next" visible on the live line.
+        const queue = this.#queues.get(msg.spaceId) ?? [];
+        queue.push({ text: turnText, principal: msg.principal, ts: msg.ts });
+        this.#queues.set(msg.spaceId, queue);
+        presenter.setQueueLength(queue.length);
       } else {
         // Non-streaming turn: replies update in place immediately, unbatched.
         // The principal travels WITH this turn: the driver binds it when the
@@ -505,6 +659,10 @@ export class SpaceService {
     session.on("turn_end", (data) => {
       console.log(`[space-service] turn_end ${spaceId}`);
       this.#presenterFor(spaceId).onTurnEnd(data);
+      // Issue #219: after the running turn finishes, drain ONE queued
+      // message as its own fresh turn; that turn's turn_end re-enters
+      // here, so the queue empties one message per turn in arrival order.
+      void this.#drainQueue(spaceId);
     });
     // Issue #193: live reasoning chunks render as the in-place progress
     // phrase on the plain path (the panel path ignores them).
@@ -524,6 +682,39 @@ export class SpaceService {
     // target until dispose removes it.
     this.#modelRoles?.set(spaceId, session);
     return live;
+  }
+
+  /**
+   * Issue #219: after a turn ends, drain ONE queued message as its own
+   * fresh turn (arrival order). Each drained turn's turn_end re-enters
+   * here, so the queue empties one fresh turn per message. The queue is
+   * in-memory per space (documented on {@link SpaceService.#queues}): a
+   * crash/restart loses only the pending ORDER — the messages themselves
+   * stay in Slack history. Skips while a turn is running (its turn_end
+   * drains) or the session is mid-dispose.
+   */
+  async #drainQueue(spaceId: string): Promise<void> {
+    const queue = this.#queues.get(spaceId);
+    if (!queue || queue.length === 0) return;
+    const live = this.#sessions.get(spaceId);
+    if (!live || live.disposing) return;
+    if (live.session.isStreaming()) return; // a turn is in flight — it drains on ITS turn_end
+    const entry = queue.shift()!;
+    const presenter = this.#presenterFor(spaceId);
+    // The remaining count (and the drain turn's phrase) re-decorates the
+    // live line BEFORE the fresh turn opens; the drained message's ts
+    // becomes the threading base so the reply lands under it.
+    presenter.setQueueLength(queue.length);
+    presenter.onQueueDrain(entry.ts);
+    try {
+      // The drain IS a fresh turn (issue #189): hot-swap the default model
+      // role like any other fresh turn, then prompt without a streaming
+      // behavior — own phrase, own reply, own principal (issue #152).
+      await live.session.reapplyDefaultModelRole?.();
+      await live.session.prompt(entry.text, { principal: entry.principal });
+    } catch (err) {
+      console.error(`[space-service] queue drain failed in ${spaceId}:`, err);
+    }
   }
 
   async #disposeSession(spaceId: string): Promise<void> {
@@ -550,6 +741,9 @@ export class SpaceService {
       this.#presenters.delete(spaceId);
       this.#sessions.delete(spaceId);
       this.#modelRoles?.delete(spaceId);
+      // Issue #219: the in-memory queue dies with the session (documented
+      // tradeoff on #queues); the messages stay in Slack history.
+      this.#queues.delete(spaceId);
     }
   }
 

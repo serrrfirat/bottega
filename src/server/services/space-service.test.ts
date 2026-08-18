@@ -6,7 +6,7 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store, type ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
-import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, emptyResponseFallback, churnMessageText, parseConnectIntent } from "./space-service";
+import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, emptyResponseFallback, churnMessageText, parseConnectIntent, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
 import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
@@ -623,11 +623,11 @@ describe("SpaceService session lifecycle", () => {
     expect(session.reapplyCalls).toBe(1);
     expect(session.prompts).toEqual([{ text: "first", opts: { principal: "U1" } }]);
 
-    // A message into a streaming turn is a STEER — the seam must NOT run
-    // again mid-turn (a use_model switch made during the turn would be
-    // clobbered by a re-apply before it ever ran).
+    // A correction message into a streaming turn is a STEER — the seam
+    // must NOT run again mid-turn (a use_model switch made during the turn
+    // would be clobbered by a re-apply before it ever ran).
     session.streaming = true;
-    await service.handleInboundMessage(msg({ text: "second", ts: "2.1" }));
+    await service.handleInboundMessage(msg({ text: "wait, use the other model", ts: "2.1" }));
     expect(session.reapplyCalls).toBe(1);
     expect(session.prompts[1]!.opts?.streamingBehavior).toBe("steer");
   });
@@ -677,13 +677,13 @@ describe("SpaceService session lifecycle", () => {
 
     await service.handleInboundMessage(msg({ text: "first" }));
     driver.last().streaming = true;
-    await service.handleInboundMessage(msg({ text: "second", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
 
     const session = driver.last();
     expect(driver.created).toHaveLength(1); // same session reused
     expect(session.prompts).toHaveLength(2);
     expect(session.prompts[1]).toEqual({
-      text: "second",
+      text: "wait, use the other file",
       opts: { streamingBehavior: "steer", principal: "U1" },
     });
   });
@@ -810,11 +810,12 @@ describe("SpaceService session lifecycle", () => {
     await service.handleInboundMessage(msg({ principal: "UA", ts: "1.1" }));
     const session = driver.last();
 
-    // A's turn is in flight (mid-tool-call); user B messages → the message
-    // STEERS the running turn, and the turn's binding must stay A's — B's
-    // personal credential must never resolve for A's extension calls.
+    // A's turn is in flight (mid-tool-call); user B sends a CORRECTION →
+    // the message STEERS the running turn, and the turn's binding must
+    // stay A's — B's personal credential must never resolve for A's
+    // extension calls.
     session.streaming = true;
-    await service.handleInboundMessage(msg({ principal: "UB", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ principal: "UB", text: "no wait, use the other key", ts: "2.2" }));
     expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
     const getPrincipal = driver.created[0].opts.getPrincipal!;
     expect(getPrincipal()).toBe("UA");
@@ -1393,7 +1394,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
       await service.handleInboundMessage(msg({ ts: "1.1" }));
       const session = driver.last();
       session.streaming = true;
-      await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+      await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
       for (let i = 0; i < 3; i++) await Promise.resolve();
       expect(posts).toHaveLength(2); // receipt phrase + the steer's own phrase (#215)
       const base = updates.length;
@@ -1441,7 +1442,7 @@ describe("SpaceService streaming phrase batching (issue #120)", () => {
       await service.handleInboundMessage(msg({ ts: "1.1" }));
       const session = driver.last();
       session.streaming = true;
-      await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+      await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
       for (let i = 0; i < 3; i++) await Promise.resolve();
 
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1505,11 +1506,12 @@ describe("SpaceService steer visibility (issue #215)", () => {
     const session = driver.last();
     await Promise.resolve(); // the phrase post settles (pendingTs = ts-1)
 
-    // Steer message 2.2 into the running turn: the service marks the turn
-    // streaming — the steer must post a FRESH phrase on the steer's own
-    // line, threaded under the steer inbound (2.2) and NEWER than it.
+    // A correction message (2.2) steers into the running turn: the service
+    // marks the turn streaming — the steer must post a FRESH phrase on the
+    // steer's own line, threaded under the steer inbound (2.2) and NEWER
+    // than it.
     session.streaming = true;
-    await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
     for (let i = 0; i < 3; i++) await Promise.resolve(); // rotation + steer phrase post settle
 
     expect(posts).toEqual([
@@ -1527,6 +1529,180 @@ describe("SpaceService steer visibility (issue #215)", () => {
   });
 });
 
+describe("SpaceService queue-by-default (issue #219)", () => {
+  test("an independent message mid-turn QUEUES (no steer); the '+N waiting' indicator shows and clears; each queued message drains as its own fresh turn in arrival order", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    vi.useFakeTimers();
+    try {
+      // Open turn 1 (fresh); the receipt phrase posts and is captured.
+      await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+      const session = driver.last();
+      for (let i = 0; i < 3; i++) await Promise.resolve(); // phrase post settles (pendingTs = ts-1)
+      session.streaming = true;
+
+      // An independent message mid-turn QUEUES — never a steer prompt.
+      await service.handleInboundMessage(msg({ text: "what is the weather", ts: "2.2" }));
+      expect(session.prompts).toHaveLength(1); // no steer into the running turn
+
+      // The indicator appears on the current phrase line.
+      vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+      await Promise.resolve();
+      expect(updates.some((u) => u.text.includes("+1 waiting"))).toBe(true);
+
+      // A second queued message bumps the count on the same line.
+      await service.handleInboundMessage(msg({ text: "and another thing", ts: "3.3" }));
+      vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+      await Promise.resolve();
+      expect(updates.some((u) => u.text.includes("+2 waiting"))).toBe(true);
+
+      // The running turn ends → ONE queued message drains as its own fresh
+      // turn (own phrase, own reply, no streamingBehavior), in arrival order.
+      session.emit("message", { spaceId: "slack:C1", text: "first reply" });
+      session.streaming = false; // the driver reports idle after turn_end
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      expect(session.prompts[1]).toEqual({ text: "what is the weather", opts: { principal: "U1" } });
+      expect(session.prompts[1].opts?.streamingBehavior).toBeUndefined();
+
+      // The drain turn ends → the SECOND message drains; the queue is empty.
+      session.emit("message", { spaceId: "slack:C1", text: "reply to the weather" });
+      session.streaming = false;
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      expect(session.prompts[2]).toEqual({ text: "and another thing", opts: { principal: "U1" } });
+      expect(session.prompts[3]).toBeUndefined(); // nothing left to drain
+
+      // The drained turns answered on their own visible lines (threaded
+      // under the drained messages, not the original turn's phrase).
+      expect(posts.some((p) => p.opts?.threadTs === "2.2")).toBe(true);
+      expect(posts.some((p) => p.opts?.threadTs === "3.3")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a correction marker mid-turn steers the running turn on the existing steer path (issue #219)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "wait, actually use python instead", ts: "2.2" }));
+
+    expect(session.prompts).toHaveLength(2); // steered, never queued
+    expect(session.prompts[1]).toEqual({
+      text: "wait, actually use python instead",
+      opts: { streamingBehavior: "steer", principal: "U1" },
+    });
+  });
+
+  test("a correction arriving after the safe window (final output committed) QUEUES instead of steering (issue #219)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+    // The turn already committed final output: the safe window is closed.
+    session.emit("message", { spaceId: "slack:C1", text: "partial answer" });
+    await Promise.resolve();
+
+    await service.handleInboundMessage(msg({ text: "no wait, use the other file", ts: "2.2" }));
+    expect(session.prompts).toHaveLength(1); // NOT steered — queued
+
+    session.streaming = false; // the driver reports idle after turn_end
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1]).toEqual({ text: "no wait, use the other file", opts: { principal: "U1" } });
+    expect(session.prompts[1].opts?.streamingBehavior).toBeUndefined(); // its own fresh turn
+  });
+
+  test("a correction arriving while a tool call is in flight QUEUES instead of interrupting the tool (issue #219)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+    // A gated tool call is mid-flight (a side-effecting call must never be
+    // interrupted): the safe window is closed.
+    service.routeToolStep({
+      spaceId: "slack:C1",
+      taskId: "t1",
+      title: "github.search_issues — allowed (read)",
+      status: "in_progress",
+    });
+
+    await service.handleInboundMessage(msg({ text: "stop, use the other repo", ts: "2.2" }));
+    expect(session.prompts).toHaveLength(1); // queued, never steered into the tool
+
+    session.streaming = false; // the driver reports idle after turn_end
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1].opts?.streamingBehavior).toBeUndefined();
+  });
+
+  test("an ambiguous mid-turn message QUEUES (fail-safe: unclassifiable never interrupts) (issue #219)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "hmm let me think about this", ts: "2.2" }));
+
+    expect(session.prompts).toHaveLength(1); // queued, never interrupted
+    session.streaming = false; // the driver reports idle after turn_end
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1]).toEqual({ text: "hmm let me think about this", opts: { principal: "U1" } });
+  });
+
+  test("an injectable model seam promotes only AMBIGUOUS input; the default classifier is deterministic-only (issue #219)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const seam = vi.fn(async (text: string): Promise<MessageClass> => (text === "ambiguous one" ? "correction" : "independent"));
+    const service = makeSpaceService({ store, adapter, driver, classifier: new CorrectionClassifier(seam) });
+
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    session.streaming = true;
+
+    // Ambiguous input reaches the seam; the seam says correction → steers.
+    await service.handleInboundMessage(msg({ text: "ambiguous one", ts: "2.2" }));
+    expect(seam).toHaveBeenCalledTimes(1);
+    expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
+
+    // A clear correction never reaches the seam (deterministic first).
+    await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "3.3" }));
+    expect(seam).toHaveBeenCalledTimes(1);
+
+    // The DEFAULT classifier has no seam: ambiguous always queues.
+    const { adapter: adapter2 } = fakeAdapter();
+    const { store: store2 } = fakeStore();
+    const driver2 = new FakeDriver();
+    const service2 = makeSpaceService({ store: store2, adapter: adapter2, driver: driver2 });
+    await service2.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session2 = driver2.last();
+    session2.streaming = true;
+    await service2.handleInboundMessage(msg({ text: "hmm, not sure", ts: "2.2" }));
+    expect(session2.prompts).toHaveLength(1); // queued
+  });
+});
+
 describe("SpaceService run settlement after a stream/panel turn (issue #183)", () => {
   test("a stream/panel turn followed by another message: the second turn runs fresh and its reply lands — no busy wedge", async () => {
     const { adapter, posts, updates } = fakeAdapter();
@@ -1540,7 +1716,7 @@ describe("SpaceService run settlement after a stream/panel turn (issue #183)", (
     const session = driver.last();
     expect(session.prompts).toHaveLength(1);
     session.streaming = true;
-    await service.handleInboundMessage(msg({ text: "second", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
     expect(session.prompts[1].opts?.streamingBehavior).toBe("steer");
 
     // The stream turn settles: the reply streams, turn_end fires, and the
@@ -2297,7 +2473,7 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().streaming = true;
-    await service.handleInboundMessage(msg({ text: "steer", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ text: "wait, use the other file", ts: "2.2" }));
     expect(reactions).toEqual([
       { kind: "add", spaceId: "slack:C1", ts: "1.1" },
       { kind: "add", spaceId: "slack:C1", ts: "2.2" },
@@ -2365,5 +2541,80 @@ describe("SpaceService receipt responsiveness (issue #119)", () => {
     driver.last().emit("message", { spaceId: "slack:C1", text: "real answer" });
     await Promise.resolve();
     expect(audit.filter((a) => a.event_type === MESSAGE_REPLIED_EVENT)).toHaveLength(1);
+  });
+});
+
+describe("classifyCorrection marker table (issue #219)", () => {
+  test("clear correction markers classify as corrections", () => {
+    const corrections = [
+      "wait, let me clarify",
+      "hold on",
+      "hold up, not that one",
+      "actually use python",
+      "no, don't do that",
+      "nope, the other one",
+      "instead use the other file",
+      "don't use that",
+      "use python instead",
+      "switch to deepseek",
+      "try the other approach",
+      "change that",
+      "change it to the beta",
+      "never mind",
+      "scratch that",
+      "ignore that",
+      "forget it",
+      "let me rephrase",
+      "what i meant was the other one",
+      "i meant the other one",
+      "correction: use the beta",
+      "rephrase that",
+      "not that one",
+      "wrong file",
+      "that's not what I asked",
+    ];
+    for (const text of corrections) {
+      expect(classifyCorrection(text)).toBe("correction");
+    }
+  });
+
+  test("clear independent messages classify as independent (the model seam is skipped)", () => {
+    const independents = [
+      "what's the weather",
+      "how do i set up the repo",
+      "please summarize this",
+      "thanks",
+      "can you do X",
+      "hello",
+      "why is the build failing",
+      "ok sounds good",
+      "yes please",
+    ];
+    for (const text of independents) {
+      expect(classifyCorrection(text)).toBe("independent");
+    }
+  });
+
+  test("ambiguous messages are neither — they resolve to the queue (fail-safe)", () => {
+    const ambiguous = [
+      "hmm let me think about this",
+      "and another thing",
+      "the second one",
+      "whatever",
+      "",
+    ];
+    for (const text of ambiguous) {
+      expect(classifyCorrection(text)).toBe("ambiguous");
+    }
+  });
+
+  test("word boundaries keep partial matches out of the table", () => {
+    // "no" must not match "not that" (a separate marker) or "nonsense";
+    // "use" must not match "useful"; "wait" mid-sentence is not a marker.
+    expect(classifyCorrection("not that one")).toBe("correction");
+    expect(classifyCorrection("no")).toBe("correction");
+    expect(classifyCorrection("nonsense aside, do X")).toBe("ambiguous");
+    expect(classifyCorrection("useful summary please")).toBe("ambiguous");
+    expect(classifyCorrection("i am waiting for the build")).toBe("ambiguous");
   });
 });
