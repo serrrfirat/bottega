@@ -807,11 +807,17 @@ describe("MCP server extension surface (in-process deps)", () => {
   test("connect_extension personal connects for the session principal and audits", async () => {
     const h = await makeInProcessHarness();
     try {
-      const res = await callTool(h.client, "connect_extension", { extension: FIXTURE_EXTENSION_ID, scope: "personal" });
+      const res = await callTool(h.client, "connect_extension", {
+        extension: FIXTURE_EXTENSION_ID,
+        scope: "personal",
+        api_key: "attio-secret-key",
+      });
       expect(res.isError).not.toBe(true);
       expect(res.content[0]?.text ?? "").toBe("Fixture Weather connected as @U123");
 
-      expect(h.brokerCalls).toEqual([{ provider: FIXTURE_EXTENSION_ID, credentialType: "api_key" }]);
+      expect(h.brokerCalls).toEqual([
+        { provider: FIXTURE_EXTENSION_ID, credentialType: "api_key", apiKey: "attio-secret-key" },
+      ]);
       const rows = await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID);
       expect(rows).toHaveLength(1);
       expect(rows[0]!.scope).toBe("personal");
@@ -827,6 +833,29 @@ describe("MCP server extension surface (in-process deps)", () => {
       });
       // Personal connects are unprivileged: no policy decision row.
       expect(await auditRows(h.store, POLICY_DECISION_EVENT)).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("connect_extension without an api_key for an api_key extension points at connect_upload_link (issue #247)", async () => {
+    const h = await makeInProcessHarness();
+    try {
+      // The chat/MCP surface never carries the key (the paste guard refuses
+      // pasted keys), so the no-key connect must surface the upload-link
+      // pointer, never the broker's bare "needs its API key" throw.
+      const res = await callTool(h.client, "connect_extension", {
+        extension: FIXTURE_EXTENSION_ID,
+        scope: "personal",
+      });
+      expect(res.isError).toBe(true);
+      const text = res.content[0]?.text ?? "";
+      expect(text).toContain("connect_upload_link");
+      expect(text).not.toContain("needs its API key");
+
+      // Nothing reached the broker and no credential row was written.
+      expect(h.brokerCalls).toHaveLength(0);
+      expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
     } finally {
       await h.cleanup();
     }

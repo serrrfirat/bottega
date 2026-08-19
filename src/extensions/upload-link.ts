@@ -420,7 +420,7 @@ export interface UploadLinkServerHandle {
 /** The connect deps the endpoint needs, with a store that can mint/consume
  * tokens AND record the resulting credential (the full {@link Store} satisfies it). */
 export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
-  store: UploadLinkStoreSlice & Pick<Store, "upsertExtensionCredential">;
+  store: UploadLinkStoreSlice & Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials">;
 };
 
 /** The upload-link surface's route handler + store, without a listener —

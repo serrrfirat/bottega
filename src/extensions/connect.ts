@@ -109,7 +109,7 @@ export interface ConnectExtensionDeps {
    * same turn.
    */
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  store: Pick<Store, "upsertExtensionCredential">;
+  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials">;
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
   broker: BrokerConnector;
@@ -320,6 +320,42 @@ export async function connectExtension(
   const manifest = resolved.manifest;
   const provider = manifest.id;
   const label = manifest.label;
+
+  // Issue #247: a chat/intent api_key connect carries no key (the intent
+  // regex captures none, and the paste guard above refuses pasted keys),
+  // so BEFORE the broker — whose only answer is the bare "needs its API
+  // key" throw with no way forward — resolve what the user actually can
+  // do. The org-scope policy gate above already ran (a denied org connect
+  // never reaches here); OAuth/upload connects skip this block by
+  // construction. An existing personal/org credential row means the
+  // provider is ALREADY connected — the honest reply names the replace
+  // path — and otherwise the #196 one-time upload link is the next step.
+  if (
+    manifest.credentialSchema.type === "api_key" &&
+    input.apiKey === undefined &&
+    !input.fromUpload
+  ) {
+    let existing: ExtensionCredential[];
+    try {
+      existing = await deps.store.listExtensionCredentials(provider);
+    } catch (err) {
+      return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
+    }
+    const target = existing.find((row) =>
+      input.scope === "personal"
+        ? row.scope === "personal" && row.owner === input.actor
+        : row.scope === "org",
+    );
+    const who = input.scope === "org" ? "as an organization" : `for @${input.actor}`;
+    const replacePath =
+      "use connect_upload_link for a one-time browser upload, or re-run connect with the key — never paste a live key in chat";
+    return {
+      ok: false,
+      message: target
+        ? `${label} is already connected ${who} — to replace the key, ${replacePath}.`
+        : `connect ${label} now: ${replacePath}.`,
+    };
+  }
 
   // Hosted OAuth MCPs (issue #198) connect through the GENERIC MCP OAuth
   // flow, never the broker's provider-registry login (the broker knows no

@@ -2168,6 +2168,7 @@ describe("SpaceService connect intent (issue #61)", () => {
           rows.push(credential);
           return credential;
         },
+        listExtensionCredentials: async (provider: string) => rows.filter((r) => r.provider === provider),
       } as ConnectExtensionDeps["store"],
       audit: {
         appendAudit: async (entry) => {
@@ -2188,7 +2189,7 @@ describe("SpaceService connect intent (issue #61)", () => {
     return { deps, adapter, posts, store, driver, brokerCalls, audit, rows };
   }
 
-  test("connect <ext> as me connects for the sender with no agent turn", async () => {
+  test("connect <ext> as me for an api_key extension with no stored key posts the one-time upload pointer (issue #247)", async () => {
     const h = makeConnectHarness();
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
@@ -2196,35 +2197,41 @@ describe("SpaceService connect intent (issue #61)", () => {
 
     // No session, no agent tool call: the capability answered directly.
     expect(h.driver.created).toHaveLength(0);
-    expect(h.posts).toEqual([
-      { spaceId: "slack:C1", text: "Fixture Weather connected as @U1", opts: { threadTs: "2.2" } },
-    ]);
-    expect(h.brokerCalls).toEqual([{ provider: "fixture.weather", credentialType: "api_key" }]);
-    expect(h.rows).toHaveLength(1);
-    expect(h.rows[0]!.scope).toBe("personal");
-    expect(h.rows[0]!.owner).toBe("U1");
-    expect(h.rows[0]!.broker_credential_id).toBe(9);
-
-    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
-    expect(connected).toMatchObject({
-      space_id: "slack:C1",
-      actor: "U1",
-      payload: { extension: "fixture.weather", scope: "personal", owner: "U1" },
-    });
+    const text = h.posts[0]!.text;
+    // The chat intent carries no key (and pasted keys are refused), so the
+    // honest answer is the #196 one-time upload link — never the broker's
+    // bare "needs its API key" throw.
+    expect(text).toContain("connect_upload_link");
+    expect(text).not.toContain("needs its API key");
+    expect(h.brokerCalls).toHaveLength(0);
+    expect(h.rows).toHaveLength(0);
     // Personal connects are unprivileged: no policy decision row.
     expect(h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT)).toHaveLength(0);
   });
 
-  test("bare connect <ext> defaults to the sender's personal account", async () => {
+  test("bare connect <ext> defaults to the sender's personal account — an existing personal row yields the already-connected pointer", async () => {
     const h = makeConnectHarness();
+    // Seed @U2's own personal credential (as a past explicit-key connect would).
+    h.rows.push({
+      id: "cred_u2",
+      provider: "fixture.weather",
+      identity_key: "api-key:U2",
+      owner: "U2",
+      scope: "personal",
+      broker_credential_id: 9,
+      created_at: 0,
+    });
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "Connect fixture.weather", principal: "U2", ts: "3.3" }));
 
     expect(h.driver.created).toHaveLength(0);
-    expect(h.posts[0]!.text).toBe("Fixture Weather connected as @U2");
-    expect(h.rows[0]!.scope).toBe("personal");
-    expect(h.rows[0]!.owner).toBe("U2");
+    // The bare connect defaulted to the sender's PERSONAL account: the
+    // match landed on @U2's personal row, so no new upload is needed.
+    expect(h.posts[0]!.text).toContain("already connected");
+    expect(h.posts[0]!.text).toContain("@U2");
+    expect(h.posts[0]!.text).toContain("connect_upload_link");
+    expect(h.brokerCalls).toHaveLength(0);
   });
 
   test("connect <ext> as org crosses the gate; denied without approval", async () => {
@@ -2242,19 +2249,25 @@ describe("SpaceService connect intent (issue #61)", () => {
     expect(decisions[0]!.payload).toMatchObject({ tool: "connect_extension", decision: "ask-human" });
   });
 
-  test("connect <ext> as org with an approving router connects the org account", async () => {
+  test("connect <ext> as org with an approving router gates first, then points an api_key extension at the upload link", async () => {
     const h = makeConnectHarness({ router: new RecordingRouter() });
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
 
     expect(h.driver.created).toHaveLength(0);
-    expect(h.posts[0]!.text).toBe("Fixture Weather connected as an organization");
-    expect(h.rows).toHaveLength(1);
-    expect(h.rows[0]!.scope).toBe("org");
-    expect(h.rows[0]!.owner).toBeNull();
-    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
-    expect(connected!.payload).toMatchObject({ extension: "fixture.weather", scope: "org", owner: null });
+    const text = h.posts[0]!.text;
+    // The org policy gate RAN before the pointer (its decision is recorded).
+    const decisions = h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.payload).toMatchObject({ tool: "connect_extension" });
+    // No org api_key credential exists, so the honest answer is the one-time
+    // upload link — never the broker's bare "needs its API key" throw.
+    expect(text).toContain("connect_upload_link");
+    expect(text).not.toContain("needs its API key");
+    expect(h.brokerCalls).toHaveLength(0);
+    expect(h.rows).toHaveLength(0);
+    expect(h.audit.filter((e) => e.event_type === EXTENSION_CONNECTED_EVENT)).toHaveLength(0);
   });
 
   test("unknown extensions post the failure without a session", async () => {
@@ -2390,6 +2403,7 @@ describe("SpaceService connect intent catalog fallback (issue #232/#233) — reg
         upsertExtensionCredential: async () => {
           throw new Error("hosted OAuth connects record at the callback, never here");
         },
+        listExtensionCredentials: async () => [],
       } as ConnectExtensionDeps["store"],
       audit: {
         appendAudit: async (entry) => {

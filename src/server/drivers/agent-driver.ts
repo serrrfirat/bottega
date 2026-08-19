@@ -69,7 +69,7 @@ export interface MemoryContextDriverOpts {
  */
 export interface ConnectExtensionDriverOpts {
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  store: Pick<Store, "upsertExtensionCredential">;
+  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials">;
   audit: AuditModule;
   loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
   router: ApprovalRouter;

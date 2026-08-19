@@ -172,11 +172,13 @@ describe("connectExtension scope gating", () => {
   test("personal connect runs for any principal without the policy gate (even under a denying policy)", async () => {
     const h = makeDeps({ policy: parseOrgConfigYaml("tools:\n  connect_extension: deny\n") });
 
-    const outcome = await connect(h, "fixture.weather", "personal", "UADA");
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
 
     expect(outcome).toMatchObject({ ok: true });
     expect(h.router.requests).toHaveLength(0); // gate never consulted
-    expect(h.broker.calls).toEqual([{ provider: "fixture.weather", credentialType: "api_key" }]);
+    expect(h.broker.calls).toEqual([
+      { provider: "fixture.weather", credentialType: "api_key", apiKey: "attio-secret-key" },
+    ]);
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows).toHaveLength(1);
     expect(rows[0]!.owner).toBe("UADA");
@@ -216,13 +218,15 @@ describe("connectExtension scope gating", () => {
     const broker = new RecordingBroker({ identityKey: "org-key@example.com", brokerCredentialId: 7 });
     const h = makeDeps({ policy: allowedPolicy(), router, broker });
 
-    const outcome = await connect(h, "fixture.weather", "org", "UADA", { spaceId: "slack:C1" });
+    const outcome = await connect(h, "fixture.weather", "org", "UADA", { spaceId: "slack:C1", apiKey: "attio-secret-key" });
 
     expect(outcome).toMatchObject({ ok: true });
     expect(h.router.requests).toHaveLength(1);
     expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
     expect(h.router.requests[0]!.spaceId).toBe("slack:C1");
-    expect(h.broker.calls).toEqual([{ provider: "fixture.weather", credentialType: "api_key" }]);
+    expect(h.broker.calls).toEqual([
+      { provider: "fixture.weather", credentialType: "api_key", apiKey: "attio-secret-key" },
+    ]);
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows).toHaveLength(1);
     expect(rows[0]!.owner).toBeNull();
@@ -319,7 +323,7 @@ describe("connectExtension broker seam", () => {
 
   test("api-key vault rows get a stable registry identity (personal)", async () => {
     const h = makeDeps();
-    const outcome = await connect(h, "fixture.weather", "personal", "UADA");
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "k" });
     expect(outcome.ok).toBe(true);
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows[0]!.identity_key).toBe("api-key:UADA");
@@ -330,7 +334,7 @@ describe("connectExtension broker seam", () => {
     // SAFETY: makeDeps' broker slot is only exercised via its connect method here; the rejecting double covers that one path.
     const h = makeDeps({ broker: failing as never });
 
-    const outcome = await connect(h, "fixture.weather", "personal", "UADA");
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
 
     expect(outcome).toMatchObject({ ok: false });
     expect(outcome.ok === false ? outcome.message : "").toContain("broker unreachable");
@@ -357,9 +361,9 @@ describe("connectExtension re-connect", () => {
   test("re-connecting org updates the existing row, never duplicates", async () => {
     const h = makeDeps({ policy: allowedPolicy() });
     h.broker.result = { identityKey: "org-a", brokerCredentialId: 1 };
-    const a = await connect(h, "fixture.weather", "org", "UADA");
+    const a = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
     h.broker.result = { identityKey: "org-b", brokerCredentialId: 2 };
-    const b = await connect(h, "fixture.weather", "org", "UADA");
+    const b = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
 
     expect(a.ok && b.ok).toBe(true);
     const rows = await rowsFor(h.store, "fixture.weather");
@@ -370,8 +374,8 @@ describe("connectExtension re-connect", () => {
 
   test("one personal row per owner: two principals get two rows", async () => {
     const h = makeDeps();
-    await connect(h, "fixture.weather", "personal", "UADA");
-    await connect(h, "fixture.weather", "personal", "UBOB");
+    await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
+    await connect(h, "fixture.weather", "personal", "UBOB", { apiKey: "attio-secret-key" });
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.owner).sort()).toEqual(["UADA", "UBOB"]);
@@ -381,9 +385,9 @@ describe("connectExtension re-connect", () => {
 describe("connectExtension audit + feedback", () => {
   test("every connect writes extension.connected {extension, scope, owner}", async () => {
     const personalHarness = makeDeps();
-    await connect(personalHarness, "fixture.weather", "personal", "UADA", { spaceId: "slack:C1" });
+    await connect(personalHarness, "fixture.weather", "personal", "UADA", { spaceId: "slack:C1", apiKey: "attio-secret-key" });
     const orgHarness = makeDeps({ policy: allowedPolicy() });
-    await connect(orgHarness, "fixture.weather", "org", "UBOB");
+    await connect(orgHarness, "fixture.weather", "org", "UBOB", { apiKey: "attio-secret-key" });
 
     const personalRows = await personalHarness.store.listAudit({ event_type: EXTENSION_CONNECTED_EVENT });
     expect(personalRows).toHaveLength(1);
@@ -413,11 +417,11 @@ describe("connectExtension audit + feedback", () => {
 
   test("feedback messages match the issue's wording", async () => {
     const personal = makeDeps();
-    const p = await connect(personal, "fixture.weather", "personal", "UADA");
+    const p = await connect(personal, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
     expect(p.ok === true ? p.message : "").toBe("Fixture Weather connected as @UADA");
 
     const org = makeDeps({ policy: allowedPolicy() });
-    const o = await connect(org, "fixture.weather", "org", "UADA");
+    const o = await connect(org, "fixture.weather", "org", "UADA", { apiKey: "attio-secret-key" });
     expect(o.ok === true ? o.message : "").toBe("Fixture Weather connected as an organization");
   });
 });
@@ -507,7 +511,7 @@ describe("connectExtensionToolDefinition", () => {
     });
 
     // SAFETY: the connect tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
-    const result = await tool.execute("t1", { extension: "fixture.weather", scope: "personal", api_key: undefined }, undefined, undefined, {
+    const result = await tool.execute("t1", { extension: "fixture.weather", scope: "personal", api_key: "attio-secret-key" }, undefined, undefined, {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
     } as never);
 
@@ -758,5 +762,92 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     const outcome = await connect(h, "com.nope", "personal", "UADA");
     expect(outcome.ok).toBe(false);
     if (outcome.ok === false) expect(outcome.message).toContain("unknown extension");
+  });
+});
+
+describe("connectExtension api_key no-key redirect (issue #247)", () => {
+  // Chat/intent connects never carry an api_key (parseConnectIntent has no
+  // key capture and the paste guard refuses pasted keys), so an api_key
+  // connect with `apiKey` omitted must NEVER fall into the broker's bare
+  // "needs its API key" throw: an existing personal/org credential means
+  // the provider is ALREADY connected, and otherwise the honest next step
+  // is the #196 one-time upload link.
+
+  test("A: personal, existing credential → already connected (replace pointer), never 'needs its API key'", async () => {
+    const h = makeDeps();
+    // The explicit-key path creates the personal row.
+    const first = await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
+    expect(first.ok).toBe(true);
+
+    // The chat re-connect carries no key.
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      expect(outcome.message).not.toContain("needs its API key");
+      expect(outcome.message).toContain("already connected");
+      expect(outcome.message).toContain("connect_upload_link");
+    }
+    // The broker was NOT called again and no duplicate row was written.
+    expect(h.broker.calls).toHaveLength(1);
+    expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(1);
+  });
+
+  test("B: personal, no credential, no key → points at connect_upload_link, not the bare broker throw", async () => {
+    const h = makeDeps();
+    const outcome = await connect(h, "fixture.weather", "personal", "UADA");
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      expect(outcome.message).toContain("connect_upload_link");
+      expect(outcome.message).not.toContain("needs its API key");
+    }
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(0);
+  });
+
+  test("C: isolation — actor B with no own credential still gets the upload-link pointer though A is connected", async () => {
+    const h = makeDeps();
+    await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
+
+    const b = await connect(h, "fixture.weather", "personal", "UBOB");
+
+    expect(b.ok).toBe(false);
+    if (b.ok === false) {
+      expect(b.message).toContain("connect_upload_link");
+      expect(b.message).not.toContain("needs its API key");
+    }
+    expect(h.broker.calls).toHaveLength(1); // only A's explicit connect reached the broker
+  });
+
+  test("D: org, no key, no org credential → gate runs first, then the connect_upload_link pointer", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    const outcome = await connect(h, "fixture.weather", "org", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      expect(outcome.message).toContain("connect_upload_link");
+      expect(outcome.message).not.toContain("needs its API key");
+    }
+    // The org policy gate ran BEFORE the pointer (its approval was requested).
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(0);
+  });
+
+  test("the chat connect_extension tool surfaces the upload-link pointer, not the broker throw (tool path)", async () => {
+    const h = makeDeps();
+    const tool = connectExtensionToolDefinition({ ...h.deps, getPrincipal: () => "UADA" });
+
+    // SAFETY: the connect tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
+    const result = await tool.execute("t1", { extension: "fixture.weather", scope: "personal", api_key: undefined }, undefined, undefined, {
+      sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
+    } as never);
+
+    expect(result.isError).toBe(true);
+    // SAFETY: the tool replies with a single text content block; the pointer text is asserted below.
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("connect_upload_link");
+    expect(text).not.toContain("needs its API key");
+    expect(h.broker.calls).toHaveLength(0);
   });
 });
