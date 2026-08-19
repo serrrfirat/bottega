@@ -670,6 +670,105 @@ describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => 
     expect(line).toContain(tail);
     expect(line).not.toContain(head);
   });
+
+  test("a retry turn_start keeps a live 🧠 reasoning line — no rotating phrase over it (issue #251)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const rotation = { next: vi.fn(() => THINKING_PHRASES[0]) };
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+      phraseRotation: rotation,
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    const phraseTs = "post-1"; // the first postMessage resolves to post-1
+
+    // Reasoning streams in (#193) and flushes to the in-place 🧠 line.
+    presenter.onThinking({ spaceId: "slack:C1", thinking: "Let me trace the failure path" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me trace the failure path" });
+
+    // OMP auto-retry (issue #60) re-fires turn_start after thinking has
+    // streamed in. It must NOT rotate the phrase over the live reasoning
+    // (#251): the 🧠 line stays and no new phrase is requested.
+    presenter.onTurnStart();
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me trace the failure path" });
+    expect(rotation.next).toHaveBeenCalledTimes(1); // the initial post only — no retry phrase
+  });
+
+  test("a retry turn_start keeps a live ⚙️ tool step line — no rotating phrase over it (issue #251)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const rotation = { next: vi.fn(() => THINKING_PHRASES[0]) };
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+      phraseRotation: rotation,
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    const phraseTs = "post-1"; // the first postMessage resolves to post-1
+
+    // A gated tool call is IN FLIGHT (#193): the step becomes the ⚙️ line.
+    emitToolStep(
+      (step) => presenter.onToolStep(step),
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" },
+    );
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
+
+    // A retry's turn_start must not clobber the in-flight step (#251).
+    presenter.onTurnStart();
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
+    expect(rotation.next).toHaveBeenCalledTimes(1); // the initial post only — no retry phrase
+  });
+
+  test("a turn_start with NO live progress still rotates the phrase (issue #251 keeps rotation)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const rotation = createPhraseRotation();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+      phraseRotation: rotation,
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    const phraseTs = "post-1"; // no step, no thinking yet — only the elapsed line
+
+    // Only the elapsed tick has rendered so far — no real progress content.
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s$/);
+
+    // With nothing live to protect, turn_start rotates exactly as before.
+    presenter.onTurnStart();
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: THINKING_PHRASES[1] });
+  });
 });
 
 describe("Codex mint-failure surface (issue #218)", () => {

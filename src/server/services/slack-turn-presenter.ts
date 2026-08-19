@@ -1012,6 +1012,14 @@ export class SlackTurnPresenter {
     this.armProgressTimer();
     const pendingTs = this.pendingTs;
     if (pendingTs !== undefined) {
+      // Live progress (#193) beats rotation (#251): a current tool step or
+      // a live reasoning snippet is never replaced by rotating phrase text
+      // (a retry's turn_start re-fires after thinking has streamed in, #60).
+      // Return WITHOUT cancelStreamUpdate() so a not-yet-flushed 🧠/⚙️ line
+      // still lands; the elapsed tick and step/thinking events keep it moving.
+      if (this.#currentStepTitle !== undefined || this.#latestThinking !== undefined) {
+        return;
+      }
       // A retry (or second turn) while the phrase is up: replace in place.
       // A stale coalesced streaming text must not overwrite the rotation (#120).
       this.cancelStreamUpdate();
