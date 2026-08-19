@@ -24,6 +24,7 @@ import {
   type ModelCatalogEntry,
 } from "../models/model-pin";
 import { errorMessage, toolError } from "./helpers";
+import { SKILL_NAME_RE } from "../server/skills";
 import type { Store } from "../store/db";
 
 /** The list_work_items audit payload: the optional state filter + the returned count (issue #159). */
@@ -79,6 +80,14 @@ export const createWorkItemArgsSchema = z.object({
   model: z.string().optional(),
   /** Per-task thinking-effort pin (issue #185): off/low/medium/high. */
   reasoning_effort: z.enum(["off", "low", "medium", "high"]).optional(),
+  /**
+   * Explicit task-level skills (issues #234/#235): skill names injected
+   * into the item's session at claim — space-authored skills and the
+   * committed built-ins (e.g. "pr_review") both resolve. Every name is
+   * validated against the skill-name charset here, fail closed: an
+   * invalid/unknown name never creates an item whose skills could not load.
+   */
+  skills: z.array(z.string()).optional(),
 });
 export const cancelWorkItemArgsSchema = z.object({ id: z.string() });
 export const completeWorkItemArgsSchema = z.object({
@@ -123,6 +132,9 @@ export function workItemToolDefinitions(
       "(\"deepseek v4\", \"gpt sol\") resolved against the available models at creation — a name that matches no " +
       "available model is rejected and no item is created. Optional `reasoning_effort` (off/low/medium/high) pins " +
       "the thinking effort. The pin overrides the space's model settings for this item's execution only. " +
+      "Optional `skills` (list of names) pins the skills injected into this task's session — space-authored skills " +
+      "and committed built-ins (e.g. \\\"pr_review\\\", the default for git delivery) both resolve; git delivery carries " +
+      "pr_review automatically. " +
       "Requires human approval (exec-tier tool).",
     parameters: createWorkItemArgsSchema,
     approval: "exec",
@@ -143,6 +155,21 @@ export function workItemToolDefinitions(
         const resolution = resolveModelPin(params.model, await (opts.listModels ?? listAvailableModels)(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR));
         if (!resolution.ok) return toolError(resolution.error);
         model = resolution.pin.kind === "role" ? resolution.pin.role : resolution.pin.modelId;
+      }
+      // Task-level skills (issues #234/#235): validate every name against
+      // the skill-name charset, fail closed — an invalid name never creates
+      // an item whose injected skills could not resolve at claim.
+      let skills: string[] | undefined;
+      if (params.skills !== undefined) {
+        if (params.skills.length === 0) return toolError("skills must be a non-empty list when provided");
+        for (const name of params.skills) {
+          if (!SKILL_NAME_RE.test(name)) {
+            return toolError(
+              `invalid skill name '${name}': must match ${SKILL_NAME_RE.source} (letters, digits, '.', '_', '-' — no separators)`,
+            );
+          }
+        }
+        skills = [...params.skills];
       }
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("work items require a space session");
@@ -177,7 +204,10 @@ export function workItemToolDefinitions(
             delivery === "git"
               ? params.repo?.trim() || (parsed ? `${parsed.owner}/${parsed.repo}` : undefined)
               : undefined,
+          ...(skills !== undefined ? { skills } : undefined),
         });
+        // The rendered skill list rides the result so the user SEES the
+        // task's injected skills in the same conversation (issues #234/#235).
         return {
           content: [
             {
@@ -187,6 +217,7 @@ export function workItemToolDefinitions(
                 state: item.state,
                 ...(model !== undefined ? { model } : undefined),
                 ...(params.reasoning_effort !== undefined ? { reasoning_effort: params.reasoning_effort } : undefined),
+                ...(skills !== undefined ? { skills } : undefined),
               }),
             },
           ],

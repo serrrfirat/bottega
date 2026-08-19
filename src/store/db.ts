@@ -82,6 +82,12 @@ export type WorkItem = {
   model: string | null;
   /** Per-task thinking-effort pin (issue #185); null = no pin (space/default effort applies). */
   reasoning_effort: ModelThinkingLevel | null;
+  /**
+   * Explicit task-level skills (issues #234/#235, Tier 3): a JSON-array
+   * TEXT of skill names ("[\"pr_review\"]") injected into the item session
+   * at claim — same TEXT-JSON convention as `approvals`/`evidence`.
+   */
+  skills: string;
   state: WorkItemState;
   approvals: string;
   evidence: string;
@@ -267,6 +273,8 @@ export interface Store {
     base_branch?: string;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
+    /** Explicit task-level skills (issues #234/#235): skill names injected into the item session at claim. */
+    skills?: string[];
   }): Promise<WorkItem>;
   /** Atomic open -> claimed for a SPECIFIC item (the worker claims by the job payload). Null when the item is not open. */
   claimWorkItemById(id: string, assignee?: string): Promise<WorkItem | null>;
@@ -661,6 +669,17 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       "ALTER TABLE work_items ADD COLUMN reasoning_effort TEXT CHECK (reasoning_effort IN ('off','low','medium','high'))",
     );
   }
+  // Idempotent migration (issues #234/#235): the explicit task-level skills
+  // column (JSON-array TEXT of skill names injected at claim). Fresh
+  // databases get it from schema.sql; existing work_items tables need the
+  // explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op for them). The
+  // default backfills every existing row — no pre-existing item has explicit
+  // skills until one is created with them.
+  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
+  const skillsColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
+  if (!skillsColumns.includes("skills")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'");
+  }
   // Idempotent migration (issue #159): the assignee column (who owns the
   // item). Nullable for legacy rows; the one-shot backfill makes the
   // requester the owner of every pre-#159 item — ownership starts as the
@@ -846,6 +865,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     base_branch?: string;
     /** Evidence entries recorded at creation (e.g. {kind: "issue_url", url}); `at` is stamped by the store. */
     evidence?: Array<{ kind: string; url: string }>;
+    /** Explicit task-level skills (issues #234/#235): skill names injected into the item session at claim. */
+    skills?: string[];
   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
@@ -853,8 +874,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // Ownership (issue #159): the requester owns the item at creation; the
     // executor's claim reassigns it later.
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, assignee, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, NULL, ?, ?)`,
+      `INSERT INTO work_items (id, space_id, requester, assignee, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, skills, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, ?, NULL, ?, ?)`,
     ).run(
       id,
       input.space_id,
@@ -869,6 +890,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       input.pr_branch ?? null,
       input.base_branch ?? null,
       JSON.stringify((input.evidence ?? []).map((e) => ({ ...e, at: t }))),
+      JSON.stringify(input.skills ?? []),
       t,
       t,
     );

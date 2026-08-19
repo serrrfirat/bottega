@@ -92,7 +92,7 @@ describe("tier resolution", () => {
     }
   });
   test("exec-tier tools", () => {
-    for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension", "register_extension"]) {
+    for (const t of ["bash", "task", "create_work_item", "work_item_cancel", "connect_extension", "register_extension", "write_space_skill"]) {
       expect(resolveTier(t)).toBe("exec");
     }
   });
@@ -100,6 +100,38 @@ describe("tier resolution", () => {
     expect(resolveTier("some_custom_tool")).toBe("exec");
     expect(isKnownTool("some_custom_tool")).toBe(false);
     expect(isKnownTool("bash")).toBe(true);
+  });
+});
+
+describe("write_space_skill governance (issues #234/#235)", () => {
+  test("an unconfigured skill write denies, fail-closed; allow alone never auto-approves (acceptance d)", () => {
+    // Default policy: write_space_skill is a KNOWN exec-tier tool but has no
+    // entry under `tools:`, so its action falls to the unknown default
+    // (deny) — an unconfigured/unauthorized write is DENIED before it can
+    // touch the space's skill store. always_approve is empty, so nothing
+    // can auto-approve it either.
+    const denied = decidePolicyCall(defaultPolicy(), "write_space_skill");
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason).toContain("policy denies the tool");
+    expect(denied.autoApproved).toBe(false);
+
+    // The always_approve footgun (AGENTS.md): allowlisting the tool under
+    // `tools:` is NOT enough to auto-approve an exec-tier write — it still
+    // routes ask-human. Only ALSO adding it to approvals.always_approve lets
+    // it run without a prompt (and audits it as auto-approved).
+    const allowlisted = parseOrgConfigYaml("tools:\n  write_space_skill: allow\n");
+    const askHuman = decidePolicyCall(allowlisted, "write_space_skill");
+    expect(askHuman.decision).toBe("ask-human");
+    expect(askHuman.reason).toContain("requires human approval");
+    expect(askHuman.autoApproved).toBe(false);
+
+    const approved = parseOrgConfigYaml(
+      "tools:\n  write_space_skill: allow\napprovals:\n  always_approve:\n    - write_space_skill\n",
+    );
+    const auto = decidePolicyCall(approved, "write_space_skill");
+    expect(auto.decision).toBe("allow");
+    expect(auto.reason).toContain("always_approve");
+    expect(auto.autoApproved).toBe(true);
   });
 });
 

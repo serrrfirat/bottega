@@ -64,7 +64,7 @@ import { extensionToolDefinitions } from "./extensions/tools";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./extensions/fixture";
 import { resolveMemoryProvider } from "./server/memory-provider";
 import { memoryToolDefinitions } from "./tools/memory";
-import type { ToolDefinition, TodoPhase } from "@oh-my-pi/pi-coding-agent";
+import type { Skill, ToolDefinition, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver, AgentSessionDriver, AgentTurnOptions, DriverEvent, DriverEventData, ModelRole, ModelRoleSwitchResult } from "./server/drivers/agent-driver";
 import { z } from "zod";
 
@@ -97,6 +97,8 @@ class FakeSession implements AgentSessionDriver {
       cwd: string;
       allowTools: readonly string[];
       getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+      /** Work-item task-level skills injected through the driver seam (issues #234/#235). */
+      skills?: readonly Skill[];
     },
     private readonly failure: Error | null,
     private readonly emittedError: string | null,
@@ -155,6 +157,7 @@ class FakeDriver implements AgentDriver {
     cwd?: string;
     allowTools?: readonly string[];
     getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    skills?: readonly Skill[];
   }): Promise<AgentSessionDriver> {
     const session = new FakeSession(
       {
@@ -163,6 +166,7 @@ class FakeDriver implements AgentDriver {
         cwd: opts.cwd ?? process.cwd(),
         allowTools: opts.allowTools ?? [],
         getModelSettings: opts.getModelSettings,
+        skills: opts.skills,
       },
       this.failure,
       this.emittedError,
@@ -701,6 +705,154 @@ describe("claim loop", () => {
   });
 });
 
+
+describe("work-item task-level skills (issues #234/#235)", () => {
+  test("injects explicitly pinned skills into the git item session", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "review the diff and land it",
+        repo: "acme/sandbox",
+        skills: ["pr_review"],
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills?.map((s) => s.name)).toEqual(["pr_review"]);
+      // The injected skill resolves `skill://pr_review` against its own dir.
+      expect(session.opts.skills![0].baseDir).toContain("pr_review");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("git-delivery items inject the pr_review builtin by default", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "ship the change",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills?.map((s) => s.name)).toEqual(["pr_review"]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("extension-delivery items carry no skills (documented v1 behavior)", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText =
+        'Task complete.\n{"url":"https://linear.example/issue/OPS-42","summary":"Created the operations ticket"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create a Linear ticket",
+        delivery: "extension",
+      });
+
+      await runUntil(fx, item.id, "done", makeExtensionDeps(fx));
+
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills?.length ?? 0).toBe(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a corrupt skills cell falls back to the kind default (fail closed)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "review the diff",
+        repo: "acme/sandbox",
+      });
+      // Poison the cell below the store API, as a legacy or manual row would.
+      const db = new Database(join(fx.dir, "store.db"));
+      try {
+        db.run("UPDATE work_items SET skills = ? WHERE id = ?", ["not-json", item.id]);
+      } finally {
+        db.close();
+      }
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      // The parse failed → the git default (`pr_review`) applies, never a crash.
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills?.map((s) => s.name)).toEqual(["pr_review"]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a pinned unknown skill is skipped without failing the job", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "review the diff",
+        repo: "acme/sandbox",
+        skills: ["pr_review", "no_such_skill_xyz"],
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills?.map((s) => s.name)).toEqual(["pr_review"]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a space-authored skill shadows the same-named builtin", async () => {
+    const fx = makeFixture();
+    const root = join(fx.dir, "skills-root");
+    const prev = process.env.BOTTEGA_SKILLS_DIR;
+    try {
+      process.env.BOTTEGA_SKILLS_DIR = root;
+      mkdirSync(join(root, "slack:C1", "pr_review"), { recursive: true });
+      writeFileSync(
+        join(root, "slack:C1", "pr_review", "SKILL.md"),
+        "---\nname: pr_review\ndescription: the space's own review loop\n---\nDo the space review.\n",
+      );
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "review the diff",
+        repo: "acme/sandbox",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      const session = fx.driver.sessions[0];
+      expect(session.opts.skills).toHaveLength(1);
+      expect(session.opts.skills![0].name).toBe("pr_review");
+      expect(session.opts.skills![0].source).toBe("space:slack:C1");
+    } finally {
+      if (prev === undefined) delete process.env.BOTTEGA_SKILLS_DIR;
+      else process.env.BOTTEGA_SKILLS_DIR = prev;
+      fx.cleanup();
+    }
+  });
+});
 
 describe("delivery routing (issue #129)", () => {
   test("extension delivery completes without git and audits the external object", async () => {

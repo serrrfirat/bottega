@@ -1,8 +1,8 @@
 import { afterAll, afterEach, describe, expect, test, vi } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext, TodoPhase } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionContext, Skill, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store, type ExtensionCredential } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
@@ -149,6 +149,8 @@ interface CreateSessionOpts {
   onOutput: (spaceId: string, text: string) => void;
   getPrincipal?: () => string | undefined;
   appendSystemPrompt?: string;
+  /** Space-authored skills injected at cold start (issues #234/#235). */
+  skills?: readonly Skill[];
 }
 
 class FakeDriver implements AgentDriver {
@@ -626,6 +628,35 @@ describe("SpaceService session lifecycle", () => {
     expect(driver.last().prompts).toEqual([{ text: "hello", opts: { principal: "U1" } }]);
   });
 
+  test("a space's authored skills are injected at cold start (issues #234/#235)", async () => {
+    const skillsRoot = mkdtempSync(join(tmpdir(), "bottega-space-skills-inject-"));
+    const prev = process.env.BOTTEGA_SKILLS_DIR;
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    try {
+      process.env.BOTTEGA_SKILLS_DIR = skillsRoot;
+      mkdirSync(join(skillsRoot, "slack:C1", "memo"), { recursive: true });
+      writeFileSync(
+        join(skillsRoot, "slack:C1", "memo", "SKILL.md"),
+        "---\nname: memo\ndescription: Note the reminder.\n---\nRecord it.\n",
+      );
+      const service = makeSpaceService({ store, adapter, driver });
+
+      await service.handleInboundMessage(msg({ text: "remind me", ts: "1.1" }));
+
+      const opts = driver.created[0].opts;
+      expect(opts.skills?.map((s) => s.name)).toContain("memo");
+      const memo = opts.skills!.find((s) => s.name === "memo")!;
+      expect(memo.source).toBe("space:slack:C1");
+      expect(memo.baseDir).toBe(join(skillsRoot, "slack:C1", "memo"));
+    } finally {
+      if (prev === undefined) delete process.env.BOTTEGA_SKILLS_DIR;
+      else process.env.BOTTEGA_SKILLS_DIR = prev;
+      rmSync(skillsRoot, { recursive: true, force: true });
+    }
+  });
+
   test("a fresh turn re-applies the default model role before prompting; a steer does not (issue #189)", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();
@@ -753,6 +784,7 @@ describe("SpaceService session lifecycle", () => {
       driver.last().deferDispose = true;
 
       vi.advanceTimersByTime(20); // idle timer fires; dispose starts and parks on the gate
+      for (let i = 0; i < 5; i++) await Promise.resolve(); // flush the async dispose start (digest awaits before session.dispose)
       expect(driver.last().disposed).toBe(true);
 
       await service.handleInboundMessage(msg({ text: "during", ts: "2.2" }));

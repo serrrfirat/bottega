@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS work_items (
                CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
   approvals    TEXT NOT NULL DEFAULT '[]',-- JSON array of {approver, at}
   evidence     TEXT NOT NULL DEFAULT '[]',-- JSON array of {kind, url, at}
+  skills       TEXT NOT NULL DEFAULT '[]',-- JSON array of explicit task-level skill names (issues #234/#235)
   result       TEXT,                     -- JSON: {pr_url, summary}, {url, summary}, or {summary}
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL

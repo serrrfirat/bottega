@@ -132,6 +132,17 @@ export function createAcpDriver(opts: AcpDriverOptions = {}): AgentDriver {
             "(the agent's own config governs there); remove the option or use the OMP SDK driver",
         );
       }
+      // Skills (issues #234/#235): ACP v1 has no skill-injection field — the
+      // agent's own skills configuration governs there. Reject loudly rather
+      // than silently drop the option (#173 honored-or-throws). Tier-1
+      // skills still reach ACP sessions server-side through the policy-gated
+      // write_space_skill tool.
+      if (options.skills !== undefined) {
+        throw new Error(
+          "acp driver: unsupported option 'skills' — ACP sessions cannot inject skills (the agent's own skill config " +
+            "governs there); remove the option or use the OMP SDK driver",
+        );
+      }
       // Transcript parity (issue #173): materialize the durable space
       // timeline at the same session-file path the OMP driver uses, so the
       // transcript contract is driver-independent.

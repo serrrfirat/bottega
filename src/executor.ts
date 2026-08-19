@@ -86,9 +86,10 @@ import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding, JsonValue } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
-import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { Skill, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
+import { resolveWorkItemSkills } from "./server/skills";
 
 /** The session driver "message" event payload: { spaceId, text }. */
 const driverMessageSchema = z.object({ text: z.string() });
@@ -101,6 +102,30 @@ const driverErrorSchema = z.object({ message: z.string() });
  * wrapper and needs its own auth, so it stays out).
  */
 export const EXECUTOR_TOOLS = ["read", "write", "glob", "grep", "bash"] as const;
+
+/**
+ * Work-item task-level skills (issues #234/#235, Tier 3): resolves the
+ * client-given pins plus the deterministic kind default at claim. An item
+ * with explicit skills uses them; otherwise git-delivery items always carry
+ * the builtin `pr_review` (review-the-diff loop, #87), extension items get
+ * none (documented v1 behavior). {@link resolveWorkItemSkills} merges the
+ * space tier + builtin tier, space shadowing builtin, and skip-logs unknown
+ * names so one bad pin never blocks a job. Fail-closed: a parse-failed
+ * `skills` cell falls back to the kind default, never to a crash.
+ */
+async function resolveItemSkills(item: WorkItem): Promise<Skill[]> {
+  const defaulted = (): string[] => (item.delivery === "git" ? ["pr_review"] : []);
+  const itemSkills = (() => {
+    if (!item.skills || item.skills.length === 0) return defaulted();
+    try {
+      const parsed: unknown = JSON.parse(item.skills);
+      return Array.isArray(parsed) && parsed.length > 0 ? (parsed as string[]) : defaulted();
+    } catch {
+      return defaulted();
+    }
+  })();
+  return resolveWorkItemSkills(item.space_id, itemSkills);
+}
 
 export interface DeliveryInfo {
   prUrl: string;
@@ -704,10 +729,15 @@ async function extensionWorkerPath(
   const allowTools = [...toolset.memoryTools, ...toolset.extensionTools].map((tool) => tool.name);
   // Issue #185: the pin-merged settings apply to extension deliveries too.
   const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
+  // issues #234/#235, Tier 3: the task-level skills ride the driver seam so
+  // `skill://<name>` resolves inside the extension worker session too.
+  const skills = await resolveItemSkills(item);
+  if (skills.length > 0) console.log(`[${item.id}] injected skills: ${skills.map((s) => s.name).join(", ")}`);
   const session = await (await deps.driver).createSession({
     spaceId: item.space_id,
     transcriptDir: join(cfg.transcriptDir, item.id),
     allowTools,
+    skills,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] extension agent: ${text}`),
     getModelSettings: async () => sessionSettings,
   });
@@ -919,11 +949,17 @@ async function runAgentSession(
   // Issue #185: the session resolves roles against the pin-merged settings
   // (task pin > space settings > defaults) so the pin applies cleanly.
   const sessionSettings = await resolveWorkItemSessionSettings(deps.store, item);
+  // issues #234/#235, Tier 3: the task-level skills (explicit pins + the
+  // git pr_review default) ride the driver seam into the item session, so
+  // `skill://pr_review` resolves while the agent reviews its own diff.
+  const skills = await resolveItemSkills(item);
+  if (skills.length > 0) console.log(`[${item.id}] injected skills: ${skills.map((s) => s.name).join(", ")}`);
   const session = await (await deps.driver).createSession({
     spaceId: item.id,
     transcriptDir: cfg.transcriptDir,
     cwd: workspace,
     allowTools: EXECUTOR_TOOLS,
+    skills,
     onOutput: (_spaceId, text) => console.log(`[${item.id}] agent: ${text}`),
     getModelSettings: async () => sessionSettings,
   });

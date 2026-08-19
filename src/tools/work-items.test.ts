@@ -379,10 +379,52 @@ describe("create_work_item", () => {
     expect(res2.isError).toBe(true);
     expect(resultText(res2)).toMatch(/empty/);
   });
+
+  test("accepts explicit task-level skills and echoes them in the result (issues #234/#235)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T-skills-1" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute(
+      "tc1",
+      { description: "review and land the change", skills: ["pr_review"] },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    expect(JSON.parse(resultText(res))).toMatchObject({ skills: ["pr_review"] });
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(JSON.parse(item!.skills)).toEqual(["pr_review"]);
+  });
+
+  test("a work item without skills stores an explicit empty list (issues #234/#235)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T-skills-2" });
+    const [createTool] = loadTools(s);
+    const res = await createTool.execute("tc1", { description: "plain task" }, undefined, undefined, ctxFor(space.id));
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(JSON.parse(item!.skills)).toEqual([]);
+  });
+
+  test("rejects an invalid skill name and an empty skills list without creating an item (issues #234/#235)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T-skills-deny" });
+    const [createTool] = loadTools(s);
+    const before = s.getDb().query("SELECT COUNT(*) AS n FROM work_items").get() as { n: number };
+
+    for (const params of [{ description: "bad", skills: ["../evil"] }, { description: "bad", skills: [] }]) {
+      const res = await createTool.execute("tc1", params, undefined, undefined, ctxFor(space.id));
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toMatch(/invalid skill name|skills must be a non-empty list/);
+    }
+
+    const after = s.getDb().query("SELECT COUNT(*) AS n FROM work_items").get() as { n: number };
+    expect(after.n).toBe(before.n);
+  });
 });
 
-describe("create_work_item model pin (issue #185)", () => {
-  const catalog: ModelCatalogEntry[] = [
+describe("create_work_item model pin (issue #185)", () => {  const catalog: ModelCatalogEntry[] = [
     { id: "gpt-sol-5.6", name: "GPT-Sol 5.6", provider: "opencode-go" },
     { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (2x usage)", provider: "opencode-go" },
   ];

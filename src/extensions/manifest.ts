@@ -120,6 +120,9 @@ export const PROJECT_TOOL_NAMES = [
   "create_work_item",
   "work_item_cancel",
   "list_work_items",
+  // Space-skill governance (issues #234/#235, Tier 1): mirrors
+  // SPACE_AGENT_TOOLS so the space agent may own its skills store.
+  "write_space_skill",
   // Todo snapshot (issue #228): read-tier assembly of the space's live
   // state; rides the custom-tools bridge like the work-item tools.
   "list_todos",

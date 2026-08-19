@@ -160,6 +160,52 @@ deployment. The shipped Attio, Linear, and GitHub extension hosts are already
 allowlisted. Add a host to the static allowlist when adding an extension;
 connected credentials never bypass the proxy or its judge.
 
+## Skills (per-space authored procedures, issues #234/#235)
+
+Skills are durable, space-specific procedures the space agent can learn and
+reference mid-session with `skill://<name>`. The agent claims skills by
+name; the store is two-tier:
+
+- **Built-ins** ship with the repo at `skills/` (override with
+  `BOTTEGA_BUILTIN_SKILLS_DIR`) and load once per boot. The shipped
+  `pr_review` built-in is injected into every git work-item session.
+- **Per-space skills** are authored at runtime into
+  `data/skills/<spaceId>/<name>/SKILL.md` (override the root with
+  `BOTTEGA_SKILLS_DIR`). A space skill with the same name as a built-in
+  shadows it for that space.
+
+Writing a skill is a privileged mutation (`write_space_skill`, exec tier):
+it injects procedures into the space agent's *future* sessions, so an
+unconfigured or unauthorized write denies fail-closed. To auto-approve
+skill writes without the ask-human prompt, list the tool under `tools:`
+with action `allow` **and** under `approvals.always_approve`:
+
+```yaml
+tools:
+  write_space_skill: allow
+approvals:
+  always_approve:
+    - write_space_skill
+```
+
+`always_approve` only skips the prompt for tools whose action is already
+`allow` — an unlisted tool (or a `deny`) still fails closed, and an unknown
+name in `always_approve` fails the policy closed. The dev floor in
+`config.yml` (`tools: unknown: allow`) already gives the tool action
+`allow`, so adding the `approvals` entry is all that is needed to
+auto-approve locally. Verify with the loader, not by eye:
+
+```bash
+bun -e 'import {loadOrgConfig,decidePolicyCall} from "./src/policy/config.ts"; const p=loadOrgConfig(); console.log(decidePolicyCall(p,"write_space_skill"))'
+```
+
+With the dev floor but no `approvals` entry this prints
+`{decision:"ask-human",reason:"exec-tier tool requires human approval",autoApproved:false}`;
+after adding `write_space_skill` to `approvals.always_approve` it prints
+`{decision:"allow",reason:"auto-approved by policy (approvals.always_approve)",autoApproved:true}`.
+A deployment that removes `config.yml` (back to deny-all) prints
+`{decision:"deny",reason:"policy denies the tool",autoApproved:false}`.
+
 ## Deployment
 
 ### Prerequisites

@@ -11,6 +11,7 @@ import {
   type CreateAgentSessionOptions,
   type CreateAgentSessionResult,
   type ExtensionFactory,
+  type Skill,
   type TodoPhase,
   type ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent";
@@ -219,6 +220,14 @@ export interface AgentDriver {
      * to switch to (role switches report applied: false).
      */
     getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    /**
+     * Skills (issues #234/#235): already-loaded {@link Skill}s to inject
+     * into this session, e.g. a space's authored skills or a work item's
+     * task-level pins. The OMP driver hands them to `createAgentSession` so
+     * `skill://<name>` resolves inside the session. The ACP driver cannot
+     * accept injection and throws (honored-or-throws, like `allowTools`).
+     */
+    skills?: readonly Skill[];
   }): Promise<AgentSessionDriver>;
 }
 
@@ -452,6 +461,9 @@ export const SPACE_AGENT_TOOLS = [
   "create_work_item",
   "work_item_cancel",
   "list_work_items",
+  // Skill governance (issues #234/#235, Tier 1): the policy-gated writer for
+  // the space's skill store — exec tier (ask-human) like create_work_item.
+  "write_space_skill",
   "connect_extension",
   "memory.save",
   "memory.search",
@@ -1134,7 +1146,7 @@ export function createOmpSdkDriver(
   const createSession = opts.createSession ?? createAgentSession;
   const thinkingLevel: DriverThinkingLevel = opts.thinkingLevel ?? "low";
   return {
-    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt, getModelSettings }) {
+    async createSession({ spaceId, transcriptDir, onOutput, cwd, allowTools, getPrincipal, appendSystemPrompt, getModelSettings, skills }) {
       mkdirSync(transcriptDir, { recursive: true });
       const sessionCwd = cwd ?? process.cwd();
       const sessionManager = SessionManager.create(sessionCwd, transcriptDir);
@@ -1314,6 +1326,11 @@ export function createOmpSdkDriver(
         // (provider-qualified) — never the raw unqualified value the SDK's
         // registry would land on the wrong provider's same-named model.
         ...(resolvedDefaultModel !== undefined ? { modelPattern: [resolvedDefaultModel] } : undefined),
+        // Skills (issues #234/#235): the SDK sets its active skill snapshot
+        // from these, so `skill://<name>` (and the rendered `<skills>`
+        // listing) resolve inside this session. Always passed — an empty
+        // array is the SDK's default and a no-op.
+        skills: [...(skills ?? [])],
         // Registry + connect tools (issues #50/#52) must surface in
         // restricted sessions; discovered extensions, MCP, and ambient
         // custom tools stay disabled.

@@ -134,6 +134,7 @@ import type { Store } from "../store/db";
 import { kbToolDefinitions } from "../tools/kb-tools";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { workItemToolDefinitions } from "../tools/work-items";
+import { writeSpaceSkillToolDefinition } from "../tools/space-skills";
 import type { ModelCatalogEntry } from "../models/model-pin";
 
 export interface MemoryMcpServerOptions {
@@ -584,6 +585,14 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           agentDir: opts.internal.agentDir,
           listModels: opts.internal.listModels,
         }),
+        // Space-skill governance (issues #234/#235, Tier 1): same
+        // write_space_skill surface on the ACP/MCP path — gated by
+        // bindInternalTool (gate → audit → validate → execute). ACP cannot
+        // INJECT loaded skills into its sessions (honors-or-throws), but
+        // the server-side skill store remains fully manageable there.
+        ...(opts.audit !== undefined
+          ? [writeSpaceSkillToolDefinition(opts.internal.store, { audit: opts.audit })]
+          : []),
         ...modelToolsDefinitions(opts.internal.store, {
           audit: opts.audit,
           agentDir: opts.internal.agentDir,

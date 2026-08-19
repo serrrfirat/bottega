@@ -398,6 +398,52 @@ approval logic — a denied extension is denied outright (with reason + audit)
 and never reaches credential resolution. `org_credentials: deny` makes the
 credential ladder's `auto` scope skip org credentials.
 
+## Skills (issues #234/#235, #87)
+
+Skills are durable procedures a session can load on demand via
+`skill://<name>`; the agent claims them by `name` + `description`. One
+`SKILL.md` per skill (frontmatter `name` + `description`, then the body;
+any file the body references sits next to it so `skill://` reads resolve
+against the skill's own directory).
+
+**Store layout.** Built-ins ship with the repo at `skills/`
+(`BOTTEGA_BUILTIN_SKILLS_DIR` overrides; the shipped `pr_review` review-
+the-diff skill lives there) and load once per boot. Per-space skills live at
+`<BOTTEGA_SKILLS_DIR>/<spaceId>/<name>/SKILL.md` (default root
+`data/skills`) with source label `space:<spaceId>`; a missing space dir
+resolves to an empty list — never an error, never a create-on-read side
+effect. In `resolveWorkItemSkills`, `[...spaceSkills, ...builtinSkills]`
+with first-name-wins means a space-authored skill **shadows** a same-named
+built-in (a space can override `pr_review`).
+
+**Injection seam.** Both session creators resolve skills and hand them to
+`AgentDriver.createSession(opts.skills)` at cold start, so the skill
+snapshot is fixed for the session's whole life:
+
+- `SpaceService.#createLive` passes `resolveSpaceSkills(spaceId)` — the
+  space tier (Tier 1 — per-space authored skills, the current surface).
+- The executor passes `resolveItemSkills(item)` — the task tier (Tier 3),
+  `WorkItem.skills` pins resolved against the space tier then the built-ins.
+
+The OMP driver forwards `opts.skills` to `createAgentSession`, where the SDK
+sets its active skill snapshot and `skill://<name>` (plus the rendered
+`<skills>` listing) resolves inside that session. The ACP driver cannot
+accept injection and throws `unsupported` (honored-or-throws, like
+`allowTools`). The three tiers, per the epic:
+per-space governed skills (Tier 1, today) → org-shared skills (Tier 2,
+future) → task-level skills via `WorkItem.skills` + `resolveItemSkills`
+(Tier 3), where a git-delivery item with no explicit pins deterministically
+carries the built-in `pr_review`; extension items carry none. An unknown
+pin name is skip-logged, never fatal.
+
+**Reload semantics.** `resolveSpaceSkills` caches in-process per space;
+`writeSpaceSkill` busts that cache after the write. A change therefore
+applies on the **next** session that cold-starts the space — never to a
+running session (its snapshot is already fixed) and never mid-session. The
+built-in cache is per boot. `write_space_skill` is exec-tier (policy-gated
+before it touches disk), so auto-approving it requires both a `tools:`
+allow entry and `approvals.always_approve` membership (see setup.md).
+
 ## Extension runtime: the safety spine
 
 `src/extensions/` implements the registry (issue #50): pinned provenance,

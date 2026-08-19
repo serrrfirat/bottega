@@ -10,6 +10,13 @@
  */
 /** Work item created (payload {id, requester, assignee}). */
 export const WORK_ITEM_CREATED_EVENT = "work_item.created";
+/**
+ * A space skill was written (issues #234/#235): payload {name, path}; the
+ * space_id rides the top-level field. Written by the `write_space_skill`
+ * tool after a successful policy-gated write lands on disk (fail-closed: no
+ * event without a file).
+ */
+export const SPACE_SKILL_WRITTEN_EVENT = "space_skill.written";
 /** Work item state transition (payload {from, to, by}). */
 export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
 /** Queue read (payload {state?, count}; space_id top-level). */

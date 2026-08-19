@@ -178,6 +178,11 @@ const TIER_BY_TOOL: ToolTiers = {
   task: "exec",
   create_work_item: "exec",
   work_item_cancel: "exec",
+  // Skill governance (issues #234/#235, Tier 1): writing a skill into a
+  // space's skill store injects procedures into the space agent's future
+  // sessions, so it is exec-tier (ask-human) like the other privileged
+  // mutations — an operator can auto-approve it via approvals.always_approve.
+  write_space_skill: "exec",
   complete_work_item: "write",
   list_work_items: "read",
   // Todo snapshot (issue #228): read-only assembly of the space's live

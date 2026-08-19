@@ -8,6 +8,7 @@ import type { MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
+import { resolveSpaceSkills } from "../skills";
 import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
@@ -656,6 +657,11 @@ export class SpaceService {
       spaceId,
       transcriptDir: this.#transcriptDir,
       appendSystemPrompt,
+      // Skills (issues #234/#235, Tier 1): the space's authored skills are
+      // injected at cold start so `skill://<name>` resolves for the whole
+      // session. resolveSpaceSkills caches in-process and is re-read on the
+      // NEXT cold start after write_space_skill (documented reload).
+      skills: await resolveSpaceSkills(spaceId),
       // A persona floor widens only the visible session toolset (#130).
       // The existing per-space policy gate still decides whether each call
       // is allowed, so a restrictive space overlay always wins.

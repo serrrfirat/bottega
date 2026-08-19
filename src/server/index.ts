@@ -10,6 +10,7 @@ import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { workItemToolDefinitions } from "../tools/work-items";
+import { writeSpaceSkillToolDefinition } from "../tools/space-skills";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
 import { modelToolsDefinitions } from "../tools/model-settings";
@@ -511,6 +512,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // onSessionToolset seam can expose the wiring to caller-level boot tests.
   const sessionToolset = [
     ...workItemToolDefinitions(store, { orgPolicy, agentDir }),
+    // Space-skill governance (issues #234/#235, Tier 1): the policy-gated
+    // write_space_skill rides the same custom-tools bridge as the work-item
+    // tools — the driver's gate wraps it identically (exec tier → ask-human
+    // by default), every write is audited, and the space's cached skills are
+    // busted so the NEXT session claims the skill.
+    writeSpaceSkillToolDefinition(store, { audit }),
     ...memoryToolDefinitions(memoryProvider, { audit }),
     ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
     ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),

@@ -346,6 +346,22 @@ describe("work items", () => {
     expect(got).toEqual(item);
   });
 
+  test("createWorkItem persists explicit task-level skills and defaults to an empty list (issues #234/#235)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C10-skills" });
+    const pinned = await s.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "review the diff",
+      skills: ["pr_review", "space_audit.1"],
+    });
+    expect(JSON.parse(pinned.skills)).toEqual(["pr_review", "space_audit.1"]);
+    expect((await s.getWorkItem(pinned.id))?.skills).toBe(pinned.skills);
+
+    const none = await s.createWorkItem({ space_id: space.id, requester: "U1", description: "plain" });
+    expect(JSON.parse(none.skills)).toEqual([]);
+  });
+
   test("createWorkItem round-trips explicit extension and chat delivery kinds", async () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C10-delivery" });
