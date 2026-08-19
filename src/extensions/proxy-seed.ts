@@ -96,6 +96,14 @@ interface ProxyOAuthBlob {
 export interface VaultOAuthCredential extends OAuthCredential {
   client_id?: string;
   client_secret?: string;
+  /**
+   * The persisted token-endpoint auth method (issue #257): whichever
+   * `token_endpoint_auth_method` the connect negotiated at registration
+   * (`client_secret_basic` / `client_secret_post`, or "none" for public
+   * clients). Rides the vault round-trip like `client_secret` so the
+   * runtime re-sends confidential credentials per the persisted method.
+   */
+  token_endpoint_auth_method?: string;
 }
 
 /** One OAuth vault row's seed-relevant fields (issue #250). */

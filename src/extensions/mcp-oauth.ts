@@ -222,7 +222,7 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
 export function tokensToVaultCredential(
   tokens: OAuthTokens,
   previous: OAuthCredential | null,
-  clientInformation?: { client_id?: string; client_secret?: string },
+  clientInformation?: { client_id?: string; client_secret?: string; token_endpoint_auth_method?: string },
 ): VaultOAuthCredential {
   // A genuine new refresh wins; otherwise the previous row's refresh is
   // carried forward (non-rotating servers). Neither present → the grant
@@ -241,8 +241,14 @@ export function tokensToVaultCredential(
   const carried = previous as VaultOAuthCredential | null;
   const clientId = clientInformation?.client_id ?? carried?.client_id;
   const clientSecret = clientInformation?.client_secret ?? carried?.client_secret;
+  // Issue #257: the negotiated auth method (client_secret_basic/post for
+  // confidential AS, "none" for public) is per-user vault data — persisted
+  // alongside the secret so the runtime mints with the SAME method, and
+  // rotation write-backs never degrade it to a public client.
+  const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? carried?.token_endpoint_auth_method;
   if (clientId !== undefined && clientId !== "") credential.client_id = clientId;
   if (clientSecret !== undefined && clientSecret !== "") credential.client_secret = clientSecret;
+  if (clientAuthMethod !== undefined && clientAuthMethod !== "") credential.token_endpoint_auth_method = clientAuthMethod;
   return credential;
 }
 
@@ -251,6 +257,13 @@ export interface PersistedOAuthFlow {
   codeVerifier?: string;
   clientInformation?: OAuthClientInformationMixed;
   discoveryState?: OAuthDiscoveryState;
+  /**
+   * The connect-negotiated `token_endpoint_auth_method` (issue #257).
+   * Persisted so the callback restores confidential client auth even when
+   * a real DCR response fails to echo the method back — defense-in-depth
+   * for the vault row's `token_endpoint_auth_method` field.
+   */
+  tokenEndpointAuthMethod?: string;
   authorizationUrl?: string;
 }
 
@@ -378,12 +391,23 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
   invalidateCredentials(): void {}
 }
 
-/** The OAuth client metadata bottega registers for every hosted MCP flow. */
-function clientMetadataFor(redirectUri: string, scopes: readonly string[] | undefined): OAuthClientMetadata {
+/**
+ * The OAuth client metadata bottega registers for every hosted MCP flow.
+ * Issue #257: `tokenEndpointAuthMethod` is the CONNECT-negotiated
+ * `token_endpoint_auth_method` — "none" for public-capable AS (the exact
+ * pre-#257 behavior), `client_secret_basic`/`client_secret_post` for
+ * confidential-capable ones, so DCR issues a client secret where the
+ * authorization server requires confidential client auth.
+ */
+function clientMetadataFor(
+  redirectUri: string,
+  scopes: readonly string[] | undefined,
+  tokenEndpointAuthMethod: string = "none",
+): OAuthClientMetadata {
   const metadata: OAuthClientMetadata = {
     client_name: "bottega",
     redirect_uris: [redirectUri],
-    token_endpoint_auth_method: "none",
+    token_endpoint_auth_method: tokenEndpointAuthMethod,
     grant_types: ["authorization_code", "refresh_token"],
   };
   if (scopes !== undefined && scopes.length > 0) metadata.scope = scopes.join(" ");
@@ -426,11 +450,11 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
 }
 
 /**
- * The connect mint's requested scope (issue #256). SEP-835 resolves the
- * OAuth scope as: auth() `scope` option → WWW-Authenticate scope →
- * the resource's advertised `scopes_supported` → client metadata `scope`.
- * The resource advertisement lists only the RESOURCE's own scopes (the
- * hosted MCP advertises e.g. "default") — it NEVER lists the OIDC
+ * The connect's negotiated server contract (issue #256 + issue #257):
+ * SEP-835 resolves the OAuth scope as: auth() `scope` option → WWW-Authenticate
+ * scope → the resource's advertised `scopes_supported` → client metadata
+ * `scope`. The resource advertisement lists only the RESOURCE's own scopes
+ * (the hosted MCP advertises e.g. "default") — it NEVER lists the OIDC
  * "offline_access" scope, without which the authorization server issues
  * NO refresh token, and every later proxy mint fails with "oauth_token
  * failed to mint". So the mint decides on the AUTHORIZATION SERVER's grant
@@ -439,27 +463,43 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
  * and the authorization URL both carry it); otherwise keep the SDK's
  * resolution untouched (e.g. client-credentials servers have no consent).
  *
+ * Issue #257 additionally negotiates the TOKEN-ENDPOINT AUTH METHOD from
+ * `token_endpoint_auth_methods_supported`: prefer `client_secret_basic`
+ * (RFC 6749 §2.3.1), fall back to `client_secret_post` (§2.3.1 alt), else
+ * "none" (public — exactly the pre-#257 behavior). The negotiated method
+ * flows into the DCR metadata, so confidential-capable AS issue a
+ * client_secret and every later refresh re-sends it per the persisted
+ * method.
+ *
  * This costs an extra discovery round trip on the connect path (not hot);
  * in exchange no provider/state plumbing is needed and every server that
  * supports refreshable grants gets a token that can actually be refreshed.
  */
-async function connectOAuthScope(
+async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
-): Promise<string | undefined> {
+): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string }> {
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
   } catch {
     // auth() below re-discovers and surfaces its own failure message (the
     // connect already fails closed there); don't double-fail here.
-    return undefined;
+    return { scope: undefined, tokenEndpointAuthMethod: "none" };
   }
+  const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
+  const supports = (method: string) => supportedMethods?.includes(method) === true;
+  const tokenEndpointAuthMethod = supports("client_secret_basic")
+    ? "client_secret_basic"
+    : supports("client_secret_post")
+      ? "client_secret_post"
+      : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  if (!grantsRefresh) return undefined;
+  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod };
   const base = info.resourceMetadata?.scopes_supported?.join(" ") ?? clientScopes?.join(" ");
-  return base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
+  const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
+  return { scope, tokenEndpointAuthMethod };
 }
 
 /**
@@ -491,10 +531,16 @@ export async function startMcpOAuthFlow(
   const serverUrl = manifest.mcp.serverUrl;
   const redirectUri = `${deps.callbackBaseUrl()}/oauth/callback`;
   const token = randomBytes(18).toString("base64url"); // the OAuth state: opaque, single-use
+  // Issue #256/#257: negotiate the server contract ONCE before the mint —
+  // the requested scope (offline_access when the AS grants refresh) + the
+  // token-endpoint auth method (client_secret_basic/post for confidential
+  // AS). auth()'s own discovery succeeds from the SAME metadata, so this
+  // is one extra round trip on the connect path, not a divergence.
+  const negotiation = await connectServerNegotiation(serverUrl, manifest.credentialSchema.scopes);
   let authorizationUrl: URL | undefined;
   const provider = new BottegaMcpOAuthProvider({
     redirectUrl: redirectUri,
-    clientMetadata: clientMetadataFor(redirectUri, manifest.credentialSchema.scopes),
+    clientMetadata: clientMetadataFor(redirectUri, manifest.credentialSchema.scopes, negotiation.tokenEndpointAuthMethod),
     tokenStore: deps.tokenStore ?? createVaultTokenStore(),
     tokenTarget: { provider: manifest.id },
     state: token,
@@ -504,8 +550,7 @@ export async function startMcpOAuthFlow(
   });
   let result: AuthResult;
   try {
-    const scope = await connectOAuthScope(serverUrl, manifest.credentialSchema.scopes);
-    result = await auth(provider, { serverUrl, ...(scope !== undefined ? { scope } : {}) });
+    result = await auth(provider, { serverUrl, ...(negotiation.scope !== undefined ? { scope: negotiation.scope } : {}) });
   } catch (err) {
     return { ok: false, message: `connect ${manifest.label} failed: ${errorMessage(err)}` };
   }
@@ -519,6 +564,7 @@ export async function startMcpOAuthFlow(
     codeVerifier: provider.codeVerifier(),
     clientInformation: provider.clientInformation(),
     discoveryState: provider.discoveryState(),
+    tokenEndpointAuthMethod: negotiation.tokenEndpointAuthMethod,
     authorizationUrl: authorizationUrl.toString(),
   };
   const flowStore = new OAuthFlowStore(deps.store, {
@@ -585,9 +631,26 @@ export async function completeMcpOAuthFlow(
   } catch {
     throw new Error(`connect ${flowRow.label} failed: the pending flow is malformed — re-run connect`);
   }
+  // Issue #257: some real DCR responses omit `token_endpoint_auth_method`
+  // even though the registration requested one (RFC 7591 servers may not
+  // echo every field). Restore the connect-negotiated method — it is
+  // authoritative, and it is what makes the vault row's confidential
+  // identity self-describing for the runtime.
+  if (persisted.tokenEndpointAuthMethod !== undefined) {
+    // Cast: the SDK union arms don't all carry token_endpoint_auth_method,
+    // but a freshly JSON.parse'd object is safe to mutate and the runtime
+    // restores the method from the SAME union (issue #257).
+    const restoredClient = persisted.clientInformation as
+      | (OAuthClientInformationMixed & { token_endpoint_auth_method?: string })
+      | undefined;
+    if (restoredClient !== undefined && restoredClient.token_endpoint_auth_method === undefined) {
+      // Fresh object from JSON.parse — mutating it never touches the row.
+      restoredClient.token_endpoint_auth_method = persisted.tokenEndpointAuthMethod;
+    }
+  }
   const provider = new BottegaMcpOAuthProvider({
     redirectUrl: flowRow.redirect_uri,
-    clientMetadata: clientMetadataFor(flowRow.redirect_uri, undefined),
+    clientMetadata: clientMetadataFor(flowRow.redirect_uri, undefined, persisted.tokenEndpointAuthMethod),
     tokenStore: deps.tokenStore ?? createVaultTokenStore(),
     tokenTarget: { provider: flowRow.provider },
     restore: persisted,
@@ -601,10 +664,35 @@ export async function completeMcpOAuthFlow(
   if (result !== "AUTHORIZED") {
     throw new Error(`connect ${flowRow.label} failed: the authorization exchange did not complete`);
   }
-  const brokerCredentialId = provider.savedBrokerCredentialId;
-  if (brokerCredentialId === undefined) {
+  if (provider.savedBrokerCredentialId === undefined) {
     throw new Error(`connect ${flowRow.label} failed: the vault recorded no OAuth credential`);
   }
+  // Issue #257: connect-time mint probe — ONE refresh_token round-trip
+  // right after the exchange persisted the vault row. A credential whose
+  // refresh grant the server immediately rejects (revoked, mis-issued, a
+  // confidential client that dropped its secret) would otherwise connect
+  // successfully only to fail closed silently on every later call. The
+  // probe reuses the SAME provider (cached discovery + client info + the
+  // just-exchanged tokens), so it costs a single HTTP round trip and the
+  // probe itself rotates the row to its latest token.
+  let probe: AuthResult;
+  try {
+    probe = await auth(provider, { serverUrl: flowRow.server_url });
+  } catch (err) {
+    throw new Error(
+      `connect ${flowRow.label} failed: the authorization exchange was rejected (${errorMessage(err)}) — ` +
+        `the returned refresh token cannot mint an access token`,
+    );
+  }
+  if (probe !== "AUTHORIZED") {
+    throw new Error(
+      `connect ${flowRow.label} failed: the authorization exchange was rejected — the returned refresh token cannot mint an access token`,
+    );
+  }
+  // The probe's refresh may have rotated the vault row again; the registry
+  // reference must point at the POST-probe row (the same identity-key vault
+  // row in production).
+  const brokerCredentialId = provider.savedBrokerCredentialId as number;
   const owner = flowRow.scope === "personal" ? flowRow.actor : null;
   await deps.store.upsertExtensionCredential({
     provider: flowRow.provider,
@@ -644,25 +732,63 @@ export interface RuntimeMcpOAuthOpts {
 }
 
 /**
+ * Vault OAuth credential → the per-user registered client identity (issue
+ * #257): restores `client_id`/`client_secret`/`token_endpoint_auth_method`
+ * from the vault row so the SDK treats the client as ALREADY registered
+ * (no re-DCR per call) and sends confidential credentials per the persisted
+ * method. Returns undefined for rows without a client_id (pre-#250 →
+ * runtime DCR as today; public clients → "none", preserved). A cast is
+ * used because the SDK union types are exact Zod-object shapes that never
+ * admit the extra fields the runtime object carries.
+ */
+function vaultCredentialClientInformation(credential: VaultOAuthCredential): OAuthClientInformationMixed | undefined {
+  const { client_id, client_secret, token_endpoint_auth_method } = credential;
+  if (client_id === undefined || client_id === "") return undefined;
+  const info: Record<string, string> = { client_id };
+  if (client_secret !== undefined && client_secret !== "") info.client_secret = client_secret;
+  if (token_endpoint_auth_method !== undefined && token_endpoint_auth_method !== "") {
+    info.token_endpoint_auth_method = token_endpoint_auth_method;
+  }
+  // `unknown`: the SDK union arms are exact Zod-object shapes — the runtime
+  // object is a structural subset, never a full arm, so no arm overlaps.
+  return info as unknown as OAuthClientInformationMixed;
+}
+
+/**
  * The RUNTIME leg's provider: loads the vault credential raw, hands the
  * SDK the tokens (real refresh token locally → the SDK refreshes on 401 and
  * `saveTokens` rotates the vault row; the broker's sentinel is dropped →
  * expiry falls to the re-auth prompt, fail closed). `redirectToAuthorization`
  * throws the re-auth prompt — the SDK's interactive path can never run
  * mid-tool-call.
+ *
+ * Issue #257: ASYNC — it eagerly loads the vault row's client identity
+ * (`client_id`/`client_secret`/`token_endpoint_auth_method`) and restores
+ * it on the provider, so confidential-capable AS get their secret on every
+ * mint (per the persisted method) with no per-call re-DCR, and rotation
+ * write-backs preserve the identity. One extra vault read per call-mint is
+ * the price of confidential fidelity; pre-#250 rows (no client_id) fall
+ * back to runtime DCR exactly as before.
  */
-export function createRuntimeMcpOAuthProvider(input: RuntimeMcpOAuthOpts): OAuthClientProvider {
+export async function createRuntimeMcpOAuthProvider(input: RuntimeMcpOAuthOpts): Promise<OAuthClientProvider> {
   const { provider } = input.credential;
-  return new BottegaMcpOAuthProvider({
+  const tokenStore = input.tokenStore ?? createVaultTokenStore();
+  const providerInstance = new BottegaMcpOAuthProvider({
     // Placeholder: the runtime leg never surfaces an authorization URL —
     // redirectToAuthorization throws first. The SDK requires a redirectUrl
     // for the authorization_code flow, so a non-interactive one is given.
     redirectUrl: "http://127.0.0.1/oauth/callback",
     clientMetadata: clientMetadataFor("http://127.0.0.1/oauth/callback", undefined),
-    tokenStore: input.tokenStore ?? createVaultTokenStore(),
+    tokenStore,
     tokenTarget: { provider, brokerCredentialId: input.credential.broker_credential_id },
     reauthMessage:
       `the ${provider} OAuth session has expired or was revoked — ` +
       `re-run "connect ${provider} as me" (or "as org") to re-authorize`,
   });
+  const credential = await tokenStore.load(provider, input.credential.broker_credential_id);
+  if (credential !== null) {
+    const clientInformation = vaultCredentialClientInformation(credential as VaultOAuthCredential);
+    if (clientInformation !== undefined) providerInstance.saveClientInformation(clientInformation);
+  }
+  return providerInstance;
 }

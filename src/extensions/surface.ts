@@ -95,7 +95,21 @@ export async function extensionToolSurface(
  */
 export async function resolveExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
-  opts: { mcpTransport?: (binding: McpBinding) => Transport } = {},
+  opts: {
+    mcpTransport?: (binding: McpBinding) => Transport;
+    /**
+     * Issue #257 connectedness probe: given an extension id, is it
+     * CONNECTED (a valid vault credential row exists)? Checked ONLY for a
+     * provider whose boot discovery just failed. `true` → the boot emits
+     * the LOUD fail-closed warning (a provider the user connected whose
+     * tools/list now cannot mint is an incident-in-waiting — every later
+     * call fails closed invisibly); `false`/absent → a provider that was
+     * never connected keeps the silent skip. Defaults to false (no probe),
+     * which is exactly the pre-#257 boot behavior; the composition root
+     * (bootstrap-runtime) wires the real store-backed probe.
+     */
+    isConnected?: (providerId: string) => boolean | Promise<boolean>;
+  } = {},
 ): Promise<ExtensionSurfaces> {
   const entries = await Promise.all(
     extensions.map(async ({ manifest }) => {
@@ -106,10 +120,33 @@ export async function resolveExtensionSurfaces(
         // auth-gated must never fail the boot. Skip it (the map carries
         // only RESOLVED surfaces) and let the runtime's lazy per-call path
         // fail closed if a call is attempted while the provider is down.
-        console.error(
-          `[surface] boot: skipping "${manifest.id}" — tools/list failed (${errorMessage(err)}); ` +
-            "the runtime resolves it lazily per call and fails closed if the provider is still unreachable",
-        );
+        //
+        // Issue #257: distinguish the SILENT skip (never connected — no
+        // credential row, e.g. linear/attio) from the LOUD failed-closed
+        // warning (CONNECTED — the user authorized it, but tools/list can
+        // no longer mint). The connected case must never look "fine" at
+        // boot: name the provider + the recovery action.
+        let connected = false;
+        if (opts.isConnected !== undefined) {
+          try {
+            connected = (await opts.isConnected(manifest.id)) === true;
+          } catch {
+            connected = false; // the probe itself failed — degrade to the silent path
+          }
+        }
+        if (connected) {
+          console.error(
+            `[surface] boot: CONNECTED provider "${manifest.id}" is unreachable or auth-gated — ` +
+              `tools/list failed (${errorMessage(err)}); it has a saved credential but can no longer mint. ` +
+              `Re-run "connect ${manifest.id}" (or revoke/refresh its credential) — ` +
+              `every call to it stays fail-closed until then.`,
+          );
+        } else {
+          console.error(
+            `[surface] boot: skipping "${manifest.id}" — tools/list failed (${errorMessage(err)}); ` +
+              "the runtime resolves it lazily per call and fails closed if the provider is still unreachable",
+          );
+        }
         return null;
       }
     }),

@@ -381,7 +381,7 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         manifest.kind === "mcp" &&
         manifest.mcp.transport === "streamable-http" &&
         manifest.credentialSchema.type === "oauth"
-          ? createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore })
+          ? await createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore })
           : undefined;
       try {
         await boundary.authorize(credential);

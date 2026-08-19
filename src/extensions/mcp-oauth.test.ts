@@ -10,7 +10,13 @@
  * connect round trip (mint → browser → callback → vault + registry +
  * audit), refresh via the runtime provider, and every fail-closed path
  * (missing metadata, bad code, replay/expired state, missing vault row →
- * re-auth prompt, broker refresh sentinel dropped).
+ * re-auth prompt, broker refresh sentinel dropped). Plus issue #257
+ * credential durability for every MCP integration: confidential-client
+ * fidelity (connect-negotiated token_endpoint_auth_method → persisted
+ * client_secret + Basic auth on /token, env-free runtime mint), the
+ * connect-time mint probe (a dead refresh fails the connect closed), and
+ * refresh-token rotation write-back (a rotating server survives ≥3 runtime
+ * refresh cycles, each using the latest rotated token — never a dead one).
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -88,6 +94,12 @@ interface StubState {
   registeredScopes: string[];
   /** The `scope` query param of every authorization URL minted (issue #256). */
   authorizeScopes: string[];
+  /** The `token_endpoint_auth_method` requested in every DCR registration (issue #257). */
+  registeredAuthMethods: string[];
+  /** The client-auth method actually used on every /token call (issue #257). */
+  clientAuthMethodsUsed: string[];
+  /** How many DCR registrations were issued a client_secret (issue #257). */
+  confidentialClients: number;
 }
 
 /**
@@ -100,13 +112,30 @@ interface StubState {
 class StubOAuthMcp {
   readonly server: ReturnType<typeof Bun.serve>;
   readonly baseUrl: string;
-  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null, registeredScopes: [], authorizeScopes: [] };
+  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null, registeredScopes: [], authorizeScopes: [], registeredAuthMethods: [], clientAuthMethodsUsed: [], confidentialClients: 0 };
   #codes = new Map<string, { clientId: string; challenge: string | null; offline: boolean }>();
   #refreshTokens = new Map<string, string>(); // refresh -> clientId
   #accessTokens = new Map<string, string>(); // access -> clientId
+  #clientSecrets = new Map<string, string>(); // client_id -> client_secret (confidential mode)
   #nextId = 0;
   /** Set false to serve /mcp with NO OAuth metadata (the fail-closed leg). */
   oauthMetadata = true;
+  /**
+   * Set true to model a CONFIDENTIAL OAuth client (RFC 6749 §2.3.1): the AS
+   * advertises client_secret_basic/post, DCR issues a client_secret ONLY to
+   * a registration that requested a confidential method, and /token rejects
+   * any call without valid client credentials (Basic header or
+   * client_secret form param). A public client (method "none") can never
+   * mint against it (issue #257).
+   */
+  confidential = false;
+  /**
+   * Set true to make the token endpoint's refresh_token grant fail with
+   * invalid_grant — every refresh is rejected (models a server that issued
+   * a refresh token which is already dead). The connect-time mint probe
+   * must then fail the connect closed (issue #257).
+   */
+  deadRefresh = false;
   /**
    * Set true to make the token endpoint refuse to issue a refresh token even
    * when offline_access WAS requested (models a server that ignores
@@ -184,7 +213,7 @@ class StubOAuthMcp {
         response_types_supported: ["code"],
         response_modes_supported: ["query"],
         grant_types_supported: this.grantRefresh ? ["authorization_code", "refresh_token"] : ["authorization_code"],
-        token_endpoint_auth_methods_supported: ["none"],
+        token_endpoint_auth_methods_supported: this.confidential ? ["client_secret_basic", "client_secret_post"] : ["none"],
         code_challenge_methods_supported: ["S256"],
       });
     }
@@ -193,10 +222,31 @@ class StubOAuthMcp {
       this.state.registerCalls += 1;
       // SAFETY: the DCR request carries these optional fields (RFC 7591);
       // the stub defaults each missing one in the registration response.
-      const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[]; scope?: string };
+      const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[]; scope?: string; token_endpoint_auth_method?: string };
       this.state.registeredScopes.push(typeof body.scope === "string" ? body.scope : "");
+      const requestedMethod = typeof body.token_endpoint_auth_method === "string" ? body.token_endpoint_auth_method : "none";
+      this.state.registeredAuthMethods.push(requestedMethod);
+      const clientId = `client-${this.state.registerCalls}`;
+      // Issue #257: a confidential-enabled server issues a client_secret ONLY
+      // when the registration actually asked for a confidential method
+      // (RFC 7591 does not force secrets on public clients). The negotiated
+      // method is echoed back so the SDK records the same method it will
+      // use to authenticate on /token.
+      if (this.confidential && (requestedMethod === "client_secret_basic" || requestedMethod === "client_secret_post")) {
+        this.state.confidentialClients += 1;
+        const clientSecret = `secret-${this.state.registerCalls}`;
+        this.#clientSecrets.set(clientId, clientSecret);
+        return json({
+          client_id: clientId,
+          redirect_uris: body.redirect_uris ?? [],
+          token_endpoint_auth_method: requestedMethod,
+          client_secret: clientSecret,
+          grant_types: body.grant_types ?? ["authorization_code"],
+          client_name: body.client_name ?? "unknown",
+        });
+      }
       return json({
-        client_id: `client-${this.state.registerCalls}`,
+        client_id: clientId,
         redirect_uris: body.redirect_uris ?? [],
         token_endpoint_auth_method: "none",
         grant_types: body.grant_types ?? ["authorization_code"],
@@ -233,6 +283,27 @@ class StubOAuthMcp {
       const params = new URLSearchParams(await req.text());
       const grantType = params.get("grant_type") ?? "";
       this.state.tokenGrantTypes.push(grantType);
+      // Issue #257: recover HOW the caller authenticated, mirroring the SDK
+      // (client_secret_basic → Basic header; client_secret_post → form
+      // client_secret; public → client_id alone). A confidential server
+      // only accepts valid confidential credentials.
+      const basicHeader = req.headers.get("authorization") ?? "";
+      let clientId = "";
+      let clientSecret = "";
+      if (basicHeader.startsWith("Basic ")) {
+        const decoded = Buffer.from(basicHeader.slice(6), "base64").toString("utf8");
+        const separator = decoded.indexOf(":");
+        clientId = separator === -1 ? decoded : decoded.slice(0, separator);
+        clientSecret = separator === -1 ? "" : decoded.slice(separator + 1);
+        this.state.clientAuthMethodsUsed.push("client_secret_basic");
+      } else {
+        clientId = params.get("client_id") ?? "";
+        clientSecret = params.get("client_secret") ?? "";
+        this.state.clientAuthMethodsUsed.push(clientSecret !== "" ? "client_secret_post" : "none");
+      }
+      if (this.confidential && (clientSecret === "" || this.#clientSecrets.get(clientId) !== clientSecret)) {
+        return json({ error: "invalid_client" }, 401);
+      }
       if (grantType === "authorization_code") {
         this.state.codeExchanges += 1;
         const entry = this.#codes.get(params.get("code") ?? "");
@@ -265,6 +336,8 @@ class StubOAuthMcp {
       }
       if (grantType === "refresh_token") {
         this.state.refreshCalls += 1;
+        // Issue #257: every refresh dies (the probe-fail leg).
+        if (this.deadRefresh) return json({ error: "invalid_grant" }, 400);
         const refresh = params.get("refresh_token") ?? "";
         const clientId = this.#refreshTokens.get(refresh);
         if (clientId === undefined) return json({ error: "invalid_grant" }, 400);
@@ -284,17 +357,36 @@ class StubOAuthMcp {
   }
 }
 
-/** A fake vault token store: records saves, serves scripted loads. */
+/**
+ * A fake vault token store: identity-keys saved rows by provider, mirroring
+ * the production `upsertAuthCredentialForProvider` — a re-save KEEPS the
+ * same row id. This matters for issue #257: the connect-time mint probe's
+ * rotation write-back saves the row a SECOND time, and the registry
+ * reference must still point at the same (stable) row id. Loads honor a
+ * scripted `loadResult` override: `undefined` (default) reads the saved
+ * row, `null` scripts a genuinely missing row, an `OAuthCredential` scripts
+ * a specific credential (expired/stripped/etc.).
+ */
 class FakeVaultStore implements McpOAuthTokenStore {
   saves: Array<{ provider: string; credential: OAuthCredential; brokerCredentialId: number }> = [];
-  loadResult: OAuthCredential | null = null;
+  #rows = new Map<string, OAuthCredential>();
+  #rowIds = new Map<string, number>();
+  #nextId = 901;
+  loadResult: OAuthCredential | null | undefined = undefined;
   async save(provider: string, credential: OAuthCredential): Promise<{ brokerCredentialId: number }> {
-    const brokerCredentialId = 900 + this.saves.length + 1; // first save → 901
-    this.saves.push({ provider, credential, brokerCredentialId });
-    return { brokerCredentialId };
+    this.#rows.set(provider, credential);
+    let rowId = this.#rowIds.get(provider);
+    if (rowId === undefined) {
+      rowId = this.#nextId;
+      this.#nextId += 1;
+      this.#rowIds.set(provider, rowId);
+    }
+    this.saves.push({ provider, credential, brokerCredentialId: rowId });
+    return { brokerCredentialId: rowId };
   }
-  async load(): Promise<OAuthCredential | null> {
-    return this.loadResult;
+  async load(provider: string): Promise<OAuthCredential | null> {
+    if (this.loadResult !== undefined) return this.loadResult;
+    return this.#rows.get(provider) ?? null;
   }
 }
 
@@ -428,13 +520,18 @@ describe("full connect round trip — mint → browser → callback → vault + 
         expect(done.status).toBe(200);
         expect(await done.text()).toContain("connected");
 
-        // The token landed in the vault through the fake store (one save).
-        expect(vault.saves).toHaveLength(1);
+        // The token landed in the vault through the fake store. TWO writes:
+        // the code-exchange row, then the issue #257 connect-time mint probe
+        // (one refresh_token round-trip) which rotates the SAME identity-key
+        // row to its latest token.
+        expect(vault.saves).toHaveLength(2);
         expect(vault.saves[0]!.provider).toBe("fixture.oauthmcp");
         expect(vault.saves[0]!.credential.access).toBeTruthy();
         expect(vault.saves[0]!.credential.refresh).toBeTruthy();
+        expect(vault.saves[1]!.provider).toBe("fixture.oauthmcp");
+        expect(vault.saves[1]!.credential.refresh).toMatch(/^refresh-rotated-/);
         expect(stub.state.codeExchanges).toBe(1);
-        expect(stub.state.tokenGrantTypes).toEqual(["authorization_code"]);
+        expect(stub.state.tokenGrantTypes).toEqual(["authorization_code", "refresh_token"]);
 
         // The registry row (personal, deterministic identity) + audit landed.
         const rows = await store.listExtensionCredentials("fixture.oauthmcp");
@@ -716,31 +813,235 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
         expect(stub.state.registeredScopes[0]!.split(" ")).toContain("offline_access");
 
         // (b) The stored credential carries a REAL, non-empty refresh token.
-        const saved = vault.saves[0];
+        // `saved` is the POST-probe row (the connect-time mint probe already
+        // refreshed + rotated once), whose token is the one the runtime
+        // mint must present next.
+        const saved = vault.saves[vault.saves.length - 1];
         expect(saved).toBeTruthy();
         if (!saved) return;
-        expect(saved.credential.refresh).toMatch(/^refresh-/);
+        expect(saved.credential.refresh).toMatch(/^refresh-rotated-/);
         expect(saved.credential.refresh).not.toBe("");
         expect(saved.credential.access).toMatch(/^access-/);
 
-        // (c) The registry row points AT the saved row, so the runtime mint
+        // (c) The registry row points AT the saved row (same identity-key
+        // row id across exchange + probe saves), so the runtime mint
         // resolves it and refreshes through the SDK.
         const rows = await store.listExtensionCredentials("fixture.oauthmcp");
         expect(rows).toHaveLength(1);
         expect(rows[0]!.broker_credential_id).toBe(saved.brokerCredentialId);
 
         vault.loadResult = { ...saved.credential, access: "access-stale", expires: Date.now() - 60_000 };
-        const provider = createRuntimeMcpOAuthProvider({
+        const provider = await createRuntimeMcpOAuthProvider({
           credential: { ...rows[0], id: "ec_test" },
           tokenStore: vault,
         });
         const result = await auth(provider, { serverUrl: stub.mcpUrl });
         expect(result).toBe("AUTHORIZED");
-        expect(stub.state.refreshCalls).toBe(1);
+        // Probe refresh + this runtime refresh — each presented the LATEST
+        // rotated token (never a dead one).
+        expect(stub.state.refreshCalls).toBe(2);
         expect(stub.state.lastRefreshTokenUsed).toBe(saved.credential.refresh);
         const rotation = vault.saves[vault.saves.length - 1]!;
         expect(rotation.credential.refresh).toMatch(/^refresh-rotated-/);
         expect(rotation.credential.access).not.toBe("access-stale");
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+});
+
+describe("issue #257 — OAuth credential durability for every MCP integration", () => {
+  test("confidential AS: the mint negotiates client_secret_basic, DCR issues a secret, and the exchange + probe send it via Basic auth", async () => {
+    const stub = new StubOAuthMcp();
+    stub.confidential = true;
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        // (a) The connect NEGOTIATED a confidential method (not "none") and
+        // the DCR request asked for it — so the server issued a secret.
+        expect(stub.state.registeredAuthMethods).toEqual(["client_secret_basic"]);
+        expect(stub.state.confidentialClients).toBe(1);
+
+        // (b) Browser authorize → callback exchange + connect-time probe
+        // BOTH authenticate with valid confidential credentials via Basic
+        // (the persisted method) — never a public (`none`) call.
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+        expect(stub.state.codeExchanges).toBe(1);
+        expect(stub.state.clientAuthMethodsUsed).toEqual(["client_secret_basic", "client_secret_basic"]);
+
+        // (c) The vault row carries the confidential client identity
+        // (client_id + client_secret + negotiated method) — not just the
+        // tokens — and the probe's refresh rotated it to the latest token.
+        const latest = vault.saves[vault.saves.length - 1]!;
+        expect(latest.credential).toMatchObject({
+          client_id: "client-1",
+          client_secret: "secret-1",
+          token_endpoint_auth_method: "client_secret_basic",
+        });
+        expect(latest.credential.refresh).toMatch(/^refresh-rotated-/);
+
+        // The registry row points at the SAME identity-key row (stable 901)
+        // despite the second (probe) save.
+        const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.broker_credential_id).toBe(901);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("connect-time mint probe: a server whose refresh is DEAD fails the connect closed with 'exchange was rejected', saving nothing beyond the exchange row", async () => {
+    const stub = new StubOAuthMcp();
+    stub.deadRefresh = true; // the exchange succeeds, but every refresh dies
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(500);
+        const errorBody = await done.text();
+        expect(errorBody).toContain("authorization exchange was rejected");
+        expect(errorBody).toContain("cannot mint an access token");
+
+        // Exactly ONE vault save — the exchange row itself. The probe's
+        // failed refresh never persisted, and NOTHING else (no registry
+        // row, no audit) was written: the connect failed closed.
+        expect(vault.saves).toHaveLength(1);
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+        expect(await store.listAudit({ event_type: EXTENSION_CONNECTED_EVENT })).toHaveLength(0);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("rotation-on (Gate): a rotating server survives 3 runtime refresh cycles, each presenting the LATEST rotated token — never a dead one — and the vault row tracks the rotation", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+
+        const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+        const provider = await createRuntimeMcpOAuthProvider({
+          credential: { ...rows[0], id: "ec_test" },
+          tokenStore: vault,
+        });
+
+        // The post-probe row is where runtime minting starts from.
+        const refreshBefore = [vault.saves[vault.saves.length - 1]!];
+        for (let i = 0; i < 3; i++) {
+          const result = await auth(provider, { serverUrl: stub.mcpUrl });
+          expect(result).toBe("AUTHORIZED");
+          // Each cycle MUST present the latest rotated token: the stub 400s
+          // any rotated-away token as invalid_grant (which rejects the mint),
+          // so a dead-token cycle could never reach AUTHORIZED.
+          expect(stub.state.lastRefreshTokenUsed).toBe(refreshBefore[refreshBefore.length - 1]!.credential.refresh);
+          refreshBefore.push(vault.saves[vault.saves.length - 1]!);
+        }
+
+        // 1 probe refresh + 3 runtime refreshes, and the vault wrote a
+        // distinct NEW token on every save — no dead-token reuse.
+        expect(stub.state.refreshCalls).toBe(4);
+        expect(stub.state.tokenGrantTypes.filter((grant) => grant === "refresh_token")).toHaveLength(4);
+        const refreshSeen = vault.saves.map((save) => save.credential.refresh);
+        expect(new Set(refreshSeen).size).toBe(refreshSeen.length);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("Gate — a confidential provider's env-free runtime mint: the vault's secret + method drive the refresh (no env vars); stripping the secret fails closed", async () => {
+    const stub = new StubOAuthMcp();
+    stub.confidential = true;
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+
+        const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+
+        // POSITIVE: the runtime provider reads ONLY the vault row — no
+        // process.env, no re-registration — and the refresh authenticates
+        // with the persisted secret via Basic auth.
+        const provider = await createRuntimeMcpOAuthProvider({
+          credential: { ...rows[0], id: "ec_test" },
+          tokenStore: vault,
+        });
+        const result = await auth(provider, { serverUrl: stub.mcpUrl });
+        expect(result).toBe("AUTHORIZED");
+        expect(stub.state.clientAuthMethodsUsed.at(-1)).toBe("client_secret_basic");
+        const mintedRow = vault.saves[vault.saves.length - 1]!;
+        expect(mintedRow.credential).toMatchObject({ token_endpoint_auth_method: "client_secret_basic" });
+
+        // NEGATIVE: a confidential client that LOSES its secret can no
+        // longer authenticate on /token → the runtime mint must FAIL CLOSED
+        // (invalid_client), never silently degrade to a public client.
+        const stripped = { ...mintedRow.credential, client_secret: "", token_endpoint_auth_method: "none" };
+        vault.loadResult = stripped;
+        const publicProvider = await createRuntimeMcpOAuthProvider({
+          credential: { ...rows[0], id: "ec_test" },
+          tokenStore: vault,
+        });
+        await expect(auth(publicProvider, { serverUrl: stub.mcpUrl })).rejects.toMatchObject({ name: "InvalidClientError" });
+        // The failed mint persisted nothing.
+        expect(vault.saves.length).toBe(3);
+        expect(vault.saves[2]!.credential.refresh).toMatch(/^refresh-rotated-/);
       } finally {
         callback.stop();
       }
@@ -765,7 +1066,9 @@ describe("token refresh — the runtime provider (issue #198)", () => {
       const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
       const done = await fetch(authorize.headers.get("location")!);
       expect(done.status).toBe(200);
-      const saved = vault.saves[0];
+      // The POST-probe row: the connect-time mint probe already refreshed +
+      // rotated once, so the runtime must start from the LATEST vault row.
+      const saved = vault.saves[vault.saves.length - 1];
       if (!saved) throw new Error("no vault save");
       return saved.credential;
     } finally {
@@ -782,7 +1085,7 @@ describe("token refresh — the runtime provider (issue #198)", () => {
       // Expire the grant: the access token is stale and the refresh token is
       // the REAL one the stub issued (locally stored, not a broker sentinel).
       vault.loadResult = { ...real, access: "access-stale", expires: Date.now() - 60_000 };
-      const provider = createRuntimeMcpOAuthProvider({
+      const provider = await createRuntimeMcpOAuthProvider({
         credential: {
           id: "ec_test",
           provider: "fixture.oauthmcp",
@@ -798,7 +1101,9 @@ describe("token refresh — the runtime provider (issue #198)", () => {
       const result = await auth(provider, { serverUrl: stub.mcpUrl });
 
       expect(result).toBe("AUTHORIZED");
-      expect(stub.state.refreshCalls).toBe(1);
+      // The connect-time probe already refreshed once; THIS is the runtime
+      // refresh, presenting the post-probe (latest rotated) token.
+      expect(stub.state.refreshCalls).toBe(2);
       expect(stub.state.lastRefreshTokenUsed).toBe(real.refresh);
       // The rotated tokens were persisted back into the vault.
       const rotation = vault.saves[vault.saves.length - 1]!;
@@ -817,7 +1122,7 @@ describe("token refresh — the runtime provider (issue #198)", () => {
     try {
       const vault = new FakeVaultStore();
       vault.loadResult = null;
-      const provider = createRuntimeMcpOAuthProvider({
+      const provider = await createRuntimeMcpOAuthProvider({
         credential: {
           id: "ec_test",
           provider: "fixture.oauthmcp",
@@ -838,7 +1143,7 @@ describe("token refresh — the runtime provider (issue #198)", () => {
   });
 
   test("the broker's refresh sentinel is dropped — the SDK never POSTs it", async () => {
-    const provider = createRuntimeMcpOAuthProvider({
+    const provider = await createRuntimeMcpOAuthProvider({
       credential: {
         id: "ec_test",
         provider: "fixture.oauthmcp",
@@ -965,7 +1270,9 @@ describe("completeMcpOAuthFlow — direct unit path", () => {
 
       const completed = await completeMcpOAuthFlow(row.row, code, { store, audit: createAudit(store), tokenStore: vault });
       expect(completed.brokerCredentialId).toBe(901);
-      expect(vault.saves).toHaveLength(1);
+      // Exchange write + the issue #257 connect-time mint probe's rotation
+      // write-back, both on the SAME identity-key row (stable id 901).
+      expect(vault.saves).toHaveLength(2);
       const rows = await store.listExtensionCredentials("fixture.oauthmcp");
       expect(rows[0]!.broker_credential_id).toBe(901);
     } finally {

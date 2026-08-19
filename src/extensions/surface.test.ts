@@ -17,6 +17,7 @@ import {
   resetToolSurfaceCache,
   resolveExtensionSurfaces,
   toolOwnerExtensionId,
+  type ExtensionSurfaces,
 } from "./surface";
 
 const BINDING: McpBinding = { serverUrl: "https://mcp.example.test/mcp", transport: "streamable-http" };
@@ -277,6 +278,48 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
     expect(surfaces.get("reachable.one")?.map((tool) => tool.name)).toEqual(["reachable.one.get_ok"]);
     expect(surfaces.has("unreachable.two")).toBe(false);
     expect(surfaces.size).toBe(1);
+  });
+
+  test("boot fails open on the provider, but LOUDLY names a CONNECTED-but-dead provider; never-connected providers keep the silent skip (issue #257)", async () => {
+    const registry = createExtensionRegistry();
+    registry.register(toolsLessManifest({ id: "connected.dead" }));
+    registry.register(toolsLessManifest({ id: "never.connected" }));
+
+    const bootLines: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      bootLines.push(args.map(String).join(" "));
+    };
+    let surfaces: ExtensionSurfaces;
+    try {
+      surfaces = await resolveExtensionSurfaces(registry.list(), {
+        mcpTransport: () => {
+          throw new Error("tools/list connection refused");
+        },
+        // The composition root's store probe: connected = has a credential row.
+        isConnected: async (providerId) => providerId === "connected.dead",
+      });
+    } finally {
+      console.error = originalError;
+    }
+
+    // Neither surface resolved and boot did NOT throw (issue #166).
+    expect(surfaces.size).toBe(0);
+
+    // Connected-but-dead: the LOUD fail-closed warning, naming the provider
+    // and the recovery action — never a silent skip.
+    const loud = bootLines.find((line) => line.includes("CONNECTED provider"));
+    expect(loud).toContain('"connected.dead"');
+    expect(loud).toContain("has a saved credential but can no longer mint");
+    expect(loud).toContain('Re-run "connect connected.dead"');
+    expect(loud).toContain("every call to it stays fail-closed");
+
+    // Never-connected (no credential row): the pre-existing SILENT skip with
+    // lazy per-call resolution — unchanged by issue #257.
+    const silent = bootLines.find((line) => line.includes('skipping "never.connected"'));
+    expect(silent).toBeTruthy();
+    expect(silent).toContain("resolves it lazily per call");
+    expect(bootLines.some((line) => line.includes("CONNECTED provider") && line.includes("never.connected"))).toBe(false);
   });
 });
 

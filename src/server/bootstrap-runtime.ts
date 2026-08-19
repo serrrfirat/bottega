@@ -90,6 +90,16 @@ export interface BootstrapRuntimeDeps {
   dbPath?: string;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (binding: McpBinding) => Transport;
+  /**
+   * Issue #257 boot connectedness probe: given an extension id, is it
+   * CONNECTED (a valid vault credential row exists)? Used by the surface
+   * resolution to decide whether a boot-time discovery failure is the
+   * LOUD fail-closed warning (connected provider that can no longer mint)
+   * or the silent skip (never connected). Defaults to "≥1 credential row
+   * for the provider" via the store — checked only for a provider whose
+   * boot discovery just failed, so it costs nothing on the happy path.
+   */
+  isConnected?: (providerId: string) => boolean | Promise<boolean>;
 }
 
 /** The shared chain every composition root boots (issue #172). */
@@ -128,10 +138,14 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // manifest tools, or the provider's tools/list for tools-less manifests
   // (a per-provider failure is skipped — the runtime's lazy per-call path
   // fails closed instead of the boot dying).
-  const surfaces = await resolveExtensionSurfaces(
-    registry.list(),
-    deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {},
-  );
+  const surfaces = await resolveExtensionSurfaces(registry.list(), {
+    ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {}),
+    // Issue #257: a boot discovery failure on a provider that HAS a
+    // credential row is a loud fail-closed warning, never the silent skip.
+    isConnected:
+      deps.isConnected ??
+      (async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0),
+  });
   // Credential boundary (issues #53/#123/#190): the resolver is the
   // deployment's configured secrets backend (issue #190) — omp-broker by
   // default (the #54/#143 behavior, byte-identical), 1password-connect
