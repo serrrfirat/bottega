@@ -76,6 +76,18 @@ function registryWith(serverUrl: string): ExtensionRegistry {
   return registry;
 }
 
+/** The hosted OAuth MCP manifest WITHOUT manifest-declared scopes (Notion's real shape, issue #262 evidence). */
+function oauthMcpManifestNoScopes(serverUrl: string): ExtensionManifest {
+  return { ...oauthMcpManifest(serverUrl), credentialSchema: { type: "oauth" } };
+}
+
+/** A registry holding a bespoke manifest (issue #262 scope-composition variants). */
+function registryWithManifest(manifest: ExtensionManifest): ExtensionRegistry {
+  const registry = createExtensionRegistry();
+  registry.register(manifest);
+  return registry;
+}
+
 function json(body: JsonValue, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -152,6 +164,20 @@ class StubOAuthMcp {
    * (issue #256 variant B).
    */
   grantRefresh = true;
+  /**
+   * The `scopes_supported` the protected-resource metadata advertises.
+   * "default" is Notion MCP's placeholder — NOT a real authorizable scope —
+   * and the mint must never stack offline_access onto it (issue #262).
+   */
+  protectedResourceScopes: string[] = ["default"];
+  /**
+   * Set true to make the authorization-server metadata endpoint answer
+   * HTTP 500 — a TRANSIENT discovery failure, not a clean 404 — so the
+   * connect's pre-negotiation discovery REJECTS. The negotiation must log
+   * the degraded (no offline_access) connect loudly instead of silently
+   * returning scope undefined (issue #262 (d)).
+   */
+  negotiationDiscoveryFails = false;
 
   constructor() {
     this.server = Bun.serve({
@@ -200,10 +226,14 @@ class StubOAuthMcp {
     }
     if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
-      return json({ resource: this.mcpUrl, authorization_servers: [this.baseUrl], scopes_supported: ["default"], bearer_methods_supported: ["header"] });
+      return json({ resource: this.mcpUrl, authorization_servers: [this.baseUrl], scopes_supported: this.protectedResourceScopes, bearer_methods_supported: ["header"] });
     }
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
+      // Issue #262 (d): a transient discovery failure (HTTP 500, not a clean
+      // 404) makes the SDK's discovery REJECT — the negotiation must log the
+      // resulting no-offline_access connect loudly, never silently.
+      if (this.negotiationDiscoveryFails) return json({ error: "internal server error" }, 500);
       return json({
         issuer: this.baseUrl,
         authorization_endpoint: `${this.baseUrl}/authorize`,
@@ -848,6 +878,117 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
         callback.stop();
       }
     } finally {
+      stub.stop();
+    }
+  });
+});
+
+describe("issue #262 — placeholder-aware offline_access scope composition (Notion) + no silent discovery degradation", () => {
+  test("(a) a refresh-advertising AS with the placeholder scope [\"default\"] and NO manifest scopes requests offline_access ALONE — never \"default offline_access\"", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      // Notion's real shape (issue #262 evidence): the AS advertises the
+      // refresh_token grant + scopes_supported ["default"], and the manifest
+      // declares NO credentialSchema.scopes.
+      const deps = flowDeps(store, registryWithManifest(oauthMcpManifestNoScopes(stub.mcpUrl)), vault, "http://127.0.0.1:9");
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+
+      // The authorize URL must NOT carry "default offline_access" — the
+      // placeholder is never a real scope to stack onto. offline_access
+      // alone requests the refreshable grant with no bogus scope.
+      const scope = new URL(outcome.authorizationUrl).searchParams.get("scope") ?? "";
+      expect(scope).toBe("offline_access");
+      expect(scope.split(" ")).not.toContain("default");
+      // The DCR registration request carried the SAME composed scope.
+      expect(stub.state.registeredScopes).toEqual(["offline_access"]);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(b) a refresh-advertising AS with the placeholder [\"default\"] + REAL manifest scopes: the manifest wins over the placeholder", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const manifest: ExtensionManifest = { ...oauthMcpManifest(stub.mcpUrl), credentialSchema: { type: "oauth", scopes: ["documents:read"] } };
+      const deps = flowDeps(store, registryWithManifest(manifest), vault, "http://127.0.0.1:9");
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+
+      // The resource placeholder is ignored; the extension's REAL manifest
+      // scopes are the base offline_access stacks onto.
+      const scope = new URL(outcome.authorizationUrl).searchParams.get("scope") ?? "";
+      expect(scope).toBe("documents:read offline_access");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(c) a REAL resource scope base (non-placeholder) still composes offline_access unchanged — no regression", async () => {
+    const stub = new StubOAuthMcp();
+    stub.protectedResourceScopes = ["documents:read"]; // a genuinely advertised scope, not the "default" placeholder
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const deps = flowDeps(store, registryWithManifest(oauthMcpManifestNoScopes(stub.mcpUrl)), vault, "http://127.0.0.1:9");
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+
+      const scope = new URL(outcome.authorizationUrl).searchParams.get("scope") ?? "";
+      expect(scope).toBe("documents:read offline_access");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(d) negotiation discovery THROWS: the connect proceeds but the offline_access degradation is LOGGED LOUDLY — never a silent scope:undefined", async () => {
+    const stub = new StubOAuthMcp();
+    stub.negotiationDiscoveryFails = true; // AS metadata answers HTTP 500 → discovery rejects
+    const errorLines: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errorLines.push(args.map(String).join(" "));
+      originalError(...args);
+    };
+    try {
+      const store = freshStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), new FakeVaultStore(), "http://127.0.0.1:9");
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+
+      // The connect proceeded past the negotiation and failed closed in
+      // auth() — as before — so the offline_access/auth-method degradation
+      // must have been VISIBLE in the log with the underlying cause.
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.message).toContain("failed");
+      const loud = errorLines.find((line) => line.includes("negotiation discovery failed"));
+      expect(loud).toBeTruthy();
+      expect(loud!).toContain(stub.baseUrl);
+      expect(loud!).toContain("500");
+    } finally {
+      console.error = originalError;
       stub.stop();
     }
   });

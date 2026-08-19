@@ -345,6 +345,14 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     this.#tokens = tokens;
+    // Issue #262 instrumentation: whether the exchange/refresh response
+    // carried a refresh_token — end-to-end evidence for the next live connect.
+    // OFF by default (DEBUG is the ambient Node convention, no new env flags).
+    if (process.env.DEBUG !== undefined) {
+      console.debug(
+        `[mcp-oauth] saveTokens provider=${this.#opts.tokenTarget.provider} refresh_token=${tokens.refresh_token ? "present" : "absent"}`,
+      );
+    }
     const previous =
       this.#opts.tokenTarget.brokerCredentialId === undefined
         ? null
@@ -450,18 +458,19 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
 }
 
 /**
- * The connect's negotiated server contract (issue #256 + issue #257):
- * SEP-835 resolves the OAuth scope as: auth() `scope` option → WWW-Authenticate
- * scope → the resource's advertised `scopes_supported` → client metadata
- * `scope`. The resource advertisement lists only the RESOURCE's own scopes
- * (the hosted MCP advertises e.g. "default") — it NEVER lists the OIDC
- * "offline_access" scope, without which the authorization server issues
- * NO refresh token, and every later proxy mint fails with "oauth_token
- * failed to mint". So the mint decides on the AUTHORIZATION SERVER's grant
- * signal: when it advertises the `refresh_token` grant, append
- * `offline_access` to the requested scope (the DCR registration request
- * and the authorization URL both carry it); otherwise keep the SDK's
- * resolution untouched (e.g. client-credentials servers have no consent).
+ * The connect's negotiated server contract (issue #256 + issue #257 +
+ * issue #262): SEP-835 resolves the OAuth scope as: auth() `scope` option →
+ * WWW-Authenticate scope → the resource's advertised `scopes_supported` →
+ * client metadata `scope`. The resource advertisement lists only the
+ * RESOURCE's own scopes (the hosted MCP advertises e.g. "default") — it
+ * NEVER lists the OIDC "offline_access" scope, without which the
+ * authorization server issues NO refresh token, and every later proxy mint
+ * fails with "oauth_token failed to mint". So the mint decides on the
+ * AUTHORIZATION SERVER's grant signal: when it advertises the
+ * `refresh_token` grant, append `offline_access` to the requested scope
+ * (the DCR registration request and the authorization URL both carry it);
+ * otherwise keep the SDK's resolution untouched (e.g. client-credentials
+ * servers have no consent).
  *
  * Issue #257 additionally negotiates the TOKEN-ENDPOINT AUTH METHOD from
  * `token_endpoint_auth_methods_supported`: prefer `client_secret_basic`
@@ -470,6 +479,17 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
  * flows into the DCR metadata, so confidential-capable AS issue a
  * client_secret and every later refresh re-sends it per the persisted
  * method.
+ *
+ * Issue #262 makes the scope BASE placeholder-aware. Notion MCP advertises
+ * `scopes_supported: ["default"]` — a PLACEHOLDER that is not a real
+ * authorizable scope. Stacking `offline_access` onto it
+ * ("default offline_access") made the AS issue an access-only token (no
+ * refresh), failing the connect closed at the exchange. So a placeholder or
+ * absent resource scope is discarded, and the extension's REAL manifest
+ * scopes (credentialSchema.scopes) win; only when no real base exists at
+ * all is `offline_access` requested alone. A transient discovery failure
+ * that would silently degrade a refresh-advertising server to a
+ * non-refreshable grant is logged loudly instead (never silent).
  *
  * This costs an extra discovery round trip on the connect path (not hot);
  * in exchange no provider/state plumbing is needed and every server that
@@ -482,9 +502,18 @@ async function connectServerNegotiation(
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
-  } catch {
-    // auth() below re-discovers and surfaces its own failure message (the
-    // connect already fails closed there); don't double-fail here.
+  } catch (err) {
+    // Issue #262 (no-silent-degradation): a refresh-advertising server that
+    // TRANSIENTLY fails this pre-negotiation discovery must not silently
+    // degrade to a non-refreshable grant request + public-client auth —
+    // exactly the invariant #256/#257 protect. Log the cause loudly; still
+    // proceed non-blocking, because auth() re-discovers and fails closed
+    // there with a clear connect error if the server is truly unreachable.
+    console.error(
+      `[mcp-oauth] connect negotiation discovery failed for ${serverUrl}: ${errorMessage(err)} — ` +
+        "proceeding without offline_access and without a negotiated token-endpoint auth method; " +
+        "the connect will fail closed in auth() if the server is unreachable",
+    );
     return { scope: undefined, tokenEndpointAuthMethod: "none" };
   }
   const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
@@ -497,7 +526,21 @@ async function connectServerNegotiation(
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
   if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod };
-  const base = info.resourceMetadata?.scopes_supported?.join(" ") ?? clientScopes?.join(" ");
+  // Issue #262: choose the scope BASE without ever building it out of the
+  // "default" placeholder Notion (and similar AS) advertise in
+  // `scopes_supported`. A placeholder/absent resource scope is discarded in
+  // favor of the extension's REAL manifest scopes; only when no real base
+  // exists is `offline_access` requested ALONE.
+  const resourceScopes = info.resourceMetadata?.scopes_supported;
+  const isPlaceholderScope =
+    resourceScopes === undefined ||
+    resourceScopes.length === 0 ||
+    (resourceScopes.length === 1 && resourceScopes[0] === "default");
+  const base =
+    (resourceScopes !== undefined && !isPlaceholderScope
+      ? resourceScopes.join(" ")
+      : undefined) ??
+    (clientScopes !== undefined && clientScopes.length > 0 ? clientScopes.join(" ") : undefined);
   const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
   return { scope, tokenEndpointAuthMethod };
 }
@@ -537,6 +580,12 @@ export async function startMcpOAuthFlow(
   // AS). auth()'s own discovery succeeds from the SAME metadata, so this
   // is one extra round trip on the connect path, not a divergence.
   const negotiation = await connectServerNegotiation(serverUrl, manifest.credentialSchema.scopes);
+  // Issue #262 instrumentation: when DEBUG is set, emit the composed authorize
+  // scope + server for end-to-end connect evidence on the next live run. OFF
+  // by default — no new env flags (DEBUG is the ambient Node convention).
+  if (process.env.DEBUG !== undefined) {
+    console.debug(`[mcp-oauth] connect ${manifest.id}: composed authorize scope=${negotiation.scope ?? "<none>"} server=${serverUrl}`);
+  }
   let authorizationUrl: URL | undefined;
   const provider = new BottegaMcpOAuthProvider({
     redirectUrl: redirectUri,
