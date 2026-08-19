@@ -597,7 +597,16 @@ export class SpaceService {
   async #handleConnectIntent(msg: SlackMessage, intent: ConnectIntent, deps: ConnectExtensionDeps): Promise<void> {
     this.#presenterFor(msg.spaceId).onConnectIntent(msg);
     const outcome = await connectExtension(
-      { extension: intent.extension, scope: intent.scope, actor: msg.principal, spaceId: msg.spaceId },
+      {
+        extension: intent.extension,
+        scope: intent.scope,
+        actor: msg.principal,
+        spaceId: msg.spaceId,
+        // Issue #255: the connect-intent seam reaches the broker seam (the
+        // issue #66 hermetic contract); the tool/direct surfaces keep #247's
+        // key-less redirect instead.
+        fromIntent: true,
+      },
       deps,
     );
     await this.#adapter.postMessage(msg.spaceId, outcome.message, this.#presenterFor(msg.spaceId).replyOpts());

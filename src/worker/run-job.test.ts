@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runExecutor, type ExecutorDeps } from "../executor";
 import { jobEgressDomains, hostFromBaseUrl, BASE_EGRESS_DOMAINS } from "../egress/generate";
 import type { IngestEvent, Poller } from "../ingest/types";
@@ -172,11 +172,24 @@ describe("ingest_poll split: worker fetches, server dispatch+post stays in-proce
     };
 
     await store.enqueueJob({ id: "poll_1", kind: "ingest_poll", payload: { provider: "github" }, spaceId: space.id });
+    // Fail-closed boot guard (executor.resolveConfig): a mode-0600 git PAT
+    // FILE must exist — never env/image. data/secrets/github-pat is a local
+    // dev artifact that CI runners don't have, so this hermetic seam test
+    // provisions its own PAT in the temp dir and points the executor at it.
+    // The guard still runs (the file must exist and be 0600); the test just
+    // stops depending on ambient repo secrets.
+    const patFile = join(dir, "secrets", "github-pat");
+    mkdirSync(dirname(patFile), { recursive: true });
+    writeFileSync(patFile, "ghp_local_test_pat", { mode: 0o600 });
+    const prevTokenEnv = process.env.EXECUTOR_GIT_TOKEN_FILE;
+    process.env.EXECUTOR_GIT_TOKEN_FILE = patFile;
     const ac = new AbortController();
     const run = runExecutor(deps, ac.signal);
     try {
       await waitFor(() => jobStatus(store, "poll_1").then((s) => s === "completed"));
     } finally {
+      if (prevTokenEnv === undefined) delete process.env.EXECUTOR_GIT_TOKEN_FILE;
+      else process.env.EXECUTOR_GIT_TOKEN_FILE = prevTokenEnv;
       ac.abort();
       await run.catch(() => {});
     }

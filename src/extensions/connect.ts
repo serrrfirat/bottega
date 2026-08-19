@@ -203,6 +203,19 @@ export async function connectExtension(
      * browser seam opted in.
      */
     fromUpload?: boolean;
+    /**
+     * Slack connect-intent seam (issue #66/#255): true ONLY when the
+     * connect is driven by the space-service connect intent (a chat
+     * "connect <ext>" message). The hermetic seam contract pins that the
+     * intent INVOKES the broker seam (issue #66 journey 3); #247's
+     * redirect-before-broker shortcut exists for the tool/direct surfaces
+     * that never carry a key, and the intent seam skips it — the broker is
+     * the oracle there (issue #255). Every tool/MCP/direct caller omits
+     * this, so #247's no-key redirect is unchanged for those surfaces. The
+     * paste guard above still applies: an intent connect never carries an
+     * api_key, so no value can leak into a transcript on this path.
+     */
+    fromIntent?: boolean;
   },
   deps: ConnectExtensionDeps,
 ): Promise<ConnectOutcome> {
@@ -301,7 +314,8 @@ export async function connectExtension(
     if (
       resolved.manifest.credentialSchema.type === "api_key" &&
       input.apiKey === undefined &&
-      !input.fromUpload
+      !input.fromUpload &&
+      !input.fromIntent
     ) {
       return {
         ok: false,
@@ -344,10 +358,15 @@ export async function connectExtension(
   // construction. An existing personal/org credential row means the
   // provider is ALREADY connected — the honest reply names the replace
   // path — and otherwise the #196 one-time upload link is the next step.
+  // The Slack connect-intent seam (input.fromIntent, issue #66/#255) skips
+  // this shortcut: the hermetic seam contract pins that the intent reaches
+  // the broker, which is the real oracle there (see the broker catch
+  // below for the key-required redirect).
   if (
     manifest.credentialSchema.type === "api_key" &&
     input.apiKey === undefined &&
-    !input.fromUpload
+    !input.fromUpload &&
+    !input.fromIntent
   ) {
     let existing: ExtensionCredential[];
     try {
@@ -414,6 +433,40 @@ export async function connectExtension(
   try {
     brokerResult = await deps.broker({ provider, credentialType: manifest.credentialSchema.type, apiKey: input.apiKey });
   } catch (err) {
+    // Issue #255: the connect-intent seam reaches the broker even key-less
+    // (issue #66 pins the seam invokes the broker; the hermetic broker
+    // accepts a key-less connect and the connect proceeds). A REAL broker
+    // refuses with "needs its API key" — do not echo that bare throw to
+    // chat: the honest #196 one-time upload link (or the replace path when
+    // already connected) is the next step, exactly as #247 established for
+    // the tool/direct surfaces that skip straight here.
+    if (
+      input.fromIntent &&
+      manifest.credentialSchema.type === "api_key" &&
+      input.apiKey === undefined &&
+      errorMessage(err).includes("needs its API key")
+    ) {
+      let existing: ExtensionCredential[];
+      try {
+        existing = await deps.store.listExtensionCredentials(provider);
+      } catch {
+        existing = [];
+      }
+      const target = existing.find((row) =>
+        input.scope === "personal"
+          ? row.scope === "personal" && row.owner === input.actor
+          : row.scope === "org",
+      );
+      const who = input.scope === "org" ? "as an organization" : `for @${input.actor}`;
+      const replacePath =
+        "use connect_upload_link for a one-time browser upload, or re-run connect with the key — never paste a live key in chat";
+      return {
+        ok: false,
+        message: target
+          ? `${label} is already connected ${who} — to replace the key, ${replacePath}.`
+          : `connect ${label} now: ${replacePath}.`,
+      };
+    }
     return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
   }
 

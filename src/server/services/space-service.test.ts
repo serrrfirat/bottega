@@ -2136,7 +2136,7 @@ describe("SpaceService connect intent (issue #61)", () => {
     rows: ExtensionCredential[];
   }
 
-  function makeConnectHarness(opts: { router?: ApprovalRouter } = {}): ConnectHarness {
+  function makeConnectHarness(opts: { router?: ApprovalRouter; keyRequiredBroker?: boolean } = {}): ConnectHarness {
     const { adapter, posts } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
@@ -2177,19 +2177,27 @@ describe("SpaceService connect intent (issue #61)", () => {
         },
         listAudit: async () => [],
       },
-      broker: async (input) => {
-        brokerCalls.push(input);
-        return { identityKey: null, brokerCredentialId: 9 };
-      },
       gate: {
         loadPolicy: () => Promise.resolve(parseOrgConfigYaml("tools:\n  connect_extension: allow\n")),
         router: opts.router ?? DenyRouter,
       },
+      broker: opts.keyRequiredBroker
+        ? async (input) => {
+            // Model the real broker (src/extensions/connect.ts): an api_key
+            // connect with no key refuses with the "needs its API key"
+            // error. brokerCalls still records the seam invocation.
+            brokerCalls.push(input);
+            throw new Error(`connect ${input.provider} needs its API key (api_key extensions require the key)`);
+          }
+        : async (input) => {
+            brokerCalls.push(input);
+            return { identityKey: null, brokerCredentialId: 9 };
+          },
     };
     return { deps, adapter, posts, store, driver, brokerCalls, audit, rows };
   }
 
-  test("connect <ext> as me for an api_key extension with no stored key posts the one-time upload pointer (issue #247)", async () => {
+  test("connect <ext> as me connects for the sender with no agent turn", async () => {
     const h = makeConnectHarness();
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
@@ -2197,41 +2205,57 @@ describe("SpaceService connect intent (issue #61)", () => {
 
     // No session, no agent tool call: the capability answered directly.
     expect(h.driver.created).toHaveLength(0);
-    const text = h.posts[0]!.text;
-    // The chat intent carries no key (and pasted keys are refused), so the
-    // honest answer is the #196 one-time upload link — never the broker's
-    // bare "needs its API key" throw.
-    expect(text).toContain("connect_upload_link");
-    expect(text).not.toContain("needs its API key");
-    expect(h.brokerCalls).toHaveLength(0);
-    expect(h.rows).toHaveLength(0);
+    // The connect-intent seam reaches the broker (issue #66/#255): the
+    // key-less intent calls the broker, which is the oracle.
+    expect(h.posts).toEqual([
+      { spaceId: "slack:C1", text: "Fixture Weather connected as @U1", opts: { threadTs: "2.2" } },
+    ]);
+    expect(h.brokerCalls).toEqual([{ provider: "fixture.weather", credentialType: "api_key" }]);
+    expect(h.rows).toHaveLength(1);
+    expect(h.rows[0]!.scope).toBe("personal");
+    expect(h.rows[0]!.owner).toBe("U1");
+    expect(h.rows[0]!.broker_credential_id).toBe(9);
+
+    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
+    expect(connected).toMatchObject({
+      space_id: "slack:C1",
+      actor: "U1",
+      payload: { extension: "fixture.weather", scope: "personal", owner: "U1" },
+    });
     // Personal connects are unprivileged: no policy decision row.
     expect(h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT)).toHaveLength(0);
   });
 
-  test("bare connect <ext> defaults to the sender's personal account — an existing personal row yields the already-connected pointer", async () => {
+  test("bare connect <ext> defaults to the sender's personal account", async () => {
     const h = makeConnectHarness();
-    // Seed @U2's own personal credential (as a past explicit-key connect would).
-    h.rows.push({
-      id: "cred_u2",
-      provider: "fixture.weather",
-      identity_key: "api-key:U2",
-      owner: "U2",
-      scope: "personal",
-      broker_credential_id: 9,
-      created_at: 0,
-    });
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "Connect fixture.weather", principal: "U2", ts: "3.3" }));
 
     expect(h.driver.created).toHaveLength(0);
-    // The bare connect defaulted to the sender's PERSONAL account: the
-    // match landed on @U2's personal row, so no new upload is needed.
-    expect(h.posts[0]!.text).toContain("already connected");
-    expect(h.posts[0]!.text).toContain("@U2");
-    expect(h.posts[0]!.text).toContain("connect_upload_link");
-    expect(h.brokerCalls).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("Fixture Weather connected as @U2");
+    expect(h.rows).toHaveLength(1);
+    expect(h.rows[0]!.scope).toBe("personal");
+    expect(h.rows[0]!.owner).toBe("U2");
+  });
+
+  test("intent api_key connect with no key still reaches the broker; a key-requiring broker yields the upload-link pointer (issue #255)", async () => {
+    const h = makeConnectHarness({ keyRequiredBroker: true });
+    const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
+
+    await service.handleInboundMessage(msg({ text: "connect fixture.weather as me", ts: "4.4" }));
+
+    // The seam invoked the broker (the oracle) even though no key was
+    // carried; nothing was written before it was consulted.
+    expect(h.brokerCalls).toHaveLength(1);
+    expect(h.brokerCalls[0]!.apiKey).toBeUndefined();
+    expect(h.rows).toHaveLength(0);
+    // A real broker refuses a key-less api_key connect; the reply must be
+    // the #196 one-time upload pointer, never the bare "needs its API key".
+    const text = h.posts[0]!.text;
+    expect(text).toContain("connect_upload_link");
+    expect(text).not.toContain("needs its API key");
+    expect(h.posts[0]!.opts).toEqual({ threadTs: "4.4" });
   });
 
   test("connect <ext> as org crosses the gate; denied without approval", async () => {
@@ -2249,25 +2273,23 @@ describe("SpaceService connect intent (issue #61)", () => {
     expect(decisions[0]!.payload).toMatchObject({ tool: "connect_extension", decision: "ask-human" });
   });
 
-  test("connect <ext> as org with an approving router gates first, then points an api_key extension at the upload link", async () => {
+  test("connect <ext> as org with an approving router connects the org account", async () => {
     const h = makeConnectHarness({ router: new RecordingRouter() });
     const service = makeSpaceService({ store: h.store, adapter: h.adapter, driver: h.driver, connect: h.deps });
 
     await service.handleInboundMessage(msg({ text: "connect fixture.weather as org" }));
 
     expect(h.driver.created).toHaveLength(0);
-    const text = h.posts[0]!.text;
-    // The org policy gate RAN before the pointer (its decision is recorded).
+    // The org policy gate RAN before the connects org account (decision row).
     const decisions = h.audit.filter((e) => e.event_type === POLICY_DECISION_EVENT);
     expect(decisions).toHaveLength(1);
     expect(decisions[0]!.payload).toMatchObject({ tool: "connect_extension" });
-    // No org api_key credential exists, so the honest answer is the one-time
-    // upload link — never the broker's bare "needs its API key" throw.
-    expect(text).toContain("connect_upload_link");
-    expect(text).not.toContain("needs its API key");
-    expect(h.brokerCalls).toHaveLength(0);
-    expect(h.rows).toHaveLength(0);
-    expect(h.audit.filter((e) => e.event_type === EXTENSION_CONNECTED_EVENT)).toHaveLength(0);
+    expect(h.posts[0]!.text).toBe("Fixture Weather connected as an organization");
+    expect(h.rows).toHaveLength(1);
+    expect(h.rows[0]!.scope).toBe("org");
+    expect(h.rows[0]!.owner).toBeNull();
+    const connected = h.audit.find((e) => e.event_type === EXTENSION_CONNECTED_EVENT);
+    expect(connected!.payload).toMatchObject({ extension: "fixture.weather", scope: "org", owner: null });
   });
 
   test("unknown extensions post the failure without a session", async () => {
