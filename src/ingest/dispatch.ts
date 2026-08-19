@@ -74,10 +74,15 @@ const ingestEnvelopeSchema = z.object({
   payload: z.record(z.string(), z.unknown(), { error: "payload must be a JSON object" }),
 });
 
-type Validation = { ok: true } | { ok: false; reason: string };
+export type IngestValidation = { ok: true } | { ok: false; reason: string };
 
-/** Envelope + known-payload validation. Fail closed: any doubt → rejected. */
-function validateEvent(event: IngestEvent): Validation {
+/**
+ * Envelope + known-payload validation. Fail closed: any doubt → rejected.
+ * Exported (issue #101) so the worker's poll-fetch leg validates events
+ * DURING fetch — only validated events ever ride the outbox to the server,
+ * where dispatchIngestEvent re-validates per event as defense in depth.
+ */
+export function validateIngestEvent(event: IngestEvent): IngestValidation {
   const envelope = ingestEnvelopeSchema.safeParse(event);
   if (!envelope.success) {
     return { ok: false, reason: envelope.error.issues[0]?.message ?? "invalid ingest envelope" };
@@ -104,7 +109,7 @@ export async function dispatchIngestEvent(ctx: IngestDispatchContext, event: Ing
   const rejectedEvent = ctx.leg === "webhook" ? INGEST_WEBHOOK_REJECTED_EVENT : INGEST_POLL_REJECTED_EVENT;
   const actor = `ingest:${event.provider}`;
 
-  const validation = validateEvent(event);
+  const validation = validateIngestEvent(event);
   if (!validation.ok) {
     ctx.log?.(`[ingest:${ctx.leg}] rejected ${String(event.provider)}/${String(event.eventType)}: ${validation.reason}`);
     await ctx.audit.appendAudit({

@@ -34,7 +34,8 @@ import {
 } from "./store/audit-events";
 import { consumeOutboxWatermarked } from "./store/outbox";
 import type { OutboxRow } from "./store/outbox";
-import type { WorkerJob } from "./worker/envelope";
+import { workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { inProcessSandboxRunner, type SandboxRunner } from "./worker/run-job";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
@@ -1585,6 +1586,75 @@ describe("worker job envelope (epic #170)", () => {
       expect(JSON.parse(reviewNotify.payload)).toMatchObject({ state: "review", workItemId: item.id });
       // Consumed rows are never re-read: the watermark advanced past the row.
       expect(consumeOutboxWatermarked(fx.store, { watermark })).toEqual({ rows: [], watermark });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a git item completes THROUGH the per-job sandbox runner (issue #101)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "add a health check endpoint",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+
+      await runUntil(fx, item.id, "done", makeDeps(fx, { sandboxRunner: inProcessSandboxRunner() }));
+      await waitForJobStatus(fx.store, item.id, "completed");
+
+      // The per-job runner wrote the terminal lifecycle itself (issue #101):
+      // one completed audit from the child (no parent duplicate), and the
+      // outbox signal carries the delivery result keyed by the envelope id.
+      const completed = await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT });
+      expect(completed.map((row) => JSON.parse(row.payload))).toContainEqual(
+        expect.objectContaining({ id: item.id, kind: "git", state: "done" }),
+      );
+      const { rows } = consumeOutboxWatermarked(fx.store);
+      expect(rows.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
+      const completion = rows.find((r) => r.kind === "git")!;
+      expect(completion).toMatchObject({ id: item.id, kind: "git", space: space.id });
+      const payload = JSON.parse(completion.payload) as { state: string; result: { pr_url: string } };
+      expect(payload.state).toBe("done");
+      expect(payload.result.pr_url).toContain("/acme/sandbox/pull/1");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a sandbox crash fails the job loudly and unsticks the item (issue #101)", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do the thing",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+      // Models the child claiming its item, then the sandbox process dying:
+      // non-zero exit, no signal, no timeout → the boss loop must fail loud.
+      const crashed: SandboxRunner = async (job, ctx) => {
+        const parsed = workItemJobPayloadSchema.safeParse(job.payload);
+        if (parsed.data) await ctx.deps.store.claimWorkItemById(parsed.data.workItemId);
+        return { exitCode: 1, signal: null, timedOut: false };
+      };
+
+      await runUntil(fx, item.id, "blocked", makeDeps(fx, { sandboxRunner: crashed }));
+      await waitForJobStatus(fx.store, item.id, "failed");
+
+      // Fail-loud: the job.failed audit names the crash and the item is
+      // blocked — never stuck at claimed/working, never silently requeued.
+      const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+      expect(failed.map((row) => JSON.parse(row.payload))).toContainEqual(
+        expect.objectContaining({ id: item.id, kind: "git", sandbox_crash: true }),
+      );
+      expect((await fx.store.getWorkItem(item.id))?.state).toBe("blocked");
+      expect((await fx.store.getJob(item.id))?.attempts).toBe(1);
     } finally {
       fx.cleanup();
     }

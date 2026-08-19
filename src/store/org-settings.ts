@@ -23,6 +23,7 @@ import { EXTENSION_ID_RE } from "../extensions/manifest";
 import type { CredentialType } from "../extensions/manifest";
 import { isKnownTool } from "../policy/config";
 import type { OrgCredentialsMode, ResponseMode } from "../policy/config";
+import type { OrgJobCaps } from "../worker/caps";
 import { z } from "zod";
 
 export const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
@@ -96,6 +97,12 @@ export interface OrgSettings {
   repos?: string[];
   /** Model defaults (default/fast/reasoning + effort); consumed by models.yml generation (Part B). */
   models?: OrgModelsSettings;
+  /**
+   * Per-kind per-job resource caps (issue #101): override the documented
+   * worker defaults in src/worker/caps.ts. Consumed by the executor's
+   * sandbox supervisor.
+   */
+  caps?: OrgJobCaps;
   /** Workspace root for work-item checkouts; consumed by the executor (Part B). */
   workspacesDir?: string;
   /** Git base URL for clones/pushes; overrides config/org.yml (Part B). */
@@ -135,6 +142,13 @@ export interface OrgSettingsInput {
     org_credentials?: OrgCredentialsMode;
   };
   repos?: string[];
+  /** Per-kind per-job resource caps (issue #101): timeout_ms/memory_mb per kind. */
+  caps?: {
+    git?: { timeout_minutes?: number; memory_mb?: number };
+    extension?: { timeout_minutes?: number; memory_mb?: number };
+    kb?: { timeout_minutes?: number; memory_mb?: number };
+    ingest_poll?: { timeout_minutes?: number; memory_mb?: number };
+  };
   models?: {
     default?: string;
     fast?: string;
@@ -383,6 +397,56 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         }
       }
       if (sectionOk) out.extensions = parsed;
+    } else if (name === "caps") {
+      // Per-kind resource caps (issue #101): a nested section whose keys are
+      // kind names, each an optional {timeout_minutes, memory_mb}. Mirrors
+      // the approvals/memory.injection tail pattern (unknown knob fails the
+      // section, a malformed section fails the whole blob).
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
+        fail("caps must be an object");
+        continue;
+      }
+      const parsed: OrgJobCaps = {};
+      let sectionOk = true;
+      for (const [kind, raw] of Object.entries(section.data)) {
+        if (kind !== "git" && kind !== "extension" && kind !== "kb" && kind !== "ingest_poll") {
+          sectionOk = false;
+          fail(`caps.${kind}: unknown kind`);
+          continue;
+        }
+        const kindResult = jsonObjectSchema.safeParse(raw);
+        if (!kindResult.success) {
+          sectionOk = false;
+          fail(`caps.${kind} must be an object`);
+          continue;
+        }
+        const knob: NonNullable<OrgJobCaps[typeof kind]> = {};
+        for (const [key, rawKnob] of Object.entries(kindResult.data)) {
+          if (key === "timeout_minutes") {
+            const n = positiveInt(rawKnob);
+            if (n === undefined) {
+              sectionOk = false;
+              fail(`caps.${kind}.timeout_minutes must be a positive integer`);
+            } else {
+              knob.timeoutMinutes = n;
+            }
+          } else if (key === "memory_mb") {
+            const n = positiveInt(rawKnob);
+            if (n === undefined) {
+              sectionOk = false;
+              fail(`caps.${kind}.memory_mb must be a positive integer`);
+            } else {
+              knob.memoryMb = n;
+            }
+          } else {
+            sectionOk = false;
+            fail(`caps.${kind}.${key}: unknown key`);
+          }
+        }
+        parsed[kind] = knob;
+      }
+      if (sectionOk) out.caps = parsed;
     } else if (name === "repos") {
       const repos = repoList(value);
       if (repos === undefined) {

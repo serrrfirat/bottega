@@ -9,7 +9,7 @@
 import type { Poller, SignatureVerifier } from "./types";
 import { githubSignatureVerifier } from "./github/webhook";
 import { linearSignatureVerifier } from "./linear/webhook";
-import { createGithubPoller } from "./github/poller";
+import { createGithubPoller, type GithubPollerOpts } from "./github/poller";
 import { createLinearPoller } from "./linear/poller";
 
 /** The verifier for a provider's webhook signatures. Throws for unknown providers. */
@@ -29,6 +29,27 @@ export function getPoller(provider: string): Poller {
   switch (provider) {
     case "github":
       return createGithubPoller();
+    case "linear":
+      return createLinearPoller();
+    default:
+      throw new Error(`unknown ingest provider: ${provider}`);
+  }
+}
+
+/**
+ * The poller for a provider's polling leg, with a DURABLE cursor seam
+ * (issue #101): the worker's poll-fetch leg supplies the seam backed by the
+ * ingest_watermark table so restarts resume past the last processed event.
+ * Linear's poller is a no-op skeleton — it has no cursor semantics, so the
+ * seam is irrelevant there.
+ */
+export function getWatermarkedPoller(
+  provider: string,
+  watermark: Exclude<GithubPollerOpts["watermark"], undefined>,
+): Poller {
+  switch (provider) {
+    case "github":
+      return createGithubPoller({ watermark });
     case "linear":
       return createLinearPoller();
     default:

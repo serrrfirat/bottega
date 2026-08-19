@@ -196,7 +196,7 @@ END;
 -- restarts (one id threads enqueue → claim → run → outbox → post).
 CREATE TABLE IF NOT EXISTS outbox (
   id         TEXT PRIMARY KEY,              -- the job id (one id across the whole lifecycle)
-  kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item')),
+  kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item','ingest_poll')),
   payload    TEXT NOT NULL,                 -- JSON payload (never secrets; the worker has none)
   space      TEXT,                          -- space id the result belongs to (nullable)
   status     TEXT NOT NULL DEFAULT 'pending'
@@ -215,7 +215,7 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_a
 -- after its backoff elapses).
 CREATE TABLE IF NOT EXISTS worker_jobs (
   id          TEXT PRIMARY KEY,      -- envelope id ("wi_..." for git/extension)
-  kind        TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+  kind        TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','ingest_poll')),
   payload     TEXT NOT NULL,         -- JSON envelope payload
   space_id    TEXT,
   status      TEXT NOT NULL DEFAULT 'queued'
@@ -226,3 +226,12 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue ON worker_jobs(status, created_at);
+
+-- Durable per-provider ingest poll cursor (issue #101): the worker's
+-- fetch/validate leg persists the poll boundary here so a restart resumes
+-- after the last processed event instead of re-seeing the whole window.
+CREATE TABLE IF NOT EXISTS ingest_watermark (
+  provider   TEXT PRIMARY KEY,   -- 'github' | 'linear'
+  cursor     TEXT NOT NULL,      -- ms-epoch boundary string
+  updated_at INTEGER NOT NULL
+);

@@ -40,6 +40,19 @@ export interface GithubPollerOpts {
   fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
   /** Injectable clock (ms epoch) for hermetic tests. */
   now?: () => number;
+  /**
+   * Durable poll boundary (issue #101): when set, the poller seeds
+   * lastPolledAt from the persisted cursor at construction and persists the
+   * advanced boundary after every poll. This turns the in-memory
+   * boot-baseline into a restart-safe watermark — the worker's poll-fetch
+   * leg supplies this seam backed by the ingest_watermark table. Absent
+   * (the scheduler's in-process instance), the poller keeps its in-memory
+   * boot baseline exactly as before.
+   */
+  watermark?: {
+    getCursor(): string | null | Promise<string | null>;
+    setCursor(cursor: string): void | Promise<void>;
+  };
 }
 
 const GITHUB_API_HEADERS = {
@@ -103,8 +116,21 @@ export function createGithubPoller(opts: GithubPollerOpts = {}): Poller {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const now = opts.now ?? Date.now;
   // Boot-time baseline: mentions updated before construction are never
-  // replayed (mirrors the scheduler runner's no-catch-up boot policy).
+  // replayed (mirrors the scheduler runner's no-catch-up boot policy). With
+  // the durable watermark seam, the first poll resumes from the persisted
+  // cursor so a restart continues after the last processed event.
   let lastPolledAt = now();
+  let watermarkSeeded = false;
+
+  async function seedWatermark(): Promise<void> {
+    if (!opts.watermark || watermarkSeeded) return;
+    const cursor = await opts.watermark.getCursor();
+    if (cursor !== null && cursor !== "") {
+      const millis = Number(cursor);
+      if (!Number.isNaN(millis)) lastPolledAt = millis;
+    }
+    watermarkSeeded = true;
+  }
   let resolvedLogin: string | null = opts.login ?? null;
 
   function readToken(): string | null {
@@ -132,6 +158,7 @@ export function createGithubPoller(opts: GithubPollerOpts = {}): Poller {
   }
 
   async function poll(): Promise<IngestEvent[]> {
+    await seedWatermark();
     const token = readToken();
     if (token === null) return [];
     const login = await resolveLogin(token);
@@ -158,6 +185,7 @@ export function createGithubPoller(opts: GithubPollerOpts = {}): Poller {
       events.push(mentionEvent(item));
     }
     lastPolledAt = boundary;
+    await opts.watermark?.setCursor(String(boundary));
     return events;
   }
 

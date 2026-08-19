@@ -76,6 +76,63 @@ export function mergedEgressDomains(extensionDomains: readonly string[]): string
   return merged;
 }
 
+/** The job kinds the per-job egress allowlist configures (issue #101). */
+export type JobEgressKind = "git" | "extension" | "kb" | "ingest_poll";
+
+/** Per-kind egress allowlist inputs (issue #101). Everything is optional — unset means "no extra hosts". */
+export interface JobEgressDomainsOpts {
+  /** git: the clone/push repo host (the git_base_url's host, e.g. github.com). */
+  repoHost?: string;
+  /** git: the outbound tunnel/cloudflared host, when the env uses one. */
+  tunnelHost?: string;
+  /** extension: the connected extension's declared domains (its pinned manifest `domains`). */
+  extensionHosts?: readonly string[];
+  /** kb: hosts from config/kb.yml. */
+  kbHosts?: readonly string[];
+}
+
+/**
+ * The per-job egress allowlist subset (issue #101, epic #229 P1): the
+ * runner's iron-proxy allowlist is the intersection this function renders —
+ * the shared base model-gateway/github/slack domains PLUS the hosts the
+ * job's kind legitimately needs, default-deny everywhere else. P1 renders
+ * + exports the subset for the boss loop's egress config generation and
+ * for the caller-surface tests; per-process allowlist ENFORCEMENT on the
+ * child is P2/#229 hardening (the proxy already applies the generated
+ * config to the whole worker's egress).
+ */
+export function jobEgressDomains(kind: JobEgressKind, opts: JobEgressDomainsOpts = {}): string[] {
+  const merged: string[] = [...BASE_EGRESS_DOMAINS];
+  const add = (host: string | undefined): void => {
+    if (host !== undefined && host.trim() !== "" && !merged.includes(host)) merged.push(host.trim());
+  };
+  switch (kind) {
+    case "git":
+      add(opts.repoHost);
+      add(opts.tunnelHost);
+      break;
+    case "extension":
+      for (const host of opts.extensionHosts ?? []) add(host);
+      break;
+    case "kb":
+      for (const host of opts.kbHosts ?? []) add(host);
+      break;
+    case "ingest_poll":
+      // The provider endpoints are already base allowlisted (api.github.com).
+      break;
+  }
+  return merged;
+}
+
+/** A host extracted from a base URL ("https://github.com/org/repo" → "github.com"). */
+export function hostFromBaseUrl(baseUrl: string): string | undefined {
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
 /** One extension's credential-injection entry for the generated egress config (issue #53). */
 export interface ExtensionEgressEntry {
   extensionId: string;

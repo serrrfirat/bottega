@@ -45,6 +45,9 @@ import {
   type OutboxRow,
 } from "../../store/outbox";
 import type { SlackAdapter } from "../adapters/slack";
+import { dispatchIngestEvent } from "../../ingest/dispatch";
+import type { IngestEvent } from "../../ingest/types";
+import { createAudit } from "../../policy/audit";
 
 /** Post-seam pass interval. Default 5000 ms — the delivery poller's cadence. */
 export const DEFAULT_OUTBOX_POST_INTERVAL_MS = 5000;
@@ -100,6 +103,23 @@ const workItemNotificationSchema = z
     evidence: z.string().optional(),
   })
   .passthrough();
+
+/**
+ * The ingest_poll outcome payload (issue #101): the worker's split
+ * fetch/validate leg ships ONLY validated events in the result's `events`
+ * array; this seam re-validates per event (defense in depth) then dispatches
+ * in-process — dispatch + Slack post stay server-side (the server holds the
+ * Slack tokens).
+ */
+const ingestPollOutcomeSchema = z.object({
+  state: z.string().optional(),
+  result: z
+    .object({
+      provider: z.string(),
+      events: z.array(z.unknown()).default([]),
+    })
+    .optional(),
+});
 
 function parsePayload(raw: string): { state?: string; result?: unknown } | null {
   try {
@@ -241,6 +261,11 @@ async function postRow(
   now: (() => number) | undefined,
   log: (line: string) => void,
 ): Promise<boolean> {
+  if (row.kind === "ingest_poll") {
+    // Issue #101 split leg: fetch/validate ran in the worker; dispatch +
+    // post stay here (in-process, server holds the Slack tokens).
+    return postIngestPollRow(store, adapter, row, log);
+  }
   if (row.space === null || parseRowPayload(row) === null) {
     // Fail closed: a row with no target space or a malformed payload is
     // never posted and never retried — it is a worker contract violation.
@@ -281,6 +306,55 @@ async function postRow(
     actor: "server",
     event_type: OUTBOX_POSTED_EVENT,
     payload: JSON.stringify({ id: row.id, kind: row.kind, space: row.space }),
+  });
+  return true;
+}
+
+/**
+ * Posts one consumed ingest_poll row (issue #101): parse the worker's
+ * validated events, re-validate + dispatch each IN-PROCESS (the server
+ * holds the Slack tokens), audit `outbox.posted`. Malformed rows fail
+ * closed exactly like the generic branch (audited + terminal). A dispatch
+ * error per event propagates to the caller's retry path — the POST seam is
+ * the bounded-retry owner, exactly like the generic Slack post branch.
+ */
+async function postIngestPollRow(
+  store: Store,
+  adapter: Pick<SlackAdapter, "postMessage">,
+  row: OutboxRow,
+  log: (line: string) => void,
+): Promise<boolean> {
+  if (row.space === null) {
+    const attempts = row.attempts + 1;
+    await auditFailed(store, row, "ingest_poll outbox row has no target space", attempts);
+    failOutboxRow(store, row.id, { attempts });
+    log(`outbox post seam: ingest_poll row ${row.id} failed closed (no space)`);
+    return false;
+  }
+  const parsed = ingestPollOutcomeSchema.safeParse(parsePayload(row.payload));
+  if (!parsed.success) {
+    const attempts = row.attempts + 1;
+    await auditFailed(store, row, "malformed ingest_poll outbox payload", attempts);
+    failOutboxRow(store, row.id, { attempts });
+    log(`outbox post seam: ingest_poll row ${row.id} failed closed (malformed payload)`);
+    return false;
+  }
+  const audit = createAudit(store);
+  const events = (parsed.data.result?.events ?? []) as IngestEvent[];
+  for (const event of events) {
+    // Defense in depth: dispatchIngestEvent re-validates every event and
+    // audits any rejection — nothing unvalidated ever reaches a work item
+    // or a Slack post.
+    await dispatchIngestEvent(
+      { store, audit, postMessage: adapter.postMessage, leg: "poll", spaceId: row.space, log },
+      event,
+    );
+  }
+  await store.appendAudit({
+    space_id: row.space,
+    actor: "server",
+    event_type: OUTBOX_POSTED_EVENT,
+    payload: JSON.stringify({ id: row.id, kind: row.kind, space: row.space, events: events.length }),
   });
   return true;
 }

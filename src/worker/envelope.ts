@@ -13,7 +13,7 @@
 import { z } from "zod";
 
 /** The containerized job kinds the worker claim loop routes. */
-export const WORKER_JOB_KINDS = ["git", "extension", "kb", "scheduled"] as const;
+export const WORKER_JOB_KINDS = ["git", "extension", "kb", "scheduled", "ingest_poll"] as const;
 export type WorkerJobKind = (typeof WORKER_JOB_KINDS)[number];
 
 /** Job-bus lifecycle states (the `worker_jobs.status` column). */
@@ -54,3 +54,11 @@ export const kbJobPayloadSchema = z.object({ url: z.string() }).passthrough();
 
 /** The scheduled envelope payload (future dispatchers, Wave 2+). */
 export const scheduledJobPayloadSchema = z.object({ action: z.string() }).passthrough();
+
+/**
+ * The ingest_poll envelope payload (issue #101): the polling leg split —
+ * the scheduler action dispatches one job per provider, and the worker does
+ * the fetch + validate. Parsed strictly (only the provider key is
+ * meaningful) so a malformed dispatch fails closed like every other kind.
+ */
+export const ingestPollJobPayloadSchema = z.object({ provider: z.string().min(1) }).passthrough();

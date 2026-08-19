@@ -153,6 +153,13 @@ export interface BootSecretSeedOpts {
    * Keychain.
    */
   readKeychain?: (service: string) => Promise<string | null>;
+  /**
+   * Env names to leave untouched by the seed (issue #101): the per-job
+   * sandbox child must never receive the Slack/webhook secrets, so its
+   * boot skips the providers that seed them (SLACK_APP_TOKEN,
+   * SLACK_BOT_TOKEN, GITHUB_WEBHOOK_SECRET).
+   */
+  skipEnvNames?: readonly string[];
   /** Boot log sink; defaults to console.log. */
   log?: (line: string) => void;
 }
@@ -171,6 +178,7 @@ export async function seedBootSecretsFromVault(opts: BootSecretSeedOpts = {}): P
   const vault = await fetchVault();
   for (const secret of BOOT_SECRETS) {
     if (secret.seedAtBoot === false) continue;
+    if (opts.skipEnvNames?.includes(secret.envName)) continue;
     // 1. Vault (the source of truth): beats env/Keychain when a row exists.
     const fromVault = vault.get(secret.vaultProvider);
     if (fromVault !== undefined && fromVault !== "") {

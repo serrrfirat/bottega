@@ -305,6 +305,14 @@ export interface Store {
   getJob(id: string): Promise<WorkerJob | null>;
   /** Requeues a running job with a backoff not-before gate; false when the job is not running. */
   requeueJob(id: string, backoffMs: number): Promise<boolean>;
+  /**
+   * Renews a RUNNING job's lease to `leaseUntilMs` (issue #101: the sandbox
+   * supervisor keeps its child's lease alive while the job is healthy).
+   * False when the job is no longer running — the lease-reclaim race, i.e.
+   * another worker already swept and re-claimed it — so the renewer stops
+   * believing it owns the job.
+   */
+  renewJobLease(id: string, leaseUntilMs: number): Promise<boolean>;
   /** Marks a running job completed (the outbox row is the completion signal); false when not running. */
   completeJob(id: string): Promise<boolean>;
   /** Marks a queued/running job failed (max attempts or the unclaimed TTL); false when already terminal. */
@@ -433,6 +441,10 @@ export interface Store {
   setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
+  /** The durable ingest poll cursor for a provider (issue #101); null when never persisted. */
+  getIngestWatermark(provider: string): Promise<string | null>;
+  /** Persists the ingest poll boundary for a provider (issue #101). */
+  setIngestWatermark(provider: string, cursor: string): Promise<void>;
   /** The underlying Database handle — memory providers share this file (#20). */
   getDb(): Database;
   close(): void;
@@ -690,24 +702,24 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     db.exec("ALTER TABLE work_items ADD COLUMN assignee TEXT");
     db.exec("UPDATE work_items SET assignee = requester WHERE assignee IS NULL");
   }
-  // Idempotent migration (issue #159): the outbox CHECK gained the
-  // 'work_item' notification kind (blocked/review landings). SQLite cannot
-  // ALTER a CHECK constraint, so rebuild the table when its definition
-  // predates the kind; fresh databases get the widened CHECK from
-  // schema.sql directly. The rebuild preserves every row (the rename keeps
-  // the old table's data until the copy completes).
+  // Idempotent migration (issues #159/#101): the outbox CHECK gained the
+  // 'work_item' notification kind and then the 'ingest_poll' kind. SQLite
+  // cannot ALTER a CHECK constraint, so rebuild the table when its
+  // definition predates the latest kind; fresh databases get the widened
+  // CHECK from schema.sql directly. The rebuild preserves every row (the
+  // rename keeps the old table's data until the copy completes).
   // SAFETY: sqlite_master.sql always exists for tables; a missing row (no
   // outbox yet) skips the rebuild entirely.
   const outboxSql =
     (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as
       | { sql: string }
       | null)?.sql ?? "";
-  if (!outboxSql.includes("'work_item'")) {
+  if (!outboxSql.includes("'ingest_poll'")) {
     db.exec(`
       ALTER TABLE outbox RENAME TO outbox_old;
       CREATE TABLE outbox (
         id         TEXT PRIMARY KEY,
-        kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item')),
+        kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item','ingest_poll')),
         payload    TEXT NOT NULL,
         space      TEXT,
         status     TEXT NOT NULL DEFAULT 'pending'
@@ -719,6 +731,36 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       INSERT INTO outbox SELECT id, kind, payload, space, status, attempts, created_at, posted_at FROM outbox_old;
       DROP TABLE outbox_old;
       CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
+    `);
+  }
+  // Idempotent migration (issue #101): the worker_jobs CHECK gained the
+  // 'ingest_poll' kind the poll-fetch leg enqueues. Same SQLite rebuild
+  // pattern as the outbox table above; fresh databases get the widened
+  // CHECK from schema.sql directly.
+  // SAFETY: sqlite_master.sql always exists for tables; a missing row (no
+  // worker_jobs yet) skips the rebuild entirely.
+  const workerJobsSql =
+    (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_jobs'").get() as
+      | { sql: string }
+      | null)?.sql ?? "";
+  if (!workerJobsSql.includes("'ingest_poll'")) {
+    db.exec(`
+      ALTER TABLE worker_jobs RENAME TO worker_jobs_old;
+      CREATE TABLE worker_jobs (
+        id          TEXT PRIMARY KEY,
+        kind        TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','ingest_poll')),
+        payload     TEXT NOT NULL,
+        space_id    TEXT,
+        status      TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued','running','completed','failed')),
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        lease_until INTEGER,
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+      INSERT INTO worker_jobs SELECT id, kind, payload, space_id, status, attempts, lease_until, created_at, updated_at FROM worker_jobs_old;
+      DROP TABLE worker_jobs_old;
+      CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue ON worker_jobs(status, created_at);
     `);
   }
   // Idempotent migration (issue #64): databases created before the model
@@ -988,6 +1030,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
          WHERE id = ? AND status = 'running'`,
       )
       .run(now + backoffMs, now, id);
+    return Number(res.changes) === 1;
+  }
+
+  async function renewJobLease(id: string, leaseUntilMs: number): Promise<boolean> {
+    // SAFETY: run() reports changed rows; 1 only while the job is still
+    // running (a swept/re-claimed job returns 0 → the renewer stops
+    // believing it owns the job).
+    const res = db
+      .query(
+        `UPDATE worker_jobs SET lease_until = ?, updated_at = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(leaseUntilMs, Date.now(), id);
     return Number(res.changes) === 1;
   }
 
@@ -1457,6 +1512,22 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return Number(res.lastInsertRowid);
   }
 
+  async function getIngestWatermark(provider: string): Promise<string | null> {
+    // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
+    const row = db.query("SELECT cursor FROM ingest_watermark WHERE provider = ?").get(provider) as
+      | { cursor: string }
+      | null
+      | undefined;
+    return row ? row.cursor : null;
+  }
+
+  async function setIngestWatermark(provider: string, cursor: string): Promise<void> {
+    db.query(
+      `INSERT INTO ingest_watermark (provider, cursor, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(provider) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
+    ).run(provider, cursor, Date.now());
+  }
+
   async function listAudit(opts: ListAuditOpts = {}): Promise<AuditRow[]> {
     const clauses: string[] = [];
     const params: (string | number)[] = [];
@@ -1524,6 +1595,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     claimNextJob,
     getJob,
     requeueJob,
+    renewJobLease,
     completeJob,
     failJob,
     markUnclaimedJobs,
@@ -1550,6 +1622,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     setSchedulerJobEnabled,
     appendAudit,
     listAudit,
+    getIngestWatermark,
+    setIngestWatermark,
     getDb: () => db,
     close: () => db.close(),
   };

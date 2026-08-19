@@ -63,7 +63,10 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
-import { kbJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { runJobInSandbox, type SandboxRunner } from "./worker/run-job";
+import type { Poller } from "./ingest/types";
+import { getWatermarkedPoller } from "./ingest/registry";
 import { createAudit } from "./policy/audit";
 import { loadKbConfig } from "./kb/config";
 import { ingestSource } from "./kb/ingest";
@@ -222,6 +225,25 @@ export interface ExecutorDeps {
    * job.unclaimed rows.
    */
   onUnclaimed?: (job: WorkerJob) => void | Promise<void>;
+  /**
+   * Per-job sandbox isolation (issue #101): when present, git/extension
+   * jobs run through this runner instead of the in-process delivery path.
+   * The runner re-derives the job's scope from the envelope id, drives the
+   * whole job through the job-scoped store facade, and returns the exit
+   * code contract (0 = completed, 2 = self-failed, 3 = transient requeue;
+   * anything else is a crash → the supervisor fails the job loudly +
+   * unsticks the work item). Absent → today's in-process runWorkItemJob
+   * path (legacy tests and runner-less deployments).
+   */
+  sandboxRunner?: SandboxRunner;
+  /** SQLite database path for a sandbox child process (production wiring; unused while the runner stays in-process). */
+  dbPath?: string;
+  /**
+   * Poller factories for the ingest_poll job kind (issue #101): one per
+   * provider key, each returning a fresh poller. Defaults to the live
+   * registry with a durable ingest watermark. Tests inject fakes.
+   */
+  ingestPollers?: Record<string, () => Poller>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -361,7 +383,7 @@ export async function bootExecutorRuntime(opts: {
   };
   return { runtime, getExtensionWorkerToolset, getDriver };
 }
-interface ExecutorConfig {
+export interface ExecutorConfig {
   /** Authorization fence (issue #47): the only owner/repo pairs the executor may clone/push to. */
   repoAllowlist: string[];
   gitBaseUrl: string;
@@ -478,6 +500,13 @@ async function processJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJo
     console.log(`[${job.id}] job attempt ${job.attempts} failed (${job.kind}): ${message} — requeued in ${backoffMs} ms`);
     return;
   }
+  if (outcome.selfReported) {
+    // Issue #101: the sandbox already wrote the job's terminal lifecycle
+    // (completeJob + its own outbox row + audit) through the scoped
+    // facade — completing again would double the outbox signal.
+    console.log(`[${job.id}] sandbox self-reported ${outcome.state} (${job.kind})`);
+    return;
+  }
   await deps.store.completeJob(job.id);
   // The worker→server signal (epic #170): one outbox row per completed job,
   // keyed by the SAME envelope id so the server's watermarked consumer can
@@ -498,9 +527,15 @@ async function processJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJo
 }
 
 /** What a job's run produced: the terminal state + the delivery result (if any). */
-interface JobRunOutcome {
+export interface JobRunOutcome {
   state: string;
   result: unknown;
+  /**
+   * Issue #101: set when the sandbox wrote the job's terminal lifecycle
+   * itself (completeJob + per-job outbox row + audit through the scoped
+   * facade) — the parent must NOT duplicate the bookkeeping.
+   */
+  selfReported?: boolean;
 }
 
 /**
@@ -517,9 +552,17 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
   switch (job.kind) {
     case "git":
     case "extension":
+      // Issue #101: with a sandbox runner wired, git/extension jobs execute
+      // in an isolated per-job scope (one job's rows, its own caps); without
+      // one, the legacy in-process delivery path runs unchanged.
+      if (deps.sandboxRunner) {
+        return runJobInSandbox(deps, cfg, job, deps.sandboxRunner);
+      }
       return runWorkItemJob(deps, cfg, job);
     case "kb":
       return runKbJob(deps, job);
+    case "ingest_poll":
+      return runIngestPollJob(deps, job);
     case "scheduled": {
       const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
       if (!parsed.success) {
@@ -528,6 +571,31 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
       throw new Error("scheduled job kind is not implemented yet (epic #170 Wave 2) — failing closed");
     }
   }
+}
+
+/**
+ * Runs an ingest_poll job (issue #101): the split fetch/validate leg of the
+ * scheduler's poll pipeline runs IN THE WORKER (mirrors the kb pattern) —
+ * fetch + validate over a watermarked poller, then hand the validated
+ * events to the outbox so the server's in-process seam does dispatch + post
+ * (the server holds the Slack tokens). The durable watermark rides the job
+ * envelope's space and is persisted via the store's ingest_watermark rows
+ * (getIngestWatermark/setIngestWatermark), so a crash re-polls from the
+ * last boundary instead of re-fetching the world.
+ */
+async function runIngestPollJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
+  const parsed = ingestPollJobPayloadSchema.safeParse(job.payload);
+  if (!parsed.success) {
+    throw new Error(`job ${job.id} (ingest_poll) payload must be { provider } — failing closed: ${parsed.error.message}`);
+  }
+  const provider = parsed.data.provider;
+  const watermark = {
+    getCursor: () => deps.store.getIngestWatermark(provider),
+    setCursor: (cursor: string) => deps.store.setIngestWatermark(provider, cursor),
+  };
+  const factory = deps.ingestPollers?.[provider] ?? (() => getWatermarkedPoller(provider, watermark));
+  const events = await factory().poll();
+  return { state: "completed", result: { provider, events } };
 }
 
 /**
@@ -614,7 +682,7 @@ function safeParseJson(text: string | null): JsonValue {
  * that outcome). Throws only when the item cannot start (still ours but
  * stuck) so the job bus can requeue.
  */
-async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkItem): Promise<WorkItem> {
+export async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item: WorkItem): Promise<WorkItem> {
   try {
     await deps.store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
   } catch (err) {
@@ -1210,7 +1278,7 @@ function loadRepoAllowlist(dir: string) {
   return { repos: repos.filter((r) => /^[^/]+\/[^/]+$/.test(r)), gitBaseUrl };
 }
 
-function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
+export function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   // Issue #67: runtime knobs live in the org settings blob (DB is the
   // source of truth); config/org.yml is the default/fallback, parsed only
   // when settings do NOT cover the keys it provides (repos or git base) —

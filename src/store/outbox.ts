@@ -25,7 +25,7 @@ import type { Store } from "./db";
  * executor writes when an item lands in blocked/review, posted by the
  * server seam like any other row.
  */
-export type OutboxKind = "git" | "extension" | "kb" | "scheduled" | "work_item";
+export type OutboxKind = "git" | "extension" | "kb" | "scheduled" | "work_item" | "ingest_poll";
 
 /** A row's lifecycle state; mirrors the outbox.status CHECK. */
 export type OutboxStatus = "pending" | "posted" | "failed";
@@ -69,7 +69,7 @@ export const DEFAULT_OUTBOX_BATCH_SIZE = 50;
  */
 export const DEFAULT_UNCLAIMED_TTL_MS = 5 * 60 * 1000;
 
-const OUTBOX_KINDS: readonly OutboxKind[] = ["git", "extension", "kb", "scheduled", "work_item"];
+const OUTBOX_KINDS: readonly OutboxKind[] = ["git", "extension", "kb", "scheduled", "work_item", "ingest_poll"];
 
 /**
  * Worker-side writer (epic #170): records one completed job for the server
