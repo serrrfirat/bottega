@@ -84,7 +84,7 @@ import type { ExtensionRegistry } from "../../src/extensions/registry";
 import type { ExtensionManifest, McpBinding } from "../../src/extensions/manifest";
 import { pollPendingDeliveries } from "../../src/server/services/delivery-poller";
 import { resolveDeliveryAction } from "../../src/server/adapters/delivery-router";
-import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
+import { APPROVAL_OUTCOME_PREFIX, SlackApprovalRouter } from "../../src/server/adapters/approval-router";
 import { DELIVERY_APPROVE_ACTION_ID, APPROVE_ACTION_ID } from "../../src/server/adapters/slack";
 import {
   startUploadLinkServer,
@@ -428,9 +428,6 @@ export const canaryBroker: BrokerConnector = async () => ({
   identityKey: null,
   brokerCredentialId: CANARY_BROKER_CREDENTIAL_ID,
 });
-
-/** The approval-outcome line posted by the Slack approval router once a request settles (issue #44). */
-const APPROVAL_OUTCOME_PREFIX = "Approval resolved";
 
 /**
  * The deployable model id the space's default should pin to (issue #189):

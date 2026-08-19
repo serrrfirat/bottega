@@ -50,7 +50,7 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } f
 import { createSecretFileBoundary } from "../../src/extensions/boundary";
 import { pollPendingDeliveries } from "../../src/server/services/delivery-poller";
 import { resolveDeliveryAction } from "../../src/server/adapters/delivery-router";
-import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
+import { APPROVAL_OUTCOME_PREFIX, SlackApprovalRouter } from "../../src/server/adapters/approval-router";
 import { DELIVERY_APPROVE_ACTION_ID, APPROVE_ACTION_ID } from "../../src/server/adapters/slack";
 import { evaluatePolicyGate } from "../../src/policy/gate";
 import { startUploadLinkServer, mintUploadLink } from "../../src/extensions/upload-link";
@@ -703,6 +703,49 @@ describe("org-settings approval journey mechanism (issue #151)", () => {
     expect(resolution).toEqual({ approved: true, approver: "U-owner" });
     expect(updated.length).toBe(1);
     expect(updated[0]!.text).toContain("Approved by <@U-owner>");
+  });
+
+  test("the settled outcome text satisfies the journey's APPROVAL_OUTCOME_PREFIX rewrite predicate (issue #242)", async () => {
+    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    const router = new SlackApprovalRouter({
+      adapter: {
+        postMessage: async (spaceId, text, opts) => {
+          posted.push({ spaceId, text, blocks: opts?.blocks });
+          return "1.000003";
+        },
+        updateMessage: async (spaceId, ts, text) => {
+          updated.push({ spaceId, ts, text });
+        },
+      },
+      timeoutMs: 60_000,
+    });
+    const pending = router.request({
+      tool: "model_settings",
+      args: { set: { reasoning_effort: "low" } },
+      reason: "write-tier",
+      spaceId: "slack:C1",
+      actor: "U-owner",
+    });
+    const value = approvalButtonValue({
+      ts: "1.000003",
+      text: "",
+      blocks: posted[0]!.blocks,
+    });
+    expect(value).toBeDefined();
+    await router.handleAction({
+      actionId: APPROVE_ACTION_ID,
+      value: value!,
+      spaceId: "slack:C1",
+      principal: "U-owner",
+      messageTs: "1.000003",
+    });
+    await expect(pending).resolves.toEqual({ approved: true, approver: "U-owner" });
+    // Issue #242: the rewritten message must satisfy the journey's own rewrite
+    // predicate (canary.ts:1382 waits on startsWith(APPROVAL_OUTCOME_PREFIX));
+    // the prefix is the router's mrkdwn form, exported as the single source of
+    // truth instead of a divergent copy in the canary.
+    expect(updated[0]!.text.startsWith(APPROVAL_OUTCOME_PREFIX)).toBe(true);
   });
 
   test("the policy gate round trip audits approval.requested → approval.resolved", async () => {

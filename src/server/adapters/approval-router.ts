@@ -112,10 +112,18 @@ export function buildApprovalBlocks(d: ApprovalRequest, id: string): unknown[] {
   ];
 }
 
+/**
+ * Mrkdwn prefix of the outcome line posted once a request settles (issue #44).
+ * Single source of truth (issue #242): the canary's rewrite predicate matches
+ * this exact prefix, so consumers import it instead of copying a divergent
+ * plain-text form.
+ */
+export const APPROVAL_OUTCOME_PREFIX = "*Approval resolved*";
+
 /** Outcome line replacing the prompt message once a request settles. */
 function outcomeText(entry: PendingRequest, r: ApprovalResolution, label: string): string {
   const verb = r.approved ? `Approved by <@${r.approver ?? "unknown"}>` : label;
-  return `*Approval resolved* — \`${entry.tool}\`: ${verb}.`;
+  return `${APPROVAL_OUTCOME_PREFIX} — \`${entry.tool}\`: ${verb}.`;
 }
 
 export class SlackApprovalRouter implements ApprovalRouter {
