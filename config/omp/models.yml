@@ -31,7 +31,7 @@ providers:
   # at egress.
   opencode-go:
     apiKey: bottega-proxy-placeholder
-  # Default model (issue #213): the NEAR AI Cloud gateway serves
+  # Default model (issue #213, re-pinned #266): the NEAR AI Cloud gateway serves
   # deepseek-ai/DeepSeek-V4-Flash WITHOUT reasoning_content (fast, verified
   # live) — GLM-5.1-FP8's verbose chain-of-thought was the latency problem
   # this swap fixes. opencode-go stays the preferred primary once its
@@ -54,8 +54,9 @@ providers:
   # (~/.codex/auth.json, CODEX_AUTH_PATH override — the filesystem
   # credential is seeded to the proxy at boot, src/extensions/proxy-seed).
   # The entry is deliberately KEY-ONLY, the opencode-go pattern: openai-codex
-  # is a BUILT-IN SDK catalog provider (gpt-5.6-luna — the default role,
-  # config.yml modelRoles.default — plus gpt-5.4/gpt-5.5/... ship there
+  # is a BUILT-IN SDK catalog provider (gpt-5.6-luna — a documented
+  # fallback, the default role moved to near/deepseek-ai/DeepSeek-V4-Flash
+  # (#266) — plus gpt-5.4/gpt-5.5/... ship there
   # with their transport metadata — api openai-codex-responses, baseUrl
   # https://chatgpt.com/backend-api, and the native wire contract the codex
   # backend demands: stream:true + store:false REQUIRED, max_output_tokens

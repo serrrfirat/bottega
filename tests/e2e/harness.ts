@@ -500,7 +500,7 @@ export type HarnessApprovalRouter = ApprovalRouter & {
 
 /** The canary model refs (issue #71): the deployment template's providers (config/omp/models.yml). */
 export const CANARY_MODEL_REFS = {
-  /** ChatGPT subscription Codex (issue #214): the CHEAP gpt-5.6-luna via the native openai-codex provider (chatgpt.com/backend-api/codex/responses; the default role, config.yml modelRoles.default). */
+  /** ChatGPT subscription Codex (issue #214): the CHEAP gpt-5.6-luna via the native openai-codex provider (chatgpt.com/backend-api/codex/responses; the codex fallback ref — the default role moved to near, #266). */
   codex: "openai-codex/gpt-5.6-luna",
   /** Preferred primary (issue #37): deepseek-v4-flash via the built-in opencode-go provider (quota-limited, #213). */
   opencode: "opencode-go/deepseek-v4-flash",

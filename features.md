@@ -73,7 +73,7 @@ unsupported settings or narrowing instead of pretending to apply them
 ## BYO Codex (ChatGPT subscription) — issue #214
 
 Bring your own **ChatGPT subscription** (Plus/Pro/Team) as a model provider:
-the `openai-codex` provider routes `gpt-5.6-luna` turns (the DEFAULT model role, config.yml modelRoles.default) to the ChatGPT Codex
+the `openai-codex` provider routes `gpt-5.6-luna` turns (an operator-selectable fallback — the default role moved to near/deepseek-ai/DeepSeek-V4-Flash, config.yml modelRoles.default, issue #266; operators re-pin `default:` to switch) to the ChatGPT Codex
 endpoint (`chatgpt.com/backend-api/codex/responses`) authenticated with the
 **Codex CLI's** subscription OAuth tokens — no OpenAI API key, no separate
 billing.

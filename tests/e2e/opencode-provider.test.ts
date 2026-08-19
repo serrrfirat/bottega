@@ -205,14 +205,14 @@ describe("deployment templates pin the opencode-go model (issue #78, layer 2)", 
     }
   });
 
-  test("config.yml pins the default model role to openai-codex/gpt-5.6-luna (issue #214)", () => {
+  test("config.yml pins the default model role to near/deepseek-ai/DeepSeek-V4-Flash (issue #213, re-pinned #266)", () => {
     const config = readFileSync(join(REPO_ROOT, "config/omp/config.yml"), "utf8");
     expect(config).toContain("modelRoles:");
-    expect(config).toContain("default: openai-codex/gpt-5.6-luna");
-    // near + opencode-go stay in the catalog as documented fallbacks; the
-    // key-only models.yml entries are untouched.
+    expect(config).toContain("default: near/deepseek-ai/DeepSeek-V4-Flash");
+    // openai-codex + opencode-go stay in the catalog as documented
+    // fallbacks; the key-only models.yml entries are untouched.
     expect(config).toContain("opencode-go");
-    expect(config).toContain("near/deepseek-ai/DeepSeek-V4-Flash");
+    expect(config).toContain("openai-codex/gpt-5.6-luna");
   });
 
   test("ensureAgentDirModelPin syncs the pin into a stale agent-dir config (issue #78 recurrence)", () => {
@@ -359,8 +359,8 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
     // SDK resolves the pinned model — and the resolved endpoint answers
     // with non-empty text on the text path. The committed template now
     // pins the NEAR default (#213); the opencode-go resolution below
-    // proves the preferred-primary path still resolves deepseek-v4-flash
-    // when the operator re-pins it (quota recovery).
+    // resolution below proves the preferred-primary path still resolves
+    // deepseek-v4-flash when the operator re-pins it (quota recovery).
     const skipReason = await liveSkipReason();
     if (skipReason !== undefined) {
       console.log(`[opencode live leg] SKIP: ${skipReason}`);
@@ -377,7 +377,7 @@ describeLive("opencode-go SDK resolution + gateway (issue #78, live)", () => {
       );
       expect(ensureAgentDirModelPin(agentDir)).toBe("patched");
       const patched = readFileSync(join(agentDir, "config.yml"), "utf8");
-      expect(patched).toContain("modelRoles:\n  default: openai-codex/gpt-5.6-luna");
+      expect(patched).toContain("modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash");
 
       process.env.OPENCODE_API_KEY ??= KEY;
       const registry = new ModelRegistry(await discoverAuthStorage(agentDir), modelsPath);
