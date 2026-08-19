@@ -707,6 +707,149 @@ export function registerActionHandler(
   });
 }
 
+/**
+ * Socket-mode connection watchdog (issue #237).
+ *
+ * Why this exists: @slack/socket-mode v3 computes its own reconnection
+ * backoff as `clientPingTimeout * consecutiveFailures`. This adapter pins
+ * `clientPingTimeout` to 24h (a Bun workaround — under Bun, Slack's Socket
+ * Mode server never pongs the client-ping monitor, so Bolt would kill a
+ * healthy connection ~7s after (re)connect unless the monitor is silenced
+ * with a huge timeout). The SDK's auto-reconnect would therefore wait ~24h
+ * after a drop — a full day of dead-silence on the Slack side. We disable
+ * the SDK's auto-reconnect (`autoReconnectEnabled: false`: every socket
+ * close then surfaces as a `disconnected` event) and drive reconnection
+ * ourselves with bounded exponential backoff, logging connect / reconnect /
+ * failure with attempt counts and elapsed time.
+ */
+
+/** First reconnect comes this soon after a drop (SDK default with the 24h ping timeout: ~24h). */
+export const SLACK_RECONNECT_BASE_DELAY_MS = 2_000;
+/** Reconnect attempts never space out beyond this. */
+export const SLACK_RECONNECT_MAX_DELAY_MS = 60_000;
+export const SLACK_RECONNECT_BACKOFF_MULTIPLIER = 2;
+/** A boot connect must reach `connected` within this or start() fails loud. */
+export const SLACK_BOOT_CONNECT_TIMEOUT_MS = 60_000;
+
+/** The socket-mode client surface the watchdog drives (real value: SocketModeReceiver#client). */
+export interface SocketModeClientLike {
+  on(event: string, listener: () => void): unknown;
+  start(): Promise<unknown>;
+}
+
+export interface ReconnectWatchdogTiming {
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  backoffMultiplier?: number;
+}
+
+/** connect: lifecycle-up INFO (console.log); failure: drop/retry ERROR (console.error). */
+export interface ReconnectWatchdogLog {
+  connect: (message: string) => void;
+  failure: (message: string) => void;
+}
+
+/**
+ * Watches a socket-mode client for drops and reconnects with bounded
+ * backoff. Backoff scale is injectable so regression tests run on
+ * millisecond timers. The returned `dispose()` must run from `stop()`
+ * BEFORE the SDK shut-down: it marks the watchdog dormant so the
+ * `disconnected` the SDK emits on a manual disconnect can never schedule a
+ * reconnect (a stopped adapter stays stopped).
+ */
+export function watchSocketModeReconnect(
+  client: SocketModeClientLike,
+  log: ReconnectWatchdogLog,
+  timing: ReconnectWatchdogTiming = {},
+): { dispose(): void } {
+  const baseDelayMs = timing.baseDelayMs ?? SLACK_RECONNECT_BASE_DELAY_MS;
+  const maxDelayMs = timing.maxDelayMs ?? SLACK_RECONNECT_MAX_DELAY_MS;
+  const multiplier = timing.backoffMultiplier ?? SLACK_RECONNECT_BACKOFF_MULTIPLIER;
+  let disposed = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  /** Reconnect attempts since the last successful connect (0 while healthy). */
+  let attempts = 0;
+  let connectedAt: number | undefined;
+  let lostAt: number | undefined;
+
+  const backoff = (attempt: number): number =>
+    Math.min(baseDelayMs * multiplier ** (attempt - 1), maxDelayMs);
+
+  const handleConnected = (): void => {
+    if (disposed) return;
+    clearTimeout(timer);
+    timer = undefined;
+    const reconnectedAfter = attempts;
+    const elapsedMs = lostAt !== undefined ? Date.now() - lostAt : 0;
+    connectedAt = Date.now();
+    lostAt = undefined;
+    attempts = 0;
+    if (reconnectedAfter > 0) {
+      log.connect(
+        `[slack] socket connected after ${reconnectedAfter} reconnect attempt(s) (${Math.round(elapsedMs / 1000)}s of reconnection)`,
+      );
+    } else {
+      log.connect("[slack] socket connected");
+    }
+  };
+
+  const handleDisconnected = (): void => {
+    if (disposed) return;
+    const attempt = attempts + 1;
+    const uptime = connectedAt !== undefined ? Math.max(0, Math.round((Date.now() - connectedAt) / 1000)) : 0;
+    lostAt = Date.now();
+    log.failure(
+      `[slack] socket-mode connection lost after ${uptime}s of uptime — reconnecting in ${backoff(attempt) / 1000}s (attempt ${attempt})`,
+    );
+    schedule(attempt);
+  };
+
+  const schedule = (attempt: number): void => {
+    if (disposed) return;
+    // Idempotent: a disconnect during an in-flight reconnect attempt can
+    // race the attempt's own failure path — both converge on one timer.
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      void fire(attempt);
+    }, backoff(attempt));
+  };
+
+  const fire = async (attempt: number): Promise<void> => {
+    if (disposed) return;
+    lostAt = lostAt ?? Date.now();
+    attempts = attempt;
+    try {
+      // Resolves once the client reaches `connected` (Slack hello); the
+      // connected listener logs and resets the backoff. A drop during the
+      // attempt rejects AND re-emits `disconnected` — the schedule() dedupe
+      // makes both paths converge on the next bounded attempt.
+      await client.start();
+    } catch (err) {
+      if (disposed) return;
+      const detail = err instanceof Error ? err.message : String(err);
+      const next = attempt + 1;
+      log.failure(
+        `[slack] reconnect attempt ${attempt} failed (${detail}) — retrying in ${backoff(next) / 1000}s (attempt ${next})`,
+      );
+      schedule(next);
+    }
+  };
+
+  client.on("connected", handleConnected);
+  client.on("disconnected", handleDisconnected);
+
+  return {
+    dispose(): void {
+      disposed = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    },
+  };
+}
+
 export function createSlackAdapter(opts: {
   appToken: string;
   botToken: string;
@@ -747,6 +890,20 @@ export function createSlackAdapter(opts: {
   const receiver = new SocketModeReceiver({
     appToken: opts.appToken,
     clientPingTimeout: 24 * 60 * 60 * 1000,
+    // The SDK's own reconnect delay is clientPingTimeout * consecutiveFailures
+    // — 24h with the timeout above, i.e. a full day of dead-silence after any
+    // drop (issue #237). Reconnect is driven by the bounded watchdog below
+    // instead; disabling auto-reconnect makes every socket close surface as a
+    // `disconnected` event the watchdog reacts to.
+    autoReconnectEnabled: false,
+  });
+  // Bounded reconnection on socket death (issue #237): sees the real
+  // SocketModeClient's `connected`/`disconnected` lifecycle events and
+  // re-drives client.start() with exponential backoff capped far below the
+  // SDK's 24h. Logs connect / reconnect / failure with attempts + elapsed.
+  const reconnectWatchdog = watchSocketModeReconnect(receiver.client, {
+    connect: (message) => console.log(message),
+    failure: (message) => console.error(message),
   });
   // When the Web API is pointed at an emulator/test stub
   // (clientOptions.slackApiUrl), a connection failure must fail fast —
@@ -1016,9 +1173,42 @@ export function createSlackAdapter(opts: {
           );
         }
       }
-      await app.start();
+      // Boot-connect verification (issue #237): `app.start()` resolves only
+      // once the socket reaches `connected` (Slack's hello handshake), so
+      // resolving is the proof the websocket actually opened — the watchdog
+      // logs "[slack] socket connected" at that point. Race it against a
+      // bounded timeout so a hung connect (no hello, no close) fails loud
+      // instead of silently booting a dead connector for hours.
+      let bootTimer: ReturnType<typeof setTimeout> | undefined;
+      const connect = app.start();
+      const bootDeadline = new Promise<never>((_, reject) => {
+        bootTimer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `Socket Mode boot connect timed out after ${SLACK_BOOT_CONNECT_TIMEOUT_MS / 1000}s without reaching connected (issue #237)`,
+              ),
+            ),
+          SLACK_BOOT_CONNECT_TIMEOUT_MS,
+        );
+      });
+      try {
+        await Promise.race([connect, bootDeadline]);
+      } catch (err) {
+        console.error(`[slack] boot connect failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      } finally {
+        clearTimeout(bootTimer);
+        // Absorb a late rejection from the raced-away connect so it never
+        // surfaces as an unhandled rejection; the watchdog still owns any
+        // recovery if the socket lands after we gave up on the boot.
+        void connect.catch(() => {});
+      }
     },
     stop: async () => {
+      // Stop the watchdog FIRST: the SDK emits `disconnected` on a manual
+      // disconnect, and a stopped adapter must stay stopped (issue #237).
+      reconnectWatchdog.dispose();
       await app.stop();
     },
   };
