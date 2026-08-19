@@ -56,6 +56,10 @@ import type { AgentToolResult, ExtensionContext } from "@oh-my-pi/pi-coding-agen
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import {
+  CHURN_MESSAGE,
+  EMPTY_RESPONSE_FALLBACK,
+} from "../../src/server/services/slack-turn-presenter";
+import {
   ADMIN_CATALOG_BROWSER_EVENT,
   APPROVAL_REQUESTED_EVENT,
   APPROVAL_RESOLVED_EVENT,
@@ -562,6 +566,54 @@ function isBotMessage(h: Harness, m: SlackApiMessage): boolean {
 }
 
 /**
+ * Issue #245 — an empty-response recovery line ("Hmm — I got an empty
+ * response…", "I keep getting empty responses — check the model key?") is
+ * adapter DECORATION like a thinking/progress phrase (#40/#60/#78): the
+ * real completion replaces it in place, so treating it as a reply
+ * false-passes a churn turn (bare empty completions / model gave up)
+ * precisely when the canary should surface the churn diagnostic. The
+ * cause-carried variants ("…: <cause> — retrying…", #78) embed the phrase
+ * too.
+ */
+function isEmptyResponseLine(text: string): boolean {
+  return (
+    text.includes(EMPTY_RESPONSE_FALLBACK) || text.includes(CHURN_MESSAGE) || text.includes("empty response")
+  );
+}
+
+/**
+ * Issue #245 — turns the bare "no bot reply … within Nms" timeout into a
+ * diagnosis from the rows the poll ALREADY fetched: whether the bot opened
+ * a turn at all (any bot-authored row newer than the inbound), the tool /
+ * progress lines it posted instead of a reply, and an empty-response loop
+ * signal (the #60/#78 churn recovery: EMPTY_RESPONSE_FALLBACK lines repeat
+ * while the completion comes back empty, and the CHURN_MESSAGE guards the
+ * terminal state). Returns "" when nothing is actionable (the bot never
+ * posted after the ask), so the plain timeout stands on its own. Exported
+ * for the hermetic diagnostic test (issue #245).
+ */
+export function noReplyEvidence(h: Harness, after: number, messages: SlackApiMessage[]): string {
+  const rows = messages.filter((m) => isBotMessage(h, m) && parseFloat(m.ts) > after);
+  if (rows.length === 0) return "";
+  const parts: string[] = [`the bot posted ${rows.length} message(s) after the ask but none reads as a reply`];
+  const toolLines = rows
+    .filter((m) => PROGRESS_LINE_RE.test(m.text.trim()) || THINKING_PHRASES.includes(m.text.trim()))
+    .map((m) => snippet(m.text));
+  if (toolLines.length > 0) {
+    parts.push(`last non-reply line(s): ${toolLines.slice(-3).join(" | ")}`);
+  }
+  const churnRows = rows.filter((m) => isEmptyResponseLine(m.text));
+  if (churnRows.length > 0) {
+    parts.push(
+      rows.some((m) => m.text.includes(CHURN_MESSAGE))
+        ? `empty-response churn hit the recovery guard — check the model key (${churnRows.length} line(s))`
+        : `the completion kept returning empty — ${churnRows.length} "empty response" line(s)`,
+    );
+  }
+  return `: ${parts.join("; ")}`;
+}
+
+/**
  * Polls live history for the bot's reply to an inbound message: any
  * bot-authored message with non-empty text, newer than the inbound ts
  * (and threaded under it in channels — DMs reply plain, #40). Thinking
@@ -597,6 +649,9 @@ export async function waitForBotReply(
   const after = parseFloat(opts.afterTs);
   const timeoutMs = opts.timeoutMs ?? JOURNEY_TIMEOUT_MS;
   let lastHistoryError: unknown;
+  // The last successful poll's rows, so the timeout message can say what the
+  // bot DID post instead of leaving a bare "no bot reply" (issue #245).
+  let lastMessages: SlackApiMessage[] | undefined;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -620,6 +675,7 @@ export async function waitForBotReply(
         // top-level eye. History rows are top-level, so no thread filter.
         messages = await live.history(channelId);
       }
+      lastMessages = messages;
       const hit = messages.find(
         (m) =>
           isBotMessage(h, m) &&
@@ -631,6 +687,11 @@ export async function waitForBotReply(
           // an empty turn (run msypizpb-qt3: the DM journey "passed" on
           // the elapsed line while the channel turn honestly timed out).
           !PROGRESS_LINE_RE.test(m.text.trim()) &&
+          // Issue #245: an empty-response recovery line is decoration too —
+          // the real completion replaces it in place; matching it
+          // false-passes a churn turn (empty completions / model gave up)
+          // exactly when the canary should surface the churn diagnostic.
+          !isEmptyResponseLine(m.text.trim()) &&
           parseFloat(m.ts) > after &&
           (!requireThread || m.thread_ts === opts.threadTs),
       );
@@ -641,7 +702,8 @@ export async function waitForBotReply(
     if (Date.now() > deadline) {
       throw new Error(
         `no bot reply to "${opts.label}" in ${channelId} within ${timeoutMs}ms` +
-          (lastHistoryError !== undefined ? ` (last history error: ${errorMessage(lastHistoryError)})` : ""),
+          (lastHistoryError !== undefined ? ` (last history error: ${errorMessage(lastHistoryError)})` : "") +
+          (lastMessages !== undefined ? noReplyEvidence(h, after, lastMessages) : ""),
       );
     }
     await Bun.sleep(750);

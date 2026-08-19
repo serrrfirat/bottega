@@ -1280,3 +1280,60 @@ describe("live-progress line shapes (issue #193)", () => {
     expect(PROGRESS_LINE_RE.test("ok")).toBe(false);
   });
 });
+
+describe("no-reply timeout diagnosis (issue #245)", () => {
+  test("a bot turn that never replies times out WITH what it posted — turn opened, tool lines, and the empty-response churn guard", async () => {
+    // Live finding (run mt01tgvw-48n): a no-reply wait reported only
+    // "no bot reply to ... within Nms" while the bot had visibly opened a
+    // turn — the bare message hid the failure mode. The stub returns ONLY
+    // bot-authored non-reply rows after the inbound: a ⚙️ progress line, a
+    // 🧠 thinking line, the adapter's EMPTY_RESPONSE_FALLBACK, and the
+    // CHURN_MESSAGE guard. Red on the pre-fix code TWICE over: the
+    // fallback row matched the reply filter, so waitForBotReply
+    // false-PASSED on the churn turn (resolved with the fallback instead
+    // of timing out) — and a true timeout carried no diagnosis. Post-fix
+    // the wait times out and the error names the cause.
+    const pingTs = "1787000000.000100";
+    const botRows: SlackApiMessage[] = [
+      { ts: "1787000000.000110", channel: "C1", bot_id: "B-bot", text: "⚙️ github.search_issues — allowed (read)" },
+      { ts: "1787000000.000120", channel: "C1", bot_id: "B-bot", text: "🧠 the model is reasoning about the fix" },
+      { ts: "1787000000.000130", channel: "C1", bot_id: "B-bot", text: "Hmm — I got an empty response, retrying…" },
+      { ts: "1787000000.000140", channel: "C1", bot_id: "B-bot", text: "I keep getting empty responses — check the model key?" },
+    ];
+    // SAFETY: the stub only exposes the sync members waitForBotReply reads
+    // (history for the poll, botUserId/qaUserId for isBotMessage); the
+    // rest of the Harness surface is unused in this mechanism test.
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        history: async (_channelId: string) => [
+          { ts: pingTs, channel: "C1", user: "U-qa", text: "canary ping" },
+          ...botRows,
+        ],
+        replies: async (_channelId: string, _threadTs: string): Promise<SlackApiMessage[]> => [],
+      },
+    } as Harness;
+    const error = await waitForBotReply(h, "C1", {
+      afterTs: pingTs,
+      label: "churn diagnostics ping",
+      timeoutMs: 300,
+    }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    // Pre-fix this resolved (the fallback false-passed as a "reply") and
+    // then the message assertions below failed; post-fix it rejects.
+    expect(error).toBeDefined();
+    const message = error instanceof Error ? error.message : String(error);
+    expect(message).toContain("no bot reply to \"churn diagnostics ping\"");
+    // Turn opened: the diagnosis counts the bot rows and calls out that
+    // none reads as a reply.
+    expect(message).toMatch(/the bot posted \d+ message\(s\) after the ask but none reads as a reply/);
+    // Tool / progress lines surface verbatim (issue #245).
+    expect(message).toContain("⚙️ github.search_issues — allowed (read)");
+    expect(message).toContain("🧠 the model is reasoning about the fix");
+    // The empty-response churn guard names the recovery (issue #245).
+    expect(message).toMatch(/empty-response churn hit the recovery guard — check the model key/);
+  });
+});
