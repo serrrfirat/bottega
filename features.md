@@ -701,6 +701,11 @@ opened a DM with the bot once (or the canary opens it via
 - **No PDF/XLSX binary extraction in `object.get`** — these objects store
   and attach normally; binary extraction belongs in the executor harness,
   not a server-side parser.
+- **`connect notion` fails closed** — Notion's hosted MCP (Beta) OAuth
+  authorization server returns access-only tokens (no refresh) on the
+  standard connect path regardless of requested scope (`offline_access`
+  included; live capture in issue #263). Nothing is silently saved; a
+  Notion-specific consumer OAuth integration is roadmap, not shipped.
 
 ## Roadmap
 
