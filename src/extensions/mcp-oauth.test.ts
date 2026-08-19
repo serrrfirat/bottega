@@ -112,6 +112,10 @@ interface StubState {
   clientAuthMethodsUsed: string[];
   /** How many DCR registrations were issued a client_secret (issue #257). */
   confidentialClients: number;
+  /** The `resource` (RFC 8707) form param of every /token call (issue #264). */
+  tokenResources: string[];
+  /** The `resource` (RFC 8707) query param of every /authorize URL minted (issue #264). */
+  authorizeResources: string[];
 }
 
 /**
@@ -124,12 +128,14 @@ interface StubState {
 class StubOAuthMcp {
   readonly server: ReturnType<typeof Bun.serve>;
   readonly baseUrl: string;
-  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null, registeredScopes: [], authorizeScopes: [], registeredAuthMethods: [], clientAuthMethodsUsed: [], confidentialClients: 0 };
+  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null, registeredScopes: [], authorizeScopes: [], registeredAuthMethods: [], clientAuthMethodsUsed: [], confidentialClients: 0, tokenResources: [], authorizeResources: [] };
   #codes = new Map<string, { clientId: string; challenge: string | null; offline: boolean }>();
   #refreshTokens = new Map<string, string>(); // refresh -> clientId
   #accessTokens = new Map<string, string>(); // access -> clientId
   #clientSecrets = new Map<string, string>(); // client_id -> client_secret (confidential mode)
   #nextId = 0;
+  /** True once an unauthenticated POST to /mcp has been seen — the connect's cold-path protected-resource probe (issue #264). */
+  #mcpProbeSeen = false;
   /** Set false to serve /mcp with NO OAuth metadata (the fail-closed leg). */
   oauthMetadata = true;
   /**
@@ -178,6 +184,31 @@ class StubOAuthMcp {
    * returning scope undefined (issue #262 (d)).
    */
   negotiationDiscoveryFails = false;
+  /**
+   * Set true to model NOTION's measured asymmetry (issue #264): the
+   * path-aware protected-resource-metadata endpoint 401s unauthenticated
+   * probes, so SDK discovery FALLS BACK to a ROOT PRM whose `resource` is
+   * the bare HOST — the RFC 8707 resource indicator the mint then binds to
+   * the origin, and the AS grants an access-only token even when
+   * `offline_access` is requested. The server 401s any unauthenticated POST
+   * to /mcp with `WWW-Authenticate: Bearer resource_metadata="<origin>/
+   * .well-known/oauth-protected-resource/mcp", error="invalid_token", …` —
+   * the challenge URL actually serves the AUTHORITATIVE PRM (`resource:
+   * <origin>/mcp`). It only serves that URL once the connect's cold-path
+   * initialize probe (the first unauth'd /mcp POST) has been seen:
+   * deterministic, because discovery's path-aware probe STRICTLY precedes
+   * it — on the unpatched code no /mcp POST arrives and the resource stays
+   * host-bound.
+   */
+  hostOnlyResourceAsymmetry = false;
+  /**
+   * Set true to strip the `WWW-Authenticate` challenge from every /mcp 401
+   * — models a server whose challenge probe yields NOTHING (no
+   * resource_metadata to adopt). The connect must proceed exactly as today
+   * and still fail closed if the exchange is access-only (issue #264's
+   * no-op branch preserves the #263 discipline).
+   */
+  noChallenge = false;
 
   constructor() {
     this.server = Bun.serve({
@@ -203,11 +234,18 @@ class StubOAuthMcp {
       const auth = req.headers.get("authorization");
       const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
       if (token === null || !this.#accessTokens.has(token)) {
-        const headers: Record<string, string> = {};
-        if (this.oauthMetadata) {
-          headers["www-authenticate"] = `Bearer resource_metadata="${this.baseUrl}/.well-known/oauth-protected-resource/mcp"`;
+        // An unauthenticated POST to /mcp is the connect's cold-path
+        // protected-resource probe (issue #264). noChallenge (or no OAuth at
+        // all) yields a bare 401 with nothing for the probe to adopt.
+        if (this.noChallenge || !this.oauthMetadata) {
+          return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
         }
-        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers });
+        if (req.method === "POST") this.#mcpProbeSeen = true;
+        const challenge =
+          this.hostOnlyResourceAsymmetry
+            ? `Bearer realm="OAuth", resource_metadata="${this.baseUrl}/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="unauthenticated protected-resource probe"`
+            : `Bearer resource_metadata="${this.baseUrl}/.well-known/oauth-protected-resource/mcp"`;
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "www-authenticate": challenge } });
       }
       // SAFETY: the MCP SDK sends jsonrpc/id/method on every request; the
       // stub reads only method and id, and anything else falls through to
@@ -226,7 +264,26 @@ class StubOAuthMcp {
     }
     if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
+      // Issue #264 (Notion): in asymmetry mode the path-aware endpoint 401s
+      // unauthenticated probes UNTIL the connect's /mcp challenge probe (which
+      // ADVERTISES this very URL) has run. Before the fix the SDK never POSTs
+      // /mcp during a connect, so discovery falls back to the ROOT PRM
+      // (host-only resource) and the exchange binds the resource to the origin.
+      if (this.hostOnlyResourceAsymmetry && !this.#mcpProbeSeen) {
+        return new Response("unauthorized", { status: 401 });
+      }
       return json({ resource: this.mcpUrl, authorization_servers: [this.baseUrl], scopes_supported: this.protectedResourceScopes, bearer_methods_supported: ["header"] });
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource") {
+      if (!this.oauthMetadata) return new Response("not found", { status: 404 });
+      // Host-only root PRM (issue #264): served ONLY in asymmetry mode as
+      // discovery's root fallback — its `resource` is the bare origin,
+      // exactly the binding that makes an AS grant an access-only token even
+      // when offline_access was requested (Notion's measured behavior).
+      if (this.hostOnlyResourceAsymmetry) {
+        return json({ resource: this.baseUrl, authorization_servers: [this.baseUrl], scopes_supported: this.protectedResourceScopes, bearer_methods_supported: ["header"] });
+      }
+      return new Response("not found", { status: 404 });
     }
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
@@ -292,6 +349,7 @@ class StubOAuthMcp {
       const challenge = url.searchParams.get("code_challenge") ?? "";
       const method = url.searchParams.get("code_challenge_method") ?? "";
       this.state.authorizeScopes.push(scope);
+      this.state.authorizeResources.push(url.searchParams.get("resource") ?? "");
       // The server only issues a REFRESH token when the consent granted
       // offline_access (RFC 6749 §3.3). The stub models the real Notion
       // failure exactly: a scope WITHOUT offline_access yields an
@@ -312,7 +370,10 @@ class StubOAuthMcp {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
       const params = new URLSearchParams(await req.text());
       const grantType = params.get("grant_type") ?? "";
+      const resource = params.get("resource") ?? "";
       this.state.tokenGrantTypes.push(grantType);
+      // Issue #264: capture the RFC 8707 resource every /token call bound to.
+      this.state.tokenResources.push(resource);
       // Issue #257: recover HOW the caller authenticated, mirroring the SDK
       // (client_secret_basic → Basic header; client_secret_post → form
       // client_secret; public → client_id alone). A confidential server
@@ -352,6 +413,14 @@ class StubOAuthMcp {
         this.#nextId += 1;
         const access = `access-${this.#nextId}`;
         this.#accessTokens.set(access, entry.clientId);
+        // Issue #264 (Notion): when the exchange resource was bound to the
+        // bare HOST (discovery's root-PRM fallback), the AS grants an
+        // access-only token even though offline_access was requested — the
+        // live capture that motivated the fix. Only the AUTHORITATIVE
+        // `<origin>/mcp` resource yields a refreshable grant here.
+        if (this.hostOnlyResourceAsymmetry && resource !== this.mcpUrl) {
+          return json({ access_token: access, token_type: "Bearer", expires_in: 3600, scope: "default" });
+        }
         // No refresh token unless offline_access was granted — the exact
         // pre-#256 Notion behavior that persisted an empty refresh and
         // broke every later read. dropRefresh forces the no-refresh
@@ -1311,6 +1380,88 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
         else process.env.DEBUG = savedDebug;
         console.debug = originalDebug;
       }
+    } finally {
+      stub.stop();
+    }
+  });
+});
+
+describe("issue #264 — challenge-advertised protected resource indicator", () => {
+  /** Full mint → browser-authorize → callback round trip; returns the callback's HTTP response. */
+  async function roundTrip(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<Response> {
+    const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+    try {
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+      const minted = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      if (!minted.ok) throw new Error(`mint failed: ${minted.message}`);
+      const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+      return await fetch(authorize.headers.get("location")!);
+    } finally {
+      callback.stop();
+    }
+  }
+
+  test("(a) a hosted MCP whose challenge advertises the authoritative PRM binds the resource indicator to <origin>/mcp and lands a refreshable credential (Notion's measured asymmetry)", async () => {
+    // Notion's live shape (issue #264): discovery's path-aware PRM probe
+    // 401s, the SDK falls back to a ROOT PRM whose resource is the bare
+    // HOST, and the AS grants an access-only token unless the exchange binds
+    // the authoritative `<origin>/mcp` resource the /mcp challenge names.
+    const stub = new StubOAuthMcp();
+    stub.hostOnlyResourceAsymmetry = true;
+    stub.confidential = true; // DCR issues a client_secret_basic client, like Notion's registry
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const done = await roundTrip(stub, store, vault);
+
+      // The connect SUCCEEDS despite discovery falling back to a host-only
+      // PRM: the challenge probe adopted the authoritative resource. On the
+      // UNPATCHED code this is a 500 (#263 fail-closed: access-only).
+      expect(done.status).toBe(200);
+
+      // Every /token call (the code exchange + the connect-time mint probe)
+      // and the minted authorize URL bound the RFC 8707 resource to
+      // `<origin>/mcp`, never the bare host.
+      expect(stub.state.tokenResources.length).toBeGreaterThan(0);
+      for (const tokenResource of stub.state.tokenResources) {
+        expect(tokenResource).toBe(stub.mcpUrl);
+      }
+      expect(stub.state.authorizeResources).toContain(stub.mcpUrl);
+
+      // The persisted vault credential is genuinely refreshable.
+      const saved = vault.saves[vault.saves.length - 1];
+      expect(saved).toBeTruthy();
+      if (!saved) return;
+      expect(saved.credential.refresh).toMatch(/^refresh-rotated-/);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(b) a server whose challenge probe yields nothing still fails closed naming the advertised-grant cause, persisting nothing", async () => {
+    const stub = new StubOAuthMcp();
+    stub.noChallenge = true; // /mcp 401 carries no WWW-Authenticate → the probe has nothing to adopt
+    stub.dropRefresh = true; // the exchange is access-only regardless
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const done = await roundTrip(stub, store, vault);
+
+      expect(done.status).toBe(500);
+      const body = await done.text();
+      // The #263 fail-closed message names the advertised grant + the
+      // access-only outcome — the no-op probe branch must not suppress it.
+      expect(body).toContain("advertised the refresh_token grant");
+      expect(body).toContain("requested offline_access");
+      expect(body).toContain("access-only");
+      expect(body).toContain("no refresh_token");
+      expect(body).not.toContain("offline_access was not granted");
+      // Nothing persisted: no empty-refresh credential, no registry row.
+      expect(vault.saves).toHaveLength(0);
+      expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
     } finally {
       stub.stop();
     }

@@ -30,7 +30,7 @@
  * silent no-op.
  */
 import { randomBytes } from "node:crypto";
-import { auth, discoverOAuthServerInfo, type AuthResult, type OAuthClientProvider, type OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth, discoverOAuthServerInfo, discoverOAuthProtectedResourceMetadata, extractWWWAuthenticateParams, type AuthResult, type OAuthClientProvider, type OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
@@ -639,10 +639,77 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
  * in exchange no provider/state plumbing is needed and every server that
  * supports refreshable grants gets a token that can actually be refreshed.
  */
+/**
+ * Issue #264: best-effort adoption of the AUTHORITATIVE RFC 8707 resource
+ * indicator. A hosted MCP server's OAuth challenge — the unauthenticated
+ * 401 it answers an initialize POST with — carries `resource_metadata="<url>"`
+ * (`WWW-Authenticate: Bearer …`), naming the protected-resource metadata
+ * whose `resource` is what the mint/refresh exchange must bind to.
+ *
+ * `discoverOAuthServerInfo` only probes the well-known path. A server like
+ * Notion that 401s the path-aware endpoint gets served by discovery's ROOT
+ * fallback, whose PRM `resource` is the bare HOST; the AS then grants an
+ * access-only token even though `offline_access` was requested (the resource
+ * indicator is wrong), and the connect fails closed at the exchange (#263).
+ *
+ * So: ONE cold-path unauthenticated initialize POST to the MCP server reads
+ * its challenge; the advertised URL is validated by fetching it (via the
+ * SDK's own discovery function, so this is exactly what auth() will trust);
+ * adopt it only when it yields a `resource` that DIFFERS from what discovery
+ * already established (or when discovery found none). Otherwise undefined —
+ * the connect proceeds exactly as before. BEST-EFFORT by contract: any probe
+ * failure is logged once and never fails the connect.
+ */
+async function challengeAdvertisedResourceMetadataUrl(
+  serverUrl: string,
+  info: OAuthServerInfo,
+): Promise<string | undefined> {
+  try {
+    const challenge = await fetch(serverUrl, {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "bottega", version: "1" },
+        },
+      }),
+    });
+    const advertised = extractWWWAuthenticateParams(challenge).resourceMetadataUrl;
+    if (advertised === undefined) return undefined;
+    const fetched = await discoverOAuthProtectedResourceMetadata(serverUrl, {
+      resourceMetadataUrl: advertised,
+    });
+    const discoveredResource = info.resourceMetadata?.resource;
+    // Adopt only when the challenge's PRM carries a resource the negotiation's
+    // discovery did NOT already establish (no adoption keeps existing binds —
+    // and every current test — byte-for-byte identical).
+    if (fetched.resource === undefined || fetched.resource === "") return undefined;
+    if (discoveredResource !== undefined && discoveredResource === fetched.resource) return undefined;
+    return advertised.toString();
+  } catch (err) {
+    // Best-effort by contract: a probe failure (network blip, non-JSON
+    // metadata, …) must never fail the connect — the (unchanged) exchange
+    // still fails closed if the server is genuinely access-only (#263).
+    console.error(
+      `[mcp-oauth] connect negotiation challenge probe failed for ${serverUrl}: ${errorMessage(err)} — ` +
+        "proceeding with the discovery-established resource indicator; the exchange still fails closed if the server is access-only",
+    );
+    return undefined;
+  }
+}
+
 async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
-): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; grantedRefresh: boolean }> {
+): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; grantedRefresh: boolean; resourceMetadataUrl: string | undefined }> {
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
@@ -658,8 +725,14 @@ async function connectServerNegotiation(
         "proceeding without offline_access and without a negotiated token-endpoint auth method; " +
         "the connect will fail closed in auth() if the server is unreachable",
     );
-    return { scope: undefined, tokenEndpointAuthMethod: "none", grantedRefresh: false };
+    return { scope: undefined, tokenEndpointAuthMethod: "none", grantedRefresh: false, resourceMetadataUrl: undefined };
   }
+  // Issue #264: best-effort adoption of the AUTHORITATIVE RFC 8707 resource
+  // indicator from the server's own OAuth challenge (see the helper). Any
+  // probe failure leaves it undefined and the connect proceeds exactly as
+  // before — the exchange still fails closed (#263) if the server really is
+  // access-only.
+  const resourceMetadataUrl = await challengeAdvertisedResourceMetadataUrl(serverUrl, info);
   const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
   const supports = (method: string) => supportedMethods?.includes(method) === true;
   const tokenEndpointAuthMethod = supports("client_secret_basic")
@@ -669,7 +742,7 @@ async function connectServerNegotiation(
       : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, grantedRefresh: false };
+  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, grantedRefresh: false, resourceMetadataUrl };
   // Issue #262: choose the scope BASE without ever building it out of the
   // "default" placeholder Notion (and similar AS) advertise in
   // `scopes_supported`. A placeholder/absent resource scope is discarded in
@@ -686,7 +759,7 @@ async function connectServerNegotiation(
       : undefined) ??
     (clientScopes !== undefined && clientScopes.length > 0 ? clientScopes.join(" ") : undefined);
   const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
-  return { scope, tokenEndpointAuthMethod, grantedRefresh: true };
+  return { scope, tokenEndpointAuthMethod, grantedRefresh: true, resourceMetadataUrl };
 }
 
 /**
@@ -749,6 +822,12 @@ export async function startMcpOAuthFlow(
     result = await auth(provider, {
       serverUrl,
       ...(negotiation.scope !== undefined ? { scope: negotiation.scope } : {}),
+      // Issue #264: when the server's challenge advertised an authoritative
+      // protected-resource-metadata URL different from what discovery found,
+      // bind the mint's RFC 8707 resource indicator to it (the SDK persists
+      // it in discoveryState; the callback + connect-probe legs restore it,
+      // so the code exchange and every refresh carry the same resource).
+      ...(negotiation.resourceMetadataUrl !== undefined ? { resourceMetadataUrl: new URL(negotiation.resourceMetadataUrl) } : {}),
       // Issue #263: DEBUG-gated raw token-endpoint capture on the connect
       // leg (INTERACTIVE mint never hits /token — the wrapper only acts on
       // /token paths — but the SDK's discovery/register/authorize run
