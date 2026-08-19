@@ -368,7 +368,7 @@ describe("full connect round trip — mint → browser → callback → vault + 
     try {
       const store = freshStore();
       const vault = new FakeVaultStore();
-      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault });
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
       try {
         const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
 
@@ -425,7 +425,7 @@ describe("full connect round trip — mint → browser → callback → vault + 
     try {
       const store = freshStore();
       const vault = new FakeVaultStore();
-      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault });
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
       try {
         const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
         const minted = await startMcpOAuthFlow(
@@ -457,7 +457,7 @@ describe("full connect round trip — mint → browser → callback → vault + 
     try {
       const store = freshStore();
       const vault = new FakeVaultStore();
-      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault });
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
       try {
         const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
         const minted = await startMcpOAuthFlow(
@@ -489,7 +489,7 @@ describe("full connect round trip — mint → browser → callback → vault + 
     const stub = new StubOAuthMcp();
     try {
       const store = freshStore();
-      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: new FakeVaultStore() });
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: new FakeVaultStore(), port: 0 });
       try {
         const missing = await fetch(`${callback.baseUrl}/oauth/callback?code=x&state=nope`);
         expect(missing.status).toBe(404);
@@ -511,12 +511,40 @@ describe("full connect round trip — mint → browser → callback → vault + 
       stub.stop();
     }
   });
+
+  test("the callback listener binds an EPHEMERAL port, never the .env-pinned dev port (#253)", async () => {
+    // Regression for #253: these callback servers once bound the repo .env's
+    // fixed BOTTEGA_CALLBACK_PORT (64204) — the port the live dev server
+    // serves on — so `bun test` died with EADDRINUSE and the "fix" was to
+    // kill the dev server. Simulate the collision env and prove the listener
+    // still derives its port from the bind (ephemeral), not from the env.
+    const savedPort = process.env.BOTTEGA_CALLBACK_PORT;
+    process.env.BOTTEGA_CALLBACK_PORT = "64204";
+    try {
+      const store = freshStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: new FakeVaultStore(), port: 0 });
+      try {
+        const bound = new URL(callback.baseUrl).port;
+        expect(bound).not.toBe("64204");
+        expect(Number(bound)).toBeGreaterThan(0);
+        expect(Number(bound)).toBeLessThan(65536);
+        // The ephemeral surface still answers (unknown state → 404).
+        const res = await fetch(`${callback.baseUrl}/oauth/callback?code=x&state=nope`);
+        expect(res.status).toBe(404);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      if (savedPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
+      else process.env.BOTTEGA_CALLBACK_PORT = savedPort;
+    }
+  });
 });
 
 describe("token refresh — the runtime provider (issue #198)", () => {
   /** Runs a real connect round trip and returns the vault-saved credential. */
   async function connectCredential(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<OAuthCredential> {
-    const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault });
+    const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
     try {
       const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
       const minted = await startMcpOAuthFlow(
