@@ -197,6 +197,19 @@ export interface OAuthTokenEntry {
    * can complete its own token dance against the proxy.
    */
   tokenEndpoint: string;
+  /**
+   * The path globs scoping each mint rule (iron-proxy `paths` rule,
+   * v0.49.0 — issue #246): a request only gets the minted bearer injected
+   * when its path matches one of these AND its host matches the rule's
+   * host. The scope is the provider's MCP resource subtree (the
+   * serverUrl's path, e.g. `/mcp` + `/mcp/*`). The RFC 8414/9207 public
+   * discovery endpoints (`/.well-known/*`) are deliberately OUT of scope:
+   * the SDK probes them BEFORE any credential exists, and a bare-host rule
+   * under `require: true` 502s every discovery probe (the issue #246
+   * symptom). The token_endpoint STUB is NOT rule-gated (iron-proxy
+   * matches it on exact host+path before rules), so it needs no path here.
+   */
+  paths: readonly string[];
 }
 
 /**
@@ -225,6 +238,57 @@ export const OAUTH_TOKEN_ENDPOINTS: VerifiedTokenEndpoints = {
   attio: "https://app.attio.com/oidc/token",
   notion: "https://mcp.notion.com/token",
 };
+
+/**
+ * Verified MCP resource paths keyed by OAuth extension id (the #198
+ * providers — issue #246): the serverUrl path the SDK calls as the MCP
+ * resource (linear/attio/notion all serve /mcp). Used as the FALLBACK
+ * when a snapshot's serverUrl yields no usable path (e.g. a root URL) —
+ * never a guessed path: an OAuth extension with neither a usable
+ * serverUrl path nor a verification here FAILS generation closed.
+ * (Fixtures and every registered provider derive their scope from the
+ * serverUrl directly; this table is the fail-closed floor.)
+ */
+interface VerifiedResourcePaths {
+  [extensionId: string]: string;
+}
+
+const OAUTH_RESOURCE_PATHS: VerifiedResourcePaths = {
+  linear: "/mcp",
+  attio: "/mcp",
+  notion: "/mcp",
+};
+
+/**
+ * The rule-scope globs for one OAuth snapshot (issue #246): the
+ * serverUrl's resource path plus its subtree when available (e.g. `/mcp` +
+ * `/mcp/*`), else the verified per-provider fallback
+ * ({@link OAUTH_RESOURCE_PATHS} — e.g. a runtime snapshot carrying a
+ * root URL). Fails generation closed when neither yields a path.
+ */
+function oauthResourcePaths(snapshot: PinnedSnapshot): readonly string[] {
+  const serverUrl = snapshot.manifest.kind === "mcp" ? snapshot.manifest.mcp.serverUrl : undefined;
+  if (serverUrl !== undefined) {
+    try {
+      // Normalize a trailing slash so a root URL ("https://host/") is
+      // detected as having no usable path (falls through fail-closed).
+      const pathname = new URL(serverUrl).pathname.replace(/\/+$/, "");
+      if (pathname.length > 0 && pathname !== "/") {
+        return [pathname, `${pathname}/*`];
+      }
+    } catch {
+      // malformed serverUrl → the verified fallback below (fail closed).
+    }
+  }
+  const fallback = OAUTH_RESOURCE_PATHS[snapshot.manifest.id];
+  if (fallback === undefined) {
+    throw new Error(
+      `egress config generation: the OAuth extension "${snapshot.manifest.id}" has no usable serverUrl path — ` +
+        "add one to OAUTH_RESOURCE_PATHS in src/egress/generate.ts before regenerating",
+    );
+  }
+  return [fallback, `${fallback}/*`];
+}
 
 /**
  * The canary's OAuth fixture id prefix (issue #212): test-only extensions
@@ -266,6 +330,10 @@ export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapsho
   return snapshots
     .filter((s) => s.manifest.credentialSchema.type === "oauth")
     .map((s): OAuthTokenEntry => {
+      // Issue #246: every entry's rules get scoped to the MCP resource
+      // subtree (paths) so public `/.well-known/*` discovery passes
+      // token-less while real API calls stay fail-closed.
+      const paths = oauthResourcePaths(s);
       if (s.manifest.id.startsWith(CANARY_OAUTH_FIXTURE_ID_PREFIX)) {
         const host = s.manifest.domains.find((domain) => domain !== "*");
         if (host === undefined) {
@@ -274,7 +342,12 @@ export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapsho
               "synthesize its token endpoint from",
           );
         }
-        return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint: `https://${host}/token` };
+        return {
+          extensionId: s.manifest.id,
+          domains: s.manifest.domains,
+          tokenEndpoint: `https://${host}/token`,
+          paths,
+        };
       }
       const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
       if (tokenEndpoint === undefined) {
@@ -284,7 +357,7 @@ export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapsho
             "before regenerating",
         );
       }
-      return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint };
+      return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint, paths };
     });
 }
 
@@ -410,15 +483,28 @@ ${extensionBlock}${gatewayEntries}
  * stubbed with a synthetic token so the app's SDK can complete its own
  * OAuth dance against the proxy (the GCP stub pattern). require: true —
  * an unmintable credential rejects the request (502), never an
- * unauthenticated upstream call. The codex model provider is NOT here
- * (issue #230): it is a STATIC secrets entry — the seed owns the refresh,
- * the proxy injects the access token at egress.
+ * unauthenticated upstream call. Issue #246: every rule is scoped with
+ * `paths` to the provider's MCP resource subtree — the RFC 8414/9207
+ * public discovery endpoints (`/.well-known/*`) must load before any
+ * credential exists, so the mint rules never match them. The codex model
+ * provider is NOT here (issue #230): it is a STATIC secrets entry — the
+ * seed owns the refresh, the proxy injects the access token at egress.
  */
 export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
   const tokenBlocks = entries
     .map((entry) => {
       const blobPath = `${PROXY_SECRETS_MOUNT_PATH}/${oauthTokenBlobFileName(entry.extensionId)}`;
-      const hostLines = entry.domains.map((domain) => `            - host: "${domain}"`).join("\n");
+      // Issue #246: each host rule is scoped to the provider's MCP
+      // resource subtree (`paths`), so the RFC 8414/9207 public discovery
+      // endpoints (`/.well-known/*` — probed BEFORE any credential exists)
+      // pass token-less while real API calls stay fail-closed under
+      // require: true. The token_endpoint stub is NOT rule-gated
+      // (iron-proxy matches it on exact host+path before rules), so it
+      // needs no rule here.
+      const pathLines = entry.paths.map((path) => `                - "${path}"`).join("\n");
+      const hostLines = entry.domains
+        .map((domain) => `            - host: "${domain}"\n              paths:\n${pathLines}`)
+        .join("\n");
       return `        - grant: refresh_token
           refresh_token:
             type: file

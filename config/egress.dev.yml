@@ -158,6 +158,9 @@ transforms:
           require: true
           rules:
             - host: "mcp.attio.com"
+              paths:
+                - "/mcp"
+                - "/mcp/*"
         - grant: refresh_token
           refresh_token:
             type: file
@@ -173,6 +176,9 @@ transforms:
           require: true
           rules:
             - host: "mcp.linear.app"
+              paths:
+                - "/mcp"
+                - "/mcp/*"
 
 log:
   level: "info"

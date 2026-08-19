@@ -418,3 +418,138 @@ describe("runtime registry merge (issue #233)", () => {
     expect(renderDevEgressConfig(seedEntries, seedOAuth)).toBe(committedDev);
   });
 });
+
+describe("oauth_token rule scoping (issue #246)", () => {
+  /** A notion-shaped RUNTIME snapshot (the #233 store-backed record — not
+   * a repo pin): resource at /mcp, domains notion.com + mcp.notion.com.
+   * Mirrors the connect-flow merge the generator performs. */
+  function notionRuntimeSnapshot(): PinnedSnapshot {
+    return {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: "notion",
+      pinnedAt: "2026-08-18T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api", specId: "notion", vendorOfficial: true, reviewed: true },
+      manifest: {
+        id: "notion",
+        label: "Notion",
+        vendor: "Notion",
+        kind: "mcp",
+        mcp: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
+        credentialSchema: { type: "oauth" },
+        domains: ["notion.com", "mcp.notion.com"],
+      },
+    };
+  }
+
+  /** The merged snapshot set the runtime connect produces: the pinned seed
+   * (attio/linear OAuth) plus a notion-shaped runtime registration. */
+  const MERGED_SNAPSHOTS = [...SNAPSHOTS, notionRuntimeSnapshot()];
+  const MERGED_ENTRIES = oauthTokenEntries(MERGED_SNAPSHOTS);
+  // The runtime render merges the runtime domains into the allowlist too
+  // (issue #233) — the strict render needs them to be internally coherent.
+  const MERGED_DOMAINS = mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains));
+  const MERGED_YAML = renderEgressConfig(MERGED_DOMAINS, apiKeyExtensionEntries(MERGED_SNAPSHOTS), MERGED_ENTRIES);
+
+  /** Every oauth_token rule across the render, or null when the transform is absent. */
+  function oauthTokenRules(yaml: string): Record<string, YamlNode>[] | null {
+    const cfg = parseYamlSubset(yaml);
+    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
+    const transforms = cfg["transforms"] as YamlNode[];
+    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token");
+    if (oauth === undefined) return null;
+    // SAFETY: the oauth_token transform is a mapping whose `config` is a block mapping.
+    const config = (oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>;
+    // SAFETY: the config's `tokens` is a sequence of entry mappings each holding a `rules` sequence.
+    const tokens = config["tokens"] as YamlNode[];
+    const rules: Record<string, YamlNode>[] = [];
+    for (const token of tokens) {
+      rules.push(...((token as Record<string, YamlNode>)["rules"] as Record<string, YamlNode>[]));
+    }
+    return rules;
+  }
+
+  /** A rule's path globs; [] when the rule carries no `paths` (the pre-fix bare-host shape). */
+  function rulePaths(rule: Record<string, YamlNode>): string[] {
+    const paths = rule["paths"];
+    if (!Array.isArray(paths)) return [];
+    return paths as string[];
+  }
+
+  /**
+   * Mirrors iron-proxy v0.49.0 hostmatch.MatchPath (verified 2026-08-19
+   * from ironsh/iron-proxy internal/hostmatch/path.go): a pattern ending
+   * `/*` matches the exact base path OR any path under it (prefix must end
+   * at a `/` — `/mcp/*` matches `/mcp` and `/mcp/anything`, never
+   * `/mcpx`); any other pattern uses path.Match glob semantics (`*` =
+   * non-separator run), which for our emitted literal resource path
+   * degenerates to exact equality.
+   */
+  function globMatchesPath(pattern: string, reqPath: string): boolean {
+    if (pattern.endsWith("/*")) {
+      const prefix = pattern.slice(0, -1); // "/mcp/"
+      const base = pattern.slice(0, -2); // "/mcp"
+      return reqPath.startsWith(prefix) || reqPath === base;
+    }
+    // Go path.Match: `*` matches any run of non-`/` characters.
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+    return new RegExp(`^${escaped}$`).test(reqPath);
+  }
+
+  test("every oauth_token rule is path-scoped so public .well-known metadata never mints (issue #246)", () => {
+    const rules = oauthTokenRules(MERGED_YAML);
+    expect(rules).not.toBeNull();
+    expect(rules!.length).toBeGreaterThan(0);
+    // The RFC 8414/9207 discovery endpoints the SDK probes BEFORE any
+    // credential exists (catalog-register.ts probes them; the MCP OAuth SDK
+    // needs them to mint). A rule matching one of these under require: true
+    // 502s the connect (issue #246's symptom).
+    const discoveryPaths = [
+      "/.well-known/oauth-authorization-server",
+      "/.well-known/oauth-protected-resource/mcp",
+    ];
+    for (const rule of rules!) {
+      // Every rule MUST be path-scoped (issue #246): the pre-fix bare-host
+      // rules have no `paths` at all, so this assertion fails red.
+      expect(rulePaths(rule).length, `rule for ${String(rule["host"])} is not path-scoped`).toBeGreaterThan(0);
+      for (const pattern of rulePaths(rule)) {
+        for (const discovery of discoveryPaths) {
+          expect(
+            globMatchesPath(pattern, discovery),
+            `rule for ${String(rule["host"])} scoping "${pattern}" matches discovery ${discovery}`,
+          ).toBe(false);
+        }
+      }
+    }
+  });
+
+  test("the MCP resource path still matches an oauth_token rule for every provider host (minting preserved)", () => {
+    const rules = oauthTokenRules(MERGED_YAML)!;
+    // Every allowlisted OAuth host keeps a rule whose scope covers the
+    // /mcp resource — real API calls stay fail-closed with the minted
+    // token injected.
+    const oauthHosts = MERGED_SNAPSHOTS.filter((s) => s.manifest.credentialSchema.type === "oauth")
+      .flatMap((s) => s.manifest.domains);
+    for (const host of oauthHosts) {
+      const rule = rules.find((r) => String(r["host"]) === host);
+      expect(rule, `no oauth_token rule for ${host}`).toBeDefined();
+      expect(
+        rulePaths(rule!).some((p) => globMatchesPath(p, "/mcp")),
+        `rule for ${host} no longer scopes the /mcp resource`,
+      ).toBe(true);
+    }
+    expect(oauthHosts.length).toBeGreaterThan(0);
+  });
+
+  test("oauth_token entries keep require true (fail-closed minting preserved)", () => {
+    const cfg = parseYamlSubset(MERGED_YAML);
+    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
+    const transforms = cfg["transforms"] as YamlNode[];
+    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
+    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
+    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const token of tokens) {
+      expect(String((token as Record<string, YamlNode>)["require"])).toBe("true");
+    }
+  });
+});
