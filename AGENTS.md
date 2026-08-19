@@ -19,6 +19,7 @@ rule below conflicts with a rule above, the user's explicit instructions win
 - **No speculative infrastructure.** Hooks, callbacks, or abstractions need a
   real consumer. Adding a hook is easy; removing one after code depends on it
   is hard.
+- **Prefer off-the-shelf software over rolling your own** as much as possible. Before hand-writing protocol or infrastructure logic (e.g. OAuth/PKCE/DCR/refresh), check the official `@modelcontextprotocol/sdk` client-auth layer (`OAuthClientProvider`, `selectClientAuthMethod`, `registerClient`, `refreshAuthorization`, RFC 8414/9728 discovery) — it is already a pinned dependency — and implement its seams instead of bespoke code. No new dependency without a stated reason in the commit.
 - **Prompts live in files, not code** (static `.md`, `include_str!`-style)
   when we ship model-visible copy beyond a single line.
 - **`.env` is for secrets only**; behavioral settings go in config files
