@@ -15,12 +15,13 @@
  * STATIC secret file (openai-codex.secret) that the egress secrets
  * transform injects; the proxy never touches auth.openai.com for codex.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
-import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
+import { resolveAuthBrokerConfig } from "@oh-my-pi/pi-coding-agent/session/auth-broker-config";
+import { AuthStorage, REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
 import { oauthTokenBlobFileName } from "../egress/generate";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
@@ -593,9 +594,10 @@ export interface ProxyCredentialSyncOpts {
   /**
    * OAuth vault-row seam (tests + the connect-time reconcile): provider →
    * the newest oauth credential rows (real refresh token locally; sentinel
-   * remotely) + the per-user registered client identity when present
-   * (issue #250). Default: the local AuthStorage (discoverAuthStorage →
-   * listStoredCredentials).
+   * the per-user registered client identity when present
+   * (issue #250). Default: the broker-aware vault reader
+   * (readOAuthRowsFromVault — the broker's own vault db when a broker is
+   * configured, else the embedded local storage, issue #252).
    */
   readOAuthRows?: (provider: string) => Promise<Array<OAuthVaultRow>>;
   /**
@@ -613,7 +615,71 @@ export interface ProxyCredentialSyncOpts {
   log?: (line: string) => void;
 }
 
-/** The default OAuth-row reader: the local AuthStorage (the #198 store). */
+/**
+ * The broker vault's agent dir (issue #252): the broker container runs
+ * with `PI_CONFIG_DIR=/data/.omp` on the shared data volume (compose) /
+ * the `./data` bind (dev), so the connect leg's OAuth rows land in the
+ * broker's OWN SQLite vault at `data/.omp/agent/agent.db` — a DIFFERENT
+ * physical file from the embedded default agent dir (`~/.omp`) the
+ * broker-less reader opens. `BOTTEGA_BROKER_AGENT_DIR` relocates it
+ * (deployments that mount the vault elsewhere; tests point it at a temp
+ * dir so the reconcile can be driven without a real broker).
+ */
+export const BROKER_AGENT_DIR_ENV = "BOTTEGA_BROKER_AGENT_DIR";
+
+/** The broker vault's agent dir relative to the server CWD (the shared data mount). */
+export const BROKER_AGENT_DIR = "data/.omp";
+
+/** The broker vault's agent dir: the override when set, else the project-local data mount. */
+export function brokerAgentDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[BROKER_AGENT_DIR_ENV];
+  return override !== undefined && override !== "" ? override : BROKER_AGENT_DIR;
+}
+
+/**
+ * The default OAuth-row reader (issue #252) for the boot sync and the
+ * connect-time reconcile. When an auth broker IS configured, the connect
+ * leg writes through the broker's `POST /v1/credential` into the
+ * BROKER's own SQLite vault; the broker's snapshot/HTTP surfaces redact
+ * the refresh token to {@link REMOTE_REFRESH_SENTINEL} and never expose
+ * `client_id`, so the seed must read that physical file directly — the
+ * SAME file the connect leg wrote — or a freshly connected provider (e.g.
+ * notion) never seeds. Without a broker the embedded local storage IS the
+ * connect-leg vault, so it stays the fallback. Both routes fail closed
+ * (no usable row → the seed deletes the blob).
+ */
+export async function readOAuthRowsFromVault(provider: string): Promise<Array<OAuthVaultRow>> {
+  const brokerConfig = await resolveAuthBrokerConfig();
+  if (brokerConfig !== null) {
+    return readOAuthRowsFromAgentDb(brokerAgentDirFromEnv(), provider);
+  }
+  return readOAuthRowsFromLocalStorage(provider);
+}
+
+/** Reads the OAuth rows straight from one agent-db DIR (the broker's vault, issue #252). */
+async function readOAuthRowsFromAgentDb(agentDir: string, provider: string): Promise<Array<OAuthVaultRow>> {
+  const dbPath = join(agentDir, "agent.db");
+  // Absent vault → no rows → the seed deletes the blob (fail closed). Do
+  // NOT create the broker's db here (SqliteAuthCredentialStore.open would):
+  // a boot must not materialize the broker's vault.
+  if (!existsSync(dbPath)) return [];
+  const storage = await AuthStorage.create(dbPath);
+  try {
+    await storage.reload();
+    return storage
+      .listStoredCredentials(provider)
+      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.credential)] : []));
+  } finally {
+    storage.close();
+  }
+}
+
+/**
+ * The broker-less OAuth-row reader: the EMBEDDED local AuthStorage (the
+ * #198 store at the default agent dir). Only correct when no broker is
+ * configured — with a broker the connect leg writes a different vault
+ * (see {@link readOAuthRowsFromVault}, issue #252).
+ */
 export async function readOAuthRowsFromLocalStorage(provider: string): Promise<Array<OAuthVaultRow>> {
   const storage = await discoverAuthStorage();
   try {
@@ -682,7 +748,7 @@ export async function seedProxyOAuthBlob(
   },
 ): Promise<ProxyBlobSeedResult> {
   const env = opts.env ?? process.env;
-  const readOAuthRows = opts.readOAuthRows ?? readOAuthRowsFromLocalStorage;
+  const readOAuthRows = opts.readOAuthRows ?? readOAuthRowsFromVault;
   const known = OAUTH_PROXY_CREDENTIALS.find((c) => c.provider === provider);
   const clientIdEnv = opts.clientIdEnv ?? known?.clientIdEnv;
   const clientSecretEnv = opts.clientSecretEnv ?? known?.clientSecretEnv;
@@ -767,7 +833,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
   }
   const fetchVault = opts.fetchVault ?? (() => fetchVaultApiKeysFromEnv(env));
   const readKeychain = opts.readKeychain ?? keychainReaderFromEnv(env);
-  const readOAuthRows = opts.readOAuthRows ?? readOAuthRowsFromLocalStorage;
+  const readOAuthRows = opts.readOAuthRows ?? readOAuthRowsFromVault;
   const control = opts.proxyControl ?? proxyBoundaryControlFromEnv(env);
 
   const vault = await fetchVault();

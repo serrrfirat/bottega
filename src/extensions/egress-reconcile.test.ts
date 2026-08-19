@@ -23,9 +23,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AuthStorage, REMOTE_REFRESH_SENTINEL, type AuthCredential } from "@oh-my-pi/pi-ai";
 import { createReconcileEgress, type ReconcileEgressDeps } from "./egress-reconcile";
 import { type PinnedSnapshot } from "./registry";
 import type { RuntimeExtensionRow } from "../store/db";
+import type { VaultOAuthCredential } from "./proxy-seed";
+import { createVaultTokenStore } from "./mcp-oauth";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -36,6 +39,88 @@ function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), `bottega-${prefix}-`));
   dirs.push(dir);
   return dir;
+}
+
+/** Apply env for the duration of `fn`, restoring the prior values after. */
+async function withEnv(env: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+  const saved = new Map<string, string | undefined>();
+  for (const key of Object.keys(env)) saved.set(key, process.env[key]);
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/**
+ * A hermetic stand-in auth broker (issue #252): an in-process `Bun.serve`
+ * backed by a REAL `AuthStorage` over the given sqlite `agent.db`. It
+ * serves the broker snapshot surface (real refresh tokens REDACTED to
+ * REMOTE_REFRESH_SENTINEL, client identity stripped — the actual broker's
+ * wire behavior) and the `POST /v1/credential` connect leg (writes the
+ * REAL credential into the on-disk vault).
+ */
+async function startFakeBroker(dbPath: string): Promise<{ url: string; token: string; stop: () => Promise<void> }> {
+  const token = "bottega-test-broker-token";
+  const storage = await AuthStorage.create(dbPath);
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (req.method === "GET" && url.pathname === "/v1/snapshot") {
+        const credentials = storage.listStoredCredentials().map((entry) => ({
+          id: entry.id,
+          provider: entry.provider,
+          credential: redactForBroker(entry.credential),
+          identityKey: null,
+          rotatesInMs: null,
+        }));
+        return Response.json({
+          generation: 0,
+          generatedAt: Date.now(),
+          serverNowMs: Date.now(),
+          refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: 0 },
+          credentials,
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/credential") {
+        return (async () => {
+          const body = (await req.json()) as { provider: string; credential: VaultOAuthCredential };
+          storage.upsertCredential(body.provider, body.credential);
+          const entries = storage.listStoredCredentials(body.provider).map((entry) => ({
+            id: entry.id,
+            provider: entry.provider,
+            credential: redactForBroker(entry.credential),
+            identityKey: null,
+          }));
+          return Response.json({ entries });
+        })();
+      }
+      if (url.pathname === "/v1/healthz") return Response.json({ ok: true });
+      return Response.json({ ok: false }, { status: 404 });
+    },
+  });
+  return {
+    url: `http://127.0.0.1:${server.port}`,
+    token,
+    stop: async () => {
+      storage.close();
+      server.stop();
+    },
+  };
+}
+
+/** Mirror the real broker: redact the refresh token + strip client identity off the wire. */
+function redactForBroker(credential: AuthCredential): Record<string, unknown> {
+  if (credential.type !== "oauth") return credential;
+  return { type: "oauth", refresh: REMOTE_REFRESH_SENTINEL, access: credential.access, expires: credential.expires };
 }
 
 /** A committed-pin-style snapshot document (same shape as config/extensions/linear.json). */
@@ -74,6 +159,8 @@ function makeHarness(opts: {
   committed?: Array<[string, PinnedSnapshot]>;
   runtimeRows?: RuntimeExtensionRow[];
   readVaultRows?: (provider: string) => Promise<Array<{ refresh?: string; clientId?: string; clientSecret?: string }>>;
+  /** Leave readVaultRows unset and exercise the production default reader (issue #252). */
+  defaultReader?: boolean;
   env?: NodeJS.ProcessEnv;
   proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
 }): Harness {
@@ -96,7 +183,7 @@ function makeHarness(opts: {
     egressPath,
     devEgressPath,
     proxyControl: opts.proxyControl,
-    readVaultRows: opts.readVaultRows ?? (async () => []),
+    readVaultRows: opts.defaultReader ? undefined : opts.readVaultRows ?? (async () => []),
     env: opts.env,
     log: () => {},
   };
@@ -179,5 +266,124 @@ describe("connect-time egress reconcile (#250)", () => {
     expect(result.warnings.join(" ")).toContain("NOTION_OAUTH_CLIENT_ID");
     expect(result.warnings.join(" ")).toContain("notion-oauth.json");
     expect(existsSync(join(h.secretsDir, "notion-oauth.json"))).toBe(false);
+  });
+
+  test("broker-backed rows seed the blob through the DEFAULT vault reader (issue #252)", async () => {
+    // A freshly connected provider's row lives in the BROKER's vault
+    // (data/.omp/agent/agent.db), NOT the embedded local one — the
+    // reconcile MUST read the same vault the connect leg writes.
+    const brokerDir = tempDir("broker-vault");
+    const dbPath = join(brokerDir, "agent.db");
+    const seeded = await AuthStorage.create(dbPath);
+    const seededRow = {
+      type: "oauth" as const,
+      refresh: "rt-notion-broker",
+      access: "acc-notion",
+      expires: Date.now() + 3_600_000,
+      client_id: "cli_notion_broker",
+      client_secret: "cs_notion_broker",
+    } satisfies VaultOAuthCredential;
+    seeded.upsertCredential("notion", seededRow);
+    seeded.close();
+
+    const broker = await startFakeBroker(dbPath);
+    try {
+      await withEnv(
+        {
+          OMP_AUTH_BROKER_URL: broker.url,
+          OMP_AUTH_BROKER_TOKEN: broker.token,
+          OMP_AUTH_BROKER_SNAPSHOT_TTL_MS: "0",
+          "BOTTEGA_BROKER_AGENT_DIR": brokerDir,
+        },
+        async () => {
+          const h = makeHarness({ committed: [["linear", linear]], defaultReader: true });
+          const result = await h.reconcile("notion");
+          expect(result.warnings).toEqual([]);
+          const blobPath = join(h.secretsDir, "notion-oauth.json");
+          // Defect: the reconcile's default reader read the EMBEDDED local
+          // storage (no broker rows → blob deleted). It must read the broker vault.
+          expect(existsSync(blobPath)).toBe(true);
+          const blob = JSON.parse(readFileSync(blobPath, "utf8")) as {
+            refresh_token?: string;
+            client_id?: string;
+            client_secret?: string;
+          };
+          expect(blob).toEqual({
+            refresh_token: "rt-notion-broker",
+            client_id: "cli_notion_broker",
+            client_secret: "cs_notion_broker",
+          });
+        },
+      );
+    } finally {
+      await broker.stop();
+    }
+  });
+
+  test("round-trip: connect-through-broker save then reconcile seed from ONE vault (issue #252)", async () => {
+    const brokerDir = tempDir("broker-vault");
+    const broker = await startFakeBroker(join(brokerDir, "agent.db"));
+    try {
+      await withEnv(
+        {
+          OMP_AUTH_BROKER_URL: broker.url,
+          OMP_AUTH_BROKER_TOKEN: broker.token,
+          OMP_AUTH_BROKER_SNAPSHOT_TTL_MS: "0",
+          "BOTTEGA_BROKER_AGENT_DIR": brokerDir,
+        },
+        async () => {
+          // The REAL connect leg: save tokens through the broker, which
+          // stores the REAL credential in its own agent.db.
+          const connected = {
+            type: "oauth" as const,
+            refresh: "rt-notion-broker",
+            access: "acc-notion",
+            expires: Date.now() + 3_600_000,
+            client_id: "cli_notion_broker",
+            client_secret: "cs_notion_broker",
+          } satisfies VaultOAuthCredential;
+          await createVaultTokenStore().save("notion", connected);
+
+          // Reconcile with the default (un-injected) vault reader: the SAME
+          // vault the connect leg just wrote.
+            const h = makeHarness({ committed: [["linear", linear]], defaultReader: true });
+            const result = await h.reconcile("notion");
+            expect(result.warnings).toEqual([]);
+            const blobPath = join(h.secretsDir, "notion-oauth.json");
+            expect(existsSync(blobPath)).toBe(true);
+            const blob = JSON.parse(readFileSync(blobPath, "utf8")) as { refresh_token?: string };
+            expect(blob.refresh_token).toBe("rt-notion-broker");
+        },
+      );
+    } finally {
+      await broker.stop();
+    }
+  });
+
+  test("fail-closed with a broker: a never-materialized broker vault still deletes the blob (issue #252)", async () => {
+    // The broker IS configured, but its vault file has never been created
+    // (broker not run yet). The default reader must NOT materialize the
+    // broker's db at reconcile time — it returns no rows and the seed
+    // fails closed exactly like the broker-less route. No broker server
+    // is started: post-fix the reader never talks to the broker.
+    const brokerDir = tempDir("broker-vault-empty");
+    await withEnv(
+      {
+        OMP_AUTH_BROKER_URL: "http://127.0.0.1:1",
+        OMP_AUTH_BROKER_TOKEN: "bottega-absent-broker-token",
+        OMP_AUTH_BROKER_SNAPSHOT_TTL_MS: "0",
+        "BOTTEGA_BROKER_AGENT_DIR": brokerDir,
+      },
+      async () => {
+        const h = makeHarness({ committed: [["linear", linear]], defaultReader: true });
+        const blobPath = join(h.secretsDir, "notion-oauth.json");
+        mkdirSync(h.secretsDir, { recursive: true });
+        writeFileSync(blobPath, JSON.stringify({ refresh_token: "stale" }));
+        await h.reconcile("notion");
+        // The absent-vault reader returned no rows → the seed deleted the
+        // stale blob (fail closed).
+        expect(existsSync(blobPath)).toBe(false);
+      },
+    );
   });
 });

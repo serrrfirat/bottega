@@ -29,7 +29,7 @@ import {
   regenerateDevEgressConfig,
   regenerateEgressConfig,
 } from "../egress/generate";
-import { readOAuthRowsFromLocalStorage, seedProxyOAuthBlob, type OAuthVaultRow } from "./proxy-seed";
+import { readOAuthRowsFromVault, seedProxyOAuthBlob, type OAuthVaultRow } from "./proxy-seed";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { resolve } from "node:path";
@@ -50,7 +50,7 @@ export interface ReconcileEgressDeps {
   devEgressPath?: string;
   /** Proxy secret-file dir; default data/proxy-secrets (PROXY_SECRETS_DIR). */
   secretsDir?: string;
-  /** Vault-row seam; defaults to the local AuthStorage. */
+  /** Vault-row seam; defaults to the broker-aware vault reader (issue #252). */
   readVaultRows?: (provider: string) => Promise<Array<OAuthVaultRow>>;
   /** The env override source for the client-credential fallback; defaults to process.env. */
   env?: NodeJS.ProcessEnv;
@@ -72,7 +72,7 @@ export function createReconcileEgress(
   const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
   const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
   const secretsDir = deps.secretsDir ?? PROXY_SECRETS_DIR;
-  const readVaultRows = deps.readVaultRows ?? readOAuthRowsFromLocalStorage;
+  const readVaultRows = deps.readVaultRows ?? readOAuthRowsFromVault;
   const proxyControl = deps.proxyControl ?? proxyBoundaryControlFromEnv();
   const log = deps.log ?? ((line: string) => console.log(line));
 
