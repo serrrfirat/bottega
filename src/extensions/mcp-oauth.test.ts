@@ -115,6 +115,14 @@ class StubOAuthMcp {
    * persist an empty-refresh credential (issue #256).
    */
   dropRefresh = false;
+  /**
+   * Set false to model a provider whose authorization server does NOT
+   * advertise the `refresh_token` grant (RFC 8414): the connect mint must
+   * NOT append offline_access (no refreshable grant exists to request) and
+   * an exchange that then returns no refresh must still fail closed
+   * (issue #256 variant B).
+   */
+  grantRefresh = true;
 
   constructor() {
     this.server = Bun.serve({
@@ -175,7 +183,7 @@ class StubOAuthMcp {
         scopes_supported: ["default"],
         response_types_supported: ["code"],
         response_modes_supported: ["query"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
+        grant_types_supported: this.grantRefresh ? ["authorization_code", "refresh_token"] : ["authorization_code"],
         token_endpoint_auth_methods_supported: ["none"],
         code_challenge_methods_supported: ["S256"],
       });
@@ -574,7 +582,7 @@ describe("full connect round trip — mint → browser → callback → vault + 
 });
 
 describe("issue #256 — offline_access + a durable refresh token", () => {
-  test("issue #256 mint — the DCR registration AND the authorization URL request offline_access", async () => {
+  test("issue #256 variant A — a server advertising refresh_token: the DCR registration AND the authorization URL request offline_access", async () => {
     const stub = new StubOAuthMcp();
     try {
       const store = freshStore();
@@ -606,7 +614,7 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
     }
   });
 
-  test("issue #256 connect — an exchange that returns NO refresh token fails closed (no empty-refresh credential saved)", async () => {
+  test("issue #256 variant C — an exchange that returns NO refresh token, with no previous row, fails closed (no empty-refresh credential saved)", async () => {
     const stub = new StubOAuthMcp();
     try {
       const store = freshStore();
@@ -640,7 +648,50 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
     }
   });
 
-  test("a fresh connect persists a real refresh token and a subsequent runtime mint rotates it", async () => {
+  test("issue #256 variant B — a server that does NOT advertise refresh_token gets no offline_access, and its no-refresh connect fails closed", async () => {
+    const stub = new StubOAuthMcp();
+    stub.grantRefresh = false; // RFC 8414 metadata lists NO refresh_token grant
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        // (a) The mint must NOT inflate the scope with offline_access: this
+        // server has no refresh grant to hand out, so requesting it would
+        // be meaningless. The SDK's own resolution (resource scope "default")
+        // is left untouched on BOTH the registration and the authorize URL.
+        const mintScope = new URL(minted.authorizationUrl).searchParams.get("scope") ?? "";
+        expect(mintScope).toBe("default");
+        expect(mintScope.split(" ")).not.toContain("offline_access");
+        expect(stub.state.registeredScopes).toHaveLength(1);
+        expect(stub.state.registeredScopes[0]!.split(" ")).not.toContain("offline_access");
+
+        // (b) The exchange then issues NO refresh token (nothing refreshable
+        // was ever requested). The connect must fail closed — an
+        // empty-refresh credential that can never mint is never persisted.
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(500);
+        expect(await done.text()).toContain("failed");
+        expect(vault.saves).toHaveLength(0);
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("issue #256 variant A — a fresh connect persists a real refresh token and a subsequent runtime mint rotates it", async () => {
     const stub = new StubOAuthMcp();
     try {
       const store = freshStore();
