@@ -11,7 +11,7 @@
  *      result, never a silent empty toolset; unknown → error audit, no
  *      execution);
  *   2. POLICY GATE (`evaluatePolicyGate`, shared with the in-process policy
- *      extension and the ACP driver): denied calls never resolve a
+ *      extension and out-of-process surfaces): denied calls never resolve a
  *      credential. The call carries the extensionId so the extension
  *      allowlist (issue #56) decides BEFORE tier/approval; the gate's
  *      `toolTier` seam resolves the manifest tier so an allowed extension

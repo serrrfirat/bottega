@@ -10,8 +10,8 @@
  * `approval.requested` / `approval.resolved` rows.
  *
  * The decision + audit + approval sequence itself lives in the shared
- * policy gate (src/policy/gate.ts, issue #26) so the ACP permission handler
- * makes exactly the same decisions this extension makes.
+ * policy gate (src/policy/gate.ts, issue #26) so every policy surface makes
+ * exactly the same decisions this extension makes.
  */
 import type {
   ExtensionContext,
@@ -71,8 +71,7 @@ export interface PolicyExtensionDeps {
    * resolution, a terminal denied card on denial. The sink is the
    * presenter bridge (SpaceService routes by space id); headless callers
    * omit it. The inline policy extension itself does not emit (its
-   * tool_call interception is inert for restricted sessions — the ACP
-   * driver's own permission seam is a separate surface).
+   * tool_call interception is inert for restricted sessions).
    */
   onToolStep?: ToolStepSink;
 }

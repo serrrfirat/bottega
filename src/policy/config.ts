@@ -73,9 +73,6 @@ export interface PolicyDecision extends ToolDecision {
   autoApproved: boolean;
 }
 
-/** Space-agent driver selected by the org config (`agent.driver`, issue #26). */
-export type AgentDriverName = "acp" | "omp-sdk";
-const DEFAULT_AGENT_DRIVER: AgentDriverName = "omp-sdk";
 /**
  * Per-space response mode (issue #55): when the agent acts at all.
  * - `always`: every non-bot message is a turn (today's behavior).
@@ -279,8 +276,6 @@ export interface PolicyConfig {
   /** Durable object limits from the org config; space overlays cannot change them. */
   objects: { maxSizeBytes: number };
 
-  /** Space-agent driver (`agent.driver` in config.yml, issue #26). Default omp-sdk; acp is opt-in. */
-  agentDriver: AgentDriverName;
   /** Response mode (issue #55): when the space agent acts; org floor default is `always`. */
   responseMode: ResponseMode;
   /**
@@ -332,7 +327,6 @@ export function defaultPolicy(): PolicyConfig {
     learning: { autoExtract: true },
     objects: { maxSizeBytes: DEFAULT_OBJECT_MAX_SIZE_BYTES },
 
-    agentDriver: DEFAULT_AGENT_DRIVER,
     responseMode: DEFAULT_RESPONSE_MODE,
     extensionsAllow: [],
     extensionsDeny: [],
@@ -405,7 +399,7 @@ export function unknownExtensionId(policy: PolicyConfig, knownIds: readonly stri
 
 /**
  * The gate decision for one tool call, shared by every policy surface
- * (in-process extension, ACP permission handler — issue #26): an invalid
+ * (in-process extension, MCP permission handler — issue #26): an invalid
  * policy denies everything, then the extension allowlist (issue #56) when
  * the call belongs to an extension, then the tier × action table applies.
  * The executor's preApproved scope (issue #11) lets an allowlisted exec-tier
@@ -650,18 +644,6 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       }
       for (const key of Object.keys(entries)) {
         if (key !== "auto_extract") policy.warnings.push(`learning.${key}: unknown key ignored`);
-      }
-    } else if (name === "agent") {
-      // Space-agent driver selection (issue #26). The flip is opt-in:
-      // anything unrecognized keeps the safe omp-sdk default with a warning.
-      const driver = scalarOrUndefined(entries.driver);
-      if (driver === "acp" || driver === "omp-sdk") {
-        policy.agentDriver = driver;
-      } else if (entries.driver !== undefined) {
-        policy.warnings.push(`agent.driver: invalid '${driver ?? "<non-scalar>"}' (acp|omp-sdk) — using default omp-sdk`);
-      }
-      for (const key of Object.keys(entries)) {
-        if (key !== "driver") policy.warnings.push(`agent.${key}: unknown key ignored`);
       }
     } else if (name === "extensions") {
       // Extension policy (issue #56): `allow`/`deny` id lists and the

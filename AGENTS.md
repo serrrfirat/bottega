@@ -66,8 +66,7 @@ rule below conflicts with a rule above, the user's explicit instructions win
   loop — not the new private helper. Patterns to reuse:
   `src/server/boot-wiring.test.ts` (real `main()` in a temp cwd),
   `src/server/onboarding-boot.test.ts` (same shape, #116),
-  `src/executor.test.ts` (real store + real git + GitHub emulator), and the
-  fake-ACP fixture (`src/server/drivers/fixtures/fake-acp-server.ts`).
+  `src/executor.test.ts` (real store + real git + GitHub emulator).
   Criteria that genuinely need live infra (real Slack, real model) are never
   silently skipped: they land as a skip-gated leg (`BOTTEGA_RUN_INTEGRATION=1`)
   or a named canary journey, and the PR says which. Reviewer checklist line:
@@ -99,7 +98,7 @@ rule below conflicts with a rule above, the user's explicit instructions win
   reproduce on current `main`, point at the exact line, fix the whole bug
   class including sibling call paths.
 - When an interface changes, enumerate ALL implementations (AgentDriver has
-  two: OMP SDK + ACP) and test doubles.
+  one: OMP SDK, plus test doubles) and their callers.
 - After moves/renames, grep for old paths in code, docs, and config.
 - Update the README/contracts when behavior changes; PR/commit must describe
   every layer touched and note rollback risk.
@@ -167,7 +166,7 @@ used whenever possible:
 1. **Unit** — pure functions, no I/O: policy decision table, normalization
    helpers, validators, state-machine rules.
 2. **Hermetic** — real code paths against local doubles: real SQLite temp
-   DBs, `Bun.serve` stubs, scripted fake ACP servers, emulate.dev emulators.
+   DBs, `Bun.serve` stubs, scripted fake servers, emulate.dev emulators.
    NO external network, NO live services, NO real credentials. **This is the
    default target for every feature.**
 3. **Integration** — real services in Docker (mem0 OSS server, iron-proxy):

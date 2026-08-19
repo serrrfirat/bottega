@@ -1,36 +1,27 @@
 /**
- * Shared AgentDriver conformance suite (issue #173): OMP and ACP held to
- * one contract — every option either honored or loudly rejected, never
- * silently ignored (the #154 fail-open: `allowTools: []` meant "zero tools"
- * but the ACP driver handed out the full toolset).
+ * Shared AgentDriver conformance suite (issue #173): the OMP SDK driver
+ * held to one contract — every option either honored or loudly rejected,
+ * never silently ignored (the #154 fail-open: `allowTools: []` meant "zero
+ * tools" but left the full toolset open).
  *
  * The pattern is `src/memory/conformance.test.ts`: one suite, run by every
  * implementation. `driverConformance(makeHost, capabilities)` registers the
- * suite; each runner (below) supplies a host that drives its driver the way
- * the suite can observe it:
- *
- * - the OMP leg runs the REAL `createOmpSdkDriver` (temp agent dir, no
- *   network) with the SDK session factory injected — the driver's option
- *   plumbing is exercised end to end while a stub SDK session simulates the
- *   turn mechanics hermetically (docs/test-coverage.md gap #1);
- * - the ACP leg runs the driver against the scripted fake ACP server
- *   (real child process, real stdio JSON-RPC).
+ * suite; each runner supplies a host that drives its driver the way the
+ * suite can observe it. The OMP leg runs the REAL `createOmpSdkDriver`
+ * (temp agent dir, no network) with the SDK session factory injected — the
+ * driver's option plumbing is exercised end to end while a stub SDK
+ * session simulates the turn mechanics hermetically
+ * (docs/test-coverage.md gap #1).
  *
  * `capabilities` is the driver's claim: supported → the suite asserts the
  * option is HONORED; unsupported → the suite asserts a loud `unsupported`
  * rejection. That forces #154's capability decision into the interface.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentSession, CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent";
-import { createAudit } from "../../policy/audit";
-import { DenyRouter } from "../../policy/approval-router";
-import { loadSpacePolicy, parseOrgConfigYaml } from "../../policy/config";
-import { createStore } from "../../store/db";
-import { POLICY_DECISION_EVENT } from "../../store/audit-events";
-import { createAcpDriver, type AcpPolicyContext } from "./acp-driver";
 import {
   createOmpSdkDriver,
   sessionFilePath,
@@ -71,7 +62,7 @@ export interface DriverConformanceCapabilities {
 /**
  * Per-leg harness. The suite drives the driver through the public
  * AgentSessionDriver surface plus the observation seams a leg can provide
- * (the OMP injected-factory capture; the ACP wire log).
+ * (the OMP injected-factory capture; the wire log).
  */
 export interface ConformanceHost {
   /** A fresh driver instance for this test. */
@@ -84,12 +75,12 @@ export interface ConformanceHost {
   spaceId: string;
   /**
    * The exact options the driver passed to its underlying session factory
-   * (OMP's injected createSession seam), or null when unobservable (ACP).
+   * (OMP's injected createSession seam), or null when unobservable.
    */
   capturedOptions(): CreateAgentSessionOptions | null;
   /** The tool allowlist the driver passed to the underlying session, or null when unobservable. */
   sessionToolNames(): readonly string[] | null;
-  /** The underlying agent's wire log (ACP fake-server log), or null. */
+  /** The underlying agent's wire log, or null when the leg surfaces none. */
   wireLog(): string | null;
   /** Resolve once the underlying agent logged `needle`; reject on timeout. */
   waitForWire?(needle: string, timeoutMs?: number): Promise<void>;
@@ -197,8 +188,8 @@ export function driverConformance(makeHost: () => ConformanceHost, capabilities:
           // OMP: the directive reaches the SDK session's appendSystemPrompt.
           expect(captured.appendSystemPrompt).toBe(DIRECTIVE);
         } else if (host.waitForWire) {
-          // ACP: the directive rides the first prompt's text (the only ACP
-          // channel that reaches the agent's context).
+          // Hosts without an appendSystemPrompt channel ride the directive
+          // on the first prompt's text.
           await host.prompt(session, "hi");
           await host.waitForWire(DIRECTIVE);
         }
@@ -250,9 +241,9 @@ export function driverConformance(makeHost: () => ConformanceHost, capabilities:
       session.on("error", (data) => errors.push(data));
       const { finish } = await host.beginStreamingTurn(session, "first");
       expect(session.isStreaming()).toBe(true);
-      // Both behaviors resolve while the turn is in flight: followUp queues
-      // (ACP) or dispatches the SDK follow-up (OMP); steer dispatches the SDK
-      // steer (OMP) or queues identically (ACP has no steer primitive).
+      // Both behaviors resolve while the turn is in flight: followUp and
+      // steer dispatch through the SDK; hosts without a dispatch primitive
+      // queue them identically.
       await session.prompt("second", { streamingBehavior: "followUp" });
       await session.prompt("third", { streamingBehavior: "steer" });
       await finish();
@@ -331,7 +322,7 @@ export function driverConformance(makeHost: () => ConformanceHost, capabilities:
         // OMP: the SDK session manager runs in the requested cwd.
         expect(captured.cwd).toBe(cwd);
       } else if (host.waitForWire) {
-        // ACP: session/new carries the requested cwd to the agent.
+        // session/new carries the requested cwd to the agent.
         await host.waitForWire(JSON.stringify(cwd));
       }
       await session.dispose();
@@ -391,8 +382,8 @@ export function driverConformance(makeHost: () => ConformanceHost, capabilities:
       try {
         await host.prompt(session, "boom");
       } catch {
-        // The prompt may reject (ACP child crash) or resolve with the error
-        // surfaced on the event channel (OMP notice) — the event is the contract.
+        // The prompt may reject (child crash) or resolve with the error
+        // surfaced on the event channel — the event is the contract.
       }
       expect(errors.length).toBeGreaterThanOrEqual(1);
       expect(errors[0]).toMatchObject({ spaceId: host.spaceId });
@@ -660,138 +651,5 @@ function makeOmpHost(): ConformanceHost {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Runner 2: the ACP driver against the scripted fake ACP server.
-// ---------------------------------------------------------------------------
+driverConformance(makeOmpHost, OMP_CAPABILITIES);
 
-const ACP_CAPABILITIES: DriverConformanceCapabilities = {
-  // ACP v1 has no tool-restriction field — an allowTools request that
-  // narrows the space-agent allowlist throws unsupported (honored-or-throws).
-  allowTools: false,
-  // The request-only directive rides the first prompt's text.
-  appendSystemPrompt: true,
-  silent: true,
-  // No steer primitive: mid-turn prompts queue behind the in-flight turn.
-  streamingBehavior: true,
-  principal: true,
-  // setModelRole reports not-supported through the documented result.
-  setModelRole: true,
-  // Per-space model settings are meaningless (no mid-session switches) —
-  // createSession throws unsupported rather than drop the option.
-  getModelSettings: false,
-  // The driver materializes the session file like the OMP driver.
-  transcript: true,
-};
-
-const ACP_FIXTURE = join(import.meta.dir, "fixtures", "fake-acp-server.ts");
-
-function makeAcpHost(): ConformanceHost {
-  const dir = mkdtempSync(join(tmpdir(), "acp-conformance-"));
-  const logfile = join(dir, "server.log");
-  const transcriptDir = join(dir, "sessions");
-  const spaceId = "slack:CONFORMANCE";
-
-  function createDriverFor(args: string[], policy?: AcpPolicyContext): AgentDriver {
-    return createAcpDriver({ command: "bun", args, sessionTimeoutMs: 5_000, policy });
-  }
-
-  const happyArgs = ["run", ACP_FIXTURE, "happy", logfile];
-  const crashArgs = ["run", ACP_FIXTURE, "crash", logfile];
-
-  // The ACP leg drives a REAL child process (the scripted fake server) over
-  // real stdio — its clock cannot be faked, so wire-assertions poll the log
-  // the child appends (same pattern as acp-driver.test.ts's waitForLog).
-  const waitForWire = async (needle: string, timeoutMs = 4_000): Promise<void> => {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (readFileSync(logfile, "utf8").includes(needle)) return;
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    throw new Error(`timed out waiting for wire needle: ${needle}\nlog:\n${readFileSync(logfile, "utf8")}`);
-  };
-  const wireLog = (): string | null => (existsSync(logfile) ? readFileSync(logfile, "utf8") : null);
-
-  return {
-    createDriver: () => createDriverFor(happyArgs),
-    createFailingDriver: () => createDriverFor(crashArgs),
-    transcriptDir,
-    spaceId,
-    capturedOptions: () => null,
-    sessionToolNames: () => null,
-    wireLog,
-    waitForWire,
-    prompt: async (session, text, opts) => {
-      await session.prompt(text, opts);
-    },
-    beginStreamingTurn: async (session, text, opts) => {
-      const p = session.prompt(text, opts);
-      // The fake server streams its first chunk quickly; the turn stays in
-      // flight until the agent answers the prompt.
-      await waitForWire('"text":"Hello, "');
-      return {
-        firstChunk: Promise.resolve(),
-        finish: async () => {
-          await p;
-        },
-      };
-    },
-    assertGetPrincipalConsumed: async () => {
-      const policyDir = mkdtempSync(join(tmpdir(), "acp-principal-"));
-      const store = createStore(join(policyDir, "test.db"));
-      const audit = createAudit(store);
-      const orgPolicy = parseOrgConfigYaml("tools:\n  read: allow\n  unknown: deny\n");
-      const permissionArgs = [
-        "run",
-        ACP_FIXTURE,
-        "permission",
-        logfile,
-        JSON.stringify({ toolCall: { toolCallId: "c1", title: "Read", kind: "read", rawInput: { path: "/x" } } }),
-      ];
-      const driver = createDriverFor(permissionArgs, {
-        orgPolicy,
-        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
-        audit,
-        router: DenyRouter,
-      });
-      const session = await driver.createSession({
-        spaceId,
-        transcriptDir,
-        onOutput: () => {},
-        // The space's current principal (issue #42): ACP consumes it as the
-        // permission-gate actor — proof the option is honored, not dropped.
-        getPrincipal: () => "U9",
-      });
-      await waitForWire('"outcome":"selected","optionId":"allow_once"');
-      await session.dispose();
-      const deadline = Date.now() + 2_000;
-      let row: { actor: string | null; payload: string } | null = null;
-      while (Date.now() < deadline) {
-        const rows = await audit.listAudit({ event_type: POLICY_DECISION_EVENT });
-        if (rows.length > 0) {
-          row = rows.at(-1)!;
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      expect(row).not.toBeNull();
-      expect(row!.actor).toBe("U9");
-      // SAFETY: the ACP permission path audits POLICY_DECISION_EVENT rows with
-      // {tool, tier, decision, reason, args} payloads (audit-events.ts); this
-      // test only reads tool and decision.
-      expect(JSON.parse(row!.payload) as { tool: string; decision: string }).toMatchObject({ tool: "read", decision: "allow" });
-      store.close();
-      rmSync(policyDir, { recursive: true, force: true });
-    },
-    cleanup: async () => {
-      rmSync(dir, { recursive: true, force: true });
-    },
-  };
-}
-
-describe("driver conformance — OMP SDK driver", () => {
-  driverConformance(makeOmpHost, OMP_CAPABILITIES);
-});
-
-describe("driver conformance — ACP driver (fake server)", () => {
-  driverConformance(makeAcpHost, ACP_CAPABILITIES);
-});

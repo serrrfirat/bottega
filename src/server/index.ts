@@ -31,7 +31,6 @@ import { sendMessageAction } from "../scheduler/send-message";
 import { kbIngestAction } from "../scheduler/kb-ingest";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
-import { createAcpDriver } from "./drivers/acp-driver";
 import { connectViaAuthBroker } from "../extensions/connect";
 import type { CatalogRegisterDeps } from "../extensions/catalog-register";
 import { storeRuntimeRegistrySeam } from "../extensions/runtime-registry";
@@ -74,7 +73,6 @@ import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 /**
  * Project-local OMP agent dir (issue #9). Per-deployment agent config
@@ -597,53 +595,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const createDriver =
     opts.createDriver ??
     ((agentDir: string) => {
-      // Org config selects the space-agent driver (issue #26): `acp` flips
-      // the space agent to the ACP driver — policy enforced over
-      // session/request_permission with audit, memory tools attached as an
-      // MCP server. Default `omp-sdk` keeps the in-process extensions
-      // (deep interception); the flip is opt-in via config until proven.
-      if (orgPolicy.agentDriver === "acp") {
-        return createAcpDriver({
-          mcpServers: [
-            {
-              name: "bottega",
-              command: process.execPath,
-              args: ["run", fileURLToPath(new URL("../mcp/server.ts", import.meta.url))],
-              env: {
-                BOTTEGA_DB_PATH: process.env.BOTTEGA_DB_PATH ?? "data/bottega.db",
-                BOTTEGA_CONFIG_DIR: process.env.BOTTEGA_CONFIG_DIR ?? process.cwd(),
-                // Absolute because ACP starts the MCP child from the session workspace.
-                BOTTEGA_SESSION_DIR: join(process.cwd(), "data/sessions"),
-                // The MCP server boots the same extension registry (issue
-                // #61) so ACP agents see connect_extension + extension
-                // tools; the driver absolutizes the relative path because
-                // the spawned server runs with the agent session's cwd.
-                BOTTEGA_EXTENSIONS_DIR: "config/extensions",
-                // Issue #196: the ACP child's connect_upload_link mint
-                // shares the server's upload_tokens table and points at
-                // the SERVER process's upload endpoint. BOTTEGA_UPLOAD_BASE_URL
-                // is the LOOPBACK fallback (the shared listener's URL) —
-                // the PUBLIC base is BOTTEGA_OAUTH_CALLBACK_BASE_URL below,
-                // which the child HEALTH-CHECKS at mint time (issue #211: a
-                // dead tunnel URL must never reach a user as a minted link).
-                BOTTEGA_UPLOAD_BASE_URL: oauthCallback.baseUrl,
-                // Issue #198: same for hosted OAuth MCPs — the child's
-                // connect mint shares the server's oauth_flows table and
-                // points the authorization redirect at the SERVER's OAuth
-                // callback endpoint (the same PUBLIC base — one ingress
-                // serves both legs on one stable port).
-                BOTTEGA_OAUTH_CALLBACK_BASE_URL: uploadPublicBase ?? oauthCallback.baseUrl,
-              },
-            },
-          ],
-          policy: {
-            orgPolicy,
-            loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
-            audit,
-            router: approvalRouter,
-          },
-        });
-      }
       return createOmpSdkDriver({
         agentDir,
         // Registry tools (issue #50): typed extension tools ride the SDK
@@ -738,12 +689,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // Boot-time guard (issue #80): createOmpSdkDriver installs the agent dir
   // as the process-global dir at construction; fail the boot here — not the
   // first prompt — when the SDK's model registry then resolves no available
-  // model from OUR models.yml. The ACP driver resolves models in its own
-  // MCP server, not through the OMP registry, so the guard is OMP-only.
-  if (orgPolicy.agentDriver !== "acp") {
-    const available = await assertAgentDirModelAvailable(agentDir);
-    console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
-  }
+  // model from OUR models.yml.
+  const available = await assertAgentDirModelAvailable(agentDir);
+  console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
   let consolidationSequence = 0;
   const consolidationModelCall: ConsolidationModelCall = async (systemPrompt, input) => {
     let reply: string | undefined;
@@ -765,11 +713,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         const text = z.object({ text: z.string().optional() }).safeParse(data);
         if (text.success && text.data.text && text.data.text.trim()) reply = text.data.text;
       });
-      // ACP v1 has no system-prompt field, so carry the instructions in-band
-      // on that driver while OMP receives them through appendSystemPrompt.
-      await sideSession.prompt(
-        orgPolicy.agentDriver === "acp" ? `${systemPrompt}\n\n${input}` : input,
-      );
+      await sideSession.prompt(input);
       return reply;
     } finally {
       offMessage?.();

@@ -243,7 +243,7 @@ echo "auth-broker: ready (vault token at data/.omp/auth-broker.token, 0600)"
 #    at the tunnel, NO_PROXY for internal names, the MITM CA for Bun/Node
 #    TLS, and the boundary control URL/token (authorize writes the secret
 #    file AND reloads the proxy). The BOTTEGA_* vars reach the server
-#    process and the ACP driver's spawned MCP server via the environment.
+#    process and the standalone MCP server via the environment.
 #    The #126 temporary NO_PROXY bypass is REVERTED: the dev proxy runs the
 #    permissive config (allow-all + no judge), so routing the server's core
 #    traffic (Slack, model endpoints, web search) through it is harmless and

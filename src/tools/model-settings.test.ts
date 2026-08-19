@@ -326,12 +326,12 @@ describe("use_model", () => {
     expect(await s.listAudit({ event_type: MODEL_SWITCHED_EVENT })).toHaveLength(0);
   });
 
-  test("surfaces the driver's not-supported result (ACP path)", async () => {
+  test("surfaces the driver's not-supported result when the session omits setModelRole", async () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C8" });
     const registry = new SessionModelRoleRegistry();
-    // A session WITHOUT the optional setModelRole hook: the registry is what
-    // the ACP driver would be if it omitted the hook entirely.
+    // A session WITHOUT the optional setModelRole hook: the registry still
+    // reports the not-supported result through the documented channel.
     const plain: AgentSessionDriver = {
       prompt: async () => {},
       abort: async () => {},

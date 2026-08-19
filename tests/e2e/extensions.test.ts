@@ -1,21 +1,21 @@
 /**
- * Journey 3 (issue #66): Extensions + policy + ACP.
+ * Journey (issue #66): Extensions + policy.
  *
  * User journeys over REAL bottega components with emulated boundaries, per
  * the issue #66 harness contract:
  *
  *   real:     SQLite store (temp file), policy (org floor + space overlay),
  *             audit trail, connect capability, extension runtime, policy
- *             gate, Slack-backed approval router, ACP driver, space-service
+ *             gate, Slack-backed approval router, space-service
  *             connect-intent seam.
  *   emulated: auth broker (scripted RecordingBroker), extension MCP
- *             transport (in-memory stub), ACP server (scripted fake stdio
- *             server), Slack message surface (recording adapter).
+ *             transport (in-memory stub), Slack message surface (recording
+ *             adapter).
  *
  * The harness contract (tests/e2e/harness.ts, issue #66) is the same shape;
  * while it is not on main yet this file carries a minimal local fixture and
- * merges into the shared harness when it lands. The ACP fake server and the
- * stub MCP transport are journey-local boundaries by contract.
+ * merges into the shared harness when it lands. The stub MCP transport is a
+ * journey-local boundary by contract.
  *
  * Coverage:
  *   1. connect as me — user message → connect intent → connect_extension
@@ -25,12 +25,10 @@
  *   3. extension tool call — runtime through the stub MCP transport with
  *      the credential ladder (org / me / auto) and the policy gate
  *      (deny-before-tier: an extension outside the space allowlist denies
- *      before any credential resolution) + audit rows;
- *   4. ACP driver — permission round-trip against the fake ACP server:
- *      allow / deny / unknown through the shared gate.
+ *      before any credential resolution) + audit rows.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -58,15 +56,13 @@ import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { SpaceService } from "../../src/server/services/space-service";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import type { AgentDriver, AgentSessionDriver } from "../../src/server/drivers/agent-driver";
-import { createAcpDriver, type AcpPolicyContext } from "../../src/server/drivers/acp-driver";
 import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAdapter } from "../../src/server/adapters/slack";
 import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
 
 // ---------------------------------------------------------------------------
 // Local harness (mirrors the issue #66 contract until tests/e2e/harness.ts
 // lands; the shared harness then owns the store/adapter/space-service and
-// this file keeps only its journey-local boundaries: broker, MCP transport,
-// fake ACP server).
+// this file keeps only its journey-local boundaries: broker, MCP transport).
 // ---------------------------------------------------------------------------
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-e2e-ext-"));
@@ -88,9 +84,9 @@ function parse(row: AuditRow): JsonObject {
   return JSON.parse(row.payload) as JsonObject;
 }
 
-// Polls a condition on real time because the awaited signals live in other
-// processes or on the adapter wire (the fake ACP server's logfile, the
-// approval router's posted message) — fake timers cannot drive them.
+// Polls a condition on real time because the awaited signals live on the
+// adapter wire (the approval router's posted message) — fake timers cannot
+// drive them.
 async function waitFor(fn: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -574,94 +570,5 @@ describe("journey 3: extension tool call through the runtime (stub MCP transport
 
     expect(result.ok).toBe(true);
     expect(h.boundary.calls).toEqual([personal]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 3. ACP driver permission round-trip (issue #26) against the scripted fake
-//    ACP server — the shared policy gate answers allow/deny/unknown.
-// ---------------------------------------------------------------------------
-
-const ACP_FIXTURE = join(import.meta.dir, "..", "..", "src", "server", "drivers", "fixtures", "fake-acp-server.ts");
-let acpRun = 0;
-
-/**
- * Boots the real ACP driver against the fake ACP server's "permission"
- * scenario with a real store/audit/policy context, waits for the driver's
- * permission response on the wire, disposes the session, and returns the
- * store for audit assertions.
- */
-async function acpPermissionRoundTrip(opts: {
-  orgYaml: string;
-  /** JSON override for the fake server's toolCall (undefined = default execute → bash). */
-  override?: JsonObject;
-  /** The optionId the driver must answer with. */
-  expectedOption: string;
-}): Promise<Store> {
-  const store = freshStore();
-  const audit = createAudit(store);
-  const orgPolicy = parseOrgConfigYaml(opts.orgYaml);
-  const policy: AcpPolicyContext = {
-    orgPolicy,
-    loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
-    audit,
-    router: DenyRouter,
-  };
-  const logfile = join(dir, `acp-permission-${acpRun++}.log`);
-  const args = [ACP_FIXTURE, "permission", logfile];
-  if (opts.override) args.push(JSON.stringify(opts.override));
-  const driver = createAcpDriver({
-    command: "bun",
-    args: ["run", ...args],
-    sessionTimeoutMs: 10_000,
-    policy,
-  });
-  const session = await driver.createSession({
-    spaceId: "slack:C1",
-    transcriptDir: join(dir, "sessions"),
-    onOutput: () => {},
-  });
-  try {
-    // The response line is the wire proof the gate answered: it only appears
-    // once the driver evaluated the policy and wrote the audit rows.
-    await waitFor(() => readFileSync(logfile, "utf8").includes(`"outcome":"selected","optionId":"${opts.expectedOption}"`), 10_000);
-  } finally {
-    await session.dispose();
-  }
-  return store;
-}
-
-describe("journey 3: ACP driver permission round-trip (fake ACP server)", () => {
-  test("allowed tool → allow_once and the policy.decision audit row", async () => {
-    const store = await acpPermissionRoundTrip({
-      orgYaml: "tools:\n  read: allow\n",
-      override: {
-        toolCall: { toolCallId: "c1", title: "Read file", kind: "read", rawInput: { path: "/x" } },
-      },
-      expectedOption: "allow_once",
-    });
-    const decisions = await store.listAudit({ event_type: POLICY_DECISION_EVENT });
-    expect(parse(decisions.at(-1)!)).toMatchObject({ tool: "read", tier: "read", decision: "allow" });
-  });
-
-  test("denied tool → reject_once and the audit row", async () => {
-    const store = await acpPermissionRoundTrip({
-      orgYaml: "tools:\n  bash: deny\n",
-      expectedOption: "reject_once",
-    });
-    const decisions = await store.listAudit({ event_type: POLICY_DECISION_EVENT });
-    expect(parse(decisions.at(-1)!)).toMatchObject({ tool: "bash", tier: "exec", decision: "deny" });
-  });
-
-  test("unknown tool kind → reject_once (fail closed)", async () => {
-    const store = await acpPermissionRoundTrip({
-      orgYaml: "tools:\n  unknown: allow\n",
-      override: {
-        toolCall: { toolCallId: "c1", title: "Think", kind: "think", rawInput: {} },
-      },
-      expectedOption: "reject_once",
-    });
-    const decisions = await store.listAudit({ event_type: POLICY_DECISION_EVENT });
-    expect(parse(decisions.at(-1)!)).toMatchObject({ tool: "think", decision: "deny" });
   });
 });

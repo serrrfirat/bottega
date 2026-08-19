@@ -43,8 +43,7 @@ export const DenyRouter: ApprovalRouter = {
 /**
  * Resolves on the first of: router resolution, router failure (deny),
  * timeout (deny). Shared by every policy surface (in-process extension and
- * the ACP permission handler, issue #26) so ask-human can never hang a
- * tool call.
+ * permission handlers, issue #26) so ask-human can never hang a tool call.
  */
 export function requestWithTimeout(
   router: ApprovalRouter,

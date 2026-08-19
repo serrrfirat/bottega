@@ -66,8 +66,9 @@ config files or server restart:
 
 Both model tools are write-tier, so they prompt for approval in non-yolo
 policy modes. Live switching and work-item pins use the OMP driver's
-per-session hooks. ACP v1 has no model-switch message: it rejects unsupported
-settings or narrowing instead of pretending to apply them (#173).
+per-session hooks. A driver without a model-switch message rejects
+unsupported settings or narrowing instead of pretending to apply them
+(#173).
 
 ## BYO Codex (ChatGPT subscription) — issue #214
 
@@ -353,9 +354,9 @@ clients.
   provider wire call once through the runtime. Provider `isError` results
   stay errors instead of inviting a blind retry.
 - **Agent-agnostic tools** — the bottega MCP server advertises
-  `connect_extension` plus the effective extension surface to OMP, ACP, or
-  future agents. Calls execute server-side through the same policy gate,
-  credential ladder, egress boundary, and audit (#61/#172).
+  `connect_extension` plus the effective extension surface to any MCP
+  client or future agent. Calls execute server-side through the same policy
+  gate, credential ladder, egress boundary, and audit (#61/#172).
 - **Curated CLI set** (issues #58, #62, #63) — `kind: "cli"` extensions run
   curated, preinstalled CLIs from the tools image (zero client code, no
   SDK): GitHub/ops `gh`, `jq`, `curl`, `git`, `glab`, `yq` (v4),
@@ -688,9 +689,9 @@ opened a DM with the bot once (or the canary opens it via
   DMs always use a normal top-level bot message. Supported channel
   workspaces may still use `chat.startStream`; unsupported or failed
   streams use the normal phrase + edit path (#180/#181).
-- **No mid-session model switches on ACP** — OMP supports `use_model`; ACP
-  v1 reports model settings/switching it cannot honor, and rejects
-  `allowTools` narrowing (#173).
+- **No mid-session model switches off-SDK** — OMP supports `use_model`; a
+  driver without it reports model settings/switching it cannot honor, and
+  rejects `allowTools` narrowing (#173).
 - **No automatic model router** — semantic pickup can derive an explicitly
   requested model/effort pin, but there is no model-based complexity
   classifier. The agent or human chooses a role/model.
@@ -704,4 +705,4 @@ opened a DM with the bot once (or the canary opens it via
   durable outbox (#187) and per-job isolation — epic #170.
 - Telegram adapter (grammY, long polling) — #13.
 - Roles (explicit approvers) and SSO.
-- A second non-OMP engine through the already-wired ACP driver.
+- A second non-OMP engine through the AgentSessionDriver seam.

@@ -5,10 +5,9 @@
  *
  * Every test spawns the real entrypoint (`src/mcp/server.ts`) as a child
  * process with a temp DB + temp config dir, and drives it with the official
- * MCP TypeScript client over the stdio transport — the same transport the
- * agent's MCP client uses when bottega attaches the server to an ACP
- * session. No ports, no global state; each test cleans up its process, DB,
- * and temp dir.
+ * MCP TypeScript client over the stdio transport — the same transport an
+ * agent's MCP client uses to reach a stdio MCP server. No ports, no global
+ * state; each test cleans up its process, DB, and temp dir.
  */
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -355,6 +354,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
         "model_settings",
         "session_search",
         "work_item_cancel",
+        "write_space_skill",
       ]);
 
       const connect = tools.find((t) => t.name === "connect_extension")!;
@@ -399,7 +399,8 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect((createWorkItem.description ?? "").length).toBeGreaterThan(0);
       // SAFETY: create_work_item's omptype zod schema emits properties as JSON-schema objects with optional type/enum.
       const createProps = createWorkItem.inputSchema.properties as Record<string, { type?: string; enum?: string[] }>;
-      expect(Object.keys(createProps).sort()).toEqual(["delivery", "description", "model", "reasoning_effort", "repo", "requester"]);
+      // skills (issues #234/#235): the explicit task-level skill pins.
+      expect(Object.keys(createProps).sort()).toEqual(["delivery", "description", "model", "reasoning_effort", "repo", "requester", "skills"]);
       expect(createProps.description?.type).toBe("string");
       expect(createProps.delivery?.enum).toEqual(["git", "extension", "chat"]);
       expect(createWorkItem.inputSchema.required).toEqual(["description"]);
@@ -598,6 +599,7 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "session_search",
         FIXTURE_EXTENSION_TOOL,
         "work_item_cancel",
+        "write_space_skill",
       ]);
 
       const weather = tools.find((t) => t.name === FIXTURE_EXTENSION_TOOL)!;
@@ -712,7 +714,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         brokerCredentialId: 7,
       });
 
-      // The ACP agent sees the FULL discovered surface (namespaced names),
+      // The MCP client sees the FULL discovered surface (namespaced names),
       // never an empty toolset.
       const listed = await h.client.listTools();
       const names = listed.tools.map((tool) => tool.name);
@@ -998,7 +1000,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         // hand-written mirror to drift.
         expect(advertised!.inputSchema).toEqual(definitionJsonSchema(definition));
       }
-      // use_model stays SDK-session-only: ACP sessions cannot switch models
+      // use_model stays SDK-session-only: MCP sessions cannot switch models
       // mid-session (the agent's own config governs there, issue #64).
       expect(advertisedByName["use_model"]).toBeUndefined();
     } finally {

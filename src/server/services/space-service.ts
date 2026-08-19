@@ -78,8 +78,8 @@ export interface SpaceServiceDeps {
    * Connect capability (issue #61): when wired, inbound messages matching
    * the narrow connect patterns ({@link parseConnectIntent}) route directly
    * to the connect capability — no agent tool call, no session. Works
-   * identically for OMP, ACP, and any future surface; humans never depend
-   * on the agent having the tool. Everything else stays agent territory.
+   * identically for OMP and any future surface; humans never depend on the
+   * agent having the tool. Everything else stays agent territory.
    */
   connect?: ConnectExtensionDeps;
   /**

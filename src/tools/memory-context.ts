@@ -24,9 +24,6 @@
  *    budget-capped by entries (maxEntries, default 5) and bytes (maxBytes,
  *    default 4096). Entries are deduped by content; org and user hits share
  *    the budget.
- *
- * ACP path: documented only — ACP agents reach memory through the MCP tools
- * (issue #25); the ACP driver cannot hook their context.
  */
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";

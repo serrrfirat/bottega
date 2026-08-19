@@ -104,7 +104,7 @@ export interface ConnectExtensionDriverOpts {
 
 /**
  * Minimal agent-session abstraction. SpaceService depends only on this — the
- * concrete driver (OMP SDK today, ACP later) owns all session mechanics.
+ * concrete driver (the OMP SDK) owns all session mechanics.
  */
 export interface AgentTurnOptions {
   streamingBehavior?: "steer" | "followUp";
@@ -156,17 +156,17 @@ export interface AgentSessionDriver {
    * The session's live todo plan (issue #228): the pull half of the todo
    * read seam. OMP sessions delegate to the SDK's AgentSession
    * (getTodoPhases — the state the `todo` tool writes, restored from the
-   * transcript across cold starts). ACP v1 has no todo transport: the ACP
-   * driver returns an empty plan (no active plan is normal, never an
-   * error). The push half is the `todo_phases` driver event, emitted when
-   * the SDK finishes a todo operation.
+   * transcript across cold starts). Absent a todo transport, a driver
+   * returns an empty plan (no active plan is normal, never an error). The
+   * push half is the `todo_phases` driver event, emitted when the SDK
+   * finishes a todo operation.
    */
   getTodoPhases(): TodoPhase[];
   /**
    * Optional per-session model-role switch (issue #64): applies the role for
    * the NEXT turn. Optional on purpose — the interface stays
-   * backward-compatible, and drivers that cannot switch mid-session (ACP:
-   * the agent's own config governs) simply omit it or return a
+   * backward-compatible, and drivers that cannot switch mid-session
+   * (the agent's own config governs) simply omit it or return a
    * not-supported result. The `use_model` tool reaches this through the
    * live-session registry (SessionModelRoleRegistry).
    */
@@ -176,7 +176,7 @@ export interface AgentSessionDriver {
    * against the CURRENT org/space settings so a settings change takes
    * effect on the very next turn — no session restart. The caller (space
    * service) invokes this BEFORE opening a fresh turn; drivers that cannot
-   * switch mid-session (ACP) omit it and the caller skips it. Best-effort:
+   * switch mid-session omit it and the caller skips it. Best-effort:
    * failures are logged and the turn proceeds on the current model.
    */
   reapplyDefaultModelRole?(): Promise<void>;
@@ -204,8 +204,7 @@ export interface AgentDriver {
     allowTools?: readonly string[];
     /**
      * The space's current principal, re-read on every LLM call (issue #42).
-     * Consumed by the OMP driver's memory-context injection; ACP sessions
-     * reach memory through the MCP tools (#25) and ignore it (documented).
+     * Consumed by the OMP driver's memory-context injection.
      */
     getPrincipal?: () => string | undefined;
     /**
@@ -224,8 +223,7 @@ export interface AgentDriver {
      * Skills (issues #234/#235): already-loaded {@link Skill}s to inject
      * into this session, e.g. a space's authored skills or a work item's
      * task-level pins. The OMP driver hands them to `createAgentSession` so
-     * `skill://<name>` resolves inside the session. The ACP driver cannot
-     * accept injection and throws (honored-or-throws, like `allowTools`).
+     * `skill://<name>` resolves inside the session.
      */
     skills?: readonly Skill[];
   }): Promise<AgentSessionDriver>;
@@ -263,7 +261,7 @@ export class SessionModelRoleRegistry {
     if (!session.setModelRole) {
       return {
         ok: false,
-        error: "this agent driver does not support mid-session model switches (ACP sessions use the agent's own config)",
+        error: "this agent driver does not support mid-session model switches (the agent's own config governs them)",
       };
     }
     return { ok: true, result: await session.setModelRole(role) };
@@ -335,17 +333,16 @@ export interface DriverEventData {
    * The session's live todo snapshot (`todo_phases` events, issue #228):
    * emitted when the SDK's todo tool finishes an operation (the push path
    * of the driver's todo read seam). The OMP driver carries the phases the
-   * tool result reported; the ACP driver never emits it (ACP v1 has no
-   * todo transport — its getTodoPhases returns an empty plan).
+   * tool result reported.
    */
   phases?: TodoPhase[];
 }
 
 /**
  * The listener plumbing behind {@link AgentSessionDriver.on} (issue #33).
- * The OMP and ACP drivers share identical event semantics, so the emitter
- * lives here once: typed by event name, idempotent `on` (a listener
- * registers once), and unsubscribe-by-closure.
+ * Driver event semantics are shared, so the emitter lives here once: typed
+ * by event name, idempotent `on` (a listener registers once), and
+ * unsubscribe-by-closure.
  */
 export function createEmitter<Event extends string>() {
   const listeners = new Map<Event, Set<(data: DriverEventData) => void>>();

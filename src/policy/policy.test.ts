@@ -328,30 +328,9 @@ memory:
     }
   });
 
-  test("agent.driver defaults to omp-sdk", () => {
-    expect(defaultPolicy().agentDriver).toBe("omp-sdk");
-    expect(parseOrgConfigYaml("").agentDriver).toBe("omp-sdk");
-    expect(parseOrgConfigYaml("tools:\n  bash: deny\n").agentDriver).toBe("omp-sdk");
-  });
-
-  test("agent.driver: acp selects the ACP driver", () => {
-    const p = parseOrgConfigYaml("agent:\n  driver: acp\n");
-    expect(p.ok).toBe(true);
-    expect(p.agentDriver).toBe("acp");
-    expect(p.errors).toEqual([]);
-  });
-
-  test("agent.driver: invalid value warns and keeps the omp-sdk default", () => {
-    const p = parseOrgConfigYaml("agent:\n  driver: telepathy\n");
-    expect(p.ok).toBe(true);
-    expect(p.agentDriver).toBe("omp-sdk");
-    expect(p.warnings.some((w) => w.includes("agent.driver"))).toBe(true);
-  });
-
   test("agent section must be a block mapping", () => {
     const p = parseOrgConfigYaml("agent: nope\n");
     expect(p.ok).toBe(false);
-    expect(p.agentDriver).toBe("omp-sdk");
   });
 
   test("response_mode parses at the org floor; default is always (issue #55)", () => {

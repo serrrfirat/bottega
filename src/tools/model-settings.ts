@@ -22,9 +22,9 @@
  * the space's settings (see resolveRoleTarget). Every switch appends a
  * `model.switched` audit row carrying {role, model, thinking_level, by}.
  *
- * ACP sessions cannot switch models mid-session (the agent's own config
- * governs there) — the registry surfaces the driver's documented
- * not-supported result as a tool error.
+ * Sessions that cannot switch models mid-session (the agent's own config
+ * governs there) surface the driver's documented not-supported result as a
+ * tool error.
  */
 import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";

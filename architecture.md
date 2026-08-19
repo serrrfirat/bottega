@@ -28,7 +28,7 @@ flowchart TB
     end
     H --> AD["src/server/adapters/slack.ts<br/>validate + normalize principal/space/text"]
     AD --> SS["SpaceService<br/>conversation + orchestration"]
-    SS --> DRV["AgentSessionDriver<br/>OMP SDK | ACP"]
+    SS --> DRV["AgentSessionDriver<br/>OMP SDK"]
     DRV --> GATE["policy gate<br/>tier × org floor × space overlay"]
     GATE -- "ask-human" --> AR["Slack ApprovalRouter"]
     GATE -- "approved work" --> WI[("work_items + audit<br/>SQLite WAL")]
@@ -226,9 +226,7 @@ flowchart LR
     SS --> IF["AgentSessionDriver"]
     EX --> IF
     IF --> OMP["createOmpSdkDriver — OMP SDK<br/>allowlist, transcripts, policy+audit extensions"]
-    IF --> ACP["createAcpDriver — ACP stdio JSON-RPC 2.0<br/>any ACP agent (default: omp acp)"]
-    ACP --> MCP["bottega MCP server (universal seam #25/#61)"]
-    MCP --> SPINE["same policy gate → credential ladder → egress → audit"]
+    MCP["bottega MCP server (universal seam #25/#61)"] --> SPINE["same policy gate → credential ladder → egress → audit"]
 ```
 
 - **`createOmpSdkDriver`** (default) wraps the OMP SDK. It owns all
@@ -237,38 +235,25 @@ flowchart LR
   on the space agent), file-backed transcripts
   (`data/sessions/<space-id>.jsonl`), a private agent registry per session,
   and the policy + audit extensions.
-- **`createAcpDriver`** spawns any ACP-speaking agent (default `omp acp`)
-  over stdio JSON-RPC 2.0 (newline-delimited, per the ACP v1 spec). This is
-  how a non-OMP agent plugs in later without touching bottega code. OMP is
-  the first engine, not a dependency. The org config selects the space-agent
-  driver with `agent.driver: acp | omp-sdk` (default `omp-sdk`; the ACP flip
-  is opt-in via config until proven — issue #26).
-- ACP sessions enforce policy over `session/request_permission`: every
-  inbound permission request runs through the same policy table the OMP
-  extensions use (tier × org config + space overlay → allow | deny |
-  ask-human), with audit on every decision. Unknown tools deny (fail
-  closed); ask-human routes through the same Slack button `ApprovalRouter`
-  as the OMP driver (issue #44), or `DenyRouter` in headless contexts.
-  With `agent.driver: acp`, the bottega MCP server attaches to each session
-  so bottega's own tools stay reachable. The MCP surface is the **universal
-  agent seam** (issues #25/#61): memory (memory.save/search), the connect
+- The bottega MCP server (`src/mcp/server.ts`) is the **universal agent
+  seam** (issues #25/#61): memory (memory.save/search), the connect
   capability (connect_extension), and every registered extension's manifest
   tools — executed server-side through the same policy gate → credential
   ladder → egress boundary → audit spine as in-session OMP tool calls, so
-  any agent (OMP, ACP, or future) gets identical enforcement. The tradeoff
-  vs the OMP driver is interception depth: ACP gives allow/deny only, no
-  arg rewriting or output redaction. It also cannot switch models
-  mid-session: `setModelRole` (issue #64) is an optional
-  `AgentSessionDriver` hook that the OMP driver implements (SDK
-  `setModel`/`setThinkingLevel`) and the ACP driver reports as
-  not-supported — `use_model` surfaces that as an error.
+  any surface gets identical enforcement. Its env contract is set by the
+  process that spawns it (BOTTEGA_SPACE_ID plus the two path vars).
+- `setModelRole` (issue #64) is an optional `AgentSessionDriver` hook: the
+  OMP driver implements it via the SDK's `setModel`/`setThinkingLevel`; a
+  driver without it reports not-supported and `use_model` surfaces that as
+  an error instead of pretending to switch.
 
 **Driver conformance (#173).** One suite,
-`src/server/drivers/driver-conformance.test.ts`, runs against both drivers.
+`src/server/drivers/driver-conformance.test.ts`, runs against the OMP
+driver.
 Every session option must be honored or rejected as unsupported; nothing may
-be silently dropped. OMP honors tool narrowing. ACP v1 has no narrowing
-field, so `allowTools` requests narrower than the standard space surface
-throw; ACP likewise rejects per-space model settings it cannot apply.
+be silently dropped. OMP honors tool narrowing; a driver without a narrowing
+field would throw for `allowTools` requests narrower than the standard space
+surface rather than silently drop them.
 
 ### Model resolution is catalog-backed and turn-aware (#78/#80/#185/#189/#192/#194)
 
@@ -427,9 +412,9 @@ snapshot is fixed for the session's whole life:
 
 The OMP driver forwards `opts.skills` to `createAgentSession`, where the SDK
 sets its active skill snapshot and `skill://<name>` (plus the rendered
-`<skills>` listing) resolves inside that session. The ACP driver cannot
-accept injection and throws `unsupported` (honored-or-throws, like
-`allowTools`). The three tiers, per the epic:
+`<skills>` listing) resolves inside that session. Skill injection is
+SDK-session-only: a driver outside the SDK surfaces `unsupported`
+(honored-or-throws, like `allowTools`). The three tiers, per the epic:
 per-space governed skills (Tier 1, today) → org-shared skills (Tier 2,
 future) → task-level skills via `WorkItem.skills` + `resolveItemSkills`
 (Tier 3), where a git-delivery item with no explicit pins deterministically
@@ -509,8 +494,8 @@ user-facing view is in
    then the org/me/auto ladder, the credential boundary, the provider call,
    and `extension.call` audit. Denied calls never touch the resolver.
    Provider `isError` results remain errors. `src/mcp/server.ts` exposes the
-   same runtime to ACP/future agents, with `DenyRouter` for ask-human
-   decisions in its headless process (#61/#172).
+   same runtime to any MCP client / future agent surfaces, with `DenyRouter`
+   for ask-human decisions in its headless process (#61/#172).
 7. **No-secrets upload path** — `connect_upload_link` is available in OMP
    sessions and, when `BOTTEGA_UPLOAD_BASE_URL` is wired, the MCP surface
    (#196) — the server sets that env to the deployment's PUBLIC base
@@ -897,8 +882,8 @@ across the full repository wave. The exact count is not a contract; behavior
 at the caller surface is. `src/server/boot-wiring.test.ts`,
 `src/executor-boot.test.ts`, and
 `src/server/composition-root-parity.test.ts` boot the real construction
-paths in temporary directories. The driver conformance suite runs both OMP
-and ACP. `src/executor.test.ts` drives the full delivery approval round-trip
+paths in temporary directories. The driver conformance suite runs the OMP
+driver. `src/executor.test.ts` drives the full delivery approval round-trip
 through real SQLite and boundary doubles.
 
 The definition of done is caller-level acceptance coverage (#174): drive a
@@ -932,7 +917,7 @@ The highest-risk external boundaries also have explicit legs:
 src/
   server/           index.ts (Slack composition root), bootstrap-runtime.ts (shared chain)
   server/adapters/  slack.ts, approval-router.ts, delivery-router.ts
-  server/drivers/   agent-driver.ts (OMP), acp-driver.ts, conformance suite
+  server/drivers/   agent-driver.ts (OMP), conformance suite
   server/services/  space-service.ts, slack-turn-presenter.ts, delivery-poller.ts
   policy/           config.ts, extension.ts, approval-router.ts, audit.ts
   extensions/       manifest/registry, discovery/generation, tool bridge, runtime/boundary, upload-link

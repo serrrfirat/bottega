@@ -1,7 +1,7 @@
 /**
  * The shared policy gate execution (issue #26): one implementation of
- * "decide → audit → route ask-human" used by every policy surface so the
- * ACP permission handler makes exactly the decisions the in-process OMP
+ * "decide → audit → route ask-human" used by every policy surface so any
+ * out-of-process surface makes exactly the decisions the in-process OMP
  * extension makes — the same table, the same audit payload shapes, the
  * same fail-closed rules.
  *

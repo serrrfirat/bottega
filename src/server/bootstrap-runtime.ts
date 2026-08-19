@@ -12,9 +12,9 @@
  *     deployment got two disjoint memory pools depending on which surface
  *     saved a memory;
  *   - the MCP and executor roots built their extension boundary without
- *     the broker secret resolver, so the whole ACP/extension path failed
- *     at call time with the unwired-default error instead of the
- *     resolver's own.
+ *     the broker secret resolver, so the whole extension path failed at
+ *     call time with the unwired-default error instead of the resolver's
+ *     own.
  *
  * bootstrapRuntime is the single source: every root resolves the SAME
  * memory backend given the same settings (memory_backend.base_url set →

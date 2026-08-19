@@ -2,23 +2,21 @@
  * Bottega-hosted MCP server (issues #25, #61, #136): exposes the bottega
  * capability surface — memory, transcript search, the connect capability,
  * registered extension tools, and the internal tools (work items, model
- * settings, scheduler actions, KB — issue #206) — to ANY ACP agent with an
- * MCP client.
+ * settings, scheduler actions, KB — issue #206) — to any MCP client.
  *
- * The ACP driver attaches this server to a session via `session/new`'s
- * `mcpServers` field; the agent spawns `bun run src/mcp/server.ts` (stdio
+ * An external agent (or tests) spawns `bun run src/mcp/server.ts` (stdio
  * transport) as a child process and sees `memory.save`, `memory.search`,
  * and `session_search` as native tools. Because tools execute server-side,
  * the policy gate and audit trail apply at execution time no matter which agent
  * called them — the MCP surface is not a bypass of `src/policy/config.ts`
  * or `src/policy/audit.ts`.
  *
- * Transport choice: stdio. Probing real `omp acp` (issue #18's interop
- * method) showed omp's MCP client connects to `{command, args, env}`
- * entries — spawning the server, running initialize → tools/list, and
- * completing session/new (streamable-HTTP url entries work too, but stdio
- * gives each session its own process: per-session env pins the space, so
- * the space policy overlay is enforced per session with no shared state).
+ * Transport choice: stdio. omp's MCP client connects to `{command, args,
+ * env}` entries — spawning the server, running initialize → tools/list,
+ * and completing session/new (streamable-HTTP url entries work too, but
+ * stdio gives each session its own process: per-session env pins the
+ * space, so the space policy overlay is enforced per session with no
+ * shared state).
  *
  * Protocol surface: the official MCP TypeScript SDK runs cleanly on Bun
  * 1.3 (verified against real omp). The low-level `Server` is used rather
@@ -32,10 +30,10 @@
  * Policy at execution (mirrors src/policy/extension.ts):
  *   - tier from TIER_BY_TOOL (memory.save=write; memory.search/session_search=read)
  *   - org config.yml floor + the session space's overlay
- *   - allow → run; deny → MCP error (no execution); ask-human → MCP error:
- *     a headless MCP context has no approval channel (ACP permission
- *     routing is issue #17's known gap), so it fails closed — the
- *     DenyRouter-equivalent. Every decision is audited as policy.decision.
+ *   allow → run; deny → MCP error (no execution); ask-human → MCP error:
+ *     a headless MCP context has no approval channel, so it fails
+ *     closed — the DenyRouter-equivalent. Every decision is audited as
+ *     policy.decision.
  *
  * Extension surface (issue #61): `connect_extension` and each registered
  * extension's manifest tools are advertised and executed through the #52
@@ -50,7 +48,7 @@
  * content_hash shape the in-session tools use (sha256Hex from
  * src/tools/memory.ts) — the hash, never the content.
  *
- * Env contract (set by the ACP driver / caller):
+ * Env contract (set by the caller):
  *   BOTTEGA_DB_PATH                SQLite file (default data/bottega.db)
  *   BOTTEGA_CONFIG_DIR             dir holding config.yml (org floor)
  *   BOTTEGA_EXTENSIONS_DIR         dir of pinned extension snapshots
@@ -162,9 +160,9 @@ export interface MemoryMcpServerOptions {
    * advertises the internal tools (create_work_item, work_item_cancel,
    * complete_work_item, model_settings, the scheduler actions, kb_ingest) —
    * the SAME definitions the SDK sessions carry, executed server-side
-   * through the same policy gate + audit. ACP sessions call them through
-   * the MCP tool channel (the #154 "tool reach" gap). use_model stays
-   * SDK-session-only: ACP sessions cannot switch models mid-session (the
+   * through the same policy gate + audit. MCP clients call them through
+   * the tool channel (the #154 "tool reach" gap). use_model stays
+   * SDK-session-only: MCP sessions cannot switch models mid-session (the
    * agent's own config governs there, issue #64). Absent → none advertised.
    */
   internal?: McpInternalToolsOptions;
@@ -202,7 +200,7 @@ export interface McpExtensionsOptions {
    * whose secret the server's browser endpoint stores DIRECTLY into the
    * vault. The store must share the `upload_tokens` table with the server
    * process's endpoint (both read the same SQLite file); `baseUrl` is the
-   * LOOPBACK fallback (BOTTEGA_UPLOAD_BASE_URL, set by the ACP driver) and
+   *   LOOPBACK fallback (BOTTEGA_UPLOAD_BASE_URL, set by the caller) and
    * `resolvePublicBase` health-checks the PUBLIC URL (issue #211; absent →
    * probe BOTTEGA_OAUTH_CALLBACK_BASE_URL). Absent → the mint tool is not
    * advertised.
@@ -586,10 +584,10 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           listModels: opts.internal.listModels,
         }),
         // Space-skill governance (issues #234/#235, Tier 1): same
-        // write_space_skill surface on the ACP/MCP path — gated by
-        // bindInternalTool (gate → audit → validate → execute). ACP cannot
-        // INJECT loaded skills into its sessions (honors-or-throws), but
-        // the server-side skill store remains fully manageable there.
+        // write_space_skill surface on the MCP path — gated by
+        // bindInternalTool (gate → audit → validate → execute). Skill
+        // injection is SDK-session-only; the server-side skill store
+        // remains fully manageable over MCP.
         ...(opts.audit !== undefined
           ? [writeSpaceSkillToolDefinition(opts.internal.store, { audit: opts.audit })]
           : []),
@@ -605,7 +603,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           ? kbToolDefinitions({ store: opts.internal.store, config: opts.internal.kb })
           : []),
       ]
-        // ACP sessions cannot switch models mid-session (the agent's own
+        // MCP sessions cannot switch models mid-session (the agent's own
         // config governs there, issue #64): use_model stays session-only.
         .filter((definition) => definition.name !== "use_model")
         .map(bindInternalTool)
@@ -848,7 +846,7 @@ export interface McpBoot {
  * (hardwired SQLite provider, boundary without the broker secret resolver)
  * are the #172 regressions this replaces.
  *
- * Env contract (set by the ACP driver / caller): BOTTEGA_DB_PATH,
+ * Env contract (set by the caller): BOTTEGA_DB_PATH,
  * BOTTEGA_CONFIG_DIR, BOTTEGA_EXTENSIONS_DIR, BOTTEGA_SPACE_ID,
  * BOTTEGA_MCP_DEFAULT_PRINCIPAL, BOTTEGA_SESSION_DIR — see the file header.
  */
@@ -878,8 +876,8 @@ export async function bootMemoryMcpServer(opts: {
   await syncProxyCredentialsFromEnv();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
-    // Env contract (see the file header): the ACP driver / tests pin the
-    // DB, config, and extensions dirs; unset falls back to the defaults.
+    // Env contract (see the file header): the caller / tests pin the DB,
+    // config, and extensions dirs; unset falls back to the defaults.
     dbPath: opts.dbPath ?? process.env.BOTTEGA_DB_PATH,
     ...(opts.configDir !== undefined ? { configDir: opts.configDir } : undefined),
     ...(opts.extensionsDir !== undefined ? { extensionsDir: opts.extensionsDir } : undefined),
@@ -899,7 +897,7 @@ export async function bootMemoryMcpServer(opts: {
     policy = applySpaceOverlay(orgPolicy, space.policy_json);
   }
   // Issue #196: when the server process exposed its upload endpoint URL
-  // (BOTTEGA_UPLOAD_BASE_URL — the ACP driver sets it), this child mints
+  // (BOTTEGA_UPLOAD_BASE_URL — the caller sets it), this child mints
   // links into the SHARED upload_tokens table, consumable by that endpoint.
   const uploadBaseUrl = process.env.BOTTEGA_UPLOAD_BASE_URL;
   const uploadLink =
@@ -909,7 +907,7 @@ export async function bootMemoryMcpServer(opts: {
   // Issue #198: same posture for hosted OAuth MCPs — the connect tool here
   // mints flows into the SHARED oauth_flows table with the callback pointed
   // at the SERVER process's OAuth callback endpoint (BOTTEGA_OAUTH_CALLBACK_BASE_URL,
-  // set by the ACP driver like BOTTEGA_UPLOAD_BASE_URL).
+  // set by the caller like BOTTEGA_UPLOAD_BASE_URL).
   const oauthBaseUrl = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
   const mcpOAuth =
     oauthBaseUrl && oauthBaseUrl.length > 0

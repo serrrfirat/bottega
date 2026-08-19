@@ -211,7 +211,6 @@ function policyView(policy: PolicyConfig) {
       deny: policy.extensionsDeny,
       org_credentials: policy.orgCredentials,
     },
-    agent_driver: policy.agentDriver,
   };
 }
 

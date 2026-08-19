@@ -10,8 +10,7 @@
  * - the KB ingest tool rides the custom-tools bridge (kb_ingest present,
  *   write-tier, KB-shaped);
  * - the boot-time pin sync runs (fresh agent dir gets the modelRoles pin),
- *   a missing Slack token fails the boot closed, and the ACP driver flip
- *   (agent.driver: acp, issue #26) boots through the ACP factory.
+ *   and a missing Slack token fails the boot closed.
  *
  * Hermetic: temp cwd + fake env, no Slack network (the adapter is never
  * started — the scheduler/onboarding paths the boot exposes need no
@@ -245,22 +244,6 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       await expect(main({ agentDir: join(env.dir, "agent") })).rejects.toThrow(
         "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required",
       );
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  test("agent.driver: acp boots through the ACP driver factory (issue #26)", async () => {
-    const env = tempEnv();
-    try {
-      // The org floor config selects the space-agent driver; `acp` flips
-      // the boot to createAcpDriver (the OMP registry guard is skipped).
-      writeFileSync(join(env.dir, "config.yml"), "agent:\n  driver: acp\n");
-      const server = await main({ agentDir: join(env.dir, "agent") });
-      await server.stop();
-      // Reaching stop() means the ACP boot path (driver factory + service
-      // wiring) completed; the MCP server spawn happens only per session,
-      // so this stays hermetic.
     } finally {
       env.cleanup();
     }
