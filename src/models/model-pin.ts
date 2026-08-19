@@ -60,8 +60,10 @@ const GATEWAY_PROBE_TIMEOUT_MS = 5_000;
  */
 const gatewayProbeCache = new Map<string, Promise<ModelCatalogEntry[]>>();
 
-/** A resolved model pin: a role slot, or one concrete available model id. */
-export type ModelPin = { kind: "role"; role: ModelRoleRef } | { kind: "id"; modelId: string };
+/** A resolved model pin: a role slot, or one concrete available model id carrying the provider it matched. */
+export type ModelPin =
+  | { kind: "role"; role: ModelRoleRef }
+  | { kind: "id"; provider: string; modelId: string };
 
 export type ModelPinResolution = { ok: true; pin: ModelPin } | { ok: false; error: string };
 
@@ -238,9 +240,13 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
   }));
 
   // A provider-qualified id ("opencode-go/deepseek-v4-flash") names ONE
-  // entry — explicit intent, resolved outright.
+  // entry — explicit intent, resolved outright. Issue #238: the pin carries
+  // the matched entry's provider so the driver never re-derives it from a
+  // bare-id catalog find (which lands on the FIRST same-id provider).
   const qualified = entries.find((e) => `${e.model.provider}/${e.model.id}`.toLowerCase() === q);
-  if (qualified) return { ok: true, pin: { kind: "id", modelId: qualified.model.id } };
+  if (qualified) {
+    return { ok: true, pin: { kind: "id", provider: qualified.model.provider, modelId: qualified.model.id } };
+  }
 
   // Score every model: 0 = the exact bare id, served by near (the working
   // provider — an exact id it serves is unambiguous intent); 1 = the exact
@@ -275,14 +281,14 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
     // opencode-go deepseek never wins an unqualified tie by default).
     const near = bestMatches.filter((s) => s.entry.model.provider === NEAR_PROVIDER);
     if (near.length === 1) {
-      return { ok: true, pin: { kind: "id", modelId: near[0]!.entry.model.id } };
+      return { ok: true, pin: { kind: "id", provider: near[0]!.entry.model.provider, modelId: near[0]!.entry.model.id } };
     }
     return {
       ok: false,
       error: `model '${query}' is ambiguous — matches ${formatModelCandidates(bestMatches.map((s) => s.entry.model))}; be more specific`,
     };
   }
-  return { ok: true, pin: { kind: "id", modelId: bestMatches[0]!.entry.model.id } };
+  return { ok: true, pin: { kind: "id", provider: bestMatches[0]!.entry.model.provider, modelId: bestMatches[0]!.entry.model.id } };
 }
 
 /** "provider/id (name)" per available model, for fail-closed error messages. */

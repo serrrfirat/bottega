@@ -79,7 +79,7 @@ describe("model/effort derivation (issue #89)", () => {
     const derived = deriveModelPin("implement X using deepseek v4 at low effort", catalog);
     expect(derived).toEqual({
       ok: true,
-      model: { kind: "id", modelId: "deepseek-v4-flash" },
+      model: { kind: "id", provider: "opencode-go", modelId: "deepseek-v4-flash" },
       reasoningEffort: "low",
     });
   });

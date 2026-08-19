@@ -1274,10 +1274,14 @@ export function createOmpSdkDriver(
           if (resolution.ok) {
             const pin = resolution.pin;
             if (pin.kind === "id") {
-              const entry = catalog.find((model) => model.id === pin.modelId);
-              if (entry) {
-                resolvedDefaultModel = `${entry.provider}/${pin.modelId}`;
-              }
+              // Issue #238: the pin already carries the provider it matched
+              // (or the near preference won). The pre-#238 code re-derived
+              // the provider with a bare-id catalog find, which lands on the
+              // FIRST same-id entry — for the org default
+              // openai-codex/gpt-5.6-luna that is openai, whose egress has
+              // no key (proxy 403 at CONNECT → silently empty turns). Use
+              // the pin's provider; never re-derive.
+              resolvedDefaultModel = `${pin.provider}/${pin.modelId}`;
             } else {
               console.error(
                 `[agent-driver] session ${spaceId}: default model '${defaultModel}' resolved to a role ref, not a model — starting on the agent-dir default`,
@@ -1865,7 +1869,9 @@ export class OmpSessionDriver implements AgentSessionDriver {
     if (resolution.pin.kind === "role") {
       throw new Error(`[agent-driver] ${context}: '${raw}' resolved to a role ref, not a model id`);
     }
-    return resolution.pin.modelId;
+    // Issue #238: return the provider-qualified id the pin matched — the
+    // caller's re-find must never land on the first bare-id provider.
+    return `${resolution.pin.provider}/${resolution.pin.modelId}`;
   }
 
   /** The session's available model matching a bare id (or "provider/id"). */

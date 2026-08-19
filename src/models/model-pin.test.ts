@@ -231,25 +231,25 @@ describe("provider-unqualified resolution prefers near (issue #194)", () => {
   test("unqualified 'deepseek-v4-flash' resolves to NEAR's working deepseek — never opencode-go's #78-broken one", () => {
     expect(resolveModelPin("deepseek-v4-flash", catalog)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
+      pin: { kind: "id", provider: "near", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
     });
   });
 
   test("unqualified 'deepseek v4' resolves to near the same way", () => {
     expect(resolveModelPin("deepseek v4", catalog)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
+      pin: { kind: "id", provider: "near", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
     });
   });
 
   test("a provider-qualified id still wins outright — explicit intent beats the preference", () => {
     expect(resolveModelPin("opencode-go/deepseek-v4-flash", catalog)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+      pin: { kind: "id", provider: "opencode-go", modelId: "deepseek-v4-flash" },
     });
     expect(resolveModelPin("opencode-zen/deepseek-v4-flash", catalog)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: "deepseek-v4-flash" },
+      pin: { kind: "id", provider: "opencode-zen", modelId: "deepseek-v4-flash" },
     });
   });
 
@@ -265,12 +265,35 @@ describe("provider-unqualified resolution prefers near (issue #194)", () => {
   });
 
   test("non-deepseek resolution is unchanged: unique ids and near-only names still resolve", () => {
-    expect(resolveModelPin("gpt-sol-5.6", catalog)).toEqual({ ok: true, pin: { kind: "id", modelId: "gpt-sol-5.6" } });
+    expect(resolveModelPin("gpt-sol-5.6", catalog)).toEqual({ ok: true, pin: { kind: "id", provider: "opencode-go", modelId: "gpt-sol-5.6" } });
     expect(resolveModelPin(DECLARED_NEAR, catalog)).toEqual({
       ok: true,
-      pin: { kind: "id", modelId: DECLARED_NEAR },
+      pin: { kind: "id", provider: "near", modelId: DECLARED_NEAR },
     });
-    expect(resolveModelPin("near deepseek", catalog)).toEqual({ ok: true, pin: { kind: "id", modelId: DECLARED_NEAR } });
-    expect(resolveModelPin("gpt-5.1", catalog)).toEqual({ ok: true, pin: { kind: "id", modelId: "openai/gpt-5.1" } });
+    expect(resolveModelPin("near deepseek", catalog)).toEqual({ ok: true, pin: { kind: "id", provider: "near", modelId: DECLARED_NEAR } });
+    expect(resolveModelPin("gpt-5.1", catalog)).toEqual({ ok: true, pin: { kind: "id", provider: "near", modelId: "openai/gpt-5.1" } });
+  });
+});
+
+describe("id pins carry the provider that matched (issue #238)", () => {
+  test("a provider-qualified id pins its provider — never a dropped-provider bare id", () => {
+    // LIVE data/omp-agent shape: openai, openai-codex, and opencode-go all
+    // serve the bare id gpt-5.6-luna (openai FIRST in catalog order), plus
+    // near serving the slashed openai-codex/gpt-5.6-luna. A default of
+    // "openai-codex/gpt-5.6-luna" matches the qualified openai-codex entry
+    // outright — the pin MUST carry provider "openai-codex". Dropping it
+    // makes the driver's bare-id re-find land on openai (the first same-id
+    // entry), whose egress has no key → the proxy 403s at CONNECT and the
+    // bot's turns silently come back empty on live Slack.
+    const catalog: ModelCatalogEntry[] = [
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai-codex" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" },
+      { id: "openai-codex/gpt-5.6-luna", name: "gpt-5.6-luna", provider: "near" },
+    ];
+    expect(resolveModelPin("openai-codex/gpt-5.6-luna", catalog)).toEqual({
+      ok: true,
+      pin: { kind: "id", provider: "openai-codex", modelId: "gpt-5.6-luna" },
+    });
   });
 });

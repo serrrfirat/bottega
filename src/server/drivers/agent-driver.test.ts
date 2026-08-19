@@ -635,6 +635,86 @@ describe("session default model resolution (issue #199)", () => {
       delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
     }
   });
+
+  test("the org default's provider survives to the session — openai-codex, never the first same-id provider (#238)", async () => {
+    process.env.BOTTEGA_TEST_OPENAI_API_KEY = "stub-key";
+    process.env.BOTTEGA_TEST_OPENAI_CODEX_API_KEY = "stub-key";
+    process.env.OPENCODE_API_KEY = "stub-key";
+    process.env.BOTTEGA_TEST_NEAR_API_KEY = "stub-key";
+    const dir = mkdtempSync(join(tmpdir(), "agent-driver-238-"));
+    try {
+      // The live data/omp-agent shape: openai, openai-codex, and
+      // opencode-go all serve the bare id gpt-5.6-luna — and because the
+      // SDK composes bundled providers in order, openai is FIRST among the
+      // same-id entries (verified empirically), so the pre-#238 bare-id
+      // re-find ALWAYS lands on openai. Plus near serves the slashed
+      // openai-codex/gpt-5.6-luna. The org default must reach the session
+      // options as ["openai-codex/gpt-5.6-luna"] — NEVER
+      // ["openai/gpt-5.6-luna"]. Dropping the pin's provider sent egress
+      // to api.openai.com with no key → proxy 403 at CONNECT → silently
+      // empty turns on live Slack. All gateways are dead or non-routable
+      // so their probes fail closed — hermetic, no network.
+      writeFileSync(
+        join(dir, "models.yml"),
+        `providers:
+  openai:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:1"
+    apiKey: BOTTEGA_TEST_OPENAI_API_KEY
+    models:
+      - id: "gpt-5.6-luna"
+        name: "GPT-5.6 Luna"
+        contextWindow: 128000
+        maxTokens: 8192
+  openai-codex:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:1"
+    apiKey: BOTTEGA_TEST_OPENAI_CODEX_API_KEY
+    models:
+      - id: "gpt-5.6-luna"
+        name: "GPT-5.6 Luna"
+        contextWindow: 128000
+        maxTokens: 8192
+  opencode-go:
+    api: openai-completions
+    baseUrl: "https://opencode.example/v1"
+    apiKey: OPENCODE_API_KEY
+    models:
+      - id: "gpt-5.6-luna"
+        name: "GPT-5.6 Luna"
+        contextWindow: 128000
+        maxTokens: 8192
+  near:
+    api: openai-completions
+    baseUrl: "http://127.0.0.1:1"
+    apiKey: BOTTEGA_TEST_NEAR_API_KEY
+    models:
+      - id: "openai-codex/gpt-5.6-luna"
+        name: "gpt-5.6-luna"
+        contextWindow: 128000
+        maxTokens: 8192
+`,
+      );
+      const { driver, options } = capturedOptionsDriver(dir);
+      await expect(
+        driver.createSession({
+          spaceId: "slack:C1",
+          transcriptDir: join(dir, "sessions"),
+          onOutput: () => {},
+          getModelSettings: async () => ({ model: "openai-codex/gpt-5.6-luna" }),
+        }),
+      ).rejects.toThrow("factory stub: no real session");
+      // The pin's provider won: the SDK gets the openai-codex entry, never
+      // the first bare-id openai one the pre-#238 find landed on.
+      expect(options()?.modelPattern).toEqual(["openai-codex/gpt-5.6-luna"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.BOTTEGA_TEST_OPENAI_API_KEY;
+      delete process.env.BOTTEGA_TEST_OPENAI_CODEX_API_KEY;
+      delete process.env.OPENCODE_API_KEY;
+      delete process.env.BOTTEGA_TEST_NEAR_API_KEY;
+    }
+  });
 });
 
 describe("resolveRoleTarget (issue #64)", () => {
