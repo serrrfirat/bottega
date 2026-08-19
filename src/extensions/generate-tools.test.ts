@@ -132,12 +132,14 @@ describe("generateManifestTools: fake tools/list over the in-memory transport se
     expect(generation.tools.map((tool) => tool.tier)).toEqual(["read", "read", "write", "exec", "exec", "write"]);
 
     // Params: JSON schema types → manifest string/number/boolean; array →
-    // string (JSON-serialized); required from the schema's required list.
+    // string (JSON-serialized) keeping jsonType "array" so the runtime
+    // restores the native array before the wire call (issue #248); required
+    // from the schema's required list.
     const search = generation.tools[0]!;
     expect(search.params).toEqual([
       { name: "query", type: "string", description: "Search query" },
       { name: "limit", type: "number", description: "Max results", required: false },
-      { name: "labels", type: "string", description: "Label names", required: false },
+      { name: "labels", type: "string", jsonType: "array", description: "Label names", required: false },
       { name: "archived", type: "boolean", description: "Include archived", required: false },
     ]);
     // A schema with no required list → every param explicitly optional.

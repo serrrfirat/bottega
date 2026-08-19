@@ -1077,3 +1077,141 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     await expect(provider.tokens()).resolves.toBeUndefined();
   });
 });
+
+describe("extension runtime: array/object MCP params restore native JSON before the wire call (issue #248)", () => {
+  const ARRAY_ID = "arraybug.me";
+  // Mirrors github-mcp-server's search_* / list_* surface: `fields` is a
+  // native array of enum'd strings, while `query` and `note` are
+  // genuinely-string params.
+  const ARRAY_WIRE_TOOLS = [
+    {
+      name: "search",
+      description: "Search",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          fields: {
+            type: "array",
+            description: "Which fields to return",
+            items: { type: "string", enum: ["number", "title", "url"] },
+          },
+          note: { type: "string", description: "Free-form note" },
+        },
+        required: ["query", "fields"],
+      },
+    },
+  ];
+
+  beforeEach(() => {
+    // Discovery is cached per manifest id + binding — hermetic tests must
+    // not observe a stale surface from an earlier fixture.
+    resetToolSurfaceCache();
+  });
+
+  function arrayManifest(): ExtensionManifest {
+    return validateManifest({
+      id: ARRAY_ID,
+      label: "Array Bug",
+      vendor: "example",
+      kind: "mcp",
+      mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
+      credentialSchema: { type: "api_key" },
+      domains: ["arraybug.me.test"],
+    });
+  }
+
+  /** Transport serving tools/list (discovery) and RECORDING tools/call args. */
+  function captureTransport(seen: Array<{ name: string; args: JsonObject }>): (binding: McpBinding) => Transport {
+    return () => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server({ name: "array-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: ARRAY_WIRE_TOOLS }));
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        // SAFETY: the harness always invokes with JSON tool args, which
+        // the SDK validated on the way in.
+        seen.push({ name: request.params.name, args: request.params.arguments as JsonObject });
+        return { content: [{ type: "text", text: "ok" }] };
+      });
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+  }
+
+  test("a JSON-serialized array param reaches the provider as a NATIVE array; a genuine JSON-looking string is untouched", async () => {
+    const seen: Array<{ name: string; args: JsonObject }> = [];
+    const h = makeHarness({
+      policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+      manifests: [arrayManifest()],
+      mcpTransport: captureTransport(seen),
+    });
+    await seedOrgCredential(h.store, ARRAY_ID);
+
+    // The discovered surface types `fields` as a string (issue #248), so
+    // the agent sends the JSON-serialized array literal; `note` is
+    // genuinely-string and its value only LOOKS like JSON — it must pass
+    // through verbatim.
+    const result = await h.runtime.execute({
+      extensionId: ARRAY_ID,
+      toolName: "search",
+      args: {
+        query: "open PRs",
+        fields: '["number","title"]',
+        note: '{"tag":"cherry-picked"}',
+      },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    // The wire request carries the NATIVE array for `fields` — not the
+    // JSON-serialized string ("[\"number\",\"title\"]") nor "number,title".
+    expect(seen[0]!.args["fields"]).toEqual(["number", "title"]);
+    expect(Array.isArray(seen[0]!.args["fields"])).toBe(true);
+    // …and the genuinely-string param was never re-parsed/retyped.
+    expect(seen[0]!.args["note"]).toBe('{"tag":"cherry-picked"}');
+    expect(typeof seen[0]!.args["note"]).toBe("string");
+    expect(seen[0]!.args["query"]).toBe("open PRs");
+  });
+
+  test("a pinned manifest's jsonType params restore native arrays/objects on pinned-tool calls too", async () => {
+    const seen: Array<{ name: string; args: JsonObject }> = [];
+    const pinned = validateManifest({
+      id: "pinso.me",
+      label: "Pinso",
+      vendor: "example",
+      kind: "mcp",
+      mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
+      credentialSchema: { type: "api_key" },
+      tools: [
+        {
+          name: "pinso.me.list",
+          tier: "read",
+          description: "List things",
+          params: [
+            { name: "fields", type: "string", jsonType: "array", required: true },
+            { name: "filters", type: "string", jsonType: "object", required: false },
+          ],
+        },
+      ],
+      domains: ["pinso.test"],
+    });
+    const h = makeHarness({
+      policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
+      manifests: [pinned],
+      mcpTransport: captureTransport(seen),
+    });
+    await seedOrgCredential(h.store, "pinso.me");
+
+    const result = await h.runtime.execute({
+      extensionId: "pinso.me",
+      toolName: "pinso.me.list",
+      args: { fields: '["id","name"]', filters: '{"state":"open"}' },
+      caller: "UADA",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(seen[0]!.args).toEqual({ fields: ["id", "name"], filters: { state: "open" } });
+  });
+});

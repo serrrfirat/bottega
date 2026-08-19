@@ -57,7 +57,15 @@ import { evaluatePolicyGate, summarizeArgs, type PolicyGateCall } from "../polic
 import type { ExtensionCredential, Store } from "../store/db";
 import { EXTENSION_CALL_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
-import { CREDENTIAL_ENV_RE, type CliBinding, type ExtensionTool, type JsonObject, type McpBinding } from "./manifest";
+import {
+  CREDENTIAL_ENV_RE,
+  type CliBinding,
+  type ExtensionTool,
+  type ExtensionToolParam,
+  type JsonObject,
+  type JsonValue,
+  type McpBinding,
+} from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
@@ -377,9 +385,16 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           : undefined;
       try {
         await boundary.authorize(credential);
+        // Issue #248: array/object manifest params travel the model-facing
+        // surface as JSON-serialized strings; restore the NATIVE type the
+        // provider's inputSchema declares before the wire call. CLI calls
+        // keep the raw args — their flags are strings (jsonType never
+        // applies there, and String(value) on a restored object would
+        // mangle it).
+        const providerArgs = manifest.kind === "mcp" ? restoreNativeJsonArgs(args, tool.params) : args;
         const result =
           manifest.kind === "mcp"
-            ? await callMcpTool(makeTransport, manifest.mcp, wireName, args, mcpAuth)
+            ? await callMcpTool(makeTransport, manifest.mcp, wireName, providerArgs, mcpAuth)
             : await callCliTool(manifest.cli, wireName, args);
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
@@ -433,6 +448,33 @@ export function defaultMcpTransport(binding: McpBinding, authProvider?: OAuthCli
   // interpreting the MCP JSON-RPC) never reaches the server log and the
   // child cannot deadlock on an unwritten stderr buffer.
   return new StdioClientTransport({ command: binding.command, stderr: "pipe" });
+}
+
+/**
+ * Restores NATIVE array/object args for manifest params that declare
+ * `jsonType` (issue #248): the provider's inputSchema demands a real
+ * array/object (e.g. github-mcp-server's `fields` on its search and list
+ * tools), but the model-facing surface types such params as `string` — the agent
+ * supplies a JSON literal. Only params declared with jsonType (generated
+ * from the provider's schema at discovery, or hand-authored on a pinned
+ * manifest) are re-parsed, so a genuinely-string param whose value only
+ * LOOKS like JSON is never touched. Values that already arrived as an
+ * array/object pass through; a string that fails to parse stays a string
+ * (the provider rejects it with its own clearer error).
+ */
+function restoreNativeJsonArgs(args: JsonObject, params: readonly ExtensionToolParam[]): JsonObject {
+  const restored: JsonObject = { ...args };
+  for (const param of params) {
+    if (param.jsonType === undefined) continue;
+    const value = args[param.name];
+    if (typeof value !== "string") continue; // already-native / absent — pass through
+    try {
+      restored[param.name] = JSON.parse(value) as JsonValue;
+    } catch {
+      // Not a JSON literal — leave the raw string for the provider to reject.
+    }
+  }
+  return restored;
 }
 
 /**

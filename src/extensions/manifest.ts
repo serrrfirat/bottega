@@ -48,6 +48,15 @@ export interface CredentialSchema {
 export interface ExtensionToolParam {
   name: string;
   type: "string" | "number" | "boolean";
+  /**
+   * The provider's ORIGINAL JSON Schema type when it declared a structured
+   * value (issue #248). Only array/object carry jsonType: the model-facing
+   * surface keeps `type: "string"` (the agent supplies a JSON literal —
+   * array/object are unrepresentable in `type`), and the runtime re-parses
+   * the JSON-serialized string back to a NATIVE array/object before the MCP
+   * wire call. Absent → a genuinely scalar/string param, never re-parsed.
+   */
+  jsonType?: "array" | "object";
   description?: string;
   /** Defaults to true: a declared param is required unless marked optional. */
   required?: boolean;
@@ -432,6 +441,21 @@ function validateParams(value: JsonValue, toolName: string): ExtensionToolParam[
     if (!type.success) {
       fail(`tool "${toolName}" param "${name}" type must be "string", "number", or "boolean"`);
     }
+    let jsonType: "array" | "object" | undefined;
+    if (rawEntry["jsonType"] !== undefined) {
+      const parsed = z.enum(["array", "object"]).safeParse(rawEntry["jsonType"]);
+      if (!parsed.success) {
+        fail(`tool "${toolName}" param "${name}" jsonType must be "array" or "object"`);
+      }
+      // jsonType records the provider's structured type (issue #248): it
+      // only applies to array/object params, which travel the model-facing
+      // surface as JSON-serialized strings — a non-string pairing is
+      // malformed (the runtime re-parses strings only).
+      if (type.data !== "string") {
+        fail(`tool "${toolName}" param "${name}" jsonType requires type "string"`);
+      }
+      jsonType = parsed.data;
+    }
     let description: string | undefined;
     if (rawEntry["description"] !== undefined) {
       const parsed = z.string().safeParse(rawEntry["description"]);
@@ -451,6 +475,7 @@ function validateParams(value: JsonValue, toolName: string): ExtensionToolParam[
     params.push({
       name,
       type: type.data,
+      ...(jsonType !== undefined ? { jsonType } : undefined),
       ...(description !== undefined ? { description } : undefined),
       ...(required !== undefined ? { required } : undefined),
     });

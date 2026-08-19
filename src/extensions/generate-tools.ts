@@ -128,10 +128,11 @@ export function classifyTier(
 
 /**
  * JSON Schema (MCP inputSchema) → manifest params. `string`/`number`/
- * `integer`/`boolean` map directly; every other JSON schema type (array,
- * object, null, enum, unknown) maps to `string` — the agent passes the
- * JSON-serialized value, and the human reviewer can tighten the draft. A
- * param absent from the schema's `required` list is explicitly optional
+ * `integer`/`boolean` map directly; `array`/`object` map to `string` while
+ * PRESERVING the structured type on `jsonType` so the runtime can restore
+ * the native array/object before the wire call (issue #248 — the agent
+ * passes the JSON-serialized value); null/enum/unknown map to `string`.
+ * A param absent from the schema's `required` list is explicitly optional
  * (the manifest defaults to required).
  */
 export function paramsFromInputSchema(schema: JsonObject): ExtensionToolParam[] {
@@ -144,17 +145,23 @@ export function paramsFromInputSchema(schema: JsonObject): ExtensionToolParam[] 
   const params: ExtensionToolParam[] = [];
   for (const [name, raw] of Object.entries(schema["properties"])) {
     if (!isRecord(raw)) continue;
-    const jsonType = raw["type"];
+    const schemaType = raw["type"];
     const type: ExtensionToolParam["type"] =
-      jsonType === "string"
+      schemaType === "string"
         ? "string"
-        : jsonType === "number" || jsonType === "integer"
+        : schemaType === "number" || schemaType === "integer"
           ? "number"
-          : jsonType === "boolean"
+          : schemaType === "boolean"
             ? "boolean"
             : "string";
+    const jsonType: ExtensionToolParam["jsonType"] =
+      schemaType === "array" ? "array" : schemaType === "object" ? "object" : undefined;
     const parsedDescription = z.string().min(1).safeParse(raw["description"]);
-    const param: ExtensionToolParam = { name, type };
+    const param: ExtensionToolParam = {
+      name,
+      type,
+      ...(jsonType !== undefined ? { jsonType } : {}),
+    };
     if (parsedDescription.success && parsedDescription.data.trim() !== "") {
       param.description = parsedDescription.data.trim();
     }

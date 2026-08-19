@@ -110,8 +110,24 @@ export function extensionToolDefinitions(
 function paramsToZodSchema(params: ExtensionToolParam[]): ReturnType<typeof z.object> {
   const fields: Record<string, zod.ZodLikeSchema<unknown>> = {};
   for (const param of params) {
-    const base =
+    // Issue #248: array/object params keep a string-facing schema (the
+    // runtime re-parses the JSON literal back to a NATIVE array/object
+    // before the wire call), but the model must know the value is a JSON
+    // literal — surface it in the parameter description so supply is
+    // unambiguous.
+    let base: zod.ZodLikeSchema<unknown> =
       param.type === "string" ? z.string() : param.type === "number" ? z.number() : z.boolean();
+    if (param.jsonType !== undefined) {
+      const literalHint =
+        param.jsonType === "array"
+          ? `must be a JSON array literal, e.g. ["a","b"]`
+          : `must be a JSON object literal, e.g. {"key":"value"}`;
+      base = z.string().describe(
+        param.description !== undefined
+          ? `${param.description} Value ${literalHint}.`
+          : `Value ${literalHint}.`,
+      );
+    }
     fields[param.name] = param.required === false ? base.optional() : base;
   }
   return z.object(fields);
