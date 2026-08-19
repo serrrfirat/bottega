@@ -689,18 +689,40 @@ describe("upload link public base + stable port (issue #196)", () => {
     const h = makeDeps();
     const endpoint = startUploadLinkServer(h.deps);
     try {
+      // The running listener's own bound address is the authoritative
+      // loopback-only proof: a wildcard bind ("0.0.0.0" / "::") surfaces
+      // here as a different hostname and fails the assertion. The baseUrl
+      // string alone cannot catch that — it is a constant, not the bound
+      // address.
+      expect(endpoint.hostname).toBe("127.0.0.1");
       expect(endpoint.baseUrl.startsWith("http://127.0.0.1:")).toBe(true);
       // Probe the first non-loopback IPv4 address, when one exists: the
-      // form must refuse there while the loopback URL serves — the tunnel /
-      // proxy terminates at the host and forwards; the listener itself
-      // never exposes the form to the network.
+      // form must be unobtainable there while the loopback URL serves — the
+      // tunnel / proxy terminates at the host and forwards; the listener
+      // itself never exposes the form to the network. The probe must accept
+      // BOTH network shapes: some refuse the hop (connection refused), while
+      // NAT/gateway setups answer with their own HTTP error (e.g. a 502).
+      // Either is proof it is not our listener — only a response that is our
+      // listener's own 404/invalid-link answer on that port would violate
+      // the loopback-only guarantee.
       const lan = Object.values(networkInterfaces())
         .flat()
         .find((iface) => iface !== undefined && !iface.internal && iface.family === "IPv4");
       if (lan !== undefined) {
         const port = endpoint.baseUrl.slice("http://127.0.0.1:".length);
         const probe = `http://${lan.address}:${port}/upload/nope`;
-        await expect(fetch(probe, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
+        try {
+          const r = await fetch(probe, { signal: AbortSignal.timeout(1_000) });
+          // Resolved: it must NOT be OUR listener answering this route. Our
+          // listener serves GET /upload/nope with 404 + its invalid-link
+          // body; any other status/body (a gateway 502, a foreign 404 page,
+          // ...) is a different host and is exactly the pass condition.
+          const body = await r.text();
+          expect(r.status === 404 && body.includes("this upload link is invalid")).toBe(false);
+        } catch {
+          // Connection refused (or unresponsive): nothing at the LAN address
+          // answers this route — the listener is not reachable off loopback.
+        }
         expect((await fetch(`${endpoint.baseUrl}/upload/nope`)).status).toBe(404);
       }
     } finally {

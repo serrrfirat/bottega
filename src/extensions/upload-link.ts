@@ -412,6 +412,8 @@ export interface UploadLinkServerHandle {
   store: UploadLinkStore;
   /** http://127.0.0.1:<port> — the mint tool's base URL. */
   baseUrl: string;
+  /** The interface the listener actually bound ("127.0.0.1": loopback-only), from the running Bun.serve. */
+  hostname: string;
   stop(): void;
 }
 
@@ -478,7 +480,15 @@ export function startUploadLinkServer(deps: UploadLinkEndpointDeps, opts: Upload
   });
   const port = server.port;
   if (port === undefined) throw new Error("upload link server did not bind a port");
-  return { store: mount.store, baseUrl: `http://127.0.0.1:${port}`, stop: () => server.stop(true) };
+  return {
+    store: mount.store,
+    baseUrl: `http://127.0.0.1:${port}`,
+    // The real bound address from the running listener — "127.0.0.1" for
+    // loopback-only. A wildcard bind ("0.0.0.0" / "::") surfaces here as a
+    // different hostname, which the loopback-only test asserts against.
+    hostname: server.url.hostname,
+    stop: () => server.stop(true),
+  };
 }
 
 async function handleUpload(
