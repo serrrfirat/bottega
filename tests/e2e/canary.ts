@@ -1899,14 +1899,29 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     let channel: { id: string; created: boolean; invited: { bot: boolean; qa: boolean } } | undefined;
     try {
       channel = await live.ensureChannel(channelName);
-      journeys.push({
-        name: "setup-channel",
-        status: "pass",
-        details: [
-          `channel #${channelName} ${channel.created ? "created" : "located"}: <#${channel.id}>`,
-          `bot in channel: ${channel.invited.bot}; QA user in channel: ${channel.invited.qa}`,
-        ],
-      });
+      // The flag now reflects REAL membership (issue #245): the bot token
+      // created the channel and the invite is best-effort — the canary only
+      // reports the stitch when the bot is actually IN the private channel;
+      // otherwise it skips with the reason instead of a misleading pass.
+      if (channel.invited.bot) {
+        journeys.push({
+          name: "setup-channel",
+          status: "pass",
+          details: [
+            `channel #${channelName} ${channel.created ? "created" : "located"}: <#${channel.id}>`,
+            `bot in channel: ${channel.invited.bot}; QA user in channel: ${channel.invited.qa}`,
+          ],
+        });
+      } else {
+        journeys.push({
+          name: "setup-channel",
+          status: "skip",
+          details: [
+            `bot not a member of #${channelName} — the channel stitch needs the bot IN private channels, so there is nothing to show (issue #245)`,
+            `QA user in channel: ${channel.invited.qa}`,
+          ],
+        });
+      }
     } catch (err) {
       journeys.push({
         name: "setup-channel",
@@ -1920,7 +1935,10 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     }
 
     journeys.push(await journeyChatReply(harness, live.dmChannelId, { label: "DM", runId }));
-    if (channel) {
+    // The thread-in-#name leg is gated on the bot being a real member
+    // (#245) — running it in a channel the bot cannot see only ever
+    // produced a bare timeout, not a channel-stitch signal.
+    if (channel?.invited.bot) {
       journeys.push(
         await journeyChatReply(harness, channel.id, { label: `channel #${channelName}`, thread: true, runId }),
       );

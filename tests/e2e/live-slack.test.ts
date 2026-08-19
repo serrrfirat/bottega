@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCanary, resolveLiveTokens, resolveModelKey } from "./canary";
 import { bootHarness, CANARY_MODEL_REFS, pickRealModelRef } from "./harness";
+import { resolveChannelMembers, type SlackInviteApi } from "./slack-live";
+import type { JsonObject } from "../../src/extensions/manifest";
 
 /** Env vars the canary reads; scrubbed and restored around each test. */
 const CANARY_ENV_KEYS = [
@@ -256,5 +258,42 @@ describe("harness model ref resolution (issue #214)", () => {
       process.env.NEAR_API_KEY = "near-env";
       expect(pickRealModelRef({ ...process.env })).toBe(CANARY_MODEL_REFS.near);
     });
+  });
+});
+
+describe("channel membership flag (issue #245)", () => {
+  test("the flag reflects REAL membership: an already-joined bot reports present, not the invite error code", async () => {
+    // conversations.invite rejects with already_in_channel a user who is
+    // ALREADY in the channel, so invite-success flagging reported "bot in
+    // channel: false" for a bot that was really there — the #245
+    // misclassification. The flag must come from conversations.members,
+    // read after the best-effort invites. The stub mirrors Slack's real
+    // behavior: the members list starts with the bot (already joined), QA
+    // absent; conversations.invite for the bot re-throws
+    // already_in_channel, for QA succeeds and joins. Red on the pre-fix
+    // code: invite-success flagging shallowly returns { bot: false,
+    // qa: true } — the already-joined bot reads as absent.
+    let members = ["B-bot"];
+    const calls: string[] = [];
+    const api: SlackInviteApi = {
+      call: async <T = JsonObject>(method: string, body?: JsonObject): Promise<T> => {
+        calls.push(method);
+        if (method === "conversations.members") return { members } as T;
+        if (method === "conversations.invite") {
+          const userId = typeof body?.users === "string" ? body.users : "";
+          if (members.includes(userId)) {
+            throw new Error("slack api conversations.invite: already_in_channel");
+          }
+          members = [...members, userId];
+          return { ok: true } as T;
+        }
+        throw new Error(`unexpected slack api method ${method}`);
+      },
+    };
+    const flag = await resolveChannelMembers(api, "C1", { bot: "B-bot", qa: "U-qa" });
+    expect(flag).toEqual({ bot: true, qa: true });
+    // The flag must be derived from the real membership read, not from a
+    // guess — at least one conversations.members call must have happened.
+    expect(calls.filter((m) => m === "conversations.members").length).toBeGreaterThan(0);
   });
 });

@@ -101,6 +101,61 @@ export class SlackApiClient {
   }
 }
 
+/** The subset of the Slack Web API the membership resolution needs (issue #245). */
+export interface SlackInviteApi {
+  call<T = JsonObject>(method: string, body?: JsonObject): Promise<T>;
+}
+
+/**
+ * Report whether both roles are really in the channel after best-effort
+ * invites (issue #245).
+ *
+ * conversations.invite rejects a user who is ALREADY in the channel
+ * (already_in_channel), so flagging "invited" from invite success
+ * misclassifies an already-joined bot as absent: setup-channel then
+ * reported "bot in channel: false" for a bot that was really there, and
+ * the channel leg ran un-gated. The flag therefore comes from
+ * conversations.members — the source of truth — read AFTER the best-effort
+ * invites so a freshly invited user counts as joined too; an unreadable
+ * members list (no channels:manage scope) fails closed to false.
+ *
+ * Exported for the hermetic flag test (the decision is pure given an
+ * injectable Slack API surface).
+ */
+export async function resolveChannelMembers(
+  api: SlackInviteApi,
+  channelId: string,
+  users: { bot: string; qa: string },
+): Promise<{ bot: boolean; qa: boolean }> {
+  // Real membership: the source of truth for the flag (issue #245).
+  const readMembers = async (): Promise<string[]> => {
+    try {
+      const res = await api.call<{ members: string[] }>("conversations.members", { channel: channelId });
+      return res.members;
+    } catch {
+      // no channels:manage (or members read) — reported, never fatal.
+      return [];
+    }
+  };
+  let members = await readMembers();
+  // Best-effort invites for whoever is missing — already-members are
+  // skipped because conversations.invite rejects them (already_in_channel),
+  // and a scope shortfall is reported, never fatal.
+  for (const userId of [users.bot, users.qa]) {
+    if (members.includes(userId)) continue;
+    try {
+      await api.call("conversations.invite", { channel: channelId, users: userId });
+    } catch {
+      // already a member or no channels:manage — reported, never fatal.
+    }
+  }
+  // Re-read after the invites: the flag must reflect REAL membership, not
+  // whether an invite call happened to succeed (#245). An invite that
+  // worked shows up here; an already-member shows up on BOTH reads.
+  members = await readMembers();
+  return { bot: members.includes(users.bot), qa: members.includes(users.qa) };
+}
+
 export interface ChannelEnsureResult {
   id: string;
   created: boolean;
@@ -218,23 +273,17 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
     return channelsCache.find((c) => c[key] === value);
   };
 
-  const invite = async (channelId: string): Promise<{ bot: boolean; qa: boolean }> => {
-    const invited = { bot: false, qa: false };
-    for (const [label, user] of [
-      ["bot", botUserId],
-      ["qa", qaUserId],
-    ] as const) {
-      try {
-        // SAFETY: bootLiveSlack already resolved qaUserId (the !qaUserId
-        // throw above); both loop values are non-empty member ids at invite
-        // time, so the union narrows to string.
-        await bot.call("conversations.invite", { channel: channelId, users: user as string });
-        invited[label] = true;
-      } catch {
-        // already a member or no channels:manage — reported, never fatal.
-      }
+  const invite = (channelId: string): Promise<{ bot: boolean; qa: boolean }> => {
+    // SAFETY: bootLiveSlack already resolved both ids above (auth.test for
+    // the bot; the `!qaUserId` throw for QA) — but qaUserId is a `let`
+    // reassigned in a nested fn, so the closure cannot narrow it. The guard
+    // satisfies the type without a cast and is unreachable in practice.
+    const botId = botUserId;
+    const qaId = qaUserId;
+    if (!qaId) {
+      throw new Error("live-slack: invite requires the resolved QA user id (resolved at boot)");
     }
-    return invited;
+    return resolveChannelMembers(bot, channelId, { bot: botId, qa: qaId });
   };
 
   return {
