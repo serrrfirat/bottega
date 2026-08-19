@@ -379,12 +379,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // registry upsert → audit). The value never goes through Slack, the
   // agent, or a transcript.
   // Issue #196: the mint's URL is the deployment's PUBLIC base when one is
-  // configured (BOTTEGA_OAUTH_CALLBACK_BASE_URL — ONE public base shared
-  // with the #198 OAuth callback: the same reverse proxy / tunnel serves
-  // both /upload/* and /oauth/callback), else the loopback URL of the
-  // in-process listener below. The listener itself stays 127.0.0.1-only —
-  // the tunnel terminates at the host and forwards to it.
-  const uploadPublicBase = uploadLinkPublicBase();
+  // configured (the durable public-base store — issue #249 — or the
+  // BOTTEGA_OAUTH_CALLBACK_BASE_URL override; ONE public base shared with
+  // the #198 OAuth callback: the same reverse proxy / tunnel serves both
+  // /upload/* and /oauth/callback), else the loopback URL of the in-process
+  // listener below. The listener itself stays 127.0.0.1-only — the tunnel
+  // terminates at the host and forwards to it. The base is NEVER captured at
+  // boot (issue #249): it resolves lazily per mint, so a rotated quick-tunnel
+  // host heals without a restart.
   // The stable local port for the in-process browser-leg listener
   // (BOTTEGA_CALLBACK_PORT, 0 = ephemeral): a static tunnel cannot forward
   // to a port that changes per boot. ONE listener serves every browser
@@ -457,14 +459,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // the space-service connect path and the per-session connect tool. The
   // callback base is the loopback URL by default (local dev — the browser
   // runs on the same host as the server, the issue #57 posture);
-  // deployments override it with BOTTEGA_OAUTH_CALLBACK_BASE_URL — the
-  // redirect_uri a mint registers with the provider is hit MINUTES later,
-  // so it must be the PUBLIC base in deployment, never a loopback URL.
+  // deployments override it with the PUBLIC base — the redirect_uri a mint
+  // registers with the provider is hit MINUTES later, so it must be the
+  // public base in deployment, never a loopback URL. Issue #249: resolved
+  // LAZILY at mint time (the durable store first, the env override second),
+  // never captured at boot — a rotated cloudflared quick-tunnel host heals
+  // the next connect without a server restart or .env edit.
   const mcpOAuthConnector = createMcpOAuthConnector({
     registry: extensionRegistry,
     store,
     audit,
-    callbackBaseUrl: () => uploadPublicBase ?? oauthCallback.baseUrl,
+    callbackBaseUrl: () => uploadLinkPublicBase() ?? oauthCallback.baseUrl,
   });
   // Issue #232/#233: the deterministic catalog seam for UNREGISTERED
   // extension connects — "connect X" drives lookup → draft → the connect's

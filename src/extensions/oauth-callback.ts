@@ -3,7 +3,8 @@
  * half of the connect flow's browser leg, mirroring the #196 one-time
  * upload-link server (Bun.serve on 127.0.0.1, ephemeral port — the same
  * public-ingress posture as issue #57's local dev; the PUBLIC base URL is
- * BOTTEGA_OAUTH_CALLBACK_BASE_URL in deployment, the loopback URL here).
+ * the durable store `data/public-base-url` (#249) — else the
+ * `BOTTEGA_OAUTH_CALLBACK_BASE_URL` override, else the loopback URL).
  *
  * The authorization URL the connect tool shows in Slack points at the
  * hosted MCP's authorize endpoint with `redirect_uri = <base>/oauth/callback`

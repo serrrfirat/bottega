@@ -321,10 +321,13 @@ clients.
   persisted in SQLite for cross-process use, capped per actor, consumed
   atomically, and POST attempts are rate-limited per client IP. OAuth
   extensions use their normal broker login and cannot mint an upload link.
-  The minted link's public base (BOTTEGA_OAUTH_CALLBACK_BASE_URL) is
+  The minted link's public base — the durable store `data/public-base-url`
+  (written by `scripts/tunnel.sh` on every rotation, issue #249), else
+  `BOTTEGA_OAUTH_CALLBACK_BASE_URL` as a deployment-only override — is
   health-checked at mint time (#211): a reachable URL wins, a stale one
-  (rotated/dead tunnel) falls back to the loopback URL with a loud warning
-  in the reply — the .env value must be refreshed when the tunnel rotates.
+  (dead tunnel) falls back to the loopback URL with a loud warning in the
+  reply. Because the store is re-read on every mint, a rotated quick-tunnel
+  host self-heals the next mint instead of waiting for an `.env` edit.
 - **Draft and pin from chat (non-MCP / manual bindings)** — `catalog_browser`
   writes an unreviewed
   draft outside the registry, tells the agent to use `web_search` for the

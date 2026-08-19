@@ -6,7 +6,7 @@
  * a transcript.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAudit } from "../policy/audit";
@@ -31,14 +31,20 @@ import {
 const dir = mkdtempSync(join(tmpdir(), "bottega-upload-link-"));
 const stores: Store[] = [];
 const callbackPort = process.env.BOTTEGA_CALLBACK_PORT;
+const publicBaseFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
 beforeAll(() => {
   process.env.BOTTEGA_CALLBACK_PORT = "0";
+  // Hermetic (issue #249): point the durable public-base store at a temp
+  // path that never exists so env-driven legs never read a stray repo store.
+  process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
 });
 afterAll(() => {
   for (const store of stores) store.close();
   rmSync(dir, { recursive: true, force: true });
   if (callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
   else process.env.BOTTEGA_CALLBACK_PORT = callbackPort;
+  if (publicBaseFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+  else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = publicBaseFile;
 });
 
 function freshStore(): Store {
@@ -586,9 +592,13 @@ describe("upload link minting (issue #196)", () => {
 });
 
 describe("upload link public base + stable port (issue #196)", () => {
-  test("uploadLinkPublicBase reads the #198 public-base env (absent/empty → undefined)", () => {
+  test("uploadLinkPublicBase reads the #198 public-base env when no durable store is present (absent/empty → undefined)", () => {
+    const savedFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
     const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
     try {
+      // Hermetic (issue #249): point the durable-store path at a temp file
+      // that never exists, so this leg exercises env-ONLY resolution.
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
       delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
       expect(uploadLinkPublicBase()).toBeUndefined();
       process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "";
@@ -596,8 +606,52 @@ describe("upload link public base + stable port (issue #196)", () => {
       process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://upload.example.com";
       expect(uploadLinkPublicBase()).toBe("https://upload.example.com");
     } finally {
+      if (savedFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+      else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = savedFile;
       if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
       else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
+    }
+  });
+
+  test("uploadLinkPublicBase prefers the durable store, then the env, then undefined (issue #249)", () => {
+    const storeDir = mkdtempSync(join(tmpdir(), "bottega-public-base-"));
+    const storeFile = join(storeDir, "public-base-url");
+    const savedFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+    const saved = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = storeFile;
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      // Neither source present → undefined.
+      expect(uploadLinkPublicBase()).toBeUndefined();
+
+      // The durable store is written (the rotating tunnel, issue #249) → it wins.
+      writeFileSync(storeFile, "https://tunnel-a.trycloudflare.com\n");
+      expect(uploadLinkPublicBase()).toBe("https://tunnel-a.trycloudflare.com");
+
+      // The env is a deployment-only override: the store still wins.
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://env.example.com";
+      expect(uploadLinkPublicBase()).toBe("https://tunnel-a.trycloudflare.com");
+
+      // Store cleared (whitespace) → the env wins.
+      writeFileSync(storeFile, "  \n");
+      expect(uploadLinkPublicBase()).toBe("https://env.example.com");
+
+      // Both absent → undefined.
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      expect(uploadLinkPublicBase()).toBeUndefined();
+
+      // Store removed mid-process → the env wins (an unreadable store never
+      // errors out of the resolution).
+      writeFileSync(storeFile, "https://tunnel-b.trycloudflare.com");
+      rmSync(storeFile);
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://env.example.com";
+      expect(uploadLinkPublicBase()).toBe("https://env.example.com");
+    } finally {
+      if (savedFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+      else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = savedFile;
+      if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
+      rmSync(storeDir, { recursive: true, force: true });
     }
   });
 

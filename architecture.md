@@ -499,9 +499,12 @@ user-facing view is in
 7. **No-secrets upload path** — `connect_upload_link` is available in OMP
    sessions and, when `BOTTEGA_UPLOAD_BASE_URL` is wired, the MCP surface
    (#196) — the server sets that env to the deployment's PUBLIC base
-   (`BOTTEGA_OAUTH_CALLBACK_BASE_URL`, the same env the #198 OAuth callback
-   reads) when configured, else the loopback URL of its in-process
-   endpoint. `src/extensions/upload-link.ts` mints a 144-bit opaque token in
+   (resolved lazily per mint, issue #249: the durable store
+   `data/public-base-url` written by `scripts/tunnel.sh` first, then the
+   `BOTTEGA_OAUTH_CALLBACK_BASE_URL` override — the same public base the
+   #198 OAuth callback reads) when configured, else the loopback URL of its
+   in-process endpoint. `src/extensions/upload-link.ts` mints a 144-bit
+   opaque token in
    SQLite, limited to five live links per actor and 15 minutes by default.
    The loopback browser endpoint atomically consumes the token, limits POST
    attempts per client IP, and invokes the existing `connectExtension` path
@@ -578,11 +581,17 @@ flowchart LR
 The endpoint binds `127.0.0.1` only — it never exposes the form to the
 network; a deployment serving remote Slack participants supplies routing
 outside this repository (a reverse proxy / tunnel in front of the host).
-When the deployment sets `BOTTEGA_OAUTH_CALLBACK_BASE_URL` (the same public
-base the #198 OAuth callback reads — ONE ingress serves both
-`/upload/<token>` and `/oauth/callback`), the mint returns
-`<base>/upload/<token>` instead of the loopback URL, so a browser on a
-remote host reaches the form through the ingress. Unset → local dev: the
+The mint's public base resolves lazily per mint (issue #249): the durable
+store `data/public-base-url` — kept current by `scripts/tunnel.sh` (the
+cloudflared quick-tunnel companion) — first, then
+`BOTTEGA_OAUTH_CALLBACK_BASE_URL` as a deployment-only override for a FIXED
+host. The SAME public base the #198 OAuth callback reads — ONE ingress
+serves both `/upload/<token>` and `/oauth/callback`. A quick tunnel that
+rotates self-heals: the script writes the new URL to the store and the next
+mint uses it, no `.env` edit and no server restart. When a base resolves,
+the mint returns `<base>/upload/<token>` instead of the loopback URL, so a
+browser on a remote host reaches the form through the ingress. Unset →
+local dev: the
 mint returns the loopback URL of the in-process endpoint. Static tunnels
 pin the listener with `BOTTEGA_CALLBACK_PORT` (default 0 = ephemeral): ONE
 Bun.serve serves `/upload/*`, `/oauth/callback`, and the webhook route on

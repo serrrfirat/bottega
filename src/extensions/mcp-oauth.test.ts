@@ -13,7 +13,7 @@
  * re-auth prompt, broker refresh sentinel dropped).
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -35,6 +35,7 @@ import {
   type PersistedOAuthFlow,
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";
+import { uploadLinkPublicBase } from "./upload-link";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-oauth-"));
 const stores: Store[] = [];
@@ -731,6 +732,54 @@ describe("completeMcpOAuthFlow — direct unit path", () => {
       const rows = await store.listExtensionCredentials("fixture.oauthmcp");
       expect(rows[0]!.broker_credential_id).toBe(901);
     } finally {
+      stub.stop();
+    }
+  });
+});
+
+describe("durable public-base store — tunnel rotation heals without a restart (issue #249)", () => {
+  test("the mint re-reads the store every flow, so the next mint uses a rotated tunnel host", async () => {
+    const stub = new StubOAuthMcp();
+    const storeDir = mkdtempSync(join(tmpdir(), "bottega-public-base-rotation-"));
+    const storeFile = join(storeDir, "public-base-url");
+    const savedFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+    const savedEnv = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = storeFile;
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9");
+      // The SERVER's wiring (issue #249): the callback base resolves LAZILY
+      // from the durable store at mint time — never captured at boot. A
+      // store rotation mid-process is picked up by the next mint.
+      deps.callbackBaseUrl = () => uploadLinkPublicBase() ?? "http://127.0.0.1:9";
+
+      const input = { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", actor: "UADA", scope: "personal" as const };
+
+      // First mint: the store points at tunnel A.
+      writeFileSync(storeFile, "https://tunnel-a.trycloudflare.com\n");
+      const first = await startMcpOAuthFlow(input, deps);
+      expect(first.ok).toBe(true);
+      if (first.ok) {
+        expect(new URL(first.authorizationUrl).searchParams.get("redirect_uri")).toBe("https://tunnel-a.trycloudflare.com/oauth/callback");
+      }
+
+      // MID-PROCESS tunnel rotation: the SAME server process, NO restart.
+      // The store now carries tunnel B — the next mint must use the new host.
+      writeFileSync(storeFile, "https://tunnel-b.trycloudflare.com\n");
+      const second = await startMcpOAuthFlow(input, deps);
+      expect(second.ok).toBe(true);
+      if (second.ok) {
+        expect(new URL(second.authorizationUrl).searchParams.get("redirect_uri")).toBe("https://tunnel-b.trycloudflare.com/oauth/callback");
+      }
+    } finally {
+      if (savedFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+      else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = savedFile;
+      if (savedEnv === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = savedEnv;
+      rmSync(storeDir, { recursive: true, force: true });
       stub.stop();
     }
   });

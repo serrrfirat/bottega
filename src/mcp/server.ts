@@ -102,6 +102,7 @@ import {
   mintUploadLink,
   MINT_UPLOAD_LINK_TOOL,
   UploadLinkStore,
+  uploadLinkPublicBase,
   uploadLinkReplyText,
   UPLOAD_LINK_RELAY_GUIDANCE,
   type PublicBaseResolution,
@@ -906,12 +907,19 @@ export async function bootMemoryMcpServer(opts: {
       : undefined;
   // Issue #198: same posture for hosted OAuth MCPs — the connect tool here
   // mints flows into the SHARED oauth_flows table with the callback pointed
-  // at the SERVER process's OAuth callback endpoint (BOTTEGA_OAUTH_CALLBACK_BASE_URL,
-  // set by the caller like BOTTEGA_UPLOAD_BASE_URL).
-  const oauthBaseUrl = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+  // at the SERVER process's OAuth callback endpoint (the durable public-base
+  // store — issue #249 — or BOTTEGA_OAUTH_CALLBACK_BASE_URL, set by the
+  // caller like BOTTEGA_UPLOAD_BASE_URL). Issue #249: resolved lazily at mint
+  // time so a rotated quick-tunnel host heals without a child restart.
+  const callbackBase = uploadLinkPublicBase();
   const mcpOAuth =
-    oauthBaseUrl && oauthBaseUrl.length > 0
-      ? createMcpOAuthConnector({ registry: runtime.registry, store, audit, callbackBaseUrl: () => oauthBaseUrl })
+    callbackBase !== undefined
+      ? createMcpOAuthConnector({
+          registry: runtime.registry,
+          store,
+          audit,
+          callbackBaseUrl: () => uploadLinkPublicBase() ?? callbackBase,
+        })
       : undefined;
   // Issue #206: the internal tools ride the MCP surface too — the same
   // scheduler registry the server boot builds (action-name validation for

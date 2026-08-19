@@ -33,6 +33,7 @@
  * child processes that mint links), so a link minted anywhere is
  * consumable by the endpoint.
  */
+import { readFileSync } from "node:fs";
 import { z, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage, toolError } from "../tools/helpers";
 import type { Store, UploadToken } from "../store/db";
@@ -53,19 +54,52 @@ export const UPLOAD_LINK_MAX_ATTEMPTS_PER_IP = 10;
 /** Attempt window for the per-IP rate limit. */
 export const UPLOAD_LINK_ATTEMPTS_WINDOW_MS = 15 * 60_000;
 
+/** Durable public-base store path (issue #249), env-overridable like the git-token file. */
+export const DEFAULT_PUBLIC_BASE_URL_FILE = "data/public-base-url";
+/** Environment name for the durable public-base store path override. */
+export const PUBLIC_BASE_URL_FILE_ENV = "BOTTEGA_PUBLIC_BASE_URL_FILE";
+
+/** The durable public-base store path (env override, else the data-dir default). */
+export function publicBaseUrlFile(): string {
+  const override = process.env[PUBLIC_BASE_URL_FILE_ENV];
+  return override !== undefined && override.length > 0 ? override : DEFAULT_PUBLIC_BASE_URL_FILE;
+}
+
+/**
+ * Reads the durable public-base store (issue #249): `scripts/tunnel.sh`
+ * writes the CURRENT cloudflared quick-tunnel URL here on every rotation, so
+ * a new host self-heals WITHOUT a server restart. Absent / unreadable / empty
+ * → `undefined` (fall through to the env override, then the loopback posture)
+ * — never throws.
+ */
+export function storedPublicBase(file = publicBaseUrlFile()): string | undefined {
+  try {
+    const value = readFileSync(file, "utf8").trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The upload endpoint's PUBLIC base URL (issue #196): the browser-facing
- * base of the deployment's ONE public ingress — the SAME env the #198 OAuth
- * callback surface reads (BOTTEGA_OAUTH_CALLBACK_BASE_URL), because the
- * same reverse proxy / tunnel serves both `/upload/<token>` and
- * `/oauth/callback`. When a deployment sets it, the mint returns
- * `<base>/upload/<token>` — a browser on a remote host (or behind the MITM
- * proxy) reaches the form through the ingress; the in-process listener
- * itself stays 127.0.0.1-only. Unset or empty → undefined: the mint falls
- * back to the loopback URL of the in-process endpoint (local dev, the
- * issue #57 posture).
+ * base of the deployment's ONE public ingress — the SAME base the #198 OAuth
+ * callback surface reads, because the same reverse proxy / tunnel serves both
+ * `/upload/<token>` and `/oauth/callback`. Resolution order (issue #249):
+ *   1. the durable store `data/public-base-url` first — written by
+ *      `scripts/tunnel.sh` on every tunnel rotation, so a rotated
+ *      quick-tunnel host heals the next mint WITHOUT a restart; then
+ *   2. the env `BOTTEGA_OAUTH_CALLBACK_BASE_URL` second — a
+ *      deployment-only override for a FIXED public host that never rotates.
+ * Neither → `undefined`: the mint falls back to the loopback URL of the
+ * in-process endpoint (local dev, the issue #57 posture).
  */
 export function uploadLinkPublicBase(): string | undefined {
+  // Issue #249: the durable store is authoritative — boot env goes stale the
+  // moment a quick-tunnel host changes (Cloudflare rotations happen without a
+  // server restart, so a boot-frozen env breaks every connect/upload).
+  const stored = storedPublicBase();
+  if (stored !== undefined) return stored;
   const base = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
   return base !== undefined && base.length > 0 ? base : undefined;
 }
@@ -89,8 +123,8 @@ export interface PublicBaseResolution {
 
 /**
  * Resolves the upload-link mint's PUBLIC base (issue #211): a quick tunnel
- * rotates, so the env value goes stale between boots — the mint must never
- * trust it blindly. The configured base is health-checked at MINT time:
+ * rotates, so any stored base goes stale between boots — the mint must
+ * never trust it blindly. The configured base is health-checked at MINT time:
  *   - any non-5xx HTTP response → REACHABLE. The app's own ingress 404s
  *     unknown paths, so a 2xx/3xx/4xx means the tunnel forwards to the
  *     listener; a 5xx (Cloudflare 502/530 when the tunnel is gone, an
@@ -112,9 +146,10 @@ export async function resolveUploadLinkPublicBase(
   return {
     base: undefined,
     warning:
-      `WARNING: the configured public base (BOTTEGA_OAUTH_CALLBACK_BASE_URL=${configuredBase}) is unreachable — ` +
-      `the tunnel URL in .env is stale (issue #211). The minted link below is LOOPBACK-only: a remote user ` +
-      `cannot open it. Refresh the tunnel and BOTTEGA_OAUTH_CALLBACK_BASE_URL, restart the server, then re-mint.`,
+      `WARNING: the configured public base (${configuredBase}) is unreachable — ` +
+      `the stored tunnel URL (data/public-base-url, issue #249) or BOTTEGA_OAUTH_CALLBACK_BASE_URL is ` +
+      `stale (issue #211). The minted link below is LOOPBACK-only: a remote user ` +
+      `cannot open it. Refresh the tunnel (scripts/tunnel.sh re-writes the store), then re-mint.`,
   };
 }
 

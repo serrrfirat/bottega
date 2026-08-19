@@ -104,6 +104,14 @@ You need Docker, a Slack workspace, and about fifteen minutes:
    SDK requests carry placeholders, not provider keys.
 3. `docker compose --profile executor up -d --build`
 
+Browser-facing connects/uploads (the OAuth callback and the one-time upload
+link) need a public base. Run `scripts/tunnel.sh` (foreground) and it keeps a
+cloudflared quick tunnel up, writing the current public URL to
+`data/public-base-url` (issue #249) — the server re-reads that store on every
+mint, so tunnel rotations heal without an `.env` edit or a restart.
+`BOTTEGA_OAUTH_CALLBACK_BASE_URL` (see `.env.example`) is a deployment-only
+override for a fixed DNS host that never rotates.
+
 The full walkthrough — including local development, credentials, the
 scheduler, and backup — is in **[setup.md](setup.md)**.
 
