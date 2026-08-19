@@ -1009,11 +1009,13 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]!.authProvider).toBeDefined();
     expect(h.boundary.calls).toHaveLength(1);
-    // The provider is vault-backed: tokens() loads the registry row's vault
-    // credential (the seam's scripted row) and exposes it to the SDK.
+    // The provider is vault-backed: load 1 = identity restoration
+    // (saveClientInformation), load 2 = provider.tokens(); tokens()
+    // reloads the registry row's vault credential (the seam's scripted
+    // row) and exposes it to the SDK.
     const provider = captured[0]!.authProvider!;
     await expect(provider.tokens()).resolves.toMatchObject({ access_token: "access-1", refresh_token: "refresh-1" });
-    expect(store.loads).toEqual([`${OAUTH_ID}:7`]);
+    expect(store.loads).toEqual([`${OAUTH_ID}:7`, `${OAUTH_ID}:7`]);
     expect(store.saves).toHaveLength(0);
   });
 
