@@ -1192,6 +1192,131 @@ describe("issue #257 — OAuth credential durability for every MCP integration",
   });
 });
 
+describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint capture", () => {
+  /** Full mint → browser-authorize → callback round trip; returns the callback's HTTP response. */
+  async function roundTrip(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<Response> {
+    const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+    try {
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+      const minted = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      if (!minted.ok) throw new Error(`mint failed: ${minted.message}`);
+      const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+      return await fetch(authorize.headers.get("location")!);
+    } finally {
+      callback.stop();
+    }
+  }
+
+  test("(a) an AS that advertises the refresh_token grant but returns an access-only exchange fails closed naming the advertised-grant cause — never 'offline_access was not granted'", async () => {
+    const stub = new StubOAuthMcp();
+    stub.dropRefresh = true; // ignores offline_access: the exchange returns access with NO refresh_token
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      // The AS DOES advertise refresh_token (the #263 shape — Notion
+      // advertises refresh_token yet grants an access-only token).
+      const metadata = (await (await fetch(`${stub.baseUrl}/.well-known/oauth-authorization-server`)).json()) as {
+        grant_types_supported: string[];
+      };
+      expect(metadata.grant_types_supported).toContain("refresh_token");
+
+      const done = await roundTrip(stub, store, vault);
+      expect(done.status).toBe(500);
+      const body = await done.text();
+      // The fail-closed message names the advertised grant + the access-only
+      // outcome — it must NOT claim offline_access was not granted.
+      expect(body).toContain("advertised the refresh_token grant");
+      expect(body).toContain("requested offline_access");
+      expect(body).toContain("access-only");
+      expect(body).toContain("no refresh_token");
+      expect(body).not.toContain("offline_access was not granted");
+      // Nothing persisted: no empty-refresh credential, no registry row.
+      expect(vault.saves).toHaveLength(0);
+      expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(b) a refresh-advertising AS that honors offline_access still lands a refreshable row a subsequent tools/list mint can use", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const done = await roundTrip(stub, store, vault);
+      expect(done.status).toBe(200);
+
+      // The POST-probe vault row is genuinely refreshable.
+      const saved = vault.saves[vault.saves.length - 1];
+      expect(saved).toBeTruthy();
+      if (!saved) return;
+      expect(saved.credential.refresh).toMatch(/^refresh-rotated-/);
+      expect(saved.credential.refresh).not.toBe("");
+
+      // A later mint resolves the registry row and refreshes through the
+      // SDK from a stale access token — the #263 negotiation threading
+      // never broke the #256/#257 happy path.
+      const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+      expect(rows).toHaveLength(1);
+      vault.loadResult = { ...saved.credential, access: "access-stale", expires: Date.now() - 60_000 };
+      const provider = await createRuntimeMcpOAuthProvider({ credential: { ...rows[0], id: "ec_test" }, tokenStore: vault });
+      const result = await auth(provider, { serverUrl: stub.mcpUrl });
+      expect(result).toBe("AUTHORIZED");
+      expect(stub.state.refreshCalls).toBe(2); // connect-time probe + this runtime mint
+      expect(vault.saves[vault.saves.length - 1]!.credential.refresh).toMatch(/^refresh-rotated-/);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("(c) DEBUG capture: the token endpoint's masked response is logged while DEBUG is set and is silent without it", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const savedDebug = process.env.DEBUG;
+      const originalDebug = console.debug;
+      const lines: string[] = [];
+      console.debug = (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      };
+      try {
+        // OFF by default: connect with DEBUG unset emits NO token capture.
+        delete process.env.DEBUG;
+        const off = await roundTrip(stub, store, vault);
+        expect(off.status).toBe(200);
+        expect(lines.filter((l) => l.includes("/token"))).toHaveLength(0);
+        lines.length = 0;
+
+        // ON: connect again with DEBUG set → the token endpoint's MASKED
+        // responses are captured (the exchange + the connect-time probe).
+        process.env.DEBUG = "1";
+        const on = await roundTrip(stub, store, vault);
+        expect(on.status).toBe(200);
+        const tokenLogs = lines.filter((l) => l.includes("/token"));
+        expect(tokenLogs.length).toBeGreaterThan(0);
+        const joined = tokenLogs.join("\n");
+        // The masked marker appears (short values → <masked>; longer → first-8 + …).
+        expect(joined).toMatch(/<masked>|…/);
+        // No real token value ever leaks into the capture.
+        for (const save of vault.saves) {
+          expect(joined).not.toContain(save.credential.access);
+          expect(joined).not.toContain(save.credential.refresh);
+        }
+      } finally {
+        if (savedDebug === undefined) delete process.env.DEBUG;
+        else process.env.DEBUG = savedDebug;
+        console.debug = originalDebug;
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+});
+
 describe("token refresh — the runtime provider (issue #198)", () => {
   /** Runs a real connect round trip and returns the vault-saved credential. */
   async function connectCredential(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<OAuthCredential> {

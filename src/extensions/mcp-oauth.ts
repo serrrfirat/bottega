@@ -223,6 +223,7 @@ export function tokensToVaultCredential(
   tokens: OAuthTokens,
   previous: OAuthCredential | null,
   clientInformation?: { client_id?: string; client_secret?: string; token_endpoint_auth_method?: string },
+  negotiation?: OAuthGrantNegotiation,
 ): VaultOAuthCredential {
   // A genuine new refresh wins; otherwise the previous row's refresh is
   // carried forward (non-rotating servers). Neither present → the grant
@@ -230,7 +231,7 @@ export function tokensToVaultCredential(
   // empty-refresh credential that mints nothing.
   const refresh = tokens.refresh_token && tokens.refresh_token !== "" ? tokens.refresh_token : previous?.refresh;
   if (refresh === undefined || refresh === "") {
-    throw new Error("the OAuth server issued no refresh token (offline_access was not granted) — the credential was not saved");
+    throw new Error(noRefreshTokenErrorMessage(negotiation));
   }
   const credential: VaultOAuthCredential = {
     type: "oauth",
@@ -252,6 +253,59 @@ export function tokensToVaultCredential(
   return credential;
 }
 
+/**
+ * The connect-negotiated grant contract (issue #263), carried from
+ * {@link connectServerNegotiation} (the mint leg) through the persisted
+ * flow (the callback leg) into the fail-closed message: whether the
+ * authorization server advertised the `refresh_token` grant + the composed
+ * scope the connect actually REQUESTED. Allowing the save path to
+ * distinguish "the AS advertised refresh but returned an access-only
+ * token" (a server limitation — Notion's live failure) from the generic
+ * no-refresh outcome, instead of the misleading blanket claim that
+ * `offline_access` "was not granted".
+ */
+export interface OAuthGrantNegotiation {
+  /** True when the AS advertised the `refresh_token` grant at connect time. */
+  grantedRefresh?: boolean;
+  /** The scope the connect actually requested (may carry `offline_access`). */
+  requestedScope?: string;
+}
+
+/**
+ * The fail-closed message for an exchange whose response carries no refresh
+ * token and no previous row has one either (issue #263). Three honest
+ * tiers, so a live connect is classified by what actually happened:
+ *
+ * 1. Advertised `refresh_token` + requested `offline_access`, yet the token
+ *    endpoint returned an access-only token → the server caps its grants at
+ *    access tokens. This is the message that names the cause precisely; it
+ *    must NEVER claim `offline_access` "was not granted" here, because it
+ *    WAS requested (and granted access-only).
+ * 2. Advertised `refresh_token` but `offline_access` was NOT requested and
+ *    no refresh came back → honest: nothing refreshable was requested.
+ * 3. No negotiated grant signal (no refresh grant advertised, or the
+ *    negotiation never completed) → the original generic message.
+ */
+export function noRefreshTokenErrorMessage(negotiation?: OAuthGrantNegotiation): string {
+  const requestedOfflineAccess =
+    negotiation?.requestedScope !== undefined &&
+    negotiation.requestedScope.split(/\s+/).includes("offline_access");
+  if (negotiation?.grantedRefresh === true && requestedOfflineAccess) {
+    return (
+      "the authorization server advertised the refresh_token grant and the connect requested offline_access, " +
+      "but the token endpoint returned an access-only token (no refresh_token) — this server appears to cap its " +
+      "grants at access tokens; the credential was not saved (fail closed)"
+    );
+  }
+  if (negotiation?.grantedRefresh === true) {
+    return (
+      "the authorization server advertised the refresh_token grant but the connect did not request offline_access, " +
+      "and the token endpoint returned no refresh_token — the credential was not saved (fail closed)"
+    );
+  }
+  return "the OAuth server issued no refresh token (offline_access was not granted) — the credential was not saved";
+}
+
 /** The persisted flow bookkeeping (the `oauth_flows.flow` JSON blob). */
 export interface PersistedOAuthFlow {
   codeVerifier?: string;
@@ -264,6 +318,14 @@ export interface PersistedOAuthFlow {
    * for the vault row's `token_endpoint_auth_method` field.
    */
   tokenEndpointAuthMethod?: string;
+  /**
+   * The connect-negotiated grant contract (issue #263) — whether the AS
+   * advertised the `refresh_token` grant + the scope the mint actually
+   * requested. Persisted so the CALLBACK's exchange fail-closed message can
+   * name the advertised-refresh-but-access-only cause (a server
+   * limitation) instead of the misleading "offline_access was not granted".
+   */
+  negotiation?: OAuthGrantNegotiation;
   authorizationUrl?: string;
 }
 
@@ -286,6 +348,13 @@ export interface McpOAuthProviderOpts {
   state?: string;
   /** Callback leg: restores the minted flow's PKCE/client/discovery state. */
   restore?: PersistedOAuthFlow;
+  /**
+   * The connect-negotiated grant contract (issue #263). The mint leg
+   * passes it directly; the callback leg reads it off `restore`; the
+   * runtime leg leaves it undefined (no negotiation context there — that
+   * leg only ever saves a successful refresh that carries a real token).
+   */
+  negotiation?: OAuthGrantNegotiation;
 }
 
 /**
@@ -302,12 +371,14 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
   #discoveryState: OAuthDiscoveryState | undefined;
   #tokens: OAuthTokens | undefined;
   #savedBrokerCredentialId: number | undefined;
+  #negotiation: OAuthGrantNegotiation | undefined;
 
   constructor(opts: McpOAuthProviderOpts) {
     this.#opts = opts;
     this.#codeVerifier = opts.restore?.codeVerifier;
     this.#clientInformation = opts.restore?.clientInformation;
     this.#discoveryState = opts.restore?.discoveryState;
+    this.#negotiation = opts.negotiation ?? opts.restore?.negotiation;
   }
 
   get redirectUrl(): string | URL {
@@ -361,7 +432,7 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
             .catch(() => null);
     const saved = await this.#opts.tokenStore.save(
       this.#opts.tokenTarget.provider,
-      tokensToVaultCredential(tokens, previous, this.#clientInformation),
+      tokensToVaultCredential(tokens, previous, this.#clientInformation, this.#negotiation),
     );
     this.#opts.tokenTarget.brokerCredentialId = saved.brokerCredentialId;
     this.#savedBrokerCredentialId = saved.brokerCredentialId;
@@ -458,6 +529,79 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
 }
 
 /**
+ * Value masking for the DEBUG token-endpoint capture (issue #263): token
+ * values are never echoed to the log. Short values (≤8 chars) become the
+ * literal `<masked>` marker; longer ones are truncated to their first 8
+ * characters plus an ellipsis — enough to identify the field, never enough
+ * to replay the token.
+ */
+function maskedTokenValue(value: string): string {
+  return value.length <= 8 ? "<masked>" : `${value.slice(0, 8)}…`;
+}
+
+/**
+ * Masks `access_token`/`refresh_token`/`id_token`/`client_secret` string
+ * values inside a JSON-ish response body. Only the four token keys are
+ * touched — every other field (scope, expires_in, the error shape) passes
+ * through verbatim so the raw response is still inspectable.
+ */
+function maskTokenFields(body: string): string {
+  return body.replace(
+    /("(?:access_token|refresh_token|id_token|client_secret)"\s*:\s*")([^"]*)(")/g,
+    (_whole, pre: string, value: string, post: string) => `${pre}${maskedTokenValue(value)}${post}`,
+  );
+}
+
+/**
+ * Issue #263 RAW token-endpoint response capture — DEBUG-gated (issue #257
+ * lens: every OAuth MCP integration shares this connect surface). When
+ * `process.env.DEBUG` is set, the returned wrapper logs any request whose
+ * URL path contains "/token": the date, request method, URL, response
+ * status, and the response body with token values masked. Use for the
+ * connect legs' `auth()` calls (the mint covers discovery/register/
+ * authorize; the callback covers the code exchange + probe) so a LIVE
+ * access-only exchange can be classified on the wire.
+ *
+ * OFF by default — DEBUG is the ambient Node convention, no new env flags.
+ * The log is read from `res.clone()` and the ORIGINAL Response is handed
+ * back untouched: the SDK conventionally consumes a Response body exactly
+ * once, and capture must never disturb the real flow (or fail it).
+ */
+export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
+  if (process.env.DEBUG === undefined) return {};
+  // Cast: the ordinary arrow function below intentionally lacks Bun's
+  // augmented `preconnect` member; its call signature is `typeof fetch`.
+  const wrapped = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const urlText =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    let response: Response;
+    try {
+      response = await fetch(input, init);
+    } catch (err) {
+      console.debug(`[mcp-oauth] token exchange ${init?.method ?? "GET"} ${urlText} failed: ${errorMessage(err)}`);
+      throw err;
+    }
+    try {
+      if (new URL(urlText).pathname.includes("/token")) {
+        const clone = response.clone();
+        const body = await clone.text();
+        console.debug(
+          `[mcp-oauth] token exchange ${new Date().toISOString()} ${init?.method ?? "GET"} ${urlText} -> ${response.status} ${maskTokenFields(body)}`,
+        );
+      }
+    } catch {
+      // Capture must never break the connect; the exchange response is untouched.
+    }
+    return response;
+  }) as unknown as typeof fetch;
+  return { fetchFn: wrapped };
+}
+
+/**
  * The connect's negotiated server contract (issue #256 + issue #257 +
  * issue #262): SEP-835 resolves the OAuth scope as: auth() `scope` option →
  * WWW-Authenticate scope → the resource's advertised `scopes_supported` →
@@ -498,7 +642,7 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
 async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
-): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string }> {
+): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; grantedRefresh: boolean }> {
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
@@ -514,7 +658,7 @@ async function connectServerNegotiation(
         "proceeding without offline_access and without a negotiated token-endpoint auth method; " +
         "the connect will fail closed in auth() if the server is unreachable",
     );
-    return { scope: undefined, tokenEndpointAuthMethod: "none" };
+    return { scope: undefined, tokenEndpointAuthMethod: "none", grantedRefresh: false };
   }
   const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
   const supports = (method: string) => supportedMethods?.includes(method) === true;
@@ -525,7 +669,7 @@ async function connectServerNegotiation(
       : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod };
+  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, grantedRefresh: false };
   // Issue #262: choose the scope BASE without ever building it out of the
   // "default" placeholder Notion (and similar AS) advertise in
   // `scopes_supported`. A placeholder/absent resource scope is discarded in
@@ -542,7 +686,7 @@ async function connectServerNegotiation(
       : undefined) ??
     (clientScopes !== undefined && clientScopes.length > 0 ? clientScopes.join(" ") : undefined);
   const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
-  return { scope, tokenEndpointAuthMethod };
+  return { scope, tokenEndpointAuthMethod, grantedRefresh: true };
 }
 
 /**
@@ -596,10 +740,21 @@ export async function startMcpOAuthFlow(
     onRedirect: (url) => {
       authorizationUrl = url;
     },
+    // Issue #263: carry the negotiated grant contract so a fail-closed
+    // access-only outcome is classifiable later (the callback exchange).
+    negotiation: { grantedRefresh: negotiation.grantedRefresh, requestedScope: negotiation.scope },
   });
   let result: AuthResult;
   try {
-    result = await auth(provider, { serverUrl, ...(negotiation.scope !== undefined ? { scope: negotiation.scope } : {}) });
+    result = await auth(provider, {
+      serverUrl,
+      ...(negotiation.scope !== undefined ? { scope: negotiation.scope } : {}),
+      // Issue #263: DEBUG-gated raw token-endpoint capture on the connect
+      // leg (INTERACTIVE mint never hits /token — the wrapper only acts on
+      // /token paths — but the SDK's discovery/register/authorize run
+      // through the same fetchFn under DEBUG).
+      ...debugTokenExchangeFetch(),
+    });
   } catch (err) {
     return { ok: false, message: `connect ${manifest.label} failed: ${errorMessage(err)}` };
   }
@@ -614,6 +769,9 @@ export async function startMcpOAuthFlow(
     clientInformation: provider.clientInformation(),
     discoveryState: provider.discoveryState(),
     tokenEndpointAuthMethod: negotiation.tokenEndpointAuthMethod,
+    // Issue #263: persist the granted-refresh contract so the callback
+    // exchange's fail-closed message can name the precise cause.
+    negotiation: { grantedRefresh: negotiation.grantedRefresh, requestedScope: negotiation.scope },
     authorizationUrl: authorizationUrl.toString(),
   };
   const flowStore = new OAuthFlowStore(deps.store, {
@@ -706,7 +864,13 @@ export async function completeMcpOAuthFlow(
   });
   let result: AuthResult;
   try {
-    result = await auth(provider, { serverUrl: flowRow.server_url, authorizationCode: code });
+    result = await auth(provider, {
+      serverUrl: flowRow.server_url,
+      authorizationCode: code,
+      // Issue #263: DEBUG-gated raw token-endpoint response capture — this
+      // exchange is the leg that actually hits /token (plus the probe).
+      ...debugTokenExchangeFetch(),
+    });
   } catch (err) {
     throw new Error(`connect ${flowRow.label} failed: the authorization exchange was rejected (${errorMessage(err)})`);
   }
@@ -726,7 +890,12 @@ export async function completeMcpOAuthFlow(
   // probe itself rotates the row to its latest token.
   let probe: AuthResult;
   try {
-    probe = await auth(provider, { serverUrl: flowRow.server_url });
+    probe = await auth(provider, {
+      serverUrl: flowRow.server_url,
+      // Issue #263: the connect-time mint probe also exchanges tokens at
+      // /token — captured under DEBUG like the code exchange.
+      ...debugTokenExchangeFetch(),
+    });
   } catch (err) {
     throw new Error(
       `connect ${flowRow.label} failed: the authorization exchange was rejected (${errorMessage(err)}) — ` +
