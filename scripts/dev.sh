@@ -248,14 +248,12 @@ echo "auth-broker: ready (vault token at data/.omp/auth-broker.token, 0600)"
 #    permissive config (allow-all + no judge), so routing the server's core
 #    traffic (Slack, model endpoints, web search) through it is harmless and
 #    keeps secret injection on every proxied extension call.
-export HTTP_PROXY="http://127.0.0.1:8080"
-export HTTPS_PROXY="http://127.0.0.1:8080"
-export NO_PROXY="localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0"
-export NODE_EXTRA_CA_CERTS="$PWD/certs/ca.crt"
-# Go/spawned tools (e.g. the gh CLI) don't read NODE_EXTRA_CA_CERTS — they
-# honor SSL_CERT_FILE. Without it their HTTPS calls through the MITM proxy
-# fail TLS verification (x509 unknown CA). (The github extension needs no
-# local binary — it binds to GitHub's hosted MCP, issue #145.)
-export SSL_CERT_FILE="$PWD/certs/ca.crt"
+#    The five export lines come from ONE canonical definition —
+#    scripts/canary-egress.ts (the same module scripts/canary.sh --live-slack
+#    evals, issue #241): tunnel URL, NO_PROXY list, and CA cert path live in
+#    exactly one place. `--env` exits non-zero if the tunnel is unreachable
+#    (the assignment form propagates that through `set -e`).
+CANARY_EGRESS="$(bun run scripts/canary-egress.ts --env)"
+eval "$CANARY_EGRESS"
 
 exec bun run ${1:+--watch} src/server/index.ts

@@ -30,6 +30,17 @@ cd "$(dirname "$0")/.."
 # the live runner resolves tokens AND model keys itself (env/Keychain).
 if [[ "${1:-}" == "--live-slack" || "${LIVE_SLACK:-}" == "1" ]]; then
   shift || true
+  # The live leg ALWAYS rides iron-proxy (issue #241): eval the canonical
+  # egress env from scripts/canary-egress.ts (HTTP(S)_PROXY / NO_PROXY /
+  # NODE_EXTRA_CA_CERTS / SSL_CERT_FILE). Fail-closed: the CLI exits non-zero
+  # when the tunnel is unreachable, so we never exec with a direct egress —
+  # a bare-shell launch once sent the raw bottega bearer to chatgpt.com
+  # ("Could not parse your authentication token" on every model turn).
+  # The assignment form (not `eval "$(…)"`) propagates that non-zero exit
+  # through `set -e` — otherwise a dead tunnel would silently eval an empty
+  # string and exec the canary with NO proxy env.
+  CANARY_EGRESS="$(bun run scripts/canary-egress.ts --env)"
+  eval "$CANARY_EGRESS"
   exec bun run tests/e2e/canary.ts --live-slack "$@"
 fi
 
