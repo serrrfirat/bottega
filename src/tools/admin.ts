@@ -91,6 +91,7 @@ import {
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
 import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
 import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
@@ -849,10 +850,24 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             };
             mkdirSync(snapshotsDir, { recursive: true });
             const outPath = await pinSnapshotDraft(reviewed, snapshotsDir, catalogOpts);
+            // SUPERSET regen (issue #250): the runtime-registry rows join
+            // the committed pins, so a pin for one extension never drops
+            // another provider's allowlist/oauth_token entry from egress
+            // (the 16:29 regen clobber). A malformed runtime row is a LOUD
+            // skip — never a pin failure (the #205 posture): the regen
+            // proceeds on the committed-only set and surfaces the warning.
+            let runtimeSet: PinnedSnapshot[] = [];
+            let runtimeSetWarning: string | undefined;
+            try {
+              runtimeSet = await runtimeSnapshotsFromStore(store);
+            } catch (err) {
+              runtimeSetWarning = `EGRESS REGEN SKIPPED MALFORMED RUNTIME ROW — the egress config regenerated with the committed ` +
+                `pins only, so a previously runtime-registered provider may be missing from egress: ${errorMessage(err)}`;
+            }
             // regenerateEgressConfig returns the rendered YAML; the paths are
             // what the caller and the audit trail need.
-            regenerateEgressConfig(snapshotsDir, egressPath);
-            regenerateDevEgressConfig(snapshotsDir, devEgressPath);
+            regenerateEgressConfig(snapshotsDir, egressPath, runtimeSet);
+            regenerateDevEgressConfig(snapshotsDir, devEgressPath, runtimeSet);
             // HOT-RELOAD (issue #197): the registry the composition root
             // wired is the LIVE instance the runtime resolves against (#172). Register the new snapshot into it so
             // NEW sessions resolve the extension immediately through the
@@ -915,6 +930,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             const proxyReload: "ok" | "failed" | "unset" =
               control.proxyControlUrl === undefined ? "unset" : reload.ok ? "ok" : "failed";
             const hotReloadWarnings: string[] = [];
+            if (runtimeSetWarning !== undefined) hotReloadWarnings.push(runtimeSetWarning);
             if (liveRegistry === "failed") {
               hotReloadWarnings.push(
                 `LIVE REGISTRY REGISTRATION FAILED — the snapshot landed, but this server's runtime won't see ` +

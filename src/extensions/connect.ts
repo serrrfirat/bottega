@@ -69,6 +69,7 @@ import {
   registerExtensionAtRuntime,
   type CatalogRegisterDeps,
 } from "./catalog-register";
+import { createReconcileEgress } from "./egress-reconcile";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -109,10 +110,19 @@ export interface ConnectExtensionDeps {
    * same turn.
    */
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials">;
+  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
   broker: BrokerConnector;
+  /**
+   * Connect-time egress reconcile (issue #250): after a successful BROKER
+   * OAuth connect (notion class), regenerate egress with the superset,
+   * seed the provider's proxy OAuth blob, and reload the running proxy.
+   * Default: built from `deps.store` (the store's `listRuntimeExtensions`
+   * supplies the runtime half of the superset), so the broker connect
+   * reconciles with zero composition-root wiring.
+   */
+  reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
   /**
    * Generic MCP OAuth seam (issue #198): hosted OAuth MCPs (kind "mcp",
    * transport streamable-http, credential type "oauth") connect through
@@ -320,6 +330,10 @@ export async function connectExtension(
   const manifest = resolved.manifest;
   const provider = manifest.id;
   const label = manifest.label;
+  // Issue #250: default the connect-time egress reconcile from the store
+  // (the runtime half of the egress superset) so a successful BROKER OAuth
+  // connect reconciles the proxy plane with zero composition-root wiring.
+  const reconcileEgress = deps.reconcileEgress ?? createReconcileEgress({ store: deps.store });
 
   // Issue #247: a chat/intent api_key connect carries no key (the intent
   // regex captures none, and the paste guard above refuses pasted keys),
@@ -425,9 +439,33 @@ export async function connectExtension(
     payload: { extension: input.extension, scope: input.scope, owner },
   });
 
+  let reconcileWarnings: string[] = [];
+  // Issue #250: a successful BROKER OAuth connect reconciles the egress
+  // proxy plane — regenerate egress/dev-egress from the superset (so this
+  // provider joins the running config without a boot or pin), seed the
+  // provider's proxy OAuth blob, and reload the running proxy. Best-effort
+  // and guarded: the connect already landed (vault row + credential +
+  // audit), so any reconcile gap is receivable via the message, never
+  // fatal. API-key connects skip the reconcile (no egress OAuth surface).
+  if (manifest.credentialSchema.type === "oauth") {
+    try {
+      const result = await reconcileEgress(provider);
+      reconcileWarnings = result.warnings;
+    } catch (err) {
+      reconcileWarnings = [`connect ${label} reconciled egress but the reconcile failed: ${errorMessage(err)}`];
+    }
+  }
+
   const message =
     input.scope === "org" ? `${label} connected as an organization` : `${label} connected as @${input.actor}`;
-  return { ok: true, credential, message };
+  return {
+    ok: true,
+    credential,
+    message:
+      reconcileWarnings.length > 0
+        ? `${message} — EGRESS WARNING: ${reconcileWarnings.join(" ")}`
+        : message,
+  };
 }
 
 /**

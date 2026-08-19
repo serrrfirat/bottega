@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
-import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
+import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
 import { oauthTokenBlobFileName } from "../egress/generate";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
@@ -55,13 +55,15 @@ export const MODEL_PROXY_KEYS: readonly ModelProxyKey[] = [
 /**
  * One OAuth provider the sync seeds into the proxy's `oauth_token`
  * entries (issue #208): the refresh token comes from the vault's OAuth
- * row (the #198 flow), the client credentials from env (the org's
- * registered client — the #198 dynamic-client-registration flow does not
- * persist the registered client id, so the deployment provides it).
+ * row (the #198 flow). Client credentials resolve per-user first — the
+ * #198 dynamic-client-registration flow persists the registered
+ * `client_information` into the vault credential (issue #250) — and fall
+ * back to the deployment-level env override below when a deployment
+ * registers ONE shared client instead.
  */
 export interface OAuthProxyCredential {
   provider: string;
-  /** Env var holding the OAuth client id (required for the refresh grant). */
+  /** Env var holding the OAuth client id (the deployment-level fallback). */
   clientIdEnv: string;
   /** Optional env var holding the OAuth client secret (public clients omit it). */
   clientSecretEnv?: string;
@@ -80,6 +82,42 @@ interface ProxyOAuthBlob {
   client_id: string;
   /** Present only when the deployment configures a client secret (public clients omit it). */
   client_secret?: string;
+}
+
+/**
+ * A vault OAuth credential carrying the per-user registered client
+ * identity (issue #250): the #198 dynamic-client-registration flow
+ * persists `client_information` (`client_id`/`client_secret`) into the
+ * vault row, so the refresh grant can mint for the USER's client rather
+ * than a shared deployment client. The SDK type omits these fields (the
+ * SDK never reads them back), but extra JSON survives the vault round-trip.
+ */
+export interface VaultOAuthCredential extends OAuthCredential {
+  client_id?: string;
+  client_secret?: string;
+}
+
+/** One OAuth vault row's seed-relevant fields (issue #250). */
+export interface OAuthVaultRow {
+  /** The refresh token (real locally; {@link REMOTE_REFRESH_SENTINEL} remotely). */
+  refresh?: string;
+  /** The per-user registered client id (the DCR `client_information`). */
+  clientId?: string;
+  /** The per-user registered client secret (public clients omit it). */
+  clientSecret?: string;
+}
+
+/**
+ * One provider's blob-seed result (issue #250): `notes` are routine
+ * transitions (seeded / removed), `warnings` are receivable gaps
+ * (refresh present but no client id anywhere). `wrote:false` means the
+ * blob was DELETED — fail closed: a blob that cannot mint is never
+ * written, so there is never half-wired state.
+ */
+export interface ProxyBlobSeedResult {
+  notes: string[];
+  warnings: string[];
+  wrote: boolean;
 }
 
 /** The proxy-side secret file for a model gateway key. */
@@ -553,11 +591,13 @@ export interface ProxyCredentialSyncOpts {
    */
   readKeychain?: (service: string) => Promise<string | null>;
   /**
-   * OAuth vault-row seam (tests): provider → the newest oauth credential
-   * rows (real refresh token locally; sentinel remotely). Default: the
-   * local AuthStorage (discoverAuthStorage → listStoredCredentials).
+   * OAuth vault-row seam (tests + the connect-time reconcile): provider →
+   * the newest oauth credential rows (real refresh token locally; sentinel
+   * remotely) + the per-user registered client identity when present
+   * (issue #250). Default: the local AuthStorage (discoverAuthStorage →
+   * listStoredCredentials).
    */
-  readOAuthRows?: (provider: string) => Promise<Array<{ refresh?: string }>>;
+  readOAuthRows?: (provider: string) => Promise<Array<OAuthVaultRow>>;
   /**
    * Codex refresh-grant seam (issue #218 + #230): performs the seed's
    * refresh — a dead token fails the boot loudly with the remedy instead
@@ -574,16 +614,25 @@ export interface ProxyCredentialSyncOpts {
 }
 
 /** The default OAuth-row reader: the local AuthStorage (the #198 store). */
-async function readOAuthRowsFromLocalStorage(provider: string): Promise<Array<{ refresh?: string }>> {
+export async function readOAuthRowsFromLocalStorage(provider: string): Promise<Array<OAuthVaultRow>> {
   const storage = await discoverAuthStorage();
   try {
     await storage.reload();
     return storage
       .listStoredCredentials(provider)
-      .flatMap((entry) => (entry.credential.type === "oauth" ? [{ refresh: entry.credential.refresh }] : []));
+      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.credential)] : []));
   } finally {
     storage.close();
   }
+}
+
+/** Picks the seed-relevant fields off one vault OAuth credential (+ the #250 client identity). */
+function oauthVaultRow(credential: OAuthCredential): OAuthVaultRow {
+  return {
+    refresh: credential.refresh,
+    clientId: (credential as VaultOAuthCredential).client_id,
+    clientSecret: (credential as VaultOAuthCredential).client_secret,
+  };
 }
 
 /** Atomic 0600 write-temp + rename (the #53 boundary pattern). */
@@ -598,6 +647,93 @@ function writeSecretFile(secretsDir: string, fileName: string, value: string): v
 /** Deletes a proxy secret file (fail-closed: no stale credential). */
 function deleteSecretFile(secretsDir: string, fileName: string): void {
   rmSync(join(secretsDir, fileName), { force: true });
+}
+
+/**
+ * Seeds ONE provider's proxy OAuth blob (issue #208; shared with the
+ * connect-time reconcile in issue #250). Client credentials resolve
+ * per-user first — the vault row's registered `client_information`
+ * (issue #250) — then the deployment env override (`clientIdEnv` /
+ * `clientSecretEnv`, the #208 boot posture). Fail closed: no refresh row
+ * → delete the blob; a refresh row with no resolvable client id → delete
+ * the blob + a LOUD warning naming the env var (or provider) that the
+ * operator must satisfy — a blob that cannot mint is never written.
+ * `clearEnv` strips the consumed env vars after a successful seed (boot
+ * behavior — the reconcile leaves the environment untouched). Never logs
+ * secret values, only names + outcome.
+ */
+export async function seedProxyOAuthBlob(
+  provider: string,
+  opts: {
+    /** Directory for the proxy secret files. */
+    secretsDir: string;
+    /** The env override source; defaults to process.env. */
+    env?: NodeJS.ProcessEnv;
+    /** Vault-row seam; defaults to the local AuthStorage. */
+    readOAuthRows?: (provider: string) => Promise<Array<OAuthVaultRow>>;
+    /** Deployment client-id env (fallback); derived from OAUTH_PROXY_CREDENTIALS when known. */
+    clientIdEnv?: string;
+    /** Deployment client-secret env (fallback, optional). */
+    clientSecretEnv?: string;
+    /** Strip the consumed env vars after a successful seed (boot only). */
+    clearEnv?: boolean;
+    /** Log sink; defaults to console.log. */
+    log?: (line: string) => void;
+  },
+): Promise<ProxyBlobSeedResult> {
+  const env = opts.env ?? process.env;
+  const readOAuthRows = opts.readOAuthRows ?? readOAuthRowsFromLocalStorage;
+  const known = OAUTH_PROXY_CREDENTIALS.find((c) => c.provider === provider);
+  const clientIdEnv = opts.clientIdEnv ?? known?.clientIdEnv;
+  const clientSecretEnv = opts.clientSecretEnv ?? known?.clientSecretEnv;
+  const fileName = proxyOAuthBlobFileName(provider);
+  const notes: string[] = [];
+  const warnings: string[] = [];
+
+  const rows = await readOAuthRows(provider);
+  const row = rows.find(
+    (r) => r.refresh !== undefined && r.refresh !== "" && r.refresh !== REMOTE_REFRESH_SENTINEL,
+  );
+  const refresh = row?.refresh;
+  // Resolve both client credentials up front so the #208 boot env-strip
+  // below never races the resolution, then strip when requested — on EVERY
+  // outcome (no-refresh, missing id, success): a booted env must not
+  // persist consumed client secrets.
+  const envClientId = clientIdEnv !== undefined ? env[clientIdEnv] : undefined;
+  const envClientSecret = clientSecretEnv !== undefined ? env[clientSecretEnv] : undefined;
+  if (opts.clearEnv === true && clientIdEnv !== undefined) delete env[clientIdEnv];
+  if (opts.clearEnv === true && clientSecretEnv !== undefined) delete env[clientSecretEnv];
+  if (refresh === undefined) {
+    deleteSecretFile(opts.secretsDir, fileName);
+    notes.push(`bottega proxy: ${fileName} REMOVED — no OAuth row for ${provider} (fail closed)`);
+    return { notes, warnings, wrote: false };
+  }
+  // Per-user vault client identity first (issue #250), deployment env second.
+  const clientId = row?.clientId !== undefined && row.clientId !== "" ? row.clientId : envClientId;
+  if (clientId === undefined || clientId === "") {
+    // Fail closed: the refresh grant cannot mint without a client id. The
+    // warning NAMES the env var (e.g. NOTION_OAUTH_CLIENT_ID) the operator
+    // must set when no per-user client was registered. The caller
+    // (boot loop / egress reconcile) is the sole logger.
+    deleteSecretFile(opts.secretsDir, fileName);
+    warnings.push(
+      `bottega proxy: ${fileName} REMOVED — ${provider} refresh token exists but ` +
+        `${clientIdEnv ?? `${provider} client id`} is unset (fail closed)`,
+    );
+    return { notes, warnings, wrote: false };
+  }
+  const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId };
+  // Per-user vault client secret first (issue #250), env second.
+  const clientSecret =
+    row?.clientSecret !== undefined && row.clientSecret !== ""
+      ? row.clientSecret
+      : envClientSecret !== undefined
+        ? envClientSecret
+        : undefined;
+  if (clientSecret !== undefined && clientSecret !== "") blob.client_secret = clientSecret;
+  writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
+  notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
+  return { notes, warnings, wrote: true };
 }
 
 /**
@@ -661,37 +797,24 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
   }
 
   // 2. OAuth blobs: the vault's newest oauth row's refresh token (+ the
-  //    env's client credentials) → `<provider>-oauth.json` (or delete).
+  //    per-user/#250 client credentials, env override) →
+  //    `<provider>-oauth.json` (or delete — fail closed). The seed rule is
+  //    the SAME implementation the connect-time reconcile uses (issue
+  //    #250): per-user vault client identity wins, env is the deployment
+  //    fallback, and a refresh without any resolvable client id deletes
+  //    the blob loudly (no half-wired state).
   for (const credential of OAUTH_PROXY_CREDENTIALS) {
-    const fileName = proxyOAuthBlobFileName(credential.provider);
-    const rows = await readOAuthRows(credential.provider);
-    const refresh = rows.find(
-      (row) => row.refresh !== undefined && row.refresh !== "" && row.refresh !== REMOTE_REFRESH_SENTINEL,
-    )?.refresh;
-    if (refresh === undefined) {
-      deleteSecretFile(secretsDir, fileName);
-      delete env[credential.clientIdEnv];
-      if (credential.clientSecretEnv !== undefined) delete env[credential.clientSecretEnv];
-      log(`bottega boot: proxy ${fileName} REMOVED — no OAuth row for ${credential.provider} (fail closed)`);
-      continue;
-    }
-    const clientId = env[credential.clientIdEnv];
-    if (clientId === undefined || clientId === "") {
-      // Fail closed: the refresh grant cannot mint without a client id.
-      deleteSecretFile(secretsDir, fileName);
-      if (credential.clientSecretEnv !== undefined) delete env[credential.clientSecretEnv];
-      log(
-        `bottega boot: proxy ${fileName} REMOVED — ${credential.provider} refresh token exists but ${credential.clientIdEnv} is unset (fail closed)`,
-      );
-      continue;
-    }
-    const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId };
-    const clientSecret = credential.clientSecretEnv !== undefined ? env[credential.clientSecretEnv] : undefined;
-    if (clientSecret !== undefined && clientSecret !== "") blob.client_secret = clientSecret;
-    writeSecretFile(secretsDir, fileName, JSON.stringify(blob));
-    delete env[credential.clientIdEnv];
-    if (credential.clientSecretEnv !== undefined) delete env[credential.clientSecretEnv];
-    log(`bottega boot: proxy ${fileName} seeded (${credential.provider} OAuth refresh token)`);
+    const result = await seedProxyOAuthBlob(credential.provider, {
+      secretsDir,
+      env,
+      readOAuthRows,
+      clientIdEnv: credential.clientIdEnv,
+      clientSecretEnv: credential.clientSecretEnv,
+      clearEnv: true,
+      log,
+    });
+    for (const note of result.notes) log(note);
+    for (const warning of result.warnings) log(warning);
   }
 
   // 2.5. Codex static credential (issue #214 + #230): the ChatGPT

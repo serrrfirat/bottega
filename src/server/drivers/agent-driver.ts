@@ -69,7 +69,9 @@ export interface MemoryContextDriverOpts {
  */
 export interface ConnectExtensionDriverOpts {
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials">;
+  // `listRuntimeExtensions` (issue #250): the connect-time egress reconcile
+  // default derives the runtime half of the egress superset from the store.
+  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
   audit: AuditModule;
   loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
   router: ApprovalRouter;

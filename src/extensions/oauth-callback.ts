@@ -28,6 +28,7 @@ import { errorMessage } from "../tools/helpers";
 import type { AuditModule } from "../policy/audit";
 import type { OAuthFlow, Store } from "../store/db";
 import { completeMcpOAuthFlow, createVaultTokenStore, type McpOAuthTokenStore } from "./mcp-oauth";
+import { createReconcileEgress } from "./egress-reconcile";
 import {
   handleWebhookRequest,
   WEBHOOK_PATH_PREFIX,
@@ -56,13 +57,21 @@ export function callbackPort(): number {
 }
 
 /** The callback endpoint's store slice (the full {@link Store} satisfies it). */
-export type OAuthCallbackStoreSlice = Pick<Store, "consumeOAuthFlow" | "upsertExtensionCredential">;
+export type OAuthCallbackStoreSlice = Pick<Store, "consumeOAuthFlow" | "upsertExtensionCredential" | "listRuntimeExtensions">;
 
 export interface OAuthCallbackEndpointDeps {
   store: OAuthCallbackStoreSlice;
   audit: AuditModule;
   /** Token persistence; defaults to the production vault store. */
   tokenStore?: McpOAuthTokenStore;
+  /**
+   * Connect-time egress reconcile (issue #250): after a successful hosted
+   * OAuth connect, regenerate egress with the superset + seed the
+   * provider's proxy OAuth blob + reload. Default: built from `deps.store`
+   * (the store's `listRuntimeExtensions` supplies the runtime half of the
+   * superset), so the callback reconciles with zero composition-root wiring.
+   */
+  reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
   /**
    * The PUBLIC base URL the browser reaches the callback at (deployment:
    * BOTTEGA_OAUTH_CALLBACK_BASE_URL; default: the loopback server URL).
@@ -116,6 +125,7 @@ async function handleCallback(
   req: Request,
   deps: OAuthCallbackEndpointDeps,
   tokenStore: McpOAuthTokenStore,
+  reconcileEgress: (provider: string) => Promise<{ warnings: string[] }>,
 ): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname !== OAUTH_CALLBACK_PATH) return new Response("not found", { status: 404 });
@@ -138,7 +148,7 @@ async function handleCallback(
   }
   const row: OAuthFlow = consumed.row;
   try {
-    await completeMcpOAuthFlow(row, code, { store: deps.store, audit: deps.audit, tokenStore });
+    await completeMcpOAuthFlow(row, code, { store: deps.store, audit: deps.audit, tokenStore, reconcileEgress });
   } catch (err) {
     return page(500, "Connect failed", `Connecting ${row.label} failed: ${errorMessage(err)} — ask the agent to try again.`);
   }
@@ -165,6 +175,10 @@ export interface OAuthCallbackServerHandle {
  */
 export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuthCallbackServerHandle {
   const tokenStore = deps.tokenStore ?? createVaultTokenStore();
+  // Issue #250: default the connect-time reconcile from the store (the
+  // runtime half of the egress superset) so the callback reconciles the
+  // proxy plane with zero composition-root wiring.
+  const reconcileEgress = deps.reconcileEgress ?? createReconcileEgress({ store: deps.store });
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: deps.port ?? callbackPort(),
@@ -176,7 +190,7 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
       if (deps.uploadLink !== undefined && url.pathname.startsWith("/upload/")) {
         return deps.uploadLink.fetch(req);
       }
-      if (url.pathname === OAUTH_CALLBACK_PATH) return handleCallback(req, deps, tokenStore);
+      if (url.pathname === OAUTH_CALLBACK_PATH) return handleCallback(req, deps, tokenStore, reconcileEgress);
       // Issue #57: the webhook route joins the same inbound surface.
       if (deps.webhooks !== undefined && url.pathname.startsWith(`${WEBHOOK_PATH_PREFIX}/`)) {
         return handleWebhookRequest(req, deps.webhooks);

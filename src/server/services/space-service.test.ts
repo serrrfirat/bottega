@@ -2404,6 +2404,7 @@ describe("SpaceService connect intent catalog fallback (issue #232/#233) — reg
           throw new Error("hosted OAuth connects record at the callback, never here");
         },
         listExtensionCredentials: async () => [],
+        listRuntimeExtensions: async () => [],
       } as ConnectExtensionDeps["store"],
       audit: {
         appendAudit: async (entry) => {

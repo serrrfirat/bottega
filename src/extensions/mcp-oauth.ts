@@ -47,6 +47,7 @@ import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { oauthIdentityKey, pickNewestBrokerEntry, type ConnectScope } from "./connect";
 import type { ExtensionRegistry } from "./registry";
+import type { VaultOAuthCredential } from "./proxy-seed";
 
 /** Default flow lifetime: short by design — 15 minutes, like upload links. */
 export const MCP_OAUTH_FLOW_TTL_MS = 15 * 60_000;
@@ -205,17 +206,31 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  * absolute epoch-ms `expires`. A missing refresh token in the exchange
  * response preserves the vault's previous one (servers that don't rotate
  * omit it) — the grant must not silently lose its refresh capability.
+ *
+ * The per-user registered client identity (issue #250) rides along: the
+ * DCR `client_information` (`client_id`/`client_secret`) is per-user vault
+ * data, not a deployment env constant, so `tokensToVaultCredential`
+ * persists it (fresh DCR first, the previous row's identity as the
+ * refresh-round-trip carry-forward) for the connect-time egress reconcile
+ * to seed the proxy OAuth blob from. Empty/undefined fields are stripped.
  */
 export function tokensToVaultCredential(
   tokens: OAuthTokens,
   previous: OAuthCredential | null,
-): OAuthCredential {
-  return {
+  clientInformation?: { client_id?: string; client_secret?: string },
+): VaultOAuthCredential {
+  const credential: VaultOAuthCredential = {
     type: "oauth",
     access: tokens.access_token,
     refresh: tokens.refresh_token ?? previous?.refresh ?? "",
     expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
   };
+  const carried = previous as VaultOAuthCredential | null;
+  const clientId = clientInformation?.client_id ?? carried?.client_id;
+  const clientSecret = clientInformation?.client_secret ?? carried?.client_secret;
+  if (clientId !== undefined && clientId !== "") credential.client_id = clientId;
+  if (clientSecret !== undefined && clientSecret !== "") credential.client_secret = clientSecret;
+  return credential;
 }
 
 /** The persisted flow bookkeeping (the `oauth_flows.flow` JSON blob). */
@@ -312,7 +327,7 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
             .catch(() => null);
     const saved = await this.#opts.tokenStore.save(
       this.#opts.tokenTarget.provider,
-      tokensToVaultCredential(tokens, previous),
+      tokensToVaultCredential(tokens, previous, this.#clientInformation),
     );
     this.#opts.tokenTarget.brokerCredentialId = saved.brokerCredentialId;
     this.#savedBrokerCredentialId = saved.brokerCredentialId;
@@ -377,7 +392,7 @@ export interface McpOAuthFlowDeps {
   store: OAuthFlowStoreSlice & Pick<Store, "upsertExtensionCredential">;
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
-  /** The PUBLIC callback base URL (BOTTEGA_OAUTH_CALLBACK_BASE_URL, else the loopback server). */
+  /** The PUBLIC callback base URL, resolved lazily per mint (issue #249): the durable store data/public-base-url, else BOTTEGA_OAUTH_CALLBACK_BASE_URL, else the loopback server. */
   callbackBaseUrl: () => string;
   /** Token persistence; defaults to the production vault store. */
   tokenStore?: McpOAuthTokenStore;
@@ -497,8 +512,16 @@ export async function completeMcpOAuthFlow(
     store: Pick<Store, "consumeOAuthFlow" | "upsertExtensionCredential">;
     audit: AuditModule;
     tokenStore?: McpOAuthTokenStore;
+    /**
+     * Connect-time egress reconcile (issue #250): called after the vault
+     * row + credential + audit land, so a successful connect immediately
+     * regenerates egress with the superset and seeds the provider's proxy
+     * OAuth blob (never boot-only, never clobbered). Best-effort: any
+     * warnings fold into the result — the connect stays successful.
+     */
+    reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
   },
-): Promise<{ brokerCredentialId: number }> {
+): Promise<{ brokerCredentialId: number; warnings: string[] }> {
   let persisted: PersistedOAuthFlow;
   try {
     // SAFETY: the JSON round-trip degrades the SDK's URL-typed fields to strings;
@@ -543,7 +566,21 @@ export async function completeMcpOAuthFlow(
     event_type: EXTENSION_CONNECTED_EVENT,
     payload: { extension: flowRow.provider, scope: flowRow.scope, owner },
   });
-  return { brokerCredentialId };
+  // Issue #250: reconcile the egress proxy plane now — regenerate egress
+  // from the superset (committed pins ∪ runtime rows) and seed this
+  // provider's proxy OAuth blob + reload. Best-effort and guarded: the
+  // connect already landed, so a reconcile failure is receivable, never
+  // fatal.
+  let warnings: string[] = [];
+  if (deps.reconcileEgress !== undefined) {
+    try {
+      const result = await deps.reconcileEgress(flowRow.provider);
+      warnings = result.warnings;
+    } catch (err) {
+      warnings = [`connect ${flowRow.label} failed to reconcile egress: ${errorMessage(err)}`];
+    }
+  }
+  return { brokerCredentialId, warnings };
 }
 
 export interface RuntimeMcpOAuthOpts {
