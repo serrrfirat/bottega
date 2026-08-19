@@ -440,4 +440,64 @@ describe("connect-time egress reconcile (#250)", () => {
       await broker.stop();
     }
   });
+
+  test("two notion rows: the DCR grant with a per-user client id wins the seed (issue #252)", async () => {
+    // The broker vault keeps EVERY grant, ascending by id. notion has an
+    // older pre-#250 row (real refresh, NO client identity) inserted before
+    // the live DCR grant (real refresh + per-user client_id). A plain
+    // `rows.find(refresh)` wins the OLD row, finds no client id, and fails
+    // closed with the NOTION_OAUTH_CLIENT_ID warning — the seed must prefer
+    // the row that ALSO carries a resolvable client identity.
+    const brokerDir = tempDir("broker-vault-dcr");
+    const dbPath = join(brokerDir, "agent.db");
+    const seeded = await AuthStorage.create(dbPath);
+    seeded.upsertCredential("notion", {
+      type: "oauth",
+      refresh: "rt-notion-old",
+      access: "acc-old",
+      expires: Date.now() + 3_600_000,
+    });
+    const dcr = {
+      type: "oauth" as const,
+      refresh: "rt-notion-dcr",
+      access: "acc-dcr",
+      expires: Date.now() + 3_600_000,
+      client_id: "cli_notion_dcr",
+      client_secret: "cs_notion_dcr",
+    } satisfies VaultOAuthCredential;
+    seeded.upsertCredential("notion", dcr);
+    seeded.close();
+
+    const broker = await startFakeBroker(dbPath);
+    try {
+      await withEnv(
+        {
+          OMP_AUTH_BROKER_URL: broker.url,
+          OMP_AUTH_BROKER_TOKEN: broker.token,
+          OMP_AUTH_BROKER_SNAPSHOT_TTL_MS: "0",
+          "BOTTEGA_BROKER_AGENT_DIR": brokerDir,
+        },
+        async () => {
+          const h = makeHarness({ committed: [["linear", linear]], defaultReader: true });
+          const result = await h.reconcile("notion");
+          // Old failure mode: the first no-client row won the find() and the
+          // seed deleted the blob with the NOTION_OAUTH_CLIENT_ID warning.
+          expect(result.warnings.join(" ")).not.toContain("NOTION_OAUTH_CLIENT_ID");
+          const blobPath = join(h.secretsDir, "notion-oauth.json");
+          expect(existsSync(blobPath)).toBe(true);
+          const blob = JSON.parse(readFileSync(blobPath, "utf8")) as {
+            refresh_token?: string;
+            client_id?: string;
+            client_secret?: string;
+          };
+          // The LIVE DCR grant wins: per-user client id, not the env fallback.
+          expect(blob.refresh_token).toBe("rt-notion-dcr");
+          expect(blob.client_id).toBe("cli_notion_dcr");
+          expect(blob.client_secret).toBe("cs_notion_dcr");
+        },
+      );
+    } finally {
+      await broker.stop();
+    }
+  });
 });

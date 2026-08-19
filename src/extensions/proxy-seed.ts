@@ -765,9 +765,17 @@ export async function seedProxyOAuthBlob(
   const warnings: string[] = [];
 
   const rows = await readOAuthRows(provider);
-  const row = rows.find(
+  const refreshRows = rows.filter(
     (r) => r.refresh !== undefined && r.refresh !== "" && r.refresh !== REMOTE_REFRESH_SENTINEL,
   );
+  // Prefer a viable row that ALSO carries a resolvable per-user client
+  // identity (issue #250 DCR grant). The broker vault keeps every grant,
+  // ascending by id: an older pre-#250 row (real refresh, no client_id)
+  // sorts BEFORE the live DCR row, so a plain `find(refresh)` would win the
+  // wrong row and fail closed. Fall back to the first viable row otherwise
+  // (pre-#250 behavior: env- or row-less client id resolution still applies).
+  const row =
+    refreshRows.find((r) => r.clientId !== undefined && r.clientId !== "") ?? refreshRows[0];
   const refresh = row?.refresh;
   // Resolve both client credentials up front so the #208 boot env-strip
   // below never races the resolution, then strip when requested — on EVERY
