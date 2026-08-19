@@ -20,7 +20,11 @@ jobs:
           # nothing further is configured here (issue #70).
       - run: bun install --frozen-lockfile
       - run: bun check
-      - run: bun test
+      # Run via the package.json script (not bare `bun test`): the script
+      # bounds e2e/journey stub-harness concurrency by running those files
+      # serial (--parallel=1) ahead of the parallel unit group, so the
+      # harness response windows hold on ANY host (issue #260).
+      - run: bun run test
 
   docker:
     runs-on: ubuntu-latest

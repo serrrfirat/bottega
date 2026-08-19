@@ -8,7 +8,7 @@
     "canary": "bash scripts/canary.sh",
     "check": "tsc --noEmit",
     "lint": "bun --bun x oxlint",
-    "test": "bun test",
+    "test": "bun test --parallel=1 tests/e2e src/models/proxy-placeholder.test.ts && bun test --path-ignore-patterns 'tests/e2e/**' --path-ignore-patterns 'src/models/proxy-placeholder.test.ts'",
     "test:e2e": "bun test tests/e2e/",
     "dev:watch": "bash scripts/dev.sh --watch"
   },

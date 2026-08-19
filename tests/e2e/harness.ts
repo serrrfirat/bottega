@@ -415,11 +415,20 @@ export interface SlackHandle {
 }
 
 function bootSlackEmulator(): SlackEmulatorHandle {
-  const probe = Bun.serve({ port: 0, fetch: () => new Response() });
-  const port = probe.port;
-  probe.stop(true);
+  // Bind once on an ephemeral port and serve the emulator through an
+  // indirection. The earlier probe-then-rebind (bind port 0, stop, seed,
+  // then bind the SAME port again) left a TOCTOU window in which a
+  // concurrent listener could steal the port — intermittent "Failed to start
+  // server. Is port N in use?" boots (issue #260). Serving through a
+  // mutable handler keeps the port stable from the first bind onward; the
+  // constructor + seeding are synchronous, so no request can arrive before
+  // the emulator handler is installed.
+  const handlerRef: { fetch: (req: Request) => Response | Promise<Response> } = {
+    fetch: () => new Response("bottega emulator not ready"),
+  };
+  const http = Bun.serve({ port: 0, fetch: (req) => handlerRef.fetch(req) });
 
-  const emu = createServer(slackPlugin, { baseUrl: `http://127.0.0.1:${port}` });
+  const emu = createServer(slackPlugin, { baseUrl: `http://127.0.0.1:${http.port}` });
   seedFromConfig(emu.store, emu.baseUrl, {
     team: { name: "Bottega E2E Workspace" },
     users: [{ name: HUMAN_USER_NAME }, { name: BOT_USER_NAME }],
@@ -450,9 +459,9 @@ function bootSlackEmulator(): SlackEmulatorHandle {
     num_members: 2,
   });
 
-  const http = Bun.serve({ port, fetch: emu.app.fetch });
+  handlerRef.fetch = (req) => emu.app.fetch(req);
   return {
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://127.0.0.1:${http.port}`,
     store: slack,
     channelId(name: string) {
       return slack.channels.findOneBy("name", name)?.channel_id;
