@@ -54,6 +54,19 @@ export const MCP_OAUTH_FLOW_TTL_MS = 15 * 60_000;
 /** Per-actor cap on live (unexpired) flows — the mint path's rate limit. */
 export const MCP_OAUTH_MAX_OUTSTANDING_PER_ACTOR = 5;
 
+/**
+ * The iron-proxy v0.49.0 token-endpoint stub bearer (verified from the
+ * source: `internal/transform/oauth/oauth.go` — `stubAccessToken`). When a
+ * provider's `oauth_token` egress entry is active, the proxy answers every
+ * POST to the configured token_endpoint with
+ * `{"access_token":"iron-proxy-stub-token",...}` so a sandboxed SDK's own
+ * token dance completes against the proxy (the real token is minted and
+ * swapped at egress). A CONNECT-leg exchange answered with this value never
+ * reached the provider — persisting it would make the connect "succeed"
+ * with a token the provider rejects (decision B guard, issue #265).
+ */
+export const IRON_PROXY_STUB_ACCESS_TOKEN = "iron-proxy-stub-token";
+
 /** The store slice the flow path needs (the full {@link Store} satisfies it). */
 export type OAuthFlowStoreSlice = Pick<
   Store,
@@ -208,9 +221,23 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  * omit it) — the grant must not silently lose its refresh capability.
  * Issue #256: when there is NO refresh token to keep — the exchange
  * returned none AND there is no previous row holding one — the credential
- * is never written as an empty-refresh row (that is the bug that breaks
+ * is NEVER written as an empty-refresh row (that is the bug that breaks
  * every later read: the proxy mint fails with `oauth_token failed to mint`).
- * The save FAILS instead, so the connect fails closed with a clear cause.
+ *
+ * Decision B (issue #265): instead of failing the save closed (the #256/
+ * #263 posture), an access-only outcome — no refresh from the exchange AND
+ * no previous row holding one — is persisted as a NON-RENEWABLE credential:
+ * `refreshable: false`, no `refresh` field, `expires` from `expires_in`.
+ * This accepts servers whose AS caps grants at ~1h access tokens (Notion's
+ * measured behavior) so the connect succeeds; the credential serves for the
+ * access token's lifetime and expiry surfaces the re-connect prompt. The
+ * ONE exception is the CONNECT leg's exchange being answered by the local
+ * iron-proxy token-endpoint STUB (`iron-proxy-stub-token`, verified from
+ * the iron-proxy v0.49.0 source): that is not a real token — the proxy
+ * stubbed the exchange before it reached the provider — so the connect
+ * fails closed with a precise cause rather than persisting garbage. The
+ * runtime refresh leg (no negotiation context) may legitimately save the
+ * stub (the proxy answers the SDK's token dance with it by design).
  *
  * The per-user registered client identity (issue #250) rides along: the
  * DCR `client_information` (`client_id`/`client_secret`) is per-user vault
@@ -227,16 +254,54 @@ export function tokensToVaultCredential(
 ): VaultOAuthCredential {
   // A genuine new refresh wins; otherwise the previous row's refresh is
   // carried forward (non-rotating servers). Neither present → the grant
-  // cannot be refreshed at all: fail closed rather than persist an
-  // empty-refresh credential that mints nothing.
+  // cannot be refreshed at all: persist a NON-RENEWABLE access-only
+  // credential (decision B) — never an empty-refresh row that mints
+  // nothing, and never a silent connect failure for servers that cap
+  // grants at access tokens.
   const refresh = tokens.refresh_token && tokens.refresh_token !== "" ? tokens.refresh_token : previous?.refresh;
   if (refresh === undefined || refresh === "") {
-    throw new Error(noRefreshTokenErrorMessage(negotiation));
+    // Connect-leg guard: the iron-proxy token-endpoint STUB (verified from
+    // the v0.49.0 source, `internal/transform/oauth/oauth.go`) answers the
+    // exchange with `iron-proxy-stub-token` when the provider's oauth_token
+    // entry is active — a masked exchange, not the provider's real grant.
+    // Persisting the stub would make the connect "succeed" with a token the
+    // provider rejects. Only the connect legs carry `negotiation`; the
+    // runtime refresh leg is expected to save the stub (the proxy's token
+    // dance completes against it by design), so the guard is scoped there.
+    if (negotiation !== undefined && tokens.access_token === IRON_PROXY_STUB_ACCESS_TOKEN) {
+      throw new Error(
+        "the authorization exchange was answered by the local iron-proxy token-endpoint stub " +
+          "(the provider's real token endpoint was not reached) — the provider's oauth_token egress entry is " +
+          "masking the exchange; remove the entry or connect without it",
+      );
+    }
+    const credential: VaultOAuthCredential = {
+      type: "oauth",
+      // The row shape requires a `refresh` field; an EMPTY value marks "no
+      // refresh" — every consumer distinguishes it: `vaultCredentialToTokens`
+      // drops it (the SDK never POSTs it), `seedProxyOAuthBlob` excludes
+      // empty-refresh rows (no blob, no mint), and the egress reconcile
+      // excludes the provider from the oauth_token entries (decision B). The
+      // `refreshable: false` marker makes the non-renewability explicit.
+      refresh: "",
+      access: tokens.access_token,
+      expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
+      refreshable: false,
+    };
+    const carried = previous as VaultOAuthCredential | null;
+    const clientId = clientInformation?.client_id ?? carried?.client_id;
+    const clientSecret = clientInformation?.client_secret ?? carried?.client_secret;
+    const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? carried?.token_endpoint_auth_method;
+    if (clientId !== undefined && clientId !== "") credential.client_id = clientId;
+    if (clientSecret !== undefined && clientSecret !== "") credential.client_secret = clientSecret;
+    if (clientAuthMethod !== undefined && clientAuthMethod !== "") credential.token_endpoint_auth_method = clientAuthMethod;
+    return credential;
   }
   const credential: VaultOAuthCredential = {
     type: "oauth",
     access: tokens.access_token,
     refresh,
+    refreshable: true,
     expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
   };
   const carried = previous as VaultOAuthCredential | null;
@@ -256,54 +321,20 @@ export function tokensToVaultCredential(
 /**
  * The connect-negotiated grant contract (issue #263), carried from
  * {@link connectServerNegotiation} (the mint leg) through the persisted
- * flow (the callback leg) into the fail-closed message: whether the
- * authorization server advertised the `refresh_token` grant + the composed
- * scope the connect actually REQUESTED. Allowing the save path to
- * distinguish "the AS advertised refresh but returned an access-only
- * token" (a server limitation — Notion's live failure) from the generic
- * no-refresh outcome, instead of the misleading blanket claim that
- * `offline_access` "was not granted".
+ * flow (the callback leg): whether the authorization server advertised the
+ * `refresh_token` grant + the composed scope the connect actually
+ * REQUESTED. Under decision B (issue #265) it no longer feeds a fail-closed
+ * message — an access-only outcome is accepted — but it still marks the
+ * CONNECT legs: `tokensToVaultCredential` scopes the iron-proxy stub guard
+ * (a stub-answered exchange is a masked connect, not a real access-only
+ * grant) to saves carrying a negotiation, so the runtime refresh leg (no
+ * negotiation) can legitimately save the proxy's stub-token dance result.
  */
 export interface OAuthGrantNegotiation {
   /** True when the AS advertised the `refresh_token` grant at connect time. */
   grantedRefresh?: boolean;
   /** The scope the connect actually requested (may carry `offline_access`). */
   requestedScope?: string;
-}
-
-/**
- * The fail-closed message for an exchange whose response carries no refresh
- * token and no previous row has one either (issue #263). Three honest
- * tiers, so a live connect is classified by what actually happened:
- *
- * 1. Advertised `refresh_token` + requested `offline_access`, yet the token
- *    endpoint returned an access-only token → the server caps its grants at
- *    access tokens. This is the message that names the cause precisely; it
- *    must NEVER claim `offline_access` "was not granted" here, because it
- *    WAS requested (and granted access-only).
- * 2. Advertised `refresh_token` but `offline_access` was NOT requested and
- *    no refresh came back → honest: nothing refreshable was requested.
- * 3. No negotiated grant signal (no refresh grant advertised, or the
- *    negotiation never completed) → the original generic message.
- */
-export function noRefreshTokenErrorMessage(negotiation?: OAuthGrantNegotiation): string {
-  const requestedOfflineAccess =
-    negotiation?.requestedScope !== undefined &&
-    negotiation.requestedScope.split(/\s+/).includes("offline_access");
-  if (negotiation?.grantedRefresh === true && requestedOfflineAccess) {
-    return (
-      "the authorization server advertised the refresh_token grant and the connect requested offline_access, " +
-      "but the token endpoint returned an access-only token (no refresh_token) — this server appears to cap its " +
-      "grants at access tokens; the credential was not saved (fail closed)"
-    );
-  }
-  if (negotiation?.grantedRefresh === true) {
-    return (
-      "the authorization server advertised the refresh_token grant but the connect did not request offline_access, " +
-      "and the token endpoint returned no refresh_token — the credential was not saved (fail closed)"
-    );
-  }
-  return "the OAuth server issued no refresh token (offline_access was not granted) — the credential was not saved";
 }
 
 /** The persisted flow bookkeeping (the `oauth_flows.flow` JSON blob). */
@@ -371,6 +402,7 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
   #discoveryState: OAuthDiscoveryState | undefined;
   #tokens: OAuthTokens | undefined;
   #savedBrokerCredentialId: number | undefined;
+  #savedRefreshable = false;
   #negotiation: OAuthGrantNegotiation | undefined;
 
   constructor(opts: McpOAuthProviderOpts) {
@@ -436,11 +468,26 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
     );
     this.#opts.tokenTarget.brokerCredentialId = saved.brokerCredentialId;
     this.#savedBrokerCredentialId = saved.brokerCredentialId;
+    // Decision B (issue #265): the exchange/refresh's refreshability —
+    // whether the persisted credential carries a refresh grant. The
+    // callback leg consults it to decide whether the connect-time mint
+    // probe must run: a non-renewable access-only credential (Notion's AS
+    // caps grants at ~1h access tokens) has nothing to probe, and running
+    // the probe would fail the connect ("the returned refresh token cannot
+    // mint an access token") on a grant that is fine for its lifetime.
+    this.#savedRefreshable =
+      (tokens.refresh_token !== undefined && tokens.refresh_token !== "") ||
+      (previous?.refresh !== undefined && previous.refresh !== "");
   }
 
   /** The vault row id the last save produced (the callback's registry upsert). */
   get savedBrokerCredentialId(): number | undefined {
     return this.#savedBrokerCredentialId;
+  }
+
+  /** Whether the last save persisted a refresh-bearing (renewable) grant. */
+  get savedRefreshable(): boolean {
+    return this.#savedRefreshable;
   }
 
   redirectToAuthorization(authorizationUrl: URL): void {
@@ -888,24 +935,34 @@ export async function completeMcpOAuthFlow(
   // probe reuses the SAME provider (cached discovery + client info + the
   // just-exchanged tokens), so it costs a single HTTP round trip and the
   // probe itself rotates the row to its latest token.
-  let probe: AuthResult;
-  try {
-    probe = await auth(provider, {
-      serverUrl: flowRow.server_url,
-      // Issue #263: the connect-time mint probe also exchanges tokens at
-      // /token — captured under DEBUG like the code exchange.
-      ...debugTokenExchangeFetch(),
-    });
-  } catch (err) {
-    throw new Error(
-      `connect ${flowRow.label} failed: the authorization exchange was rejected (${errorMessage(err)}) — ` +
-        `the returned refresh token cannot mint an access token`,
-    );
-  }
-  if (probe !== "AUTHORIZED") {
-    throw new Error(
-      `connect ${flowRow.label} failed: the authorization exchange was rejected — the returned refresh token cannot mint an access token`,
-    );
+  //
+  // Decision B (issue #265): a NON-RENEWABLE credential (access-only
+  // exchange — no refresh anywhere, e.g. Notion's AS caps grants at ~1h
+  // access tokens) has nothing to probe; running the probe would fail the
+  // connect with "the returned refresh token cannot mint an access token"
+  // on a grant that is perfectly usable for its lifetime. The probe runs
+  // only for refresh-bearing saves; expiry of a non-renewable credential
+  // surfaces the re-connect prompt at runtime instead.
+  if (provider.savedRefreshable) {
+    let probe: AuthResult;
+    try {
+      probe = await auth(provider, {
+        serverUrl: flowRow.server_url,
+        // Issue #263: the connect-time mint probe also exchanges tokens at
+        // /token — captured under DEBUG like the code exchange.
+        ...debugTokenExchangeFetch(),
+      });
+    } catch (err) {
+      throw new Error(
+        `connect ${flowRow.label} failed: the authorization exchange was rejected (${errorMessage(err)}) — ` +
+          `the returned refresh token cannot mint an access token`,
+      );
+    }
+    if (probe !== "AUTHORIZED") {
+      throw new Error(
+        `connect ${flowRow.label} failed: the authorization exchange was rejected — the returned refresh token cannot mint an access token`,
+      );
+    }
   }
   // The probe's refresh may have rotated the vault row again; the registry
   // reference must point at the POST-probe row (the same identity-key vault

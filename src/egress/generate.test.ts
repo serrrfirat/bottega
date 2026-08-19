@@ -445,6 +445,25 @@ describe("oauth_token rule scoping (issue #246)", () => {
    * (attio/linear OAuth) plus a notion-shaped runtime registration. */
   const MERGED_SNAPSHOTS = [...SNAPSHOTS, notionRuntimeSnapshot()];
   const MERGED_ENTRIES = oauthTokenEntries(MERGED_SNAPSHOTS);
+
+  test("decision B: a non-renewable provider (excluded set) gets NO oauth_token entry; its domains still allowlist", () => {
+    const excluded = new Set(["notion"]);
+    const entries = oauthTokenEntries(MERGED_SNAPSHOTS, excluded);
+    expect(entries.map((e) => e.extensionId)).not.toContain("notion");
+    // The other OAuth providers keep their entries (their rows are
+    // refreshable — the caller only excludes non-renewable ones).
+    expect(entries.map((e) => e.extensionId)).toContain("attio");
+    expect(entries.map((e) => e.extensionId)).toContain("linear");
+    // The allowlist is independent of the exclusion: notion's domains still
+    // pass egress so the boundary secrets injection can reach them.
+    const yaml = renderEgressConfig(
+      mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains)),
+      apiKeyExtensionEntries(MERGED_SNAPSHOTS),
+      entries,
+    );
+    expect(allowlistDomains(yaml)).toContain("mcp.notion.com"); // allowlist entry
+    expect(oauthTokenRules(yaml)?.some((r) => String(r["host"]) === "mcp.notion.com") ?? false).toBe(false);
+  });
   // The runtime render merges the runtime domains into the allowlist too
   // (issue #233) — the strict render needs them to be internally coherent.
   const MERGED_DOMAINS = mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains));

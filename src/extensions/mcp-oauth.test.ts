@@ -42,6 +42,7 @@ import {
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";
 import { uploadLinkPublicBase } from "./upload-link";
+import type { VaultOAuthCredential } from "./proxy-seed";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-oauth-"));
 const stores: Store[] = [];
@@ -741,7 +742,7 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
     }
   });
 
-  test("issue #256 variant C — an exchange that returns NO refresh token, with no previous row, fails closed (no empty-refresh credential saved)", async () => {
+  test("issue #256 variant C — an exchange that returns NO refresh token, with no previous row, lands a NON-RENEWABLE credential (decision B)", async () => {
     const stub = new StubOAuthMcp();
     try {
       const store = freshStore();
@@ -758,15 +759,24 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
 
         // The mint DID request offline_access (issue #256) — but the server
         // still refuses to issue a refresh token (the exact Notion failure).
-        // The connect must fail CLOSED: an empty-refresh credential that
-        // can never mint must not be persisted.
+        // Decision B (issue #265): the connect SUCCEEDS with a
+        // NON-RENEWABLE credential — refresh "", refreshable: false, expires
+        // from expires_in — instead of failing closed. No empty-refresh row
+        // that LOOKS refreshable is ever written (the #256 bug); the marker
+        // + empty refresh keep the seed/egress from minting on it.
         stub.dropRefresh = true;
         const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
         const done = await fetch(authorize.headers.get("location")!);
-        expect(done.status).toBe(500);
-        expect(await done.text()).toContain("failed");
-        expect(vault.saves).toHaveLength(0); // no empty-refresh credential
-        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+        expect(done.status).toBe(200);
+        expect(vault.saves).toHaveLength(1); // the exchange save; the mint probe is SKIPPED (nothing to probe)
+        const saved = vault.saves[0]!.credential;
+        expect(saved.type).toBe("oauth");
+        expect(saved.refresh).toBe("");
+        expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+        expect(saved.expires).toBeGreaterThan(Date.now());
+        expect(saved.expires).toBeLessThanOrEqual(Date.now() + 3_700_000); // expires_in 3600s
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
+        expect(stub.state.refreshCalls).toBe(0); // non-renewable: no probe round-trip
       } finally {
         callback.stop();
       }
@@ -775,7 +785,7 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
     }
   });
 
-  test("issue #256 variant B — a server that does NOT advertise refresh_token gets no offline_access, and its no-refresh connect fails closed", async () => {
+  test("issue #256 variant B — a server that does NOT advertise refresh_token gets no offline_access, and its no-refresh connect lands a NON-RENEWABLE credential (decision B)", async () => {
     const stub = new StubOAuthMcp();
     stub.grantRefresh = false; // RFC 8414 metadata lists NO refresh_token grant
     try {
@@ -802,14 +812,17 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
         expect(stub.state.registeredScopes[0]!.split(" ")).not.toContain("offline_access");
 
         // (b) The exchange then issues NO refresh token (nothing refreshable
-        // was ever requested). The connect must fail closed — an
-        // empty-refresh credential that can never mint is never persisted.
+        // was ever requested). Decision B (issue #265, blanket): the connect
+        // SUCCEEDS with a non-renewable credential instead of failing
+        // closed — the access-only grant is accepted for its lifetime.
         const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
         const done = await fetch(authorize.headers.get("location")!);
-        expect(done.status).toBe(500);
-        expect(await done.text()).toContain("failed");
-        expect(vault.saves).toHaveLength(0);
-        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+        expect(done.status).toBe(200);
+        expect(vault.saves).toHaveLength(1);
+        const saved = vault.saves[0]!.credential;
+        expect(saved.refresh).toBe("");
+        expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
       } finally {
         callback.stop();
       }
@@ -1210,7 +1223,7 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
     }
   }
 
-  test("(a) an AS that advertises the refresh_token grant but returns an access-only exchange fails closed naming the advertised-grant cause — never 'offline_access was not granted'", async () => {
+  test("(a) an AS that advertises the refresh_token grant but returns an access-only exchange lands a NON-RENEWABLE credential (decision B)", async () => {
     const stub = new StubOAuthMcp();
     stub.dropRefresh = true; // ignores offline_access: the exchange returns access with NO refresh_token
     try {
@@ -1223,19 +1236,17 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
       };
       expect(metadata.grant_types_supported).toContain("refresh_token");
 
+      // Decision B (issue #265): the access-only outcome is ACCEPTED — the
+      // connect succeeds and persists a non-renewable credential (the #263
+      // fail-closed rejection is deliberately relaxed for this tier).
       const done = await roundTrip(stub, store, vault);
-      expect(done.status).toBe(500);
-      const body = await done.text();
-      // The fail-closed message names the advertised grant + the access-only
-      // outcome — it must NOT claim offline_access was not granted.
-      expect(body).toContain("advertised the refresh_token grant");
-      expect(body).toContain("requested offline_access");
-      expect(body).toContain("access-only");
-      expect(body).toContain("no refresh_token");
-      expect(body).not.toContain("offline_access was not granted");
-      // Nothing persisted: no empty-refresh credential, no registry row.
-      expect(vault.saves).toHaveLength(0);
-      expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+      expect(done.status).toBe(200);
+      expect(vault.saves).toHaveLength(1); // exchange save only — probe skipped
+      const saved = vault.saves[0]!.credential;
+      expect(saved.refresh).toBe("");
+      expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+      expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
+      expect(stub.state.refreshCalls).toBe(0); // non-renewable: no mint probe
     } finally {
       stub.stop();
     }

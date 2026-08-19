@@ -29,6 +29,7 @@ import {
   regenerateDevEgressConfig,
   regenerateEgressConfig,
 } from "../egress/generate";
+import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
 import { readOAuthRowsFromVault, seedProxyOAuthBlob, type OAuthVaultRow } from "./proxy-seed";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
@@ -111,9 +112,32 @@ export function createReconcileEgress(
 
     // 2. Regenerate BOTH egress configs with the superset (defect B
     //    fixed: a regen for one extension never drops another provider).
+    //    Decision B (issue #265): a provider whose CURRENT vault credential
+    //    is non-renewable (access-only — no refresh-bearing row anywhere)
+    //    is EXCLUDED from the oauth_token mint entries: there is no
+    //    refresh to seed, and the transform's require:true would 502 every
+    //    runtime call even though the SDK sent a valid access token (the
+    //    boundary secrets injection carries that provider's token instead).
+    //    An unreadable vault fails safe to KEEPING the entry (status quo —
+    //    a refreshable assumption), never silently dropping a provider.
+    const excludedOAuthProviders = new Set<string>();
+    for (const snapshot of superset) {
+      if (snapshot.manifest.credentialSchema.type !== "oauth") continue;
+      try {
+        const rows = await readVaultRows(snapshot.manifest.id);
+        const refreshable = rows.some(
+          (r) => r.refresh !== undefined && r.refresh !== "" && r.refresh !== REMOTE_REFRESH_SENTINEL,
+        );
+        if (!refreshable) excludedOAuthProviders.add(snapshot.manifest.id);
+      } catch (err) {
+        warnings.push(
+          `egress reconcile: ${snapshot.manifest.id} OAuth vault read failed (${errorMessage(err)}) — keeping its oauth_token entry`,
+        );
+      }
+    }
     try {
-      regenerateEgressConfig(snapshotsDir, egressPath, superset);
-      regenerateDevEgressConfig(snapshotsDir, devEgressPath, superset);
+      regenerateEgressConfig(snapshotsDir, egressPath, superset, excludedOAuthProviders);
+      regenerateDevEgressConfig(snapshotsDir, devEgressPath, superset, excludedOAuthProviders);
       log(`bottega egress reconcile: regenerated ${egressPath} + ${devEgressPath} (${superset.length} snapshots)`);
     } catch (err) {
       warnings.push(`egress reconcile: egress regeneration failed (${errorMessage(err)})`);

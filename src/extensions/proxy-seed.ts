@@ -94,6 +94,17 @@ interface ProxyOAuthBlob {
  * SDK never reads them back), but extra JSON survives the vault round-trip.
  */
 export interface VaultOAuthCredential extends OAuthCredential {
+  /**
+   * Whether the credential's grant is refreshable (decision B, issue #265).
+   * Explicitly `false` when the exchange returned an access-only token (no
+   * refresh anywhere — e.g. Notion's AS caps grants at ~1h access tokens):
+   * the row is still persisted so the connect succeeds, but the proxy must
+   * NOT seed an oauth_token mint entry for it (no refresh to mint from)
+   * and expiry surfaces the re-connect prompt. Refresh-bearing rows carry
+   * `true`; pre-#265 rows omit it (treated as refreshable by presence of
+   * `refresh`).
+   */
+  refreshable?: boolean;
   client_id?: string;
   client_secret?: string;
   /**

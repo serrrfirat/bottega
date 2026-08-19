@@ -325,10 +325,23 @@ export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSn
  * from the fixture's own allowlisted domain (there is no real
  * authorization server behind a fixture domain), so the #195 extension-pin
  * journey's egress regeneration runs deterministically.
+ *
+ * Decision B (issue #265): `excluded` names providers whose CURRENT vault
+ * credential is non-renewable (access-only — no refresh grant anywhere).
+ * The oauth_token transform is a refresh_token-grant mint: for a
+ * non-renewable provider there is no refresh to seed, so `require: true`
+ * would 502 every runtime call (the mint fails) even though the SDK sent a
+ * valid access token — the boundary `secrets` injection carries that
+ * provider's token instead. The connect-time egress reconcile computes the
+ * exclusion set from the vault and passes it; the CLI generator and the
+ * committed byte-stable config keep the default (no exclusion).
  */
-export function oauthTokenEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): OAuthTokenEntry[] {
+export function oauthTokenEntries(
+  snapshots: ReturnType<typeof readPinnedSnapshots>,
+  excluded: ReadonlySet<string> = new Set(),
+): OAuthTokenEntry[] {
   return snapshots
-    .filter((s) => s.manifest.credentialSchema.type === "oauth")
+    .filter((s) => s.manifest.credentialSchema.type === "oauth" && !excluded.has(s.manifest.id))
     .map((s): OAuthTokenEntry => {
       // Issue #246: every entry's rules get scoped to the MCP resource
       // subtree (paths) so public `/.well-known/*` discovery passes
@@ -725,6 +738,7 @@ export function regenerateEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = EGRESS_CONFIG_PATH,
   runtimeSnapshots: readonly PinnedSnapshot[] = [],
+  excludedOAuthProviders: ReadonlySet<string> = new Set(),
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   // mergedEgressDomains prepends the base domains and dedupes, so the raw
@@ -733,8 +747,13 @@ export function regenerateEgressConfig(
   // OAuth extensions (#198) move to the oauth_token transform (issue
   // #208): they get NO file-injection entry — the proxy mints their
   // access token. api_key extensions keep the file-injection entry.
+  // Decision B (issue #265): non-renewable providers (access-only vault
+  // credential — no refresh anywhere) are EXCLUDED from the oauth_token
+  // mint entries — there is no refresh to mint from, and `require: true`
+  // would 502 every runtime call; the boundary secrets injection carries
+  // their access token instead.
   const extensionEntries = apiKeyExtensionEntries(snapshots);
-  const oauthEntries = oauthTokenEntries(snapshots);
+  const oauthEntries = oauthTokenEntries(snapshots, excludedOAuthProviders);
   const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
@@ -753,10 +772,11 @@ export function regenerateDevEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = DEV_EGRESS_CONFIG_PATH,
   runtimeSnapshots: readonly PinnedSnapshot[] = [],
+  excludedOAuthProviders: ReadonlySet<string> = new Set(),
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   const extensionEntries = apiKeyExtensionEntries(snapshots);
-  const oauthEntries = oauthTokenEntries(snapshots);
+  const oauthEntries = oauthTokenEntries(snapshots, excludedOAuthProviders);
   const yaml = renderDevEgressConfig(extensionEntries, oauthEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;

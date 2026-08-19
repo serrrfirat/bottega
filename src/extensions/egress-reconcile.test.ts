@@ -236,17 +236,47 @@ describe("connect-time egress reconcile (#250)", () => {
       runtimeRows: [
         { id: "notion", snapshot: JSON.stringify(notion), registered_by: "test-user", space_id: null, created_at: Date.now(), updated_at: Date.now() },
       ],
-      readVaultRows: async () => [],
+      readVaultRows: async () => [{ refresh: "rt-notion", clientId: "cli_notion" }],
     });
 
     const result = await h.reconcile("linear");
     expect(result.warnings).toEqual([]);
 
-    // The superset union means the notion entry SURVIVES the linear regen.
+    // The superset union means the notion entry SURVIVES the linear regen
+    // (refreshable row → not excluded from the oauth_token entries).
     for (const path of [h.egressPath, h.devEgressPath]) {
       const yaml = readFileSync(path, "utf8");
       expect(yaml).toContain("mcp.notion.com");
       expect(yaml).toContain("notion-oauth.json");
+    }
+  });
+
+  test("decision B: a NON-RENEWABLE provider (no refresh row) keeps its allowlist + secrets entries but NO oauth_token entry", async () => {
+    const h = makeHarness({
+      committed: [["notion", notion]],
+      runtimeRows: [],
+      // The notion connect persisted an access-only credential (refresh ""
+      // or absent — nothing refreshable anywhere).
+      readVaultRows: async () => [{ refresh: "", clientId: "cli_notion" }],
+    });
+
+    const result = await h.reconcile("notion");
+    expect(result.warnings).toEqual([]);
+
+    // The blob is deleted (nothing to seed)…
+    const blobPath = join(h.secretsDir, "notion-oauth.json");
+    expect(existsSync(blobPath)).toBe(false);
+
+    // …the strict allowlist still carries the provider's domain (the dev
+    // config is allow-all "*" — the domain never appears there)…
+    const strict = readFileSync(h.egressPath, "utf8");
+    expect(strict).toContain("mcp.notion.com");
+    // …but the oauth_token MINT entry is GONE from BOTH configs: with
+    // require: true it would 502 every runtime call even though the SDK
+    // sent a valid access token (the boundary secrets injection carries it
+    // instead).
+    for (const path of [h.egressPath, h.devEgressPath]) {
+      expect(readFileSync(path, "utf8")).not.toContain("notion-oauth.json");
     }
   });
 
