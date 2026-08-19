@@ -241,6 +241,83 @@ describe("OAuth blobs (issue #208)", () => {
       s.cleanup();
     }
   });
+
+  test("a broken row with an EMPTY refresh never displaces a row with a real refresh (issue #256)", async () => {
+    const s = tempSecretsDir();
+    try {
+      // Row 4: the proven-working grant (real refresh + its DCR client).
+      // Row 5: a newer connect that (pre-#256) persisted an EMPTY refresh —
+      // it MUST NOT win the seed no matter how fresh its DCR client is.
+      const rows = [
+        { id: 4, refresh: "row-4-refresh", clientId: "client-old", expires: Date.now() + 3_600_000 },
+        { id: 5, refresh: "", clientId: "broken-client", expires: Date.now() + 3_600_000 },
+      ];
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) => (provider === "linear" ? rows : []),
+        log: SILENT,
+      });
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
+      expect(blob).toEqual({ refresh_token: "row-4-refresh", client_id: "client-old" });
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("an UNEXPIRED refresh row is seeded over an expired one, even when the expired row is older (issue #256)", async () => {
+    const s = tempSecretsDir();
+    try {
+      // The older row's access token is already expired (its server-side
+      // grant has been superseded); the newer row is fresh. The seed must
+      // prefer the unexpired grant — not the oldest client-id row.
+      const rows = [
+        { id: 4, refresh: "stale-refresh", clientId: "client-old", expires: Date.now() - 3_600_000 },
+        { id: 6, refresh: "fresh-refresh", clientId: "client-new", expires: Date.now() + 3_600_000 },
+      ];
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) => (provider === "linear" ? rows : []),
+        log: SILENT,
+      });
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
+      expect(blob.refresh_token).toBe("fresh-refresh");
+      expect(blob.client_id).toBe("client-new");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("the NEWEST equally-viable row wins — a re-auth's fresh grant supersedes the older one it invalidated (issue #256)", async () => {
+    const s = tempSecretsDir();
+    try {
+      // After a re-auth, BOTH rows carry a real, unexpired refresh + a DCR
+      // client; the NEWER row is the registration the server still honors
+      // (the older client was invalidated server-side by the re-auth), so
+      // the seed must pick the newest, not the oldest.
+      const rows = [
+        { id: 4, refresh: "row-4-refresh", clientId: "client-invalidated", expires: Date.now() + 3_600_000 },
+        { id: 6, refresh: "row-6-refresh", clientId: "client-live", expires: Date.now() + 3_600_000 },
+      ];
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) => (provider === "linear" ? rows : []),
+        log: SILENT,
+      });
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
+      expect(blob).toEqual({ refresh_token: "row-6-refresh", client_id: "client-live" });
+    } finally {
+      s.cleanup();
+    }
+  });
 });
 
 describe("codex static credential (issue #214 + #230)", () => {

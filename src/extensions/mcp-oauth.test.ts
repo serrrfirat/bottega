@@ -84,6 +84,10 @@ interface StubState {
   refreshCalls: number;
   tokenGrantTypes: string[];
   lastRefreshTokenUsed: string | null;
+  /** The `scope` field of every DCR registration request (issue #256). */
+  registeredScopes: string[];
+  /** The `scope` query param of every authorization URL minted (issue #256). */
+  authorizeScopes: string[];
 }
 
 /**
@@ -96,13 +100,21 @@ interface StubState {
 class StubOAuthMcp {
   readonly server: ReturnType<typeof Bun.serve>;
   readonly baseUrl: string;
-  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null };
-  #codes = new Map<string, { clientId: string; challenge: string | null }>();
+  readonly state: StubState = { registerCalls: 0, codeExchanges: 0, refreshCalls: 0, tokenGrantTypes: [], lastRefreshTokenUsed: null, registeredScopes: [], authorizeScopes: [] };
+  #codes = new Map<string, { clientId: string; challenge: string | null; offline: boolean }>();
   #refreshTokens = new Map<string, string>(); // refresh -> clientId
   #accessTokens = new Map<string, string>(); // access -> clientId
   #nextId = 0;
   /** Set false to serve /mcp with NO OAuth metadata (the fail-closed leg). */
   oauthMetadata = true;
+  /**
+   * Set true to make the token endpoint refuse to issue a refresh token even
+   * when offline_access WAS requested (models a server that ignores
+   * offline_access — exactly what Notion did pre-fix): the exchange returns
+   * access with NO refresh, so a connect must fail closed rather than
+   * persist an empty-refresh credential (issue #256).
+   */
+  dropRefresh = false;
 
   constructor() {
     this.server = Bun.serve({
@@ -173,7 +185,8 @@ class StubOAuthMcp {
       this.state.registerCalls += 1;
       // SAFETY: the DCR request carries these optional fields (RFC 7591);
       // the stub defaults each missing one in the registration response.
-      const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[] };
+      const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[]; scope?: string };
+      this.state.registeredScopes.push(typeof body.scope === "string" ? body.scope : "");
       return json({
         client_id: `client-${this.state.registerCalls}`,
         redirect_uris: body.redirect_uris ?? [],
@@ -187,11 +200,21 @@ class StubOAuthMcp {
       const clientId = url.searchParams.get("client_id") ?? "";
       const redirectUri = url.searchParams.get("redirect_uri") ?? "";
       const state = url.searchParams.get("state") ?? undefined;
+      const scope = url.searchParams.get("scope") ?? "";
       const challenge = url.searchParams.get("code_challenge") ?? "";
       const method = url.searchParams.get("code_challenge_method") ?? "";
+      this.state.authorizeScopes.push(scope);
+      // The server only issues a REFRESH token when the consent granted
+      // offline_access (RFC 6749 §3.3). The stub models the real Notion
+      // failure exactly: a scope WITHOUT offline_access yields an
+      // authorization_code grant with NO refresh token.
       this.#nextId += 1;
       const code = `code-${this.#nextId}`;
-      this.#codes.set(code, { clientId, challenge: method === "S256" ? challenge : null });
+      this.#codes.set(code, {
+        clientId,
+        challenge: method === "S256" ? challenge : null,
+        offline: scope.split(" ").includes("offline_access"),
+      });
       const target = new URL(redirectUri);
       target.searchParams.set("code", code);
       if (state !== undefined && state !== "") target.searchParams.set("state", state);
@@ -219,8 +242,16 @@ class StubOAuthMcp {
         }
         this.#nextId += 1;
         const access = `access-${this.#nextId}`;
-        const refresh = `refresh-${this.#nextId}`;
         this.#accessTokens.set(access, entry.clientId);
+        // No refresh token unless offline_access was granted — the exact
+        // pre-#256 Notion behavior that persisted an empty refresh and
+        // broke every later read. dropRefresh forces the no-refresh
+        // response even when offline_access WAS requested, for the
+        // fail-closed connect test.
+        if (!entry.offline || this.dropRefresh) {
+          return json({ access_token: access, token_type: "Bearer", expires_in: 3600, scope: "default" });
+        }
+        const refresh = `refresh-${this.#nextId}`;
         this.#refreshTokens.set(refresh, entry.clientId);
         return json({ access_token: access, token_type: "Bearer", expires_in: 3600, refresh_token: refresh, scope: "default" });
       }
@@ -247,11 +278,12 @@ class StubOAuthMcp {
 
 /** A fake vault token store: records saves, serves scripted loads. */
 class FakeVaultStore implements McpOAuthTokenStore {
-  saves: Array<{ provider: string; credential: OAuthCredential }> = [];
+  saves: Array<{ provider: string; credential: OAuthCredential; brokerCredentialId: number }> = [];
   loadResult: OAuthCredential | null = null;
   async save(provider: string, credential: OAuthCredential): Promise<{ brokerCredentialId: number }> {
-    this.saves.push({ provider, credential });
-    return { brokerCredentialId: 900 + this.saves.length };
+    const brokerCredentialId = 900 + this.saves.length + 1; // first save → 901
+    this.saves.push({ provider, credential, brokerCredentialId });
+    return { brokerCredentialId };
   }
   async load(): Promise<OAuthCredential | null> {
     return this.loadResult;
@@ -289,7 +321,7 @@ describe("startMcpOAuthFlow — discovery + DCR + PKCE (issue #198)", () => {
       expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:9/oauth/callback");
       expect(url.searchParams.get("code_challenge_method")).toBe("S256");
       expect(url.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{40,}$/);
-      expect(url.searchParams.get("scope")).toBe("default");
+      expect(url.searchParams.get("scope")).toBe("default offline_access");
       const state = url.searchParams.get("state");
       expect(state).toBeTruthy();
       expect(stub.state.registerCalls).toBe(1); // dynamic client registration happened
@@ -537,6 +569,132 @@ describe("full connect round trip — mint → browser → callback → vault + 
     } finally {
       if (savedPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
       else process.env.BOTTEGA_CALLBACK_PORT = savedPort;
+    }
+  });
+});
+
+describe("issue #256 — offline_access + a durable refresh token", () => {
+  test("issue #256 mint — the DCR registration AND the authorization URL request offline_access", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9");
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+
+      // The exported authorization URL the user's browser visits.
+      const scope = new URL(outcome.authorizationUrl).searchParams.get("scope") ?? "";
+      expect(scope.split(" ")).toContain("offline_access");
+
+      // The dynamic client REGISTRATION request carried the same scope.
+      expect(stub.state.registeredScopes).toHaveLength(1);
+      expect(stub.state.registeredScopes[0]!.split(" ")).toContain("offline_access");
+      // When the user's browser follows the redirect, /authorize receives
+      // the same offline_access scope (server-side view).
+      const authorize = await fetch(outcome.authorizationUrl, { redirect: "manual" });
+      expect(authorize.status).toBe(302);
+      expect(stub.state.authorizeScopes).toHaveLength(1);
+      expect(stub.state.authorizeScopes[0]!.split(" ")).toContain("offline_access");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("issue #256 connect — an exchange that returns NO refresh token fails closed (no empty-refresh credential saved)", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        // The mint DID request offline_access (issue #256) — but the server
+        // still refuses to issue a refresh token (the exact Notion failure).
+        // The connect must fail CLOSED: an empty-refresh credential that
+        // can never mint must not be persisted.
+        stub.dropRefresh = true;
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(500);
+        expect(await done.text()).toContain("failed");
+        expect(vault.saves).toHaveLength(0); // no empty-refresh credential
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(0);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("a fresh connect persists a real refresh token and a subsequent runtime mint rotates it", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+
+        // (a) offline_access was requested on the minted/DCR surfaces.
+        const mintedScope = new URL(minted.authorizationUrl).searchParams.get("scope") ?? "";
+        expect(mintedScope.split(" ")).toContain("offline_access");
+        expect(stub.state.registeredScopes[0]!.split(" ")).toContain("offline_access");
+
+        // (b) The stored credential carries a REAL, non-empty refresh token.
+        const saved = vault.saves[0];
+        expect(saved).toBeTruthy();
+        if (!saved) return;
+        expect(saved.credential.refresh).toMatch(/^refresh-/);
+        expect(saved.credential.refresh).not.toBe("");
+        expect(saved.credential.access).toMatch(/^access-/);
+
+        // (c) The registry row points AT the saved row, so the runtime mint
+        // resolves it and refreshes through the SDK.
+        const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.broker_credential_id).toBe(saved.brokerCredentialId);
+
+        vault.loadResult = { ...saved.credential, access: "access-stale", expires: Date.now() - 60_000 };
+        const provider = createRuntimeMcpOAuthProvider({
+          credential: { ...rows[0], id: "ec_test" },
+          tokenStore: vault,
+        });
+        const result = await auth(provider, { serverUrl: stub.mcpUrl });
+        expect(result).toBe("AUTHORIZED");
+        expect(stub.state.refreshCalls).toBe(1);
+        expect(stub.state.lastRefreshTokenUsed).toBe(saved.credential.refresh);
+        const rotation = vault.saves[vault.saves.length - 1]!;
+        expect(rotation.credential.refresh).toMatch(/^refresh-rotated-/);
+        expect(rotation.credential.access).not.toBe("access-stale");
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
     }
   });
 });

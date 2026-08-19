@@ -30,7 +30,7 @@
  * silent no-op.
  */
 import { randomBytes } from "node:crypto";
-import { auth, type AuthResult, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth, discoverOAuthServerInfo, type AuthResult, type OAuthClientProvider, type OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
@@ -206,6 +206,11 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  * absolute epoch-ms `expires`. A missing refresh token in the exchange
  * response preserves the vault's previous one (servers that don't rotate
  * omit it) — the grant must not silently lose its refresh capability.
+ * Issue #256: when there is NO refresh token to keep — the exchange
+ * returned none AND there is no previous row holding one — the credential
+ * is never written as an empty-refresh row (that is the bug that breaks
+ * every later read: the proxy mint fails with `oauth_token failed to mint`).
+ * The save FAILS instead, so the connect fails closed with a clear cause.
  *
  * The per-user registered client identity (issue #250) rides along: the
  * DCR `client_information` (`client_id`/`client_secret`) is per-user vault
@@ -219,10 +224,18 @@ export function tokensToVaultCredential(
   previous: OAuthCredential | null,
   clientInformation?: { client_id?: string; client_secret?: string },
 ): VaultOAuthCredential {
+  // A genuine new refresh wins; otherwise the previous row's refresh is
+  // carried forward (non-rotating servers). Neither present → the grant
+  // cannot be refreshed at all: fail closed rather than persist an
+  // empty-refresh credential that mints nothing.
+  const refresh = tokens.refresh_token && tokens.refresh_token !== "" ? tokens.refresh_token : previous?.refresh;
+  if (refresh === undefined || refresh === "") {
+    throw new Error("the OAuth server issued no refresh token (offline_access was not granted) — the credential was not saved");
+  }
   const credential: VaultOAuthCredential = {
     type: "oauth",
     access: tokens.access_token,
-    refresh: tokens.refresh_token ?? previous?.refresh ?? "",
+    refresh,
     expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
   };
   const carried = previous as VaultOAuthCredential | null;
@@ -413,13 +426,52 @@ export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pic
 }
 
 /**
+ * The connect mint's requested scope (issue #256). SEP-835 resolves the
+ * OAuth scope as: auth() `scope` option → WWW-Authenticate scope →
+ * the resource's advertised `scopes_supported` → client metadata `scope`.
+ * The resource advertisement lists only the RESOURCE's own scopes (the
+ * hosted MCP advertises e.g. "default") — it NEVER lists the OIDC
+ * "offline_access" scope, without which the authorization server issues
+ * NO refresh token, and every later proxy mint fails with "oauth_token
+ * failed to mint". So the mint decides on the AUTHORIZATION SERVER's grant
+ * signal: when it advertises the `refresh_token` grant, append
+ * `offline_access` to the requested scope (the DCR registration request
+ * and the authorization URL both carry it); otherwise keep the SDK's
+ * resolution untouched (e.g. client-credentials servers have no consent).
+ *
+ * This costs an extra discovery round trip on the connect path (not hot);
+ * in exchange no provider/state plumbing is needed and every server that
+ * supports refreshable grants gets a token that can actually be refreshed.
+ */
+async function connectOAuthScope(
+  serverUrl: string,
+  clientScopes: readonly string[] | undefined,
+): Promise<string | undefined> {
+  let info: OAuthServerInfo;
+  try {
+    info = await discoverOAuthServerInfo(serverUrl);
+  } catch {
+    // auth() below re-discovers and surfaces its own failure message (the
+    // connect already fails closed there); don't double-fail here.
+    return undefined;
+  }
+  const grantsRefresh =
+    info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
+  if (!grantsRefresh) return undefined;
+  const base = info.resourceMetadata?.scopes_supported?.join(" ") ?? clientScopes?.join(" ");
+  return base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
+}
+
+/**
  * The connect mint (issue #198): runs the SDK's `auth()` orchestration in
  * REDIRECT mode against the extension's hosted MCP server — discovery,
  * dynamic client registration, PKCE challenge — and persists the flow so
  * the callback can complete it. Returns the authorization URL for Slack
  * (the one-time-link posture; the URL is shown, the token never touches
  * chat). Fail closed: a non-hosted-OAuth extension, missing metadata, or a
- * failed flow start are clear errors with no flow row written.
+ * failed flow start are clear errors with no flow row written. When the
+ * server advertises the `refresh_token` grant, the requested scope carries
+ * `offline_access` so the issued grant is refreshable (issue #256).
  */
 export async function startMcpOAuthFlow(
   input: McpOAuthStartInput,
@@ -452,7 +504,8 @@ export async function startMcpOAuthFlow(
   });
   let result: AuthResult;
   try {
-    result = await auth(provider, { serverUrl });
+    const scope = await connectOAuthScope(serverUrl, manifest.credentialSchema.scopes);
+    result = await auth(provider, { serverUrl, ...(scope !== undefined ? { scope } : {}) });
   } catch (err) {
     return { ok: false, message: `connect ${manifest.label} failed: ${errorMessage(err)}` };
   }

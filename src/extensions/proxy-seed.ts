@@ -100,12 +100,23 @@ export interface VaultOAuthCredential extends OAuthCredential {
 
 /** One OAuth vault row's seed-relevant fields (issue #250). */
 export interface OAuthVaultRow {
+  /** Vault row id (ascending ⇒ newest last); absent on inline test rows. */
+  id?: number;
   /** The refresh token (real locally; {@link REMOTE_REFRESH_SENTINEL} remotely). */
   refresh?: string;
   /** The per-user registered client id (the DCR `client_information`). */
   clientId?: string;
   /** The per-user registered client secret (public clients omit it). */
   clientSecret?: string;
+  /**
+   * Absolute epoch-ms expiry of the row's access token. A refresh grant is
+   * "fresh" while its access token is unexpired (and 0/undefined rows are
+   * treated as fresh — they cannot be judged stale). Issue #256: the seed
+   * prefers fresh rows so a stale/rotated grant cannot displace a working
+   * one, and `0` (never-expiring fixture rows) must not lose to older
+   * real rows (issue #228 fresh-vs-stale regression).
+   */
+  expires?: number;
 }
 
 /**
@@ -676,7 +687,7 @@ async function readOAuthRowsFromAgentDb(agentDir: string, provider: string): Pro
     await storage.reload();
     return storage
       .listStoredCredentials(provider)
-      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.credential)] : []));
+      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.id, entry.credential)] : []));
   } finally {
     storage.close();
   }
@@ -694,18 +705,20 @@ export async function readOAuthRowsFromLocalStorage(provider: string): Promise<A
     await storage.reload();
     return storage
       .listStoredCredentials(provider)
-      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.credential)] : []));
+      .flatMap((entry) => (entry.credential.type === "oauth" ? [oauthVaultRow(entry.id, entry.credential)] : []));
   } finally {
     storage.close();
   }
 }
 
 /** Picks the seed-relevant fields off one vault OAuth credential (+ the #250 client identity). */
-function oauthVaultRow(credential: OAuthCredential): OAuthVaultRow {
+function oauthVaultRow(id: number, credential: OAuthCredential): OAuthVaultRow {
   return {
+    id,
     refresh: credential.refresh,
     clientId: (credential as VaultOAuthCredential).client_id,
     clientSecret: (credential as VaultOAuthCredential).client_secret,
+    expires: credential.expires,
   };
 }
 
@@ -768,14 +781,26 @@ export async function seedProxyOAuthBlob(
   const refreshRows = rows.filter(
     (r) => r.refresh !== undefined && r.refresh !== "" && r.refresh !== REMOTE_REFRESH_SENTINEL,
   );
-  // Prefer a viable row that ALSO carries a resolvable per-user client
-  // identity (issue #250 DCR grant). The broker vault keeps every grant,
-  // ascending by id: an older pre-#250 row (real refresh, no client_id)
-  // sorts BEFORE the live DCR row, so a plain `find(refresh)` would win the
-  // wrong row and fail closed. Fall back to the first viable row otherwise
-  // (pre-#250 behavior: env- or row-less client id resolution still applies).
-  const row =
-    refreshRows.find((r) => r.clientId !== undefined && r.clientId !== "") ?? refreshRows[0];
+  // Prefer the row whose grant is most likely to mint right now (issue
+  // #256): a NON-EMPTY, UNEXPIRED refresh beats empty/expired ones, then a
+  // resolvable per-user DCR client identity (issue #250), then the NEWEST
+  // vault row (ascending ids ⇒ newer registration = the server-side grant
+  // still honors it, e.g. after a re-auth registers a fresh client).
+  // A row with an EMPTY refresh (the pre-#256 connect bug: offline_access
+  // was never requested, so no refresh was issued) is EXCLUDED entirely —
+  // a broken newer row can never displace a working older one until a
+  // valid re-auth lands a real token. 0/undefined `expires` counts as
+  // fresh (cannot be judged stale; fixture rows never degrade to the
+  // #228 stale path). No viable row ⇒ `row` is undefined ⇒ refresh is
+  // undefined ⇒ the blob is deleted (fail closed), unchanged.
+  const fresh = (r: OAuthVaultRow): boolean => r.expires === undefined || r.expires === 0 || r.expires > Date.now();
+  const rank = (r: OAuthVaultRow): number =>
+    (fresh(r) ? 4 : 0) + (r.clientId !== undefined && r.clientId !== "" ? 2 : 0);
+  const row = [...refreshRows].sort((a, b) => {
+    const byRank = rank(b) - rank(a);
+    if (byRank !== 0) return byRank;
+    return (b.id ?? 0) - (a.id ?? 0);
+  })[0];
   const refresh = row?.refresh;
   // Resolve both client credentials up front so the #208 boot env-strip
   // below never races the resolution, then strip when requested — on EVERY
