@@ -94,6 +94,7 @@ import {
 import { OAuthFlowStore, type McpOAuthConnector, type OAuthFlowStoreSlice } from "../../src/extensions/mcp-oauth";
 import { adminToolDefinitions } from "../../src/tools/admin";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
+import { listAvailableModels, resolveModelPin } from "../../src/models/model-pin";
 import { evaluatePolicyGate } from "../../src/policy/gate";
 import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
@@ -439,8 +440,28 @@ export const canaryBroker: BrokerConnector = async () => ({
 export function defaultModelIdFor(modelRef: string): string {
   if (modelRef.includes("near")) return "deepseek-ai/DeepSeek-V4-Flash";
   if (modelRef.includes("opencode")) return "deepseek-v4-flash";
+  // Keep the ref exactly as the operator pinned it (issue #243). Stripping
+  // a provider-qualified ref to its bare id ("openai-codex/gpt-5.6-luna" →
+  // "gpt-5.6-luna") made the turn-start default re-apply fail ambiguous (an
+  // id served by several providers with no near winner) or silently spill
+  // to near's #194 preference — the session kept its current model while
+  // the persistence + reply assertions still passed (the hot-swap
+  // false-pass).
+  return modelRef;
+}
+
+/**
+ * The provider a hot-swap default MUST re-apply under (issue #243): the
+ * model ref's own provider when {@link defaultModelIdFor} passes the ref
+ * through qualified, undefined for the near/opencode forms the resolver
+ * normalizes to a single working provider by preference (#194). The
+ * journey asserts the stored default resolves to this provider, never a
+ * near-tied or ambiguous spillover.
+ */
+export function defaultModelProviderFor(modelRef: string): string | undefined {
+  if (modelRef.includes("near") || modelRef.includes("opencode")) return undefined;
   const slash = modelRef.lastIndexOf("/");
-  return slash >= 0 ? modelRef.slice(slash + 1) : modelRef;
+  return slash >= 0 ? modelRef.slice(0, slash) : undefined;
 }
 
 /** A tool-execute session ctx pinned to the space (the session-file seam). */
@@ -1401,8 +1422,12 @@ async function journeySettingsApproval(
  * model + effort persists (model.settings_changed audited) and the NEXT
  * turn applies it — the session re-applies the default role against the
  * current settings at turn start, no restart. Deterministic proof: the
- * settings column + the audited before/after; the live turn after the
- * change is the hot-swap observable.
+ * settings column + the audited before/after, PLUS (issue #243) a
+ * resolution proof that the stored default re-applies to the pinned
+ * provider on the next turn — a bare/stripped default that resolves
+ * ambiguous (or to a different provider) would silently keep the session's
+ * model while persistence + reply still pass (the #243 false-pass). The
+ * live turn after the change is the hot-swap observable.
  */
 async function journeyModelHotSwap(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
@@ -1439,6 +1464,29 @@ async function journeyModelHotSwap(h: Harness, channelId: string, runId: string)
     if (persisted.model !== targetModel || persisted.reasoning_effort !== "high") {
       throw new Error(`space settings did not persist the swap: ${JSON.stringify(persisted)}`);
     }
+    // Issue #243 — prove the swap is APPLIED, not just persisted. The next
+    // turn's re-apply routes `persisted.model` through the provider-aware
+    // resolver at turn start; a stored value it cannot resolve to ONE
+    // provider (a bare id served by several providers with no near winner →
+    // "ambiguous") or that lands on a DIFFERENT provider than the one pinned
+    // (near's #194 preference winning a bare tie) would silently keep the
+    // session on its current model while persistence + reply still pass —
+    // the hot-swap false-pass. Resolve the stored default against the same
+    // deployment catalog the re-apply sees and require it to pin the ref's
+    // provider (when the ref is provider-qualified).
+    const reapplyCatalog = await listAvailableModels(h.agentDir);
+    const reapply = resolveModelPin(persisted.model, reapplyCatalog);
+    if (!reapply.ok || reapply.pin.kind !== "id") {
+      throw new Error(
+        `stored default '${persisted.model}' would not re-apply on the next turn (${reapply.ok ? "role ref" : reapply.error}) — the swap is not applied`,
+      );
+    }
+    const pinnedProvider = defaultModelProviderFor(h.modelRef);
+    if (pinnedProvider !== undefined && reapply.pin.provider !== pinnedProvider) {
+      throw new Error(
+        `stored default '${persisted.model}' re-applies as ${reapply.pin.provider}/${reapply.pin.modelId}, not its pinned ${pinnedProvider} model — the swap is not applied`,
+      );
+    }
     // The NEXT turn applies the changed default at turn start (issue #189):
     // the live session re-reads the settings and the turn completes.
     const { reply } = await postAndWait(h, channelId, `hot-swap probe ${runId}: reply with ok`, {
@@ -1450,6 +1498,7 @@ async function journeyModelHotSwap(h: Harness, channelId: string, runId: string)
       status: "pass",
       details: [
         `space default pinned to ${targetModel} at high effort (model.settings_changed audited, settings persisted)`,
+        `next-turn re-apply resolves '${persisted.model}' to ${reapply.pin.provider}/${reapply.pin.modelId} (no ambiguity)`,
         `the next turn ran on the swapped default — reply: "${snippet(reply.text)}"`,
       ],
       permalink,

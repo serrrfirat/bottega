@@ -35,6 +35,7 @@ import type { Store, SpaceModelSettings } from "../store/db";
 import {
   DEFAULT_MODEL_CATALOG_DIR,
   listAvailableModels,
+  MODEL_ROLE_REFS,
   type ModelCatalogEntry,
 } from "../models/model-pin";
 import { errorMessage, toolError } from "./helpers";
@@ -166,6 +167,22 @@ export function modelToolsDefinitions(
         // Every settable knob is a string (model ids and the reasoning_effort enum value alike).
         const trimmed = raw.trim();
         if (!trimmed) return toolError(`model_settings ${key} must not be empty`);
+        // Issue #243: the model-id slots must never hold a model ROLE ref
+        // ("fast"/"reasoning"). A settings value is an ID the turn-start
+        // re-apply routes through the resolver; a role-ref word there is a
+        // config error that the driver's best-effort re-apply would silently
+        // swallow ("resolved to a role ref, not a model id") instead of
+        // applying — fail loudly to the caller now rather than dead-end the
+        // default on the next turn.
+        if (
+          (key === "model" || key.endsWith("_model")) &&
+          (MODEL_ROLE_REFS as readonly string[]).includes(trimmed.toLowerCase())
+        ) {
+          return toolError(
+            `model_settings ${key} names the role ref '${trimmed}' — a model ROLE, not a model id; ` +
+              `set ${key} to one of the deployment's available model ids (use use_model to switch roles)`,
+          );
+        }
         after[key] = trimmed;
       }
       try {

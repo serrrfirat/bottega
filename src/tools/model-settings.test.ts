@@ -180,6 +180,36 @@ describe("model_settings", () => {
     expect(resultText(res)).toContain("at least one field");
   });
 
+  test("rejects a model ROLE ref as a model-id setting (issue #243)", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "C243" });
+    const tool = loadTools(s).find((t) => t.name === "model_settings")!;
+    // A role ref ("fast"/"reasoning") is a model ROLE, not a model id — a
+    // settings default storing it makes the turn-start re-apply dead-end on
+    // "resolved to a role ref, not a model id" (issue #243). Reject loudly
+    // at the write boundary, case-insensitively like the resolver.
+    for (const ref of ["fast", "reasoning", "FAST"]) {
+      const res = await tool.execute("tc1", { set: { model: ref } }, undefined, undefined, ctxFor(space.id));
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toContain("role ref");
+    }
+    const roleSlot = await tool.execute("tc1", { set: { fast_model: "fast" } }, undefined, undefined, ctxFor(space.id));
+    expect(roleSlot.isError).toBe(true);
+    expect(resultText(roleSlot)).toContain("role ref");
+    // Nothing of the rejected writes persisted.
+    expect(await s.getSpaceSettings(space.id)).toEqual({});
+    // A legit model id on the same slots still sets fine.
+    for (const set of [{ model: "gpt-sol-5.6" }, { fast_model: "gpt-sol-5.6" }, { reasoning_model: "deepseek-v4-flash" }]) {
+      const ok = await tool.execute("tc1", { set }, undefined, undefined, ctxFor(space.id));
+      expect(ok.isError).not.toBe(true);
+    }
+    expect(await s.getSpaceSettings(space.id)).toEqual({
+      model: "gpt-sol-5.6",
+      fast_model: "gpt-sol-5.6",
+      reasoning_model: "deepseek-v4-flash",
+    });
+  });
+
   test("set succeeds on a DM space once the row exists after first contact (issue #188)", async () => {
     const s = freshStore();
     // The inbound path upserts the space row on first contact (issue #188);

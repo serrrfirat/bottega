@@ -59,6 +59,7 @@ import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import { adminToolDefinitions } from "../../src/tools/admin";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
+import { resolveModelPin, type ModelCatalogEntry } from "../../src/models/model-pin";
 import { classifyPickupIntent, buildAutoPickupDirective } from "../../src/tools/work-item-pickup";
 import type { JsonValue, McpBinding } from "../../src/extensions/manifest";
 import { bootHarness, AutoApproveRouter, type Harness, type StubTurn } from "./harness";
@@ -71,6 +72,8 @@ import {
   CANARY_ORG_CONFIG,
   canaryFixtureMcpTransport,
   createCanaryRegistry,
+  defaultModelIdFor,
+  defaultModelProviderFor,
   JOURNEY_TIMEOUT_MS,
   memorySavePromptFor,
   oauthAuthorizeStateFrom,
@@ -837,6 +840,57 @@ describe("model hot-swap + catalog surface mechanisms (issues #189/#192)", () =>
     } finally {
       await h.cleanup();
     }
+  });
+
+  test("defaultModelIdFor keeps a provider-qualified model ref qualified (issue #243)", () => {
+    // The org default (issue #214) pins the codex model through its provider;
+    // stripping the qualifier made the turn-start re-apply resolve the bare
+    // id ambiguous and the session silently kept its current model.
+    expect(defaultModelIdFor("openai-codex/gpt-5.6-luna")).toBe("openai-codex/gpt-5.6-luna");
+    // The near/opencode special forms still normalize to their resolve-forms
+    // (near-preference picks the single working provider at re-apply).
+    expect(defaultModelIdFor("near/deepseek-ai/DeepSeek-V4-Flash")).toBe("deepseek-ai/DeepSeek-V4-Flash");
+    expect(defaultModelIdFor("opencode-go/deepseek-v4-flash")).toBe("deepseek-v4-flash");
+    // The provider the journey forces a resolution to: the ref's provider,
+    // except for the near/opencode forms the resolver normalizes itself.
+    expect(defaultModelProviderFor("openai-codex/gpt-5.6-luna")).toBe("openai-codex");
+    expect(defaultModelProviderFor("near/deepseek-ai/DeepSeek-V4-Flash")).toBeUndefined();
+    expect(defaultModelProviderFor("opencode-go/deepseek-v4-flash")).toBeUndefined();
+  });
+
+  test("the qualified hot-swap default re-applies to its pinned provider over the live-shape catalog (issue #243)", () => {
+    // The live deployment catalog (config/omp/models.yml + SDK built-ins +
+    // gateway probe merges): FOUR providers carry gpt-5.6-luna — openai,
+    // openai-codex and opencode-go as bare ids, and near serving the slashed
+    // codex id (issue #238's resolution shape). A bare "gpt-5.6-luna"
+    // re-apply ties across them and either loses to near's #194 preference or
+    // errors ambiguous — never pins openai-codex.
+    const liveCatalog: ModelCatalogEntry[] = [
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna (Codex)", provider: "openai-codex" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" },
+      { id: "openai-codex/gpt-5.6-luna", name: "GPT-5.6 Luna (near)", provider: "near" },
+    ];
+    const ref = "openai-codex/gpt-5.6-luna";
+    const target = defaultModelIdFor(ref);
+    const resolution = resolveModelPin(target, liveCatalog);
+    if (!resolution.ok || resolution.pin.kind !== "id") {
+      throw new Error(`stored default '${target}' would not re-apply — ${resolution.ok ? "role ref" : resolution.error}`);
+    }
+    // The swap is APPLIED only when the stored default pins the operator's
+    // provider: pre-fix the stripped bare id resolved via near's preference,
+    // so the next turn ran a different provider while persistence passed.
+    expect(resolution.pin.provider).toBe("openai-codex");
+    // Same tripwire over the ambiguity shape (no near winner): a bare id
+    // fails closed as ambiguous; the qualified id pins openai-codex.
+    const noNearWinner = liveCatalog.filter((m) => m.provider !== "near");
+    const bare = resolveModelPin("gpt-5.6-luna", noNearWinner);
+    expect(bare.ok).toBe(false);
+    const qualified = resolveModelPin(target, noNearWinner);
+    if (!qualified.ok || qualified.pin.kind !== "id") {
+      throw new Error(`stored default '${target}' ambiguous without near — ${qualified.ok ? "role ref" : qualified.error}`);
+    }
+    expect(qualified.pin.provider).toBe("openai-codex");
   });
 });
 
