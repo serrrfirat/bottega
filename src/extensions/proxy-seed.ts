@@ -627,8 +627,16 @@ export interface ProxyCredentialSyncOpts {
  */
 export const BROKER_AGENT_DIR_ENV = "BOTTEGA_BROKER_AGENT_DIR";
 
-/** The broker vault's agent dir relative to the server CWD (the shared data mount). */
-export const BROKER_AGENT_DIR = "data/.omp";
+/**
+ * The broker vault's agent dir relative to the server CWD (the shared
+ * data mount): `data/.omp/agent`. The broker runs with its config root
+ * at `data/.omp` and keeps its vault in the `agent/` subdir, so the
+ * agent.db is `data/.omp/agent/agent.db` — NOT `data/.omp/agent.db`,
+ * which may hold a stale pre-broker file. Joining {@link
+ * readOAuthRowsFromAgentDb}'s `agent.db` onto this dir yields the broker
+ * vault path.
+ */
+export const BROKER_AGENT_DIR = "data/.omp/agent";
 
 /** The broker vault's agent dir: the override when set, else the project-local data mount. */
 export function brokerAgentDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {

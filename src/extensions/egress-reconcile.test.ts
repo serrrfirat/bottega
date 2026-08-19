@@ -386,4 +386,58 @@ describe("connect-time egress reconcile (#250)", () => {
       },
     );
   });
+
+  test("production default reads the broker vault's agent SUBDIR, not the config root (issue #252)", async () => {
+    // The REAL broker vault is <config-root>/data/.omp/agent/agent.db — the
+    // broker runs with PI_CONFIG_DIR=<config root> and keeps its vault in
+    // the agent/ subdir, so the default agent dir is data/.omp/agent. A
+    // stray data/.omp/agent.db (a stale pre-broker file) must NOT be the
+    // seed source. This test exercises the PRODUCTION default resolution:
+    // NO BOTTEGA_BROKER_AGENT_DIR override, cwd hoisted to a fixture laid
+    // out exactly like the real shared-data mount.
+    const root = tempDir("broker-vault-default");
+    const agentDir = join(root, "data", ".omp", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    // A stale PRE-broker agent.db at the config root carries only a legacy
+    // api_key row. The default must NOT treat it as the OAuth vault.
+    const stale = await AuthStorage.create(join(root, "data", ".omp", "agent.db"));
+    stale.upsertCredential("github", { type: "api_key", key: "ghp_stale" });
+    stale.close();
+    const seeded = await AuthStorage.create(join(agentDir, "agent.db"));
+    const defaultRow = {
+      type: "oauth" as const,
+      refresh: "rt-notion-default",
+      access: "acc-notion",
+      expires: Date.now() + 3_600_000,
+      client_id: "cli_notion_default",
+      client_secret: "cs_notion_default",
+    } satisfies VaultOAuthCredential;
+    seeded.upsertCredential("notion", defaultRow);
+    seeded.close();
+
+    const broker = await startFakeBroker(join(agentDir, "agent.db"));
+    const cwd = process.cwd();
+    try {
+      process.chdir(root);
+      await withEnv(
+        {
+          OMP_AUTH_BROKER_URL: broker.url,
+          OMP_AUTH_BROKER_TOKEN: broker.token,
+          OMP_AUTH_BROKER_SNAPSHOT_TTL_MS: "0",
+        },
+        async () => {
+          const h = makeHarness({ committed: [["linear", linear]], defaultReader: true });
+          const result = await h.reconcile("notion");
+          expect(result.warnings).toEqual([]);
+          const blobPath = join(h.secretsDir, "notion-oauth.json");
+          expect(existsSync(blobPath)).toBe(true);
+          const blob = JSON.parse(readFileSync(blobPath, "utf8")) as { refresh_token?: string };
+          expect(blob.refresh_token).toBe("rt-notion-default");
+        },
+      );
+    } finally {
+      process.chdir(cwd);
+      await broker.stop();
+    }
+  });
 });
