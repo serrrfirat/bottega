@@ -24,7 +24,8 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SlackApiMessage } from "./slack-live";
+import type { PostedSlackMessage, SlackApiMessage } from "./slack-live";
+import type { AuditRow, WorkItem } from "../../src/store/db";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { z } from "zod";
 import { proactiveEnabled } from "../../src/scheduler/proactive-config";
@@ -45,6 +46,7 @@ import {
   EXTENSION_CONNECTED_EVENT,
   MODEL_SETTINGS_CHANGED_EVENT,
   MODEL_SWITCHED_EVENT,
+  WORK_ITEM_CREATED_EVENT,
 } from "../../src/store/audit-events";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "../../src/extensions/fixture";
 import { createSecretFileBoundary } from "../../src/extensions/boundary";
@@ -74,6 +76,7 @@ import {
   createCanaryRegistry,
   defaultModelIdFor,
   defaultModelProviderFor,
+  journeySemanticPickup,
   JOURNEY_TIMEOUT_MS,
   memorySavePromptFor,
   oauthAuthorizeStateFrom,
@@ -1335,5 +1338,86 @@ describe("no-reply timeout diagnosis (issue #245)", () => {
     expect(message).toContain("🧠 the model is reasoning about the fix");
     // The empty-response churn guard names the recovery (issue #245).
     expect(message).toMatch(/empty-response churn hit the recovery guard — check the model key/);
+  });
+});
+
+describe("auto-pickup explicit-confirm gate (issue #245)", () => {
+  test("a work item created during the draft wait (no in-channel confirmation) fails the journey instead of passing the count-poll", async () => {
+    // The pickup journey's item poll only proves "a WORK_ITEM_CREATED_EVENT
+    // row appeared after the inbound"; it cannot tell whether the item came
+    // from the human's in-channel confirmation (the #89 explicit-confirm
+    // contract) or PREMATURELY from the draft ask alone. A gate regression
+    // (auto-pickup creates without confirming) would PASS the count-poll.
+    // This stub simulates exactly that: history has the draft ask (no
+    // confirmation is ever posted — postAsUser never returns a confirm
+    // reply) while the audit store grows the premature created row on the
+    // second listAudit call (the count-poll BELOW the confirm, where the
+    // pre-fix journey reads it). RED on pre-fix: the journey reports
+    // "pass" (the premature row satisfied the count-poll); GREEN now: the
+    // draft-wait gate fails it with the diagnostic.
+    const spaceId = "slack:C1";
+    const fixture = "canary pickup fixture hermetic";
+    const prematureRow: AuditRow = {
+      id: 1,
+      ts: 101,
+      space_id: spaceId,
+      actor: "space",
+      event_type: WORK_ITEM_CREATED_EVENT,
+      payload: JSON.stringify({ id: "wi-1", requester: "space", assignee: null }),
+    };
+    const prematureItem: WorkItem = {
+      id: "wi-1",
+      space_id: spaceId,
+      requester: "space",
+      assignee: null,
+      description: `${fixture} — add a docstring to the project README explaining the canary`,
+      repo: null,
+      pr_url: null,
+      pr_branch: null,
+      base_branch: null,
+      delivery: "chat",
+      model: null,
+      reasoning_effort: null,
+      skills: "[]",
+      state: "open",
+      approvals: "[]",
+      evidence: "[]",
+      result: null,
+      created_at: 101,
+      updated_at: 101,
+    };
+    let listAudits = 0;
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        postAsUser: async (_channelId: string, _text: string): Promise<PostedSlackMessage> => ({
+          ts: "100.000001",
+        }),
+        // The draft ask lands; NO confirmation reply ever does (the item was
+        // created without the in-channel confirmation, the regression under
+        // test).
+        history: async (_channelId: string): Promise<SlackApiMessage[]> => [
+          { ts: "100.000001", channel: "C1", user: "U-qa", text: "canary ping" },
+          { ts: "101.000002", channel: "C1", bot_id: "B-bot", text: "here is the draft — confirm to create the item" },
+        ],
+        permalink: async (_channelId: string, _ts: string): Promise<string | undefined> =>
+          `https://example/p/${_ts}`,
+      },
+      store: {
+        // First call is the journey's `before` snapshot (no rows yet); every
+        // later read finds the premature created row.
+        listAudit: async (_opts?: { space?: string; event_type?: string }): Promise<AuditRow[]> => {
+          listAudits += 1;
+          return listAudits === 1 ? [] : [prematureRow];
+        },
+        getWorkItem: async (_id: string): Promise<WorkItem | null> => prematureItem,
+      },
+    } as Harness;
+    const result = await journeySemanticPickup(h, "C1", "hermetic");
+    // Pre-fix this was "pass" (the count-poll below the confirm read the
+    // premature row as success); post-fix the draft-wait gate fails loudly.
+    expect(result.status).toBe("fail");
+    expect(result.details.join(" ")).toContain("item created without confirmation draft");
   });
 });

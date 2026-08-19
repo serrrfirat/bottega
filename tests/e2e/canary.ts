@@ -147,6 +147,15 @@ export const JOURNEY_TIMEOUT_MS = 300_000;
  * for the hermetic journey-mechanism tests.
  */
 export const STORE_TIMEOUT_MS = 90_000;
+/**
+ * The pickup journey's explicit-confirm gate window (issue #245): after the
+ * draft ask is seen, this bounded window asserts NO work item is created by
+ * the draft alone, then releases the confirmation — a premature create is
+ * the #89 gate regression the canary must surface. Short so the happy path
+ * pays little; the 90s item poll the confirmation leg already runs keeps
+ * the real wait headroom.
+ */
+const PICKUP_GATE_WINDOW_MS = 5_000;
 
 export interface JourneyResult {
   name: string;
@@ -1267,6 +1276,42 @@ async function journeyPerTaskPin(h: Harness, channelId: string, runId: string): 
 }
 
 /**
+ * Issue #245 — the pickup journey's item poll only proves "a
+ * WORK_ITEM_CREATED_EVENT row appeared after the inbound"; it cannot tell
+ * whether the item was created by the human's in-channel confirmation (the
+ * #89 explicit-confirm contract) or PREMATURELY by the draft ask alone.
+ * This gate runs between the draft ask and the confirmation posts: after
+ * the draft ask reply is seen it waits out a short draft window and fails
+ * the journey the moment a created row shows up without the confirmation —
+ * auto-pickup must hold the item for the human's explicit confirm, so a
+ * premature creation is a gate regression the canary surfaces, never
+ * passes. The window is short (a premature create lands with/right after
+ * the draft reply — the tool call precedes the presenter's post, and the
+ * window also swallows an async tail) so the happy path only pays ~5s per
+ * run, far short of the 90s item poll the confirmation leg already uses.
+ * Times out (no-op) when the gate holds.
+ */
+async function assertNoPrematureWorkItem(
+  h: Harness,
+  spaceId: string,
+  before: number,
+  fixture: string,
+): Promise<void> {
+  const deadline = Date.now() + PICKUP_GATE_WINDOW_MS;
+  for (;;) {
+    const rows = await h.store.listAudit({ space: spaceId, event_type: WORK_ITEM_CREATED_EVENT });
+    if (rows.length > before) {
+      const row = rows[rows.length - 1]!;
+      throw new Error(
+        `item created without confirmation draft (${fixture}): row ${row.id} payload ${snippet(row.payload)} — the auto-pickup explicit-confirm gate was violated (issue #245)`,
+      );
+    }
+    if (Date.now() > deadline) return;
+    await Bun.sleep(500);
+  }
+}
+
+/**
  * The semantic auto-pickup journey (issue #89): with work_items.auto_pickup
  * on (the org config the leg boots with), an actionable intent should
  * produce a confirmable draft asking for confirmation; the QA user's
@@ -1274,7 +1319,7 @@ async function journeyPerTaskPin(h: Harness, channelId: string, runId: string): 
  * proof is the created item whose description carries the fixture text —
  * the intent → draft → confirm → work-item round trip.
  */
-async function journeySemanticPickup(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
+export async function journeySemanticPickup(h: Harness, channelId: string, runId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
   const spaceId = `slack:${channelId}`;
   const fixture = `canary pickup fixture ${runId}`;
@@ -1287,6 +1332,11 @@ async function journeySemanticPickup(h: Harness, channelId: string, runId: strin
     // The draft ask: the agent posts a confirmable draft and waits. The
     // reply itself is the human-visible half; the gate is the created item.
     await waitForBotReply(h, channelId, { afterTs: inboundTs, label: "pickup draft ask" });
+    // The explicit-confirm gate (#89 + #245): the item must NOT exist after
+    // the draft ask alone — auto-pickup holds it until the human's
+    // in-channel confirmation. A row here is a gate regression the
+    // count-poll below would pass.
+    await assertNoPrematureWorkItem(h, spaceId, before, fixture);
     // The human's in-channel confirmation (the directive's explicit-confirm
     // gate — never created without it).
     const confirmTs = (await live.postAsUser(channelId, "confirmed — create the work item now")).ts;
