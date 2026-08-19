@@ -582,6 +582,79 @@ describe("create_work_item model pin (issue #185)", () => {  const catalog: Mode
   });
 });
 
+describe("create_work_item resolves a bare default-model id via the space's provider (issue #244)", () => {
+  // LIVE data/omp-agent shape: openai, openai-codex, opencode-go, and
+  // anthropic all serve the bare id gpt-5.6-luna (config/omp/models.yml
+  // openai anchor + gateway probe merge), so a work item pinned to the bare
+  // default id ties FOUR non-near providers → "ambiguous" fail-closed even
+  // though the space's default is precisely "openai-codex/gpt-5.6-luna".
+  const liveCatalog: ModelCatalogEntry[] = [
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai-codex" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "anthropic" },
+  ];
+
+  test("a bare pin matching the space's qualifying default model creates the item resolved to that provider", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN244" });
+    // The canary hot-swap persists the provider-qualified default
+    // (openai-codex/gpt-5.6-luna) as the space's model setting.
+    await s.updateSpaceSettings(space.id, { model: "openai-codex/gpt-5.6-luna" });
+    const [createTool] = loadTools(s, { listModels: async () => liveCatalog });
+    const res = await createTool.execute(
+      "tc244",
+      { description: "run on the space default", model: "gpt-5.6-luna" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).not.toBe(true);
+    const item = await s.getWorkItem(JSON.parse(resultText(res)).id);
+    expect(item?.model).toBe("gpt-5.6-luna");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(1);
+  });
+
+  test("without a qualifying space default the same bare pin still fails closed as ambiguous", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN244B" });
+    const [createTool] = loadTools(s, { listModels: async () => liveCatalog });
+    const res = await createTool.execute(
+      "tc244b",
+      { description: "bare, no space default", model: "gpt-5.6-luna" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("ambiguous");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+
+  test("a genuinely ambiguous id the default provider does NOT serve still fails closed", async () => {
+    const s = freshStore();
+    const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "PIN244C" });
+    await s.updateSpaceSettings(space.id, { model: "openai-codex/gpt-5.6-luna" });
+    // The pinned id ties two providers, neither of which is openai-codex —
+    // the space default's provider must NOT paper over a real ambiguity.
+    const catalog: ModelCatalogEntry[] = [
+      { id: "gpt-sol-9.9", name: "GPT-Sol 9.9", provider: "opencode-go" },
+      { id: "gpt-sol-9.9", name: "GPT-Sol 9.9", provider: "anthropic" },
+    ];
+    const [createTool] = loadTools(s, { listModels: async () => catalog });
+    const res = await createTool.execute(
+      "tc244c",
+      { description: "ambiguous, foreign id", model: "gpt-sol-9.9" },
+      undefined,
+      undefined,
+      ctxFor(space.id),
+    );
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toContain("ambiguous");
+    expect(await s.listAudit({ event_type: "work_item.created" })).toHaveLength(0);
+  });
+});
+
 describe("complete_work_item", () => {
   function completeTool(s: Store, actor = "agent"): ToolDefinition {
     return loadTools(s, { actor }).find((t) => t.name === "complete_work_item")!;

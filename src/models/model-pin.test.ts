@@ -297,3 +297,64 @@ describe("id pins carry the provider that matched (issue #238)", () => {
     });
   });
 });
+
+describe("a bare default-model id resolves via the space default's provider (issue #244)", () => {
+  // LIVE data/omp-agent shape: openai, openai-codex, opencode-go, and
+  // anthropic all serve the bare id gpt-5.6-luna (config/omp/models.yml
+  // openai anchor + gateway probe merge) and near serves the slashed
+  // openai-codex/gpt-5.6-luna. A work item pinned to the bare default id
+  // therefore ties FOUR non-near providers → fail-closed ambiguous, even
+  // though the space's default is precisely "openai-codex/gpt-5.6-luna".
+  // Issue #244: the caller may hand the resolver the provider the space
+  // already runs on, and a bare-id tie breaks toward that provider.
+  const catalog: ModelCatalogEntry[] = [
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai-codex" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "anthropic" },
+  ];
+
+  test("a bare id served by several providers resolves to the space default's provider", () => {
+    expect(resolveModelPin("gpt-5.6-luna", catalog, { preferredProvider: "openai-codex" })).toEqual({
+      ok: true,
+      pin: { kind: "id", provider: "openai-codex", modelId: "gpt-5.6-luna" },
+    });
+  });
+
+  test("without a preferred provider the same id still fails closed as ambiguous", () => {
+    const result = resolveModelPin("gpt-5.6-luna", catalog);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("ambiguous");
+  });
+
+  test("a preferred provider that is NOT among the tied matches leaves ambiguity (fail closed)", () => {
+    // The space runs openai-codex, but the pinned id is served by four
+    // OTHER providers: no candidate carries the preference → still ambiguous.
+    const otherProviders: ModelCatalogEntry[] = [
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "openai" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "opencode-go" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "anthropic" },
+    ];
+    const result = resolveModelPin("gpt-5.6-luna", otherProviders, { preferredProvider: "openai-codex" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("ambiguous");
+  });
+
+  test("a provider-qualified id still wins outright over the preferred provider", () => {
+    expect(resolveModelPin("anthropic/gpt-5.6-luna", catalog, { preferredProvider: "openai-codex" })).toEqual({
+      ok: true,
+      pin: { kind: "id", provider: "anthropic", modelId: "gpt-5.6-luna" },
+    });
+  });
+
+  test("the near preference still outranks a preferred provider (issue #244 never re-breaks #194)", () => {
+    const catalog: ModelCatalogEntry[] = [
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "opencode-go" },
+      { id: "deepseek-ai/DeepSeek-V4-Flash", name: "DeepSeek V4 Flash", provider: "near" },
+    ];
+    expect(resolveModelPin("deepseek-v4-flash", catalog, { preferredProvider: "opencode-go" })).toEqual({
+      ok: true,
+      pin: { kind: "id", provider: "near", modelId: "deepseek-ai/DeepSeek-V4-Flash" },
+    });
+  });
+});

@@ -67,6 +67,20 @@ export function parseGithubIssueUrl(text: string): { owner: string; repo: string
   return { owner: match[1]!, repo: match[2]!, issueNumber: Number(match[3]!) };
 }
 
+/**
+ * The provider of a model ref (issue #244): a provider-qualified ref
+ * ("openai-codex/gpt-5.6-luna") names its provider; a bare id, a role ref,
+ * or an empty/unset value carries none (undefined → the normal resolution
+ * rules stand). Matches the canary's defaultModelProviderFor split at the
+ * last "/".
+ */
+function providerOfModelRef(modelRef: string | undefined): string | undefined {
+  if (!modelRef) return undefined;
+  const slash = modelRef.lastIndexOf("/");
+  if (slash <= 0 || slash === modelRef.length - 1) return undefined;
+  return modelRef.slice(0, slash);
+}
+
 export const createWorkItemArgsSchema = z.object({
   description: z.string(),
   requester: z.string().optional(),
@@ -152,7 +166,20 @@ export function workItemToolDefinitions(
         return toolError("model must not be empty when provided");
       }
       if (params.model !== undefined) {
-        const resolution = resolveModelPin(params.model, await (opts.listModels ?? listAvailableModels)(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR));
+        // Issue #244: a bare id served by several providers (gpt-5.6-luna on
+        // openai, openai-codex, opencode-go, anthropic) ties and would fail
+        // closed even when it is the SPACE's own default id. The space's
+        // effective default is provider-qualified ("openai-codex/gpt-5.6-luna"),
+        // so tell the resolver to prefer that provider; a bare/unset default
+        // carries no preference (normal resolution stands).
+        const spaceIdForDefault = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+        const spaceDefault = spaceIdForDefault ? (await store.getEffectiveSpaceSettings(spaceIdForDefault)).model : undefined;
+        const preferredProvider = providerOfModelRef(spaceDefault);
+        const resolution = resolveModelPin(
+          params.model,
+          await (opts.listModels ?? listAvailableModels)(opts.agentDir ?? DEFAULT_MODEL_CATALOG_DIR),
+          preferredProvider !== undefined ? { preferredProvider } : undefined,
+        );
         if (!resolution.ok) return toolError(resolution.error);
         model = resolution.pin.kind === "role" ? resolution.pin.role : resolution.pin.modelId;
       }

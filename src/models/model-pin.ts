@@ -31,7 +31,11 @@
  * providers, near wins deterministically. A provider-qualified value
  * ("opencode-go/deepseek-v4-flash") still wins outright — explicit intent
  * beats the preference. Ties without a single near candidate fail closed
- * as ambiguous, listing the candidates.
+ * as ambiguous, listing the candidates — unless the caller passes a
+ * `preferredProvider` (the provider of the space's own qualified default
+ * model, issue #244): a bare id that ties across providers resolves to
+ * that single preferred provider, so a work item pinned to the space's
+ * bare default id is never rejected as ambiguous.
  */
 import { ModelRegistry, discoverAuthStorage, type AuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { readFileSync } from "node:fs";
@@ -66,6 +70,21 @@ export type ModelPin =
   | { kind: "id"; provider: string; modelId: string };
 
 export type ModelPinResolution = { ok: true; pin: ModelPin } | { ok: false; error: string };
+
+/**
+ * Optional resolution hints (issue #244): when the caller resolves a model
+ * for a space whose DEFAULT model is provider-qualified
+ * ("openai-codex/gpt-5.6-luna"), a bare id that ties across several
+ * providers breaks toward the space's own provider. This only unties a
+ * genuinely ambiguous bare id (several same-best matches); it never
+ * overrides a provider-qualified query (explicit intent) or near
+ * (issue #194), and it fails closed when the preferred provider is not
+ * uniquely among the tied best matches.
+ */
+export interface ModelPinResolutionOptions {
+  /** The provider of the space's effective default model, when that default is qualified. */
+  preferredProvider?: string;
+}
 
 /** The catalog shape the resolver matches against (id/name/provider of an available model). */
 export interface ModelCatalogEntry {
@@ -228,7 +247,11 @@ function mergeProbedModels(declared: ModelCatalogEntry[], probed: ModelCatalogEn
  * Never guesses: an unresolvable or ambiguous name is an error the agent
  * can clarify, and no work item is created.
  */
-export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): ModelPinResolution {
+export function resolveModelPin(
+  raw: string,
+  catalog: ModelCatalogEntry[],
+  options: ModelPinResolutionOptions = {},
+): ModelPinResolution {
   const query = raw.trim();
   const q = query.toLowerCase();
   if (q === "fast" || q === "reasoning") return { ok: true, pin: { kind: "role", role: q } };
@@ -282,6 +305,21 @@ export function resolveModelPin(raw: string, catalog: ModelCatalogEntry[]): Mode
     const near = bestMatches.filter((s) => s.entry.model.provider === NEAR_PROVIDER);
     if (near.length === 1) {
       return { ok: true, pin: { kind: "id", provider: near[0]!.entry.model.provider, modelId: near[0]!.entry.model.id } };
+    }
+    // Preferred-provider tie-break (issue #244): a bare id served by several
+    // providers (gpt-5.6-luna on openai, openai-codex, opencode-go,
+    // anthropic) is not ambiguous when the caller pins the SPACE's own
+    // default — the space's qualified default names that provider. Only a
+    // UNIQUE preferred candidate among the tied best matches wins; a
+    // preferred provider that is not in the tie leaves the ambiguity
+    // (fail closed). Near (above) and provider-qualified queries (before
+    // scoring) both outrank this.
+    const preferred =
+      options.preferredProvider === undefined
+        ? []
+        : bestMatches.filter((s) => s.entry.model.provider === options.preferredProvider);
+    if (preferred.length === 1) {
+      return { ok: true, pin: { kind: "id", provider: preferred[0]!.entry.model.provider, modelId: preferred[0]!.entry.model.id } };
     }
     return {
       ok: false,
