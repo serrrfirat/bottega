@@ -97,8 +97,6 @@ const FAIL_ANCHOR = /^\s*\(fail\)\s+.+?\s+\[\d+(?:\.\d+)?ms\]\s*$/;
 const FAIL_DETAIL = /^(?:error[: ]|Expected:|Received:|AssertionError|this test timed out|✗ )/i;
 /** Stack/continuation lines inside the same failure block (kept contiguous with the anchor). */
 const FAIL_CONNECTOR = /^(\s*at\s+<|^\s*$)/;
-/** A signal that a new test's context began (breaks detail association with the next anchor). */
-const CONTEXT_BREAK = /^\s*[\d]+\s+\||^\s*[\^~-]+\s*$|\.test\.ts:|\.run\.ts:/;
 /** A timeout message: `this test timed out after 5000ms.` */
 const TIMEOUT_RE = /timed out after\s+\d+\s*ms/i;
 /** Long token-shaped runs: Bearer tokens, github_pat_* secrets, hex/base64 blobs. */
@@ -124,30 +122,31 @@ export function summarizeSuiteFailure(report: string): string[] {
   const lines = report.split("\n");
   const out: string[] = [];
   for (let i = 0; i < lines.length && out.length < MAX_FAILURES; i++) {
-    const anchor = lines[i];
-    if (!FAIL_ANCHOR.test(anchor)) continue;
+    const anchorLine = lines[i];
+    if (!FAIL_ANCHOR.test(anchorLine)) continue;
+    // A timeout bun prints on the line(s) right AFTER the anchor
+    // (`this test timed out after 5000ms.`); it belongs to this same test.
+    const following = lines.slice(i + 1, i + 3).find((l) => TIMEOUT_RE.test(l))?.trim();
+    // Reserve the timeout's slot up front so the final snippet (upward +
+    // optional timeout) is ALWAYS <= MAX_SNIPPET_LINES — never +1 (P3).
+    const budget = MAX_SNIPPET_LINES - (following === undefined ? 0 : 1);
     // Associate ONLY the detail/stack lines contiguous with THIS anchor —
-    // scanning upward, stopping at the first line that begins a different
-    // context (source preview, caret, file header). A passing test's logged
-    // `error: ...` line (console.error) is separated by source/caret lines,
-    // so it never bleeds into a later test's failure snippet.
-    const upward: string[] = [anchor.trim()];
-    for (let j = i - 1; j >= 0 && upward.length < MAX_SNIPPET_LINES; j--) {
+    // scanning upward, stopping at the first line that does not belong to
+    // this failure (source preview, caret, file header, coverage row). A
+    // passing test's logged `error: ...` line (console.error) is separated
+    // by such lines, so it never bleeds into a later test's snippet.
+    const upward: string[] = [anchorLine.trim()];
+    for (let j = i - 1; j >= 0 && upward.length < budget; j--) {
       const t = lines[j].trim();
       if (FAIL_DETAIL.test(t) || FAIL_CONNECTOR.test(lines[j])) {
         upward.unshift(t);
-      } else if (CONTEXT_BREAK.test(lines[j])) {
-        break;
       } else {
-        // A non-detail, non-connector, non-break line (e.g. a coverage row,
-        // a summary line) ends association.
+        // A non-detail, non-connector line ends this failure's contiguous
+        // detail run (most-important, anchor-adjacent detail is kept).
         break;
       }
     }
-    // A timeout bun prints on the line(s) right AFTER the anchor
-    // (`this test timed out after 5000ms.`) belongs to this same test.
-    const following = lines.slice(i + 1, i + 3).find((l) => TIMEOUT_RE.test(l));
-    if (following !== undefined) upward.push(following.trim());
+    if (following !== undefined) upward.push(following);
     out.push(scrubSecrets(upward.join("\n")));
   }
   return out;

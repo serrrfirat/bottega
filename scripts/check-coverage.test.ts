@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
 import {
   FLOOR,
   MAX_FAILURES,
+  MAX_SNIPPET_LINES,
   decideGate,
   meetsFloor,
   parseAllFilesRow,
@@ -184,6 +185,38 @@ describe("summarizeSuiteFailure (issue #300)", () => {
     expect(failures[0]).toContain("the real failure");
     // …and the unrelated passing test's log line is NOT attributed.
     expect(failures[0]).not.toContain("slack unreachable");
+  });
+
+  test("every snippet stays within MAX_SNIPPET_LINES, timeout included (P3)", () => {
+    // Regression (review P3): the extractor could emit MAX_SNIPPET_LINES + 1
+    // lines by filling the pre-anchor detail budget AND then unconditionally
+    // appending the trailing timeout. The timeout's slot must be reserved up
+    // front so the snippet never exceeds the bound.
+    const withTimeout = [
+      "error: detail-furthest",
+      "Expected: detail-middle",
+      "Received: detail-nearest",
+      "(fail) suite > capped [1.00ms]",
+      "this test timed out after 5000ms.",
+    ].join("\n");
+    const failures = summarizeSuiteFailure(withTimeout);
+    expect(failures).toHaveLength(1);
+    const linesOut = failures[0]!.split("\n");
+    // Retains the timeout AND stays within the bound (never MAX+1).
+    expect(linesOut).toHaveLength(MAX_SNIPPET_LINES);
+    expect(failures[0]).toContain("timed out after 5000ms");
+    expect(linesOut.length).toBeLessThanOrEqual(MAX_SNIPPET_LINES);
+
+    // No timeout: the anchor-adjacent detail is still within the bound.
+    const noTimeout = [
+      "error: one",
+      "Expected: two",
+      "Received: three",
+      "Expected: four",
+      "(fail) suite > capped-no-timeout [1.00ms]",
+    ].join("\n");
+    const noTimeoutLines = summarizeSuiteFailure(noTimeout)[0]!.split("\n");
+    expect(noTimeoutLines.length).toBeLessThanOrEqual(MAX_SNIPPET_LINES);
   });
 });
 
