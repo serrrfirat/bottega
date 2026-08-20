@@ -202,7 +202,10 @@ export function chartToolDefinition(opts: RenderChartOpts): ToolDefinition {
 
       const block = buildChartBlock(params);
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-      if (spaceId !== undefined) opts.postChart(spaceId, block);
+      // A chart has nowhere to land without a space session — fail closed
+      // instead of reporting success without posting (mirrors list_todos).
+      if (spaceId === undefined) return toolError("render_chart requires a space session");
+      opts.postChart(spaceId, block);
       return {
         content: [
           {

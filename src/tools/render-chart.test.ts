@@ -9,12 +9,19 @@
  * single-post guarantee.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { chartArgsSchema, chartToolDefinition, buildChartBlock } from "./render-chart";
 import { SlackTurnPresenter } from "../server/services/slack-turn-presenter";
 import type { SlackAdapter, SlackMessage } from "../server/adapters/slack";
 import type { Store } from "../store/db";
+import { createStore } from "../store/db";
+import { createAudit } from "../policy/audit";
+import { DenyRouter } from "../policy/approval-router";
+import { parseOrgConfigYaml, resolveTier, isKnownTool } from "../policy/config";
+import { withPolicyGate } from "../server/drivers/agent-driver";
 
 // ---------------------------------------------------------------------------
 // Tool-level: schema + validation + the pure renderer.
@@ -311,5 +318,70 @@ describe("SlackTurnPresenter.postChartBlock: exact one-block post to the thread 
     expect(post.opts?.threadTs).toBe("1.1");
     expect(post.opts?.blocks).toHaveLength(1);
     expect(post.opts?.blocks?.[0]).toEqual(block);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reachability through the policy gate (issue #276): render_chart must be a
+// KNOWN read-tier tool so withPolicyGate lets it through under "read: allow"
+// instead of resolving to the exec default and denying every runtime call.
+// ---------------------------------------------------------------------------
+
+describe("render_chart policy reachability (issue #276)", () => {
+  test("registering render_chart as read tier makes it known and non-exec", () => {
+    expect(isKnownTool("render_chart")).toBe(true);
+    expect(resolveTier("render_chart")).toBe("read");
+  });
+
+  test("withPolicyGate reaches the underlying execute under a read: allow policy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chart-gate-"));
+    const store = createStore(join(dir, "test.db"));
+    try {
+      const audit = createAudit(store);
+      const orgPolicy = parseOrgConfigYaml("tools:\n  render_chart: allow\n");
+      const posts: Array<{ spaceId: string; block: unknown }> = [];
+      const tool = withPolicyGate(chartToolDefinition({ postChart: (spaceId, block) => posts.push({ spaceId, block }) }), {
+        orgPolicy,
+        audit,
+        router: DenyRouter,
+        store,
+      });
+      const ctx = {
+        sessionManager: { getSessionFile: (): string | undefined => join(dir, "sessions", "slack:C1.jsonl") },
+      } as ExtensionContext;
+      const result = await tool.execute("c1", {
+        type: "pie",
+        title: "Fruit",
+        segments: [{ label: "Apples", value: 3 }],
+      }, undefined, undefined, ctx);
+      // Read tier + read:allow → the gate lets the call through and the
+      // underlying execute runs (it would throw a gate deny if it resolved
+      // to exec). The chart posts exactly once.
+      expect(result.isError).not.toBe(true);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]!.spaceId).toBe("slack:C1");
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("render_chart execute: missing space session fails closed (issue #276)", () => {
+  test("no session file returns a tool error and posts nothing — never a false success", async () => {
+    const posts: Array<{ spaceId: string; block: unknown }> = [];
+    const tool = toolFor(posts);
+    // A headless/no-session context: getSessionFile yields no space id.
+    const ctx = {
+      sessionManager: { getSessionFile: (): string | undefined => undefined },
+    } as ExtensionContext;
+    const res = await tool.execute("c1", {
+      type: "pie",
+      title: "Fruit",
+      segments: [{ label: "Apples", value: 3 }],
+    }, undefined, undefined, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toBe("render_chart requires a space session");
+    expect(posts).toHaveLength(0);
   });
 });

@@ -185,6 +185,10 @@ const TIER_BY_TOOL: ToolTiers = {
   // Todo snapshot (issue #228): read-only assembly of the space's live
   // state — work items, approvals, scheduled jobs, and the agent's plan.
   list_todos: "read",
+  // Native Slack charts (issue #276): rendering a chart only posts a
+  // message — read-tier like list_todos, so the gate lets it through
+  // instead of falling back to exec (unknown default).
+  render_chart: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.
