@@ -28,8 +28,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Issue #293: the store is SHARED across worktrees — the CANONICAL
+# checkout's data/ (resolved by shared-data-dir.sh), never this script's
+# own cwd: a tunnel run from any checkout must write the file the dev
+# server (started from any worktree, scripts/dev.sh) reads. The env
+# override still wins (tests / unusual data layouts).
+. "$(dirname "$0")/shared-data-dir.sh"
+
 PORT="${BOTTEGA_CALLBACK_PORT:-64204}"
-PUBLIC_BASE_FILE="${BOTTEGA_PUBLIC_BASE_URL_FILE:-data/public-base-url}"
+PUBLIC_BASE_FILE="${BOTTEGA_PUBLIC_BASE_URL_FILE:-$(shared_data_dir)/public-base-url}"
 TARGET="http://127.0.0.1:${PORT}"
 
 command -v cloudflared >/dev/null 2>&1 || {

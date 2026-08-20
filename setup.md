@@ -320,7 +320,11 @@ Static tunnels need a stable local target: pin `BOTTEGA_CALLBACK_PORT`
 listener serves every browser leg — `/upload/*`, `/oauth/callback`, and
 the webhook route — so the tunnel forwards to that single port and both
 connect flows work through it. Local dev with `bun run dev` needs nothing
-set.
+set: the launcher propagates the canonical checkout's store path to the
+server (issue #293), so a dev server restarted from ANY repository
+worktree — including `.worktrees/<name>` feature worktrees — reads the same
+`data/public-base-url` the tunnel writes (a worktree's own `data/` stays
+per-checkout state; the public-base store is shared).
 
 ### Static OAuth clients for no-DCR servers (issue #288, Gmail)
 

@@ -6,9 +6,9 @@
  * a transcript.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
@@ -952,6 +952,69 @@ describe("upload link public base liveness (issue #211)", () => {
       }
     } finally {
       endpoint.stop();
+    }
+  });
+});
+
+describe("shared public base across worktrees (issue #293)", () => {
+  test("a mint from a worktree-shaped cwd (no local data/public-base-url) uses the shared store the dev launcher propagated", async () => {
+    // The chat failure: the live dev server restarted from
+    // .worktrees/<name>, whose data/ has no public-base-url, while the
+    // canonical checkout's store held the live tunnel URL — so the mint
+    // fell back to the loopback URL. scripts/dev.sh now propagates the
+    // CANONICAL store path via BOTTEGA_PUBLIC_BASE_URL_FILE (the #249 env
+    // contract); the server never guesses repo topology.
+    const top = mkdtempSync(join(tmpdir(), "bottega-worktree-base-"));
+    const sharedStore = join(top, "checkout", "data", "public-base-url");
+    const worktreeCwd = join(top, "checkout", ".worktrees", "feature");
+    mkdirSync(dirname(sharedStore), { recursive: true });
+    mkdirSync(worktreeCwd, { recursive: true });
+
+    const savedFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+    const savedEnv = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    const savedCwd = process.cwd();
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = sharedStore;
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      process.chdir(worktreeCwd);
+      // Reproduces the failure shape exactly: this cwd has NO local store.
+      expect(existsSync(join(worktreeCwd, "data", "public-base-url"))).toBe(false);
+      // The #249 resolution (store first, env second, then undefined) still
+      // finds the CANONICAL store from a worktree cwd — the fix.
+      writeFileSync(sharedStore, "https://tunnel-a.trycloudflare.com\n");
+      expect(uploadLinkPublicBase()).toBe("https://tunnel-a.trycloudflare.com");
+
+      // Caller-level: the mint's DEFAULT resolver (the post-fix
+      // server/index.ts wiring) health-checks the resolved base and mints
+      // with it — a live loopback stub stands in for the tunnel.
+      const tunnel = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("not found", { status: 404 }) });
+      try {
+        writeFileSync(sharedStore, `http://127.0.0.1:${tunnel.port}\n`);
+        const h = makeDeps();
+        const endpoint = startUploadLinkServer(h.deps);
+        try {
+          const outcome = await mintUploadLink(
+            { extension: "fixture.weather", scope: "personal", actor: "UADA" },
+            { registry: registry(), store: endpoint.store, baseUrl: () => endpoint.baseUrl },
+          );
+          expect(outcome.ok).toBe(true);
+          if (outcome.ok) {
+            expect(outcome.url.startsWith(`http://127.0.0.1:${tunnel.port}/upload/`)).toBe(true);
+            expect(outcome.warning).toBeUndefined(); // the live probe passed
+          }
+        } finally {
+          endpoint.stop();
+        }
+      } finally {
+        tunnel.stop();
+      }
+    } finally {
+      if (savedFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+      else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = savedFile;
+      if (savedEnv === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = savedEnv;
+      process.chdir(savedCwd);
+      rmSync(top, { recursive: true, force: true });
     }
   });
 });

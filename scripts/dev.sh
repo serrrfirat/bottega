@@ -57,6 +57,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Issue #293: the durable public-base store (data/public-base-url, written
+# by scripts/tunnel.sh) is SHARED across worktrees — it lives in the dev
+# topology's CANONICAL checkout, not in a feature worktree's local data/
+# (a dev server restarted from .worktrees/<name> used to fall back to the
+# loopback URL for upload links and OAuth callbacks). Propagate the
+# explicit store path so the server resolves the SAME store the tunnel
+# writes, from ANY worktree cwd; the server never guesses repo topology.
+. "$(dirname "$0")/shared-data-dir.sh"
+export BOTTEGA_PUBLIC_BASE_URL_FILE="$(shared_data_dir)/public-base-url"
+
 mkdir -p data/omp-agent
 bun run scripts/seed-agent-dir.ts data/omp-agent config/omp
 

@@ -19,9 +19,9 @@
  * refresh cycles, each using the latest rotated token — never a dead one).
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
@@ -1714,6 +1714,57 @@ describe("durable public-base store — tunnel rotation heals without a restart 
       if (savedEnv === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
       else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = savedEnv;
       rmSync(storeDir, { recursive: true, force: true });
+      stub.stop();
+    }
+  });
+});
+
+describe("shared public base across worktrees — OAuth callback surface (issue #293)", () => {
+  test("a worktree-started server mints the authorize redirect_uri from the shared store, not a loopback fallback", async () => {
+    const stub = new StubOAuthMcp();
+    const top = mkdtempSync(join(tmpdir(), "bottega-worktree-oauth-"));
+    const sharedStore = join(top, "checkout", "data", "public-base-url");
+    const worktreeCwd = join(top, "checkout", ".worktrees", "feature");
+    mkdirSync(dirname(sharedStore), { recursive: true });
+    mkdirSync(worktreeCwd, { recursive: true });
+    // The tunnel (issue #249) wrote the live base to the canonical store.
+    writeFileSync(sharedStore, "https://tunnel-a.trycloudflare.com\n");
+
+    const savedFile = process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+    const savedEnv = process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+    const savedCwd = process.cwd();
+    try {
+      // scripts/dev.sh (issue #293): the server runs from the feature
+      // worktree, the env carries the CANONICAL store's absolute path.
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = sharedStore;
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      process.chdir(worktreeCwd);
+
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9");
+      // The server's exact wiring (src/server/index.ts): the callback base
+      // resolves LAZILY from the shared store on every mint; the loopback
+      // URL is only the unconfigured fallback.
+      deps.callbackBaseUrl = () => uploadLinkPublicBase() ?? "http://127.0.0.1:9";
+
+      const minted = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", actor: "UADA", scope: "personal" as const },
+        deps,
+      );
+      expect(minted.ok).toBe(true);
+      if (minted.ok) {
+        expect(new URL(minted.authorizationUrl).searchParams.get("redirect_uri")).toBe(
+          "https://tunnel-a.trycloudflare.com/oauth/callback",
+        );
+      }
+    } finally {
+      if (savedFile === undefined) delete process.env.BOTTEGA_PUBLIC_BASE_URL_FILE;
+      else process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = savedFile;
+      if (savedEnv === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = savedEnv;
+      process.chdir(savedCwd);
+      rmSync(top, { recursive: true, force: true });
       stub.stop();
     }
   });

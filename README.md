@@ -108,7 +108,9 @@ Browser-facing connects/uploads (the OAuth callback and the one-time upload
 link) need a public base. Run `scripts/tunnel.sh` (foreground) and it keeps a
 cloudflared quick tunnel up, writing the current public URL to
 `data/public-base-url` (issue #249) — the server re-reads that store on every
-mint, so tunnel rotations heal without an `.env` edit or a restart.
+mint, so tunnel rotations heal without an `.env` edit or a restart. The store
+lives in the canonical checkout's `data/` and is SHARED across worktrees:
+`scripts/dev.sh` propagates it to any worktree-started server (issue #293).
 `BOTTEGA_OAUTH_CALLBACK_BASE_URL` (see `.env.example`) is a deployment-only
 override for a fixed DNS host that never rotates.
 
