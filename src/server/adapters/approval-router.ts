@@ -38,6 +38,19 @@ export const MAX_PENDING_REQUESTS = 64;
 /** Cap for the confirmed-write-failure memory; the oldest entry is evicted at capacity. */
 export const FAILURE_MEMORY_MAX = 64;
 
+/**
+ * Slack section block `text` cap: a `section.text` string beyond this makes
+ * Slack reject the whole message with `invalid_blocks`. The approval card is
+ * rendered below it so a dense payload never auto-denies (issue #277).
+ */
+export const SLACK_SECTION_TEXT_MAX = 3000;
+
+/** Budget for the humanized *Would-be write:* rows, leaving room for the heading + block overhead. */
+export const ARGS_SECTION_TEXT_MAX = 2800;
+
+/** Budget for the *Last confirmed write failed:* banner reason (block-safe). */
+export const FAILURE_BANNER_REASON_MAX = 2800;
+
 interface PendingRequest {
   id: string;
   spaceId: string;
@@ -132,13 +145,28 @@ export function humanizeArgsRows(args: unknown): ApprovalArgRow[] {
 }
 
 /**
- * Mrkdwn lines for the humanized rows, capped at ARGS_ROW_MAX with a "…
- * and N more fields" note for the rest.
+ * Mrkdwn lines for the humanized rows (issue #277): capped by row count
+ * (ARGS_ROW_MAX) AND by a block-safe character budget (ARGS_SECTION_TEXT_MAX)
+ * so a dense payload never pushes a section past Slack's 3000-char cap —
+ * which would make Slack reject the whole card and the approval auto-deny.
+ * Overshoot appends a "… and N more fields" note for the rows dropped.
  */
 export function renderArgsRowsText(rows: readonly ApprovalArgRow[]): string {
-  const shown = rows.slice(0, ARGS_ROW_MAX);
-  const lines = shown.map((row) => `• *${row.label}:* ${row.value}`);
-  if (rows.length > ARGS_ROW_MAX) lines.push(`… and ${rows.length - ARGS_ROW_MAX} more fields`);
+  const lines: string[] = [];
+  let used = 0;
+  // Cap by row count (ARGS_ROW_MAX) AND by a block-safe character budget
+  // (ARGS_SECTION_TEXT_MAX): a dense payload of many max-size values must
+  // never push a section past Slack's 3000-char cap — Slack would reject the
+  // whole card and the approval would auto-deny (issue #277).
+  for (const row of rows) {
+    if (lines.length >= ARGS_ROW_MAX) break;
+    const line = `• *${row.label}:* ${row.value}`;
+    const tail = rows.length > lines.length + 1 ? `… and ${rows.length - lines.length - 1} more fields` : "";
+    if (used + line.length + tail.length > ARGS_SECTION_TEXT_MAX) break;
+    lines.push(line);
+    used += line.length + 1; // trailing newline
+  }
+  if (rows.length > lines.length) lines.push(`… and ${rows.length - lines.length} more fields`);
   return lines.join("\n");
 }
 
@@ -221,9 +249,12 @@ export function buildApprovalBlocks(d: ApprovalRequest, id: string, rememberedFa
     });
   }
   if (rememberedFailure !== undefined && rememberedFailure.length > 0) {
+    // Block-safe: a long failure reason is truncated (after redaction) so the
+    // banner section stays under Slack's cap (issue #277).
+    const banner = redact(rememberedFailure).slice(0, FAILURE_BANNER_REASON_MAX);
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*Last confirmed write failed:* ${redact(rememberedFailure)}` },
+      text: { type: "mrkdwn", text: `*Last confirmed write failed:* ${banner}` },
     });
   }
   blocks.push({
@@ -308,19 +339,22 @@ export class SlackApprovalRouter implements ApprovalRouter {
    * Records a confirmed write whose execution FAILED (issue #277): remembered
    * per (space, tool) in the BOUNDED memory, and — when a step sink is wired —
    * posted back into the thread as a failure step card through the existing
-   * presenter/step path (never a parallel messaging API). The decision policy
-   * is untouched: this only reports a downstream failure.
+   * presenter/step path (never a parallel messaging API). The step is opened
+   * as in_progress then completed with a SHARED taskId so the phrase/stream
+   * renderer surfaces a visible failure instead of swallowing an orphaned
+   * complete card (and so a strict stream never rejects a task id it hasn't
+   * seen open). The decision policy is untouched: this only reports a
+   * downstream failure.
    */
   recordConfirmedWriteFailure(spaceId: string, tool: string, reason: string): void {
     const text = reason && reason.trim().length > 0 ? reason.trim() : "confirmed write failed";
     this.failures.record(spaceId, tool, text);
-    emitToolStep(this.onToolStep, {
-      spaceId: spaceId === "" ? undefined : spaceId,
-      taskId: nextToolStepId(),
-      title: toolStepTitle(tool, "confirmed write failed"),
-      status: "complete",
-      output: redact(text),
-    });
+    const space = spaceId === "" ? undefined : spaceId;
+    const title = toolStepTitle(tool, "confirmed write failed");
+    const taskId = nextToolStepId();
+    const output = redact(text);
+    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, status: "in_progress", output });
+    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, status: "complete", output });
     this.log(`[approvals] confirmed write failed for ${tool}: ${text}`);
   }
 
