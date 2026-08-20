@@ -42,6 +42,13 @@ class FakeSession implements AgentSessionDriver {
   deferPrompt = false;
   /** When true, prompt() throws — exercises the handler's failure path. */
   failPrompt = false;
+  /**
+   * When set, prompt() first emits a session `error` event (buffered by the
+   * DM presenter, issue #296) then throws — models a REAL driver rejection,
+   * which is always preceded by an onError/empty-completion surface. Tests
+   * that the service STILL settles the pending DM request on prompt reject.
+   */
+  failPromptError?: string;
   /** When set, prompt() emits a message event with this text (the model's reply). */
   autoReply?: string;
   /** The principal of the current turn; mirrors the real drivers' binding (issue #152). */
@@ -66,6 +73,12 @@ class FakeSession implements AgentSessionDriver {
 
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     if (this.failPrompt) throw new Error("fake prompt failure");
+    if (this.failPromptError !== undefined) {
+      // Model the real driver: a rejection is surfaced (onError buffers it)
+      // BEFORE the prompt rejects — the service must still settle the DM.
+      this.emit("error", { spaceId: this.spaceId, message: this.failPromptError });
+      throw new Error("fake prompt failure after error");
+    }
     this.prompts.push({ text, opts });
     // Mirrors the drivers: a FRESH turn (not streaming) binds the inbound
     // principal; a steer into the running turn keeps the turn's principal.
@@ -1043,6 +1056,76 @@ describe("SpaceService output routing", () => {
     // closed with the final reply as the stopStream block.
     expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
   });
+
+describe("SpaceService DM request settlement (issue #296)", () => {
+  test("a REJECTED fresh DM request still settles its card to the error and clears the request (issue #296)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // First message creates the session and settles normally.
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    const session = driver.last();
+    expect(posts.filter((p) => p.spaceId === "slack:D1")).toHaveLength(1);
+
+    // A second message starts a FRESH DM request whose prompt REJECTS after
+    // the driver buffered an error (onError). The service MUST still settle
+    // the card to that error and never leave the request wedged.
+    session.failPromptError = "provider exploded";
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "2.2" }));
+    const dmError = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "provider exploded");
+    expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one card
+    expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME card ts, no second post
+
+    // The request cleared: a THIRD message opens a FRESH card (not a wedged
+    // reuse of the stuck request) and settles normally.
+    session.failPromptError = undefined;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "3.3" }));
+    const dmPosts = posts.filter((p) => p.spaceId === "slack:D1");
+    expect(dmPosts).toHaveLength(3); // three distinct request cards
+    const lastUpdate = updates.at(-1)!;
+    expect(lastUpdate.ts).toBe("ts-3"); // the third request's own card
+  });
+
+  test("a REJECTED drained DM request settles its card and drains the NEXT queued message exactly once (issue #296)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // Turn 1 runs (streaming); two independent messages queue behind it.
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    const session = driver.last();
+    await Promise.resolve();
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "queued A", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "queued B", ts: "3.3" }));
+    expect(session.prompts).toHaveLength(1); // both queued, neither prompted yet
+
+    // Turn 1 ends; the queue drains. The FIRST drained turn's prompt REJECTS
+    // after buffering an error — the service must settle the drained card to
+    // the error AND still drain the second queued message.
+    session.streaming = false;
+    session.failPromptError = "drained exploded";
+    session.emit("turn_end", { spaceId: "slack:D1" });
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    // BOTH queued messages drained as their own fresh requests, and EACH
+    // rejected drained request surfaced the buffered error exactly once —
+    // as a same-card edit, or (the reply-races-phrase-post edge) a fresh
+    // final post. This is the regression: a rejected drained DM must still
+    // settle + drain the NEXT queued message exactly once (issue #296).
+    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "drained exploded");
+    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && p.text === "drained exploded");
+    expect(explodedUpdates.length + explodedPosts.length).toBe(2); // queued A + queued B
+    // The queue fully drained and no request is wedged: a NEW fresh turn runs.
+    session.failPromptError = undefined;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "fresh after drain", ts: "4.4" }));
+    expect(posts.filter((p) => p.spaceId === "slack:D1").length).toBeGreaterThanOrEqual(4); // fresh card, not queued/stuck
+    expect(updates.at(-1)!.text).toBe("Done."); // the fresh turn settled normally
+  });
+});
 
   test("a session error replaces the thinking phrase with the error text", async () => {
     const { adapter, posts, updates } = fakeAdapter();
