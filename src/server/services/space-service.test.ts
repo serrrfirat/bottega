@@ -2447,6 +2447,7 @@ describe("SpaceService connect intent catalog fallback (issue #232/#233) — reg
             message: "Open this link to authorize Notion from the catalog",
           };
         },
+        probeCallbackBase: async () => ({ ok: true, base: "https://callback.example" }),
       },
       gate: {
         // Issue #233: the register gate is GONE — the org connect gate is

@@ -32,6 +32,7 @@ import type { JsonValue } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
 import {
   completeMcpOAuthFlow,
+  createMcpOAuthConnector,
   createRuntimeMcpOAuthProvider,
   OAuthFlowStore,
   startMcpOAuthFlow,
@@ -1602,6 +1603,44 @@ describe("durable public-base store — tunnel rotation heals without a restart 
       else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = savedEnv;
       rmSync(storeDir, { recursive: true, force: true });
       stub.stop();
+    }
+  });
+});
+
+describe("production connector probeCallbackBase — the connect-side gate (issue #271)", () => {
+  test("any non-5xx answers live; a dead base is refused with the base named", async () => {
+    // Live: the callback surface 404s unknown paths, so a real loopback
+    // server answering 404 proves the base forwards to a listener.
+    const live = Bun.serve({ port: 0, fetch: () => new Response("not found", { status: 404 }) });
+    // Dead: a port that just stopped listening — connection refused.
+    const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
+    const deadPort = dead.port;
+    dead.stop();
+    try {
+      const store = freshStore();
+      const connector = createMcpOAuthConnector({
+        registry: registryWith("https://mcp.example.com/mcp"),
+        store,
+        audit: createAudit(store),
+        callbackBaseUrl: () => `http://127.0.0.1:${live.port}`,
+      });
+      const liveProbe = await connector.probeCallbackBase();
+      expect(liveProbe).toMatchObject({ ok: true, base: `http://127.0.0.1:${live.port}` });
+
+      const deadConnector = createMcpOAuthConnector({
+        registry: registryWith("https://mcp.example.com/mcp"),
+        store,
+        audit: createAudit(store),
+        callbackBaseUrl: () => `http://127.0.0.1:${deadPort}`,
+      });
+      const deadProbe = await deadConnector.probeCallbackBase();
+      expect(deadProbe.ok).toBe(false);
+      if (!deadProbe.ok) {
+        expect(deadProbe.base).toContain(String(deadPort));
+        expect(deadProbe.message).toBeDefined();
+      }
+    } finally {
+      live.stop();
     }
   });
 });

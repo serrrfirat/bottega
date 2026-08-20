@@ -56,7 +56,11 @@
  * broker/gateway/iron-proxy/mem0/executor. Compose state via
  * `docker compose ps` when docker is available; local HTTP/TCP probes
  * otherwise (in-container, the compose-internal names resolve). Any DOWN
- * service fails the result loudly with evidence (isError).
+ * service fails the result loudly with evidence (isError). The OAuth
+ * callback chain (issue #271) is part of the stack: the callback listener
+ * on BOTTEGA_CALLBACK_PORT and the public callback base the connect mints
+ * authorize URLs at are probed like any service, so a live listener +
+ * tunnel is provably up and a dead one is loud.
  *
  * Deploy info (`deploy_info`): image tag (BOTTEGA_IMAGE_TAG), git commit,
  * process uptime, config dir.
@@ -91,6 +95,8 @@ import {
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { OAUTH_CALLBACK_PATH, callbackPort } from "../extensions/oauth-callback";
+import { uploadLinkPublicBase } from "../extensions/upload-link";
 import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
 import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
@@ -143,6 +149,22 @@ export interface HealthProbeSeams {
   httpGet?: (url: string, timeoutMs?: number) => Promise<{ ok: boolean; evidence: string }>;
   /** TCP connect probe: ok on connect; evidence carries the error. */
   tcpConnect?: (host: string, port: number, timeoutMs?: number) => Promise<{ ok: boolean; evidence: string }>;
+  /**
+   * OAuth callback-listener probe (issue #271): TCP connect to
+   * 127.0.0.1:<port> PLUS a GET /oauth/callback on the same port — any
+   * non-5xx HTTP answer proves the listener serves the callback route (a
+   * bare GET 400s: no code/state), so a 4xx is UP, not down.
+   */
+  callbackListener?: (port: number, timeoutMs?: number) => Promise<{ ok: boolean; evidence: string }>;
+  /**
+   * Public callback-base probe (issue #271): GET the base the connect mints
+   * authorize URLs at (the SAME source the redirect_uri embeds:
+   * data/public-base-url, else BOTTEGA_OAUTH_CALLBACK_BASE_URL). Any
+   * non-5xx answers "up" — the ingress 404s unknown paths, so a 2xx/3xx/4xx
+   * proves the tunnel forwards to the listener; a 5xx (502/530) or a
+   * transport failure means a dead/stale tunnel.
+   */
+  publicBase?: (base: string, timeoutMs?: number) => Promise<{ ok: boolean; evidence: string }>;
 }
 
 export interface AdminToolsOpts {
@@ -397,6 +419,55 @@ export async function defaultTcpConnect(
 }
 
 /**
+ * Default OAuth callback-listener probe (issue #271): TCP connect to
+ * 127.0.0.1:<port>, then GET /oauth/callback on the same port. The callback
+ * endpoint answers 400 for a bare GET (no code/state), so any non-5xx
+ * response — the TCP connect PLUS a served route — proves the listener is
+ * up; a 5xx or transport failure proves it is not.
+ */
+export async function defaultCallbackListenerProbe(
+  port: number,
+  timeoutMs = PROBE_TIMEOUT_MS,
+): Promise<{ ok: boolean; evidence: string }> {
+  const tcp = await defaultTcpConnect("127.0.0.1", port, timeoutMs);
+  if (!tcp.ok) return tcp;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}${OAUTH_CALLBACK_PATH}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "follow",
+    });
+    return {
+      ok: res.status < 500,
+      evidence: `GET http://127.0.0.1:${port}${OAUTH_CALLBACK_PATH} -> HTTP ${res.status}`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      evidence: `GET http://127.0.0.1:${port}${OAUTH_CALLBACK_PATH} failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
+ * Default public callback-base probe (issue #271): any non-5xx HTTP
+ * response answers "up" (the ingress 404s unknown paths, so a 2xx/3xx/4xx
+ * means the tunnel forwards to the listener); a 5xx (Cloudflare 502/530,
+ * nginx 502) or a transport failure (DNS, refused, timeout) means the base
+ * is dead and every minted authorize URL would die in the browser.
+ */
+export async function defaultPublicBaseProbe(
+  base: string,
+  timeoutMs = PROBE_TIMEOUT_MS,
+): Promise<{ ok: boolean; evidence: string }> {
+  try {
+    const res = await fetch(base, { signal: AbortSignal.timeout(timeoutMs), redirect: "follow" });
+    return { ok: res.status < 500, evidence: `GET ${base} -> HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, evidence: `GET ${base} failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/**
  * Probes one service: compose state when docker is available, local
  * HTTP/TCP probes otherwise. Returns up/down/unknown with evidence.
  */
@@ -433,10 +504,14 @@ async function probeService(
 }
 
 async function runStackHealth(store: Store, opts: AdminToolsOpts): Promise<ServiceStatus[]> {
-  const seams: Required<Pick<HealthProbeSeams, "composePs" | "httpGet" | "tcpConnect">> = {
+  const seams: Required<
+    Pick<HealthProbeSeams, "composePs" | "httpGet" | "tcpConnect" | "callbackListener" | "publicBase">
+  > = {
     composePs: opts.health?.composePs ?? ((service) => defaultComposePs(service, process.cwd())),
     httpGet: opts.health?.httpGet ?? defaultHttpGet,
     tcpConnect: opts.health?.tcpConnect ?? defaultTcpConnect,
+    callbackListener: opts.health?.callbackListener ?? defaultCallbackListenerProbe,
+    publicBase: opts.health?.publicBase ?? defaultPublicBaseProbe,
   };
   const brokerUrl = (process.env.OMP_AUTH_BROKER_URL ?? "http://auth-broker:8765").replace(/\/+$/, "");
   const settings = store.getOrgSettings();
@@ -482,6 +557,67 @@ async function runStackHealth(store: Store, opts: AdminToolsOpts): Promise<Servi
       status: "unknown",
       method: "none",
       evidence: "no listening port; docker/compose unavailable here — check `docker compose ps` on the host",
+    });
+  }
+  // The OAuth callback chain (issue #271): the connect mints authorize URLs
+  // at <public-base>/oauth/callback, served by the in-process listener on
+  // BOTTEGA_CALLBACK_PORT — BOTH must be live, or every minted link dies in
+  // the browser. These rows exist so a LIVE chain is provably up and a dead
+  // one is loud (the 2026-08-20 misdiagnosis: a live listener + tunnel read
+  // as a dead stack because nothing probed them).
+  try {
+    const port = callbackPort();
+    if (port === 0) {
+      // Ephemeral port (local dev, tests): nothing stable to probe, and no
+      // tunnel can forward to it — honest unknown, never a fabricated down.
+      results.push({
+        service: "oauth-callback-listener",
+        status: "unknown",
+        method: "none",
+        evidence:
+          "BOTTEGA_CALLBACK_PORT is not set — the callback listener binds an ephemeral port; " +
+          "set a stable port when a tunnel/reverse proxy forwards to it",
+      });
+    } else {
+      const listener = await seams.callbackListener(port, PROBE_TIMEOUT_MS);
+      results.push({
+        service: "oauth-callback-listener",
+        status: listener.ok ? "up" : "down",
+        method: "tcp",
+        evidence: listener.evidence,
+      });
+    }
+  } catch (err) {
+    // A mistyped BOTTEGA_CALLBACK_PORT must never crash the report.
+    results.push({
+      service: "oauth-callback-listener",
+      status: "down",
+      method: "none",
+      evidence: `invalid BOTTEGA_CALLBACK_PORT: ${errorMessage(err)}`,
+    });
+  }
+  // The SAME public base the connect embeds into the authorize URL's
+  // redirect_uri (data/public-base-url, else BOTTEGA_OAUTH_CALLBACK_BASE_URL
+  // — uploadLinkPublicBase, the source server/index.ts wires). Unconfigured
+  // → loopback-only posture: the listener row above covers loopback
+  // liveness, reported unknown here (local dev), never a fabricated down.
+  const publicBase = uploadLinkPublicBase();
+  if (publicBase === undefined) {
+    results.push({
+      service: "public-callback-base",
+      status: "unknown",
+      method: "none",
+      evidence:
+        "no public callback base configured (data/public-base-url or BOTTEGA_OAUTH_CALLBACK_BASE_URL) — " +
+        "authorize URLs use the loopback URL (local dev only; a remote user cannot open them)",
+    });
+  } else {
+    const baseProbe = await seams.publicBase(publicBase, PROBE_TIMEOUT_MS);
+    results.push({
+      service: "public-callback-base",
+      status: baseProbe.ok ? "up" : "down",
+      method: "http",
+      evidence: baseProbe.evidence,
     });
   }
   return results;
@@ -1072,7 +1208,9 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
     name: "stack_health",
     label: "Check stack health",
     description:
-      "Reports per-service status for broker, gateway, iron-proxy, mem0, and executor: compose " +
+      "Reports per-service status for broker, gateway, iron-proxy, mem0, executor, and the OAuth " +
+      "callback chain (issue #271: the callback listener on BOTTEGA_CALLBACK_PORT + the public " +
+      "callback base the connect mints authorize URLs at): compose " +
       "state via `docker compose ps` when docker is available, local HTTP/TCP probes otherwise " +
       "(in-container the compose-internal names resolve). Every service carries evidence (state or " +
       "probe result); any DOWN service fails the result loudly (the tool result is an error with " +

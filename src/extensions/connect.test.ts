@@ -27,7 +27,7 @@ import { fixtureManifest } from "./fixture";
 import type { ExtensionManifest } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry, type PinnedSnapshot } from "./registry";
 import { DEFAULT_CATALOG_URL } from "./fetch-catalog";
-import type { McpOAuthStartResult } from "./mcp-oauth";
+import type { McpOAuthBaseProbeResult, McpOAuthStartResult } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-connect-"));
 const stores: Store[] = [];
@@ -108,12 +108,19 @@ class RecordingBroker {
 class RecordingMcpOAuth {
   readonly calls: Array<{ extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }> = [];
   result: McpOAuthStartResult;
+  /** Issue #271: the scripted callback-base liveness verdict + probe call count. */
+  probeResult: McpOAuthBaseProbeResult = { ok: true, base: "https://callback.example" };
+  probeCalls = 0;
   constructor(result: McpOAuthStartResult = { ok: true, authorizationUrl: "https://auth.example/authorize?state=xyz", message: "Open this link to authorize" }) {
     this.result = result;
   }
   async start(input: { extension: string; provider: string; label: string; scope: string; actor: string; spaceId?: string }): Promise<McpOAuthStartResult> {
     this.calls.push(input);
     return this.result;
+  }
+  async probeCallbackBase(): Promise<McpOAuthBaseProbeResult> {
+    this.probeCalls += 1;
+    return this.probeResult;
   }
 }
 
@@ -150,7 +157,7 @@ function makeDeps(overrides: {
       store,
       audit: createAudit(store),
       broker: broker.connect.bind(broker),
-      mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth) },
+      mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth), probeCallbackBase: mcpOAuth.probeCallbackBase.bind(mcpOAuth) },
       gate: { loadPolicy: () => Promise.resolve(policy), router },
     },
     store,
@@ -293,6 +300,35 @@ describe("connectExtension broker seam", () => {
     expect(h.broker.calls).toHaveLength(0);
     expect(h.mcpOAuth.calls).toHaveLength(0);
     expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+  });
+
+  test("a dead callback base refuses the connect BEFORE any authorize URL is minted, naming the base (issue #271)", async () => {
+    const mcpOAuth = new RecordingMcpOAuth();
+    mcpOAuth.probeResult = { ok: false, base: "https://stale.tunnel.example", message: "GET https://stale.tunnel.example -> HTTP 502" };
+    const h = makeDeps({ mcpOAuth });
+
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      // The refusal is loud and names the base that would have been embedded.
+      expect(outcome.message).toContain("stale.tunnel.example");
+      expect(outcome.message).toContain("not reachable");
+    }
+    expect(h.mcpOAuth.probeCalls).toBe(1); // the gate probed the base first...
+    expect(h.mcpOAuth.calls).toHaveLength(0); // ...and refused BEFORE minting an authorize URL
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+  });
+
+  test("a live callback base lets the hosted-OAuth connect mint the authorize URL (issue #271)", async () => {
+    const h = makeDeps(); // the harness probe answers ok by default
+
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
+
+    expect(outcome.ok).toBe(true);
+    expect(h.mcpOAuth.probeCalls).toBe(1);
+    expect(h.mcpOAuth.calls).toHaveLength(1);
   });
 
   test("an org-scope hosted OAuth connect gates first, then mints (denied → nothing)", async () => {

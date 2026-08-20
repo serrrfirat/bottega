@@ -389,6 +389,12 @@ export function canaryMcpOAuthConnector(store: () => OAuthFlowStoreSlice): McpOA
           `after you authorize in the browser, ${input.label} is connected.`,
       };
     },
+    // Issue #271: the connect gate probes the callback base before minting.
+    // The canary's base is a SYNTHETIC fixture (oauth.fixture.test, port 0)
+    // that no real network can reach — the liveness gate is proven
+    // hermetically in connect.test.ts; here the verdict is scripted ok so
+    // the canary keeps exercising the routing/mint/flow-row journey.
+    probeCallbackBase: async () => ({ ok: true, base: "http://127.0.0.1:0" }),
   };
 }
 

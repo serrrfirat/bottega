@@ -568,11 +568,55 @@ export interface McpOAuthFlowDeps {
 /** The connect seam: mints a hosted-MCP OAuth flow and returns the authorization URL. */
 export interface McpOAuthConnector {
   start(input: McpOAuthStartInput): Promise<McpOAuthStartResult>;
+  /**
+   * Base-liveness probe (issue #271): verifies the PUBLIC callback base the
+   * authorize URL's redirect_uri embeds (deps.callbackBaseUrl) is reachable
+   * BEFORE a flow mints — fail closed: a dead tunnel/base refuses the
+   * connect with the base named, never a dead authorize link.
+   */
+  probeCallbackBase(): Promise<McpOAuthBaseProbeResult>;
+}
+
+/** Issue #271 base-liveness verdict: the probed base + ok + failure evidence. */
+export interface McpOAuthBaseProbeResult {
+  ok: boolean;
+  /** The public callback base that was probed (the redirect_uri base). */
+  base?: string;
+  /** Failure evidence (HTTP status / transport error) when !ok. */
+  message?: string;
+}
+
+/** How long the callback-base liveness probe may take before the base is treated as dead (issue #271). */
+export const MCP_OAUTH_BASE_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Issue #271 liveness probe: any non-5xx HTTP response answers "live" — the
+ * callback surface 404s unknown paths (a bare GET on the base), so a
+ * 2xx/3xx/4xx proves the tunnel forwards to the listener; a 5xx
+ * (Cloudflare 502/530, nginx 502) or a transport failure (DNS, refused,
+ * timeout) proves the base is dead and any minted authorize URL would die
+ * in the browser.
+ */
+export async function probeCallbackBaseLive(
+  base: string,
+  timeoutMs = MCP_OAUTH_BASE_PROBE_TIMEOUT_MS,
+): Promise<McpOAuthBaseProbeResult> {
+  try {
+    const res = await fetch(base, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+    return res.status < 500
+      ? { ok: true, base }
+      : { ok: false, base, message: `GET ${base} -> HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, base, message: `GET ${base} failed: ${errorMessage(err)}` };
+  }
 }
 
 /** Production connect seam (the server's default): {@link startMcpOAuthFlow}. */
 export function createMcpOAuthConnector(deps: McpOAuthFlowDeps & { registry: Pick<ExtensionRegistry, "resolve"> }): McpOAuthConnector {
-  return { start: (input) => startMcpOAuthFlow(input, deps) };
+  return {
+    start: (input) => startMcpOAuthFlow(input, deps),
+    probeCallbackBase: () => probeCallbackBaseLive(deps.callbackBaseUrl()),
+  };
 }
 
 /**

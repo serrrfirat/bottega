@@ -239,6 +239,10 @@ const ENV_KEYS = [
   "BOTTEGA_PROXY_CONTROL_URL",
   "BOTTEGA_PROXY_CONTROL_TOKEN",
   "BOTTEGA_PROXY_SECRETS_DIR",
+  // Issue #271: the OAuth callback chain env — stack_health probes these.
+  "BOTTEGA_CALLBACK_PORT",
+  "BOTTEGA_OAUTH_CALLBACK_BASE_URL",
+  "BOTTEGA_PUBLIC_BASE_URL_FILE",
 ];
 
 function backupEnv(): EnvBackup {
@@ -261,6 +265,10 @@ function allUpProbes(): Required<HealthProbeSeams> {
     composePs: async () => ({ available: false }),
     httpGet: async (url) => ({ ok: true, evidence: `GET ${url} -> HTTP 200` }),
     tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+    // Issue #271: the OAuth callback chain — hermetic fakes so no real
+    // listener/tunnel is probed, whatever the ambient env/file says.
+    callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+    publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
   };
 }
 
@@ -788,6 +796,7 @@ describe("catalog_browser pin (issue #195)", () => {
                 message: "Open this link to authorize Notion",
               };
             },
+            probeCallbackBase: async () => ({ ok: true, base: "https://callback.example" }),
           },
           gate: minimalConnectGate(),
         },
@@ -978,7 +987,14 @@ describe("catalog_browser pin (issue #195)", () => {
 describe("stack_health (issue #73)", () => {
   test("all services up via local probes → ok result with per-service evidence", async () => {
     const { store, cleanup } = freshStore();
+    const env = backupEnv();
     try {
+      // Issue #271: pin the callback port so the listener row is probed
+      // (fake seam → up), not honestly unknown on the ephemeral posture;
+      // and point the public base at the env so the base row is probed too
+      // (a worktree may have no data/public-base-url).
+      process.env.BOTTEGA_CALLBACK_PORT = "18776";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
       const { audit, rows } = fakeAudit();
       const tool = findTool(loadTools(store, { audit, health: allUpProbes() }), "stack_health");
       const res = await call(tool, {});
@@ -992,6 +1008,9 @@ describe("stack_health (issue #73)", () => {
         "gateway",
         "iron-proxy",
         "mem0",
+        // Issue #271: the OAuth callback chain rows.
+        "oauth-callback-listener",
+        "public-callback-base",
       ]);
       for (const svc of body.services) {
         // The four network services answer their local probes; the
@@ -1008,6 +1027,7 @@ describe("stack_health (issue #73)", () => {
       expect(rows[0].event_type).toBe(ADMIN_STACK_HEALTH_EVENT);
       expect(rows[0].payload["ok"]).toBe(true);
     } finally {
+      restoreEnv(env);
       cleanup();
     }
   });
@@ -1019,6 +1039,8 @@ describe("stack_health (issue #73)", () => {
         composePs: async () => ({ available: false }),
         httpGet: async (url) => ({ ok: url.includes("healthz"), evidence: `GET ${url} -> HTTP ${url.includes("healthz") ? 200 : 500}` }),
         tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
       };
       const tool = findTool(loadTools(store, { health: probes }), "stack_health");
       const res = await call(tool, {});
@@ -1051,6 +1073,8 @@ describe("stack_health (issue #73)", () => {
         },
         httpGet: async () => ({ ok: true, evidence: "unused" }),
         tcpConnect: async () => ({ ok: true, evidence: "unused" }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
       };
       const tool = findTool(loadTools(store, { health: probes }), "stack_health");
       const res = await call(tool, {});
@@ -1097,11 +1121,166 @@ describe("stack_health (issue #73)", () => {
           return { ok: true, evidence: `GET ${url} -> HTTP 200` };
         },
         tcpConnect: async () => ({ ok: true, evidence: "tcp ok" }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
       };
       const tool = findTool(loadTools(store, { health: probes }), "stack_health");
       await call(tool, {});
       expect(probed.some((url) => url.startsWith("http://mem0.internal:9000"))).toBe(true);
     } finally {
+      cleanup();
+    }
+  });
+
+  test("callback listener row: up when the stable port serves the OAuth callback route (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "18777";
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      const probes: Required<HealthProbeSeams> = {
+        ...allUpProbes(),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const listener = body.services.find((s) => s.service === "oauth-callback-listener");
+      expect(listener).toBeDefined();
+      expect(listener!.status).toBe("up");
+      expect(listener!.evidence).toContain("18777");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("callback listener row fails loudly, naming the port, when nothing listens (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "18778";
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      const probes: Required<HealthProbeSeams> = {
+        ...allUpProbes(),
+        callbackListener: async (port) => ({ ok: false, evidence: `tcp 127.0.0.1:${port} failed: connect ECONNREFUSED` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(true);
+      expect(body.ok).toBe(false);
+      const listener = body.services.find((s) => s.service === "oauth-callback-listener");
+      expect(listener).toBeDefined();
+      expect(listener!.status).toBe("down");
+      expect(listener!.evidence).toContain("18778");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("callback listener row reports the ephemeral-port posture when BOTTEGA_CALLBACK_PORT is unset (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      delete process.env.BOTTEGA_CALLBACK_PORT;
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      const tool = findTool(loadTools(store, { health: allUpProbes() }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(body.ok).toBe(true);
+      const listener = body.services.find((s) => s.service === "oauth-callback-listener");
+      expect(listener).toBeDefined();
+      expect(listener!.status).toBe("unknown");
+      expect(listener!.evidence).toContain("ephemeral");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("public callback base row: up when the tunnel base answers (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
+      const probes: Required<HealthProbeSeams> = {
+        ...allUpProbes(),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const base = body.services.find((s) => s.service === "public-callback-base");
+      expect(base).toBeDefined();
+      expect(base!.status).toBe("up");
+      expect(base!.evidence).toContain("tunnel-a.trycloudflare.com");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("public callback base row fails loudly when the tunnel base is dead (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://dead.tunnel.example";
+      const probes: Required<HealthProbeSeams> = {
+        ...allUpProbes(),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: false, evidence: `GET ${base} -> HTTP 502` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(true);
+      expect(body.ok).toBe(false);
+      const base = body.services.find((s) => s.service === "public-callback-base");
+      expect(base).toBeDefined();
+      expect(base!.status).toBe("down");
+      expect(base!.evidence).toContain("dead.tunnel.example");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("public callback base row reports the loopback-only posture when no base is configured (issue #271)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_PUBLIC_BASE_URL_FILE = join(dir, "no-public-base");
+      delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
+      const tool = findTool(loadTools(store, { health: allUpProbes() }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(body.ok).toBe(true);
+      const base = body.services.find((s) => s.service === "public-callback-base");
+      expect(base).toBeDefined();
+      expect(base!.status).toBe("unknown");
+      expect(base!.evidence).toContain("loopback");
+    } finally {
+      restoreEnv(env);
       cleanup();
     }
   });

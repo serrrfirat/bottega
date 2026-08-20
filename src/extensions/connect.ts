@@ -61,7 +61,7 @@ import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT } from "../store/au
 import type { BootSecret } from "../server/boot-secrets";
 import { errorMessage, toolError } from "../tools/helpers";
 import { looksLikeObviousSecret } from "../tools/memory";
-import type { McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
+import type { McpOAuthBaseProbeResult, McpOAuthConnector, McpOAuthStartResult } from "./mcp-oauth";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import {
@@ -405,6 +405,32 @@ export async function connectExtension(
       return {
         ok: false,
         message: `connect ${label} failed: generic MCP OAuth is not wired in this server (issue #198)`,
+      };
+    }
+    // Issue #271 gate: the authorize URL embeds
+    // `<callback-base>/oauth/callback` — verify that base is LIVE before
+    // ANY authorize URL is generated (fail closed). A dead tunnel/base
+    // (connection refused, 502/530, timeout) would mint a link that dies in
+    // the browser; the refusal names the base so the human knows what to
+    // refresh (scripts/tunnel.sh re-writes data/public-base-url, or fix
+    // BOTTEGA_OAUTH_CALLBACK_BASE_URL).
+    let baseProbe: McpOAuthBaseProbeResult;
+    try {
+      baseProbe = await deps.mcpOAuth.probeCallbackBase();
+    } catch (err) {
+      return {
+        ok: false,
+        message: `connect ${label} failed: the OAuth callback base is not reachable: ${errorMessage(err)}`,
+      };
+    }
+    if (!baseProbe.ok) {
+      return {
+        ok: false,
+        message:
+          `connect ${label} failed: the OAuth callback base (${baseProbe.base ?? "unknown"}) is not reachable ` +
+          `(${baseProbe.message ?? "no response"}) — an authorize link minted now would die in the browser. ` +
+          "Refresh the tunnel (scripts/tunnel.sh re-writes data/public-base-url) or fix " +
+          "BOTTEGA_OAUTH_CALLBACK_BASE_URL, then re-connect.",
       };
     }
     let oauthStart: McpOAuthStartResult;
