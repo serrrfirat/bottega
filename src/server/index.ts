@@ -646,6 +646,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // the driver) — the closure reads it only at call time, the same
           // pattern as extensionCaller above.
           onToolStep: (step) => spaceService.routeToolStep(step),
+          // Issue #278: a successful search_web call hands its cited rows
+          // to the space's turn presenter (posts exactly one cited table
+          // to the turn thread). Late-bound on spaceService like onToolStep.
+          onSearchResults: (spaceId, results) => spaceService.routeSearchResults(spaceId, results),
         },
         // Connect capability (issue #52): connect_extension is built per
         // session so the actor is the requesting principal; org-scope

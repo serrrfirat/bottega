@@ -426,6 +426,39 @@ export function renderSearchResultBlocks(
   return blocks;
 }
 
+/**
+ * Fail-closed parse of the search_web tool's JSON result text into the
+ * rows a turn actually used (issue #278). The tool emits
+ * `{query, count, results:[{title,url,snippet}]}`; this extracts only
+ * well-formed rows (a url must be present and string). Malformed or
+ * non-search text → `[]` — a turn never posts a half-parsed table or
+ * throws into the turn path.
+ */
+export function parseSearchResultRows(text: string): SearchResultRow[] {
+  if (!text) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { results?: unknown }).results)) {
+    return [];
+  }
+  const rows: SearchResultRow[] = [];
+  for (const raw of (parsed as { results: unknown[] }).results) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const row = raw as Record<string, unknown>;
+    if (typeof row.url !== "string" || row.url.trim() === "") continue;
+    rows.push({
+      title: typeof row.title === "string" ? row.title : row.url,
+      url: row.url,
+      snippet: typeof row.snippet === "string" ? row.snippet : "",
+    });
+  }
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Presenter
 // ---------------------------------------------------------------------------
@@ -803,6 +836,24 @@ export class SlackTurnPresenter {
   onToolStep(step: ToolStepEvent): void {
     if (this.digesting) return;
     this.renderToolStep(step);
+  }
+
+  /**
+   * Cited search results a turn actually used (issue #278): posts exactly
+   * ONE cited table (header + rows + a "Sources used" section) to the
+   * turn's thread — the acceptance that the citations reach the human,
+   * not just JSON to the model. Fail closed at the call site: this method
+   * renders whatever rows it is handed; the dispatch only ever hands it
+   * {@link parseSearchResultRows} output (already well-formed URLs). Digest
+   * turns skip it (their output is memory, #42). Never throws into the
+   * turn path — a Slack post failure is logged and dropped.
+   */
+  presentSearchResults(results: readonly SearchResultRow[]): void {
+    if (this.digesting) return;
+    const blocks = renderSearchResultBlocks(results);
+    void this.adapter
+      .postMessage(this.spaceId, "Search results (cited)", { ...this.replyOpts(), blocks })
+      .catch((err) => console.error("[search-results] cited table post failed:", err));
   }
 
   /**

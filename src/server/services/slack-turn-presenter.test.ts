@@ -33,6 +33,7 @@ import {
   nextToolStepId,
   toolStepTitle,
   renderSearchResultBlocks,
+  parseSearchResultRows,
   SEARCH_TABLE_MAX_ROWS,
   type ToolStepEvent,
 } from "./slack-turn-presenter";
@@ -52,7 +53,7 @@ interface RecordedAdapter {
   texts: Array<{ spaceId: string; ts: string; text: string }>;
   tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }>;
   stops: Array<{ spaceId: string; ts: string; text?: string }>;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }>;
+  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
   updates: Array<{ spaceId: string; ts: string; text: string }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
 }
@@ -64,14 +65,15 @@ function recordingAdapter(
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
   const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let tsSeq = 0;
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, replyOpts) {
-      // SAFETY: the presenter passes only { threadTs } as post options (blocks are the approval router's job), so recording just that field covers every posted message.
-      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string } | undefined });
+      // SAFETY: the presenter passes { threadTs } as post options; issue #278
+      // carries cited-search blocks on the same seam, so record opts fully.
+      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string; blocks?: unknown[] } | undefined });
       tsSeq += 1;
       return `post-${tsSeq}`;
     },
@@ -1159,5 +1161,55 @@ describe("renderSearchResultBlocks (issue #278)", () => {
     expect(sections.length).toBe(3); // 2 rows + the sources-used footer
     const context = blocks.find((b) => b.type === "context") as { elements?: { text?: string }[] };
     expect(context.elements?.[0]?.text).toContain("5 more results");
+  });
+});
+
+describe("presentSearchResults cited-table dispatch (issue #278)", () => {
+  test("a speaker posts exactly ONE cited table to the turn thread, as blocks", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    // The search post is the ONLY cited table the presenter emits — the
+    // receipt phrase is a separate post, so expect exactly one more post
+    // carrying the "Search results (cited)" text.
+    presenter.presentSearchResults([
+      { title: "Bottega", url: "https://example.com/bottega", snippet: "The harness." },
+      { title: "Proxy seam", url: "https://example.com/proxy", snippet: "Keys ride a seam." },
+    ]);
+    await flush();
+    const searchPosts = rec.posts.filter((p) => p.text === "Search results (cited)");
+    expect(searchPosts).toHaveLength(1);
+    const post = searchPosts[0]!;
+    expect(post.text).toBe("Search results (cited)");
+    // Threaded under the inbound turn message.
+    expect(post.opts?.threadTs).toBe("1.1");
+    // The cited table travels as blocks inside the post opts — the
+    // acceptance that citations reach the human, not just JSON to the model.
+    expect(Array.isArray(post.opts?.blocks)).toBe(true);
+    const blocks = (post.opts?.blocks ?? []) as { type: string; text?: { text?: string }; elements?: { text?: string }[] }[];
+    expect(blocks[0]!.type).toBe("header");
+    expect(String(blocks[0]!.text?.text)).toContain("Search results");
+    const sections = blocks.filter((b) => b.type === "section");
+    expect(sections).toHaveLength(3); // 2 rows + the sources-used footer
+    expect(sections[1]!.text?.text).toContain("https://example.com/proxy");
+    const footer = sections.pop();
+    expect(footer?.text?.text).toContain("*Sources used:*");
+    expect(footer?.text?.text).toContain("<https://example.com/bottega>");
+  });
+
+  test("parseSearchResultRows fail-closed: malformed or missing results never dispatch rows", async () => {
+    expect(parseSearchResultRows("not json")).toEqual([]);
+    expect(parseSearchResultRows('{"count":2,"results":[]}')).toEqual([]);
+    expect(parseSearchResultRows('{"results":[{"url":"","title":"x"}]}')).toEqual([]);
+    expect(
+      parseSearchResultRows('{"results":[{"title":"B","url":"https://b", "snippet":"s"},{"title":"NoUrl"}]}'),
+    ).toEqual([{ title: "B", url: "https://b", snippet: "s" }]);
   });
 });

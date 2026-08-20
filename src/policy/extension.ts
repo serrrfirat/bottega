@@ -25,7 +25,7 @@ import type { AuditModule } from "./audit";
 import type { ApprovalRouter } from "./approval-router";
 import { loadSpacePolicy, type PolicyConfig, type Tier } from "./config";
 import { evaluatePolicyGate } from "./gate";
-import type { ToolStepSink } from "../server/services/slack-turn-presenter";
+import type { SearchResultRow, ToolStepSink } from "../server/services/slack-turn-presenter";
 
 export interface PolicyExtensionDeps {
   orgPolicy: PolicyConfig;
@@ -74,6 +74,15 @@ export interface PolicyExtensionDeps {
    * tool_call interception is inert for restricted sessions).
    */
   onToolStep?: ToolStepSink;
+  /**
+   * Cited-search-result sink (issue #278): the driver's withPolicyGate
+   * wrapper hands a SUCCESSFUL search_web call's parsed cited rows to
+   * this — failure is forbidden (a non-search tool, an unavailable key, or
+   * an unparseable result never dispatches) — so the turn's citations
+   * reach the human. SpaceService routes it to the space's turn presenter,
+   * which posts exactly one cited table; headless callers omit it.
+   */
+  onSearchResults?: (spaceId: string, results: readonly SearchResultRow[]) => void;
 }
 
 export default function createPolicyExtension(deps: PolicyExtensionDeps): ExtensionFactory {
