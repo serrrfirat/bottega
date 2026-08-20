@@ -22,7 +22,7 @@ import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { resolveAuthBrokerConfig } from "@oh-my-pi/pi-coding-agent/session/auth-broker-config";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
-import { oauthTokenBlobFileName } from "../egress/generate";
+import { oauthTokenBlobFileName, OAUTH_TOKEN_ENDPOINTS } from "../egress/generate";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { fetchVaultApiKeysFromEnv, keychainReaderFromEnv, keychainServiceFor } from "../server/boot-secrets";
@@ -143,6 +143,28 @@ export interface OAuthVaultRow {
    * real rows (issue #228 fresh-vs-stale regression).
    */
   expires?: number;
+  /**
+   * The row's access token (issue #269): preserved when the seed-time
+   * refresh response omits a minted one — the rotation write-back never
+   * blanks the vault row's access token.
+   */
+  access?: string;
+  /**
+   * The connect-negotiated token-endpoint auth method (issue #257): the
+   * seed's app-side refresh honors it on the wire (client_secret_basic →
+   * Basic header, client_secret_post → form body, "none"/absent → public).
+   */
+  tokenEndpointAuthMethod?: string;
+  /**
+   * The vault row's OAuth identity (email/account/project/org, issue
+   * #269): carried through the rotation write-back so the broker's
+   * identity-keyed upsert REPLACES the row in place instead of inserting a
+   * duplicate (opaque tokens like Notion's carry no identity of their own).
+   */
+  email?: string;
+  accountId?: string;
+  orgId?: string;
+  projectId?: string;
 }
 
 /**
@@ -646,6 +668,21 @@ export interface ProxyCredentialSyncOpts {
    * rule). Tests stub it.
    */
   mintCodexRefreshToken?: CodexMintProbe;
+  /**
+   * MCP OAuth refresh-grant seam (issue #269): refreshes every RENEWABLE
+   * credential app-side at seed time and returns the (possibly rotated)
+   * refresh token. Default: a real refresh-grant POST to the provider's
+   * verified token endpoint (a no-op success under the test runner — the
+   * #191 isolation rule). Tests stub it.
+   */
+  refreshOAuthToken?: McpOAuthRefreshProbe;
+  /**
+   * Rotated-token write-back seam (issue #269): persists the endpoint's
+   * rotated refresh token to the vault row (the broker write seam
+   * connect.ts uses). Default: the production broker-aware writer; tests
+   * stub it (never a real vault write under the runner).
+   */
+  persistRotatedToken?: RotatedTokenPersister;
   /** Proxy management API base + bearer (the reload half); default from env. */
   proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
   /** Boot log sink; defaults to console.log. */
@@ -739,12 +776,21 @@ export async function readOAuthRowsFromLocalStorage(provider: string): Promise<A
 
 /** Picks the seed-relevant fields off one vault OAuth credential (+ the #250 client identity). */
 function oauthVaultRow(id: number, credential: OAuthCredential): OAuthVaultRow {
+  const vault = credential as VaultOAuthCredential;
   return {
     id,
     refresh: credential.refresh,
-    clientId: (credential as VaultOAuthCredential).client_id,
-    clientSecret: (credential as VaultOAuthCredential).client_secret,
+    clientId: vault.client_id,
+    clientSecret: vault.client_secret,
     expires: credential.expires,
+    access: credential.access,
+    tokenEndpointAuthMethod: vault.token_endpoint_auth_method,
+    // The identity fields ride the rotation write-back (issue #269) so the
+    // broker's identity-keyed upsert replaces the row instead of duplicating it.
+    email: credential.email,
+    accountId: credential.accountId,
+    orgId: credential.orgId,
+    projectId: credential.projectId,
   };
 }
 
@@ -763,17 +809,178 @@ function deleteSecretFile(secretsDir: string, fileName: string): void {
 }
 
 /**
+ * One MCP OAuth refresh-grant probe outcome (issue #269): the token
+ * endpoint's verdict on the seeded refresh token, the freshly minted
+ * ACCESS token, and the refresh token to persist — the endpoint's rotation
+ * when it returned one, else the probed token. Mirrors
+ * {@link CodexMintOutcome} (the codex mint probe generalized to the
+ * confidential-client OAuth providers).
+ */
+export interface McpOAuthRefreshOutcome {
+  /** True when the token endpoint accepted the refresh grant (HTTP 2xx). */
+  minted: boolean;
+  /** The endpoint's HTTP status on a rejected grant; undefined on transport errors. */
+  status?: number;
+  /**
+   * The freshly minted access token (RFC 6749 §5.1 `access_token`), when
+   * the endpoint returned one — the vault write-back's access/expiry.
+   */
+  accessToken?: string;
+  /** The refresh token to persist: the endpoint's rotated token or the probed one. */
+  refreshToken: string;
+  /** The minted access token's lifetime in ms (RFC 6749 §5.1 `expires_in`). */
+  expiresInMs?: number;
+}
+
+/** One MCP OAuth refresh-grant probe's inputs — all already in the seed (issue #269). */
+export interface McpOAuthRefreshInput {
+  refreshToken: string;
+  clientId: string;
+  clientSecret: string;
+  /** The provider's verified token endpoint (the egress OAUTH_TOKEN_ENDPOINTS map). */
+  tokenEndpoint: string;
+  /** The connect-negotiated token-endpoint auth method (issue #257), when persisted. */
+  authMethod?: string;
+}
+
+/**
+ * The refresh-grant probe seam (issue #269): verifies + refreshes the
+ * renewable grant before the blob is written; tests stub it.
+ */
+export type McpOAuthRefreshProbe = (input: McpOAuthRefreshInput) => Promise<McpOAuthRefreshOutcome>;
+
+/**
+ * The OAuth token endpoint's 2xx response (RFC 6749 §5.1): `access_token`
+ * is the minted bearer; `refresh_token` is present only when the endpoint
+ * rotates it, and is a non-empty string.
+ */
+const oauthRefreshResponseSchema = z.object({
+  access_token: z.string().min(1).optional(),
+  refresh_token: z.string().min(1).optional(),
+  expires_in: z.number().int().positive().optional(),
+});
+
+/**
+ * The default MCP OAuth refresh probe (issue #269): POSTs the refresh
+ * grant to the provider's VERIFIED token endpoint with the credential's
+ * client id + secret and reports the verdict. Client auth honors the
+ * connect-negotiated method (issue #257): `client_secret_basic` → Basic
+ * header; `client_secret_post`/absent → form `client_secret` (the wire
+ * shape the oauth_token transform's json_key client_secret describes). A
+ * 2xx response's `access_token` and rotated `refresh_token` are returned.
+ * Under the test runner this is a no-op success — hermetic tests never
+ * touch the network (the #191 isolation rule, mirroring
+ * {@link probeCodexMint}).
+ */
+async function probeMcpOAuthRefresh(input: McpOAuthRefreshInput): Promise<McpOAuthRefreshOutcome> {
+  if (process.env.NODE_ENV === "test") return { minted: true, refreshToken: input.refreshToken };
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: input.refreshToken,
+    client_id: input.clientId,
+  });
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+  if (input.authMethod === "client_secret_basic") {
+    headers.authorization = `Basic ${Buffer.from(`${input.clientId}:${input.clientSecret}`).toString("base64")}`;
+  } else if (input.clientSecret !== "") {
+    params.set("client_secret", input.clientSecret);
+  }
+  let res: Response;
+  try {
+    res = await fetch(input.tokenEndpoint, { method: "POST", headers, body: params });
+  } catch {
+    return { minted: false, refreshToken: input.refreshToken };
+  }
+  if (!res.ok) return { minted: false, status: res.status, refreshToken: input.refreshToken };
+  let accessToken: string | undefined;
+  let rotated = input.refreshToken;
+  let expiresInMs: number | undefined;
+  try {
+    const parsed = oauthRefreshResponseSchema.safeParse(await res.json());
+    if (parsed.success) {
+      accessToken = parsed.data.access_token;
+      if (parsed.data.refresh_token !== undefined) {
+        rotated = parsed.data.refresh_token;
+      }
+      if (parsed.data.expires_in !== undefined) {
+        expiresInMs = parsed.data.expires_in * 1000;
+      }
+    }
+  } catch {
+    // A 2xx with a non-JSON body still minted; keep the probed tokens.
+  }
+  return { minted: true, accessToken, refreshToken: rotated, expiresInMs };
+}
+
+/**
+ * Persists a rotated refresh token back to the vault row (issue #269):
+ * the broker write seam — {@link McpOAuthTokenStore.save} (the
+ * `AuthBrokerClient.uploadCredential` path when a broker is configured,
+ * else the embedded AuthStorage), the SAME seam the connect/callback legs
+ * store OAuth credentials through. Default: the production broker-aware
+ * writer (loaded lazily to keep proxy-seed free of the mcp-oauth value
+ * cycle); tests stub it (hermetic — never a real vault write).
+ */
+export type RotatedTokenPersister = (provider: string, credential: VaultOAuthCredential) => Promise<unknown>;
+
+const persistRotatedTokenToVault: RotatedTokenPersister = async (provider, credential) => {
+  const { createVaultTokenStore } = await import("./mcp-oauth");
+  await createVaultTokenStore().save(provider, credential);
+};
+
+/**
+ * Builds the vault write-back credential for a rotated refresh token
+ * (issue #269): the rotated refresh + the probe's minted access/expiry
+ * (falling back to the row's own), the per-user DCR client identity
+ * (issue #250 — never lost on write-back), the connect-negotiated auth
+ * method (issue #257 — rotation never degrades a confidential client to a
+ * public one), and the row's OAuth identity (email/account/org/project) so
+ * the broker's identity-keyed upsert REPLACES the row instead of
+ * duplicating it.
+ */
+function rotatedVaultCredential(input: {
+  row: OAuthVaultRow | undefined;
+  refreshToken: string;
+  outcome: McpOAuthRefreshOutcome;
+  clientId: string;
+  clientSecret: string;
+}): VaultOAuthCredential {
+  const credential: VaultOAuthCredential = {
+    type: "oauth",
+    refresh: input.refreshToken,
+    access: input.outcome.accessToken ?? input.row?.access ?? "",
+    expires:
+      input.outcome.expiresInMs !== undefined ? Date.now() + input.outcome.expiresInMs : (input.row?.expires ?? 0),
+    refreshable: true,
+    client_id: input.clientId,
+  };
+  if (input.clientSecret !== "") credential.client_secret = input.clientSecret;
+  const authMethod = input.row?.tokenEndpointAuthMethod;
+  if (authMethod !== undefined && authMethod !== "") credential.token_endpoint_auth_method = authMethod;
+  if (input.row?.email !== undefined) credential.email = input.row.email;
+  if (input.row?.accountId !== undefined) credential.accountId = input.row.accountId;
+  if (input.row?.orgId !== undefined) credential.orgId = input.row.orgId;
+  if (input.row?.projectId !== undefined) credential.projectId = input.row.projectId;
+  return credential;
+}
+
+/**
  * Seeds ONE provider's proxy OAuth blob (issue #208; shared with the
  * connect-time reconcile in issue #250). Client credentials resolve
  * per-user first — the vault row's registered `client_information`
  * (issue #250) — then the deployment env override (`clientIdEnv` /
- * `clientSecretEnv`, the #208 boot posture). Fail closed: no refresh row
- * → delete the blob; a refresh row with no resolvable client id → delete
- * the blob + a LOUD warning naming the env var (or provider) that the
- * operator must satisfy — a blob that cannot mint is never written.
- * `clearEnv` strips the consumed env vars after a successful seed (boot
- * behavior — the reconcile leaves the environment untouched). Never logs
- * secret values, only names + outcome.
+ * `clientSecretEnv`, the #208 boot posture). Issue #269: a RENEWABLE
+ * credential (refresh + client secret) is refreshed APP-SIDE first — the
+ * rotated refresh token is written back to the vault row (the broker write
+ * seam) AND the blob, so the proxy never mints from a consumed token (a
+ * rejected grant removes the blob fail-closed; a transient error warns and
+ * writes the existing token). Fail closed: no refresh row → delete the
+ * blob; a refresh row with no resolvable client id → delete the blob + a
+ * LOUD warning naming the env var (or provider) that the operator must
+ * satisfy — a blob that cannot mint is never written. `clearEnv` strips
+ * the consumed env vars after a successful seed (boot behavior — the
+ * reconcile leaves the environment untouched). Never logs secret values,
+ * only names + outcome.
  */
 export async function seedProxyOAuthBlob(
   provider: string,
@@ -788,6 +995,22 @@ export async function seedProxyOAuthBlob(
     clientIdEnv?: string;
     /** Deployment client-secret env (fallback, optional). */
     clientSecretEnv?: string;
+    /**
+     * Refresh-grant seam (issue #269): refreshes a RENEWABLE credential
+     * (refresh + client secret) app-side before the blob is written and
+     * returns the (possibly rotated) refresh token. Default: a real
+     * refresh-grant POST to the provider's verified token endpoint (a
+     * no-op success under the test runner — the #191 isolation rule).
+     * Tests stub it.
+     */
+    refreshOAuthToken?: McpOAuthRefreshProbe;
+    /**
+     * Rotated-token write-back seam (issue #269): persists the endpoint's
+     * rotated refresh token to the vault row (the broker write seam).
+     * Default: the production broker-aware writer; tests stub it (never a
+     * real vault write under the runner).
+     */
+    persistRotatedToken?: RotatedTokenPersister;
     /** Strip the consumed env vars after a successful seed (boot only). */
     clearEnv?: boolean;
     /** Log sink; defaults to console.log. */
@@ -865,9 +1088,87 @@ export async function seedProxyOAuthBlob(
       : envClientSecret !== undefined
         ? envClientSecret
         : "";
-  const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId, client_secret: clientSecret };
+  // Issue #269 rotation persistence: the proxy's oauth_token transform
+  // rotates the refresh token in memory on every mint and never persists
+  // it — a blob seeded verbatim from the vault row re-reads a token the
+  // proxy already consumed (every restart / 24h ttl re-read kills the
+  // connector). A RENEWABLE credential (refresh + client secret) is
+  // refreshed APP-SIDE first, and the endpoint's ROTATED token is written
+  // back to the vault row (the broker write seam) AND the blob. A REJECTED
+  // grant (invalid_grant etc. — the token was consumed or revoked) is
+  // never written as renewable: the blob is removed fail-closed with a
+  // receivable warning naming the reconnect path (the same posture as a
+  // refresh row with no resolvable client id). A transport error / 5xx /
+  // 429 is transient, not dead: warn and write the existing token
+  // unverified (the codex pattern, issue #230). Public clients (no secret)
+  // and providers without a verified token endpoint stay non-renewable:
+  // unchanged. The token endpoint comes from the egress
+  // OAUTH_TOKEN_ENDPOINTS map — the SAME verified endpoints the oauth_token
+  // transform mints through, never a guessed URL.
+  const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[provider];
+  let refreshToken = refresh;
+  if (clientSecret !== "" && tokenEndpoint !== undefined) {
+    const refreshProbe = opts.refreshOAuthToken ?? probeMcpOAuthRefresh;
+    const outcome = await refreshProbe({
+      refreshToken: refresh,
+      clientId,
+      clientSecret,
+      tokenEndpoint,
+      authMethod: row?.tokenEndpointAuthMethod,
+    });
+    if (
+      !outcome.minted &&
+      outcome.status !== undefined &&
+      outcome.status >= 400 &&
+      outcome.status < 500 &&
+      outcome.status !== 429
+    ) {
+      // The grant is dead (invalid_grant / revoked): fail closed — never a
+      // blob that mints nothing. The warning NAMES the reconnect path.
+      deleteSecretFile(opts.secretsDir, fileName);
+      warnings.push(
+        `bottega proxy: ${fileName} REMOVED — ${provider} refresh token REJECTED (HTTP ${outcome.status}); ` +
+          `reconnect ${provider} to mint a fresh grant (fail closed)`,
+      );
+      return { notes, warnings, wrote: false };
+    }
+    if (!outcome.minted) {
+      notes.push(
+        `bottega proxy: ${fileName} seeded (${provider} OAuth refresh could not be verified ` +
+          `${outcome.status === undefined ? "token endpoint unreachable" : `HTTP ${outcome.status}`} — ` +
+          "writing the existing refresh token unverified)",
+      );
+    } else {
+      refreshToken = outcome.refreshToken;
+      if (outcome.refreshToken !== refresh) {
+        // Rotation write-back (issue #269): persist the endpoint's rotated
+        // refresh token to the vault row (the broker write seam connect.ts
+        // uses) so a later boot/reconnect re-reads a LIVE token. A failed
+        // write-back is receivable — the blob still carries the rotated
+        // token for THIS seed (the proxy works until the next re-seed).
+        const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
+        try {
+          await persistRotated(provider, rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }));
+          notes.push(
+            `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed; ` +
+              "rotated token written back to the vault)",
+          );
+        } catch (err) {
+          warnings.push(
+            `bottega proxy: ${fileName} rotated refresh token could not be written back to the vault ` +
+              `(${errorMessage(err)}) — the next boot will re-read the consumed token; reconnect ${provider} if it fails`,
+          );
+          notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed)`);
+        }
+      } else {
+        notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant verified)`);
+      }
+    }
+  } else {
+    notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
+  }
+  const blob: ProxyOAuthBlob = { refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret };
   writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
-  notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
   return { notes, warnings, wrote: true };
 }
 
@@ -947,6 +1248,8 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
       clientSecretEnv: credential.clientSecretEnv,
       clearEnv: true,
       log,
+      refreshOAuthToken: opts.refreshOAuthToken,
+      persistRotatedToken: opts.persistRotatedToken,
     });
     for (const note of result.notes) log(note);
     for (const warning of result.warnings) log(warning);

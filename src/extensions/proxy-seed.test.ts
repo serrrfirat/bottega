@@ -21,6 +21,7 @@ import {
   writeCodexAuthTokens,
 } from "./proxy-seed";
 import type { JsonValue } from "./manifest";
+import type { McpOAuthRefreshInput, VaultOAuthCredential } from "./proxy-seed";
 
 const NO_VAULT = (): Promise<Map<string, string>> => Promise.resolve(new Map());
 const NO_KEYCHAIN = (): Promise<string | null> => Promise.resolve(null);
@@ -366,6 +367,137 @@ describe("OAuth blobs (issue #208)", () => {
       });
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
       expect(blob).toEqual({ refresh_token: "row-6-refresh", client_id: "client-live", client_secret: "" });
+    } finally {
+      s.cleanup();
+    }
+  });
+});
+
+describe("MCP OAuth rotation persistence (issue #269)", () => {
+  test("a renewable credential (refresh + client id + secret) is refreshed at seed — the rotated token lands in the blob AND the vault", async () => {
+    // iron-proxy's oauth_token transform rotates the refresh token in
+    // memory on every mint and never persists it; the blob file source
+    // (24h ttl) re-reads a token the proxy already consumed. The seed must
+    // refresh the renewable grant APP-SIDE and write the endpoint's
+    // ROTATED token back to BOTH the vault row (the broker write seam) and
+    // the blob — never the vault row's consumed token verbatim.
+    const s = tempSecretsDir();
+    try {
+      const env = {};
+      const probes: McpOAuthRefreshInput[] = [];
+      const persisted: Array<{ provider: string; credential: VaultOAuthCredential }> = [];
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) =>
+          provider === "notion"
+            ? [
+                {
+                  id: 9,
+                  refresh: "notion-refresh-1",
+                  clientId: "cli_notion",
+                  clientSecret: "cs_notion",
+                  expires: Date.now() + 3_600_000,
+                },
+              ]
+            : [],
+        log: SILENT,
+        // The fake rotating token endpoint: mints a fresh access token and
+        // rotates the refresh token on every exchange (Notion's behavior).
+        refreshOAuthToken: async (input) => {
+          probes.push(input);
+          return { minted: true, accessToken: "acc-minted", refreshToken: "notion-refresh-2-rotated", expiresInMs: 3_600_000 };
+        },
+        persistRotatedToken: async (provider, credential) => {
+          persisted.push({ provider, credential });
+        },
+      });
+      // The refresh seam was called with the credential's client identity +
+      // the provider's VERIFIED token endpoint (the egress map).
+      expect(probes).toEqual([
+        {
+          refreshToken: "notion-refresh-1",
+          clientId: "cli_notion",
+          clientSecret: "cs_notion",
+          tokenEndpoint: "https://mcp.notion.com/token",
+          authMethod: undefined,
+        },
+      ]);
+      // The ROTATED token was written back to the vault row (the broker
+      // update seam) — the pre-fix code never touches the vault.
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]!.provider).toBe("notion");
+      expect(persisted[0]!.credential.refresh).toBe("notion-refresh-2-rotated");
+      // The blob carries the ROTATED token — NOT the row's original.
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("notion")), "utf8"));
+      expect(blob).toEqual({
+        refresh_token: "notion-refresh-2-rotated",
+        client_id: "cli_notion",
+        client_secret: "cs_notion",
+      });
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a REJECTED refresh (invalid_grant) is never seeded renewable — the blob is deleted fail-closed", async () => {
+    // A consumed/revoked refresh token fails the grant with a 4xx. The
+    // credential must NOT be written as renewable: the blob is removed
+    // (the proxy's require:true 502s) and the rejection is receivable —
+    // never a stale blob carrying a dead token.
+    const s = tempSecretsDir();
+    try {
+      const stale = join(s.dir, proxyOAuthBlobFileName("notion"));
+      writeFileSync(stale, "{}", { mode: 0o600 });
+      const log: string[] = [];
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) =>
+          provider === "notion"
+            ? [{ id: 9, refresh: "notion-refresh-1", clientId: "cli_notion", clientSecret: "cs_notion" }]
+            : [],
+        log: (line) => log.push(line),
+        refreshOAuthToken: async () => ({ minted: false, status: 400, refreshToken: "notion-refresh-1" }),
+        persistRotatedToken: async () => {
+          throw new Error("a rejected grant must never be persisted");
+        },
+      });
+      expect(existsSync(stale)).toBe(false);
+      expect(log.join("\n")).toContain("REJECTED (HTTP 400)");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a non-renewable credential (no client secret) is unchanged — no refresh call, blob written as today", async () => {
+    // Public clients (no secret) cannot be refreshed app-side: the seed
+    // writes the blob exactly as before — no refresh round-trip, no vault
+    // write, the empty client_secret key intact.
+    const s = tempSecretsDir();
+    try {
+      const env = {};
+      let probeCalls = 0;
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) =>
+          provider === "linear" ? [{ id: 9, refresh: "linear-refresh-1", clientId: "linear-client" }] : [],
+        log: SILENT,
+        refreshOAuthToken: async () => {
+          probeCalls += 1;
+          throw new Error("the refresh seam must not run for a non-renewable credential");
+        },
+      });
+      expect(probeCalls).toBe(0);
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
+      expect(blob).toEqual({ refresh_token: "linear-refresh-1", client_id: "linear-client", client_secret: "" });
     } finally {
       s.cleanup();
     }

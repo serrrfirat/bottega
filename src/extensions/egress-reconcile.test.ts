@@ -27,7 +27,7 @@ import { AuthStorage, REMOTE_REFRESH_SENTINEL, type AuthCredential } from "@oh-m
 import { createReconcileEgress, type ReconcileEgressDeps } from "./egress-reconcile";
 import { type PinnedSnapshot } from "./registry";
 import type { RuntimeExtensionRow } from "../store/db";
-import type { VaultOAuthCredential } from "./proxy-seed";
+import type { McpOAuthRefreshProbe, RotatedTokenPersister, VaultOAuthCredential } from "./proxy-seed";
 import { createVaultTokenStore } from "./mcp-oauth";
 
 const dirs: string[] = [];
@@ -163,6 +163,10 @@ function makeHarness(opts: {
   defaultReader?: boolean;
   env?: NodeJS.ProcessEnv;
   proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
+  /** Refresh-grant seam (issue #269): forwarded to the blob seed. */
+  refreshOAuthToken?: McpOAuthRefreshProbe;
+  /** Rotated-token vault write-back seam (issue #269): forwarded to the blob seed. */
+  persistRotatedToken?: RotatedTokenPersister;
 }): Harness {
   const root = tempDir("egress-reconcile");
   const snapshotsDir = join(root, "extensions");
@@ -186,6 +190,8 @@ function makeHarness(opts: {
     readVaultRows: opts.defaultReader ? undefined : opts.readVaultRows ?? (async () => []),
     env: opts.env,
     log: () => {},
+    refreshOAuthToken: opts.refreshOAuthToken,
+    persistRotatedToken: opts.persistRotatedToken,
   };
   return { reconcile: createReconcileEgress(deps), secretsDir, egressPath, devEgressPath };
 }
@@ -226,6 +232,43 @@ describe("connect-time egress reconcile (#250)", () => {
       expect(yaml).toContain("mcp.notion.com");
       expect(yaml).toContain("notion-oauth.json");
     }
+  });
+
+  test("the connect-time reconcile refreshes a renewable credential and writes the rotated token to the vault + blob (issue #269)", async () => {
+    // The connect leg re-seeds the blob — the SAME refresh-on-seed the
+    // boot sync runs: a renewable credential (refresh + client id +
+    // secret) is refreshed app-side, and the endpoint's ROTATED token is
+    // written to BOTH the vault row (the broker write seam) and the blob.
+    const persisted: Array<{ provider: string; credential: VaultOAuthCredential }> = [];
+    const h = makeHarness({
+      committed: [["linear", linear]],
+      runtimeRows: [
+        { id: "notion", snapshot: JSON.stringify(notion), registered_by: "test-user", space_id: null, created_at: Date.now(), updated_at: Date.now() },
+      ],
+      readVaultRows: async () => [{ refresh: "rt-notion", clientId: "cli_notion", clientSecret: "cs_notion" }],
+      refreshOAuthToken: async () => ({
+        minted: true,
+        accessToken: "acc-minted",
+        refreshToken: "rt-notion-rotated",
+        expiresInMs: 3_600_000,
+      }),
+      persistRotatedToken: async (provider, credential) => {
+        persisted.push({ provider, credential });
+      },
+    });
+
+    const result = await h.reconcile("notion");
+    expect(result.warnings).toEqual([]);
+
+    // The blob carries the ROTATED token — not the vault row's original.
+    const blobPath = join(h.secretsDir, "notion-oauth.json");
+    expect(existsSync(blobPath)).toBe(true);
+    const blob = JSON.parse(readFileSync(blobPath, "utf8")) as { refresh_token?: string };
+    expect(blob.refresh_token).toBe("rt-notion-rotated");
+    // The broker write seam was called with the rotated token.
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.provider).toBe("notion");
+    expect(persisted[0]!.credential.refresh).toBe("rt-notion-rotated");
   });
 
   test("a regen for a DIFFERENT extension does not drop the runtime provider", async () => {

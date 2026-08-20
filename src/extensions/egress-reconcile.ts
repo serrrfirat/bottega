@@ -30,7 +30,13 @@ import {
   regenerateEgressConfig,
 } from "../egress/generate";
 import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
-import { readOAuthRowsFromVault, seedProxyOAuthBlob, type OAuthVaultRow } from "./proxy-seed";
+import {
+  readOAuthRowsFromVault,
+  seedProxyOAuthBlob,
+  type McpOAuthRefreshProbe,
+  type OAuthVaultRow,
+  type RotatedTokenPersister,
+} from "./proxy-seed";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { resolve } from "node:path";
@@ -55,6 +61,19 @@ export interface ReconcileEgressDeps {
   readVaultRows?: (provider: string) => Promise<Array<OAuthVaultRow>>;
   /** The env override source for the client-credential fallback; defaults to process.env. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Refresh-grant seam (issue #269): the connect-time seed refreshes a
+   * renewable credential app-side, exactly like the boot sync. Default: a
+   * real refresh-grant POST (no-op success under the test runner). Tests
+   * stub it.
+   */
+  refreshOAuthToken?: McpOAuthRefreshProbe;
+  /**
+   * Rotated-token write-back seam (issue #269): persists the endpoint's
+   * rotated refresh token to the vault row (the broker write seam).
+   * Default: the production broker-aware writer; tests stub it.
+   */
+  persistRotatedToken?: RotatedTokenPersister;
   /** Proxy control boundary (reload); defaults from env. */
   proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
   /** Log sink; defaults to console.log. */
@@ -146,7 +165,13 @@ export function createReconcileEgress(
     // 3. Seed the provider's proxy OAuth blob (defect A fixed: not
     //    boot-only). Any fail-closed gap surfaces as a receivable warning.
     try {
-      const seed = await seedProxyOAuthBlob(provider, { secretsDir, readOAuthRows: readVaultRows, env: deps.env });
+      const seed = await seedProxyOAuthBlob(provider, {
+        secretsDir,
+        readOAuthRows: readVaultRows,
+        env: deps.env,
+        refreshOAuthToken: deps.refreshOAuthToken,
+        persistRotatedToken: deps.persistRotatedToken,
+      });
       for (const note of seed.notes) log(note);
       warnings.push(...seed.warnings);
     } catch (err) {
