@@ -26,6 +26,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Browser leg (issue #298): dispatch to the real-browser canary (dedicated
+# self-hosted runner; persistent Chrome profiles). Env: BROWSER_PROFILE_DIR /
+# BROWSER_EVIDENCE_DIR / SLACK_WORKSPACE_URL + optional --journey/--role filters.
+if [[ "${1:-}" == "--layer" && "${2:-}" == "browser" ]]; then
+  shift 2 || true
+  exec bun run tests/e2e/browser-canary.ts "$@"
+fi
+if [[ "${BROWSER_CANARY:-}" == "1" ]]; then
+  exec bun run tests/e2e/browser-canary.ts "$@"
+fi
+
 # Live-Slack leg (issue #79): dispatch before the emulated-leg key loading —
 # the live runner resolves tokens AND model keys itself (env/Keychain).
 if [[ "${1:-}" == "--live-slack" || "${LIVE_SLACK:-}" == "1" ]]; then
@@ -41,6 +52,8 @@ if [[ "${1:-}" == "--live-slack" || "${LIVE_SLACK:-}" == "1" ]]; then
   # string and exec the canary with NO proxy env.
   CANARY_EGRESS="$(bun run scripts/canary-egress.ts --env)"
   eval "$CANARY_EGRESS"
+  # Pass through the focused-run filters (issue #298): --layer / --journey /
+  # --role are forwarded to the canary's live runner.
   exec bun run tests/e2e/canary.ts --live-slack "$@"
 fi
 

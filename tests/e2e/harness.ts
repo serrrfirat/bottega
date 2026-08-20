@@ -368,6 +368,8 @@ export interface SlackEmulatorHandle {
   user(name: string): string | undefined;
   /** The seeded is_im DM channel id between the bot and the human. */
   dmChannelId: string;
+  /** Per-extra-identity DM channel id (issue #298); undefined when the name is not seeded. */
+  dmChannelFor(name: string): string | undefined;
   stop(): void;
 }
 
@@ -413,12 +415,14 @@ export interface SlackHandle {
   };
   /** DM channel id between the bot and the human (emulator) / QA user (live). */
   dmChannelId: string;
+  /** Per-extra-identity DM channel id (emulator only; issue #298). */
+  dmChannelFor?(name: string): string | undefined;
   channelId(name: string): string | undefined;
   user(name: string): string | undefined;
   stop(): void;
 }
 
-function bootSlackEmulator(): SlackEmulatorHandle {
+function bootSlackEmulator(extraUserNames: string[] = []): SlackEmulatorHandle {
   // Bind once on an ephemeral port and serve the emulator through an
   // indirection. The earlier probe-then-rebind (bind port 0, stop, seed,
   // then bind the SAME port again) left a TOCTOU window in which a
@@ -435,7 +439,7 @@ function bootSlackEmulator(): SlackEmulatorHandle {
   const emu = createServer(slackPlugin, { baseUrl: `http://127.0.0.1:${http.port}` });
   seedFromConfig(emu.store, emu.baseUrl, {
     team: { name: "Bottega E2E Workspace" },
-    users: [{ name: HUMAN_USER_NAME }, { name: BOT_USER_NAME }],
+    users: [{ name: HUMAN_USER_NAME }, { name: BOT_USER_NAME }, ...extraUserNames.map((n) => ({ name: n }))],
     channels: [{ name: "ops" }],
     tokens: [{ token: BOT_TOKEN, user: BOT_USER_NAME }],
   });
@@ -462,6 +466,29 @@ function bootSlackEmulator(): SlackEmulatorHandle {
     creator: botUser.user_id,
     num_members: 2,
   });
+  // Deterministic DM per extra identity, so multi-user journeys can drive
+  // and read each member's own DM conversation (issue #298).
+  const extraDms = new Map<string, string>();
+  for (const name of extraUserNames) {
+    const user = slack.users.findOneBy("name", name)!;
+    const c = slack.channels.insert({
+      channel_id: `D${crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase()}`,
+      team_id: slack.teams.all()[0]?.team_id ?? "T000000001",
+      name,
+      is_channel: false,
+      is_private: true,
+      is_im: true,
+      is_mpim: false,
+      user: user.user_id,
+      is_archived: false,
+      topic: { value: "", creator: botUser.user_id, last_set: Math.floor(Date.now() / 1000) },
+      purpose: { value: "", creator: botUser.user_id, last_set: Math.floor(Date.now() / 1000) },
+      members: [botUser.user_id, user.user_id],
+      creator: botUser.user_id,
+      num_members: 2,
+    });
+    extraDms.set(name, c.channel_id);
+  }
 
   handlerRef.fetch = (req) => emu.app.fetch(req);
   return {
@@ -474,6 +501,9 @@ function bootSlackEmulator(): SlackEmulatorHandle {
       return slack.users.findOneBy("name", name)?.user_id;
     },
     dmChannelId: dm.channel_id,
+    dmChannelFor(name: string) {
+      return extraDms.get(name);
+    },
     stop() {
       http.stop(true);
     },
@@ -542,6 +572,14 @@ export function pickRealModelRef(env: Record<string, string | undefined> = proce
 export interface HarnessConfig {
   /** Scripted model turns; defaults to a single "ok" text turn (repeats). */
   modelTurns?: StubTurn[];
+  /**
+   * Extra emulator member identities beyond the seeded "owner" + "bottega"
+   * (issue #298): each name is seeded as a chat member with its own DM
+   * channel, so multi-user role/multiplayer journeys can drive inbound
+   * messages from different principals and read per-identity DMs. Ignored
+   * in realSlack mode (live identities come from the workspace tokens).
+   */
+  slackUsers?: string[];
   /**
    * Canary mode (issue #71): the driver resolves the REAL provider — the
    * temp agent dir gets the deployment model catalog (config/omp/models.yml:
@@ -638,8 +676,8 @@ export interface Harness {
   /** Temp org config dir (bottega config.yml). */
   configDir: string;
   transcriptDir: string;
-  /** Inbound Slack message through the real Bolt router (#29 seam). */
-  deliverMessage(channelId: string, text: string, extra?: Record<string, string>): Promise<void>;
+  /** Inbound Slack message through the real Bolt router (#29 seam); `user` is the acting principal (default: the seeded human). */
+  deliverMessage(channelId: string, text: string, extra?: Record<string, string>, user?: string): Promise<void>;
   /** Inbound block-action click through the real Bolt router (#44 seam). */
   deliverAction(action: {
     actionId: string;
@@ -766,7 +804,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // policy) is identical either way.
   const slack: SlackHandle = realSlack
     ? await bootLiveSlack(cfg.slackTokens!)
-    : bootSlackEmulator();
+    : bootSlackEmulator(cfg.slackUsers);
   // SAFETY: in realSlack mode the slack handle IS the live handle (the
   // boot branch above constructs it via bootLiveSlack); the emulator branch
   // leaves liveSlack undefined.
@@ -1014,7 +1052,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     agentDir,
     configDir,
     transcriptDir,
-    async deliverMessage(channelId, text, extra = {}) {
+    async deliverMessage(channelId, text, extra = {}, user) {
       if (realSlack) {
         // Live mode: post through the REAL API as the QA user; the message
         // event then arrives over the Socket Mode websocket exactly like a
@@ -1031,10 +1069,11 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       // without the row the store answers message_not_found (real Slack
       // would have the human's message). `messages()` filters the human's
       // own rows, so the outbound-only contract is unchanged.
+      const principal = user ?? humanUserId;
       slack.store.messages.insert?.({
         ts,
         channel_id: channelId,
-        user: humanUserId,
+        user: principal,
         text,
         type: "message",
         reactions: [],
@@ -1042,7 +1081,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       await app.processEvent({
         body: {
           type: "event_callback",
-          event: { type: "message", channel: channelId, user: humanUserId, text, ts, ...extra },
+          event: { type: "message", channel: channelId, user: principal, text, ts, ...extra },
         },
         ack: async () => {},
       });

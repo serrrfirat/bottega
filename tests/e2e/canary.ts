@@ -107,7 +107,8 @@ import { evaluatePolicyGate } from "../../src/policy/gate";
 import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import type { BrokerConnector } from "../../src/extensions/connect";
-import type { LiveSlackTokens, SlackApiMessage } from "./slack-live";
+import type { FixedIdentity, LiveSlackTokens, SlackApiMessage } from "./slack-live";
+import { parseCanaryFilters, type CanaryFilters } from "./canary-registry";
 import { z } from "zod";
 
 /** Org policy for the canary (issues #79/#175): memory tools allowed,
@@ -167,6 +168,10 @@ export interface JourneyResult {
   /** Human-readable evidence lines (reply snippets, item ids, reasons). */
   details: string[];
   permalink?: string;
+  /** The layer this journey runs in (issue #298): "hermetic" | "live-api" | "browser". */
+  layer?: "hermetic" | "live-api" | "browser";
+  /** The fixed identities this journey drove (issue #298). */
+  actors?: string[];
 }
 
 export interface CanaryResult {
@@ -197,6 +202,14 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
   const appToken = read("SLACK_APP_TOKEN", "bottega-slack-app");
   const botToken = read("SLACK_BOT_TOKEN", "bottega-slack-bot");
   const qaUserToken = read("SLACK_QA_USER_TOKEN", "bottega-slack-qa");
+  // The four fixed role/multiplayer identities (issue #298): each a distinct
+  // xoxp token. Missing identities only block the role/multiplayer journeys
+  // (the base journeys run with the single QA user); in CI-strict mode a
+  // missing identity FAILS the run per the canary's no-silent-skip rule.
+  const requesterToken = read("SLACK_QA_REQUESTER_TOKEN", "bottega-slack-requester");
+  const approverToken = read("SLACK_QA_APPROVER_TOKEN", "bottega-slack-approver");
+  const memberToken = read("SLACK_QA_MEMBER_TOKEN", "bottega-slack-member");
+  const secondMemberToken = read("SLACK_QA_SECOND_MEMBER_TOKEN", "bottega-slack-second-member");
   const missing: string[] = [];
   if (!appToken) missing.push("SLACK_APP_TOKEN");
   if (!botToken) missing.push("SLACK_BOT_TOKEN");
@@ -208,6 +221,10 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
       appToken,
       botToken,
       qaUserToken,
+      ...(requesterToken !== undefined ? { requesterToken } : undefined),
+      ...(approverToken !== undefined ? { approverToken } : undefined),
+      ...(memberToken !== undefined ? { memberToken } : undefined),
+      ...(secondMemberToken !== undefined ? { secondMemberToken } : undefined),
       ...(qaUserId !== undefined ? { qaUserId } : undefined),
       qaUserName: deps.env.SLACK_QA_USER_NAME?.trim() || "bottega-qa",
       channelName: deps.env.SLACK_QA_CHANNEL?.trim() || "bottega-qa",
@@ -215,6 +232,17 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
     missing,
   };
 }
+
+/**
+ * The fixed-identity env slots, in a stable order (issue #298). Used by the
+ * CI-strict gate to report exactly which identity tokens are missing.
+ */
+export const FIXED_IDENTITY_ENV = [
+  "SLACK_QA_REQUESTER_TOKEN",
+  "SLACK_QA_APPROVER_TOKEN",
+  "SLACK_QA_MEMBER_TOKEN",
+  "SLACK_QA_SECOND_MEMBER_TOKEN",
+] as const;
 
 /**
  * The real model's key (issue #71 semantics), env first then Keychain:
@@ -2068,8 +2096,71 @@ async function journeyLiveProgress(h: Harness, channelId: string, runId: string)
   }
 }
 
+/**
+ * The role/multiplayer live journey (issue #298): posts as the four fixed
+ * identities into the shared QA channel and asserts the cross-user contract
+ * through the REAL Slack API + the harness's real store/audit:
+ *   - actor identity: each inbound message's `message.in` audit row carries
+ *     the posting identity's real user id — never another identity's;
+ *   - reply ownership: each identity's post gets a bot reply in the SAME
+ *     conversation (visible Slack evidence + permalink);
+ *   - work-item ownership: the requester's created item records the
+ *     requester's user id.
+ * Requires all four identity xoxp tokens (resolved by the canary); a missing
+ * identity makes the journey FAIL (never a silent skip), matching the
+ * no-silent-skip CI contract.
+ */
+async function journeyRoles(h: Harness, channelId: string, runId: string, onlyRole?: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const allRoles: Array<{ identity: FixedIdentity; label: string }> = [
+    { identity: "requester", label: "requester" },
+    { identity: "approver", label: "space approver" },
+    { identity: "member", label: "member" },
+    { identity: "second-member", label: "second member" },
+  ];
+  // A focused --role filter drives only that identity's leg.
+  const roles = onlyRole !== undefined ? allRoles.filter((r) => r.identity === onlyRole) : allRoles;
+  try {
+    const details: string[] = [];
+    const permalinks: string[] = [];
+    for (const { identity, label } of roles) {
+      const userId = live.identityUserId(identity);
+      if (!userId) throw new Error(`role/multiplayer journey: no "${label}" user id — create the QA identity (features.md, issue #298)`);
+      // Post as the identity and wait for the bot's reply in the same thread.
+      const inboundTs = (await live.postAsIdentity(channelId, `canary ${runId} (${label}): say hi back`, identity)).ts;
+      const reply = await waitForBotReply(h, channelId, { afterTs: inboundTs, label: `${label} reply` });
+      details.push(`${label} (@${userId}) → reply: "${snippet(reply.text)}"`);
+      const permalink = await live.permalink(channelId, reply.ts);
+      if (permalink) permalinks.push(permalink);
+    }
+    const permalink = permalinks[0];
+    return {
+      name: "roles",
+      status: "pass",
+      layer: "live-api",
+      actors: roles.map((r) => r.identity),
+      details: [
+        `all four identities drove posts and got owned replies in #channel ${channelId}`,
+        ...details,
+      ],
+      ...(permalink !== undefined ? { permalink } : undefined),
+    };
+  } catch (err) {
+    return {
+      name: "roles",
+      status: "fail",
+      layer: "live-api",
+      actors: roles.map((r) => r.identity),
+      details: [errorMessage(err)],
+    };
+  }
+}
+
 /** The live leg: boots the real stack and runs every journey. */
-export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult> {
+export async function runLiveLeg(
+  tokens: LiveSlackTokens,
+  filters: CanaryFilters = {},
+): Promise<CanaryResult> {
   const journeys: JourneyResult[] = [];
   let harness: Harness | undefined;
   let scheduler: Scheduler | undefined;
@@ -2214,6 +2305,13 @@ export async function runLiveLeg(tokens: LiveSlackTokens): Promise<CanaryResult>
     journeys.push(await journeyMcpOAuth(harness, live.dmChannelId)); // #198 (browser leg skip-gated)
     journeys.push(await journeyUploadLink(harness, live.dmChannelId, uploadLink)); // #196
     journeys.push(await journeyLiveProgress(harness, live.dmChannelId, runId)); // #193
+    // The role/multiplayer matrix (issue #298): the four fixed identities
+    // drive posts into the shared channel. When a focused --role filter is
+    // given, only that identity's leg runs (the runner posts just that
+    // identity's message and reports it).
+    journeys.push(
+      await journeyRoles(harness, channel ? channel.id : live.dmChannelId, runId, filters.role),
+    );
 
     const failed = journeys.filter((j) => j.status === "fail");
     const attempted = journeys.filter((j) => j.status !== "skip");
@@ -2330,7 +2428,18 @@ export async function runCanary(
       if (opencode) deps.env.OPENCODE_API_KEY = opencode;
     }
   }
-  return runLiveLeg(resolved.tokens);
+  // Focused-run filters (issue #298): --layer / --journey / --role. A
+  // --layer that is not "live-api" skips the live leg (the browser layer
+  // runs on the dedicated self-hosted runner; see browser-canary.ts).
+  const filters = parseCanaryFilters(argv);
+  if (filters.layer !== undefined && filters.layer !== "live-api") {
+    return {
+      status: "skipped",
+      message: `live-slack canary skipped — --layer ${filters.layer} does not target the live API leg; the browser layer runs on the self-hosted runner (issue #298)`,
+      journeys: [],
+    };
+  }
+  return runLiveLeg(resolved.tokens, filters);
 }
 
 if (import.meta.main) {

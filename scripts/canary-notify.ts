@@ -9,6 +9,7 @@
  */
 import { readFileSync } from "node:fs";
 import { SlackApiClient } from "../tests/e2e/slack-live";
+import { classifyRerun } from "./canary-rerun";
 
 const reportPath = process.argv[2] ?? "canary-report.txt";
 const token = process.env.SLACK_BOT_TOKEN;
@@ -48,8 +49,34 @@ const channel = list.channels.find((c) => c.name === channelName)?.id ?? channel
 const text = [
   "SCHEDULED LIVE-SLACK CANARY FAILED",
   "```" + report() + "```",
+  rerunContext(),
   runUrl !== undefined ? `See the run: ${runUrl}` : "See the GitHub Actions run for the full report.",
+  "Evidence: the canary-report.txt / canary-rerun.txt / canary-status.json artifacts (per-journey status, permalinks, redacted blocks) are in the run.",
 ].join("\n");
 
 await client.call("chat.postMessage", { channel, text });
 console.log(`canary-notify: failure report posted to #${channelName}`);
+
+/** One-isolated-rerun context (issue #298): distinct when a flake recovered. */
+function rerunContext(): string {
+  let original: string;
+  try {
+    original = readFileSync(reportPath, "utf8");
+  } catch {
+    return "";
+  }
+  const rerunPath = process.env.CANARY_RERUN_REPORT;
+  if (rerunPath === undefined || !readFileSyncQuiet(rerunPath)) return "";
+  const classification = classifyRerun(original, readFileSyncQuiet(rerunPath));
+  return classification.recoveredOnRerun
+    ? "The isolated RERUN recovered (flake), but the ORIGINAL failure is release-blocking — confirm the root cause before deploy."
+    : "";
+}
+
+function readFileSyncQuiet(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}

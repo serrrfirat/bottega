@@ -187,17 +187,33 @@ double local.
   provider keys) is a **manual checklist** in `setup.md` / `scripts/smoke.sh`.
   Never report it as passing without running it.
 
-## Scheduled live-Slack canary (issue #175)
+## Hybrid canary (issue #298; nightly live-API + browser, hermetic on every commit)
 
-`.github/workflows/canary.yml` runs the live-Slack canary
-(`tests/e2e/canary.ts`, issue #79) weekly against the dedicated QA
-workspace — real Socket Mode, real model, real Slack — with repository
-secrets (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN`,
-`NEAR_API_KEY`/`CANARY_MODEL_REF`; see features.md → "Live-Slack QA
-canary" for the full list). It runs CI-strict (`--ci`): missing
-credentials FAIL the job instead of skipping — a canary that silently
-skips in CI is worse than none. On failure it posts the per-journey report
-+ permalinks + the run URL to the QA channel.
+The canary is three layers sharing stable journey ids
+(`tests/e2e/canary-registry.ts` is the source of truth). The **hermetic**
+layer (role/multiplayer journeys + the built-in-tool coverage gate) runs
+on every commit — a surfaced built-in tool without a journey or an
+explicit exclusion fails CI. The **live-API** and **browser** layers run
+**nightly in parallel** via `.github/workflows/canary.yml`:
+
+- **live-API** — `tests/e2e/canary.ts`, issue #79: real Socket Mode + real
+  model + real Slack against the dedicated QA workspace, CI-strict
+  (`--ci`), now with the **four fixed QA identities** (requester, space
+  approver, member, second member — `SLACK_QA_REQUESTER/APPROVER/MEMBER/
+  SECOND_MEMBER_TOKEN`). Missing credentials FAIL the job, never a silent
+  skip. On failure it posts the per-journey report + permalinks + the run
+  URL (with layer/actors + rerun context) to the QA channel.
+- **browser** — `tests/e2e/browser-canary.ts`: real Chromium via CDP on a
+  dedicated **self-hosted runner** with two persistent Chrome profiles
+  (requester + approver user-data dirs, runner-local paths, never
+  secrets). Preflights both authenticated profiles, uploads screenshot +
+  trace evidence, fails loudly. A browser journey never reports pass
+  without observing its final visible state + durable proof.
+
+**One isolated rerun** on a failed live journey classifies a flake; the
+ORIGINAL failure stays release-blocking and a recovered-on-rerun is
+reported distinctly. A machine-readable status artifact (`canary-status.json`,
+green + <24h fresh) is what release automation checks.
 
 - **Release gate, not a merge gate.** The scheduled canary is live infra
   and can flake, so it never gates merges; a red scheduled run BLOCKS the
@@ -206,13 +222,14 @@ skips in CI is worse than none. On failure it posts the per-journey report
   run before deploying.
 - **One journey per major feature, as features land.** When a shipped
   feature lands, it gets a canary journey (chat reply, memory, work-item,
-  connect intent, scheduled standup, extension call, model role switch;
-  delivery approval once #149 lands). A journey asserts the human-visible
-  round-trip with deterministic store/audit evidence, never a fabricated
-  pass. Missing tokens locally → skip-and-exit-0 stays correct; in CI →
-  fail.
+  connect intent, scheduled standup, extension call, model role switch,
+  delivery approval, and the role/multiplayer matrix). A journey asserts
+  the human-visible round-trip with deterministic store/audit evidence,
+  never a fabricated pass. Missing tokens locally → skip-and-exit-0 stays
+  correct; in CI → fail.
 - Never run the live leg in ad-hoc CI without `--ci` (it stays skip-gated
-  there); never report a live journey as passing without running it.
+  there); never report a live or browser journey as passing without
+  running it.
 
 ## Code discipline
 

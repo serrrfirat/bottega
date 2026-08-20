@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "bash scripts/dev.sh",
     "canary": "bash scripts/canary.sh",
+    "canary:browser": "bun run tests/e2e/browser-canary.ts",
+    "canary:rerun": "bun run scripts/canary-rerun.ts",
     "check": "tsc --noEmit",
     "lint": "bun --bun x oxlint",
     "test": "bun test --parallel=1 tests/e2e src/models/proxy-placeholder.test.ts && bun test --path-ignore-patterns 'tests/e2e/**' --path-ignore-patterns 'src/models/proxy-placeholder.test.ts'",

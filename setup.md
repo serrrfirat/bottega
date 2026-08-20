@@ -389,26 +389,40 @@ install -m 0600 /path/to/your-pat data/secrets/github-pat
 > only with the `executor` profile enabled, as above. Drop `--profile
 > executor` to run without it.
 
-### Scheduled live-Slack canary (issue #175)
+### Hybrid canary (issue #298): nightly live-API + browser, hermetic on every commit
 
-The live-Slack QA canary (issue #79 — the only true "does the product
-work" check: real Socket Mode, real model, real workspace) runs on a
-schedule in CI (`.github/workflows/canary.yml`, weekly Monday 06:00 UTC)
-against the dedicated QA workspace. Configure these **GitHub Actions
-repository secrets** (see features.md → "Live-Slack QA canary" for the QA
-user + token setup):
+The hybrid canary's **hermetic** layer (role/multiplayer journeys + the
+built-in-tool coverage gate) runs on every commit as part of the suite.
+The **live-API** and **browser** layers run **nightly in parallel**
+(`.github/workflows/canary.yml`, cron `0 4 * * *`), issue #79/#175/#298:
 
-- `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN` — required.
-- `SLACK_QA_USER_ID`, `SLACK_QA_CHANNEL` — optional (defaults: users.list
-  lookup, `bottega-qa`).
-- `NEAR_API_KEY` (preferred) or `CANARY_MODEL_REF` — the model key/ref.
+- The **live-API leg** (real Socket Mode, real model, real workspace,
+  CI-strict `--ci`) now needs the **four fixed QA identities** in
+  addition to the single QA user. Configure these **GitHub Actions
+  repository secrets** (see features.md → "Live-Slack QA canary" for the
+  QA-user + token setup):
+  - `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_QA_USER_TOKEN` — required.
+  - `SLACK_QA_REQUESTER_TOKEN`, `SLACK_QA_APPROVER_TOKEN`,
+    `SLACK_QA_MEMBER_TOKEN`, `SLACK_QA_SECOND_MEMBER_TOKEN` — required for
+    the role/multiplayer matrix.
+  - `SLACK_QA_USER_ID`, `SLACK_QA_CHANNEL` — optional (defaults: users.list
+    lookup, `bottega-qa`).
+  - `NEAR_API_KEY` (preferred) or `CANARY_MODEL_REF` — the model key/ref.
+- The **browser leg** runs on a **dedicated self-hosted runner** with two
+  persistent Chrome user-data directories (requester + approver profiles,
+  runner-local paths supplied as repository **variables**, never secrets).
+  Configure the runner label (`[self-hosted, linux, x64, canary]`) and the
+  variables `BROWSER_PROFILE_REQUESTER`, `BROWSER_PROFILE_APPROVER`,
+  `SLACK_WORKSPACE_URL`. It preflights both authenticated profiles and
+  uploads screenshot + trace evidence.
 
-The job runs CI-strict (`--ci`): missing secrets fail the run loudly
-instead of skipping, and a failure posts the per-journey report +
-permalinks + the run URL to the QA channel. **The scheduled canary is a
-release gate, not a merge gate**: a red scheduled run blocks the next
-deploy until triaged (AGENTS.md → "Scheduled live-Slack canary (issue
-#175)").
+A failure posts the per-journey report + permalinks + the run URL to the
+QA channel. **One isolated rerun** classifies a flake but the ORIGINAL
+failure stays release-blocking; a machine-readable status artifact
+(`canary-status.json`) lets release automation verify green + <24h fresh.
+**The scheduled canary is a release gate, not a merge gate**: a red
+scheduled run blocks the next deploy until triaged (AGENTS.md → "Hybrid
+canary (issue #298)").
 
 ### GitHub credentials: the two token paths
 

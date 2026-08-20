@@ -29,6 +29,17 @@ export interface LiveSlackTokens {
   botToken: string;
   /** QA user token (xoxp-...) — drives inbound as the human. */
   qaUserToken: string;
+  /**
+   * The four fixed role/multiplayer identities (issue #298), each a
+   * distinct workspace user with its own xoxp token. Optional — the base
+   * journeys only need the single QA user; the role/multiplayer journeys
+   * fail in CI when any is missing. The user ids resolve from users.list by
+   * name when the corresponding id is absent.
+   */
+  requesterToken?: string;
+  approverToken?: string;
+  memberToken?: string;
+  secondMemberToken?: string;
   /** QA user id; resolved from users.list by name when absent (SLACK_QA_USER_ID). */
   qaUserId?: string;
   /** users.list name filter for the QA user; default "bottega-qa". */
@@ -36,6 +47,21 @@ export interface LiveSlackTokens {
   /** Channel the canary creates/locates; default "bottega-qa". */
   channelName?: string;
 }
+
+/**
+ * The four fixed role/multiplayer identities (issue #298): requester, space
+ * approver, ordinary member, second member. Each maps to a distinct
+ * workspace user + its own xoxp token for live-role journeys.
+ */
+export type FixedIdentity = "requester" | "approver" | "member" | "second-member";
+
+/** The token slot + user-id slot for one of the four fixed identities. */
+const FIXED_IDENTITY_SLOTS: Record<FixedIdentity, { tokenKey: "requesterToken" | "approverToken" | "memberToken" | "secondMemberToken"; userNameEnv: string }> = {
+  requester: { tokenKey: "requesterToken", userNameEnv: "SLACK_QA_REQUESTER_NAME" },
+  approver: { tokenKey: "approverToken", userNameEnv: "SLACK_QA_APPROVER_NAME" },
+  member: { tokenKey: "memberToken", userNameEnv: "SLACK_QA_MEMBER_NAME" },
+  "second-member": { tokenKey: "secondMemberToken", userNameEnv: "SLACK_QA_SECOND_MEMBER_NAME" },
+};
 
 /** A raw message row as Slack's history APIs return it. */
 export interface SlackApiMessage {
@@ -192,6 +218,14 @@ export interface LiveSlackHandle {
   replies(channelId: string, threadTs: string): Promise<SlackApiMessage[]>;
   /** Post a message AS the QA user; resolves with the posted message's identity. */
   postAsUser(channelId: string, text: string): Promise<PostedSlackMessage>;
+  /**
+   * Post as any of the four fixed identity tokens (issue #298): the
+   * requester / approver / member / second-member xoxp tokens from
+   * `tokens`. Throws when the named identity has no token wired.
+   */
+  postAsIdentity(channelId: string, text: string, identity: FixedIdentity): Promise<PostedSlackMessage>;
+  /** The resolved user id for one of the four fixed identities; undefined when the token is absent. */
+  identityUserId(identity: FixedIdentity): string | undefined;
   /** Permalink for a message (bot token, chat.getPermalink). */
   permalink(channelId: string, ts: string): Promise<string | undefined>;
   // --- SlackHandle-shaped sync surface (cached) ---------------------------
@@ -232,6 +266,23 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
       `live-slack: QA user "${tokens.qaUserName ?? "bottega-qa"}" not found via users.list — ` +
         "create the test user (features.md, issue #79) or pass SLACK_QA_USER_ID",
     );
+  }
+
+  // The four fixed identity tokens + their resolved user ids (issue #298).
+  // A token's user id resolves from users.list by the identity's name env
+  // (default "{role}" seen below) when no explicit id is provided; the
+  // live-role journey requires the id to FAIL loudly when the workspace
+  // lacks the user.
+  const identityClients = new Map<FixedIdentity, SlackApiClient>();
+  const identityUserIds = new Map<FixedIdentity, string>();
+  for (const identity of Object.keys(FIXED_IDENTITY_SLOTS) as FixedIdentity[]) {
+    const slot = FIXED_IDENTITY_SLOTS[identity];
+    const token = tokens[slot.tokenKey];
+    if (!token) continue;
+    identityClients.set(identity, new SlackApiClient(token));
+    const name = process.env[slot.userNameEnv]?.trim() || identity.replace("-", "-");
+    const found = usersCache.find((m) => m.name === name || m.real_name === name)?.user_id;
+    if (found) identityUserIds.set(identity, found);
   }
 
   // QA DM: conversations.open with the bot token; fall back to im.open with
@@ -355,6 +406,26 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
         ts: res.ts,
         ...(res.message?.thread_ts !== undefined ? { thread_ts: res.message.thread_ts } : undefined),
       };
+    },
+    async postAsIdentity(channelId, text, identity) {
+      const client = identityClients.get(identity);
+      if (!client) {
+        throw new Error(
+          `live-slack: identity "${identity}" has no xoxp token wired — the role/multiplayer journey needs it (issue #298)`,
+        );
+      }
+      const res = await client.call<{ ts: string; message?: { ts?: string; thread_ts?: string } }>("chat.postMessage", {
+        channel: channelId,
+        text,
+        as_user: true,
+      });
+      return {
+        ts: res.ts,
+        ...(res.message?.thread_ts !== undefined ? { thread_ts: res.message.thread_ts } : undefined),
+      };
+    },
+    identityUserId(identity) {
+      return identityUserIds.get(identity);
     },
     async permalink(channelId, ts) {
       try {

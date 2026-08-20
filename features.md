@@ -636,6 +636,10 @@ with repository secrets:
 | `SLACK_APP_TOKEN` | yes | Socket Mode app token (xapp) |
 | `SLACK_BOT_TOKEN` | yes | bot user token (xoxb) |
 | `SLACK_QA_USER_TOKEN` | yes | QA user token (xoxp) |
+| `SLACK_QA_REQUESTER_TOKEN` | roles | requester identity xoxp (issue #298) |
+| `SLACK_QA_APPROVER_TOKEN` | roles | space-approver identity xoxp (issue #298) |
+| `SLACK_QA_MEMBER_TOKEN` | roles | ordinary-member identity xoxp (issue #298) |
+| `SLACK_QA_SECOND_MEMBER_TOKEN` | roles | second-member identity xoxp (issue #298) |
 | `SLACK_QA_USER_ID` | no | skips the users.list name lookup |
 | `SLACK_QA_CHANNEL` | no | defaults to `bottega-qa` |
 | `NEAR_API_KEY` | one of | the model key (preferred — the NEAR gateway accepts the agent's dotted tool names, issue #71) |
@@ -651,6 +655,59 @@ triages it. **One journey per major feature, added as features land** —
 when a feature ships, it gets a canary journey in the priority order above.
 Both policies live in AGENTS.md → "Scheduled live-Slack canary (issue
 #175)".
+
+### Hybrid layers + nightly cadence (issue #298)
+
+The canary is three layers sharing stable journey ids
+(`tests/e2e/canary-registry.ts` is the source of truth for what every
+journey covers):
+
+1. **hermetic** — deterministic caller-level role/multiplayer journeys
+   through the real SpaceService/store/policy/Slack emulator path. Run on
+   every commit (these are part of the suite). The built-in-tool coverage
+   gate fails CI when a surfaced built-in tool lacks a journey or an
+   explicit exclusion.
+2. **live-api** — strict nightly journeys against the real Slack API with
+   the four fixed QA identities (requester, space approver, member, second
+   member). Run **nightly in parallel** with the browser leg.
+3. **browser** — real-browser journeys on a **dedicated self-hosted
+   runner** with two persistent Chrome profiles.
+
+The live-API and browser legs run **nightly in parallel**
+(`.github/workflows/canary.yml`, cron `0 4 * * *`). Manual dispatch
+supports focused `--layer` / `--journey` / `--role` filters. **One
+isolated rerun** classifies a flake but the ORIGINAL failure stays
+release-blocking; a recovered-on-rerun is reported distinctly. A
+machine-readable status artifact (`canary-status.json` per leg: green +
+freshness <24h) is what release automation checks — this remains a
+**release gate, never a merge gate**.
+
+### Browser layer + the self-hosted runner (issue #298)
+
+The browser layer runs the five registered journeys
+(`browser.dm-card-lifecycle`, `browser.approve-deny-buttons`,
+`browser.native-chart-citation`, `browser.connect-upload`,
+`browser.threaded-multiplayer`) in a real Chromium via the Chrome
+DevTools Protocol (no Playwright/Puppeteer dependency — the platform
+Chrome + protocol are used). It drives Slack with semantic /
+accessibility-first selectors and **never reports a pass without observing
+the final visible state and its durable/API proof**. On any failure it
+captures a screenshot + a CDP trace into the evidence directory, uploaded
+as a workflow artifact.
+
+- The job targets the self-hosted label `[self-hosted, linux, x64,
+  canary]` (a dedicated runner with Google Chrome installed).
+- Two persistent Chrome **user-data directories** hold the workspace
+  sessions pre-authenticated (requester + approver). They are supplied as
+  **runner-local paths** — repository *variables* (`BROWSER_PROFILE_REQUESTER`,
+  `BROWSER_PROFILE_APPROVER`, `SLACK_WORKSPACE_URL`), **never secrets**:
+  Slack browser cookies/passwords are never stored in GitHub secrets.
+- The job preflights both authenticated profiles and uploads the evidence
+  artifact regardless of result, then fails loudly when a journey fails —
+  a browser journey never silently skips or fabricates a pass.
+- Run locally on the runner:
+  `BROWSER_PROFILE_DIR=… SLACK_WORKSPACE_URL=… bun run canary:browser`
+  (the `canary:browser` script; `--journey` / `--role` focus a run).
 
 ### QA user + tokens
 
