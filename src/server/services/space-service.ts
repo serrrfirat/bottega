@@ -488,7 +488,13 @@ export class SpaceService {
           // the turn was mid-flight when the message arrived.
           presenter.activateInbound(msg);
           presenter.setSteered(true);
-          await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
+          try {
+            await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
+          } finally {
+            // Issue #296: settle the steered DM request on resolve OR reject
+            // (a rejected steer must still release the wedged request).
+            await this.#settleAndDrain(msg.spaceId);
+          }
           return;
         }
         // Queued: the receipt (👀 reaction, message.in audit) already
@@ -515,7 +521,17 @@ export class SpaceService {
         // turn instead of opening a second one. Best-effort: never blocks
         // the turn on a model misconfiguration.
         await live.session.reapplyDefaultModelRole?.();
-        await live.session.prompt(turnText, { principal: msg.principal });
+        try {
+          await live.session.prompt(turnText, { principal: msg.principal });
+          // Issue #296: the opening prompt's resolution is the true request
+          // end — NOT the SDK's per-round turn_end events.
+        } finally {
+          // A REJECTED prompt (after onError buffered the failure) must also
+          // finalize the DM card and drain the queue; finally runs on resolve
+          // AND reject. #settleAndDrain never throws, so it cannot mask the
+          // prompting error the outer catch logs.
+          await this.#settleAndDrain(msg.spaceId);
+        }
       }
     } catch (err) {
       console.error(`[space-service] failed to handle message in ${msg.spaceId}:`, err);
@@ -666,7 +682,14 @@ export class SpaceService {
       // Issue #219: after the running turn finishes, drain ONE queued
       // message as its own fresh turn; that turn's turn_end re-enters
       // here, so the queue empties one message per turn in arrival order.
-      void this.#drainQueue(spaceId);
+      // Issue #296: a pending top-level DM request emits turn_end after
+      // EVERY internal SDK tool round — that is NOT the request end. Drain
+      // only when no DM request is pending (channels/threads keep the
+      // turn_end drain; a DM drains once its opening prompt settles, at
+      // the call sites signaling onRequestSettled).
+      if (!this.#presenterFor(spaceId).isDmRequestPending()) {
+        void this.#drainQueue(spaceId);
+      }
     });
     // Issue #193: live reasoning chunks render as the in-place progress
     // phrase on the plain path (the panel path ignores them).
@@ -722,9 +745,38 @@ export class SpaceService {
       // role like any other fresh turn, then prompt without a streaming
       // behavior — own phrase, own reply, own principal (issue #152).
       await live.session.reapplyDefaultModelRole?.();
-      await live.session.prompt(entry.text, { principal: entry.principal });
+      try {
+        await live.session.prompt(entry.text, { principal: entry.principal });
+      } finally {
+        // Issue #296: a DRAINED top-level DM request also settles on resolve
+        // OR reject — a rejection after onError buffered the failure must
+        // still finalize the drained card and drain the NEXT queued message.
+        await this.#settleAndDrain(spaceId);
+      }
     } catch (err) {
       console.error(`[space-service] queue drain failed in ${spaceId}:`, err);
+    }
+  }
+
+  /**
+   * Issue #296: settles a pending top-level DM request and drains ONE
+   * queued message, running after the opening prompt's RESOLUTION OR
+   * REJECTION — a prompt can reject after {@link SlackTurnPresenter.onError}
+   * buffered the failure, and a REJECTED request must still finalize its
+   * card and clear the pending-request state so the queue drains and later
+   * turns get a fresh card (never a wedged reuse). {@link SlackTurnPresenter.onRequestSettled}
+   * is idempotent, so a steered request settling from both paths drains
+   * exactly once. Never throws — a settlement/drain failure is logged, never
+   * allowed to mask the prompting error (or the outer handleInboundMessage
+   * catch) it follows.
+   */
+  async #settleAndDrain(spaceId: string): Promise<void> {
+    const presenter = this.#presenterFor(spaceId);
+    if (!presenter.onRequestSettled()) return;
+    try {
+      await this.#drainQueue(spaceId);
+    } catch (err) {
+      console.error(`[space-service] settlement drain failed in ${spaceId}:`, err);
     }
   }
 
