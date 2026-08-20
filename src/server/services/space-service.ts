@@ -438,21 +438,33 @@ export class SpaceService {
         });
         return;
       }
-      // Receipt responsiveness (issue #119/#168): the thinking phrase (or
-      // the stream opening), the reaction ack, and the receipt audit all
-      // happen NOW — before the session cold-start below — so a slow
-      // createSession is never silent. Each is fire-and-forget: the turn
-      // path never blocks on Slack latency or a missing reactions:write
-      // scope. The space's turn presenter owns all of it.
+      // Receipt responsiveness (issue #119/#168): the reaction ack and the
+      // receipt audit always happen NOW, and a FRESH turn's phrase (or
+      // stream opening) posts before the session cold-start below — so a
+      // slow createSession is never silent. Each is fire-and-forget: the
+      // turn path never blocks on Slack latency or a missing
+      // reactions:write scope. The space's turn presenter owns all of it.
       const presenter = this.#presenterFor(msg.spaceId);
       // Issue #219 safe-window snapshot: taken BEFORE the receipt resets
-      // turn-rendering state (onInbound re-arms the phrase and clears the
+      // turn-rendering state (activation re-arms the phrase and clears the
       // delivered flag), so it reflects the RUNNING turn as this message
       // arrived — a message landing after the final reply committed or
       // while a tool call is in flight can never steer. Only consulted on
       // the streaming branch; fresh turns ignore it.
       const steerSafe = presenter.canSteer();
-      presenter.onInbound(msg);
+      // Issue #289: the receipt (👀 reaction + message.in audit) happens
+      // at queue time for EVERY inbound. The message identity — threading
+      // base, conversation root, thinking phrase — activates ONLY when a
+      // turn actually starts (fresh/steer below, or onQueueDrain for a
+      // queued message); a queued message must never retarget the running
+      // turn's reply or open a placeholder for a turn that has not begun.
+      presenter.receipt(msg);
+      // A message that will start a FRESH turn activates NOW (issue #119:
+      // the phrase posts before a slow session cold-start). Only a message
+      // landing mid-turn defers: it may queue (never activates) or steer
+      // (activates at the steer decision below).
+      const midTurn = existing !== undefined && existing.session.isStreaming();
+      if (!midTurn) presenter.activateInbound(msg);
       const turnText = await this.#ingestAttachments(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
@@ -471,13 +483,17 @@ export class SpaceService {
         // extension calls.
         const isCorrection = await this.#classifier.classify(turnText);
         if (isCorrection === "correction" && steerSafe) {
+          // The steer owns the turn surface from here (issues #215/#40):
+          // activate the steer's identity — deferred at receipt because
+          // the turn was mid-flight when the message arrived.
+          presenter.activateInbound(msg);
           presenter.setSteered(true);
           await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
           return;
         }
-        // Queued: the receipt (phrase rotation, 👀 reaction, message.in
-        // audit) already happened above via onInbound, so the user knows
-        // the message was received; the "+N waiting" indicator makes
+        // Queued: the receipt (👀 reaction, message.in audit) already
+        // happened above; identity activation happens at DRAIN time via
+        // onQueueDrain — never here. The "+N waiting" indicator makes
         // "and is next" visible on the live line.
         const queue = this.#queues.get(msg.spaceId) ?? [];
         queue.push({ text: turnText, principal: msg.principal, ts: msg.ts, rootThreadTs: msg.threadTs });
@@ -487,6 +503,9 @@ export class SpaceService {
         // Non-streaming turn: replies update in place immediately, unbatched.
         // The principal travels WITH this turn: the driver binds it when the
         // fresh turn starts and drops it at turn_end (issue #152).
+        // Activate when the receipt-time activation was deferred (the
+        // session settled mid-flight); already activated → skip.
+        if (midTurn) presenter.activateInbound(msg);
         presenter.setSteered(false);
         // Issue #189: hot-swap the default model BEFORE the fresh turn opens
         // — re-resolve the "default" role against the CURRENT settings and

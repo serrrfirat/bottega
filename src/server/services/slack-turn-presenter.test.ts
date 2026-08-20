@@ -1143,6 +1143,58 @@ describe("SlackTurnPresenter: threaded inbound turns (issue #289)", () => {
       { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
     ]);
   });
+
+  test("receipt() alone (queue time) never activates the turn surface; activateInbound() opens it when the turn starts", async () => {
+    const rec = recordingAdapter();
+    const { store, audit } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // Queue-time receipt of a top-level message that will QUEUE behind the
+    // running turn: reaction + message.in audit only. The turn identity
+    // (threading base, placeholder) must stay untouched — a queued message
+    // must never retarget the running turn (issue #289 review).
+    const m = msg({ ts: "5.0" });
+    presenter.receipt(m);
+    await flush();
+    expect(rec.posts).toHaveLength(0); // no placeholder at queue time
+    expect(rec.reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "5.0" }]);
+    expect(audit.map((a) => a.event_type)).toContain(MESSAGE_RECEIVED_EVENT);
+    expect(presenter.latestInboundTs()).toBeUndefined(); // identity untouched
+
+    // The message's turn actually starts: identity activation opens the
+    // phrase under the message.
+    presenter.activateInbound(m);
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "5.0" } }]);
+    expect(presenter.latestInboundTs()).toBe("5.0");
+  });
+
+  test("a threaded drain re-arms the steer safe-window: the delivered flag resets even though no placeholder opens (issue #289 review)", async () => {
+    const rec = recordingAdapter();
+    const presenter = threadedPresenter(rec);
+
+    // A delivered top-level turn closes the steer safe-window (#219).
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onMessage({ spaceId: "slack:C1", text: "answered" });
+    await flush();
+    expect(presenter.canSteer()).toBe(false);
+
+    // A threaded drain opens a FRESH turn: reaction-only (no placeholder —
+    // the post count must not grow), but the fresh-turn bookkeeping must
+    // reset so the drained turn can steer, re-render progress, and count
+    // empty completions like any other fresh turn.
+    const postsBeforeDrain = rec.posts.length; // turn 1's own phrase
+    presenter.onQueueDrain("2.1", "U1", "1.0");
+    await flush();
+    expect(rec.posts).toHaveLength(postsBeforeDrain); // no drain placeholder
+    expect(presenter.canSteer()).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

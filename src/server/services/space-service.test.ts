@@ -1902,6 +1902,111 @@ describe("SpaceService threaded inbound turns (issue #289)", () => {
     expect(updates).toHaveLength(0);
     expect(reactions.at(-1)).toEqual({ kind: "remove", spaceId: "slack:C1", ts: "1.1" });
   });
+
+  test("a queued top-level message during a threaded turn never retargets it: A's reply posts under the root; B's phrase appears only when B drains (issue #289 review)", async () => {
+    const { adapter, posts, updates, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Threaded request A (root 1.0): reaction-only receipt, no placeholder.
+    await service.handleInboundMessage(msg({ text: "threaded A", ts: "1.1", threadTs: "1.0" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(posts).toHaveLength(0);
+    expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+    session.streaming = true;
+
+    // Top-level B arrives mid-turn: QUEUES. It must not post a placeholder
+    // nor retarget the running threaded turn's reply target.
+    await service.handleInboundMessage(msg({ text: "top-level B", ts: "5.0" }));
+    expect(session.prompts).toHaveLength(1); // queued, never prompted
+    expect(posts).toHaveLength(0); // no B placeholder at queue time
+    expect(reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "add", spaceId: "slack:C1", ts: "5.0" },
+    ]); // B still acked at queue time
+
+    // A completes: its reply posts FRESH under the ROOT — never under B's ts.
+    session.emit("message", { spaceId: "slack:C1", text: "A answer" });
+    await Promise.resolve();
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "A answer", opts: { threadTs: "1.0" } }]);
+    expect(updates).toHaveLength(0); // no edit of a placeholder (B never got one)
+
+    // B drains: only NOW does B's own phrase post under B's ts (5.0).
+    session.streaming = false;
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1]).toEqual({ text: "top-level B", opts: { principal: "U1" } });
+    expect(posts.some((p) => p.opts?.threadTs === "5.0" && p.text === THINKING_PHRASES[0])).toBe(true);
+  });
+
+  test("a queued message from a DIFFERENT thread root never retargets the running threaded turn (issue #289 review)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Threaded A (root 1.0) runs.
+    await service.handleInboundMessage(msg({ text: "threaded A", ts: "1.1", threadTs: "1.0" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    session.streaming = true;
+
+    // C arrives from a DIFFERENT thread (root 2.0): queues; must not swap
+    // the running turn's root.
+    await service.handleInboundMessage(msg({ text: "other thread C", ts: "6.6", threadTs: "2.0" }));
+    expect(session.prompts).toHaveLength(1);
+
+    // A answers under ITS root 1.0 — never under C's root 2.0.
+    session.emit("message", { spaceId: "slack:C1", text: "A answer" });
+    await Promise.resolve();
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "A answer", opts: { threadTs: "1.0" } }]);
+
+    // C drains: its reply lands under ITS OWN root 2.0.
+    session.streaming = false;
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1]).toEqual({ text: "other thread C", opts: { principal: "U1" } });
+    session.emit("message", { spaceId: "slack:C1", text: "C answer" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(posts).toEqual([
+      { spaceId: "slack:C1", text: "A answer", opts: { threadTs: "1.0" } },
+      { spaceId: "slack:C1", text: "C answer", opts: { threadTs: "2.0" } },
+    ]);
+    expect(updates).toHaveLength(0);
+  });
+
+  test("a threaded drain re-arms steering: a correction mid-drained-turn steers instead of queueing (issue #289 review)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Turn 1 (top-level) runs; a threaded request queues mid-turn.
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "threaded queued", ts: "2.1", threadTs: "1.0" }));
+    expect(session.prompts).toHaveLength(1);
+
+    // Turn 1 delivers and ends → the threaded request drains as its own
+    // fresh turn (reaction-only).
+    session.emit("message", { spaceId: "slack:C1", text: "first answer" });
+    await Promise.resolve();
+    session.streaming = false;
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session.prompts[1]).toEqual({ text: "threaded queued", opts: { principal: "U1" } });
+
+    // The drained turn runs; a correction in the same thread must STEER it
+    // — the drain resets the delivered flag, re-opening the safe window.
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ text: "wait, actually use python instead", ts: "3.1", threadTs: "1.0" }));
+    expect(session.prompts).toHaveLength(3);
+    expect(session.prompts[2]!.opts?.streamingBehavior).toBe("steer");
+  });
 });
 
 describe("SpaceService run settlement after a stream/panel turn (issue #183)", () => {

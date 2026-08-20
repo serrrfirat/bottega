@@ -651,20 +651,47 @@ export class SlackTurnPresenter {
   }
 
   /**
-   * Receipt (issue #119): record the inbound ts, open the turn's visible
-   * message (phrase post, or stream open in streaming mode), ack with the
-   * 👀 reaction, and audit the message.in row — all BEFORE the session
-   * cold-start, so a slow createSession is never silent. Each is
-   * fire-and-forget: the turn path never blocks on Slack latency.
+   * Receipt (issue #119): ack the inbound with the 👀 reaction and audit
+   * the message.in row — the queue-time receipt for EVERY inbound, whether
+   * the message starts a turn now, steers, or queues behind a running
+   * turn. Identity activation is deliberately NOT part of the receipt: a
+   * queued message must never retarget the running turn's reply target or
+   * open a placeholder for a turn that has not started (issue #289). Each
+   * call is fire-and-forget: the turn path never blocks on Slack latency
+   * or a missing reactions:write scope.
+   */
+  receipt(msg: SlackMessage): void {
+    this.#addReceiptReaction(msg);
+    this.#auditReceipt(msg);
+  }
+
+  /**
+   * Receipt + identity activation in one call — the shape an inbound that
+   * STARTS a turn takes (turn-start simulation, tests). SpaceService uses
+   * {@link receipt} at queue time and {@link activateInbound} only when
+   * the message actually starts a fresh or steered turn.
    */
   onInbound(msg: SlackMessage): void {
+    this.receipt(msg);
+    this.activateInbound(msg);
+  }
+
+  /**
+   * Activates the inbound's identity as the CURRENT turn's surface (issue
+   * #289): the threading base ({@link lastInboundTs}), the channel
+   * stream's recipient ({@link lastInboundPrincipal}, issue #287), and
+   * the conversation ROOT when the message is itself a thread reply
+   * ({@link turnThreadTs}). Called ONLY when a fresh or steered turn
+   * actually starts — never for a queued message, whose identity must not
+   * mutate the running turn until its own turn opens (onQueueDrain). A
+   * threaded turn is reaction-only: no thinking placeholder and no stream
+   * open — the final/error reply posts as a NEW message under the root,
+   * so two requests in one thread never reuse or edit a shared
+   * placeholder.
+   */
+  activateInbound(msg: SlackMessage): void {
     this.lastInboundTs = msg.ts;
     this.lastInboundPrincipal = msg.principal;
-    // Issue #289: an inbound that is itself a thread reply carries the
-    // conversation ROOT (thread_ts). The turn's replies must target that
-    // root — never a nested thread under this latest reply — and the
-    // receipt is reaction-only: no thinking placeholder, no stream open
-    // (the final reply posts as a NEW message under the root).
     this.turnThreadTs = msg.threadTs;
     // A new turn: the previous turn's progress state is stale (#193). The
     // opening phrase (and the elapsed tick) take over from here.
@@ -681,8 +708,6 @@ export class SlackTurnPresenter {
       this.#turnDelivered = false;
       this.pendingTs = undefined;
     }
-    this.#addReceiptReaction(msg);
-    this.#auditReceipt(msg);
   }
 
   /** The latest inbound message ts (digest marker base, #42); undefined before the first message. */
@@ -861,7 +886,17 @@ export class SlackTurnPresenter {
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
-    this.#postThinkingPhrase();
+    if (this.turnThreadTs === undefined) {
+      this.#postThinkingPhrase();
+    } else {
+      // Issue #289: a threaded drain is reaction-only — no placeholder —
+      // but it is still a FRESH turn: reset the delivered flag (and drop
+      // any stale pending phrase) so the steer safe-window (#219), the
+      // empty-turn churn guard (#60), and the live progress line all see
+      // a fresh turn instead of the previous turn's delivered state.
+      this.#turnDelivered = false;
+      this.pendingTs = undefined;
+    }
   }
 
   /** Digest turns are invisible to the channel (their output is memory, #42). */
