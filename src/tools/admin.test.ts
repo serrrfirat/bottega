@@ -42,6 +42,7 @@ import { connectExtension, type ConnectExtensionDeps } from "../extensions/conne
 import {
   adminToolDefinitions,
   adminToolsExtension,
+  defaultComposePs,
   onboardingGuideText,
   runWizardChecks,
   type AdminToolDefinition,
@@ -1346,6 +1347,31 @@ describe("catalog_browser pin (issue #195)", () => {
   });
 });
 
+/**
+ * Writes an executable `docker` shim into a temp bin dir and returns helpers
+ * to put it first on PATH. The shim prints the canned stdout for
+ * `docker compose ps --format json <service>` regardless of args (issue #297:
+ * Docker Compose v5 emits a single JSON object instead of an array).
+ */
+function fakeDockerBin(stdout: string): { withBin: () => void; restore: () => void; cleanup: () => void } {
+  const bin = mkdtempSync(join(tmpdir(), "bottega-docker-"));
+  const outFile = join(bin, "out.json");
+  writeFileSync(outFile, stdout);
+  const docker = join(bin, "docker");
+  writeFileSync(docker, `#!/bin/sh\ncat "${outFile}"\n`);
+  chmodSync(docker, 0o755);
+  const pathBackup = process.env.PATH;
+  const withBin = () => {
+    process.env.PATH = `${bin}:${pathBackup ?? ""}`;
+  };
+  const restore = () => {
+    if (pathBackup === undefined) delete process.env.PATH;
+    else process.env.PATH = pathBackup;
+  };
+  const cleanup = () => rmSync(bin, { recursive: true, force: true });
+  return { withBin, restore, cleanup };
+}
+
 describe("stack_health (issue #73)", () => {
   test("all services up via local probes → ok result with per-service evidence", async () => {
     const { store, cleanup } = freshStore();
@@ -1644,6 +1670,169 @@ describe("stack_health (issue #73)", () => {
     } finally {
       restoreEnv(env);
       cleanup();
+    }
+  });
+
+  test("absent optional services report unknown (not down, not probed) when compose is available (issue #297)", async () => {
+    const { store, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      // Intended local dev topology (scripts/dev.sh): broker + iron-proxy
+      // run; gateway and mem0 are not part of the running project.
+      process.env.BOTTEGA_CALLBACK_PORT = "18780";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
+      const composeState = new Map<string, { state: string; health: string; restartCount: number }>([
+        ["broker", { state: "running", health: "", restartCount: 0 }],
+        ["iron-proxy", { state: "running", health: "", restartCount: 0 }],
+      ]);
+      const probed: string[] = [];
+      const probes: Required<HealthProbeSeams> = {
+        composePs: async (service) => {
+          const s = composeState.get(service);
+          // Compose ran but the service is not in the running project.
+          return s ? { available: true, state: s.state, health: s.health, restartCount: s.restartCount } : { available: true };
+        },
+        httpGet: async (url) => {
+          probed.push(url);
+          return { ok: true, evidence: `GET ${url} -> HTTP 200` };
+        },
+        tcpConnect: async (host, port) => {
+          probed.push(`tcp:${host}:${port}`);
+          return { ok: true, evidence: `tcp ${host}:${port} connected` };
+        },
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const byService = new Map(body.services.map((s) => [s.service, s]));
+      // Present services are up via compose.
+      expect(byService.get("broker")!.status).toBe("up");
+      expect(byService.get("broker")!.method).toBe("compose");
+      expect(byService.get("iron-proxy")!.status).toBe("up");
+      // Absent-but-optional services are honestly unknown, never down.
+      expect(byService.get("gateway")!.status).toBe("unknown");
+      expect(byService.get("mem0")!.status).toBe("unknown");
+      // No Docker-internal HTTP/TCP fallback probes ran for absent services.
+      expect(probed).toEqual([]);
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("absent executor reports unknown, not down, when compose is available but it is not in the project (issue #297)", async () => {
+    const { store, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "18781";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
+      // broker + iron-proxy run; executor is NOT part of the running project.
+      const composeState = new Map<string, { state: string; health: string; restartCount: number }>([
+        ["broker", { state: "running", health: "", restartCount: 0 }],
+        ["iron-proxy", { state: "running", health: "", restartCount: 0 }],
+      ]);
+      const probes: Required<HealthProbeSeams> = {
+        composePs: async (service) => {
+          const s = composeState.get(service);
+          return s ? { available: true, state: s.state, health: s.health, restartCount: s.restartCount } : { available: true };
+        },
+        httpGet: async (url) => ({ ok: true, evidence: `GET ${url} -> HTTP 200` }),
+        tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const executor = body.services.find((s) => s.service === "executor");
+      expect(executor).toBeDefined();
+      expect(executor!.status).toBe("unknown");
+      expect(executor!.method).toBe("compose");
+      expect(executor!.evidence).toContain("not in the running project");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("overall ok in the intended dev topology: broker+iron-proxy up, optional services absent (issue #297)", async () => {
+    const { store, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      process.env.BOTTEGA_CALLBACK_PORT = "18782";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
+      const composeState = new Map<string, { state: string; health: string; restartCount: number }>([
+        ["broker", { state: "running", health: "", restartCount: 0 }],
+        ["iron-proxy", { state: "running", health: "", restartCount: 0 }],
+      ]);
+      const probes: Required<HealthProbeSeams> = {
+        composePs: async (service) => {
+          const s = composeState.get(service);
+          return s ? { available: true, state: s.state, health: s.health, restartCount: s.restartCount } : { available: true };
+        },
+        httpGet: async (url) => ({ ok: true, evidence: `GET ${url} -> HTTP 200` }),
+        tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const byService = new Map(body.services.map((s) => [s.service, s]));
+      expect(byService.get("broker")!.status).toBe("up");
+      expect(byService.get("iron-proxy")!.status).toBe("up");
+      expect(byService.get("gateway")!.status).toBe("unknown");
+      expect(byService.get("mem0")!.status).toBe("unknown");
+      expect(byService.get("executor")!.status).toBe("unknown");
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
+});
+
+describe("defaultComposePs (issue #297)", () => {
+  test("parses a single JSON object (Docker Compose v5), not only an array", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "bottega-compose-cwd-"));
+    const fake = fakeDockerBin(JSON.stringify({ Service: "iron-proxy", State: "running", Health: "", RestartCount: 0 }));
+    try {
+      fake.withBin();
+      // SAFETY: defaultComposePs parses whatever the docker shim prints.
+      const result = await defaultComposePs("iron-proxy", cwd);
+      expect(result.available).toBe(true);
+      expect(result.state).toBe("running");
+      expect(result.health).toBe("");
+      expect(result.restartCount).toBe(0);
+    } finally {
+      fake.restore();
+      fake.cleanup();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("no row for a service absent from the project is available:true, no fallback state (issue #297)", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "bottega-compose-cwd-"));
+    const fake = fakeDockerBin("[]");
+    try {
+      fake.withBin();
+      const result = await defaultComposePs("gateway", cwd);
+      expect(result.available).toBe(true);
+      expect(result.state).toBeUndefined();
+    } finally {
+      fake.restore();
+      fake.cleanup();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });

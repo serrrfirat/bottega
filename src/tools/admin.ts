@@ -376,7 +376,12 @@ export async function defaultComposePs(
       Health: z.string().optional(),
       RestartCount: z.number().optional(),
     });
-    const rows = z.array(composeRowSchema).parse(JSON.parse(stdout));
+    const parsed: unknown = JSON.parse(stdout);
+    // Docker Compose v5 emits a single JSON object for `ps --format json
+    // <service>`; older versions emit an array. Normalize both to an array,
+    // then validate every row — accepting either shape without weakening
+    // the row schema.
+    const rows = z.array(composeRowSchema).parse(Array.isArray(parsed) ? parsed : [parsed]);
     const row = rows.find((r) => r["Service"] === service);
     if (!row) return { available: true };
     return {
@@ -494,6 +499,21 @@ async function probeService(
       evidence: `docker compose ps ${service}: ${state}`,
     };
   }
+  // Compose is available but produced no row: the service is simply not
+  // part of the running project (not running / not enabled), so it is
+  // honestly unknown — never "down". Do NOT fall back to a Docker-internal
+  // hostname HTTP/TCP probe: from the macOS host those names do not resolve
+  // (ENOTFOUND), which would falsely report a healthy local dev stack as
+  // down. The fallback probes below run only when docker/compose itself is
+  // unavailable here.
+  if (compose.available) {
+    return {
+      service,
+      status: "unknown",
+      method: "compose",
+      evidence: `docker compose ps ${service}: ${compose.health || "service not in the running project (not running/not enabled)"}`,
+    };
+  }
   if (target.kind === "http") {
     const result = await seams.httpGet(target.url!, PROBE_TIMEOUT_MS);
     return { service, status: result.ok ? "up" : "down", method: "http", evidence: result.evidence };
@@ -547,11 +567,14 @@ async function runStackHealth(store: Store, opts: AdminToolsOpts): Promise<Servi
       evidence: `docker compose ps executor: ${state}`,
     });
   } else if (compose.available) {
+    // Compose is available but the executor is not part of the running
+    // project (not enabled / not running in this topology) — honest unknown,
+    // never a fabricated "down" of an absent profile.
     results.push({
       service: "executor",
-      status: "down",
+      status: "unknown",
       method: "compose",
-      evidence: "docker compose ps executor: service not in the running project",
+      evidence: "docker compose ps executor: service not in the running project (not running/not enabled)",
     });
   } else {
     results.push({
