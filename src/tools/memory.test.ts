@@ -180,6 +180,30 @@ describe("memory.save", () => {
     expect(rows).toHaveLength(0);
   });
 
+  test("a DM with no authenticated principal derives NO writable scope; person and channel saves fail closed", async () => {
+    // Issue #137 fail-closed edge: a direct-message context without a bound
+    // principal (a turn nobody started, or a broken identity seam) must not
+    // fall back to writing a channel key. Both person and channel requests
+    // error, nothing is written, nothing is audited.
+    const provider = new FakeProvider();
+    const { audit, rows } = fakeAudit();
+    const [saveTool] = loadTools(provider, {
+      audit,
+      getScopeContext: () => ({ spaceId: "slack:D1", principal: undefined, directMessage: true, teamId: undefined }),
+    });
+
+    const person = await saveTool.execute("tc1", { content: "orphaned", scope: "person" }, undefined, undefined, noopCtx);
+    expect(person.isError).toBe(true);
+    expect(resultText(person)).toMatch(/cannot write that scope/);
+
+    const channel = await saveTool.execute("tc1", { content: "orphaned", scope: "channel" }, undefined, undefined, noopCtx);
+    expect(channel.isError).toBe(true);
+    expect(resultText(channel)).toMatch(/cannot write that scope/);
+
+    expect(provider.saved).toHaveLength(0);
+    expect(rows).toHaveLength(0);
+  });
+
   test("rejects empty content", async () => {
     const provider = new FakeProvider();
     const [saveTool] = loadTools(provider);

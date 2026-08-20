@@ -51,8 +51,12 @@ export interface ReadableScopes {
  * channel key. Facts are never auto-promoted into team/org.
  */
 export function deriveWritableScopes(ctx: MemoryScopeContext): MemoryScopeKey[] {
-  if (ctx.principal && ctx.directMessage) {
-    return [{ kind: "person", principal: ctx.principal }];
+  if (ctx.directMessage) {
+    // A DM writes only its authenticated person's key. A DM with no
+    // principal (a turn nobody started, or a caller failed to bind one)
+    // derives NO writable scope — fail closed: nothing can be written and
+    // the caller must refuse rather than fall back to a channel key.
+    return ctx.principal ? [{ kind: "person", principal: ctx.principal }] : [];
   }
   return [{ kind: "channel", spaceId: ctx.spaceId }];
 }

@@ -176,7 +176,10 @@ argument.
 is how the agent learns the repo names so it can answer "which repo?"
 without asking. Org memory feeds work-item handoff (the agent derives the
 repo for `create_work_item` from a mentioned repo or org memory) and the
-connect intent seam.
+connect intent seam. Facts the agent auto-learns from a shared channel are
+channel-local (`channel:<spaceId>`) unless the space configures a
+`memory.team`, which extends recall to a shared team pool; existing org
+facts stay org-readable everywhere.
 
 Backend (issues #43, #67): the default (unset `memory_backend.base_url`)
 runs the SQLite memory fallback. To use the self-hosted mem0 service, set

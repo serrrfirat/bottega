@@ -305,6 +305,12 @@ never affects memory visibility. Every successful recall appends an
 append-only `memory.recalled` audit row with the requester/space and per-scope
 counts — never the query or memory content.
 
+Facts the agent auto-learns from a shared channel are now stored channel-local
+(`channel:<spaceId>`): they are recalled only in that channel unless the space
+also configures a `memory.team`, which extends recall to the team's shared
+pool. Existing org-scope facts remain org-readable everywhere; nothing about
+existing org or per-person rows changes.
+
 ### Public ingress for browser legs (issues #196, #198, #249)
 
 The connect flows have two browser legs served by in-process listeners on
