@@ -26,6 +26,24 @@ jobs:
       # harness response windows hold on ANY host (issue #260).
       - run: bun run test
 
+  # Aggregate coverage gate (issue #290): runs the suite WITH coverage as a
+  # single serial invocation (--parallel=1) — the e2e/journey harness
+  # windows hold by construction (issue #260's concurrency rule: nothing
+  # ever runs concurrently with the e2e files) — and fails when the whole-
+  # suite "All files" aggregate drops below the 85% lines/functions floor
+  # (percent units — the old gate compared bun's 91.34-style output against
+  # fractional 0.85 floors and could never fail). A separate job so the
+  # fast `ci` job never pays for coverage instrumentation.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run check-coverage
+
   docker:
     runs-on: ubuntu-latest
     steps:
