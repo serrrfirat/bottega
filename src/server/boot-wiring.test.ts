@@ -17,7 +17,7 @@
  * sessions), no live services. Same shape as onboarding-boot.test.ts (#116).
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -29,6 +29,7 @@ import { createStore } from "../store/db";
 import type { SchedulerJob } from "../scheduler/types";
 import type { McpBinding } from "../extensions/manifest";
 import type { ExtensionSurfaces } from "../extensions/surface";
+import type { McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import { resetToolSurfaceCache } from "../extensions/surface";
 import { opencodeSafeToolName } from "./drivers/agent-driver";
 import { main } from "./index";
@@ -396,6 +397,142 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       expect(
         github.every((tool) => tool.approval === "read" || tool.approval === "write" || tool.approval === "exec"),
       ).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("an authenticated tools-less OAuth MCP receives an SDK OAuthClientProvider at boot discovery — the persisted credential's tool lands (issue #284)", async () => {
+    const env = tempEnv();
+    try {
+      // Ship the agent-config template so the boot-time pin sync (issue
+      // #78) takes the "created" path (same as the other boot tests).
+      mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
+      writeFileSync(
+        join(env.dir, "config", "omp", "config.yml"),
+        "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n",
+      );
+      // A tools-less hosted OAuth MCP manifest in the temp deployment root
+      // (the #231 pattern: no pinned tools — the surface is discovered from
+      // tools/list at boot, AUTHENTICATED through the persisted credential).
+      const OAUTH_ID = "fixture.oauthboot";
+      mkdirSync(join(env.dir, "config", "extensions"), { recursive: true });
+      writeFileSync(
+        join(env.dir, "config", "extensions", `${OAUTH_ID}.json`),
+        JSON.stringify(
+          {
+            schema: "bottega.extension-snapshot.v1",
+            extensionId: OAUTH_ID,
+            pinnedAt: "2026-08-20T00:00:00.000Z",
+            source: { catalog: "canary://fixture", specId: OAUTH_ID, vendorOfficial: true, reviewed: false },
+            manifest: {
+              id: OAUTH_ID,
+              label: "Fixture OAuth Boot",
+              vendor: "bottega-fixtures",
+              kind: "mcp",
+              mcp: { serverUrl: "http://127.0.0.1:0/mcp", transport: "streamable-http" },
+              credentialSchema: { type: "oauth", scopes: ["read"] },
+              domains: ["mcp.oauthboot.example.com"],
+            },
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      // A fake authenticated MCP server: tools/list REQUIRES the bearer the
+      // SDK's OAuthClientProvider supplies — a token-less request is 401.
+      const seenAuth: string[] = [];
+      const mcp = Bun.serve({
+        port: 0,
+        fetch: async (req) => {
+          if (req.method !== "POST" || !new URL(req.url).pathname.startsWith("/mcp")) {
+            return new Response("", { status: 404 });
+          }
+          const authorization = req.headers.get("authorization") ?? "";
+          if (authorization === "") {
+            return new Response("", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+          }
+          seenAuth.push(authorization);
+          const body = (await req.json()) as { jsonrpc: string; id: number; method: string };
+          if (body.method === "initialize") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: {
+                protocolVersion: "2024-11-05",
+                capabilities: { tools: {} },
+                serverInfo: { name: "oauthboot-stub", version: "1.0.0" },
+              },
+            });
+          }
+          if (body.method === "tools/list") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: {
+                tools: [{ name: "oauthboot.ping", description: "Authenticated stub ping", inputSchema: { type: "object", properties: {} } }],
+              },
+            });
+          }
+          return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "unknown method" } });
+        },
+      });
+      // Patch the manifest's placeholder serverUrl to the live stub port.
+      const manifestPath = join(env.dir, "config", "extensions", `${OAUTH_ID}.json`);
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { manifest: { mcp: { serverUrl: string } } };
+      manifest.manifest.mcp.serverUrl = `http://127.0.0.1:${mcp.port}/mcp`;
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      // Pre-seed the boot store's PERSISTED extension credential (the
+      // surface auth provider reads exactly this row).
+      const seeded = createStore("data/bottega.db");
+      await seeded.upsertExtensionCredential({
+        provider: OAUTH_ID,
+        identityKey: `oauth:${OAUTH_ID}`,
+        owner: null,
+        scope: "org",
+        brokerCredentialId: 42,
+      });
+      seeded.close();
+      // The vault-backed token store the persisted credential resolves to.
+      const vault: McpOAuthTokenStore = {
+        async load(provider, brokerCredentialId) {
+          if (provider === OAUTH_ID && brokerCredentialId === 42) {
+            return { type: "oauth", access: "access-boot-1", refresh: "refresh-boot-1", expires: Date.now() + 3_600_000 };
+          }
+          return null;
+        },
+        async save(_provider, _credential) {
+          return { brokerCredentialId: 42 };
+        },
+      };
+      let surfaces: ExtensionSurfaces | undefined;
+      let definitions: ToolDefinition[] | undefined;
+      const server = await main({
+        agentDir: join(env.dir, "agent"),
+        // NO surfaceTransport seam: the production defaultMcpTransport
+        // (with the boot-built authProvider) drives the discovery through
+        // the REAL SDK streamable-http client — the strongest proof that
+        // the persisted credential authenticates tools/list.
+        mcpOAuthTokenStore: vault,
+        onExtensionSurfaces: (resolved) => {
+          surfaces = resolved;
+        },
+        onExtensionToolset: (tools) => {
+          definitions = tools;
+        },
+      });
+      await server.stop();
+
+      // The discovered surface landed: the authenticated tools/list was
+      // served with the vault bearer and its tool is exposed.
+      expect(seenAuth.length).toBeGreaterThan(0);
+      expect(seenAuth[0]).toBe("Bearer access-boot-1");
+      expect(surfaces).toBeDefined();
+      const surface = surfaces!.get(OAUTH_ID);
+      expect(surface).toBeDefined();
+      expect(surface!.map((tool) => tool.name)).toEqual(["fixture.oauthboot.oauthboot.ping"]);
+      expect(definitions).toBeDefined();
+      expect(definitions!.some((tool) => tool.name === "fixture.oauthboot.oauthboot.ping")).toBe(true);
     } finally {
       env.cleanup();
     }

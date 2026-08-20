@@ -136,18 +136,18 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   test("secrets transform (issue #53 + #208 + #230) runs AFTER judge and injects auth per api_key extension + model gateway", () => {
     const secrets = transforms.find((t) => asRecord(t)["name"] === "secrets")!;
     expect(secrets).toBeDefined();
-    // Ordering: allowlist, judge, secrets, oauth_token — the LLM judge
-    // must never see real credentials (iron-proxy README's recommended
-    // ordering), and oauth_token runs last (the proxy's minted bearer is
-    // the final word for the OAuth extensions).
+    // Ordering: allowlist, judge, secrets — the LLM judge must never see
+    // real credentials (iron-proxy README's recommended ordering). Issue
+    // #284: there is NO oauth_token transform (the SDK owns hosted-MCP
+    // OAuth; the proxy is transport/allowlist only).
     const names = transforms.map((t) => asString(asRecord(t)["name"]));
-    expect(names).toEqual(["allowlist", "judge", "secrets", "oauth_token"]);
+    expect(names).toEqual(["allowlist", "judge", "secrets"]);
     const cfg = asRecord(secrets["config"]);
     const entries = asRecordArray(cfg["secrets"]);
     // api_key extensions (github) + the six model-gateway keys (#208 +
     // #230, incl. the openai-codex static access token) + the Tavily web
     // search provider (issue #278). The OAuth extensions (linear/attio)
-    // moved to oauth_token — no file entries for them.
+    // get NO file entry (issue #284 — the SDK sends its own bearer).
     expect(entries).toHaveLength(7); // github + near/opencode/openai/anthropic/openai-codex/tavily
     for (const entry of entries) {
       const source = asRecord(entry["source"]);
@@ -189,53 +189,22 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(codexRules.map((r) => String(r["host"]))).toEqual(["chatgpt.com"]);
   });
 
-  test("oauth_token transform (issue #208) mints ONLY the OAuth extensions' access tokens — the codex provider has no oauth_token entry (issue #230)", () => {
-    const oauth = transforms.find((t) => asRecord(t)["name"] === "oauth_token")!;
-    expect(oauth).toBeDefined();
-    const tokens = asRecordArray(asRecord(oauth["config"])["tokens"]);
-    // linear + attio (the #198 OAuth seed providers — issue #233: notion's
-    // pin is gone, so its oauth_token entry appears only when a runtime
-    // connect registers it) — the codex model provider is a STATIC secrets
-    // entry now (issue #230: the seed owns the refresh; the proxy never
-    // mints for codex).
-    expect(tokens).toHaveLength(2);
-    for (const token of tokens) {
-      expect(asString(token["grant"])).toBe("refresh_token");
-      expect(asString(token["token_endpoint"])).toMatch(/^https:\/\//);
-      expect(asString(token["require"])).toBe("true");
-      const refresh = asRecord(token["refresh_token"]);
-      const clientId = asRecord(token["client_id"]);
-      const clientSecret = asRecord(token["client_secret"]);
-      expect(refresh["type"]).toBe("file");
-      expect(clientId["type"]).toBe("file");
-      expect(clientSecret["type"]).toBe("file");
-      expect(asString(refresh["json_key"])).toBe("refresh_token");
-      expect(asString(clientId["json_key"])).toBe("client_id");
-      expect(asString(clientSecret["json_key"])).toBe("client_secret");
-      // Both fields come from the SAME per-provider JSON blob.
-      expect(asString(refresh["path"])).toBe(asString(clientId["path"]));
-      expect(asString(refresh["path"])).toBe(asString(clientSecret["path"]));
-      expect(asString(refresh["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z-]+-oauth\.json$/);
-      // Issue #268: the refresh_token source uses a LONG ttl (>=12h) so a
-      // re-read cannot clobber the in-memory rotated token inside the
-      // access-token lifetime (notion rotates on every exchange); the
-      // client-credential sources keep the short ttl (rotation pickup).
-      expect(asString(refresh["ttl"])).toMatch(/^[0-9]+h$/);
-      expect(parseInt(asString(refresh["ttl"]), 10)).toBeGreaterThanOrEqual(12);
-      expect(asString(clientId["ttl"])).toBe("30s");
-      expect(asString(clientSecret["ttl"])).toBe("30s");
-      const rules = asRecordArray(token["rules"]);
-      expect(rules.length).toBeGreaterThanOrEqual(1);
-      for (const rule of rules) {
-        expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
-      }
-    }
-    // No token entry may reference the codex blob or the auth.openai.com
-    // token endpoint (the seed owns the codex refresh now).
-    for (const token of tokens) {
-      const path = asString(asRecord(token["refresh_token"])["path"]);
-      expect(path).not.toContain("openai-codex");
-      expect(asString(token["token_endpoint"])).not.toBe("https://auth.openai.com/oauth/token");
-    }
+  test("NO oauth_token transform — hosted-MCP OAuth is SDK-owned; the proxy is transport/allowlist only (issue #284)", () => {
+    // The OAuth extensions' domains are allowlisted (their SDK bearer
+    // passes through the proxy transport), but the committed config emits
+    // no oauth_token transform, no per-provider JSON blobs, and no token
+    // endpoints — the proxy never holds or mints extension OAuth
+    // credentials. The codex MODEL provider is a STATIC secrets entry
+    // (issue #230: the seed owns the refresh; the proxy never touches
+    // auth.openai.com).
+    expect(transforms.find((t) => asRecord(t)["name"] === "oauth_token")).toBeUndefined();
+    const raw = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
+    expect(raw).not.toContain("-oauth.json");
+    expect(raw).not.toContain("token_endpoint:");
+    expect(raw).not.toContain("grant: refresh_token");
+    // The OAuth extensions' domains stay allowlisted for the SDK bearer.
+    const domains = asStringArray(allowlistCfg["domains"]);
+    expect(domains).toContain("mcp.linear.app");
+    expect(domains).toContain("mcp.attio.com");
   });
 });

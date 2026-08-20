@@ -24,18 +24,14 @@ export type McpTransport = "streamable-http" | "stdio";
  * (preinstalled stdio server in the tools image). The transport must match
  * the binding: streamable-http goes with a serverUrl, stdio with a command.
  *
- * `tokenEndpoint` (issue #275): the provider's OAuth2 token endpoint,
- * CARRIED ON THE RECORD at pin/register time (the pinned snapshot manifest
- * or the store-backed runtime registration row). The egress oauth_token
- * generation resolves it record-first — the hardcoded OAUTH_TOKEN_ENDPOINTS
- * map in src/egress/generate.ts is the legacy fallback for records that
- * carry none. Optional: legacy records without it stay byte-stable.
- * HTTPS-only (the proxy POSTs the refresh grant here — a non-https
- * endpoint would ship credentials over plaintext, so it fails closed).
+ * Issue #284: OAuth for hosted MCP bindings is owned by the MCP SDK (the
+ * runtime's OAuthClientProvider), so the binding carries no OAuth
+ * endpoint — the SDK performs its own RFC 8414 discovery at connect and
+ * call time. The egress proxy is transport/allowlist only.
  */
 export type McpBinding =
-  | { serverUrl: string; command?: never; transport: "streamable-http"; tokenEndpoint?: string }
-  | { command: string; serverUrl?: never; transport: "stdio"; tokenEndpoint?: string };
+  | { serverUrl: string; command?: never; transport: "streamable-http" }
+  | { command: string; serverUrl?: never; transport: "stdio" };
 
 /** CLI binding: the preinstalled binary, fixed args, and optional env delta. */
 export interface CliBinding {
@@ -276,28 +272,6 @@ function validateMcpBinding(value: JsonValue): McpBinding {
   if (transport !== "streamable-http" && transport !== "stdio") {
     fail("mcp.transport must be \"streamable-http\" or \"stdio\"");
   }
-  // Issue #275: the OPTIONAL record-carried OAuth token endpoint. Absent →
-  // the egress generation falls back to OAUTH_TOKEN_ENDPOINTS (legacy) or
-  // fails closed; present → must be a valid HTTPS URL (the proxy POSTs the
-  // refresh grant here — never shipped over plaintext).
-  const tokenEndpointValue = value["tokenEndpoint"];
-  let tokenEndpoint: string | null = null;
-  if (tokenEndpointValue !== undefined) {
-    const parsedValue = z.string().safeParse(tokenEndpointValue);
-    if (!parsedValue.success || parsedValue.data.trim() === "") {
-      fail("mcp.tokenEndpoint must be a non-empty string");
-    }
-    tokenEndpoint = parsedValue.data;
-    let parsed: URL;
-    try {
-      parsed = new URL(tokenEndpoint);
-    } catch {
-      fail("mcp.tokenEndpoint must be a valid URL");
-    }
-    if (parsed.protocol !== "https:") {
-      fail("mcp.tokenEndpoint must be an https URL");
-    }
-  }
   if (serverUrl !== null) {
     if (transport !== "streamable-http") {
       fail("mcp serverUrl bindings must use transport \"streamable-http\"");
@@ -314,7 +288,6 @@ function validateMcpBinding(value: JsonValue): McpBinding {
     return {
       serverUrl,
       transport: "streamable-http",
-      ...(tokenEndpoint !== null ? { tokenEndpoint } : undefined),
     };
   }
   if (transport !== "stdio") {
@@ -338,7 +311,6 @@ function validateMcpBinding(value: JsonValue): McpBinding {
   return {
     command: stdioCommand,
     transport: "stdio",
-    ...(tokenEndpoint !== null ? { tokenEndpoint } : undefined),
   };
 }
 

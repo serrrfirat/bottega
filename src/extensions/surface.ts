@@ -28,6 +28,7 @@
  * CLI-only extensions have no tools/list protocol: absent tools on a cli
  * manifest is an egress-only extension (empty surface, like `tools: []`).
  */
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { errorMessage } from "../tools/helpers";
 import { listProviderTools, toolsFromMcpList } from "./generate-tools";
@@ -58,7 +59,8 @@ const discoveryCache = new Map<string, Promise<ExtensionTool[]>>();
  */
 export async function extensionToolSurface(
   manifest: ExtensionManifest,
-  mcpTransport?: (binding: McpBinding) => Transport,
+  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
+  authProvider?: OAuthClientProvider,
 ): Promise<ExtensionTool[]> {
   if (manifest.tools !== undefined) return manifest.tools;
   if (manifest.kind !== "mcp") return [];
@@ -66,7 +68,7 @@ export async function extensionToolSurface(
   const cached = discoveryCache.get(key);
   if (cached !== undefined) return cached;
   const pending = (async () => {
-    const wire = await listProviderTools(manifest.mcp, mcpTransport);
+    const wire = await listProviderTools(manifest.mcp, mcpTransport, { authProvider });
     return toolsFromMcpList(wire, manifest.id).tools;
   })();
   discoveryCache.set(key, pending);
@@ -96,7 +98,8 @@ export async function extensionToolSurface(
 export async function resolveExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
   opts: {
-    mcpTransport?: (binding: McpBinding) => Transport;
+    mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
+    authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
     /**
      * Issue #257 connectedness probe: given an extension id, is it
      * CONNECTED (a valid vault credential row exists)? Checked ONLY for a
@@ -114,7 +117,8 @@ export async function resolveExtensionSurfaces(
   const entries = await Promise.all(
     extensions.map(async ({ manifest }) => {
       try {
-        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport)] as const;
+        const authProvider = await opts.authProvider?.(manifest);
+        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport, authProvider)] as const;
       } catch (err) {
         // Issue #166: a tools-less manifest whose provider is unreachable /
         // auth-gated must never fail the boot. Skip it (the map carries
@@ -167,7 +171,7 @@ export async function resolveExtensionSurfaces(
 export async function toolOwnerExtensionId(
   registry: Pick<ExtensionRegistry, "list">,
   toolName: string,
-  mcpTransport?: (binding: McpBinding) => Transport,
+  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
 ): Promise<string | undefined> {
   const pinned = registry.list().find(({ manifest }) =>
     (manifest.tools ?? []).some((tool) => tool.name === toolName),
@@ -194,7 +198,10 @@ export async function toolOwnerExtensionId(
 export async function refreshMissingExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
   current: ExtensionSurfaces,
-  opts: { mcpTransport?: (binding: McpBinding) => Transport } = {},
+  opts: {
+    mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
+    authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
+  } = {},
 ): Promise<ExtensionSurfaces> {
   const missing = extensions.filter(
     ({ manifest }) => !current.has(manifest.id) && manifest.tools === undefined && manifest.kind === "mcp",

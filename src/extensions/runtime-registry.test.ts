@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { createStore, type Store } from "../store/db";
 import { createExtensionRegistry, parsePinnedSnapshot, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "./registry";
 import { fixtureManifest, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
+import type { McpBinding } from "./manifest";
 import {
   mergeRuntimeRegistry,
   runtimeRecordFromRow,
@@ -125,13 +126,16 @@ describe("store-backed runtime extension registry (issue #233)", () => {
     expect(() => runtimeRecordFromRow(broken)).toThrow(/not valid JSON/);
   });
 
-  test("a record-carried token endpoint survives the store round-trip (issue #275)", async () => {
-    // The runtime registration's snapshot carries the OAuth token endpoint
-    // on the mcp binding (the #275 record shape); the persisted row must
-    // keep it through the registry's fail-closed parse — the egress regen
-    // reads the endpoint from exactly this record.
+  test("a legacy record carrying a token endpoint survives the store round-trip endpoint-free (issue #284)", async () => {
+    // Pre-#284 the runtime registration's snapshot could carry the OAuth
+    // token endpoint on the mcp binding (the #275 record shape). Issue
+    // #284 removes the field from the schema: the persisted row still
+    // round-trips through the registry's fail-closed parse, and the
+    // endpoint is dropped from the validated manifest (the SDK owns
+    // OAuth — the egress regen never reads an endpoint).
     const store = freshStore();
-    // The notion binding with the #275 record shape: the endpoint rides on the mcp binding.
+    // A legacy notion binding with the #275 record shape: the endpoint
+    // rides on the mcp binding (an unknown field the validator ignores).
     const snapshot: PinnedSnapshot = {
       schema: SNAPSHOT_SCHEMA,
       extensionId: "notion",
@@ -146,7 +150,7 @@ describe("store-backed runtime extension registry (issue #233)", () => {
           serverUrl: "https://mcp.notion.com/mcp",
           transport: "streamable-http",
           tokenEndpoint: "https://mcp.notion.com/token",
-        },
+        } as unknown as McpBinding,
         credentialSchema: { type: "oauth" },
         domains: ["notion.com", "mcp.notion.com"],
       },
@@ -159,13 +163,14 @@ describe("store-backed runtime extension registry (issue #233)", () => {
     const rows = await store.listRuntimeExtensions();
     expect(rows).toHaveLength(1);
     const record = runtimeRecordFromRow(rows[0]!);
-    // SAFETY: the notion manifest is kind mcp — the binding carries the endpoint.
     expect(record.snapshot.manifest.kind).toBe("mcp");
     if (record.snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect(record.snapshot.manifest.mcp.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    expect((record.snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
     const set = await runtimeSnapshotsFromStore(store);
     if (set[0]!.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect(set[0]!.manifest.mcp.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    expect((set[0]!.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    // The egress merge still allowlists the OAuth domains from the record.
+    expect(set[0]!.manifest.domains).toContain("mcp.notion.com");
   });
 
   test("runtimeSnapshotsFromStore returns the validated runtime set for the egress merge", async () => {

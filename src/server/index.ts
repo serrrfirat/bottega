@@ -38,6 +38,7 @@ import { storeRuntimeRegistrySeam } from "../extensions/runtime-registry";
 import { mountUploadLink, uploadLinkPublicBase } from "../extensions/upload-link";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import { callbackPort, startOAuthCallbackServer } from "../extensions/oauth-callback";
+import type { McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import { SNAPSHOTS_DIR } from "../egress/generate";
 import {
   refreshMissingExtensionSurfaces,
@@ -141,6 +142,14 @@ export interface BottegaServerOpts {
    */
   surfaceTransport?: (binding: McpBinding) => Transport;
   /**
+   * Vault token store seam for the authenticated boot/session tools/list
+   * discovery (issue #284 test seam): defaults to the production
+   * vault-backed store. Hermetic caller-level tests inject a fake so the
+   * discovery provider loads the persisted credential's tokens without a
+   * real vault write.
+   */
+  mcpOAuthTokenStore?: McpOAuthTokenStore;
+  /**
    * Extension-surface observation seam (issue #166): receives the map of
    * surfaces resolved at boot — only the extensions whose discovery
    * succeeded (a per-provider failure is skipped, never a boot failure).
@@ -217,6 +226,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const wiring = await bootstrapRuntime({
     router: () => approvalRouter,
     ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : undefined),
+    ...(opts.mcpOAuthTokenStore !== undefined ? { mcpOAuthTokenStore: opts.mcpOAuthTokenStore } : undefined),
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
     // Issue #193: extension-tool steps reach the space's turn presenter
     // too — late-bound, same pattern as the driver gate below.
@@ -229,6 +239,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     registry: extensionRegistry,
     runtime: extensionRuntime,
     surfaces: extensionSurfaces,
+    surfaceAuthProvider,
     memoryProvider,
   } = wiring;
   opts.onRuntimeWiring?.(wiring);
@@ -631,7 +642,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     const surfaces = await refreshMissingExtensionSurfaces(
       extensionRegistry.list(),
       extensionSurfaces,
-      opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {},
+      {
+        ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
+        authProvider: surfaceAuthProvider,
+      },
     );
     return buildExtensionToolset(surfaces);
   };

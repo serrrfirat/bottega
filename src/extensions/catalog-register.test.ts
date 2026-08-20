@@ -372,14 +372,15 @@ describe("registerExtensionAtRuntime (issue #233) — store write → egress reg
     expect(existsSync(join(h.deps.snapshotsDir, "notion.json"))).toBe(false);
 
     // Egress regenerated (byte-pinned) with the runtime set merged: the
-    // vendor host AND the MCP host are allowlisted, the oauth_token entry
-    // is emitted for the OAuth extension.
+    // vendor host AND the MCP host are allowlisted, and — issue #284 — NO
+    // oauth_token entry/blob is emitted (the SDK owns the OAuth).
     const egress = readFileSync(h.egressPath, "utf8");
     expect(egress).toContain('"mcp.notion.com"');
     expect(egress).toContain('"notion.com"');
-    expect(egress).toContain("notion-oauth.json");
+    expect(egress).not.toContain("notion-oauth.json");
+    expect(egress).not.toContain("- name: oauth_token");
     expect(existsSync(h.devEgressPath)).toBe(true);
-    expect(readFileSync(h.devEgressPath, "utf8")).toContain("mcp.notion.com");
+    expect(readFileSync(h.devEgressPath, "utf8")).toContain("- name: allowlist");
 
     // Hot-registered: the LIVE registry resolves the extension immediately.
     expect(h.registry.resolve("notion")?.manifest.id).toBe("notion");
@@ -457,23 +458,31 @@ describe("registerExtensionAtRuntime (issue #233) — store write → egress reg
     expect(h.registry.resolve("acme-key")).toBeDefined();
   });
 
-  test("an OAuth extension without a verified token endpoint registers but surfaces the egress failure loudly", async () => {
-    // OAUTH_TOKEN_ENDPOINTS (src/egress/generate.ts) has no "oauth-only"
-    // entry → regeneration fails closed (never a guessed token endpoint).
-    // The runtime registration still lands (the approved durable change),
-    // and the failure is LOUD in the result — never silent drift.
+  test("an OAuth-gated extension registers and the egress regen SUCCEEDS — domains allowlisted, no oauth_token transform (issue #284)", async () => {
+    // Pre-#284 an OAuth extension without a verified token endpoint failed
+    // the egress regen loudly. Issue #284: the record carries no token
+    // endpoint at all (the SDK owns OAuth via its own RFC 8414 discovery),
+    // so the regen always succeeds for an OAuth extension — its domains
+    // allowlist and NO transform entry is emitted. The runtime
+    // registration lands (the approved durable change) with no warning.
     const h = makeHarness({ records: [OAUTH_ONLY_RECORD], wellKnownStatus: 200 });
     tracked.push(h);
     const draft = await lookup(h, "oauth-only");
     const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA" });
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.warnings.some((w) => w.includes("EGRESS REGEN FAILED"))).toBe(true);
+      expect(result.warnings.some((w) => w.includes("EGRESS REGEN FAILED"))).toBe(false);
       expect(result.liveRegistry).toBe("registered");
     }
-    // The registration is persisted and live — only the egress failed.
+    // The registration is persisted and live.
     expect(h.runtimeRegistry.rows).toHaveLength(1);
     expect(h.registry.resolve("oauth-only")).toBeDefined();
+    // The egress allowlist carries the OAuth domain with no mint machinery.
+    const egress = readFileSync(h.egressPath, "utf8");
+    expect(egress).toContain("mcp.oauth-only.example.com");
+    expect(egress).not.toContain("- name: oauth_token");
+    expect(egress).not.toContain("oauth-only-oauth.json");
+    expect(egress).not.toContain("token_endpoint:");
   });
 
   test("the registration audit row records the runtime store + egress + live-registry outcome", async () => {
@@ -494,8 +503,8 @@ describe("registerExtensionAtRuntime (issue #233) — store write → egress reg
   });
 });
 
-describe("record-carried token endpoint (issue #275) — the register path supplies the endpoint deterministically", () => {
-  /** An RFC 8414 authorization-server metadata document carrying the vendor's token endpoint. */
+describe("OAuth discovery carries no token endpoint on the record (issue #284 — the SDK owns OAuth)", () => {
+  /** An RFC 8414 authorization-server metadata document (the vendor's own). */
   const AS_METADATA = JSON.stringify({
     issuer: "https://mcp.notion.com",
     authorization_endpoint: "https://mcp.notion.com/authorize",
@@ -504,16 +513,6 @@ describe("record-carried token endpoint (issue #275) — the register path suppl
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["client_secret_basic", "none"],
   });
-
-  /** Serves the catalog doc + the RFC 8414 metadata body for every well-known probe. */
-  function oauthMetadataFetch(records: unknown[], metadata: string): typeof fetch {
-    // SAFETY: the stub implements fetch's call contract (same shape as stubFetch).
-    return (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url === CATALOG_URL) return new Response(catalogDoc(records), { status: 200 });
-      return new Response(metadata, { status: 200 });
-    }) as typeof fetch;
-  }
 
   const NOTION_ENTRY: CatalogEntry = {
     id: "mcp/notion",
@@ -524,19 +523,26 @@ describe("record-carried token endpoint (issue #275) — the register path suppl
     url: "https://notion.com/docs/mcp",
   };
 
-  test("discoverCatalogMcp extracts the token endpoint from the RFC 8414 authorization-server metadata (never guessed)", async () => {
-    const discovered = await discoverCatalogMcp(NOTION_ENTRY, {
-      fetchImpl: oauthMetadataFetch([], AS_METADATA),
-    });
+  test("an RFC 8414 metadata 200 classifies OAuth-gated WITHOUT extracting a token endpoint (never carried on the record)", async () => {
+    // Pre-#284 the discovery extracted the vendor's token_endpoint for the
+    // egress mint. Issue #284: the proxy never mints, so the record is
+    // endpoint-free — the SDK re-discovers RFC 8414 metadata itself at
+    // connect/call time. The 200 on the metadata path is the classification
+    // signal only.
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
+      return new Response(AS_METADATA, { status: 200 });
+    }) as typeof fetch;
+    const discovered = await discoverCatalogMcp(NOTION_ENTRY, { fetchImpl });
     expect(discovered.oauthGated).toBe(true);
-    // The vendor's OWN published metadata — not a guess, not the hardcoded map.
-    expect(discovered.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    expect((discovered as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
   });
 
-  test("the protected-resource metadata's authorization_servers lead to the AS metadata's token endpoint", async () => {
-    // The real providers (linear/attio/notion) serve the protected-resource
-    // doc first with `authorization_servers` listing the AS origin; the
-    // endpoint lives on that origin's standard metadata path.
+  test("the protected-resource metadata 200 classifies OAuth-gated with no follow-hop (issue #284)", async () => {
+    // The old discovery followed `authorization_servers` to the AS metadata
+    // to extract the token endpoint. Issue #284: any 200 on the well-known
+    // paths is the OAuth signal; there is no endpoint extraction hop.
     const fetchImpl = (async (input: string | URL | Request) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
@@ -546,55 +552,31 @@ describe("record-carried token endpoint (issue #275) — the register path suppl
           { status: 200 },
         );
       }
-      if (url.includes("oauth-authorization-server")) {
-        return new Response(AS_METADATA, { status: 200 });
-      }
       return new Response("", { status: 404 });
     }) as typeof fetch;
     const entry: CatalogEntry = { ...NOTION_ENTRY, slug: "linear", domain: "linear.app" };
     const discovered = await discoverCatalogMcp(entry, { fetchImpl });
     expect(discovered.oauthGated).toBe(true);
-    expect(discovered.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    expect((discovered as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
   });
 
-  test("a metadata token_endpoint that is not an https URL is never adopted (fail closed, issue #275)", async () => {
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
-      return new Response(
-        JSON.stringify({ issuer: "https://mcp.x.example", token_endpoint: "http://insecure.example/token" }),
-        { status: 200 },
-      );
-    }) as typeof fetch;
-    const discovered = await discoverCatalogMcp(NOTION_ENTRY, { fetchImpl });
-    expect(discovered.oauthGated).toBe(true);
-    // Not adopted — the record never carries a non-https endpoint, so the
-    // egress generation fails closed loudly instead of minting over http.
-    expect(discovered.tokenEndpoint).toBeUndefined();
-  });
-
-  test("lookupCatalogExtension carries the discovered token endpoint on the registration snapshot", async () => {
+  test("lookupCatalogExtension registers an endpoint-free OAuth snapshot (the record carries no token endpoint)", async () => {
     const h = makeHarness({ records: [NOTION_RECORD], wellKnownStatus: 200 });
     tracked.push(h);
-    h.deps.catalog = { fetchImpl: oauthMetadataFetch([NOTION_RECORD], AS_METADATA) };
     const result = await lookupCatalogExtension("notion", h.deps);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.snapshot.manifest.mcp).toMatchObject({
+    expect(result.snapshot.manifest.mcp).toEqual({
       serverUrl: "https://mcp.notion.com/mcp",
       transport: "streamable-http",
-      tokenEndpoint: "https://mcp.notion.com/token",
     });
+    expect(result.facts.oauthGated).toBe(true);
+    expect((result.facts as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
   });
 
-  test("registerExtensionAtRuntime with a record-carried endpoint regenerates egress WITHOUT the fail-closed warning (issue #275)", async () => {
-    // The old posture: an OAuth extension without a verified map entry fails
-    // the regen loudly. The register path now supplies the endpoint on the
-    // record (from the vendor's RFC 8414 metadata) — the regen must succeed
-    // and render the record's endpoint.
+  test("registerExtensionAtRuntime for an OAuth catalog entry regenerates egress WITHOUT any warning — allowlist only (issue #284)", async () => {
     const h = makeHarness({ records: [NOTION_RECORD], wellKnownStatus: 200 });
     tracked.push(h);
-    h.deps.catalog = { fetchImpl: oauthMetadataFetch([NOTION_RECORD], AS_METADATA) };
     const lookupResult = await lookupCatalogExtension("notion", h.deps);
     if (!lookupResult.ok) throw new Error(lookupResult.message);
     const draft = lookupResult;
@@ -604,12 +586,14 @@ describe("record-carried token endpoint (issue #275) — the register path suppl
       expect(result.warnings.some((w) => w.includes("EGRESS REGEN FAILED"))).toBe(false);
     }
     const egress = readFileSync(h.egressPath, "utf8");
-    expect(egress).toContain('token_endpoint: "https://mcp.notion.com/token"');
-    // The persisted store row carries the endpoint too (the durable record).
+    expect(egress).toContain("mcp.notion.com");
+    expect(egress).not.toContain('token_endpoint: "https://mcp.notion.com/token"');
+    expect(egress).not.toContain("notion-oauth.json");
+    expect(egress).not.toContain("- name: oauth_token");
+    // The persisted store row is endpoint-free too (the durable record).
     const persisted = parsePinnedSnapshot(JSON.stringify(h.runtimeRegistry.rows[0]!));
-    // SAFETY: the notion registration is a hosted mcp manifest — the binding carries the endpoint.
     expect(persisted.manifest.kind).toBe("mcp");
     if (persisted.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect(persisted.manifest.mcp.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    expect((persisted.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
   });
 });

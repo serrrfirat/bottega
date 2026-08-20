@@ -6,8 +6,9 @@
  *
  * Boot merges the pinned seeds (config/extensions snapshots) + the
  * persisted runtime set into the LIVE registry, so resolve/list surfaces
- * include both. The egress generator merges the same runtime set (domains
- * + oauth_token entries) into both emitted configs — see
+ * include both. The egress generator merges the same runtime set (the
+ * allowlist domains; issue #284 — OAuth extensions get no transform
+ * entry, the SDK owns OAuth) into both emitted configs — see
  * src/egress/generate.ts.
  *
  * The snapshot column holds the full PinnedSnapshot document; every read

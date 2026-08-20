@@ -47,7 +47,6 @@ import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { oauthIdentityKey, pickNewestBrokerEntry, type ConnectScope } from "./connect";
 import type { ExtensionRegistry } from "./registry";
-import type { VaultOAuthCredential } from "./proxy-seed";
 import type { ReconcileEgress } from "./egress-reconcile";
 
 /** Default flow lifetime: short by design — 15 minutes, like upload links. */
@@ -56,17 +55,35 @@ export const MCP_OAUTH_FLOW_TTL_MS = 15 * 60_000;
 export const MCP_OAUTH_MAX_OUTSTANDING_PER_ACTOR = 5;
 
 /**
- * The iron-proxy v0.49.0 token-endpoint stub bearer (verified from the
- * source: `internal/transform/oauth/oauth.go` — `stubAccessToken`). When a
- * provider's `oauth_token` egress entry is active, the proxy answers every
- * POST to the configured token_endpoint with
- * `{"access_token":"iron-proxy-stub-token",...}` so a sandboxed SDK's own
- * token dance completes against the proxy (the real token is minted and
- * swapped at egress). A CONNECT-leg exchange answered with this value never
- * reached the provider — persisting it would make the connect "succeed"
- * with a token the provider rejects (decision B guard, issue #265).
+ * A vault OAuth credential carrying the per-user registered client
+ * identity (issue #250): the dynamic-client-registration flow persists
+ * `client_information` (`client_id`/`client_secret`) into the vault row,
+ * so the SDK's refresh grant can mint for the USER's client rather than a
+ * shared deployment client. The SDK type omits these fields (the SDK
+ * never reads them back), but extra JSON survives the vault round-trip.
  */
-export const IRON_PROXY_STUB_ACCESS_TOKEN = "iron-proxy-stub-token";
+export interface VaultOAuthCredential extends OAuthCredential {
+  /**
+   * Whether the credential's grant is refreshable (decision B, issue #265).
+   * Explicitly `false` when the exchange returned an access-only token (no
+   * refresh anywhere — e.g. Notion's AS caps grants at ~1h access tokens):
+   * the row is still persisted so the connect succeeds, but there is no
+   * refresh to mint from and expiry surfaces the re-connect prompt.
+   * Refresh-bearing rows carry `true`; pre-#265 rows omit it (treated as
+   * refreshable by presence of `refresh`).
+   */
+  refreshable?: boolean;
+  client_id?: string;
+  client_secret?: string;
+  /**
+   * The persisted token-endpoint auth method (issue #257): whichever
+   * `token_endpoint_auth_method` the connect negotiated at registration
+   * (`client_secret_basic` / `client_secret_post`, or "none" for public
+   * clients). Rides the vault round-trip like `client_secret` so the
+   * runtime re-sends confidential credentials per the persisted method.
+   */
+  token_endpoint_auth_method?: string;
+}
 
 /** The store slice the flow path needs (the full {@link Store} satisfies it). */
 export type OAuthFlowStoreSlice = Pick<
@@ -222,8 +239,7 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  * omit it) — the grant must not silently lose its refresh capability.
  * Issue #256: when there is NO refresh token to keep — the exchange
  * returned none AND there is no previous row holding one — the credential
- * is NEVER written as an empty-refresh row (that is the bug that breaks
- * every later read: the proxy mint fails with `oauth_token failed to mint`).
+ * is NEVER written as an empty-refresh row.
  *
  * Decision B (issue #265): instead of failing the save closed (the #256/
  * #263 posture), an access-only outcome — no refresh from the exchange AND
@@ -231,59 +247,35 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  * `refreshable: false`, no `refresh` field, `expires` from `expires_in`.
  * This accepts servers whose AS caps grants at ~1h access tokens (Notion's
  * measured behavior) so the connect succeeds; the credential serves for the
- * access token's lifetime and expiry surfaces the re-connect prompt. The
- * ONE exception is the CONNECT leg's exchange being answered by the local
- * iron-proxy token-endpoint STUB (`iron-proxy-stub-token`, verified from
- * the iron-proxy v0.49.0 source): that is not a real token — the proxy
- * stubbed the exchange before it reached the provider — so the connect
- * fails closed with a precise cause rather than persisting garbage. The
- * runtime refresh leg (no negotiation context) may legitimately save the
- * stub (the proxy answers the SDK's token dance with it by design).
+ * access token's lifetime and expiry surfaces the re-connect prompt.
  *
  * The per-user registered client identity (issue #250) rides along: the
  * DCR `client_information` (`client_id`/`client_secret`) is per-user vault
  * data, not a deployment env constant, so `tokensToVaultCredential`
  * persists it (fresh DCR first, the previous row's identity as the
- * refresh-round-trip carry-forward) for the connect-time egress reconcile
- * to seed the proxy OAuth blob from. Empty/undefined fields are stripped.
+ * refresh-round-trip carry-forward) and the runtime re-sends it on every
+ * mint. Empty/undefined fields are stripped.
  */
 export function tokensToVaultCredential(
   tokens: OAuthTokens,
   previous: OAuthCredential | null,
   clientInformation?: { client_id?: string; client_secret?: string; token_endpoint_auth_method?: string },
-  negotiation?: OAuthGrantNegotiation,
 ): VaultOAuthCredential {
   // A genuine new refresh wins; otherwise the previous row's refresh is
   // carried forward (non-rotating servers). Neither present → the grant
   // cannot be refreshed at all: persist a NON-RENEWABLE access-only
-  // credential (decision B) — never an empty-refresh row that mints
-  // nothing, and never a silent connect failure for servers that cap
-  // grants at access tokens.
+  // credential (decision B) — never an empty-refresh row, and never a
+  // silent connect failure for servers that cap grants at access tokens.
   const refresh = tokens.refresh_token && tokens.refresh_token !== "" ? tokens.refresh_token : previous?.refresh;
   if (refresh === undefined || refresh === "") {
-    // Connect-leg guard: the iron-proxy token-endpoint STUB (verified from
-    // the v0.49.0 source, `internal/transform/oauth/oauth.go`) answers the
-    // exchange with `iron-proxy-stub-token` when the provider's oauth_token
-    // entry is active — a masked exchange, not the provider's real grant.
-    // Persisting the stub would make the connect "succeed" with a token the
-    // provider rejects. Only the connect legs carry `negotiation`; the
-    // runtime refresh leg is expected to save the stub (the proxy's token
-    // dance completes against it by design), so the guard is scoped there.
-    if (negotiation !== undefined && tokens.access_token === IRON_PROXY_STUB_ACCESS_TOKEN) {
-      throw new Error(
-        "the authorization exchange was answered by the local iron-proxy token-endpoint stub " +
-          "(the provider's real token endpoint was not reached) — the provider's oauth_token egress entry is " +
-          "masking the exchange; remove the entry or connect without it",
-      );
-    }
     const credential: VaultOAuthCredential = {
       type: "oauth",
       // The row shape requires a `refresh` field; an EMPTY value marks "no
-      // refresh" — every consumer distinguishes it: `vaultCredentialToTokens`
-      // drops it (the SDK never POSTs it), `seedProxyOAuthBlob` excludes
-      // empty-refresh rows (no blob, no mint), and the egress reconcile
-      // excludes the provider from the oauth_token entries (decision B). The
-      // `refreshable: false` marker makes the non-renewability explicit.
+      // refresh" — `vaultCredentialToTokens` drops it (the SDK never POSTs
+      // it) and the runtime treats the credential as non-renewable
+      // (decision B): expiry surfaces the re-connect prompt instead of a
+      // mint. The `refreshable: false` marker makes the non-renewability
+      // explicit.
       refresh: "",
       access: tokens.access_token,
       expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
@@ -319,25 +311,6 @@ export function tokensToVaultCredential(
   return credential;
 }
 
-/**
- * The connect-negotiated grant contract (issue #263), carried from
- * {@link connectServerNegotiation} (the mint leg) through the persisted
- * flow (the callback leg): whether the authorization server advertised the
- * `refresh_token` grant + the composed scope the connect actually
- * REQUESTED. Under decision B (issue #265) it no longer feeds a fail-closed
- * message — an access-only outcome is accepted — but it still marks the
- * CONNECT legs: `tokensToVaultCredential` scopes the iron-proxy stub guard
- * (a stub-answered exchange is a masked connect, not a real access-only
- * grant) to saves carrying a negotiation, so the runtime refresh leg (no
- * negotiation) can legitimately save the proxy's stub-token dance result.
- */
-export interface OAuthGrantNegotiation {
-  /** True when the AS advertised the `refresh_token` grant at connect time. */
-  grantedRefresh?: boolean;
-  /** The scope the connect actually requested (may carry `offline_access`). */
-  requestedScope?: string;
-}
-
 /** The persisted flow bookkeeping (the `oauth_flows.flow` JSON blob). */
 export interface PersistedOAuthFlow {
   codeVerifier?: string;
@@ -350,14 +323,6 @@ export interface PersistedOAuthFlow {
    * for the vault row's `token_endpoint_auth_method` field.
    */
   tokenEndpointAuthMethod?: string;
-  /**
-   * The connect-negotiated grant contract (issue #263) — whether the AS
-   * advertised the `refresh_token` grant + the scope the mint actually
-   * requested. Persisted so the CALLBACK's exchange fail-closed message can
-   * name the advertised-refresh-but-access-only cause (a server
-   * limitation) instead of the misleading "offline_access was not granted".
-   */
-  negotiation?: OAuthGrantNegotiation;
   authorizationUrl?: string;
 }
 
@@ -380,13 +345,6 @@ export interface McpOAuthProviderOpts {
   state?: string;
   /** Callback leg: restores the minted flow's PKCE/client/discovery state. */
   restore?: PersistedOAuthFlow;
-  /**
-   * The connect-negotiated grant contract (issue #263). The mint leg
-   * passes it directly; the callback leg reads it off `restore`; the
-   * runtime leg leaves it undefined (no negotiation context there — that
-   * leg only ever saves a successful refresh that carries a real token).
-   */
-  negotiation?: OAuthGrantNegotiation;
 }
 
 /**
@@ -404,14 +362,12 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
   #tokens: OAuthTokens | undefined;
   #savedBrokerCredentialId: number | undefined;
   #savedRefreshable = false;
-  #negotiation: OAuthGrantNegotiation | undefined;
 
   constructor(opts: McpOAuthProviderOpts) {
     this.#opts = opts;
     this.#codeVerifier = opts.restore?.codeVerifier;
     this.#clientInformation = opts.restore?.clientInformation;
     this.#discoveryState = opts.restore?.discoveryState;
-    this.#negotiation = opts.negotiation ?? opts.restore?.negotiation;
   }
 
   get redirectUrl(): string | URL {
@@ -465,7 +421,7 @@ export class BottegaMcpOAuthProvider implements OAuthClientProvider {
             .catch(() => null);
     const saved = await this.#opts.tokenStore.save(
       this.#opts.tokenTarget.provider,
-      tokensToVaultCredential(tokens, previous, this.#clientInformation, this.#negotiation),
+      tokensToVaultCredential(tokens, previous, this.#clientInformation),
     );
     this.#opts.tokenTarget.brokerCredentialId = saved.brokerCredentialId;
     this.#savedBrokerCredentialId = saved.brokerCredentialId;
@@ -700,10 +656,10 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
  * client metadata `scope`. The resource advertisement lists only the
  * RESOURCE's own scopes (the hosted MCP advertises e.g. "default") — it
  * NEVER lists the OIDC "offline_access" scope, without which the
- * authorization server issues NO refresh token, and every later proxy mint
- * fails with "oauth_token failed to mint". So the mint decides on the
- * AUTHORIZATION SERVER's grant signal: when it advertises the
- * `refresh_token` grant, append `offline_access` to the requested scope
+ * authorization server issues NO refresh token, and the grant cannot be
+ * refreshed (the SDK's runtime mint fails closed at expiry). So the mint
+ * decides on the AUTHORIZATION SERVER's grant signal: when it advertises
+ * the `refresh_token` grant, append `offline_access` to the requested scope
  * (the DCR registration request and the authorization URL both carry it);
  * otherwise keep the SDK's resolution untouched (e.g. client-credentials
  * servers have no consent).
@@ -734,7 +690,7 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
 async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
-): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; grantedRefresh: boolean }> {
+): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string }> {
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
@@ -750,7 +706,7 @@ async function connectServerNegotiation(
         "proceeding without offline_access and without a negotiated token-endpoint auth method; " +
         "the connect will fail closed in auth() if the server is unreachable",
     );
-    return { scope: undefined, tokenEndpointAuthMethod: "none", grantedRefresh: false };
+    return { scope: undefined, tokenEndpointAuthMethod: "none" };
   }
   const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
   const supports = (method: string) => supportedMethods?.includes(method) === true;
@@ -761,7 +717,7 @@ async function connectServerNegotiation(
       : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, grantedRefresh: false };
+  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod };
   // Issue #262: choose the scope BASE without ever building it out of the
   // "default" placeholder Notion (and similar AS) advertise in
   // `scopes_supported`. A placeholder/absent resource scope is discarded in
@@ -778,7 +734,7 @@ async function connectServerNegotiation(
       : undefined) ??
     (clientScopes !== undefined && clientScopes.length > 0 ? clientScopes.join(" ") : undefined);
   const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
-  return { scope, tokenEndpointAuthMethod, grantedRefresh: true };
+  return { scope, tokenEndpointAuthMethod };
 }
 
 /**
@@ -832,9 +788,6 @@ export async function startMcpOAuthFlow(
     onRedirect: (url) => {
       authorizationUrl = url;
     },
-    // Issue #263: carry the negotiated grant contract so a fail-closed
-    // access-only outcome is classifiable later (the callback exchange).
-    negotiation: { grantedRefresh: negotiation.grantedRefresh, requestedScope: negotiation.scope },
   });
   let result: AuthResult;
   try {
@@ -861,9 +814,6 @@ export async function startMcpOAuthFlow(
     clientInformation: provider.clientInformation(),
     discoveryState: provider.discoveryState(),
     tokenEndpointAuthMethod: negotiation.tokenEndpointAuthMethod,
-    // Issue #263: persist the granted-refresh contract so the callback
-    // exchange's fail-closed message can name the precise cause.
-    negotiation: { grantedRefresh: negotiation.grantedRefresh, requestedScope: negotiation.scope },
     authorizationUrl: authorizationUrl.toString(),
   };
   const flowStore = new OAuthFlowStore(deps.store, {
@@ -913,9 +863,11 @@ export async function completeMcpOAuthFlow(
     /**
      * Connect-time egress reconcile (issue #250): called after the vault
      * row + credential + audit land, so a successful connect immediately
-     * regenerates egress with the superset and seeds the provider's proxy
-     * OAuth blob (never boot-only, never clobbered). Best-effort: any
-     * warnings fold into the result — the connect stays successful.
+     * regenerates egress with the superset and reloads the proxy (the
+     * allowlist gains the new provider's domains). Issue #284: never
+     * touches OAuth credentials — no blob seeding, no refresh POST (the
+     * SDK owns the grant). Best-effort: any warnings fold into the result
+     * — the connect stays successful.
      */
     reconcileEgress?: ReconcileEgress;
     /**
@@ -1038,10 +990,13 @@ export async function completeMcpOAuthFlow(
     payload: { extension: flowRow.provider, scope: flowRow.scope, owner },
   });
   // Issue #250: reconcile the egress proxy plane now — regenerate egress
-  // from the superset (committed pins ∪ runtime rows) and seed this
-  // provider's proxy OAuth blob + reload. Best-effort and guarded: the
-  // connect already landed, so a reconcile failure is receivable, never
-  // fatal.
+  // from the superset (committed pins ∪ runtime rows) so the new
+  // provider's domains are allowlisted, and reload the running proxy.
+  // Issue #284: this NEVER touches OAuth credentials — no blob seeding,
+  // no refresh POST; the SDK owns the grant (the connect-time mint probe
+  // above was the single refresh round-trip). Best-effort and guarded:
+  // the connect already landed, so a reconcile failure is receivable,
+  // never fatal.
   let warnings: string[] = [];
   if (deps.reconcileEgress !== undefined) {
     try {

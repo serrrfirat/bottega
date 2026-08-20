@@ -176,39 +176,21 @@ describe("extension manifest validation (fail closed)", () => {
       .toBeDefined();
   });
 
-  test("an mcp binding carries an optional HTTPS tokenEndpoint on the record (issue #275)", () => {
+  test("an mcp binding carries no OAuth token endpoint on the record (issue #284 — the SDK owns OAuth)", () => {
+    // Pre-#284 the record could carry the provider's token endpoint for the
+    // egress oauth_token mint. Issue #284 removes that machinery: the
+    // binding is endpoint-free (the SDK performs its own RFC 8414
+    // discovery), and a legacy record carrying the extra field is ignored
+    // (never a parse failure — old snapshots stay readable).
     const manifest = validateManifest(
       asJsonDoc({
         ...fixtureManifest(),
         mcp: { ...fixtureManifest().mcp, tokenEndpoint: "https://mcp.linear.app/token" },
       }),
     );
-    // SAFETY: the fixture manifest is kind mcp — the typed binding carries the endpoint.
     expect(manifest.kind).toBe("mcp");
     if (manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect(manifest.mcp.tokenEndpoint).toBe("https://mcp.linear.app/token");
-    // Absent → the binding stays endpoint-free (legacy records byte-stable).
-    const plain = validateManifest(asJsonDoc(fixtureManifest()));
-    if (plain.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect(plain.mcp.tokenEndpoint).toBeUndefined();
-  });
-
-  test("a non-https or malformed tokenEndpoint fails closed (issue #275)", () => {
-    // The egress mint POSTs the refresh grant to this URL — a non-https
-    // endpoint would ship credentials over plaintext, so the record refuses it.
-    expectInvalid(
-      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: "http://insecure.example/token" } },
-      "tokenEndpoint must be an https URL",
-    );
-    expectInvalid(
-      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: "not a url" } },
-      "tokenEndpoint must be a valid URL",
-    );
-    // A PRESENT-but-non-string value fails too (never silently dropped).
-    expectInvalid(
-      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: 42 } },
-      "tokenEndpoint must be a non-empty string",
-    );
+    expect((manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
   });
 
   test("mcp serverUrl must be an http(s) URL", () => {

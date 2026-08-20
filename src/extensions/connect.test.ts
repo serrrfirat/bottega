@@ -258,9 +258,11 @@ describe("connectExtension broker seam", () => {
   test("hosted OAuth MCPs route to the GENERIC MCP OAuth flow, never the broker (issue #198)", async () => {
     const h = makeDeps({ broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }) });
     let prepared = false;
-    h.deps.reconcileEgress = async (provider, options) => {
+    // Issue #284: the pre-authorization preflight is the plain reconcile
+    // (allowlist regen + reload) — no exclude/seed options exist anymore,
+    // and the call must never probe/seed a credential.
+    h.deps.reconcileEgress = async (provider) => {
       expect(provider).toBe("com.example.oauth");
-      expect(options).toEqual({ excludeProvider: true, seedProvider: false });
       prepared = true;
       return { warnings: [] };
     };

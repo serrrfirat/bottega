@@ -31,6 +31,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage } from "../tools/helpers";
 import { EXTENSION_ID_RE, isRecord, type ExtensionTool, type ExtensionToolParam, type ExtensionToolTier, type JsonObject, type JsonValue, type McpBinding } from "./manifest";
@@ -248,13 +249,13 @@ export const MCP_DISCOVERY_TIMEOUT_MS = 10_000;
  */
 export async function listProviderTools(
   binding: McpBinding,
-  mcpTransport: (binding: McpBinding) => Transport = defaultMcpTransport,
-  opts: { timeoutMs?: number } = {},
+  mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport = defaultMcpTransport,
+  opts: { timeoutMs?: number; authProvider?: OAuthClientProvider } = {},
 ): Promise<ProviderTool[]> {
   const timeoutMs = opts.timeoutMs ?? MCP_DISCOVERY_TIMEOUT_MS;
   const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
   try {
-    const transport = mcpTransport(binding);
+    const transport = mcpTransport(binding, opts.authProvider);
     // Contain a misbehaving stdio server's stderr (issue #205): the boot log
     // must never carry a child's exec noise, and an unbounded pipe would
     // stall the child on backpressure. Drain up to a bounded prefix for

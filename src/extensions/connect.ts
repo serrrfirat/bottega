@@ -116,8 +116,9 @@ export interface ConnectExtensionDeps {
   broker: BrokerConnector;
   /**
    * Connect-time egress reconcile (issue #250): after a successful BROKER
-   * OAuth connect (notion class), regenerate egress with the superset,
-   * seed the provider's proxy OAuth blob, and reload the running proxy.
+   * OAuth connect (notion class), regenerate egress with the superset
+   * (allowlist only — issue #284: the SDK owns OAuth, the proxy never
+   * holds or mints extension credentials) and reload the running proxy.
    * Default: built from `deps.store` (the store's `listRuntimeExtensions`
    * supplies the runtime half of the superset), so the broker connect
    * reconciles with zero composition-root wiring.
@@ -414,12 +415,12 @@ export async function connectExtension(
           "BOTTEGA_OAUTH_CALLBACK_BASE_URL, then re-connect.",
       };
     }
-    // Issue #283: iron-proxy answers configured token endpoints with its
-    // local stub. Remove this provider's oauth_token entry and reload the
-    // proxy BEFORE minting an authorization URL, otherwise the callback's
-    // code exchange never reaches the provider. Do not seed/probe the old
-    // credential during this preflight.
-    const prepared = await reconcileEgress(provider, { excludeProvider: true, seedProvider: false });
+    // Issue #284: the pre-authorization preflight only needs the egress
+    // allowlist regenerated + the proxy reloaded (a catalog/runtime
+    // registration's domains must be live before the browser exchange
+    // reaches the provider). It never seeds/probes a credential — the SDK
+    // owns the grant, and probing the existing one would consume it.
+    const prepared = await reconcileEgress(provider);
     if (prepared.warnings.length > 0) {
       return {
         ok: false,
@@ -480,11 +481,12 @@ export async function connectExtension(
   let reconcileWarnings: string[] = [];
   // Issue #250: a successful BROKER OAuth connect reconciles the egress
   // proxy plane — regenerate egress/dev-egress from the superset (so this
-  // provider joins the running config without a boot or pin), seed the
-  // provider's proxy OAuth blob, and reload the running proxy. Best-effort
-  // and guarded: the connect already landed (vault row + credential +
-  // audit), so any reconcile gap is receivable via the message, never
-  // fatal. API-key connects skip the reconcile (no egress OAuth surface).
+  // provider joins the running config without a boot or pin) and reload
+  // the running proxy. Issue #284: allowlist only — no credential
+  // seeding/probing (the SDK owns the grant). Best-effort and guarded:
+  // the connect already landed (vault row + credential + audit), so any
+  // reconcile gap is receivable via the message, never fatal. API-key
+  // connects skip the reconcile (no egress OAuth surface).
   if (manifest.credentialSchema.type === "oauth") {
     try {
       const result = await reconcileEgress(provider);

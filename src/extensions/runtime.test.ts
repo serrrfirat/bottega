@@ -31,7 +31,7 @@ import { createSecretFileBoundary, extensionSecretFileName, PROXY_SECRETS_DIR, t
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "./fixture";
 import { validateManifest, type ExtensionManifest, type JsonObject, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
-import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
+import { createExtensionRuntime, defaultMcpTransport, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
 import type { McpOAuthTokenStore } from "./mcp-oauth";
 import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
@@ -1077,6 +1077,86 @@ describe("extension runtime: generic MCP OAuth (issue #198)", () => {
     expect(result.ok).toBe(true); // the transport seam is a fake — auth is the SDK's job
     const provider = captured[0]!.authProvider!;
     await expect(provider.tokens()).resolves.toBeUndefined();
+  });
+
+  test("a runtime OAuth tool call authenticates through the REAL SDK transport against an authenticated fake MCP server — no proxy minting (issue #284)", async () => {
+    // The full wire proof: the runtime builds the vault-backed provider,
+    // hands it to the PRODUCTION defaultMcpTransport (StreamableHTTPClient
+    // with the SDK OAuth client), and the SDK attaches the vault bearer —
+    // the fake MCP server 401s any token-less request, so a successful
+    // call PROVES the SDK sent the credential. The proxy plane is not
+    // involved at all (no oauth_token transform, no blob — the egress
+    // generator tests pin that contract).
+    const seenAuth: string[] = [];
+    const stub = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (req.method !== "POST" || !new URL(req.url).pathname.startsWith("/mcp")) {
+          return new Response("", { status: 404 });
+        }
+        const authorization = req.headers.get("authorization") ?? "";
+        if (authorization === "") {
+          return new Response("", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+        }
+        seenAuth.push(authorization);
+        const body = (await req.json()) as { jsonrpc: string; id: number; method: string; params?: unknown };
+        if (body.method === "initialize") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "oauth-exec-stub", version: "1.0.0" },
+            },
+          });
+        }
+        if (body.method === "tools/call") {
+          const params = body.params as { name?: string; arguments?: { city?: string } };
+          return Response.json({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              content: [{ type: "text", text: `sunny in ${String(params.arguments?.city ?? "")}` }],
+              isError: false,
+            },
+          });
+        }
+        return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "unknown method" } });
+      },
+    });
+    const manifest = oauthManifest();
+    manifest.mcp = { serverUrl: `http://127.0.0.1:${stub.port}/mcp`, transport: "streamable-http" };
+    const store = tokenStore({ access: "access-1", refresh: "refresh-1", expires: Date.now() + 60_000 });
+    const h = makeHarness({
+      manifests: [manifest],
+      mcpOAuthTokenStore: store,
+      // The PRODUCTION transport: the SDK's streamable-http client with the
+      // runtime's OAuthClientProvider attaches the vault bearer on the wire.
+      mcpTransport: defaultMcpTransport,
+    });
+    try {
+      await seedOrgCredential(h.store, OAUTH_ID);
+
+      const result = await h.runtime.execute({
+        extensionId: OAUTH_ID,
+        toolName: OAUTH_TOOL,
+        args: { city: "Lisbon" },
+        caller: "UADA",
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const text = result.content.map((block) => ("text" in block ? block.text : "")).join(" ");
+      expect(text).toContain("sunny in Lisbon");
+      // The authenticated wire calls carried the vault bearer — the SDK
+      // OAuth client, NOT any proxy mint, authenticated this call.
+      expect(seenAuth.length).toBeGreaterThan(0);
+      expect(seenAuth[0]).toBe("Bearer access-1");
+      expect(h.boundary.calls).toHaveLength(1);
+    } finally {
+      stub.stop(true);
+    }
   });
 });
 

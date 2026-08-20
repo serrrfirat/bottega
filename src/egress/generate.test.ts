@@ -14,7 +14,6 @@ import {
   SNAPSHOTS_DIR,
   renderSecretsTransform,
   apiKeyExtensionEntries,
-  oauthTokenEntries,
 } from "./generate";
 import { readPinnedSnapshots, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "../extensions/registry";
 import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID } from "../extensions/fixture";
@@ -27,10 +26,10 @@ const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egr
 const SNAPSHOTS = readPinnedSnapshots(SNAPSHOTS_DIR);
 const EXTENSION_DOMAINS = SNAPSHOTS.flatMap((s) => s.manifest.domains);
 
-/** File-injection entries for the committed api_key snapshots + the OAuth
- * entries for the oauth snapshots (issue #208: the proxy mints OAuth). */
+/** File-injection entries for the committed api_key snapshots (issue #208;
+ * since #284 the OAuth snapshots get no egress entry of any kind — the SDK
+ * owns their OAuth, the proxy is transport/allowlist only). */
 const EXTENSION_ENTRIES = apiKeyExtensionEntries(SNAPSHOTS);
-const OAUTH_ENTRIES = oauthTokenEntries(SNAPSHOTS);
 
 function allowlistDomains(yaml: string): string[] {
   const cfg = parseYamlSubset(yaml);
@@ -65,12 +64,11 @@ describe("egress config generation", () => {
   test("rendering with the base + pinned extension domains reproduces the committed config byte-for-byte", () => {
     // config/egress.yml is a generated artifact; this pins it to the
     // template so hand edits and generator drift both fail here. The
-    // pinned extension domains (issue #54), their credential-injection
-    // entries (issue #53), and the oauth_token transform for the OAuth
-    // extensions (issue #208) are part of the committed output.
-    expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS), EXTENSION_ENTRIES, OAUTH_ENTRIES)).toBe(
-      COMMITTED_EGRESS,
-    );
+    // pinned extension domains (issue #54) and their credential-injection
+    // entries (issue #53) are part of the committed output; since #284 the
+    // OAuth extensions contribute ONLY their allowlisted domains (no
+    // oauth_token transform — the SDK owns their OAuth).
+    expect(renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS), EXTENSION_ENTRIES)).toBe(COMMITTED_EGRESS);
   });
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
@@ -297,7 +295,7 @@ describe("dev-permissive egress config (issue #126)", () => {
   test("the committed dev config is byte-identical to renderDevEgressConfig with the pinned extensions", () => {
     // config/egress.dev.yml is a generated artifact (same discipline as the
     // strict config): hand edits and generator drift both fail here.
-    expect(renderDevEgressConfig(EXTENSION_ENTRIES, OAUTH_ENTRIES)).toBe(COMMITTED_DEV_EGRESS);
+    expect(renderDevEgressConfig(EXTENSION_ENTRIES)).toBe(COMMITTED_DEV_EGRESS);
   });
 
   test("allow-all: the dev allowlist contains only \"*\"", () => {
@@ -345,7 +343,7 @@ describe("dev-permissive egress config (issue #126)", () => {
       const outPath = join(dir, "egress.dev.yml");
       const yaml = regenerateDevEgressConfig(SNAPSHOTS_DIR, outPath);
       expect(readFileSync(outPath, "utf8")).toBe(yaml);
-      expect(yaml).toBe(renderDevEgressConfig(EXTENSION_ENTRIES, OAUTH_ENTRIES));
+      expect(yaml).toBe(renderDevEgressConfig(EXTENSION_ENTRIES));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -373,13 +371,10 @@ describe("runtime registry merge (issue #233)", () => {
     };
   }
 
-  test("regenerateEgressConfig merges the RUNTIME set (domains + oauth_token entries) into the emitted config", () => {
+  test("regenerateEgressConfig merges the RUNTIME set (domains allowlisted, api_key injected, NO oauth_token transform) — issue #284", () => {
     const dir = mkdtempSync(join(tmpdir(), "egress-runtime-"));
     try {
       const outPath = join(dir, "egress.yml");
-      // The OAuth runtime extension uses a "fixture."-prefixed id (the
-      // canary's synthesized-endpoint seam — there is no real authorization
-      // server behind a fixture domain); the api_key one is a plain id.
       const runtime = [
         runtimeSnapshot("fixture.runtime-oauth", ["fixture-runtime.example.com"], "oauth"),
         runtimeSnapshot("runtime-key", ["runtime-key.example.com", "mcp.runtime-key.example.com"], "api_key"),
@@ -390,12 +385,13 @@ describe("runtime registry merge (issue #233)", () => {
       const domains = allowlistDomains(yaml);
       expect(domains).toContain("fixture-runtime.example.com");
       expect(domains).toContain("runtime-key.example.com");
-      // The OAuth runtime extension gets an oauth_token entry (the #198
-      // mint shape; the endpoint is synthesized from its own allowlisted
-      // host — a fixture id, never a guessed production URL)…
-      expect(yaml).toContain("fixture.runtime-oauth-oauth.json");
-      expect(yaml).toContain('token_endpoint: "https://fixture-runtime.example.com/token"');
-      // …and the api_key runtime extension gets a secrets file entry.
+      // Issue #284: the OAuth runtime extension gets NO egress entry of any
+      // kind — the SDK sends its own bearer through the allowlisted host.
+      // No oauth_token transform, no blob seed, no token_endpoint.
+      expect(yaml).not.toContain("- name: oauth_token");
+      expect(yaml).not.toContain("-oauth.json");
+      expect(yaml).not.toContain("token_endpoint:");
+      // …the api_key runtime extension still gets a secrets file entry.
       expect(yaml).toContain('path: "/data/proxy-secrets/runtime-key.secret"');
       // The base config stays intact around the merge.
       expect(yaml).toContain('fallback: "deny"');
@@ -428,13 +424,12 @@ describe("runtime registry merge (issue #233)", () => {
     const seed = readPinnedSnapshots(SNAPSHOTS_DIR);
     const seedDomains = seed.flatMap((s) => s.manifest.domains);
     const seedEntries = apiKeyExtensionEntries(seed);
-    const seedOAuth = oauthTokenEntries(seed);
-    expect(renderEgressConfig(mergedEgressDomains(seedDomains), seedEntries, seedOAuth)).toBe(COMMITTED_EGRESS);
-    expect(renderDevEgressConfig(seedEntries, seedOAuth)).toBe(committedDev);
+    expect(renderEgressConfig(mergedEgressDomains(seedDomains), seedEntries)).toBe(COMMITTED_EGRESS);
+    expect(renderDevEgressConfig(seedEntries)).toBe(committedDev);
   });
 });
 
-describe("oauth_token rule scoping (issue #246)", () => {
+describe("OAuth extension egress contract (issue #284)", () => {
   /** A notion-shaped RUNTIME snapshot (the #233 store-backed record — not
    * a repo pin): resource at /mcp, domains notion.com + mcp.notion.com.
    * Mirrors the connect-flow merge the generator performs. */
@@ -459,260 +454,37 @@ describe("oauth_token rule scoping (issue #246)", () => {
   /** The merged snapshot set the runtime connect produces: the pinned seed
    * (attio/linear OAuth) plus a notion-shaped runtime registration. */
   const MERGED_SNAPSHOTS = [...SNAPSHOTS, notionRuntimeSnapshot()];
-  const MERGED_ENTRIES = oauthTokenEntries(MERGED_SNAPSHOTS);
 
-  test("decision B: a non-renewable provider (excluded set) gets NO oauth_token entry; its domains still allowlist", () => {
-    const excluded = new Set(["notion"]);
-    const entries = oauthTokenEntries(MERGED_SNAPSHOTS, excluded);
-    expect(entries.map((e) => e.extensionId)).not.toContain("notion");
-    // The other OAuth providers keep their entries (their rows are
-    // refreshable — the caller only excludes non-renewable ones).
-    expect(entries.map((e) => e.extensionId)).toContain("attio");
-    expect(entries.map((e) => e.extensionId)).toContain("linear");
-    // The allowlist is independent of the exclusion: notion's domains still
-    // pass egress so the boundary secrets injection can reach them.
+  test("OAuth MCP domains stay allowlisted but ZERO oauth_token transforms / blob seeds are emitted", () => {
+    // The OAuth extensions' domains remain egress-allowlisted (the SDK's
+    // bearer passes through the proxy transport), but the proxy plane is
+    // transport-only under issue #284: no oauth_token transform, no
+    // <provider>-oauth.json blob seed, no token_endpoint.
     const yaml = renderEgressConfig(
       mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains)),
       apiKeyExtensionEntries(MERGED_SNAPSHOTS),
-      entries,
     );
-    expect(allowlistDomains(yaml)).toContain("mcp.notion.com"); // allowlist entry
-    expect(oauthTokenRules(yaml)?.some((r) => String(r["host"]) === "mcp.notion.com") ?? false).toBe(false);
-  });
-  // The runtime render merges the runtime domains into the allowlist too
-  // (issue #233) — the strict render needs them to be internally coherent.
-  const MERGED_DOMAINS = mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains));
-  const MERGED_YAML = renderEgressConfig(MERGED_DOMAINS, apiKeyExtensionEntries(MERGED_SNAPSHOTS), MERGED_ENTRIES);
-
-  /** Every oauth_token rule across the render, or null when the transform is absent. */
-  function oauthTokenRules(yaml: string): Record<string, YamlNode>[] | null {
-    const cfg = parseYamlSubset(yaml);
-    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
-    const transforms = cfg["transforms"] as YamlNode[];
-    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token");
-    if (oauth === undefined) return null;
-    // SAFETY: the oauth_token transform is a mapping whose `config` is a block mapping.
-    const config = (oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>;
-    // SAFETY: the config's `tokens` is a sequence of entry mappings each holding a `rules` sequence.
-    const tokens = config["tokens"] as YamlNode[];
-    const rules: Record<string, YamlNode>[] = [];
-    for (const token of tokens) {
-      rules.push(...((token as Record<string, YamlNode>)["rules"] as Record<string, YamlNode>[]));
+    const domains = allowlistDomains(yaml);
+    for (const host of ["mcp.notion.com", "notion.com", "mcp.linear.app", "mcp.attio.com"]) {
+      expect(domains).toContain(host);
     }
-    return rules;
-  }
-
-  /** A rule's path globs; [] when the rule carries no `paths` (the pre-fix bare-host shape). */
-  function rulePaths(rule: Record<string, YamlNode>): string[] {
-    const paths = rule["paths"];
-    if (!Array.isArray(paths)) return [];
-    return paths as string[];
-  }
-
-  /**
-   * Mirrors iron-proxy v0.49.0 hostmatch.MatchPath (verified 2026-08-19
-   * from ironsh/iron-proxy internal/hostmatch/path.go): a pattern ending
-   * `/*` matches the exact base path OR any path under it (prefix must end
-   * at a `/` — `/mcp/*` matches `/mcp` and `/mcp/anything`, never
-   * `/mcpx`); any other pattern uses path.Match glob semantics (`*` =
-   * non-separator run), which for our emitted literal resource path
-   * degenerates to exact equality.
-   */
-  function globMatchesPath(pattern: string, reqPath: string): boolean {
-    if (pattern.endsWith("/*")) {
-      const prefix = pattern.slice(0, -1); // "/mcp/"
-      const base = pattern.slice(0, -2); // "/mcp"
-      return reqPath.startsWith(prefix) || reqPath === base;
-    }
-    // Go path.Match: `*` matches any run of non-`/` characters.
-    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
-    return new RegExp(`^${escaped}$`).test(reqPath);
-  }
-
-  test("every oauth_token rule is path-scoped so public .well-known metadata never mints (issue #246)", () => {
-    const rules = oauthTokenRules(MERGED_YAML);
-    expect(rules).not.toBeNull();
-    expect(rules!.length).toBeGreaterThan(0);
-    // The RFC 8414/9207 discovery endpoints the SDK probes BEFORE any
-    // credential exists (catalog-register.ts probes them; the MCP OAuth SDK
-    // needs them to mint). A rule matching one of these under require: true
-    // 502s the connect (issue #246's symptom).
-    const discoveryPaths = [
-      "/.well-known/oauth-authorization-server",
-      "/.well-known/oauth-protected-resource/mcp",
-    ];
-    for (const rule of rules!) {
-      // Every rule MUST be path-scoped (issue #246): the pre-fix bare-host
-      // rules have no `paths` at all, so this assertion fails red.
-      expect(rulePaths(rule).length, `rule for ${String(rule["host"])} is not path-scoped`).toBeGreaterThan(0);
-      for (const pattern of rulePaths(rule)) {
-        for (const discovery of discoveryPaths) {
-          expect(
-            globMatchesPath(pattern, discovery),
-            `rule for ${String(rule["host"])} scoping "${pattern}" matches discovery ${discovery}`,
-          ).toBe(false);
-        }
-      }
-    }
-  });
-
-  test("the MCP resource path still matches an oauth_token rule for every provider host (minting preserved)", () => {
-    const rules = oauthTokenRules(MERGED_YAML)!;
-    // Every allowlisted OAuth host keeps a rule whose scope covers the
-    // /mcp resource — real API calls stay fail-closed with the minted
-    // token injected.
-    const oauthHosts = MERGED_SNAPSHOTS.filter((s) => s.manifest.credentialSchema.type === "oauth")
-      .flatMap((s) => s.manifest.domains);
-    for (const host of oauthHosts) {
-      const rule = rules.find((r) => String(r["host"]) === host);
-      expect(rule, `no oauth_token rule for ${host}`).toBeDefined();
-      expect(
-        rulePaths(rule!).some((p) => globMatchesPath(p, "/mcp")),
-        `rule for ${host} no longer scopes the /mcp resource`,
-      ).toBe(true);
-    }
-    expect(oauthHosts.length).toBeGreaterThan(0);
-  });
-
-  test("oauth_token entries keep require true (fail-closed minting preserved)", () => {
-    const cfg = parseYamlSubset(MERGED_YAML);
-    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
-    const transforms = cfg["transforms"] as YamlNode[];
-    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
-    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
-    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
-    expect(tokens.length).toBeGreaterThan(0);
-    for (const token of tokens) {
-      expect(String((token as Record<string, YamlNode>)["require"])).toBe("true");
-    }
-  });
-
-  test("every oauth_token entry sends client_secret from the same per-provider blob (issue #268)", () => {
-    // The refresh grant mints with the provider's client credentials: the
-    // transform must send client_secret for EVERY provider (notion's
-    // confidential client rejects the grant without it — invalid_client).
-    // Each credential field is its own json_key read of the SAME blob, so
-    // the file source stays one file per provider. (The blob always
-    // carries the key — "" for public clients — so the json_key read
-    // never hits a missing key; the oauth2 client omits the empty value
-    // from the token POST.)
-    const cfg = parseYamlSubset(MERGED_YAML);
-    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
-    const transforms = cfg["transforms"] as YamlNode[];
-    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
-    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
-    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
-    expect(tokens.length).toBeGreaterThan(0);
-    for (const token of tokens) {
-      const entry = token as Record<string, YamlNode>;
-      // SAFETY: every rendered token entry carries the file-source blocks.
-      const refresh = entry["refresh_token"] as Record<string, YamlNode>;
-      const clientId = entry["client_id"] as Record<string, YamlNode>;
-      const clientSecret = entry["client_secret"] as Record<string, YamlNode>;
-      const endpoint = String(entry["token_endpoint"]);
-      expect(clientSecret, `entry for ${endpoint} has no client_secret source`).toBeDefined();
-      expect(clientSecret["type"]).toBe("file");
-      expect(clientSecret["json_key"]).toBe("client_secret");
-      // One blob per provider: all three fields read the same file.
-      expect(String(clientSecret["path"])).toBe(String(refresh["path"]));
-      expect(String(clientSecret["path"])).toBe(String(clientId["path"]));
-      expect(String(clientSecret["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z-]+-oauth\.json$/);
-    }
-  });
-
-  test("the refresh_token source uses a LONG ttl — a short re-read clobbers the in-memory rotated token (issue #268)", () => {
-    // iron-proxy docs (oauth-token → Refresh Token Rotation): "Avoid short
-    // ttl values on the refresh-token secret source. A re-read overwrites
-    // the in-memory rotated token with the stale store value." Notion
-    // rotates the refresh token on every exchange, so a 30s re-read lands
-    // inside the 8h access-token lifetime and the next mint fails
-    // invalid_grant. The refresh source must outlive the access token;
-    // client_id/client_secret keep the short ttl (operator rotation
-    // pickup). Deeper fix (#269) persists rotation; this is the config
-    // mitigation.
-    const cfg = parseYamlSubset(MERGED_YAML);
-    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
-    const transforms = cfg["transforms"] as YamlNode[];
-    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
-    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
-    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
-    expect(tokens.length).toBeGreaterThan(0);
-    for (const token of tokens) {
-      const entry = token as Record<string, YamlNode>;
-      // SAFETY: every rendered token entry carries the file-source blocks.
-      const refresh = entry["refresh_token"] as Record<string, YamlNode>;
-      const clientId = entry["client_id"] as Record<string, YamlNode>;
-      const clientSecret = entry["client_secret"] as Record<string, YamlNode>;
-      const refreshTtl = String(refresh["ttl"]);
-      // Long enough to outlive any provider's access-token lifetime (notion 8h).
-      expect(refreshTtl).toMatch(/^[0-9]+h$/);
-      expect(parseInt(refreshTtl, 10)).toBeGreaterThanOrEqual(12);
-      // The client-credential sources keep the short ttl (rotation pickup).
-      expect(String(clientId["ttl"])).toBe("30s");
-      expect(String(clientSecret["ttl"])).toBe("30s");
-    }
-  });
-});
-
-describe("record-carried token endpoints (issue #275)", () => {
-  /** A snapshot whose mcp binding carries the provider's OAuth token endpoint — the pin/register record shape. */
-  function recordEndpointSnapshot(extensionId: string, tokenEndpoint: string): PinnedSnapshot {
-    return {
-      schema: SNAPSHOT_SCHEMA,
-      extensionId,
-      pinnedAt: "2026-08-20T00:00:00.000Z",
-      source: { catalog: "https://integrations.sh/api", specId: extensionId, vendorOfficial: true, reviewed: true },
-      manifest: {
-        id: extensionId,
-        label: extensionId,
-        vendor: extensionId,
-        kind: "mcp",
-        mcp: {
-          serverUrl: `https://mcp.${extensionId}.example.com/mcp`,
-          transport: "streamable-http",
-          tokenEndpoint,
-        },
-        credentialSchema: { type: "oauth" },
-        domains: [`mcp.${extensionId}.example.com`],
-      },
-    };
-  }
-
-  test("a snapshot's record token endpoint is the primary source — no OAUTH_TOKEN_ENDPOINTS entry needed (issue #275)", () => {
-    // The endpoint rides on the record (pinned snapshot / runtime
-    // registration); the hardcoded map has no entry for this id — the
-    // generation must use the record, never fail closed on the map.
-    const entries = oauthTokenEntries([
-      recordEndpointSnapshot("record.oauth", "https://record.example.com/oauth/token"),
-    ]);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]!.tokenEndpoint).toBe("https://record.example.com/oauth/token");
-    const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS, [], entries);
-    expect(yaml).toContain('token_endpoint: "https://record.example.com/oauth/token"');
-  });
-
-  test("the record endpoint beats the legacy map fallback (issue #275)", () => {
-    // notion IS in OAUTH_TOKEN_ENDPOINTS — a record endpoint on the snapshot
-    // must win (the map is the legacy fallback for records that carry none).
-    const entries = oauthTokenEntries([
-      ...SNAPSHOTS,
-      recordEndpointSnapshot("notion", "https://mcp.notion.com/record-token"),
-    ]);
-    const notion = entries.find((e) => e.extensionId === "notion");
-    expect(notion?.tokenEndpoint).toBe("https://mcp.notion.com/record-token");
-  });
-
-  test("a runtime-registered snapshot carrying the endpoint renders it through the merged generation (issue #275)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "egress-record-endpoint-"));
+    expect(yaml).not.toContain("- name: oauth_token");
+    expect(yaml).not.toContain("-oauth.json");
+    expect(yaml).not.toContain("token_endpoint:");
+    expect(yaml).not.toContain("grant: refresh_token");
+    // The OAuth extensions get NO secrets-file entry either (nothing for
+    // the proxy to inject) — only the api_key extension (github) + the six
+    // model-gateway keys appear.
+    expect(secretsEntries(yaml)?.length).toBe(7);
+    // A runtime regen of the same set emits the same contract.
+    const dir = mkdtempSync(join(tmpdir(), "egress-oauth-allowlist-"));
     try {
       const outPath = join(dir, "egress.yml");
-      const runtime = [
-        recordEndpointSnapshot("runtime.oauth", "https://mcp.runtime-oauth.example.com/oauth/token"),
-      ];
-      const yaml = regenerateEgressConfig(join(dir, "missing-snapshots"), outPath, runtime);
-      expect(readFileSync(outPath, "utf8")).toBe(yaml);
-      expect(yaml).toContain('token_endpoint: "https://mcp.runtime-oauth.example.com/oauth/token"');
-      expect(yaml).toContain("runtime.oauth-oauth.json");
+      const regen = regenerateEgressConfig(join(dir, "missing-snapshots"), outPath, [notionRuntimeSnapshot()]);
+      expect(allowlistDomains(regen)).toContain("mcp.notion.com");
+      expect(regen).not.toContain("- name: oauth_token");
+      expect(regen).not.toContain("notion-oauth.json");
+      expect(regen).not.toContain("token_endpoint:");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -990,16 +990,18 @@ describe("extension-pin journey mechanism (issue #195)", () => {
     }
   });
 
-  test("the journey's OAuth fixture.pin regenerates the egress configs — fixtures need no verified token endpoint (#212)", async () => {
-    // Live finding (run msyggnjh-123m): the #195 journey pins fixture.pin
-    // with an oauth credentialSchema (the preferred hosted-OAuth shape),
-    // and the pin's egress regeneration failed with
+  test("the journey's OAuth fixture.pin regenerates the egress configs — allowlisted domains, NO oauth_token transform (#284)", async () => {
+    // The #195 journey pins fixture.pin with an oauth credentialSchema
+    // (the preferred hosted-OAuth shape). Pre-#284 the pin's egress
+    // regeneration demanded a verified token endpoint
     //   egress config generation: the OAuth extension "fixture.pin" has no
     //   verified token endpoint — add one to OAUTH_TOKEN_ENDPOINTS
-    // The draft/params below are the journey's EXACT shape (canary.ts
+    // Issue #284 removes the mint machinery entirely: the record carries
+    // no endpoint, the SDK owns OAuth, and the regenerated config simply
+    // allowlists the fixture's domains with no oauth_token transform. The
+    // draft/params below are the journey's EXACT shape (canary.ts
     // journeyExtensionPin) driven through the real catalog_browser tool;
-    // the regenerated egress config must carry the fixture's oauth_token
-    // entry. The deployed config/egress.yml is untouched (temp dirs).
+    // the deployed config/egress.yml is untouched (temp dirs).
     const tempRoot = mkdtempSync(join(tmpdir(), "bottega-canary-pin-oauth-"));
     const draftsDir = join(tempRoot, "drafts");
     const snapshotsDir = join(tempRoot, "snapshots");
@@ -1070,13 +1072,14 @@ describe("extension-pin journey mechanism (issue #195)", () => {
       expect(body.reviewed).toBe(true);
       expect(body.live_registry).toBe("registered");
       expect(body.egress_regenerated).toEqual([egressPath, devEgressPath]);
-      // The strict egress config regenerated with the fixture's oauth_token
-      // entry (the proxy mints its access token at egress — issue #208).
+      // Issue #284: the OAuth fixture's domains allowlist (as allowlist
+      // entries), but NO oauth_token transform is emitted (the SDK owns
+      // OAuth — the proxy is transport/allowlist only and never mints).
       const egress = readFileSync(egressPath, "utf8");
-      expect(egress).toContain("- name: oauth_token");
-      expect(egress).toContain('token_endpoint: "https://fixture-pin.example.com/token"');
-      expect(egress).toContain('- host: "fixture-pin.example.com"');
-      expect(readFileSync(devEgressPath, "utf8")).toContain("- name: oauth_token");
+      expect(egress).not.toContain("- name: oauth_token");
+      expect(egress).not.toContain('token_endpoint: "https://fixture-pin.example.com/token"');
+      expect(egress).toContain('- "fixture-pin.example.com"');
+      expect(readFileSync(devEgressPath, "utf8")).not.toContain("- name: oauth_token");
     } finally {
       await h.cleanup();
     }

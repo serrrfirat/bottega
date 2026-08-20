@@ -37,6 +37,7 @@
  *     MCP advertised surface) — that assembly lives in the roots, not
  *     here.
  */
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore, type Store } from "../store/db";
 import { createAudit, type AuditModule } from "../policy/audit";
@@ -53,7 +54,8 @@ import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/r
 import { mergeRuntimeRegistry } from "../extensions/runtime-registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
 import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
-import type { McpBinding } from "../extensions/manifest";
+import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "../extensions/mcp-oauth";
+import type { ExtensionManifest, McpBinding } from "../extensions/manifest";
 import type { ToolStepSink } from "./services/slack-turn-presenter";
 import { resolveMemoryProvider, type ResolvedMemoryProvider } from "./memory-provider";
 
@@ -91,6 +93,15 @@ export interface BootstrapRuntimeDeps {
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (binding: McpBinding) => Transport;
   /**
+   * Vault token store seam for the authenticated tools/list discovery
+   * provider (issue #284 test seam, mirroring the runtime's
+   * mcpOAuthTokenStore): defaults to the production vault-backed store.
+   * The surface auth provider built here loads the persisted vault row's
+   * tokens through this store, so a boot-time tools/list for an OAuth MCP
+   * sends a real bearer. Tests inject a fake (never a real vault write).
+   */
+  mcpOAuthTokenStore?: McpOAuthTokenStore;
+  /**
    * Issue #257 boot connectedness probe: given an extension id, is it
    * CONNECTED (a valid vault credential row exists)? Used by the surface
    * resolution to decide whether a boot-time discovery failure is the
@@ -114,6 +125,8 @@ export interface BootstrapRuntime {
   surfaces: ExtensionSurfaces;
   /** The credential boundary wired into the runtime — always carries the configured secret resolver (#172/#190). */
   boundary: CredentialBoundary;
+  /** Auth provider used for authenticated tools/list discovery of hosted OAuth MCPs. */
+  surfaceAuthProvider: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
 }
 
 /**
@@ -134,12 +147,19 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // malformed runtime row is a loud skip, never a boot failure (the #205
   // posture).
   await mergeRuntimeRegistry(store, registry);
+  const surfaceAuthProvider = async (manifest: ExtensionManifest): Promise<OAuthClientProvider | undefined> => {
+    if (manifest.kind !== "mcp" || manifest.credentialSchema.type !== "oauth") return undefined;
+    const credential = (await store.listExtensionCredentials(manifest.id)).at(-1);
+    if (credential === undefined) return undefined;
+    return createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore });
+  };
   // Effective tool surfaces (issues #158/#166), resolved once: pinned
   // manifest tools, or the provider's tools/list for tools-less manifests
   // (a per-provider failure is skipped — the runtime's lazy per-call path
   // fails closed instead of the boot dying).
   const surfaces = await resolveExtensionSurfaces(registry.list(), {
     ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {}),
+    authProvider: surfaceAuthProvider,
     // Issue #257: a boot discovery failure on a provider that HAS a
     // credential row is a loud fail-closed warning, never the silent skip.
     isConnected:
@@ -184,5 +204,5 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // identical in every root (the MCP root's historical SQLite hardwire is
   // the #172 divergence this replaces).
   const memoryProvider = resolveMemoryProvider(store.getOrgSettings(), store.getDb());
-  return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary };
+  return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary, surfaceAuthProvider };
 }

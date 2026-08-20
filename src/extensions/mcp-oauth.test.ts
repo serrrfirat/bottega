@@ -43,7 +43,7 @@ import {
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";
 import { uploadLinkPublicBase } from "./upload-link";
-import type { VaultOAuthCredential } from "./proxy-seed";
+import type { VaultOAuthCredential } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-oauth-"));
 const stores: Store[] = [];

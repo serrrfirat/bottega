@@ -8,16 +8,17 @@
  * on the seed fixtures with an empty runtime set) and the secrets
  * transform for boundary credential injection (issue #53).
  *
- * Issue #208 (proxy-only credentials) adds two blocks to the pipeline:
- * the model-gateway static-key entries in the secrets transform (the
- * providers' placeholder bearer swapped for the real key at egress,
- * require: true — fail closed) and the `oauth_token` transform for the
- * OAuth extensions (#198: linear/attio — the proxy holds the refresh
- * token + client credentials and mints access tokens at egress). Issue
- * #230 moves the codex provider (the ChatGPT subscription credential)
- * from the oauth_token transform to the STATIC-key entries: the SEED
- * owns the codex refresh and writes the access token to
- * openai-codex.secret — the proxy never touches auth.openai.com.
+ * Issue #208 (proxy-only credentials) adds the model-gateway static-key
+ * entries to the secrets transform (the providers' placeholder bearer
+ * swapped for the real key at egress, require: true — fail closed). Issue
+ * #230 moves the codex provider (the ChatGPT subscription credential) to
+ * the STATIC-key entries: the SEED owns the codex refresh and writes the
+ * access token to openai-codex.secret — the proxy never touches
+ * auth.openai.com. Issue #284 removes the extension `oauth_token`
+ * transform entirely: OAuth for hosted MCP extensions is owned by the MCP
+ * SDK (the runtime's OAuthClientProvider sends the bearer through the
+ * allowlisted host), so the proxy is transport/allowlist only and never
+ * mints or holds extension OAuth credentials.
  *
  * Run `bun run src/egress/generate.ts` after adding or updating snapshots in
  * config/extensions/; the committed config/egress.yml (strict, deployment)
@@ -187,215 +188,15 @@ export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
 ] as const;
 
 /**
- * One OAuth provider's `oauth_token` transform entry (issue #208): the
- * proxy holds the provider's refresh token (+ client credentials) and
- * mints the access token at egress, so the app never touches a live OAuth
- * credential. The credential fields come from ONE JSON blob per provider
- * (`data/proxy-secrets/<provider>-oauth.json`, seeded by the sync) via
- * `json_key`. `require: true` — a missing/unmintable credential rejects
- * the request (502) instead of forwarding it unauthenticated.
- */
-export interface OAuthTokenEntry {
-  extensionId: string;
-  /** The extension's allowlisted domains; the proxy injects the minted bearer for these hosts. */
-  domains: string[];
-  /**
-   * The provider's OAuth2 token endpoint (RFC 8414 discovery, verified
-   * 2026-08-18): the proxy POSTs the refresh grant here AND stubs inbound
-   * requests to this host+path with a synthetic token, so the app's SDK
-   * can complete its own token dance against the proxy.
-   */
-  tokenEndpoint: string;
-  /**
-   * The path globs scoping each mint rule (iron-proxy `paths` rule,
-   * v0.49.0 — issue #246): a request only gets the minted bearer injected
-   * when its path matches one of these AND its host matches the rule's
-   * host. The scope is the provider's MCP resource subtree (the
-   * serverUrl's path, e.g. `/mcp` + `/mcp/*`). The RFC 8414/9207 public
-   * discovery endpoints (`/.well-known/*`) are deliberately OUT of scope:
-   * the SDK probes them BEFORE any credential exists, and a bare-host rule
-   * under `require: true` 502s every discovery probe (the issue #246
-   * symptom). The token_endpoint STUB is NOT rule-gated (iron-proxy
-   * matches it on exact host+path before rules), so it needs no path here.
-   */
-  paths: readonly string[];
-}
-
-/**
- * The LEGACY token-endpoint fallback for the OAuth extensions (issue
- * #275): the PRIMARY source is now the record itself — the snapshot's
- * mcp binding carries the provider's token endpoint (pinned snapshot
- * manifest at pin time, store-backed runtime registration row at register
- * time; RFC 8414 authorization-server metadata, never guessed). This map
- * keeps the #198 pinned seed providers (linear/attio/notion) working
- * WITHOUT re-pinning: their committed snapshots carry no record endpoint,
- * so resolution falls back here byte-stably.
- *   linear — https://mcp.linear.app/.well-known/oauth-authorization-server
- *   attio  — https://mcp.attio.com/.well-known/oauth-authorization-server
- * An oauth-type extension with neither a record endpoint NOR an entry here
- * FAILS config generation (never a guessed URL — a wrong token endpoint
- * would mint garbage). The canary's test fixtures (issue #212) are the
- * exception: `fixture.`-prefixed ids (tests/e2e/canary.ts — fixture.pin,
- * fixture.oauth) are test-only and synthesize their endpoint from their
- * own allowlisted domain in {@link oauthTokenEntries} — they never appear
- * in config/extensions, so the production map stays fake-domain-free.
- * (The codex endpoint moved out under issue #230: the SEED calls
- * auth.openai.com/oauth/token directly — see CODEX_TOKEN_ENDPOINT in
- * src/extensions/proxy-seed.ts — the proxy never mints for codex.)
- */
-/** Verified token endpoints keyed by OAuth extension id (the #198 providers — legacy fallback). */
-interface VerifiedTokenEndpoints {
-  [extensionId: string]: string;
-}
-
-export const OAUTH_TOKEN_ENDPOINTS: VerifiedTokenEndpoints = {
-  linear: "https://mcp.linear.app/token",
-  attio: "https://app.attio.com/oidc/token",
-  notion: "https://mcp.notion.com/token",
-};
-
-/**
- * Verified MCP resource paths keyed by OAuth extension id (the #198
- * providers — issue #246): the serverUrl path the SDK calls as the MCP
- * resource (linear/attio/notion all serve /mcp). Used as the FALLBACK
- * when a snapshot's serverUrl yields no usable path (e.g. a root URL) —
- * never a guessed path: an OAuth extension with neither a usable
- * serverUrl path nor a verification here FAILS generation closed.
- * (Fixtures and every registered provider derive their scope from the
- * serverUrl directly; this table is the fail-closed floor.)
- */
-interface VerifiedResourcePaths {
-  [extensionId: string]: string;
-}
-
-const OAUTH_RESOURCE_PATHS: VerifiedResourcePaths = {
-  linear: "/mcp",
-  attio: "/mcp",
-  notion: "/mcp",
-};
-
-/**
- * The rule-scope globs for one OAuth snapshot (issue #246): the
- * serverUrl's resource path plus its subtree when available (e.g. `/mcp` +
- * `/mcp/*`), else the verified per-provider fallback
- * ({@link OAUTH_RESOURCE_PATHS} — e.g. a runtime snapshot carrying a
- * root URL). Fails generation closed when neither yields a path.
- */
-function oauthResourcePaths(snapshot: PinnedSnapshot): readonly string[] {
-  const serverUrl = snapshot.manifest.kind === "mcp" ? snapshot.manifest.mcp.serverUrl : undefined;
-  if (serverUrl !== undefined) {
-    try {
-      // Normalize a trailing slash so a root URL ("https://host/") is
-      // detected as having no usable path (falls through fail-closed).
-      const pathname = new URL(serverUrl).pathname.replace(/\/+$/, "");
-      if (pathname.length > 0 && pathname !== "/") {
-        return [pathname, `${pathname}/*`];
-      }
-    } catch {
-      // malformed serverUrl → the verified fallback below (fail closed).
-    }
-  }
-  const fallback = OAUTH_RESOURCE_PATHS[snapshot.manifest.id];
-  if (fallback === undefined) {
-    throw new Error(
-      `egress config generation: the OAuth extension "${snapshot.manifest.id}" has no usable serverUrl path — ` +
-        "add one to OAUTH_RESOURCE_PATHS in src/egress/generate.ts before regenerating",
-    );
-  }
-  return [fallback, `${fallback}/*`];
-}
-
-/**
- * The canary's OAuth fixture id prefix (issue #212): test-only extensions
- * (fixture.pin, fixture.oauth — tests/e2e/canary.ts) with reserved testing
- * domains (fixture-pin.example.com, oauth.fixture.test). Their egress
- * regeneration must not demand a verified RFC 8414 token endpoint — there
- * is no real authorization server behind a fixture domain, so the endpoint
- * is synthesized from the fixture's own allowlisted host instead.
- */
-const CANARY_OAUTH_FIXTURE_ID_PREFIX = "fixture.";
-
-/** The proxy-side OAuth credential blob for a provider (the `tokens` entry's json_key file). */
-export function oauthTokenBlobFileName(extensionId: string): string {
-  return `${extensionId}-oauth.json`;
-}
-
-/**
  * The file-injection entries for the pinned snapshots: ONLY the api_key
- * extensions (issue #208 — the OAuth extensions move to the oauth_token
- * transform and get no `.secret` file entry).
+ * extensions (issue #208 — since #284 the OAuth extensions get no egress
+ * entry at all: the SDK sends its own bearer through the allowlisted
+ * host, so the proxy has nothing to inject for them).
  */
 export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): ExtensionEgressEntry[] {
   return snapshots
     .filter((s) => s.manifest.credentialSchema.type !== "oauth")
     .map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
-}
-
-/**
- * The oauth_token entries for the pinned snapshots' OAuth extensions
- * (issue #208): each needs a VERIFIED token endpoint. Issue #275: the
- * endpoint resolves RECORD-FIRST — the snapshot's mcp binding carries it
- * (pinned snapshot manifest at pin time; store-backed runtime registration
- * row at register time) — then the LEGACY OAUTH_TOKEN_ENDPOINTS map
- * (the #198 seed providers, whose committed snapshots carry no record
- * endpoint), then FAILS generation closed (never a guessed URL). The
- * canary's `fixture.`-prefixed OAuth fixtures (issue #212) are test-only:
- * their endpoint is synthesized from the fixture's own allowlisted domain
- * (there is no real authorization server behind a fixture domain), so the
- * #195 extension-pin journey's egress regeneration runs deterministically.
- *
- * Decision B (issue #265): `excluded` names providers whose CURRENT vault
- * credential is non-renewable (access-only — no refresh grant anywhere).
- * The oauth_token transform is a refresh_token-grant mint: for a
- * non-renewable provider there is no refresh to seed, so `require: true`
- * would 502 every runtime call (the mint fails) even though the SDK sent a
- * valid access token — the boundary `secrets` injection carries that
- * provider's token instead. The connect-time egress reconcile computes the
- * exclusion set from the vault and passes it; the CLI generator and the
- * committed byte-stable config keep the default (no exclusion).
- */
-export function oauthTokenEntries(
-  snapshots: ReturnType<typeof readPinnedSnapshots>,
-  excluded: ReadonlySet<string> = new Set(),
-): OAuthTokenEntry[] {
-  return snapshots
-    .filter((s) => s.manifest.credentialSchema.type === "oauth" && !excluded.has(s.manifest.id))
-    .map((s): OAuthTokenEntry => {
-      // Issue #246: every entry's rules get scoped to the MCP resource
-      // subtree (paths) so public `/.well-known/*` discovery passes
-      // token-less while real API calls stay fail-closed.
-      const paths = oauthResourcePaths(s);
-      if (s.manifest.id.startsWith(CANARY_OAUTH_FIXTURE_ID_PREFIX)) {
-        const host = s.manifest.domains.find((domain) => domain !== "*");
-        if (host === undefined) {
-          throw new Error(
-            `egress config generation: the OAuth fixture "${s.manifest.id}" has no allowlisted domain to ` +
-              "synthesize its token endpoint from",
-          );
-        }
-        return {
-          extensionId: s.manifest.id,
-          domains: s.manifest.domains,
-          tokenEndpoint: `https://${host}/token`,
-          paths,
-        };
-      }
-      // Issue #275: the record is the PRIMARY source — the snapshot's mcp
-      // binding carries the provider's token endpoint (pinned at pin time,
-      // store-backed at register time). The hardcoded map is the legacy
-      // fallback for records that carry none (the #198 seed providers).
-      const recordEndpoint = s.manifest.kind === "mcp" ? s.manifest.mcp.tokenEndpoint : undefined;
-      const tokenEndpoint = recordEndpoint ?? OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
-      if (tokenEndpoint === undefined) {
-        throw new Error(
-          `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
-            "carry one on the extension record (the mcp binding's tokenEndpoint, supplied at pin/register " +
-            "time — issue #275) or add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC " +
-            "8414 discovery metadata) before regenerating",
-        );
-      }
-      return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint, paths };
-    });
 }
 
 /** Static blocks shared verbatim by the strict and dev renderers (dns, proxy, tls, management). */
@@ -512,98 +313,6 @@ ${extensionBlock}${gatewayEntries}
 }
 
 /**
- * Renders the `oauth_token` transform (iron-proxy v0.49.0, issue #208):
- * one refresh_token-grant entry per OAuth extension (#198 providers —
- * linear/attio/notion, plus any extension whose record carries its own
- * token endpoint — issue #275: the endpoint is resolved record-first,
- * OAUTH_TOKEN_ENDPOINTS is the legacy fallback). The proxy holds the
- * provider's refresh token + client credentials (from the sync's JSON
- * blob) and mints the access token at egress; inbound requests to the
- * configured token_endpoint are stubbed with a synthetic token so the
- * app's SDK can complete its own OAuth dance against the proxy (the GCP
- * stub pattern). require: true — an unmintable credential rejects the
- * request (502), never an unauthenticated upstream call. Issue #246:
- * every rule is scoped with `paths` to the provider's MCP resource
- * subtree — the RFC 8414/9207 public discovery endpoints (`/.well-known/*`)
- * must load before any credential exists, so the mint rules never match
- * them. The codex model provider is NOT here (issue #230): it is a STATIC
- * secrets entry — the seed owns the refresh, the proxy injects the access
- * token at egress.
- *
- * client_secret is sent UNCONDITIONALLY for every entry (issue #268): the
- * sync's blob always carries the key ("" for public clients), so the
- * json_key read never hits a MISSING key — iron-proxy's json_key
- * extraction errors on a missing key and the mint fails closed (502).
- * The refresh_token source uses a LONG ttl (24h): iron-proxy's refresh
- * token rotation warning — a short ttl re-read overwrites the in-memory
- * rotated token with the stale store value; notion rotates the refresh
- * token on every exchange, so the old 30s ttl clobbered it inside the 8h
- * access-token lifetime and the next mint failed invalid_grant (deeper
- * fix: issue #269). client_id/client_secret keep the short ttl for
- * operator rotation pickup.
- */
-export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
-  const tokenBlocks = entries
-    .map((entry) => {
-      const blobPath = `${PROXY_SECRETS_MOUNT_PATH}/${oauthTokenBlobFileName(entry.extensionId)}`;
-      // Issue #246: each host rule is scoped to the provider's MCP
-      // resource subtree (`paths`), so the RFC 8414/9207 public discovery
-      // endpoints (`/.well-known/*` — probed BEFORE any credential exists)
-      // pass token-less while real API calls stay fail-closed under
-      // require: true. The token_endpoint stub is NOT rule-gated
-      // (iron-proxy matches it on exact host+path before rules), so it
-      // needs no rule here.
-      const pathLines = entry.paths.map((path) => `                - "${path}"`).join("\n");
-      const hostLines = entry.domains
-        .map((domain) => `            - host: "${domain}"\n              paths:\n${pathLines}`)
-        .join("\n");
-      return `        - grant: refresh_token
-          refresh_token:
-            type: file
-            path: "${blobPath}"
-            ttl: "24h"
-            json_key: "refresh_token"
-          client_id:
-            type: file
-            path: "${blobPath}"
-            ttl: "30s"
-            json_key: "client_id"
-          client_secret:
-            type: file
-            path: "${blobPath}"
-            ttl: "30s"
-            json_key: "client_secret"
-          token_endpoint: "${entry.tokenEndpoint}"
-          require: true
-          rules:
-${hostLines}`;
-    })
-    .join("\n");
-  return `  # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send the
-  #    placeholder bearer; this transform holds each provider's refresh
-  #    token + client credentials (the sync's JSON blob,
-  #    data/proxy-secrets/<provider>-oauth.json), mints short-lived access
-  #    tokens at egress, and stubs inbound requests to each configured
-  #    token_endpoint with a synthetic token so the SDK's own token dance
-  #    completes against the proxy. require: true — a missing/unmintable
-  #    credential rejects the request (502), never an unauthenticated
-  #    upstream call. client_secret is sent for EVERY provider (issue
-  #    #268): the blob always carries the key ("" for public clients) so
-  #    the json_key read never 502s on a missing key; the refresh_token
-  #    source uses a 24h ttl (a short re-read would clobber the in-memory
-  #    rotated token before the 8h access token expires — notion rotates
-  #    on every exchange, iron-proxy's refresh-token rotation warning).
-  #    The codex model provider is NOT here (issue #230):
-  #    its access token is a STATIC secrets entry — the seed owns the
-  #    refresh, the proxy injects the minted token for chatgpt.com.
-  - name: oauth_token
-    config:
-      tokens:
-${tokenBlocks}
-`;
-}
-
-/**
  * Renders the full iron-proxy config (v0.49.0) with the given allowlist.
  * Byte-stable: rendering with {@link BASE_EGRESS_DOMAINS} reproduces the
  * committed config/egress.yml exactly.
@@ -611,18 +320,18 @@ ${tokenBlocks}
 export function renderEgressConfig(
   domains: readonly string[],
   extensions: readonly ExtensionEgressEntry[] = [],
-  oauthTokens: readonly OAuthTokenEntry[] = [],
 ): string {
   const domainLines = domains.map((domain) => `        - "${domain}"`).join("\n");
   // The secrets transform is always emitted: the model-gateway static-key
   // entries (issue #208) are base config — only the extension entries are
   // optional.
   const secretsTransform = `${renderSecretsTransform(extensions)}\n`;
-  // The oauth_token transform covers only extension OAuth entries (issue
-  // #230: the codex model provider is a STATIC secrets entry now — the
-  // seed owns the refresh); it is omitted entirely when no extension
-  // snapshots carry an oauth credential.
-  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
+  // Issue #284: there is NO oauth_token transform — OAuth for hosted MCP
+  // extensions is owned by the MCP SDK (the runtime's OAuthClientProvider
+  // sends the bearer through the allowlisted host); the proxy is
+  // transport/allowlist only and never mints tokens. The codex MODEL
+  // provider's access token is a STATIC secrets entry (issue #230 — the
+  // seed owns the refresh), so no transform is emitted for it either.
   return `# iron-proxy egress policy for bottega (issue #8).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -684,7 +393,7 @@ ${domainLines}
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
-${secretsTransform}${oauthTransform}log:
+${secretsTransform}log:
   level: "info"
 `;
 }
@@ -727,17 +436,12 @@ ${extensionBlock}${gatewayEntries}
  */
 export function renderDevEgressConfig(
   extensions: readonly ExtensionEgressEntry[] = [],
-  oauthTokens: readonly OAuthTokenEntry[] = [],
 ): string {
   // The secrets transform is always emitted: the model-gateway static-key
   // entries (issue #208) are base config — only the extension entries are
-  // optional.
+  // optional. Issue #284: no oauth_token transform — hosted-MCP OAuth is
+  // the SDK's job, the proxy never mints.
   const secretsTransform = `${renderDevSecretsTransform(extensions)}\n`;
-  // The oauth_token transform covers only extension OAuth entries (issue
-  // #230: the codex model provider is a STATIC secrets entry now — the
-  // seed owns the refresh); it is omitted entirely when no extension
-  // snapshots carry an oauth credential.
-  const oauthTransform = oauthTokens.length > 0 ? `${renderOAuthTokenTransform(oauthTokens)}\n` : "";
   return `# iron-proxy egress policy for bottega — LOCAL DEV (permissive, issue #126).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -767,7 +471,7 @@ transforms:
       domains:
         - "*"
 
-${secretsTransform}${oauthTransform}log:
+${secretsTransform}log:
   level: "info"
 `;
 }
@@ -777,34 +481,29 @@ ${secretsTransform}${oauthTransform}log:
  * (issue #233: the store-backed runtime-registered extensions — machine
  * state, never a repo file) into the allowlist and the credential-injection
  * entries (issue #53), writes config/egress.yml, and returns the rendered
- * text. OAuth extensions (#198 providers) move from file injection to the
- * `oauth_token` transform (issue #208): their access tokens are minted by
- * the proxy, so they get no `.secret` file entry. Defaults are the
- * deployment paths; CLI: `bun run src/egress/generate.ts`. The committed
- * byte-pin tests stay hermetic on the seed fixtures: they regenerate with
- * an empty runtime set.
+ * text. Issue #284: OAuth extensions get NO egress entry of any kind —
+ * their domains stay allowlisted (the SDK's bearer passes through the
+ * proxy transport), but the proxy never holds or mints their credentials.
+ * api_key extensions keep the file-injection entry (issue #53). Defaults
+ * are the deployment paths; CLI: `bun run src/egress/generate.ts`. The
+ * committed byte-pin tests stay hermetic on the seed fixtures: they
+ * regenerate with an empty runtime set.
  */
 export function regenerateEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = EGRESS_CONFIG_PATH,
   runtimeSnapshots: readonly PinnedSnapshot[] = [],
-  excludedOAuthProviders: ReadonlySet<string> = new Set(),
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   // mergedEgressDomains prepends the base domains and dedupes, so the raw
   // per-snapshot domains pass through as-is (order-stable).
   const extensionDomains = snapshots.flatMap((s) => s.manifest.domains);
-  // OAuth extensions (#198) move to the oauth_token transform (issue
-  // #208): they get NO file-injection entry — the proxy mints their
-  // access token. api_key extensions keep the file-injection entry.
-  // Decision B (issue #265): non-renewable providers (access-only vault
-  // credential — no refresh anywhere) are EXCLUDED from the oauth_token
-  // mint entries — there is no refresh to mint from, and `require: true`
-  // would 502 every runtime call; the boundary secrets injection carries
-  // their access token instead.
+  // api_key extensions keep the file-injection entry (the boundary writes
+  // their secret file at call time). OAuth extensions get NO entry: the
+  // SDK sends its own bearer (issue #284) — the allowlist above is the
+  // only egress surface they need.
   const extensionEntries = apiKeyExtensionEntries(snapshots);
-  const oauthEntries = oauthTokenEntries(snapshots, excludedOAuthProviders);
-  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries, oauthEntries);
+  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }
@@ -822,12 +521,10 @@ export function regenerateDevEgressConfig(
   snapshotsDir: string = SNAPSHOTS_DIR,
   outPath: string = DEV_EGRESS_CONFIG_PATH,
   runtimeSnapshots: readonly PinnedSnapshot[] = [],
-  excludedOAuthProviders: ReadonlySet<string> = new Set(),
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   const extensionEntries = apiKeyExtensionEntries(snapshots);
-  const oauthEntries = oauthTokenEntries(snapshots, excludedOAuthProviders);
-  const yaml = renderDevEgressConfig(extensionEntries, oauthEntries);
+  const yaml = renderDevEgressConfig(extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }

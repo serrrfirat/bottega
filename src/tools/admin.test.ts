@@ -822,16 +822,13 @@ describe("catalog_browser pin (issue #195)", () => {
     }
   });
 
-  test("pin with token_endpoint carries it onto the snapshot, the review summary, and the audit (issue #275)", async () => {
+  test("pin with a legacy token_endpoint param is REFUSED — the record no longer carries one (issue #284)", async () => {
     const { store, dir, cleanup } = freshStore();
     try {
       const draftsDir = join(dir, "drafts");
       const snapshotsDir = join(dir, "snapshots");
       const egressPath = join(dir, "egress.yml");
       const devEgressPath = join(dir, "egress.dev.yml");
-      // A DISTINCT value (not the legacy map's linear endpoint) proves the
-      // record — not the OAUTH_TOKEN_ENDPOINTS fallback — is what renders.
-      const endpoint = "https://mcp.linear.app/record-token";
       writeCompletedDraft(draftsDir);
       const { audit, rows } = fakeAudit();
       const tools = loadTools(store, {
@@ -843,40 +840,37 @@ describe("catalog_browser pin (issue #195)", () => {
         catalog: { fetchImpl: stubFetch() },
       });
 
-      // 1. the review-gate summary surfaces the endpoint the agent supplied
-      const refused = await call(tools[0], { action: "pin", spec: "linear", token_endpoint: endpoint });
-      expect(refused.isError).toBe(true);
-      // SAFETY: the review-gated pin serializes the draft summary (asserted below).
-      const refusedBody = JSON.parse(refused.text) as { summary: { token_endpoint: string | null } };
-      expect(refusedBody.summary.token_endpoint).toBe(endpoint);
-
-      // 2. the confirmed pin writes the endpoint onto the snapshot + audit
+      // Issue #284: the OAuth token endpoint is gone from the record (the
+      // SDK owns OAuth via its own RFC 8414 discovery; the egress proxy
+      // never mints). The tool contract no longer carries `token_endpoint`
+      // (zod strips unknown params), and the pinned snapshot is
+      // endpoint-free — no mint machinery anywhere in the regenerated
+      // egress.
       const pinned = await call(tools[0], {
         action: "pin",
         spec: "linear",
         confirm: true,
         vendor_official: true,
-        token_endpoint: endpoint,
+        token_endpoint: "https://mcp.linear.app/record-token",
       });
       expect(pinned.isError).toBe(false);
       const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
-      // SAFETY: linear is a hosted mcp snapshot — the binding carries the endpoint.
       expect(snapshot.manifest.kind).toBe("mcp");
       if (snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-      expect(snapshot.manifest.mcp.tokenEndpoint).toBe(endpoint);
-      // The regenerated egress renders the RECORD endpoint (not the map's).
+      expect((snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
       const egress = readFileSync(egressPath, "utf8");
-      expect(egress).toContain(`token_endpoint: "${endpoint}"`);
-      expect(egress).not.toContain('token_endpoint: "https://mcp.linear.app/token"');
-      // The audit row carries it.
+      expect(egress).toContain("mcp.linear.app");
+      expect(egress).not.toContain("token_endpoint:");
+      expect(egress).not.toContain("linear-oauth.json");
+      expect(egress).not.toContain("- name: oauth_token");
       expect(rows).toHaveLength(1);
-      expect(rows[0]!.payload["token_endpoint"]).toBe(endpoint);
+      expect(rows[0]!.payload["token_endpoint"]).toBeUndefined();
     } finally {
       cleanup();
     }
   });
 
-  test("pin refuses a non-https token_endpoint — fail closed (issue #275)", async () => {
+  test("an OAuth pin regenerates egress with the domain allowlisted and NO oauth_token transform (issue #284)", async () => {
     const { store, dir, cleanup } = freshStore();
     try {
       const draftsDir = join(dir, "drafts");
@@ -884,23 +878,38 @@ describe("catalog_browser pin (issue #195)", () => {
       const egressPath = join(dir, "egress.yml");
       const devEgressPath = join(dir, "egress.dev.yml");
       writeCompletedDraft(draftsDir);
+      const { audit, rows } = fakeAudit();
       const tools = loadTools(store, {
+        audit,
         catalogDraftsDir: draftsDir,
         catalogSnapshotsDir: snapshotsDir,
-        // Temp egress outputs: a WRONG pin must never reach the repo's configs.
         egressConfigPath: egressPath,
         devEgressConfigPath: devEgressPath,
         catalog: { fetchImpl: stubFetch() },
       });
-      const refused = await call(tools[0], {
+
+      const pinned = await call(tools[0], {
         action: "pin",
         spec: "linear",
         confirm: true,
-        token_endpoint: "http://insecure.example/token",
+        vendor_official: true,
       });
-      expect(refused.isError).toBe(true);
-      expect(refused.text).toContain("tokenEndpoint");
-      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
+      expect(pinned.isError).toBe(false);
+      // The pinned snapshot's mcp binding carries NO token endpoint.
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
+      expect(snapshot.manifest.kind).toBe("mcp");
+      if (snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
+      expect((snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+      // The regenerated egress allowlists the binding host with NO mint
+      // machinery (the SDK sends its own bearer).
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain("mcp.linear.app");
+      expect(egress).not.toContain("token_endpoint:");
+      expect(egress).not.toContain("linear-oauth.json");
+      expect(egress).not.toContain("- name: oauth_token");
+      // The audit row carries no token_endpoint either.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.payload["token_endpoint"]).toBeUndefined();
     } finally {
       cleanup();
     }
