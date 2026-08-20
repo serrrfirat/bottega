@@ -45,12 +45,16 @@ export interface ModelProxyKey {
   envName: string;
 }
 
-/** The four model-gateway keys (opencode-go's key-only decl + the three custom gateways). */
+/** The model-gateway + web-search keys (opencode-go's key-only decl + the three custom gateways + tavily). */
 export const MODEL_PROXY_KEYS: readonly ModelProxyKey[] = [
   { provider: "near", envName: "NEAR_API_KEY" },
   { provider: "opencode", envName: "OPENCODE_API_KEY" },
   { provider: "openai", envName: "OPENAI_API_KEY" },
   { provider: "anthropic", envName: "ANTHROPIC_API_KEY" },
+  // The Tavily web-search provider key (issue #278): the search_web tool's
+  // static secret, seeded like the model gateways and injected by the
+  // proxy for api.tavily.com at egress.
+  { provider: "tavily", envName: "TAVILY_API_KEY" },
 ] as const;
 
 /**

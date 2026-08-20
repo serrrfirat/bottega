@@ -185,6 +185,9 @@ const TIER_BY_TOOL: ToolTiers = {
   // Todo snapshot (issue #228): read-only assembly of the space's live
   // state — work items, approvals, scheduled jobs, and the agent's plan.
   list_todos: "read",
+  // Web search (issue #278): read-only cited search — the proxy-injected
+  // provider key never leaves the egress boundary.
+  search_web: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

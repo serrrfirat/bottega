@@ -64,6 +64,7 @@ transforms:
         - "chatgpt.com"
         - "api.openai.com"
         - "api.anthropic.com"
+        - "api.tavily.com"
         - "raw.githubusercontent.com"
         - "files.slack.com"
         - "slack.com"
@@ -185,6 +186,16 @@ transforms:
             require: true
           rules:
             - host: "chatgpt.com"
+        - source:
+            type: file
+            path: "/data/proxy-secrets/tavily.secret"
+            ttl: "30s"
+          inject:
+            header: "Authorization"
+            formatter: "Bearer {{ .Value }}"
+            require: true
+          rules:
+            - host: "api.tavily.com"
 
   # 4. OAuth token minting (issue #208): the OAuth extensions (#198) send the
   #    placeholder bearer; this transform holds each provider's refresh

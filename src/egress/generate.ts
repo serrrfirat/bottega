@@ -42,7 +42,9 @@ import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions
  * (issue #91), the server's OWN Slack traffic (issue #126 — the Web API
  * at slack.com/api/* and api.slack.com, the Socket Mode websocket on
  * *.slack.com, and file downloads on files.slack.com, issue #124), and
- * the GitHub API for the ingest poller (issue #57, mentions search). */
+ * the GitHub API for the ingest poller (issue #57, mentions search), and
+ * the Tavily web-search gateway (issue #278 — the search_web tool's
+ * provider host, api.tavily.com). */
 export const BASE_EGRESS_DOMAINS = [
   "cloud-api.near.ai",
   "*.completions.near.ai",
@@ -50,6 +52,7 @@ export const BASE_EGRESS_DOMAINS = [
   "chatgpt.com",
   "api.openai.com",
   "api.anthropic.com",
+  "api.tavily.com",
   "raw.githubusercontent.com",
   "files.slack.com",
   "slack.com",
@@ -175,6 +178,12 @@ export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
   // — the seed owns the refresh and writes the minted access token; the
   // proxy injects it as the bearer for chatgpt.com, require: true).
   { provider: "openai-codex", host: "chatgpt.com" },
+  // The Tavily web-search gateway (issue #278): the search_web tool's
+  // outbound call to api.tavily.com/search sends the placeholder bearer;
+  // the proxy injects the real key from data/proxy-secrets/tavily.secret
+  // (seeded at boot — require: true, so a missing key rejects the request
+  // closed instead of reaching the provider unauthenticated).
+  { provider: "tavily", host: "api.tavily.com" },
 ] as const;
 
 /**

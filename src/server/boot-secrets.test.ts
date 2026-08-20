@@ -111,6 +111,7 @@ describe("boot secret identity table (issue #201, shrunk #208)", () => {
       "near",
       "openai",
       "anthropic",
+      "tavily",
     ]);
     for (const provider of providers) {
       expect(bootSecretForProvider(provider)?.vaultProvider).toBe(provider);

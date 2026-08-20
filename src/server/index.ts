@@ -18,6 +18,7 @@ import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
+import { searchWebToolDefinition } from "../tools/search-web";
 import { loadKbConfig } from "../kb/config";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
@@ -556,6 +557,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         (approvalRouter.pendingPrompts?.() ?? []).filter((prompt) => prompt.spaceId === spaceId),
       getTodoPhases: (spaceId) => spaceService.getTodoPhases(spaceId),
     }),
+    // Web search (issue #278): read-tier tool that returns cited results
+    // via a search provider; the key rides the proxy seam (boot-seeded
+    // data/proxy-secrets/tavily.secret, injected at egress). Fail-closed
+    // on a missing key — no fabricated result set.
+    searchWebToolDefinition(),
   ];
   opts.onSessionToolset?.(sessionToolset);
   // Issue #167: the extension half of the space agent's session toolset.

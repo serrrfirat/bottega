@@ -32,6 +32,8 @@ import {
   emitToolStep,
   nextToolStepId,
   toolStepTitle,
+  renderSearchResultBlocks,
+  SEARCH_TABLE_MAX_ROWS,
   type ToolStepEvent,
 } from "./slack-turn-presenter";
 
@@ -1099,5 +1101,63 @@ describe("StreamTurnPresenter: live todo (issue #228)", () => {
       { spaceId: "slack:C1", text: "🛠 Agent's plan:\n  ✅ 1. Read the repo\n  ⏳ 2. Draft the section\n  ⏳ 3. Push + PR", opts: { threadTs: "1.1" } },
     ]);
     expect(rec.texts).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Search-citation table rendering (issue #278): pure presenter seam — a turn
+// that used search results posts a table block + the citations actually used.
+// ---------------------------------------------------------------------------
+
+describe("renderSearchResultBlocks (issue #278)", () => {
+  const RESULTS = [
+    { title: "Bottega", url: "https://example.com/bottega", snippet: "The harness." },
+    { title: "Proxy seam", url: "https://example.com/proxy", snippet: "Keys ride the seam." },
+    { title: "Third", url: "https://example.com/third", snippet: "A third claim." },
+    { title: "Fourth", url: "https://example.com/4", snippet: "Four." },
+    { title: "Fifth", url: "https://example.com/5", snippet: "Five." },
+    { title: "Sixth", url: "https://example.com/6", snippet: "Six." },
+    { title: "Seventh", url: "https://example.com/7", snippet: "Seven." },
+  ];
+
+  test("renders a header + one section per cited result (capped) with an elided tail count", () => {
+    const blocks = renderSearchResultBlocks(RESULTS) as { type: string; text?: { text?: string } }[];
+    expect(blocks[0].type).toBe("header");
+    expect(String(blocks[0].text?.text)).toContain("Search results");
+    // Cap: SEARCH_TABLE_MAX_ROWS rows, then the elided tail.
+    const sections = blocks.filter((b) => b.type === "section");
+    expect(sections.length).toBe(SEARCH_TABLE_MAX_ROWS + 1); // rows + the "sources used" footer
+    // Each row carries its source URL.
+    for (const section of sections.slice(0, SEARCH_TABLE_MAX_ROWS)) {
+      expect(section.text?.text).toContain("https://example.com/");
+    }
+    const context = blocks.find((b) => b.type === "context") as { elements?: { text?: string }[] };
+    expect(context.elements?.[0]?.text).toContain("1 more result");
+  });
+
+  test("the citations used section lists every cited source URL", () => {
+    const blocks = renderSearchResultBlocks(RESULTS) as { type: string; text?: { text?: string } }[];
+    const footer = blocks.filter((b) => b.type === "section").pop();
+    expect(footer?.text?.text).toContain("*Sources used:*");
+    for (const row of RESULTS.slice(0, SEARCH_TABLE_MAX_ROWS)) {
+      expect(footer?.text?.text).toContain(`<${row.url}>`);
+    }
+    // The elided (beyond-cap) row is NOT cited in the footer.
+    expect(footer?.text?.text).not.toContain("<https://example.com/7>");
+  });
+
+  test("empty results render a no-sources surface, never throwing", () => {
+    const blocks = renderSearchResultBlocks([]) as { type: string; text?: { text?: string } }[];
+    const body = blocks.map((b) => b.text?.text ?? "").join("\n");
+    expect(body).toContain("No search results to cite");
+    expect(body).toContain("_none_");
+  });
+
+  test("a custom row cap is honored", () => {
+    const blocks = renderSearchResultBlocks(RESULTS, 2) as { type: string; text?: { text?: string } }[];
+    const sections = blocks.filter((b) => b.type === "section");
+    expect(sections.length).toBe(3); // 2 rows + the sources-used footer
+    const context = blocks.find((b) => b.type === "context") as { elements?: { text?: string }[] };
+    expect(context.elements?.[0]?.text).toContain("5 more results");
   });
 });
