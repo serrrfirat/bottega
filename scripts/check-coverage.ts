@@ -21,7 +21,10 @@
  * measured. One invocation yields ONE honest whole-suite "All files"
  * aggregate — no leg-splitting, no file omitted. A failing suite
  * (nonzero exit), an unparseable/missing "All files" row, or either metric
- * below the floor fails the gate.
+ * below the floor fails the gate. When the suite itself fails, the gate
+ * prints bounded, scrubbed failing-test diagnostics (test name + assertion/
+ * timeout detail) so a red run is diagnosable from CI output alone — the
+ * coverage wrapper no longer swallows the child output (issue #300).
  *
  * Usage: bun run scripts/check-coverage.ts
  */
@@ -73,13 +76,95 @@ export function meetsFloor(coverage: CoverageReport, floor: CoverageFloor = FLOO
 }
 
 /**
+ * Bounded failure diagnostics shown when the suite itself fails (issue #300).
+ * `bun test --coverage` prints, per failing test, an `error:` message plus
+ * an anchor line `(fail) <test name> [<duration>ms]`; a timed-out test adds
+ * `this test timed out after <n>ms.`. The coverage wrapper used to swallow
+ * ALL child output and report only "the suite itself failed", so a red run
+ * gave CI no way to find the failing test. These bounds keep the gate's
+ * stderr concise and secret-safe:
+ * - at most {@link MAX_FAILURES} failing tests are surfaced;
+ * - each snippet is truncated to at most {@link MAX_SNIPPET_LINES} lines;
+ * - token-shaped values are scrubbed so a caught fixture PAT or live token
+ *   never leaks into CI logs.
+ */
+export const MAX_FAILURES = 5;
+export const MAX_SNIPPET_LINES = 4;
+
+/** Anchors a failing test report: `(fail) <test name> [<duration>ms]`. */
+const FAIL_ANCHOR = /^\s*\(fail\)\s+.+?\s+\[\d+(?:\.\d+)?ms\]\s*$/;
+/** A line that names the failure and is contiguous with its own `(fail)` anchor. */
+const FAIL_DETAIL = /^(?:error[: ]|Expected:|Received:|AssertionError|this test timed out|✗ )/i;
+/** Stack/continuation lines inside the same failure block (kept contiguous with the anchor). */
+const FAIL_CONNECTOR = /^(\s*at\s+<|^\s*$)/;
+/** A timeout message: `this test timed out after 5000ms.` */
+const TIMEOUT_RE = /timed out after\s+\d+\s*ms/i;
+/** Long token-shaped runs: Bearer tokens, github_pat_* secrets, hex/base64 blobs. */
+const SECRET_RE = /(?:Bearer\s+[A-Za-z0-9_\-.]{12,}|github_pat_[A-Za-z0-9_]+|[A-Za-z0-9+/]{40,}={0,2})/g;
+const SECRET_REDACTED = "[redacted]";
+
+/**
+ * Scrub token-shaped values from a snippet so child output (fixture PATs,
+ * live tokens) never reaches the CI log.
+ */
+export function scrubSecrets(text: string): string {
+  return text.replace(SECRET_RE, SECRET_REDACTED);
+}
+
+/**
+ * Extract bounded, scrubbed failing-test diagnostics from a `bun test
+ * --coverage` report (combined stdout+stderr). Each entry names the failing
+ * test plus its assertion/timeout detail when bun printed one. Never
+ * throws; returns [] on a report with no recognizable failure so a caller
+ * can still fail closed with a generic message.
+ */
+export function summarizeSuiteFailure(report: string): string[] {
+  const lines = report.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length && out.length < MAX_FAILURES; i++) {
+    const anchorLine = lines[i];
+    if (!FAIL_ANCHOR.test(anchorLine)) continue;
+    // A timeout bun prints on the line(s) right AFTER the anchor
+    // (`this test timed out after 5000ms.`); it belongs to this same test.
+    const following = lines.slice(i + 1, i + 3).find((l) => TIMEOUT_RE.test(l))?.trim();
+    // Reserve the timeout's slot up front so the final snippet (upward +
+    // optional timeout) is ALWAYS <= MAX_SNIPPET_LINES — never +1 (P3).
+    const budget = MAX_SNIPPET_LINES - (following === undefined ? 0 : 1);
+    // Associate ONLY the detail/stack lines contiguous with THIS anchor —
+    // scanning upward, stopping at the first line that does not belong to
+    // this failure (source preview, caret, file header, coverage row). A
+    // passing test's logged `error: ...` line (console.error) is separated
+    // by such lines, so it never bleeds into a later test's snippet.
+    const upward: string[] = [anchorLine.trim()];
+    for (let j = i - 1; j >= 0 && upward.length < budget; j--) {
+      const t = lines[j].trim();
+      if (FAIL_DETAIL.test(t) || FAIL_CONNECTOR.test(lines[j])) {
+        upward.unshift(t);
+      } else {
+        // A non-detail, non-connector line ends this failure's contiguous
+        // detail run (most-important, anchor-adjacent detail is kept).
+        break;
+      }
+    }
+    if (following !== undefined) upward.push(following);
+    out.push(scrubSecrets(upward.join("\n")));
+  }
+  return out;
+}
+
+/**
  * The gate decision for one coverage run: a failing suite (status !== 0),
  * an unparseable/missing "All files" row, or either metric below the floor
- * all fail the gate. Pure — never spawns the suite.
+ * all fail the gate. Pure — never spawns the suite. On a failing suite the
+ * message carries bounded, scrubbed failing-test diagnostics so a red run
+ * can be diagnosed from CI output alone (issue #300).
  */
 export function decideGate(report: string, status: number | null, floor: CoverageFloor = FLOOR): GateResult {
   if (status !== 0) {
-    return { ok: false, message: `the suite itself failed (bun test --coverage exited ${status})` };
+    const failures = summarizeSuiteFailure(report);
+    const base = `the suite itself failed (bun test --coverage exited ${status})`;
+    const detail = failures.length > 0 ? `\n${failures.map((f) => `  ${f}`).join("\n")}` : "";
+    return { ok: false, message: base + detail };
   }
   let coverage: CoverageReport;
   try {
