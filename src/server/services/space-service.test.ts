@@ -7,6 +7,7 @@ import { createStore, type Store } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, THINKING_PHRASES, emptyResponseFallback, churnMessageText, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
+import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
 import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
@@ -41,6 +42,13 @@ class FakeSession implements AgentSessionDriver {
   deferPrompt = false;
   /** When true, prompt() throws — exercises the handler's failure path. */
   failPrompt = false;
+  /**
+   * When set, prompt() first emits a session `error` event (buffered by the
+   * DM presenter, issue #296) then throws — models a REAL driver rejection,
+   * which is always preceded by an onError/empty-completion surface. Tests
+   * that the service STILL settles the pending DM request on prompt reject.
+   */
+  failPromptError?: string;
   /** When set, prompt() emits a message event with this text (the model's reply). */
   autoReply?: string;
   /** The principal of the current turn; mirrors the real drivers' binding (issue #152). */
@@ -65,6 +73,12 @@ class FakeSession implements AgentSessionDriver {
 
   async prompt(text: string, opts?: AgentTurnOptions): Promise<void> {
     if (this.failPrompt) throw new Error("fake prompt failure");
+    if (this.failPromptError !== undefined) {
+      // Model the real driver: a rejection is surfaced (onError buffers it)
+      // BEFORE the prompt rejects — the service must still settle the DM.
+      this.emit("error", { spaceId: this.spaceId, message: this.failPromptError });
+      throw new Error("fake prompt failure after error");
+    }
     this.prompts.push({ text, opts });
     // Mirrors the drivers: a FRESH turn (not streaming) binds the inbound
     // principal; a steer into the running turn keeps the turn's principal.
@@ -247,8 +261,8 @@ function fakeAdapter(
   } = {},
 ) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
@@ -267,13 +281,19 @@ function fakeAdapter(
       }
       return `ts-${posts.length}`; // deterministic ts per post
     },
-    async updateMessage(spaceId, ts, text) {
+    async updateMessage(spaceId, ts, text, updateOpts) {
       if (failuresLeft > 0) {
         failuresLeft -= 1;
         // Slack chat.update 429 shape: rate_limited with retry_after.
         throw new Error("rate_limited");
       }
-      updates.push({ spaceId, ts, text });
+      const blocks = updateOpts?.blocks;
+      const attachments = updateOpts?.attachments;
+      updates.push(
+        blocks !== undefined || attachments !== undefined
+          ? { spaceId, ts, text, opts: { ...(blocks !== undefined ? { blocks } : {}), ...(attachments !== undefined ? { attachments } : {}) } }
+          : { spaceId, ts, text },
+      );
     },
     async downloadFile(fileId) {
       downloadedFileIds.push(fileId);
@@ -974,78 +994,144 @@ describe("SpaceService output routing", () => {
     expect(posts).toHaveLength(1); // replaced in place, nothing posted fresh
   });
 
-  test("DM replies are plain messages (no thread); channel replies keep threading; phrases rotate", async () => {
+  test("DM replies are plain messages (no thread); channel replies keep threading (issue #296)", async () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
-    const driver = new FakeDriver();
-    const service = makeSpaceService({ store, adapter, driver });
 
-    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
-    const dm = driver.last();
-    dm.emit("turn_start", { spaceId: "slack:D1" });
-    await Promise.resolve();
-    dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
-    await Promise.resolve();
+    // DM: the plain phrase presenter owns DMs (issue #180) — ONE plain post,
+    // never a thread_ts, and the final answer edits the SAME card at request
+    // settlement (issue #296). Constructed directly: the DM routing contract
+    // is the presenter's, and session creation is flaky in this test env.
+    const dm = new SlackTurnPresenter({ spaceId: "slack:D1", adapter, store, onboardingChecks: () => [] });
+    dm.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    dm.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    dm.onRequestSettled();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
-    const channel = driver.last();
-    channel.emit("turn_start", { spaceId: "slack:C1" });
-    await Promise.resolve();
-    channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
-    await Promise.resolve();
+    // Channel: replies thread under the inbound message (issue #40) and
+    // replace the same line.
+    const channel = new SlackTurnPresenter({ spaceId: "slack:C1", adapter, store, onboardingChecks: () => [] });
+    channel.onInbound(msg({ spaceId: "slack:C1", ts: "9.9" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    // Phrases post at receipt (issue #119) and rotate on turn_start; both
-    // spaces hold exactly one message, replaced in place by each reply.
+    // DM: exactly ONE plain post (never a thread_ts); the final answer edits
+    // the same ts with the Slack-native status/final ATTACHMENT container
+    // (recorded opts.attachments — a lone section would render flat).
     expect(posts).toEqual([
-      { spaceId: "slack:D1", text: "Thinking…", opts: undefined },
-      { spaceId: "slack:C1", text: "Give me a second…", opts: { threadTs: "9.9" } },
+      { spaceId: "slack:D1", text: "Thinking…", opts: { attachments: expect.any(Array) } },
+      { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "9.9" } },
     ]);
-    expect(updates).toEqual([
-      { spaceId: "slack:D1", ts: "ts-1", text: "On it — thinking…" },
-      { spaceId: "slack:D1", ts: "ts-1", text: "dm answer" },
-      { spaceId: "slack:C1", ts: "ts-2", text: "Working on it…" },
-      { spaceId: "slack:C1", ts: "ts-2", text: "channel answer" },
-    ]);
+    expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
+    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
   });
 
   test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
     const { adapter, posts, updates, streams, stops } = fakeAdapter({ streaming: true });
     const { store } = fakeStore();
+
+    // DM: constructed directly WITH streaming supported — it still uses the
+    // plain phrase presenter (no stream open, never a thread_ts), one card,
+    // final answer edits it at settlement.
+    const dm = new SlackTurnPresenter({ spaceId: "slack:D1", adapter, store, onboardingChecks: () => [] });
+    dm.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    dm.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    dm.onRequestSettled();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // Channel with streaming: the StreamTurnPresenter opens the panel.
+    const channel = new StreamTurnPresenter({ spaceId: "slack:C1", adapter, store, onboardingChecks: () => [] });
+    channel.onInbound(msg({ spaceId: "slack:C1", ts: "9.9" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
+    channel.onTurnEnd({ spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // DM: one plain message, phrase replaced in place with the final answer —
+    // no stream call and no thread_ts anywhere on the DM surface (issue #180).
+    expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
+    expect(streams[0].opts.threadTs).toBe("9.9");
+    expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
+    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
+    // The DM surface never opened a stream (plain phrase path throughout).
+    expect(streams.filter((s) => s.spaceId === "slack:D1")).toHaveLength(0);
+    // Channel: the panel opened (threaded under the inbound ts) and
+    // closed with the final reply as the stopStream block.
+    expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
+  });
+
+describe("SpaceService DM request settlement (issue #296)", () => {
+  test("a REJECTED fresh DM request still settles its card to the error and clears the request (issue #296)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = makeSpaceService({ store, adapter, driver });
-    try {
-      await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
-      const dm = driver.last();
-      dm.emit("turn_start", { spaceId: "slack:D1" });
-      await Promise.resolve();
-      dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
-      await Promise.resolve();
-      dm.emit("turn_end", { spaceId: "slack:D1" });
-      await Promise.resolve();
 
-      await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
-      const channel = driver.last();
-      channel.emit("turn_start", { spaceId: "slack:C1" });
-      await Promise.resolve();
-      channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
-      await Promise.resolve();
-      channel.emit("turn_end", { spaceId: "slack:C1" });
-      await Promise.resolve();
-      await Promise.resolve();
+    // First message creates the session and settles normally.
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    const session = driver.last();
+    expect(posts.filter((p) => p.spaceId === "slack:D1")).toHaveLength(1);
 
-      // DM: one plain message, phrase replaced in place — no stream call
-      // and no thread_ts anywhere on the DM surface (issue #180).
-      expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
-      expect(streams[0].opts.threadTs).toBe("9.9");
-      expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts === undefined)).toBe(true);
-      expect(updates).toContainEqual({ spaceId: "slack:D1", ts: "ts-1", text: "dm answer" });
-      // Channel: the panel opened (threaded under the inbound ts) and
-      // closed with the final reply as the stopStream block.
-      expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
-    } finally {
-      await service.stop();
-    }
+    // A second message starts a FRESH DM request whose prompt REJECTS after
+    // the driver buffered an error (onError). The service MUST still settle
+    // the card to that error and never leave the request wedged.
+    session.failPromptError = "provider exploded";
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "2.2" }));
+    const dmError = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "provider exploded");
+    expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one card
+    expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME card ts, no second post
+
+    // The request cleared: a THIRD message opens a FRESH card (not a wedged
+    // reuse of the stuck request) and settles normally.
+    session.failPromptError = undefined;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "3.3" }));
+    const dmPosts = posts.filter((p) => p.spaceId === "slack:D1");
+    expect(dmPosts).toHaveLength(3); // three distinct request cards
+    const lastUpdate = updates.at(-1)!;
+    expect(lastUpdate.ts).toBe("ts-3"); // the third request's own card
   });
+
+  test("a REJECTED drained DM request settles its card and drains the NEXT queued message exactly once (issue #296)", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // Turn 1 runs (streaming); two independent messages queue behind it.
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    const session = driver.last();
+    await Promise.resolve();
+    session.streaming = true;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "queued A", ts: "2.2" }));
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "queued B", ts: "3.3" }));
+    expect(session.prompts).toHaveLength(1); // both queued, neither prompted yet
+
+    // Turn 1 ends; the queue drains. The FIRST drained turn's prompt REJECTS
+    // after buffering an error — the service must settle the drained card to
+    // the error AND still drain the second queued message.
+    session.streaming = false;
+    session.failPromptError = "drained exploded";
+    session.emit("turn_end", { spaceId: "slack:D1" });
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    // BOTH queued messages drained as their own fresh requests, and EACH
+    // rejected drained request surfaced the buffered error exactly once —
+    // as a same-card edit, or (the reply-races-phrase-post edge) a fresh
+    // final post. This is the regression: a rejected drained DM must still
+    // settle + drain the NEXT queued message exactly once (issue #296).
+    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "drained exploded");
+    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && p.text === "drained exploded");
+    expect(explodedUpdates.length + explodedPosts.length).toBe(2); // queued A + queued B
+    // The queue fully drained and no request is wedged: a NEW fresh turn runs.
+    session.failPromptError = undefined;
+    await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "fresh after drain", ts: "4.4" }));
+    expect(posts.filter((p) => p.spaceId === "slack:D1").length).toBeGreaterThanOrEqual(4); // fresh card, not queued/stuck
+    expect(updates.at(-1)!.text).toBe("Done."); // the fresh turn settled normally
+  });
+});
 
   test("a session error replaces the thinking phrase with the error text", async () => {
     const { adapter, posts, updates } = fakeAdapter();
