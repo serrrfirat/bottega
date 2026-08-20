@@ -101,6 +101,19 @@ describe("egress config generation", () => {
     expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("api.anthropic.com");
   });
 
+  test("egress permits the search_web provider and pins its proxy-key entry (issue #278)", () => {
+    // The search_web tool (issue #278) calls the search provider at
+    // api.tavily.com/search; the static key rides the proxy-secret seam —
+    // the app never holds the key, the proxy injects it at egress
+    // (config/egress.yml's require:true entry 502s if unseeded).
+    expect(BASE_EGRESS_DOMAINS).toContain("api.tavily.com");
+    const domains = allowlistDomains(COMMITTED_EGRESS);
+    expect(domains).toContain("api.tavily.com");
+    const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS);
+    expect(yaml).toContain('path: "/data/proxy-secrets/tavily.secret"');
+    expect(COMMITTED_EGRESS).toContain('path: "/data/proxy-secrets/tavily.secret"');
+  });
+
   test("the base allowlist permits Slack file downloads", () => {
     expect(BASE_EGRESS_DOMAINS).toContain("files.slack.com");
   });
@@ -137,7 +150,7 @@ describe("egress config generation", () => {
     expect(yaml).not.toContain("- name: oauth_token");
     expect(yaml).not.toContain("openai-codex-oauth.json");
     expect(yaml).not.toContain("https://auth.openai.com/oauth/token");
-    expect(secretsEntries(yaml)?.length).toBe(5); // near/opencode/openai/anthropic/openai-codex
+    expect(secretsEntries(yaml)?.length).toBe(6); // near/opencode/openai/anthropic/openai-codex/tavily
   });
 
   test("rendered config enables the management API for boundary reloads (issue #123)", () => {
@@ -152,8 +165,8 @@ describe("egress config generation", () => {
       { extensionId: FIXTURE_EXTENSION_ID, domains: [FIXTURE_EXTENSION_DOMAIN, "api.example.com"] },
     ]);
     const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
-    // 5 model-gateway keys (issue #208 + #230, incl. openai-codex) + the fixture extension.
-    expect(entries).toHaveLength(6);
+    // 6 model-gateway keys (issue #208 + #230, incl. openai-codex + tavily) + the fixture extension.
+    expect(entries).toHaveLength(7);
     // SAFETY: every rendered secrets entry's `source` is a block mapping
     // carrying a `path` scalar (renderSecretsTransform emits it).
     const fixture = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(FIXTURE_EXTENSION_ID));
@@ -165,7 +178,7 @@ describe("egress config generation", () => {
     const rules = fixture!["rules"] as Record<string, YamlNode>[];
     expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
     // The gateway entries are REQUIRED (fail closed — issue #208).
-    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex"]) {
+    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex", "tavily"]) {
       // SAFETY: each gateway entry's `source` is a block mapping with a `path` scalar.
       const entry = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(`${provider}.secret`));
       expect(entry, `${provider} gateway entry`).toBeDefined();
@@ -182,6 +195,7 @@ describe("egress config generation", () => {
       "chatgpt.com",
       "api.openai.com",
       "api.anthropic.com",
+      "api.tavily.com",
       "raw.githubusercontent.com",
       "files.slack.com",
       "slack.com",
@@ -251,6 +265,7 @@ describe("egress config generation", () => {
         "chatgpt.com",
         "api.openai.com",
         "api.anthropic.com",
+        "api.tavily.com",
         "raw.githubusercontent.com",
         "files.slack.com",
         "slack.com",
@@ -319,7 +334,7 @@ describe("dev-permissive egress config (issue #126)", () => {
   test("rendering the dev config without extensions still allow-alls, keeps management + the gateway entries", () => {
     const yaml = renderDevEgressConfig();
     expect(allowlistDomains(yaml)).toEqual(["*"]);
-    expect(secretsEntries(yaml)?.length).toBe(5); // the model-gateway keys (issue #208 + #230)
+    expect(secretsEntries(yaml)?.length).toBe(6); // the model-gateway keys + tavily (issue #208 + #278)
     expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
     expect(yaml).not.toContain("- name: judge");
   });

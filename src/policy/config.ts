@@ -189,6 +189,9 @@ const TIER_BY_TOOL: ToolTiers = {
   // message — read-tier like list_todos, so the gate lets it through
   // instead of falling back to exec (unknown default).
   render_chart: "read",
+  // Web search (issue #278): read-only cited search — the proxy-injected
+  // provider key never leaves the egress boundary.
+  search_web: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

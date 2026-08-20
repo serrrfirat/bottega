@@ -359,6 +359,74 @@ export function todoProgressLine(phases: readonly TodoPhase[]): string | undefin
 }
 
 // ---------------------------------------------------------------------------
+// Search-citation table rendering (issue #278): the search_web tool returns
+// structured results; a turn that used them posts a table block (headers +
+// capped rows with an elided tail count) alongside the citations actually
+// used. Pure so the presenter seam is unit-testable without Slack.
+// ---------------------------------------------------------------------------
+
+/** One structured search result a turn used (issue #278) — the search_web tool's shape. */
+export interface SearchResultRow {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/** Max rows the citations table renders; the remainder folds into the elided tail count. */
+export const SEARCH_TABLE_MAX_ROWS = 6;
+
+/**
+ * Renders the search-results citation blocks: a header row, one section
+ * per result (capped at {@link SEARCH_TABLE_MAX_ROWS} — a line for the
+ * elided tail count when more came back), and a closing "sources used"
+ * section listing every cited URL so the turn's claims carry their source.
+ * Pure Slack block objects (the same shape {@link buildApprovalBlocks}
+ * emits); never throws on empty input (empty renders a no-sources section).
+ */
+export function renderSearchResultBlocks(
+  results: readonly SearchResultRow[],
+  maxRows: number = SEARCH_TABLE_MAX_ROWS,
+): unknown[] {
+  const blocks: unknown[] = [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "🔎 Search results (cited)" },
+    },
+  ];
+  const shown = results.slice(0, maxRows);
+  for (const result of shown) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `• *${result.title || result.url}*\n${result.snippet}\n${result.url}`,
+      },
+    });
+  }
+  const elided = results.length - shown.length;
+  if (elided > 0) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `…and ${elided} more result${elided === 1 ? "" : "s"} not shown.` }],
+    });
+  }
+  if (results.length === 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "_No search results to cite._" },
+    });
+  }
+  blocks.push({
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Sources used:*\n${shown.map((r) => `<${r.url}>`).join("\n") || "_none_"}`,
+    },
+  });
+  return blocks;
+}
+
+// ---------------------------------------------------------------------------
 // Presenter
 // ---------------------------------------------------------------------------
 
