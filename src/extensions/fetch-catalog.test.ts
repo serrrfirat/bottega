@@ -308,9 +308,10 @@ describe("fetch-catalog helper (issue #54)", () => {
 });
 
 /**
- * Catalog doc: a valid linear entry (with url), a url-less entry (LISTABLE —
- * the live integrations.sh failure mode, issue #118), and one truly
- * unlistable record (missing a renderable field) that must be skipped.
+ * Catalog doc: a valid linear entry (with url), a url-less entry (the live
+ * integrations.sh failure mode — issue #118, valid on every path since
+ * #270), and one truly unlistable record (missing a renderable field) that
+ * must be skipped.
  */
 function catalogWithBadEntry() {
   return {
@@ -331,7 +332,8 @@ function catalogWithBadEntry() {
         name: "B12 Website Generator",
         kind: "mcp",
         domain: "b12.io",
-        // no url — listable (issue #118); the strict draft/pin paths still reject it
+        // no url — valid everywhere (issue #118, #270): listing, single-entry
+        // fetch, and the draft/pin paths; url is never fabricated.
       },
       {
         id: "mcp/broken",
@@ -396,9 +398,59 @@ describe("listCatalogEntries resilience (issue #117, #118)", () => {
   });
 
   test("direct single-entry fetch of a malformed spec still fails closed", async () => {
-    await expect(fetchCatalogEntry("b12-website-generator", { fetchImpl: stubFetch(catalogWithBadEntry()) })).rejects.toThrow(
-      /missing a non-empty "url"/,
+    await expect(fetchCatalogEntry("broken-entry", { fetchImpl: stubFetch(catalogWithBadEntry()) })).rejects.toThrow(
+      /missing a non-empty "name"/,
     );
+  });
+
+  test("fetchCatalogEntry accepts a url-less record: entry returned, url undefined (issue #270)", async () => {
+    const entry = await fetchCatalogEntry("b12-website-generator", {
+      fetchImpl: stubFetch(catalogWithBadEntry()),
+    });
+    expect(entry.id).toBe("mcp/b12");
+    expect(entry.slug).toBe("b12-website-generator");
+    expect(entry.name).toBe("B12 Website Generator");
+    expect(entry.kind).toBe("mcp");
+    expect(entry.domain).toBe("b12.io");
+    // url is optional on the single-entry path too — never fabricated.
+    expect(entry.url).toBeUndefined();
+  });
+
+  test("pinSnapshotDraft accepts an integrations.sh-sourced draft whose spec is url-less (issue #270)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
+    try {
+      const draft = completedDraft({
+        extensionId: "b12-website-generator",
+        source: {
+          catalog: DEFAULT_CATALOG_URL,
+          specId: "b12-website-generator",
+          vendorOfficial: true,
+          reviewed: true,
+        },
+        manifest: {
+          id: "b12-website-generator",
+          label: "B12 Website Generator",
+          vendor: "B12 Website Generator",
+          kind: "mcp",
+          mcp: { serverUrl: "https://mcp.b12.io/mcp", transport: "streamable-http" },
+          credentialSchema: { type: "api_key" },
+          domains: ["b12.io"],
+        },
+      });
+      // The provenance re-fetch resolves the url-less record; the completed
+      // draft still pins (existence check, not a url requirement).
+      const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl: stubFetch(catalogWithBadEntry()) });
+      const parsed = parsePinnedSnapshot(readFileSync(outPath, "utf8"));
+      expect(parsed.extensionId).toBe("b12-website-generator");
+      expect(parsed.source.specId).toBe("b12-website-generator");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a url-bearing entry round-trips its url unchanged (issue #270)", async () => {
+    const entry = await fetchCatalogEntry("linear", { fetchImpl: stubFetch(catalogWithBadEntry()) });
+    expect(entry.url).toBe("https://linear.app/docs/mcp");
   });
 });
 

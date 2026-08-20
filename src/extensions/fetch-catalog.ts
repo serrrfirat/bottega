@@ -83,9 +83,9 @@ export interface CatalogEntry {
   /** Provider hostname the entry points at, e.g. "linear.app". */
   domain: string;
   /**
-   * Vendor documentation URL. OPTIONAL for listing — the live integrations.sh
-   * catalog omits it for most entries (issue #118). Required by the strict
-   * draft/pin paths (`fetchCatalogEntry`, `pinSnapshotDraft`).
+   * Vendor documentation URL. OPTIONAL everywhere: the live integrations.sh
+   * catalog omits it for most entries (issue #118, #270), and no downstream
+   * consumer (draft, pin, listing) requires it — it round-trips when present.
    */
   url?: string;
   description?: string;
@@ -179,36 +179,11 @@ function requireString(record: JsonObject, field: string, specId: string): strin
 }
 
 /**
- * STRICT record validation for the draft/pin paths: requires every field
- * including `url` — an explicitly requested or pinned entry must have
- * complete provenance. Throws {@link CatalogError} on malformed records.
- */
-function parseCatalogRecord(record: JsonObject): CatalogEntry {
-  const specId = optionalString(record["slug"]) ?? String(record["id"] ?? "?");
-  const id = requireString(record, "id", specId);
-  const slug = requireString(record, "slug", specId);
-  const name = requireString(record, "name", specId);
-  const kind = requireString(record, "kind", specId);
-  const domain = requireString(record, "domain", specId);
-  const url = requireString(record, "url", specId);
-  const description = optionalString(record["description"]);
-  return {
-    id,
-    slug,
-    name,
-    kind,
-    domain,
-    url,
-    ...(description !== null ? { description } : undefined),
-  };
-}
-
-/**
- * LENIENT record validation for LISTING (issue #118): a record is listable
- * with id/slug/name/kind/domain — `url` is NOT required (the live catalog
- * omits it for most entries) and is included only when present, never
- * fabricated. Truly unlistable records (missing a renderable field) throw
- * {@link CatalogError}.
+ * LENIENT record validation for LISTING and the single-entry lookup (issues
+ * #118, #270): a record is valid with id/slug/name/kind/domain — `url` is
+ * NOT required (the live catalog omits it for most entries) and is included
+ * only when present, never fabricated. Truly invalid records (missing a
+ * renderable field) throw {@link CatalogError}.
  */
 function parseListableRecord(record: JsonObject): CatalogEntry {
   const specId = optionalString(record["slug"]) ?? String(record["id"] ?? "?");
@@ -261,7 +236,7 @@ export async function fetchCatalogEntry(
   if (entry === undefined) {
     throw new CatalogError(`spec "${specId}" not found in ${catalogUrl}`);
   }
-  return parseCatalogRecord(entry);
+  return parseListableRecord(entry);
 }
 
 /** Result of a catalog listing: valid entries plus surfaced malformed-record diagnostics. */
