@@ -13,7 +13,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCanary, resolveLiveTokens, resolveModelKey, resolveRoleIdentities, LIVE_JOURNEY_IDS } from "./canary";
+import { runCanary, resolveLiveTokens, resolveModelKey, resolveRoleIdentities, LIVE_REGISTRY_IDS, registryJourneyLayer, resolveLiveJourneySelection } from "./canary";
+import { parseCanaryFilters } from "./canary-registry";
 import { bootHarness, CANARY_MODEL_REFS, pickRealModelRef } from "./harness";
 import { resolveChannelMembers, type SlackInviteApi } from "./slack-live";
 import type { JsonObject } from "../../src/extensions/manifest";
@@ -372,13 +373,47 @@ describe("live-API focused filters (issue #298 re-review)", () => {
     ]);
   });
 
-  test("--journey is honored: the live-API journey id set is surfaced and an unknown id fails closed", () => {
-    // A known live-API journey id can be selected by --journey.
-    expect(LIVE_JOURNEY_IDS).toContain("roles");
-    expect(LIVE_JOURNEY_IDS).toContain("chat-reply");
-    // (The runLiveLeg fail-closed branch is exercised live; here we pin the
-    // id set the filter may select so a body-less --journey can never be
-    // "validated then ignored".)
-    expect((LIVE_JOURNEY_IDS as readonly string[]).includes("nonsense")).toBe(false);
+  test("--journey selects live bodies by CANONICAL registry ids: one dotted id selects exactly its body, no-body ids fail closed (issue #298)", () => {
+    // The canonical namespace is the registry's dotted journey ids — the
+    // same namespace parseCanaryFilters validates and the workflow inputs
+    // expose. A live.roles.* id maps to the role/multiplayer matrix body.
+    expect(LIVE_REGISTRY_IDS).toContain("live.roles.approve-deny");
+    expect(LIVE_REGISTRY_IDS).toContain("live.roles.queue-ownership");
+    // No short ids leak into the canonical selectable set (the old defect):
+    // a short id is NOT a registry id, so it cannot select a body.
+    expect((LIVE_REGISTRY_IDS as readonly string[]).includes("roles")).toBe(false);
+    expect((LIVE_REGISTRY_IDS as readonly string[]).includes("chat-reply")).toBe(false);
+    // A no-body registry journey resolves to its layer for the precise
+    // fail-closed message: browser + hermetic journeys have no live-API body.
+    expect(registryJourneyLayer("browser.dm-card-lifecycle")).toBe("browser");
+    expect(registryJourneyLayer("roles.approve-deny-actors")).toBe("hermetic");
+    // An unknown id is not a registry journey at all.
+    expect(registryJourneyLayer("nonsense")).toBeUndefined();
+  });
+
+  test("end-to-end --journey: parseCanaryFilters resolves a dotted registry id to exactly the roles body, and a no-body dotted id fails closed", () => {
+    // A dotted live.roles.* id passes parseCanaryFilters (it is a registered
+    // journey) and the selector resolves it to the roles body — proving one
+    // actual registry id selects exactly its body (unrelated bodies do not run).
+    const filter = parseCanaryFilters(["--journey", "live.roles.approve-deny"]);
+    expect(filter.journey).toBe("live.roles.approve-deny");
+    expect(resolveLiveJourneySelection(filter.journey!)).toEqual({
+      runner: "roles",
+      problem: undefined,
+    });
+    // A different live.roles.* id selects the same body (the role matrix), so
+    // a focused --journey never runs an unrelated journey body.
+    expect(resolveLiveJourneySelection("live.roles.queue-ownership").runner).toBe("roles");
+    // A no-body dotted registry id fails closed with a precise layer message.
+    const browser = resolveLiveJourneySelection("browser.dm-card-lifecycle");
+    expect(browser.runner).toBeUndefined();
+    expect(browser.problem).toMatch(/browser.*layer|runs in the "browser" layer/);
+    const hermetic = resolveLiveJourneySelection("roles.cross-user-queue-ownership");
+    expect(hermetic.runner).toBeUndefined();
+    expect(hermetic.problem).toMatch(/hermetic/);
+    // An unknown id fails closed as not a registered journey.
+    const unk = resolveLiveJourneySelection("nonsense");
+    expect(unk.runner).toBeUndefined();
+    expect(unk.problem).toMatch(/not a registered journey/);
   });
 });

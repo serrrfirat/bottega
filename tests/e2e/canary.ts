@@ -108,7 +108,7 @@ import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import type { BrokerConnector } from "../../src/extensions/connect";
 import type { FixedIdentity, LiveSlackTokens, SlackApiMessage } from "./slack-live";
-import { parseCanaryFilters, canonicalIdentity, type CanaryFilters } from "./canary-registry";
+import { parseCanaryFilters, canonicalIdentity, JOURNEYS, type CanaryFilters } from "./canary-registry";
 import { z } from "zod";
 
 /** Org policy for the canary (issues #79/#175): memory tools allowed,
@@ -2206,31 +2206,48 @@ export function resolveRoleIdentities(onlyRole?: string): {
 }
 
 /**
- * The live-API journey ids the `--journey` filter can select (issue #298).
- * A `--journey` id NOT in this set has no live body and must FAIL CLOSED.
+ * The live-API journey registry ids that have a live body and can be
+ * selected by `--journey` (issue #298). The registry's journey ids are the
+ * CANONICAL namespace (parseCanaryFilters validates against them; the
+ * workflow inputs expose them). Every `live.roles.*` registry journey maps
+ * to the role/multiplayer matrix body; a `--journey` selecting any OTHER
+ * registry id — a hermetic (`roles.*`) or browser (`browser.*`) journey, or
+ * a `coverage.*` exclusion row — has NO live-API body and FAILS CLOSED with
+ * a precise message (never "validated then ignored").
  */
-export const LIVE_JOURNEY_IDS = [
-  "chat-reply",
-  "chat-reply-channel",
-  "memory",
-  "work-item",
-  "connect",
-  "standup",
-  "extension",
-  "model-role",
-  "delivery-approval",
-  "per-task-pin",
-  "semantic-pickup",
-  "spaces-persistence",
-  "settings-approval",
-  "model-hot-swap",
-  "catalog-surface",
-  "extension-pin",
-  "mcp-oauth",
-  "upload-link",
-  "live-progress",
-  "roles",
-] as const;
+export const LIVE_REGISTRY_IDS: readonly string[] = JOURNEYS.filter(
+  (j) => j.layer === "live-api" && j.id.startsWith("live.roles."),
+).map((j) => j.id);
+
+/** The registry journey a `--journey` filter refers to, or undefined. */
+export function registryJourneyLayer(id: string): string | undefined {
+  return JOURNEYS.find((j) => j.id === id)?.layer;
+}
+
+/**
+ * The `--journey` single-body selection decision, keyed by the CANONICAL
+ * registry journey ids (issue #298). Pure + exported so the end-to-end
+ * selector is hermetically testable through parseCanaryFilters:
+ *   - a `live.roles.*` id → { runner: "roles" } (runs exactly that body);
+ *   - any other registry journey id → { problem } with a precise message
+ *     naming its layer (browser / hermetic / coverage — no live-API body);
+ *   - an unknown id → { problem } (not a registered journey).
+ * NEVER "validated then ignored".
+ */
+export function resolveLiveJourneySelection(journeyId: string): {
+  runner: "roles" | undefined;
+  problem: string | undefined;
+} {
+  if ((LIVE_REGISTRY_IDS as readonly string[]).includes(journeyId)) {
+    return { runner: "roles", problem: undefined };
+  }
+  const layer = registryJourneyLayer(journeyId);
+  const problem =
+    layer === undefined
+      ? `"${journeyId}" is not a registered journey`
+      : `registry journey "${journeyId}" has no live-API body — it runs in the "${layer}" layer (issue #298)`;
+  return { runner: undefined, problem };
+}
 
 /** The live leg: boots the real stack and runs every journey. */
 export async function runLiveLeg(
@@ -2388,20 +2405,22 @@ const standupChannel = channel ? channel.id : live.dmChannelId;
 
     const run = (body: { id: string; run: () => Promise<JourneyResult> }) => body.run().then((r) => ({ ...r, name: body.id }));
 
-    // --journey honors the focused filter: only that journey's body runs.
-    // An unknown/body-less journey FAILS CLOSED — never "validate then ignore".
+    // --journey honors the focused filter, keyed by the CANONICAL registry
+    // journey ids (issue #298). A registry journey with a live body runs
+    // ONLY that body; a registry id with NO live-API body (a hermetic,
+    // browser, or coverage-exclusion journey) FAILS CLOSED with a precise
+    // message — never "validated then ignored".
     if (filters.journey !== undefined) {
-      const body = liveBodies.find((b) => b.id === filters.journey);
-      if (body === undefined) {
+      const { problem } = resolveLiveJourneySelection(filters.journey);
+      if (problem !== undefined) {
         return {
           status: "failed",
-          message:
-            `live-slack canary FAILED — --journey "${filters.journey}" has no live-API body in this implementation ` +
-            "(issue #298); fail closed rather than ignoring the filter",
+          message: `live-slack canary FAILED — --journey ${problem}; fail closed rather than ignoring the filter`,
           journeys: [],
         };
       }
-      journeys.push(await run(body));
+      const rolesBody = liveBodies.find((b) => b.id === "roles")!;
+      journeys.push(await run({ id: filters.journey, run: rolesBody.run }));
     } else {
       for (const body of liveBodies) journeys.push(await run(body));
     }
