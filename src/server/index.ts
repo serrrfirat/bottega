@@ -66,6 +66,7 @@ import {
   type SlackAdapter,
 } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
+import type { ToolStepSink } from "./services/slack-turn-presenter";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -103,6 +104,8 @@ export interface BottegaServerOpts {
   createApprovalRouter?: (deps: {
     adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
     timeoutMs: number;
+    /** Presenter/step path (issue #277): lets the router post confirmed-write-failure steps. */
+    onToolStep?: ToolStepSink;
   }) => ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
   /**
    * Agent dir override (issue #67): where the SDK agent config lives and
@@ -361,6 +364,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   approvalRouter = (opts.createApprovalRouter ?? ((deps) => new SlackApprovalRouter(deps)))({
     adapter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+    // Issue #277: a confirmed write that fails is posted back through the
+    // SAME step path tool steps use — never a parallel messaging API.
+    onToolStep: (step) => spaceService.routeToolStep(step),
   });
   // Delivery resolution (issue #149): a block-action click on the poller's
   // prompt records the human's decision as delivery.resolved — the audit

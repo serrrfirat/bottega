@@ -796,6 +796,19 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
         console.log(`[tool] ${def.name} → ok`);
         return result;
       } catch (err) {
+        // A human-confirmed write that then FAILED (issue #277) is posted
+        // back into the thread and remembered per (space, tool) — bounded —
+        // via the router's optional failure seam: a later approval card for
+        // the same tool surfaces 'last confirmed write failed'. Denials and
+        // policy-allowed calls are not "confirmed writes" — only ask-human
+        // approvals are. The decision is unchanged: the error still throws.
+        if (outcome.decision === "ask-human") {
+          deps.router.recordConfirmedWriteFailure?.(
+            spaceId ?? "",
+            def.name,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
             spaceId,

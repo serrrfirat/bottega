@@ -27,7 +27,8 @@ import {
   type SlackAdapter,
 } from "./slack";
 import {
-  ARGS_SUMMARY_MAX_CHARS,
+  ARGS_ROW_VALUE_MAX,
+  FAILURE_MEMORY_MAX,
   SlackApprovalRouter,
   buildApprovalBlocks,
 } from "./approval-router";
@@ -144,17 +145,19 @@ describe("SlackApprovalRouter request", () => {
     expect(rendered).toContain("ls");
   });
 
-  test("the args summary is capped at ARGS_SUMMARY_MAX_CHARS", async () => {
+  test("an oversized arg value is elided at the per-row cap with an ellipsis (issue #277)", async () => {
     const { adapter, posted } = fakeAdapter();
     const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
 
-    void router.request({ ...REQUEST, args: { blob: "x".repeat(ARGS_SUMMARY_MAX_CHARS + 500) } });
+    void router.request({ ...REQUEST, args: { blob: "x".repeat(ARGS_ROW_VALUE_MAX + 500) } });
     const rendered = actionBlocks(posted)
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
-    expect(rendered).toContain("[truncated]");
-    expect(rendered.length).toBeLessThan(ARGS_SUMMARY_MAX_CHARS + 1000);
+    // The value is cut at ARGS_ROW_VALUE_MAX with an ellipsis — not the raw,
+    // full-length blob.
+    expect(rendered).not.toContain("x".repeat(ARGS_ROW_VALUE_MAX + 500));
+    expect(rendered).toContain(`${"x".repeat(ARGS_ROW_VALUE_MAX)}…`);
   });
 
   test("postMessage failure denies the request without registering it", async () => {
@@ -333,9 +336,9 @@ describe("SlackApprovalRouter resolution", () => {
 });
 
 describe("buildApprovalBlocks", () => {
-  test("renders tool, reason, redacted args and both buttons carrying the id", () => {
+  test("renders tool, reason, humanized {label, value} rows and both buttons carrying the id (issue #277)", () => {
     const blocks = buildApprovalBlocks(
-      { ...REQUEST, args: { api_key: "AKIA1234567890ABCDEF" } },
+      { ...REQUEST, args: { api_key: "AKIA1234567890ABCDEF", due_date: "2026-08-20", addTeams: ["a", "b"] } },
       "req-123",
     );
     // SAFETY: buildApprovalBlocks emits section + actions blocks whose
@@ -346,6 +349,12 @@ describe("buildApprovalBlocks", () => {
       .join("\n");
     expect(rendered).toContain("create_work_item");
     expect(rendered).toContain(REQUEST.reason);
+    // camelCase / snake_case keys become spaced title words.
+    expect(rendered).toContain("*Api key:*");
+    expect(rendered).toContain("*Due date:* 2026-08-20");
+    expect(rendered).toContain("*Add teams:*");
+    expect(rendered).toContain("[\"a\",\"b\"]");
+    // Secret-shaped values are redacted, never shown verbatim.
     expect(rendered).toContain("[REDACTED]");
     expect(rendered).not.toContain("AKIA1234567890ABCDEF");
     // SAFETY: buildApprovalBlocks emits an actions block whose elements carry
@@ -355,6 +364,53 @@ describe("buildApprovalBlocks", () => {
       ?.elements?.filter((e) => e.action_id !== undefined && e.value !== undefined);
     expect(buttons?.map((b) => b.value)).toEqual(["req-123", "req-123"]);
     expect(buttons?.map((b) => b.style)).toEqual(["primary", "danger"]);
+  });
+
+  test("empty values are elided from the card ('' / [] / {} / empty set)", () => {
+    const blocks = buildApprovalBlocks(
+      { ...REQUEST, args: { title: "keep me", empty: "", none: [], obj: {}, set: new Set(), keep: "also" } },
+      "req-123",
+    );
+    const rendered = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).toContain("*Title:* keep me");
+    expect(rendered).toContain("*Keep:* also");
+    // Empty values never render a row.
+    expect(rendered).not.toContain("Empty:");
+    expect(rendered).not.toContain("None:");
+    expect(rendered).not.toContain("Obj:");
+    expect(rendered).not.toContain("Set:");
+  });
+
+  test("more than ARGS_ROW_MAX fields render a '… and N more fields' note", () => {
+    const args: Record<string, string> = {};
+    for (let i = 0; i < 15; i += 1) args[`field_${i}`] = `v${i}`;
+    const blocks = buildApprovalBlocks({ ...REQUEST, args }, "req-123");
+    const rendered = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).toContain("… and 3 more fields");
+  });
+
+  test("a remembered confirmed-write failure is surfaced on the card (issue #277)", () => {
+    const blocks = buildApprovalBlocks(REQUEST, "req-123", "write-blob: disk full");
+    const rendered = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).toContain("*Last confirmed write failed:* write-blob: disk full");
+  });
+
+  test("an empty args payload omits the would-be-write section", () => {
+    const blocks = buildApprovalBlocks({ ...REQUEST, args: {} }, "req-123");
+    const rendered = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).not.toContain("Would-be write");
   });
 });
 
@@ -470,6 +526,64 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
     expect(updated.some((u) => u.text.includes("expired"))).toBe(true);
     const resolved = await resolvedAuditRows();
     expect(resolved.at(-1)).toMatchObject({ tool: "bash", approved: false });
+  });
+
+  test("a confirmed write that fails posts the failure to the thread and a later card surfaces it (issue #277)", async () => {
+    const postedSignal = Promise.withResolvers<void>();
+    const steps: Array<{ spaceId?: string; title: string; output?: string }> = [];
+    const { adapter, posted } = fakeAdapter({ onPosted: () => postedSignal.resolve() });
+    const router = new SlackApprovalRouter({
+      adapter,
+      timeoutMs: 60_000,
+      // The presenter/step seam: a confirmed write that fails posts through
+      // the SAME sink tool steps use — never a parallel messaging API.
+      onToolStep: (step) => steps.push(step),
+    });
+    const gate = makeGate(router);
+
+    // A write-tier tool is approved by a human…
+    const pending = gate("create_work_item", { title: "x" });
+    await postedSignal.promise;
+    const id = requestIdFrom(posted);
+    await router.handleAction(click(APPROVE_ACTION_ID, id, { principal: "U42" }));
+    await pending;
+
+    // …then its execution fails: the caller reports the failure to the router.
+    router.recordConfirmedWriteFailure("slack:C1", "create_work_item", "duplicate work item");
+
+    // The failure is posted back through the step emit seam.
+    const failureStep = steps.find((s) => s.title.includes("confirmed write failed"));
+    expect(failureStep).toBeDefined();
+    expect(failureStep!.spaceId).toBe("slack:C1");
+    expect(failureStep!.output).toContain("duplicate work item");
+
+    // A later approval card for the same tool surfaces the remembered failure.
+    void router.request({ ...REQUEST, args: { title: "y" } });
+    // Await the second post landing (the fake posts synchronously in postMessage).
+    for (let i = 0; i < 20 && posted.length < 2; i += 1) {
+      await Promise.resolve();
+    }
+    expect(posted).toHaveLength(2);
+    const rendered = (posted[1].blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).toContain("*Last confirmed write failed:* duplicate work item");
+  });
+
+  test("the confirmed-write-failure memory is bounded and evicts the oldest (issue #277)", async () => {
+    const { adapter } = fakeAdapter();
+    const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
+
+    // Record one failure per distinct tool, past the cap.
+    for (let i = 0; i < FAILURE_MEMORY_MAX + 20; i += 1) {
+      router.recordConfirmedWriteFailure("slack:C1", `tool_${i}`, `boom ${i}`);
+    }
+    expect(router.failureMemorySize).toBeLessThanOrEqual(FAILURE_MEMORY_MAX);
+    // The NEWEST failure is still remembered…
+    expect(router.lastConfirmedWriteFailure("slack:C1", `tool_${FAILURE_MEMORY_MAX + 19}`)).toBe(`boom ${FAILURE_MEMORY_MAX + 19}`);
+    // …and the OLDEST (tool_0) was evicted.
+    expect(router.lastConfirmedWriteFailure("slack:C1", "tool_0")).toBeUndefined();
   });
 });
 

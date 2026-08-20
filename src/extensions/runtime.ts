@@ -407,6 +407,15 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         }
         return result;
       } catch (err) {
+        // A human-confirmed write that then FAILED (issue #277): posted
+        // back into the thread and remembered per (space, tool) — bounded —
+        // via the router's optional failure seam, so a later approval card
+        // for the same tool surfaces 'last confirmed write failed'. Only
+        // ask-human approvals are "confirmed writes"; the decision is
+        // unchanged and the failure still surfaces as a tool error.
+        if (outcome.decision === "ask-human") {
+          deps.router.recordConfirmedWriteFailure?.(spaceId ?? "", tool.name, errorMessage(err));
+        }
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
             spaceId,

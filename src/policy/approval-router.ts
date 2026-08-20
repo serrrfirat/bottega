@@ -31,6 +31,16 @@ export interface ApprovalRouter {
    * pending prompt, so they omit it and callers see an empty list.
    */
   pendingPrompts?(): ReadonlyArray<{ spaceId: string; tool: string }>;
+  /**
+   * Reports a confirmed (human-approved) write whose execution FAILED
+   * (issue #277): remembered per (space, tool) in a bounded store and
+   * posted back into the thread via the caller's step sink, so a later
+   * approval card for the same tool surfaces 'last confirmed write
+   * failed: <reason>'. Optional — headless routers (DenyRouter) never see
+   * a confirmed write, so they omit it. Purely a downstream-failure
+   * report; it never changes a decision.
+   */
+  recordConfirmedWriteFailure?(spaceId: string, tool: string, reason: string): void;
 }
 
 /** No-op router for headless contexts: every ask-human request is denied. */
