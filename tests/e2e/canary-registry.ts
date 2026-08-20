@@ -422,7 +422,23 @@ export function journeyById(
   return journeys.find((j) => j.id === id);
 }
 
-/** Focused-run filters parsed from the canary CLI (issue #298). */
+/** The four fixed identities the role/multiplayer matrix drives (issue #298). */
+export const LIVE_IDENTITIES = ["requester", "approver", "member", "second-member"] as const;
+
+/**
+ * Canonicalize a role alias to a fixed identity (issue #298). The registry
+ * and CLI accept `space-approver` as the human-friendly name for the
+ * `approver` identity; anything not a fixed identity or a known alias is
+ * undefined (unknown role → caller must fail closed, never vacuously pass).
+ */
+const ROLE_TO_IDENTITY: Record<string, string> = { "space-approver": "approver" };
+export function canonicalIdentity(role: string): string | undefined {
+  if (ROLE_TO_IDENTITY[role]) return ROLE_TO_IDENTITY[role];
+  return (LIVE_IDENTITIES as readonly string[]).includes(role) ? role : undefined;
+}
+
+/**
+ * Focused-run filters parsed from the canary CLI (issue #298). */
 export interface CanaryFilters {
   layer?: JourneyLayer;
   /** A single stable journey id ("roles.queue-ownership", …). */

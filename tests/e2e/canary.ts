@@ -108,7 +108,7 @@ import { SNAPSHOT_SCHEMA } from "../../src/extensions/registry";
 import type { SnapshotDraft } from "../../src/extensions/fetch-catalog";
 import type { BrokerConnector } from "../../src/extensions/connect";
 import type { FixedIdentity, LiveSlackTokens, SlackApiMessage } from "./slack-live";
-import { parseCanaryFilters, type CanaryFilters } from "./canary-registry";
+import { parseCanaryFilters, canonicalIdentity, type CanaryFilters } from "./canary-registry";
 import { z } from "zod";
 
 /** Org policy for the canary (issues #79/#175): memory tools allowed,
@@ -2120,18 +2120,23 @@ async function journeyLiveProgress(h: Harness, channelId: string, runId: string)
  */
 async function journeyRoles(h: Harness, channelId: string, runId: string, onlyRole?: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
-  const allRoles: Array<{ identity: FixedIdentity; label: string }> = [
-    { identity: "requester", label: "requester" },
-    { identity: "approver", label: "space approver" },
-    { identity: "member", label: "member" },
-    { identity: "second-member", label: "second member" },
-  ];
-  // A focused --role filter drives only that identity's leg.
-  const roles = onlyRole !== undefined ? allRoles.filter((r) => r.identity === onlyRole) : allRoles;
+  // Resolve the identity set from the --role filter (canonicalized; FAILS
+  // CLOSED on unknown/zero-selection — never a vacuous pass with no actor).
+  const { identities, problem } = resolveRoleIdentities(onlyRole);
+  if (problem !== undefined) {
+    return {
+      name: "roles",
+      status: "fail",
+      layer: "live-api",
+      actors: [],
+      details: [problem],
+    };
+  }
   try {
     const details: string[] = [];
     const permalinks: string[] = [];
-    for (const { identity, label } of roles) {
+    for (const identity of identities) {
+      const label = ROLES_WITH_LABEL.find((r) => r.identity === identity)!.label;
       const userId = live.identityUserId(identity);
       if (!userId) throw new Error(`role/multiplayer journey: no "${label}" user id — create the QA identity (features.md, issue #298)`);
       // Post as the identity and wait for the bot's reply in the same thread.
@@ -2146,9 +2151,9 @@ async function journeyRoles(h: Harness, channelId: string, runId: string, onlyRo
       name: "roles",
       status: "pass",
       layer: "live-api",
-      actors: roles.map((r) => r.identity),
+      actors: identities,
       details: [
-        `all four identities drove posts and got owned replies in #channel ${channelId}`,
+        `${identities.length} identity(ies) drove posts and got owned replies in #channel ${channelId}`,
         ...details,
       ],
       ...(permalink !== undefined ? { permalink } : undefined),
@@ -2158,11 +2163,74 @@ async function journeyRoles(h: Harness, channelId: string, runId: string, onlyRo
       name: "roles",
       status: "fail",
       layer: "live-api",
-      actors: roles.map((r) => r.identity),
+      actors: identities,
       details: [errorMessage(err)],
     };
   }
 }
+
+const ROLES_WITH_LABEL: Array<{ identity: FixedIdentity; label: string }> = [
+  { identity: "requester", label: "requester" },
+  { identity: "approver", label: "space approver" },
+  { identity: "member", label: "member" },
+  { identity: "second-member", label: "second member" },
+];
+
+/**
+ * Resolve a `--role` filter to the identities it drives (issue #298). The
+ * CLI value is canonicalized (space-approver → approver). Returns the
+ * matching identities, or `{ problem }` when the role is unknown or selects
+ * zero identities — the caller FAILS CLOSED (never a vacuous pass). Pure,
+ * exported for the hermetic role-filter regressions.
+ */
+export function resolveRoleIdentities(onlyRole?: string): {
+  identities: FixedIdentity[];
+  problem?: string;
+} {
+  if (onlyRole === undefined) return { identities: ROLES_WITH_LABEL.map((r) => r.identity) };
+  const canonical = canonicalIdentity(onlyRole);
+  if (canonical === undefined) {
+    return {
+      identities: [],
+      problem: `unknown --role "${onlyRole}" — expected requester | approver | member | second-member | space-approver`,
+    };
+  }
+  const identities = ROLES_WITH_LABEL.filter((r) => r.identity === canonical).map((r) => r.identity);
+  if (identities.length === 0) {
+    return {
+      identities: [],
+      problem: `--role "${onlyRole}" selects zero identity actors — fail closed (issue #298); no journey body ran`,
+    };
+  }
+  return { identities };
+}
+
+/**
+ * The live-API journey ids the `--journey` filter can select (issue #298).
+ * A `--journey` id NOT in this set has no live body and must FAIL CLOSED.
+ */
+export const LIVE_JOURNEY_IDS = [
+  "chat-reply",
+  "chat-reply-channel",
+  "memory",
+  "work-item",
+  "connect",
+  "standup",
+  "extension",
+  "model-role",
+  "delivery-approval",
+  "per-task-pin",
+  "semantic-pickup",
+  "spaces-persistence",
+  "settings-approval",
+  "model-hot-swap",
+  "catalog-surface",
+  "extension-pin",
+  "mcp-oauth",
+  "upload-link",
+  "live-progress",
+  "roles",
+] as const;
 
 /** The live leg: boots the real stack and runs every journey. */
 export async function runLiveLeg(
@@ -2279,47 +2347,64 @@ export async function runLiveLeg(
         ],
       });
     }
+const standupChannel = channel ? channel.id : live.dmChannelId;
+    // The full live-journey descriptor set (issue #298, finding --journey):
+    // each has a stable id + a body. --journey runs ONLY the matching body
+    // (never "validate then ignore"); an id with no live body FAILS CLOSED.
+    const liveBodies: Array<{ id: string; run: () => Promise<JourneyResult> }> = [
+      { id: "chat-reply", run: () => journeyChatReply(harness!, live.dmChannelId, { label: "DM", runId }) },
+      ...(channel?.invited.bot
+        ? [
+            {
+              id: "chat-reply-channel",
+              run: () => journeyChatReply(harness!, channel!.id, { label: `channel #${channelName}`, thread: true, runId }),
+            },
+          ]
+        : []),
+      { id: "memory", run: () => journeyMemory(harness!, live.dmChannelId, runId) },
+      { id: "work-item", run: () => journeyWorkItem(harness!, live.dmChannelId, runId) },
+      { id: "connect", run: () => journeyConnect(harness!, live.dmChannelId) },
+      { id: "standup", run: () => journeyStandup(harness!, standupChannel) },
+      { id: "extension", run: () => journeyExtension(harness!, live.dmChannelId, runId) },
+      { id: "model-role", run: () => journeyModelRole(harness!, live.dmChannelId, runId) },
+      { id: "delivery-approval", run: () => journeyDeliveryApproval(harness!, live.dmChannelId, runId) },
+      { id: "per-task-pin", run: () => journeyPerTaskPin(harness!, live.dmChannelId, runId) },
+      { id: "semantic-pickup", run: () => journeySemanticPickup(harness!, live.dmChannelId, runId) },
+      { id: "spaces-persistence", run: () => journeySpacesPersistence(harness!, live.dmChannelId, runId) },
+      { id: "settings-approval", run: () => journeySettingsApproval(harness!, live.dmChannelId, approvalRouter) },
+      { id: "model-hot-swap", run: () => journeyModelHotSwap(harness!, live.dmChannelId, runId) },
+      { id: "catalog-surface", run: () => journeyCatalogSurface(harness!, live.dmChannelId) },
+      { id: "extension-pin", run: () => journeyExtensionPin(harness!, live.dmChannelId) },
+      { id: "mcp-oauth", run: () => journeyMcpOAuth(harness!, live.dmChannelId) },
+      { id: "upload-link", run: () => journeyUploadLink(harness!, live.dmChannelId, uploadLink!) },
+      { id: "live-progress", run: () => journeyLiveProgress(harness!, live.dmChannelId, runId) },
+      // Role/multiplayer matrix (issue #298): the four fixed identities post
+      // into the shared channel. A --role filter narrows which identity runs.
+      {
+        id: "roles",
+        run: () => journeyRoles(harness!, channel ? channel.id : live.dmChannelId, runId, filters.role),
+      },
+    ];
 
-    journeys.push(await journeyChatReply(harness, live.dmChannelId, { label: "DM", runId }));
-    // The thread-in-#name leg is gated on the bot being a real member
-    // (#245) — running it in a channel the bot cannot see only ever
-    // produced a bare timeout, not a channel-stitch signal.
-    if (channel?.invited.bot) {
-      journeys.push(
-        await journeyChatReply(harness, channel.id, { label: `channel #${channelName}`, thread: true, runId }),
-      );
+    const run = (body: { id: string; run: () => Promise<JourneyResult> }) => body.run().then((r) => ({ ...r, name: body.id }));
+
+    // --journey honors the focused filter: only that journey's body runs.
+    // An unknown/body-less journey FAILS CLOSED — never "validate then ignore".
+    if (filters.journey !== undefined) {
+      const body = liveBodies.find((b) => b.id === filters.journey);
+      if (body === undefined) {
+        return {
+          status: "failed",
+          message:
+            `live-slack canary FAILED — --journey "${filters.journey}" has no live-API body in this implementation ` +
+            "(issue #298); fail closed rather than ignoring the filter",
+          journeys: [],
+        };
+      }
+      journeys.push(await run(body));
+    } else {
+      for (const body of liveBodies) journeys.push(await run(body));
     }
-    journeys.push(await journeyMemory(harness, live.dmChannelId, runId));
-    journeys.push(await journeyWorkItem(harness, live.dmChannelId, runId));
-    journeys.push(await journeyConnect(harness, live.dmChannelId));
-    // Issue #175 journeys: the standup needs the QA channel space (run
-    // after the channel chat journey created it); extension + model-role
-    // ride the DM like memory/work-item.
-    const standupChannel = channel ? channel.id : live.dmChannelId;
-    journeys.push(await journeyStandup(harness, standupChannel));
-    journeys.push(await journeyExtension(harness, live.dmChannelId, runId));
-    journeys.push(await journeyModelRole(harness, live.dmChannelId, runId));
-
-    // Full-matrix journeys (#175 follow-up): each asserts one observable
-    // feature end-to-end against the live workspace.
-    journeys.push(await journeyDeliveryApproval(harness, live.dmChannelId, runId)); // #149
-    journeys.push(await journeyPerTaskPin(harness, live.dmChannelId, runId)); // #185
-    journeys.push(await journeySemanticPickup(harness, live.dmChannelId, runId)); // #89
-    journeys.push(await journeySpacesPersistence(harness, live.dmChannelId, runId)); // #188
-    journeys.push(await journeySettingsApproval(harness, live.dmChannelId, approvalRouter)); // #151
-    journeys.push(await journeyModelHotSwap(harness, live.dmChannelId, runId)); // #189
-    journeys.push(await journeyCatalogSurface(harness, live.dmChannelId)); // #192
-    journeys.push(await journeyExtensionPin(harness, live.dmChannelId)); // #195
-    journeys.push(await journeyMcpOAuth(harness, live.dmChannelId)); // #198 (browser leg skip-gated)
-    journeys.push(await journeyUploadLink(harness, live.dmChannelId, uploadLink)); // #196
-    journeys.push(await journeyLiveProgress(harness, live.dmChannelId, runId)); // #193
-    // The role/multiplayer matrix (issue #298): the four fixed identities
-    // drive posts into the shared channel. When a focused --role filter is
-    // given, only that identity's leg runs (the runner posts just that
-    // identity's message and reports it).
-    journeys.push(
-      await journeyRoles(harness, channel ? channel.id : live.dmChannelId, runId, filters.role),
-    );
 
     const failed = journeys.filter((j) => j.status === "fail");
     const attempted = journeys.filter((j) => j.status !== "skip");

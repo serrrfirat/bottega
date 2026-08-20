@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCanary, resolveLiveTokens, resolveModelKey } from "./canary";
+import { runCanary, resolveLiveTokens, resolveModelKey, resolveRoleIdentities, LIVE_JOURNEY_IDS } from "./canary";
 import { bootHarness, CANARY_MODEL_REFS, pickRealModelRef } from "./harness";
 import { resolveChannelMembers, type SlackInviteApi } from "./slack-live";
 import type { JsonObject } from "../../src/extensions/manifest";
@@ -344,5 +344,41 @@ describe("channel membership flag (issue #245)", () => {
     // The flag must be derived from the real membership read, not from a
     // guess — at least one conversations.members call must have happened.
     expect(calls.filter((m) => m === "conversations.members").length).toBeGreaterThan(0);
+  });
+});
+
+describe("live-API focused filters (issue #298 re-review)", () => {
+  test("--role space-approver canonicalizes to the approver identity and is non-vacuous (approver actually posts)", () => {
+    const { identities, problem } = resolveRoleIdentities("space-approver");
+    expect(problem).toBeUndefined();
+    expect(identities).toEqual(["approver"]);
+  });
+
+  test("--role approver selects exactly the approver identity (never an empty vacuous pass)", () => {
+    const { identities, problem } = resolveRoleIdentities("approver");
+    expect(problem).toBeUndefined();
+    expect(identities).toEqual(["approver"]);
+  });
+
+  test("an unknown or generic --role fails closed (problem), never a vacuous pass with no actor", () => {
+    expect(resolveRoleIdentities("nobody").problem).toMatch(/unknown --role/);
+    expect(resolveRoleIdentities("nobody").identities).toEqual([]);
+    // No filter → every fixed identity drives (the full matrix).
+    expect(resolveRoleIdentities(undefined).identities).toEqual([
+      "requester",
+      "approver",
+      "member",
+      "second-member",
+    ]);
+  });
+
+  test("--journey is honored: the live-API journey id set is surfaced and an unknown id fails closed", () => {
+    // A known live-API journey id can be selected by --journey.
+    expect(LIVE_JOURNEY_IDS).toContain("roles");
+    expect(LIVE_JOURNEY_IDS).toContain("chat-reply");
+    // (The runLiveLeg fail-closed branch is exercised live; here we pin the
+    // id set the filter may select so a body-less --journey can never be
+    // "validated then ignored".)
+    expect((LIVE_JOURNEY_IDS as readonly string[]).includes("nonsense")).toBe(false);
   });
 });
