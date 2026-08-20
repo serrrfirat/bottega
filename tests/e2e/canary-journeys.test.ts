@@ -689,9 +689,9 @@ describe("org-settings approval journey mechanism (issue #151)", () => {
       actor: "U-owner",
     });
     expect(posted.length).toBe(1);
-    // Issue #160: the prompt carries the payload, not just the tool name —
-    // the posted text is the plain-text form of the blocks (tool + args).
-    expect(posted[0]!.text).toBe('Approval required for model_settings — {"set":{"reasoning_effort":"low"}}');
+    // Issue #277: the prompt carries the HUMANIZED payload (labeled rows,
+    // not flat JSON) — the posted text is the plain-text form of the blocks.
+    expect(posted[0]!.text).toBe('Approval required for model_settings — • *Set:* {"reasoning_effort":"low"}');
     const value = approvalButtonValue({
       ts: "1.000001",
       text: "",
