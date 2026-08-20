@@ -144,11 +144,11 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(names).toEqual(["allowlist", "judge", "secrets", "oauth_token"]);
     const cfg = asRecord(secrets["config"]);
     const entries = asRecordArray(cfg["secrets"]);
-    // api_key extensions (github) + the five model-gateway keys (#208 +
-    // #230, incl. the openai-codex static access token). The OAuth
-    // extensions (linear/attio) moved to oauth_token — no file entries for
-    // them.
-    expect(entries).toHaveLength(6); // github + near/opencode/openai/anthropic/openai-codex
+    // api_key extensions (github) + the six model-gateway keys (#208 +
+    // #230, incl. the openai-codex static access token) + the Tavily web
+    // search provider (issue #278). The OAuth extensions (linear/attio)
+    // moved to oauth_token — no file entries for them.
+    expect(entries).toHaveLength(7); // github + near/opencode/openai/anthropic/openai-codex/tavily
     for (const entry of entries) {
       const source = asRecord(entry["source"]);
       expect(source["type"]).toBe("file");
@@ -162,12 +162,23 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
         expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
       }
     }
-    // The model-gateway entries are REQUIRED (fail closed — issue #208).
-    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex"]) {
+    // The model-gateway entries are REQUIRED (fail closed — issue #208),
+    // including the Tavily web-search provider (issue #278).
+    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex", "tavily"]) {
       const entry = entries.find((e) => asString(asRecord(e["source"])["path"]).includes(`${provider}.secret`));
       expect(entry, `${provider} gateway entry`).toBeDefined();
       expect(asString(asRecord(entry!["inject"])["require"])).toBe("true");
     }
+    // The Tavily web-search entry's specific contract (issue #278): the
+    // search_web tool's provider key is a REQUIRED proxy secret injected at
+    // egress for api.tavily.com — fail closed if the app ever holds it, and
+    // the entry must exist (removal → meaningful failure, not just a count).
+    const tavily = entries.find((e) => asString(asRecord(e["source"])["path"]).includes("tavily.secret"));
+    expect(tavily).toBeDefined();
+    expect(asString(asRecord(tavily!["source"])["path"])).toBe("/data/proxy-secrets/tavily.secret");
+    expect(asString(asRecord(tavily!["inject"])["require"])).toBe("true");
+    const tavilyRules = asRecordArray(tavily!["rules"]);
+    expect(tavilyRules.map((r) => String(r["host"]))).toEqual(["api.tavily.com"]);
     // The codex static entry's specific contract (issue #230): the seed
     // writes the minted access token to openai-codex.secret (the static
     // secrets pattern — no oauth_token entry, the proxy never touches
