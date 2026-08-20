@@ -80,14 +80,28 @@ export interface ReconcileEgressDeps {
   log?: (line: string) => void;
 }
 
+export interface ReconcileEgressOptions {
+  /**
+   * Remove this provider's oauth_token entry before a fresh authorization
+   * exchange. iron-proxy stubs configured token endpoints, so the connect
+   * leg must reach the provider with that entry absent.
+   */
+  excludeProvider?: boolean;
+  /** Skip credential seeding during the pre-authorization config reload. */
+  seedProvider?: boolean;
+}
+
+export type ReconcileEgress = (
+  provider: string,
+  options?: ReconcileEgressOptions,
+) => Promise<{ warnings: string[] }>;
+
 /**
  * Builds the connect-time reconcile: regenerates egress/dev-egress from
  * the superset and seeds + reloads the provider's proxy OAuth blob. The
  * returned callable NEVER throws — every failure is a receivable warning.
  */
-export function createReconcileEgress(
-  deps: ReconcileEgressDeps,
-): (provider: string) => Promise<{ warnings: string[] }> {
+export function createReconcileEgress(deps: ReconcileEgressDeps): ReconcileEgress {
   const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
   const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
   const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
@@ -96,7 +110,7 @@ export function createReconcileEgress(
   const proxyControl = deps.proxyControl ?? proxyBoundaryControlFromEnv();
   const log = deps.log ?? ((line: string) => console.log(line));
 
-  return async (provider: string): Promise<{ warnings: string[] }> => {
+  return async (provider: string, options: ReconcileEgressOptions = {}): Promise<{ warnings: string[] }> => {
     const warnings: string[] = [];
 
     // Test isolation (issue #191 pattern, mirroring the boot sync): under
@@ -140,8 +154,10 @@ export function createReconcileEgress(
     //    An unreadable vault fails safe to KEEPING the entry (status quo —
     //    a refreshable assumption), never silently dropping a provider.
     const excludedOAuthProviders = new Set<string>();
+    if (options.excludeProvider === true) excludedOAuthProviders.add(provider);
     for (const snapshot of superset) {
       if (snapshot.manifest.credentialSchema.type !== "oauth") continue;
+      if (snapshot.manifest.id === provider && options.excludeProvider === true) continue;
       try {
         const rows = await readVaultRows(snapshot.manifest.id);
         const refreshable = rows.some(
@@ -162,20 +178,23 @@ export function createReconcileEgress(
       warnings.push(`egress reconcile: egress regeneration failed (${errorMessage(err)})`);
     }
 
-    // 3. Seed the provider's proxy OAuth blob (defect A fixed: not
-    //    boot-only). Any fail-closed gap surfaces as a receivable warning.
-    try {
-      const seed = await seedProxyOAuthBlob(provider, {
-        secretsDir,
-        readOAuthRows: readVaultRows,
-        env: deps.env,
-        refreshOAuthToken: deps.refreshOAuthToken,
-        persistRotatedToken: deps.persistRotatedToken,
-      });
-      for (const note of seed.notes) log(note);
-      warnings.push(...seed.warnings);
-    } catch (err) {
-      warnings.push(`egress reconcile: ${provider} OAuth blob seed failed (${errorMessage(err)})`);
+    // 3. Seed the provider's proxy OAuth blob unless this is the
+    // pre-authorization reload. The connect leg must not probe or rewrite
+    // the existing grant before the browser exchanges its fresh code.
+    if (options.seedProvider !== false) {
+      try {
+        const seed = await seedProxyOAuthBlob(provider, {
+          secretsDir,
+          readOAuthRows: readVaultRows,
+          env: deps.env,
+          refreshOAuthToken: deps.refreshOAuthToken,
+          persistRotatedToken: deps.persistRotatedToken,
+        });
+        for (const note of seed.notes) log(note);
+        warnings.push(...seed.warnings);
+      } catch (err) {
+        warnings.push(`egress reconcile: ${provider} OAuth blob seed failed (${errorMessage(err)})`);
+      }
     }
 
     // 4. Reload the running proxy via the existing control boundary.
@@ -193,6 +212,8 @@ export function createReconcileEgress(
       } catch (err) {
         warnings.push(`egress reconcile: proxy reload failed (${errorMessage(err)})`);
       }
+    } else if (options.excludeProvider === true) {
+      warnings.push("egress reconcile: proxy control is not configured — cannot remove the OAuth mint entry before authorization");
     } else {
       log("bottega egress reconcile: egress regenerated (no proxy control configured — reload skipped)");
     }

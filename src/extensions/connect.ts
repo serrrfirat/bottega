@@ -69,7 +69,7 @@ import {
   registerExtensionAtRuntime,
   type CatalogRegisterDeps,
 } from "./catalog-register";
-import { createReconcileEgress } from "./egress-reconcile";
+import { createReconcileEgress, type ReconcileEgress } from "./egress-reconcile";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -122,7 +122,7 @@ export interface ConnectExtensionDeps {
    * supplies the runtime half of the superset), so the broker connect
    * reconciles with zero composition-root wiring.
    */
-  reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
+  reconcileEgress?: ReconcileEgress;
   /**
    * Generic MCP OAuth seam (issue #198): hosted OAuth MCPs (kind "mcp",
    * transport streamable-http, credential type "oauth") connect through
@@ -412,6 +412,18 @@ export async function connectExtension(
           `(${baseProbe.message ?? "no response"}) — an authorize link minted now would die in the browser. ` +
           "Refresh the tunnel (scripts/tunnel.sh re-writes data/public-base-url) or fix " +
           "BOTTEGA_OAUTH_CALLBACK_BASE_URL, then re-connect.",
+      };
+    }
+    // Issue #283: iron-proxy answers configured token endpoints with its
+    // local stub. Remove this provider's oauth_token entry and reload the
+    // proxy BEFORE minting an authorization URL, otherwise the callback's
+    // code exchange never reaches the provider. Do not seed/probe the old
+    // credential during this preflight.
+    const prepared = await reconcileEgress(provider, { excludeProvider: true, seedProvider: false });
+    if (prepared.warnings.length > 0) {
+      return {
+        ok: false,
+        message: `connect ${label} failed to prepare the OAuth exchange: ${prepared.warnings.join(" ")}`,
       };
     }
     let oauthStart: McpOAuthStartResult;

@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, type AuthCredential } from "@oh-my-pi/pi-ai";
-import { createReconcileEgress, type ReconcileEgressDeps } from "./egress-reconcile";
+import { createReconcileEgress, type ReconcileEgress, type ReconcileEgressDeps } from "./egress-reconcile";
 import { type PinnedSnapshot } from "./registry";
 import type { RuntimeExtensionRow } from "../store/db";
 import type { McpOAuthRefreshProbe, RotatedTokenPersister, VaultOAuthCredential } from "./proxy-seed";
@@ -149,7 +149,7 @@ function pinSnapshot(id: string, label: string, domain: string): PinnedSnapshot 
 
 /** One held temp harness: committed pins + runtime rows + reconcile callable. */
 interface Harness {
-  reconcile: (provider: string) => Promise<{ warnings: string[] }>;
+  reconcile: ReconcileEgress;
   secretsDir: string;
   egressPath: string;
   devEgressPath: string;
@@ -231,6 +231,30 @@ describe("connect-time egress reconcile (#250)", () => {
       const yaml = readFileSync(path, "utf8");
       expect(yaml).toContain("mcp.notion.com");
       expect(yaml).toContain("notion-oauth.json");
+    }
+  });
+
+  test("pre-authorization reconcile removes the provider mint entry without probing the old token (issue #283)", async () => {
+    let probes = 0;
+    const h = makeHarness({
+      committed: [["notion", notion]],
+      readVaultRows: async () => [
+        { refresh: "consumable-notion-refresh", clientId: "cli_notion", clientSecret: "cs_notion" },
+      ],
+      refreshOAuthToken: async () => {
+        probes += 1;
+        throw new Error("pre-authorization must not consume the existing grant");
+      },
+    });
+
+    const result = await h.reconcile("notion", { excludeProvider: true, seedProvider: false });
+
+    expect(probes).toBe(0);
+    expect(result.warnings.join("\n")).toContain("proxy control is not configured");
+    expect(existsSync(join(h.secretsDir, "notion-oauth.json"))).toBe(false);
+    expect(readFileSync(h.egressPath, "utf8")).toContain("mcp.notion.com");
+    for (const path of [h.egressPath, h.devEgressPath]) {
+      expect(readFileSync(path, "utf8")).not.toContain("notion-oauth.json");
     }
   });
 

@@ -48,6 +48,7 @@ import { errorMessage } from "../tools/helpers";
 import { oauthIdentityKey, pickNewestBrokerEntry, type ConnectScope } from "./connect";
 import type { ExtensionRegistry } from "./registry";
 import type { VaultOAuthCredential } from "./proxy-seed";
+import type { ReconcileEgress } from "./egress-reconcile";
 
 /** Default flow lifetime: short by design — 15 minutes, like upload links. */
 export const MCP_OAUTH_FLOW_TTL_MS = 15 * 60_000;
@@ -916,7 +917,7 @@ export async function completeMcpOAuthFlow(
      * OAuth blob (never boot-only, never clobbered). Best-effort: any
      * warnings fold into the result — the connect stays successful.
      */
-    reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
+    reconcileEgress?: ReconcileEgress;
     /**
      * Post-connect same-space refresh (issue #281): invoked after a
      * successful connect (credential + registry + audit + egress all

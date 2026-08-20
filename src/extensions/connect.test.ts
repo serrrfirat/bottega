@@ -257,6 +257,18 @@ describe("connectExtension scope gating", () => {
 describe("connectExtension broker seam", () => {
   test("hosted OAuth MCPs route to the GENERIC MCP OAuth flow, never the broker (issue #198)", async () => {
     const h = makeDeps({ broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }) });
+    let prepared = false;
+    h.deps.reconcileEgress = async (provider, options) => {
+      expect(provider).toBe("com.example.oauth");
+      expect(options).toEqual({ excludeProvider: true, seedProvider: false });
+      prepared = true;
+      return { warnings: [] };
+    };
+    const start = h.deps.mcpOAuth!.start;
+    h.deps.mcpOAuth!.start = async (input) => {
+      expect(prepared).toBe(true);
+      return await start(input);
+    };
 
     const outcome = await connect(h, "com.example.oauth", "personal", "UADA", { spaceId: "slack:C1" });
 
