@@ -757,7 +757,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     audit,
     registry: schedulerRegistry,
     memoryProvider,
-    postMessage: (spaceId, text) => adapter.postMessage(spaceId, text),
+    postMessage: (spaceId, text, opts) => adapter.postMessage(spaceId, text, opts),
     loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
     log: (line) => console.log(line),
   });

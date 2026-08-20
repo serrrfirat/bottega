@@ -19,6 +19,7 @@ import {
   DEFAULT_OUTBOX_MAX_POST_ATTEMPTS,
   nudgeUnclaimedOutboxRowsToSlack,
   postPendingOutboxRows,
+  renderOutboxBlocks,
   renderOutboxMessage,
   startOutboxPostSeam,
   type OutboxPostPass,
@@ -56,17 +57,17 @@ function outboxRow(store: Store, id: string): OutboxRow | null {
 }
 
 class FakeAdapter implements Pick<SlackAdapter, "postMessage"> {
-  posted: Array<{ spaceId: string; text: string }> = [];
+  posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
   /** Fail this many postMessage calls, then succeed. */
   failuresLeft = 0;
   failForever = false;
 
-  async postMessage(spaceId: string, text: string): Promise<string | undefined> {
+  async postMessage(spaceId: string, text: string, opts?: { blocks?: unknown[] }): Promise<string | undefined> {
     if (this.failForever || this.failuresLeft > 0) {
       if (!this.failForever) this.failuresLeft -= 1;
       throw new Error("postMessage failed (fake)");
     }
-    this.posted.push({ spaceId, text });
+    this.posted.push({ spaceId, text, blocks: opts?.blocks });
     return undefined;
   }
 }
@@ -138,6 +139,41 @@ describe("renderOutboxMessage", () => {
     };
     expect(renderOutboxMessage(review)).toBe("Review: check the PR");
   });
+
+  test("a work_item notification renders an issueCard with the state icon, title, and optional link (issue #279)", () => {
+    const row: OutboxRow = {
+      id: "wi_x:blocked", kind: "work_item",
+      payload: JSON.stringify({ state: "review", workItemId: "wi_x", description: "check the PR", link: "https://github.com/acme/sandbox/work/wi_x" }),
+      space: SPACE, status: "posted", attempts: 0, created_at: T0, posted_at: T0,
+    };
+    const blocks = renderOutboxBlocks(row);
+    expect(blocks).toBeDefined();
+    const card = blocks![0] as { text?: { text?: string } };
+    const text = card.text!.text!;
+    expect(text).toContain("🔍");
+    expect(text).toContain("*check the PR*");
+    expect(text).toContain("https://github.com/acme/sandbox/work/wi_x");
+  });
+
+  test("a work_item payload without card fields keeps the text fallback (no blocks)", () => {
+    const row: OutboxRow = {
+      id: "wi_bad", kind: "work_item",
+      payload: "not json",
+      space: SPACE, status: "posted", attempts: 0, created_at: T0, posted_at: T0,
+    };
+    // The text line still renders; the card renderer declines (undefined) —
+    // the post seam falls back to the bare line, never a malformed block.
+    expect(renderOutboxMessage(row)).toBe("work_item");
+    expect(renderOutboxBlocks(row)).toBeUndefined();
+  });
+
+  test("non-work_item rows render no card blocks", () => {
+    const row: OutboxRow = {
+      id: "job_1", kind: "git", payload: JSON.stringify(GIT_PAYLOAD), space: SPACE,
+      status: "posted", attempts: 0, created_at: T0, posted_at: T0,
+    };
+    expect(renderOutboxBlocks(row)).toBeUndefined();
+  });
 });
 
 // --- One pass (postPendingOutboxRows) ---------------------------------------
@@ -153,7 +189,7 @@ describe("postPendingOutboxRows", () => {
 
     expect(result.posted).toBe(1);
     expect(result.nudged).toBe(0);
-    expect(adapter.posted).toEqual([{ spaceId: SPACE, text: "Done: implemented it — https://github.com/acme/sandbox/pull/42" }]);
+    expect(adapter.posted).toEqual([{ spaceId: SPACE, text: "Done: implemented it — https://github.com/acme/sandbox/pull/42", blocks: undefined }]);
     expect(outboxRow(store, "job_1")!.status).toBe("posted");
     expect(outboxRow(store, "job_1")!.posted_at).toBe(T0);
     const posted = await store.listAudit({ event_type: OUTBOX_POSTED_EVENT });
@@ -194,10 +230,17 @@ describe("postPendingOutboxRows", () => {
     postOutboxRow(store, { id: "wi_x", kind: "git", payload: { state: "blocked", result: null }, space: SPACE }, { now: t.now });
 
     const result = await postPendingOutboxRows(store, adapter, { now: t.now });
-    // Exactly ONE post: the notification line — the completion row's bare
+    // Exactly ONE post: the notification card — the completion row's bare
     // "Blocked" would duplicate it and is never posted.
     expect(result.posted).toBe(1);
-    expect(adapter.posted).toEqual([{ spaceId: SPACE, text: "Blocked: do the thing — no repo" }]);
+    expect(adapter.posted).toHaveLength(1);
+    expect(adapter.posted[0]!.spaceId).toBe(SPACE);
+    expect(adapter.posted[0]!.text).toBe("Blocked: do the thing — no repo");
+    // The issueCard carries the state icon + bold description.
+    const blocks = adapter.posted[0]!.blocks as Array<{ text?: { text?: string } }>;
+    const cardText = blocks[0]!.text!.text!;
+    expect(cardText).toContain("🚫");
+    expect(cardText).toContain("*do the thing*");
     expect(outboxRow(store, "wi_x:blocked")!.status).toBe("posted");
     expect(outboxRow(store, "wi_x")!.status).toBe("posted");
     // Only the notification row's post is audited outbox.posted.

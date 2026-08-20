@@ -45,6 +45,7 @@ import {
   type OutboxRow,
 } from "../../store/outbox";
 import type { SlackAdapter } from "../adapters/slack";
+import { issueCard, type SlackBlock } from "../adapters/blocks";
 import { dispatchIngestEvent } from "../../ingest/dispatch";
 import type { IngestEvent } from "../../ingest/types";
 import { createAudit } from "../../policy/audit";
@@ -101,6 +102,8 @@ const workItemNotificationSchema = z
     workItemId: z.string(),
     description: z.string(),
     evidence: z.string().optional(),
+    /** Optional link (e.g. a PR or issue URL) rendered in the issue card. */
+    link: z.string().optional(),
   })
   .passthrough();
 
@@ -186,6 +189,34 @@ export function renderOutboxMessage(row: OutboxRow): string {
     if (r.count !== undefined) bits.push(`${r.count} item(s)`);
   }
   return bits.length > 0 ? `${kindLabel}${stateText}: ${bits.join(" — ")}` : `${kindLabel}${stateText}`;
+}
+
+/**
+ * Block Kit rendering for a consumed row — the issue #279 upgrade of the
+ * work_item notification line: the landing renders as an issueCard (state
+ * icon + bold description + optional evidence link). Returns undefined for
+ * non-work_item rows and for a work_item payload that lacks the card fields
+ * (title/state) — those keep the plain-text line as the fallback, never a
+ * malformed card. Fail-closed: a card shape is validated by {@link issueCard};
+ * an unparseable payload yields undefined (the text fallback), never a block.
+ */
+export function renderOutboxBlocks(row: OutboxRow): SlackBlock[] | undefined {
+  if (row.kind !== "work_item") return undefined;
+  let payload: z.infer<typeof workItemNotificationSchema> | null = null;
+  try {
+    const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
+    payload = parsed.success ? parsed.data : null;
+  } catch {
+    payload = null;
+  }
+  if (payload === null) return undefined;
+  return issueCard({
+    title: payload.description,
+    state: payload.state,
+    // The notification payload carries no owner; evidence links when the
+    // worker includes a `link` field (passthrough-preserved), else none.
+    link: payload.link,
+  });
 }
 
 /**
@@ -287,7 +318,8 @@ async function postRow(
     return false;
   }
   try {
-    await adapter.postMessage(row.space, text);
+    const blocks = renderOutboxBlocks(row);
+    await adapter.postMessage(row.space, text, blocks !== undefined ? { blocks } : undefined);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     const attempts = row.attempts + 1;

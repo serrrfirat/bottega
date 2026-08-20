@@ -1,6 +1,7 @@
 import type { MemoryEntry } from "../memory/types";
 import { OBSERVER_READ_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
+import { tableBlock, type SlackBlock } from "../server/adapters/blocks";
 import type { SchedulerAction, SchedulerActionContext } from "./types";
 
 const OBSERVER_ACTOR = "scheduler:org_pulse";
@@ -59,6 +60,49 @@ function weeklySummary(reflections: MemoryEntry[], digests: MemoryEntry[]): stri
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Issue #279: the org-pulse post also ships as Block Kit tables alongside
+ * the text — one "Reflection topics" table (topic | count | sources) and one
+ * "Notable digest themes" table (theme | source). Mirrors weeklySummary's
+ * grouping/order so the two surfaces never drift. Undefined when nothing
+ * qualifies, leaving a text-only pulse.
+ */
+function weeklyBlocks(reflections: MemoryEntry[], digests: MemoryEntry[]): SlackBlock[] | undefined {
+  if (reflections.length === 0 && digests.length === 0) return undefined;
+  const blocks: SlackBlock[] = [];
+  if (reflections.length > 0) {
+    const topics = new Map<string, MemoryEntry[]>();
+    for (const reflection of reflections) {
+      const topic = reflection.metadata.topic?.trim() || "Other";
+      const entries = topics.get(topic);
+      if (entries) entries.push(reflection);
+      else topics.set(topic, [reflection]);
+    }
+    const sortedTopics = [...topics.entries()].sort(([topicA, entriesA], [topicB, entriesB]) => {
+      const countOrder = entriesB.length - entriesA.length;
+      if (countOrder !== 0) return countOrder;
+      return topicA < topicB ? -1 : topicA > topicB ? 1 : 0;
+    });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Reflection topics*" } });
+    blocks.push(
+      ...tableBlock({
+        headers: ["topic", "count", "sources"],
+        rows: sortedTopics.map(([topic, entries]) => [topic, String(entries.length), entries.map(sourceLabel).join(", ")]),
+      }),
+    );
+  }
+  if (digests.length > 0) {
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Notable digest themes*" } });
+    blocks.push(
+      ...tableBlock({
+        headers: ["theme", "source"],
+        rows: digests.map((digest) => [digestTheme(digest.content) || "No digest summary", sourceLabel(digest)]),
+      }),
+    );
+  }
+  return blocks;
 }
 
 async function auditFailure(
@@ -127,8 +171,9 @@ export const orgPulseAction: SchedulerAction = {
       const start = now - WEEK_MS;
       const inWindow = (entry: MemoryEntry): boolean => entry.createdAt >= start && entry.createdAt <= now;
       const summary = weeklySummary(reflections.filter(inWindow), digests.filter(inWindow));
+      const blocks = weeklyBlocks(reflections.filter(inWindow), digests.filter(inWindow));
 
-      await ctx.postMessage(pulseSpace, summary);
+      await ctx.postMessage(pulseSpace, summary, blocks !== undefined ? { blocks } : undefined);
       await ctx.audit.appendAudit({
         space_id: pulseSpace,
         actor: OBSERVER_ACTOR,

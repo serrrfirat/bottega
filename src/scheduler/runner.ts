@@ -31,7 +31,7 @@ export interface SchedulerTickDeps {
   audit: AuditModule;
   registry: SchedulerActionRegistry;
   memoryProvider: MemoryProvider;
-  postMessage: (spaceId: string, text: string) => Promise<string | undefined>;
+  postMessage: (spaceId: string, text: string, opts?: { blocks?: unknown[] }) => Promise<string | undefined>;
   loadPolicy: (spaceId: string) => Promise<PolicyConfig>;
   log: (line: string) => void;
   now: () => number;

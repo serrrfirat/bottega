@@ -72,7 +72,7 @@ function makeContext(options: {
   const space = options.space === undefined ? pulseSpace() : options.space;
   const provider = new FakeMemoryProvider(options.entries ?? [], options.searchError);
   const audits: AuditInput[] = [];
-  const posts: Array<{ spaceId: string; text: string }> = [];
+  const posts: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
   const audit: AuditModule = {
     async appendAudit(entry) {
       audits.push(entry);
@@ -99,8 +99,8 @@ function makeContext(options: {
       store,
       audit,
       memoryProvider: provider,
-      async postMessage(spaceId: string, text: string) {
-        posts.push({ spaceId, text });
+      async postMessage(spaceId: string, text: string, opts?: { blocks?: unknown[] }) {
+        posts.push({ spaceId, text, blocks: opts?.blocks });
         return "1712345.6789";
       },
       async loadPolicy() {
@@ -165,6 +165,17 @@ describe("orgPulseAction", () => {
     expect(posts[0]!.text).not.toContain("This second sentence must not appear");
     expect(posts[0]!.text).not.toContain("ref_old");
     expect(posts[0]!.text).not.toContain("digest_old");
+    // Issue #279: the pulse also ships as Block Kit tables alongside the text.
+    const blocks = posts[0]!.blocks as Array<{ text?: { text?: string } }>;
+    expect(blocks).toBeDefined();
+    const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
+    expect(tableText).toContain("*Reflection topics*");
+    expect(tableText).toContain("*Notable digest themes*");
+    expect(tableText).toContain("Reliability");
+    expect(tableText).toContain("Customer requests");
+    expect(tableText).toContain("Customers repeatedly requested SSO.");
+    expect(tableText).not.toContain("ref_old");
+    expect(tableText).not.toContain("digest_old");
 
     expect(audits).toHaveLength(3);
     expect(audits.map((entry) => entry.event_type)).toEqual([
