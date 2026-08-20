@@ -225,9 +225,29 @@ export interface ToolStepEvent {
   title: string;
   /** in_progress opens a card; complete checks it off (a deny resolves as complete). */
   status: "in_progress" | "complete";
+  /**
+   * Truthful EXECUTION outcome on a terminal (complete) step, set at the
+   * source (issue #295). `complete` alone is NOT success: denied calls,
+   * ask-human approvals (emitted BEFORE the tool runs), and allowed calls
+   * that errored all resolve as complete. Only `"succeeded"` means the
+   * tool actually ran and returned — the completed-action footer claims
+   * only genuinely successful executions. Undefined for in_progress steps.
+   */
+  outcome?: ToolStepOutcome;
+  /**
+   * Human-readable tool label derived from the tool NAME at the source
+   * (issue #295), e.g. "Search issues" for `github.search_issues`. The DM
+   * footer renders this, never the raw internal identifier. Absent when no
+   * trustworthy label exists — the footer then omits that action rather
+   * than leak an identifier.
+   */
+  label?: string;
   /** Redacted args summary (the card's code block); capped by the adapter. */
   output?: string;
 }
+
+/** How a gated tool call's TERMINAL card resolved (issue #295). */
+export type ToolStepOutcome = "succeeded" | "denied" | "approved" | "failed";
 
 /** The step-source → presenter bridge; must never throw into the turn path. */
 export type ToolStepSink = (step: ToolStepEvent) => void;
@@ -650,15 +670,23 @@ export class SlackTurnPresenter {
   /** The last rendered plan body; identical snapshots skip the edit. */
   #lastPlanText: string | undefined;
   /**
-   * Completed gated tool-step titles for the CURRENT turn (top-level DMs
-   * only, issue #295): the compact completion footer lists what was done,
-   * bounded to {@link DM_COMPLETED_ACTIONS_MAX} titles plus a "+N more"
-   * count. Titles are already redacted/bounded at the source. Reset at each
-   * turn start so a prior turn's footer never leaks into the next card.
+   * Completed gated tool-step LABELS for the CURRENT turn (top-level DMs
+   * only, issue #295): the compact completion footer lists what was done —
+   * human-readable labels, never internal tool identifiers — bounded to
+   * {@link DM_COMPLETED_ACTIONS_MAX} labels plus a "+N more" count. Only
+   * genuinely-successful executions (outcome === "succeeded") land here.
+   * Reset at each turn start so a prior turn's footer never leaks into the
+   * next card.
    */
   #completedActions: string[] = [];
   /** Completed actions beyond {@link #completedActions} (the "+N more" tail). */
   #completedActionsExtra = 0;
+  /**
+   * taskIds whose SUCCEEDED terminal already contributed a footer label
+   * (issue #295): a redelivered/replayed terminal for the same taskId is
+   * deduped so a retry can never double-count an action.
+   */
+  #recordedActionTaskIds = new Set<string>();
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -720,6 +748,7 @@ export class SlackTurnPresenter {
     // prior turn's footer must never leak into this turn's card.
     this.#completedActions = [];
     this.#completedActionsExtra = 0;
+    this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -920,6 +949,7 @@ export class SlackTurnPresenter {
     // #295: a drained turn is a FRESH turn — no carried-over completed actions.
     this.#completedActions = [];
     this.#completedActionsExtra = 0;
+    this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -1081,6 +1111,7 @@ export class SlackTurnPresenter {
     // #295: completed-action tracking dies with the session too.
     this.#completedActions = [];
     this.#completedActionsExtra = 0;
+    this.#recordedActionTaskIds.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -1136,10 +1167,20 @@ export class SlackTurnPresenter {
     // The in-flight flag (issue #219) gates the steer safe window.
     this.toolStepInFlight = step.status === "in_progress";
     this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
-    // #295: a top-level DM's completed footer records each finished gated
-    // action (bounded, already-redacted title). Channels/threads don't.
-    if (step.status === "complete" && step.title && this.#dmTopLevel) {
-      this.#recordCompletedAction(step.title);
+    // #295: a top-level DM's completed footer records only GENUINELY
+    // SUCCESSFUL executions (outcome === "succeeded") with a human-readable
+    // label — denied / approval-only / failed completions never get a ✅,
+    // and internal identifiers never reach Slack. Deduped by taskId so a
+    // replay cannot double-count. Channels/threads don't track a footer.
+    if (
+      this.#dmTopLevel &&
+      step.status === "complete" &&
+      step.outcome === "succeeded" &&
+      step.label &&
+      !this.#recordedActionTaskIds.has(step.taskId)
+    ) {
+      this.#recordedActionTaskIds.add(step.taskId);
+      this.#recordCompletedAction(step.label);
     }
     this.#renderProgressNow();
   }
@@ -1212,17 +1253,18 @@ export class SlackTurnPresenter {
 
   /**
    * The compact completed-action footer for a top-level DM's final reply
-   * (issue #295): one "✅ <title>" line per completed gated tool action,
-   * bounded to {@link DM_COMPLETED_ACTIONS_MAX} titles plus a "+N more"
-   * tail. Only present when >= 1 action completed; absent for errors and
-   * empty completions (the card then holds the error/fallback only). Titles
-   * are redacted and bounded at the source, so no raw args or secrets leak.
+   * (issue #295): one "✅ <label>" line per genuinely-successful gated tool
+   * action, bounded to {@link DM_COMPLETED_ACTIONS_MAX} labels plus a
+   * "+N more" tail. Only present when >= 1 action succeeded; absent for
+   * errors and empty completions (the card then holds the error/fallback
+   * only). Labels are humanized at the source, so no raw tool identifiers,
+   * args, or secrets leak.
    */
   #completionFooter(): string | undefined {
     if (!this.#dmTopLevel) return undefined;
-    const names = this.#completedActions;
-    if (names.length === 0) return undefined;
-    const lines = names.map((name) => `  ✅ ${name}`);
+    const labels = this.#completedActions;
+    if (labels.length === 0) return undefined;
+    const lines = labels.map((name) => `  ✅ ${name}`);
     if (this.#completedActionsExtra > 0) lines.push(`  … +${this.#completedActionsExtra} more`);
     return `\n\n${lines.join("\n")}`;
   }
@@ -1234,9 +1276,10 @@ export class SlackTurnPresenter {
   }
 
   /** Records a completed gated tool action for the #295 footer, bounded. */
-  #recordCompletedAction(title: string): void {
+  /** Records a succeeded action's humanized label for the #295 footer, bounded; the caller pre-dedupes by taskId. */
+  #recordCompletedAction(label: string): void {
     if (this.#completedActions.length < DM_COMPLETED_ACTIONS_MAX) {
-      this.#completedActions.push(title);
+      this.#completedActions.push(label);
     } else {
       this.#completedActionsExtra += 1;
     }

@@ -71,6 +71,7 @@ import { recordCredentialResolution, resolveCredential, type CallScope } from ".
 import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
 import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "./mcp-oauth";
 import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
+import { humanizeToolName } from "../server/adapters/approval-router";
 import {
   emitToolStep,
   nextToolStepId,
@@ -267,6 +268,9 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
       const tier = tool.tier ?? resolveTier(tool.name);
       const stepArgs = sink !== undefined ? redact(summarizeArgs(args)) : undefined;
       const taskId = nextToolStepId();
+      // #295: the human-readable footer label for the tool NAME, derived at
+      // the source (no internal tool identifiers reach Slack).
+      const label = humanizeToolName(tool.name);
       const outcome = await evaluatePolicyGate(
         {
           loadPolicy,
@@ -286,6 +290,7 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
                   emitToolStep(sink, {
                     spaceId,
                     taskId,
+                    label,
                     title: toolStepTitle(tool.name, "waiting for approval"),
                     status: "in_progress",
                     output: stepArgs,
@@ -302,8 +307,10 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(tool.name, `denied (${tier})`),
           status: "complete",
+          outcome: "denied",
           output: stepArgs,
         });
         return { ok: false, error: outcome.blockReason };
@@ -313,14 +320,17 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(tool.name, `approved (${tier})`),
           status: "complete",
+          outcome: "approved",
           output: stepArgs,
         });
       } else {
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(tool.name, `allowed (${tier})`),
           status: "in_progress",
           output: stepArgs,
@@ -348,12 +358,15 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         await auditCall({ extensionId, toolName, actor: caller, spaceId, credentialId: null, decision: "error" });
         // The card documents the attempt: check it off so the thinking
         // panel never shows a stuck spinner (the error rides the reply).
+        // The tool never ran — this is a FAILED outcome, never success.
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
             spaceId,
             taskId,
+            label,
             title: toolStepTitle(tool.name, `allowed (${tier})`),
             status: "complete",
+            outcome: "failed",
             output: stepArgs,
           });
         }
@@ -400,8 +413,10 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           emitToolStep(sink, {
             spaceId,
             taskId,
+            label,
             title: toolStepTitle(tool.name, `allowed (${tier})`),
             status: "complete",
+            outcome: "succeeded",
             output: stepArgs,
           });
         }
@@ -420,8 +435,10 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           emitToolStep(sink, {
             spaceId,
             taskId,
+            label,
             title: toolStepTitle(tool.name, `allowed (${tier})`),
             status: "complete",
+            outcome: "failed",
             output: stepArgs,
           });
         }

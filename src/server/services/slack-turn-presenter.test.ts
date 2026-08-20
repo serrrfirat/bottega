@@ -20,6 +20,7 @@ import type { Store } from "../../store/db";
 import type { OrgSettings } from "../../store/org-settings";
 import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
 import { redact } from "../../policy/audit";
+import { humanizeToolName } from "../adapters/approval-router";
 import { SlackStreamRequestError, type SlackAdapter, type SlackMessage, type SlackStreamTask } from "../adapters/slack";
 import {
   STREAM_FINAL_RETRY_LIMIT,
@@ -1516,16 +1517,19 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
     expect(rec.posts).toHaveLength(1);
     const cardTs = "post-1";
 
-    // Two gated tool calls complete.
+    // Two gated tool calls run and genuinely SUCCEED (outcome: succeeded).
     const read = nextToolStepId();
     const write = nextToolStepId();
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress" });
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "complete" });
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, title: toolStepTitle("create_work_item", "allowed (write)"), status: "in_progress" });
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, title: toolStepTitle("create_work_item", "allowed (write)"), status: "complete" });
+    const readStep = { title: toolStepTitle("github.search_issues", "allowed (read)"), label: humanizeToolName("github.search_issues") };
+    const writeStep = { title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item") };
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, ...readStep, status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, ...readStep, status: "complete", outcome: "succeeded" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, ...writeStep, status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, ...writeStep, status: "complete", outcome: "succeeded" });
     await flush();
 
-    // The final answer EDITS the one card (same ts) with a compact footer.
+    // The final answer EDITS the one card (same ts) with a compact footer
+    // of HUMAN-READABLE labels — no internal tool identifiers.
     presenter.onMessage({ spaceId: "slack:D1", text: "Here is the answer" });
     presenter.onTurnEnd({ spaceId: "slack:D1" });
     await flush();
@@ -1534,9 +1538,10 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
     expect(rec.updates.at(-1)).toEqual({
       spaceId: "slack:D1",
       ts: cardTs,
-      text:
-        "Here is the answer\n\n  ✅ github.search_issues — allowed (read)\n  ✅ create_work_item — allowed (write)",
+      text: "Here is the answer\n\n  ✅ Search issues\n  ✅ Create work item",
     });
+    expect(rec.updates.at(-1)!.text).not.toContain("github.search_issues");
+    expect(rec.updates.at(-1)!.text).not.toContain("create_work_item");
   });
 
   test("completed-action footer is bounded: >3 complete steps collapse to 3 + a '+N more' tail (issue #295)", async () => {
@@ -1545,10 +1550,11 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
     await flush();
 
-    for (const name of ["a", "b", "c", "d"]) {
+    const names = ["github.search_issues", "create_work_item", "slack_post_message", "github.create_draft_pr"];
+    for (const name of names) {
       const id = nextToolStepId();
-      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), status: "in_progress" });
-      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), status: "complete" });
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), label: humanizeToolName(name), status: "in_progress" });
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), label: humanizeToolName(name), status: "complete", outcome: "succeeded" });
     }
     await flush();
 
@@ -1557,11 +1563,57 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
     await flush();
 
     const final = rec.updates.at(-1)!.text;
-    expect(final).toContain("✅ a — allowed (exec)");
-    expect(final).toContain("✅ b — allowed (exec)");
-    expect(final).toContain("✅ c — allowed (exec)");
-    expect(final).not.toContain("✅ d");
+    expect(final).toContain("✅ Search issues");
+    expect(final).toContain("✅ Create work item");
+    expect(final).toContain("✅ Slack post message");
+    expect(final).not.toContain("✅ Create draft pr"); // 4th collapses into the tail
     expect(final).toContain("… +1 more");
+  });
+
+  test("denied, execution-failed, and approval-only events NEVER get ✅; only genuine success does (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    // A straight deny resolves complete but is NOT a successful execution.
+    const denied = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: denied, title: toolStepTitle("bash", "denied (exec)"), label: humanizeToolName("bash"), status: "complete", outcome: "denied" });
+    // An allowed call that RAN but ERRORED is not success either.
+    const failed = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: failed, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "failed" });
+    // An ask-human approval emits BEFORE execution — no proof it ran ok.
+    const approved = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: approved, title: toolStepTitle("create_work_item", "approved (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "approved" });
+    await flush();
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+
+    const final = rec.updates.at(-1)!.text;
+    expect(final).toBe("Done"); // no footer at all — nothing succeeded
+    expect(final).not.toContain("✅");
+  });
+
+  test("a replayed succeeded terminal for the SAME taskId is deduped — never double-counted (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    const id = nextToolStepId();
+    const step = { spaceId: "slack:D1", taskId: id, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "complete" as const, outcome: "succeeded" as const };
+    // The driver emits the terminal succeeded card; a REDELIVERY replays it.
+    presenter.onToolStep(step);
+    presenter.onToolStep(step);
+    await flush();
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+
+    expect(rec.updates.at(-1)!.text).toBe("Done\n\n  ✅ Create work item");
   });
 
   test("no completed action means no footer: the reply is just the answer (issue #295)", async () => {
@@ -1586,10 +1638,11 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
     await flush();
     const cardTs = "post-1";
 
-    // A step ran, then the session errored.
+    // A step ran (and even succeeded — proof the error still wins clean),
+    // then the session errored: the error replaces the card with no footer.
     const id = nextToolStepId();
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" });
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), status: "complete" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), label: humanizeToolName("bash"), status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), label: humanizeToolName("bash"), status: "complete", outcome: "succeeded" });
     await flush();
 
     presenter.onError({ spaceId: "slack:D1", message: "provider exploded" });
@@ -1634,6 +1687,20 @@ describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
 
     expect(rec.posts).toEqual([{ spaceId: "slack:D1", text: "dm answer", opts: undefined }]);
     expect(rec.updates).toHaveLength(0);
+  });
+});
+
+describe("humanizeToolName (issue #295 label seam)", () => {
+  test("dotted/snake tool names become spaced human-readable labels, no internal identifiers", () => {
+    expect(humanizeToolName("github.search_issues")).toBe("Search issues");
+    expect(humanizeToolName("create_work_item")).toBe("Create work item");
+    expect(humanizeToolName("slack_post_message")).toBe("Slack post message");
+    expect(humanizeToolName("github.create_draft_pr")).toBe("Create draft pr");
+  });
+
+  test("a plain (undotted) tool name is humanized as-is", () => {
+    expect(humanizeToolName("bash")).toBe("Bash");
+    expect(humanizeToolName("getOrgSettings")).toBe("Get org settings");
   });
 });
 

@@ -44,6 +44,7 @@ import { loadSpacePolicy, resolveTier } from "../../policy/config";
 import { evaluatePolicyGate, summarizeArgs, type PolicyGateOutcome } from "../../policy/gate";
 import type { PolicyExtensionDeps } from "../../policy/extension";
 import type { Store } from "../../store/db";
+import { humanizeToolName } from "../adapters/approval-router";
 import { emitToolStep, nextToolStepId, toolStepTitle, parseSearchResultRows } from "../services/slack-turn-presenter";
 
 /**
@@ -714,6 +715,9 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
       const tier = deps.toolTier?.(def.name) ?? resolveTier(def.name);
       const stepArgs = sink !== undefined ? redact(summarizeArgs(params)) : undefined;
       const taskId = nextToolStepId();
+      // #295: the human-readable footer label for the tool NAME, derived at
+      // the source (no internal tool identifiers reach Slack).
+      const label = humanizeToolName(def.name);
       let outcome: PolicyGateOutcome;
       try {
         outcome = await evaluatePolicyGate(
@@ -733,6 +737,7 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
                     emitToolStep(sink, {
                       spaceId,
                       taskId,
+                      label,
                       title: toolStepTitle(def.name, "waiting for approval"),
                       status: "in_progress",
                       output: stepArgs,
@@ -761,8 +766,10 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(def.name, `denied (${tier})`),
           status: "complete",
+          outcome: "denied",
           output: stepArgs,
         });
         // Tool-outcome INFO (issue #224): the canary's tool-event seam —
@@ -777,14 +784,17 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(def.name, `approved (${tier})`),
           status: "complete",
+          outcome: "approved",
           output: stepArgs,
         });
       } else {
         emitToolStep(sink, {
           spaceId,
           taskId,
+          label,
           title: toolStepTitle(def.name, `allowed (${tier})`),
           status: "in_progress",
           output: stepArgs,
@@ -792,14 +802,17 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
       }
       try {
         const result = await execute.call(def, toolCallId, params, signal, onUpdate, ctx);
-        // The call RAN: check the card off (success or failure — the step
-        // documents the attempt, so the panel never shows a stuck spinner).
+        // The call RAN AND RETURNED: check the card off as SUCCEEDED — the
+        // only #295-footer-eligible outcome. (A call that later throws is
+        // the failed path below, never succeeded.)
         if (outcome.decision !== "ask-human") {
           emitToolStep(sink, {
             spaceId,
             taskId,
+            label,
             title: toolStepTitle(def.name, `allowed (${tier})`),
             status: "complete",
+            outcome: "succeeded",
             output: stepArgs,
           });
         }
@@ -844,8 +857,10 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
           emitToolStep(sink, {
             spaceId,
             taskId,
+            label,
             title: toolStepTitle(def.name, `allowed (${tier})`),
             status: "complete",
+            outcome: "failed",
             output: stepArgs,
           });
         }

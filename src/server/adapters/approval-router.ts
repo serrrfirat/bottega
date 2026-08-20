@@ -103,6 +103,17 @@ export function humanizeKey(key: string): string {
   return words.length === 0 ? key : words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/**
+ * Humanizes a tool NAME for the #295 completed-action footer: strips a
+ * dotted scope prefix ('github.search_issues' → 'search_issues') then runs
+ * the shared {@link humanizeKey} ('search issues' → 'Search issues'). Reused
+ * so the footer never prints an internal tool identifier to a human.
+ */
+export function humanizeToolName(name: string): string {
+  const base = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name;
+  return humanizeKey(base);
+}
+
 /** True for values that carry no information on an approval card (elided). */
 function isEmptyValue(v: unknown): boolean {
   if (v === null || v === undefined) return true;
@@ -353,8 +364,9 @@ export class SlackApprovalRouter implements ApprovalRouter {
     const title = toolStepTitle(tool, "confirmed write failed");
     const taskId = nextToolStepId();
     const output = redact(text);
-    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, status: "in_progress", output });
-    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, status: "complete", output });
+    const label = humanizeToolName(tool);
+    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, label, status: "in_progress", output });
+    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, label, status: "complete", output, outcome: "failed" });
     this.log(`[approvals] confirmed write failed for ${tool}: ${text}`);
   }
 
