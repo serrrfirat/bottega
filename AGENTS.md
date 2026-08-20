@@ -75,6 +75,15 @@ rule below conflicts with a rule above, the user's explicit instructions win
   question (unit tests around the delivery loop all passed while nothing
   drove a work item to `done` through the real pipeline; `review`/`done`
   shipped unreachable). Enforcement is review, not tooling.
+- **Frontend changes to Slack/Teams require real-client UI verification**
+  (issue #299): UI changes to the Slack or Teams channel must be verified
+  against the real client before they pass. Locally, drive the authenticated
+  real Slack/Teams app (Computer Use or the harness browser). In CI, run
+  Playwright against an authenticated dedicated test identity/profile. Final
+  proof is the real client UI only — API calls, payload/log inspection,
+  emulator/unit tests, and mock-HTML screenshots are supporting evidence, not
+  a pass. If the real client is unreachable, the change is blocked/incomplete,
+  never silently passed.
 - **Chat-discovered bugs ship a hermetic regression test** (user-mandated,
   2026-08-17): a fix for a bug found in conversation must include a test that
   reproduces the exact failure (e.g. an unwired seam defaulting to a wrong
