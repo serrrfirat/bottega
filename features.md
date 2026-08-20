@@ -17,6 +17,7 @@ do, and why it matters. For how it works under the hood, see
 | --- | --- |
 | **Model settings** | See the provider catalog, pin a model and thinking effort per space or work item, and apply changes without a restart. |
 | **Slack delivery** | Get an immediate receipt, live progress, tool steps, and a final reply on a path that degrades safely when Slack streaming is unavailable. |
+| **Native Slack charts** | Ask the agent for a chart and it renders Slack's native pie/bar/area/line data-visualization block straight into the thread — right from CSV or tabular data it already holds. |
 | **Org settings** | Runtime configuration in the database, with approver-gated org writes and tighten-only space overlays. |
 | **Memory** | The agent remembers facts per user or per org and uses them across conversations. |
 | **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
@@ -191,6 +192,17 @@ Text extraction supports `text/plain`, `text/csv`, `application/json`, and
 `object.get` returns an explicit unsupported-format error: binary content
 extraction is executor-harness work (the tools image runs python3, sqlite3,
 and CLIs over the shared data volume), not a server-side extractor.
+
+## Native Slack charts (issue #276)
+
+Ask the agent for a chart and it renders Slack's native data-visualization
+block (`render_chart`) — pie, bar, area, or line — straight into the thread,
+using data it already holds (e.g. a CSV pulled via `object.get`). The tool
+validates its payload fail-closed (non-finite values, over-cap segments or
+series, empty labels, and series/category length mismatches are rejected
+rather than posted) and posts exactly one chart block per result through the
+same blocks-capable `postMessage` path the approval router uses, so charts
+land beside the reply — never per streamed chunk.
 
 ## Slack replies stay visible and settle (issues #119, #120, #179, #180, #181, #184, #193)
 

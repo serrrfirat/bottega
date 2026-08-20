@@ -18,6 +18,7 @@ import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
+import { chartToolDefinition } from "../tools/render-chart";
 import { loadKbConfig } from "../kb/config";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
@@ -555,6 +556,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       pendingApprovals: (spaceId) =>
         (approvalRouter.pendingPrompts?.() ?? []).filter((prompt) => prompt.spaceId === spaceId),
       getTodoPhases: (spaceId) => spaceService.getTodoPhases(spaceId),
+    }),
+    // Native Slack charts (issue #276): render_chart builds a Block Kit
+    // data-visualization block and posts it into the thread through the
+    // space's turn presenter — the same blocks-capable postMessage path the
+    // approval router uses. Read-tier: rendering a chart only posts a
+    // message, it does not mutate state. spaceService is late-bound
+    // (constructed after the toolset) — the closure reads it only at call
+    // time, the same pattern as listTodos above.
+    chartToolDefinition({
+      postChart: (spaceId, block) => spaceService.postChart(spaceId, block),
     }),
   ];
   opts.onSessionToolset?.(sessionToolset);
