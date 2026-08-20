@@ -1425,6 +1425,218 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Top-level DM status card (issue #295): a top-level Slack DM turn
+// (slack:D*) shows EXACTLY ONE evolving status card — one post, edited in
+// place — with the todo plan folded into that same surface (NO separate
+// "🛠 Agent's plan" message), raw model reasoning (`ThinkingEvent.thinking`)
+// NEVER reaching Slack (only the elapsed/step status), and the completed
+// reply replacing the SAME timestamp with the final answer plus a compact
+// completed-action footer ONLY when >= 1 gated tool action completed.
+// Errors / empty completions replace the same surface without the footer
+// or any stale status. Channel (slack:C*) and threaded turns are untouched.
+// ---------------------------------------------------------------------------
+
+describe("SlackTurnPresenter: top-level DM status card (issue #295)", () => {
+  function dmPresenter(rec: RecordedAdapter): SlackTurnPresenter {
+    const { store } = recordingStore();
+    return new SlackTurnPresenter({
+      spaceId: "slack:D1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+  }
+
+  /** A long plan (>= 3 steps across >= 2 phases) that channels would show as a separate plan message (#228). */
+  const DM_LONG_PLAN = [
+    {
+      name: "Research",
+      tasks: [
+        { content: "Read the repo", status: "completed" as const },
+        { content: "Draft the section", status: "completed" as const },
+      ],
+    },
+    { name: "Land", tasks: [{ content: "Push + PR", status: "in_progress" as const }] },
+  ];
+
+  test("exactly ONE card: a long plan folds into the single status line, no separate plan message (issue #295)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toHaveLength(1); // a single phrase card — nothing else
+
+    // A long plan that would qualify for the separate #228 message in a
+    // channel must N OT post one here: the todo progress folds into the
+    // one card's line instead.
+    presenter.onTodoPhases({ spaceId: "slack:D1", phases: DM_LONG_PLAN });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.posts).toHaveLength(1); // still one card — no plan message post
+    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+    // The todo progress still surfaces on the single line (folded in).
+    expect(rec.updates.at(-1)?.text).toMatch(/🛠 3\/3 — Push \+ PR$/);
+
+    // The turn completes by editing the SAME card, never a second post.
+    presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+    expect(rec.posts).toHaveLength(1);
+  });
+
+  test("raw model reasoning NEVER surfaces: thinking renders no 🧠 line, only the elapsed/step status (issue #295)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    // Reasoning streams in — it must never reach the card.
+    presenter.onThinking({ spaceId: "slack:D1", thinking: "the raw chain-of-thought the human must never see" });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+
+    expect(rec.updates.some((u) => u.text.startsWith("🧠"))).toBe(false);
+    expect(rec.updates.some((u) => u.text.includes("raw chain-of-thought"))).toBe(false);
+    // The card stays alive with a non-content status instead.
+    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s$/);
+  });
+
+  test("completed reply replaces the SAME timestamp with the answer + a compact completed-action footer (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toHaveLength(1);
+    const cardTs = "post-1";
+
+    // Two gated tool calls complete.
+    const read = nextToolStepId();
+    const write = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: read, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "complete" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, title: toolStepTitle("create_work_item", "allowed (write)"), status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: write, title: toolStepTitle("create_work_item", "allowed (write)"), status: "complete" });
+    await flush();
+
+    // The final answer EDITS the one card (same ts) with a compact footer.
+    presenter.onMessage({ spaceId: "slack:D1", text: "Here is the answer" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+
+    expect(rec.posts).toHaveLength(1); // one card throughout
+    expect(rec.updates.at(-1)).toEqual({
+      spaceId: "slack:D1",
+      ts: cardTs,
+      text:
+        "Here is the answer\n\n  ✅ github.search_issues — allowed (read)\n  ✅ create_work_item — allowed (write)",
+    });
+  });
+
+  test("completed-action footer is bounded: >3 complete steps collapse to 3 + a '+N more' tail (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    for (const name of ["a", "b", "c", "d"]) {
+      const id = nextToolStepId();
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), status: "in_progress" });
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), status: "complete" });
+    }
+    await flush();
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "Answer" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+
+    const final = rec.updates.at(-1)!.text;
+    expect(final).toContain("✅ a — allowed (exec)");
+    expect(final).toContain("✅ b — allowed (exec)");
+    expect(final).toContain("✅ c — allowed (exec)");
+    expect(final).not.toContain("✅ d");
+    expect(final).toContain("… +1 more");
+  });
+
+  test("no completed action means no footer: the reply is just the answer (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    const cardTs = "post-1";
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "Plain answer" });
+    presenter.onTurnEnd({ spaceId: "slack:D1" });
+    await flush();
+
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:D1", ts: cardTs, text: "Plain answer" });
+    expect(rec.updates.at(-1)!.text).not.toContain("✅");
+  });
+
+  test("an error replaces the SAME card in place with the error text — no footer, no stale status (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    const cardTs = "post-1";
+
+    // A step ran, then the session errored.
+    const id = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), status: "complete" });
+    await flush();
+
+    presenter.onError({ spaceId: "slack:D1", message: "provider exploded" });
+    await flush();
+
+    // The SAME card now holds the error — no second post, no completed-action
+    // footer, no leftover progress line.
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:D1", ts: cardTs, text: "provider exploded" });
+    expect(rec.updates.at(-1)!.text).not.toContain("✅");
+  });
+
+  test("an empty completion replaces the same card with the visible fallback — no stale status (issue #295)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    const cardTs = "post-1";
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "", error: "provider exploded" });
+    await flush();
+
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs });
+    expect(rec.updates.at(-1)!.text).not.toContain("✅");
+  });
+
+  test("a threaded DM keeps the reaction-only flow — no thinking suppression, no completed-action footer (issue #295 preserves #289)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1", threadTs: "1.0" }));
+    await flush();
+    expect(rec.posts).toHaveLength(0); // reaction-only receipt
+
+    // Even with a completed step, a threaded turn stays a plain fresh post
+    // under the root — never the top-level #295 footer.
+    const id = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("bash", "allowed (exec)"), status: "complete" });
+    await flush();
+    presenter.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    await flush();
+
+    expect(rec.posts).toEqual([{ spaceId: "slack:D1", text: "dm answer", opts: undefined }]);
+    expect(rec.updates).toHaveLength(0);
+  });
+});
+
 describe("StreamTurnPresenter: live todo (issue #228)", () => {
   test("a long turn posts the plan message while the panel stays clean — no progress-line appends (issue #228)", async () => {
     const rec = recordingAdapter();

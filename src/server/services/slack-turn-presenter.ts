@@ -244,6 +244,14 @@ export function nextToolStepId(): string {
 const STEP_TITLE_MAX = 256;
 
 /**
+ * Max completed-action titles a top-level DM's completion footer lists
+ * before collapsing into a "+N more" tail (issue #295). Titles are already
+ * redacted and bounded at the source ({@link toolStepTitle}), so the footer
+ * stays human-readable and secret-free.
+ */
+const DM_COMPLETED_ACTIONS_MAX = 3;
+
+/**
  * Composes a thinking-step card title and applies the SAME redaction the
  * audit module applies to payloads (issue #168): secret-shaped values in
  * tool names/qualifiers render `[REDACTED]`, never raw.
@@ -641,6 +649,16 @@ export class SlackTurnPresenter {
   #planPosting = false;
   /** The last rendered plan body; identical snapshots skip the edit. */
   #lastPlanText: string | undefined;
+  /**
+   * Completed gated tool-step titles for the CURRENT turn (top-level DMs
+   * only, issue #295): the compact completion footer lists what was done,
+   * bounded to {@link DM_COMPLETED_ACTIONS_MAX} titles plus a "+N more"
+   * count. Titles are already redacted/bounded at the source. Reset at each
+   * turn start so a prior turn's footer never leaks into the next card.
+   */
+  #completedActions: string[] = [];
+  /** Completed actions beyond {@link #completedActions} (the "+N more" tail). */
+  #completedActionsExtra = 0;
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -698,6 +716,10 @@ export class SlackTurnPresenter {
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
+    // #295: a fresh top-level turn starts with no completed actions — a
+    // prior turn's footer must never leak into this turn's card.
+    this.#completedActions = [];
+    this.#completedActionsExtra = 0;
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -760,7 +782,9 @@ export class SlackTurnPresenter {
       this.#scheduleStreamUpdate(text);
       return;
     }
-    this.#replaceOrPost(text);
+    // #295: a top-level DM's completed reply is "answer + completed-action
+    // footer" (when >= 1 action completed), still editing the one card.
+    this.#replaceOrPost(this.#withCompletionFooter(text));
     // The reply landed: the receipt reaction comes off and the reply
     // latency is audited (issue #119).
     this.#clearReactions();
@@ -808,6 +832,13 @@ export class SlackTurnPresenter {
     if (this.digesting) return;
     if (!this.#turnDelivered) {
       this.#countEmptyTurn(data.error?.trim() || undefined);
+    }
+    // #295: a top-level DM's ~streamed~ (steer) final reply carries the
+    // completed-action footer too — append it to the pending coalesced
+    // text right before the final flush so it lands on the one card.
+    if (this.streamingTurns && this.#dmTopLevel) {
+      const entry = this.#streamUpdate;
+      if (entry) entry.text = this.#withCompletionFooter(entry.text);
     }
     const finalText = this.#latestStreamedText();
     const finalized = this.finalizeTurn(finalText);
@@ -886,6 +917,9 @@ export class SlackTurnPresenter {
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
+    // #295: a drained turn is a FRESH turn — no carried-over completed actions.
+    this.#completedActions = [];
+    this.#completedActionsExtra = 0;
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -976,6 +1010,17 @@ export class SlackTurnPresenter {
   }
 
   /**
+   * True for a TOP-LEVEL (non-threaded) Slack DM — the single-status-card
+   * surface (issue #295): exactly one evolving card per turn, no separate
+   * plan message, no raw model reasoning, and the completed-action footer.
+   * Channels (C/G) and threaded turns (any space) keep their existing
+   * surfaces untouched.
+   */
+  get #dmTopLevel(): boolean {
+    return this.turnThreadTs === undefined && isDmChannel(channelFromSpaceId(this.spaceId));
+  }
+
+  /**
    * DMs read naturally as a plain message — no thread. Team channels (C/G)
    * keep replies threaded: under the conversation ROOT when the request
    * was itself a thread reply (issue #289), otherwise under the inbound
@@ -1033,6 +1078,9 @@ export class SlackTurnPresenter {
     this.#planTs = undefined;
     this.#planPosting = false;
     this.#lastPlanText = undefined;
+    // #295: completed-action tracking dies with the session too.
+    this.#completedActions = [];
+    this.#completedActionsExtra = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -1088,6 +1136,11 @@ export class SlackTurnPresenter {
     // The in-flight flag (issue #219) gates the steer safe window.
     this.toolStepInFlight = step.status === "in_progress";
     this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
+    // #295: a top-level DM's completed footer records each finished gated
+    // action (bounded, already-redacted title). Channels/threads don't.
+    if (step.status === "complete" && step.title && this.#dmTopLevel) {
+      this.#recordCompletedAction(step.title);
+    }
     this.#renderProgressNow();
   }
 
@@ -1095,6 +1148,10 @@ export class SlackTurnPresenter {
   protected renderThinking(data: ThinkingEvent): void {
     const thinking = data.thinking?.trim();
     if (!thinking) return;
+    // #295: a top-level DM's single status card NEVER surfaces raw model
+    // reasoning. The elapsed tick keeps the card alive; the thinking chunk
+    // is a no-op for the surface, so Reasoning text can never reach Slack.
+    if (this.#dmTopLevel) return;
     this.#latestThinking = this.#tailSnippet(thinking);
     this.#renderProgressNow();
   }
@@ -1151,6 +1208,38 @@ export class SlackTurnPresenter {
   #tailSnippet(text: string): string {
     if (text.length <= THINKING_SNIPPET_MAX) return text;
     return `…${text.slice(-(THINKING_SNIPPET_MAX - 1))}`;
+  }
+
+  /**
+   * The compact completed-action footer for a top-level DM's final reply
+   * (issue #295): one "✅ <title>" line per completed gated tool action,
+   * bounded to {@link DM_COMPLETED_ACTIONS_MAX} titles plus a "+N more"
+   * tail. Only present when >= 1 action completed; absent for errors and
+   * empty completions (the card then holds the error/fallback only). Titles
+   * are redacted and bounded at the source, so no raw args or secrets leak.
+   */
+  #completionFooter(): string | undefined {
+    if (!this.#dmTopLevel) return undefined;
+    const names = this.#completedActions;
+    if (names.length === 0) return undefined;
+    const lines = names.map((name) => `  ✅ ${name}`);
+    if (this.#completedActionsExtra > 0) lines.push(`  … +${this.#completedActionsExtra} more`);
+    return `\n\n${lines.join("\n")}`;
+  }
+
+  /** Appends the #295 completed-action footer to a final reply text when one is due. */
+  #withCompletionFooter(text: string): string {
+    const footer = this.#completionFooter();
+    return footer === undefined ? text : `${text}${footer}`;
+  }
+
+  /** Records a completed gated tool action for the #295 footer, bounded. */
+  #recordCompletedAction(title: string): void {
+    if (this.#completedActions.length < DM_COMPLETED_ACTIONS_MAX) {
+      this.#completedActions.push(title);
+    } else {
+      this.#completedActionsExtra += 1;
+    }
   }
 
   /**
@@ -1321,6 +1410,10 @@ export class SlackTurnPresenter {
    * a posting/editing failure is logged, never thrown into the turn path.
    */
   #renderPlanMessage(): void {
+    // #295: a top-level DM is ONE status card — the long-plan message would
+    // be a second surface. The todo progress folds into the single card's
+    // line (the 🛠 N/M indicator) instead; no separate plan message posts.
+    if (this.#dmTopLevel) return;
     if (!isLongPlan(this.#todoPhases)) return;
     const text = renderTodoPlan(this.#todoPhases);
     if (text === this.#lastPlanText) return;
