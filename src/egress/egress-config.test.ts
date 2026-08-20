@@ -194,13 +194,25 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(asString(token["require"])).toBe("true");
       const refresh = asRecord(token["refresh_token"]);
       const clientId = asRecord(token["client_id"]);
+      const clientSecret = asRecord(token["client_secret"]);
       expect(refresh["type"]).toBe("file");
       expect(clientId["type"]).toBe("file");
+      expect(clientSecret["type"]).toBe("file");
       expect(asString(refresh["json_key"])).toBe("refresh_token");
       expect(asString(clientId["json_key"])).toBe("client_id");
+      expect(asString(clientSecret["json_key"])).toBe("client_secret");
       // Both fields come from the SAME per-provider JSON blob.
       expect(asString(refresh["path"])).toBe(asString(clientId["path"]));
+      expect(asString(refresh["path"])).toBe(asString(clientSecret["path"]));
       expect(asString(refresh["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z-]+-oauth\.json$/);
+      // Issue #268: the refresh_token source uses a LONG ttl (>=12h) so a
+      // re-read cannot clobber the in-memory rotated token inside the
+      // access-token lifetime (notion rotates on every exchange); the
+      // client-credential sources keep the short ttl (rotation pickup).
+      expect(asString(refresh["ttl"])).toMatch(/^[0-9]+h$/);
+      expect(parseInt(asString(refresh["ttl"]), 10)).toBeGreaterThanOrEqual(12);
+      expect(asString(clientId["ttl"])).toBe("30s");
+      expect(asString(clientSecret["ttl"])).toBe("30s");
       const rules = asRecordArray(token["rules"]);
       expect(rules.length).toBeGreaterThanOrEqual(1);
       for (const rule of rules) {

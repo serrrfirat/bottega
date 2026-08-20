@@ -81,8 +81,15 @@ export const OAUTH_PROXY_CREDENTIALS: readonly OAuthProxyCredential[] = [
 interface ProxyOAuthBlob {
   refresh_token: string;
   client_id: string;
-  /** Present only when the deployment configures a client secret (public clients omit it). */
-  client_secret?: string;
+  /**
+   * ALWAYS present (issue #268): the oauth_token transform reads
+   * json_key "client_secret" unconditionally, and iron-proxy's json_key
+   * extraction FAILS the mint on a MISSING key (502). Public clients
+   * carry "" — the oauth2 client omits the empty value from the token
+   * POST, so the wire behavior is unchanged; confidential clients
+   * (notion) carry the real secret.
+   */
+  client_secret: string;
 }
 
 /**
@@ -848,15 +855,17 @@ export async function seedProxyOAuthBlob(
     );
     return { notes, warnings, wrote: false };
   }
-  const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId };
-  // Per-user vault client secret first (issue #250), env second.
+  // Per-user vault client secret first (issue #250), env second. Issue
+  // #268: the key is ALWAYS written — "" when neither exists, because the
+  // oauth_token transform reads json_key "client_secret" unconditionally
+  // and iron-proxy's json_key extraction 502s the mint on a MISSING key.
   const clientSecret =
     row?.clientSecret !== undefined && row.clientSecret !== ""
       ? row.clientSecret
       : envClientSecret !== undefined
         ? envClientSecret
-        : undefined;
-  if (clientSecret !== undefined && clientSecret !== "") blob.client_secret = clientSecret;
+        : "";
+  const blob: ProxyOAuthBlob = { refresh_token: refresh, client_id: clientId, client_secret: clientSecret };
   writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
   notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
   return { notes, warnings, wrote: true };

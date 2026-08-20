@@ -137,7 +137,13 @@ transforms:
   #    token_endpoint with a synthetic token so the SDK's own token dance
   #    completes against the proxy. require: true — a missing/unmintable
   #    credential rejects the request (502), never an unauthenticated
-  #    upstream call. The codex model provider is NOT here (issue #230):
+  #    upstream call. client_secret is sent for EVERY provider (issue
+  #    #268): the blob always carries the key ("" for public clients) so
+  #    the json_key read never 502s on a missing key; the refresh_token
+  #    source uses a 24h ttl (a short re-read would clobber the in-memory
+  #    rotated token before the 8h access token expires — notion rotates
+  #    on every exchange, iron-proxy's refresh-token rotation warning).
+  #    The codex model provider is NOT here (issue #230):
   #    its access token is a STATIC secrets entry — the seed owns the
   #    refresh, the proxy injects the minted token for chatgpt.com.
   - name: oauth_token
@@ -147,13 +153,18 @@ transforms:
           refresh_token:
             type: file
             path: "/data/proxy-secrets/attio-oauth.json"
-            ttl: "30s"
+            ttl: "24h"
             json_key: "refresh_token"
           client_id:
             type: file
             path: "/data/proxy-secrets/attio-oauth.json"
             ttl: "30s"
             json_key: "client_id"
+          client_secret:
+            type: file
+            path: "/data/proxy-secrets/attio-oauth.json"
+            ttl: "30s"
+            json_key: "client_secret"
           token_endpoint: "https://app.attio.com/oidc/token"
           require: true
           rules:
@@ -165,13 +176,18 @@ transforms:
           refresh_token:
             type: file
             path: "/data/proxy-secrets/linear-oauth.json"
-            ttl: "30s"
+            ttl: "24h"
             json_key: "refresh_token"
           client_id:
             type: file
             path: "/data/proxy-secrets/linear-oauth.json"
             ttl: "30s"
             json_key: "client_id"
+          client_secret:
+            type: file
+            path: "/data/proxy-secrets/linear-oauth.json"
+            ttl: "30s"
+            json_key: "client_secret"
           token_endpoint: "https://mcp.linear.app/token"
           require: true
           rules:

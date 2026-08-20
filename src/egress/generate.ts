@@ -502,6 +502,18 @@ ${extensionBlock}${gatewayEntries}
  * credential exists, so the mint rules never match them. The codex model
  * provider is NOT here (issue #230): it is a STATIC secrets entry — the
  * seed owns the refresh, the proxy injects the access token at egress.
+ *
+ * client_secret is sent UNCONDITIONALLY for every entry (issue #268): the
+ * sync's blob always carries the key ("" for public clients), so the
+ * json_key read never hits a MISSING key — iron-proxy's json_key
+ * extraction errors on a missing key and the mint fails closed (502).
+ * The refresh_token source uses a LONG ttl (24h): iron-proxy's refresh
+ * token rotation warning — a short ttl re-read overwrites the in-memory
+ * rotated token with the stale store value; notion rotates the refresh
+ * token on every exchange, so the old 30s ttl clobbered it inside the 8h
+ * access-token lifetime and the next mint failed invalid_grant (deeper
+ * fix: issue #269). client_id/client_secret keep the short ttl for
+ * operator rotation pickup.
  */
 export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): string {
   const tokenBlocks = entries
@@ -522,13 +534,18 @@ export function renderOAuthTokenTransform(entries: readonly OAuthTokenEntry[]): 
           refresh_token:
             type: file
             path: "${blobPath}"
-            ttl: "30s"
+            ttl: "24h"
             json_key: "refresh_token"
           client_id:
             type: file
             path: "${blobPath}"
             ttl: "30s"
             json_key: "client_id"
+          client_secret:
+            type: file
+            path: "${blobPath}"
+            ttl: "30s"
+            json_key: "client_secret"
           token_endpoint: "${entry.tokenEndpoint}"
           require: true
           rules:
@@ -543,7 +560,13 @@ ${hostLines}`;
   #    token_endpoint with a synthetic token so the SDK's own token dance
   #    completes against the proxy. require: true — a missing/unmintable
   #    credential rejects the request (502), never an unauthenticated
-  #    upstream call. The codex model provider is NOT here (issue #230):
+  #    upstream call. client_secret is sent for EVERY provider (issue
+  #    #268): the blob always carries the key ("" for public clients) so
+  #    the json_key read never 502s on a missing key; the refresh_token
+  #    source uses a 24h ttl (a short re-read would clobber the in-memory
+  #    rotated token before the 8h access token expires — notion rotates
+  #    on every exchange, iron-proxy's refresh-token rotation warning).
+  #    The codex model provider is NOT here (issue #230):
   #    its access token is a STATIC secrets entry — the seed owns the
   #    refresh, the proxy injects the minted token for chatgpt.com.
   - name: oauth_token

@@ -163,7 +163,11 @@ describe("OAuth blobs (issue #208)", () => {
         log: SILENT,
       });
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
-      expect(blob).toEqual({ refresh_token: "linear-refresh-1", client_id: "linear-client" });
+      // Issue #268: the blob ALWAYS carries client_secret — "" when no
+      // secret exists (the transform reads json_key "client_secret"
+      // unconditionally; a MISSING key 502s the mint, an empty value
+      // resolves cleanly and the oauth2 client omits it from the POST).
+      expect(blob).toEqual({ refresh_token: "linear-refresh-1", client_id: "linear-client", client_secret: "" });
       // attio has no vault row in this test → its blob is deleted (fail closed).
       expect(existsSync(join(s.dir, proxyOAuthBlobFileName("attio")))).toBe(false);
     } finally {
@@ -192,6 +196,54 @@ describe("OAuth blobs (issue #208)", () => {
         refresh_token: "linear-refresh-1",
         client_id: "linear-client",
         client_secret: "linear-secret",
+      });
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("the blob ALWAYS carries client_secret — \"\" without one, the per-user vault secret when the row has one (issue #268)", async () => {
+    // The oauth_token transform reads json_key "client_secret"
+    // unconditionally for every provider. iron-proxy's json_key extraction
+    // FAILS a mint when the key is missing from the blob (502 — fail
+    // closed), so a secret-less public client must still get the key with
+    // an empty value; the oauth2 client then omits the empty secret from
+    // the token POST (public PKCE clients keep working). A per-user vault
+    // client secret (issue #250) lands in the blob.
+    const s = tempSecretsDir();
+    try {
+      const env = { LINEAR_OAUTH_CLIENT_ID: "linear-client" };
+      // No secret anywhere → the key is present, empty.
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) => (provider === "linear" ? [{ refresh: "linear-refresh-1" }] : []),
+        log: SILENT,
+      });
+      expect(JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"))).toEqual({
+        refresh_token: "linear-refresh-1",
+        client_id: "linear-client",
+        client_secret: "",
+      });
+      // The per-user vault row's client secret (issue #250) wins. The
+      // boot env-strip consumed LINEAR_OAUTH_CLIENT_ID on the first call
+      // (issue #208), so a FRESH env object is required here.
+      await syncProxyCredentialsFromEnv({
+        env: { LINEAR_OAUTH_CLIENT_ID: "linear-client" },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) =>
+          provider === "linear" ? [{ refresh: "linear-refresh-1", clientSecret: "row-secret" }] : [],
+        log: SILENT,
+      });
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
+      expect(blob).toEqual({
+        refresh_token: "linear-refresh-1",
+        client_id: "linear-client",
+        client_secret: "row-secret",
       });
     } finally {
       s.cleanup();
@@ -261,7 +313,7 @@ describe("OAuth blobs (issue #208)", () => {
         log: SILENT,
       });
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
-      expect(blob).toEqual({ refresh_token: "row-4-refresh", client_id: "client-old" });
+      expect(blob).toEqual({ refresh_token: "row-4-refresh", client_id: "client-old", client_secret: "" });
     } finally {
       s.cleanup();
     }
@@ -313,7 +365,7 @@ describe("OAuth blobs (issue #208)", () => {
         log: SILENT,
       });
       const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("linear")), "utf8"));
-      expect(blob).toEqual({ refresh_token: "row-6-refresh", client_id: "client-live" });
+      expect(blob).toEqual({ refresh_token: "row-6-refresh", client_id: "client-live", client_secret: "" });
     } finally {
       s.cleanup();
     }

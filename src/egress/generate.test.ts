@@ -571,4 +571,70 @@ describe("oauth_token rule scoping (issue #246)", () => {
       expect(String((token as Record<string, YamlNode>)["require"])).toBe("true");
     }
   });
+
+  test("every oauth_token entry sends client_secret from the same per-provider blob (issue #268)", () => {
+    // The refresh grant mints with the provider's client credentials: the
+    // transform must send client_secret for EVERY provider (notion's
+    // confidential client rejects the grant without it — invalid_client).
+    // Each credential field is its own json_key read of the SAME blob, so
+    // the file source stays one file per provider. (The blob always
+    // carries the key — "" for public clients — so the json_key read
+    // never hits a missing key; the oauth2 client omits the empty value
+    // from the token POST.)
+    const cfg = parseYamlSubset(MERGED_YAML);
+    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
+    const transforms = cfg["transforms"] as YamlNode[];
+    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
+    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
+    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const token of tokens) {
+      const entry = token as Record<string, YamlNode>;
+      // SAFETY: every rendered token entry carries the file-source blocks.
+      const refresh = entry["refresh_token"] as Record<string, YamlNode>;
+      const clientId = entry["client_id"] as Record<string, YamlNode>;
+      const clientSecret = entry["client_secret"] as Record<string, YamlNode>;
+      const endpoint = String(entry["token_endpoint"]);
+      expect(clientSecret, `entry for ${endpoint} has no client_secret source`).toBeDefined();
+      expect(clientSecret["type"]).toBe("file");
+      expect(clientSecret["json_key"]).toBe("client_secret");
+      // One blob per provider: all three fields read the same file.
+      expect(String(clientSecret["path"])).toBe(String(refresh["path"]));
+      expect(String(clientSecret["path"])).toBe(String(clientId["path"]));
+      expect(String(clientSecret["path"])).toMatch(/^\/data\/proxy-secrets\/[a-z-]+-oauth\.json$/);
+    }
+  });
+
+  test("the refresh_token source uses a LONG ttl — a short re-read clobbers the in-memory rotated token (issue #268)", () => {
+    // iron-proxy docs (oauth-token → Refresh Token Rotation): "Avoid short
+    // ttl values on the refresh-token secret source. A re-read overwrites
+    // the in-memory rotated token with the stale store value." Notion
+    // rotates the refresh token on every exchange, so a 30s re-read lands
+    // inside the 8h access-token lifetime and the next mint fails
+    // invalid_grant. The refresh source must outlive the access token;
+    // client_id/client_secret keep the short ttl (operator rotation
+    // pickup). Deeper fix (#269) persists rotation; this is the config
+    // mitigation.
+    const cfg = parseYamlSubset(MERGED_YAML);
+    // SAFETY: every rendered egress config emits `transforms` as a top-level sequence.
+    const transforms = cfg["transforms"] as YamlNode[];
+    const oauth = transforms.find((t) => (t as Record<string, YamlNode>)["name"] === "oauth_token")!;
+    // SAFETY: the oauth_token transform's `config` is a block mapping carrying `tokens`.
+    const tokens = ((oauth as Record<string, YamlNode>)["config"] as Record<string, YamlNode>)["tokens"] as YamlNode[];
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const token of tokens) {
+      const entry = token as Record<string, YamlNode>;
+      // SAFETY: every rendered token entry carries the file-source blocks.
+      const refresh = entry["refresh_token"] as Record<string, YamlNode>;
+      const clientId = entry["client_id"] as Record<string, YamlNode>;
+      const clientSecret = entry["client_secret"] as Record<string, YamlNode>;
+      const refreshTtl = String(refresh["ttl"]);
+      // Long enough to outlive any provider's access-token lifetime (notion 8h).
+      expect(refreshTtl).toMatch(/^[0-9]+h$/);
+      expect(parseInt(refreshTtl, 10)).toBeGreaterThanOrEqual(12);
+      // The client-credential sources keep the short ttl (rotation pickup).
+      expect(String(clientId["ttl"])).toBe("30s");
+      expect(String(clientSecret["ttl"])).toBe("30s");
+    }
+  });
 });
