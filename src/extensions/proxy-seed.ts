@@ -721,6 +721,13 @@ export interface ProxyCredentialSyncOpts {
    */
   probeTimeoutMs?: number;
   /**
+   * Max ms a single rotated-token vault write-back (broker write seam) may
+   * run before the seed treats it as a receivable failure (issue #283 High).
+   * Bounds the cross-process lock holder; defaults to
+   * {@link PROXY_SEED_PERSIST_TIMEOUT_MS}. Tests inject a small value.
+   */
+  persistTimeoutMs?: number;
+  /**
    * Rotated-token write-back seam (issue #269): persists the endpoint's
    * rotated refresh token to the vault row (the broker write seam
    * connect.ts uses). Default: the production broker-aware writer; tests
@@ -891,85 +898,159 @@ const PROXY_SEED_LOCK_RETRIES = { retries: 600, factor: 1, minTimeout: 50, maxTi
 const PROXY_SEED_PROBE_TIMEOUT_MS = 15_000;
 
 /**
+ * Time (ms) a single rotated-token VAULT WRITE-BACK (broker write seam) may
+ * take before the seed treats it as a receivable failure (issue #283 High).
+ * The write-back runs INSIDE the cross-process lock's critical section, so
+ * like the probe it is bounded below the lock's stale threshold (10s < 30s)
+ * — a hanging broker must not wedge the lock holder. A timeout is RECEIVABLE
+ * (the blob still carries the rotated token for this seed; the next boot
+ * re-verifies): warn + continue, never fail the whole boot.
+ */
+const PROXY_SEED_PERSIST_TIMEOUT_MS = 10_000;
+
+/**
+ * Result of a bounded async call ({@link runBounded}): either the callee's
+ * value, a TIMEOUT firing before it settled, or an early ERROR/rejection.
+ * The shared helper guarantees the in-flight callee is ALWAYS observed
+ * (both handlers attached) so a late resolve/reject never surfaces as an
+ * unhandled rejection, and its timer is unref'd + cleared on an early
+ * (non-timeout) settle so no timer holds the event loop.
+ */
+type Bounded<T> = { kind: "ok"; value: T } | { kind: "timeout" } | { kind: "error"; error: unknown };
+
+/**
+ * Runs `fn` under a hard time bound (shared by the probe and the vault
+ * write-back, issue #283 High). On timeout the in-flight `fn` is LEFT to
+ * settle with both promise handlers attached — a late resolve OR rejection
+ * is observed (never an unhandled rejection). The bound timer is unref'd
+ * where available and cleared when `fn` settles first, so an early result
+ * never leaks a timer or holds the event loop.
+ */
+async function runBounded<T>(fn: () => Promise<T>, timeoutMs: number): Promise<Bounded<T>> {
+  const bounded = Promise.withResolvers<Bounded<T>>();
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    bounded.resolve({ kind: "timeout" });
+  }, timeoutMs);
+  // Don't let the bound timer keep the process alive just because a probe
+  // is hung; the seed's result is produced on timeout, not on the hang.
+  timer.unref();
+  Promise.resolve().then(fn).then(
+    (value) => {
+      if (settled) return; // timeout already won; the (late) resolve is harmless
+      settled = true;
+      clearTimeout(timer);
+      bounded.resolve({ kind: "ok", value });
+    },
+    (error) => {
+      if (settled) return; // timeout already won; this rejection is OBSERVED here (no unhandled)
+      settled = true;
+      clearTimeout(timer);
+      bounded.resolve({ kind: "error", error });
+    },
+  );
+  return await bounded.promise;
+}
+
+/** True when proper-lockfile could not acquire the lock (retries exhausted). */
+function isLockAcquireFailure(err: unknown): boolean {
+  return err !== null && typeof err === "object" && "code" in err && err.code === "ELOCKED";
+}
+
+/** The outcome of a {@link withProxySeedLock} run: the critical section's value + whether the lock was compromised. */
+interface LockRun<A> {
+  value: A;
+  /** The lock compromise error, when the heartbeat detected the lock was lost/stolen AFTER `fn` (rare). */
+  compromised?: Error;
+}
+
+/**
  * Runs `fn` while holding an exclusive, cross-PROCESS mutex on one proxy
  * OAuth blob (issue #283). Correct cross-process stale-lock ownership +
  * heartbeat is infrastructure we must not roll ourselves, so we use the
  * exact-pinned `proper-lockfile` (package.json): its atomic-mkdir lock,
  * mtime heartbeat refresh (stale/update), and age-based stale-steal are
  * battle-tested. The lock file is `<blob>.lock`; a LIVE holder's heartbeat
- * keeps it fresh whatever the critical section takes (the 15s probe + any
- * broker write stay within the lease), and a waiter steals it only when it
- * is genuinely stale — so the seed's read → choose-probe-token → probe →
+ * keeps it fresh whatever the critical section takes (the 15s probe + 10s
+ * write-back stay within the lease), and a waiter steals it only when it is
+ * genuinely stale — so the seed's read → choose-probe-token → probe →
  * write/delete decision is serialized ACROSS the independent OS processes
  * (server root + per-session MCP/executor child) that race the same shared
- * blob. The lock is always released in `finally`.
+ * blob.
+ *
+ * COMPROMISE (issue #283): the library's `onCompromised` callback runs off
+ * its heartbeat timer — it MUST NOT throw (that would be an uncaught
+ * exception outside the caller's await). It CAPTURES the compromise error
+ * into a closure flag instead; `fn` receives an `isCompromised()` getter so
+ * it can refuse to write a possibly-stale grant when it discovers the lock
+ * is lost, and the flag is surfaced to the caller (via {@link LockRun}) so
+ * the loss never goes silently unobserved. A failed ACQUIRE (another
+ * process holds a fresh lock past its lease) propagates as the library's
+ * ELOCKED error, which the seed catches per-provider to warn + preserve the
+ * existing blob instead of hard-failing the whole boot.
  */
 async function withProxySeedLock<A>(
   secretsDir: string,
   fileName: string,
-  fn: () => Promise<A>,
-): Promise<A> {
+  fn: (isCompromised: () => Error | undefined) => Promise<A>,
+): Promise<LockRun<A>> {
   // The secrets dir may not exist on a first-ever seed (the model-key / blob
   // writes mkdir it lazily); the lock dir needs the parent.
   mkdirSync(secretsDir, { recursive: true });
   // Lock the blob file itself (the shared boundary). realpath:false so the
   // file needn't exist yet — the atomic mkdir lock is placed at `<file>.lock`.
+  let compromised: Error | undefined;
   const release = await lockFile(join(secretsDir, fileName), {
     realpath: false,
     stale: PROXY_SEED_LOCK_STALE_MS,
     update: PROXY_SEED_LOCK_UPDATE_MS,
     retries: PROXY_SEED_LOCK_RETRIES,
-    // A compromised lock means the probe/lock state is no longer trusted —
-    // fail closed loudly rather than write a possibly-stale grant (AGENTS.md).
+    // Capture (never throw — the callback runs off the library's heartbeat
+    // timer; an uncaught throw there would crash the process). The seed
+    // checks `isCompromised()` before its final blob write and surfaces it
+    // after `fn` won the race, so a lost lock is never silently written past
+    // or ignored.
     onCompromised: (err) => {
-      throw new Error(
-        `bottega proxy: ${fileName} cross-process lock COMPROMISED (${err.message}) — bailing, not writing a stale grant`,
-        { cause: err },
-      );
+      compromised = new Error(`${fileName} cross-process lock COMPROMISED: ${err.message}`, { cause: err });
     },
   });
   try {
-    return await fn();
+    const value = await fn(() => compromised);
+    return { value, compromised };
   } finally {
     // Best-effort release; the holder's own cleanup must not mask a real
-    // failure of the critical section.
-    await release();
+    // failure of the critical section, and once compromised the release is
+    // a no-op anyway (the lock is gone).
+    try {
+      await release();
+    } catch {
+      // Already released / compromised — the lock is no longer ours.
+    }
   }
 }
 
 /**
  * Runs a refresh-grant PROBE under a hard time bound (issue #283 High):
  * a hanging token endpoint must not wedge the cross-process lock holder
- * (and thus block every other boot root forever). On timeout the probe is
- * treated exactly like a transport error — a TRANSIENT outcome
- * (`minted:false`, no `status`) that the seed maps to "keep the blob
- * unverified", NEVER a rejection that deletes it. Passing this bound is
- * safe because the lock's stale-steal ceiling is well above it (and the
- * heartbeat refreshes a live holder): no healthy holder lingers long enough
- * to be mis-stolen. `probeTimeoutMs` is a real production config option
- * (default {@link PROXY_SEED_PROBE_TIMEOUT_MS}) — not a test-only seam.
+ * (and thus block every other boot root forever). Both a TIMEOUT and an
+ * early probe REJECTION are TRANSIENT outcomes (`minted:false`, no
+ * `status`) — the seed maps them to "keep the blob unverified", NEVER a
+ * rejection that deletes it. Passing this bound is safe because the lock's
+ * stale-steal ceiling is well above it (and the heartbeat refreshes a live
+ * holder): no healthy holder lingers long enough to be mis-stolen. Uses
+ * the shared {@link runBounded} so a late rejection is always observed
+ * (never an unhandled rejection) and no timer is held after an early probe.
  */
 async function probeWithTimeout(
   probe: McpOAuthRefreshProbe,
   input: McpOAuthRefreshInput,
   probeTimeoutMs: number,
 ): Promise<McpOAuthRefreshOutcome> {
-  // Sentinel the timer resolves to — the probe never returns it, so the race
-  // loser's side effect is unambiguously attributable.
-  const TIMEOUT: unique symbol = Symbol("probe-with-timeout");
-  const raced: McpOAuthRefreshOutcome | typeof TIMEOUT = await Promise.race<
-    McpOAuthRefreshOutcome | typeof TIMEOUT
-  >([
-    probe(input),
-    new Promise<typeof TIMEOUT>((resolve) => setTimeout(() => resolve(TIMEOUT), probeTimeoutMs)),
-  ]);
-  if (raced === TIMEOUT) {
-    // The endpoint hung past the bound: TRANSIENT — keep the blob
-    // unverified (the !minted, no-status path the seed maps to "keep the
-    // existing token unverified"), NEVER a rejection that deletes it.
-    return { minted: false, refreshToken: input.refreshToken };
-  }
-  return raced;
+  const bounded = await runBounded(() => probe(input), probeTimeoutMs);
+  if (bounded.kind === "ok") return bounded.value;
+  return { minted: false, refreshToken: input.refreshToken };
 }
 
 /**
@@ -1197,6 +1278,14 @@ export async function seedProxyOAuthBlob(
      */
     probeTimeoutMs?: number;
     /**
+     * Max ms a single rotated-token vault write-back may run before the seed
+     * treats it as a receivable failure (issue #283 High). Bounds the
+     * critical section so a hanging broker never wedges the cross-process
+     * lock holder. Defaults to {@link PROXY_SEED_PERSIST_TIMEOUT_MS}; tests
+     * inject a small value with a hung write-back.
+     */
+    persistTimeoutMs?: number;
+    /**
      * Rotated-token write-back seam (issue #269): persists the endpoint's
      * rotated refresh token to the vault row (the broker write seam).
      * Default: the production broker-aware writer; tests stub it (never a
@@ -1214,9 +1303,10 @@ export async function seedProxyOAuthBlob(
   const known = OAUTH_PROXY_CREDENTIALS.find((c) => c.provider === provider);
   const clientIdEnv = opts.clientIdEnv ?? known?.clientIdEnv;
   const clientSecretEnv = opts.clientSecretEnv ?? known?.clientSecretEnv;
-  // Issue #283 High: the probe time bound (below the lock's stale ceiling);
-  // a test may override it with a small value to exercise the timeout path.
+  // Issue #283 High: the probe + write-back time bounds (both below the
+  // lock's stale ceiling); a test may override either with a small value.
   const probeTimeoutMs = opts.probeTimeoutMs ?? PROXY_SEED_PROBE_TIMEOUT_MS;
+  const persistTimeoutMs = opts.persistTimeoutMs ?? PROXY_SEED_PERSIST_TIMEOUT_MS;
   const fileName = proxyOAuthBlobFileName(provider);
   const notes: string[] = [];
   const warnings: string[] = [];
@@ -1320,7 +1410,8 @@ export async function seedProxyOAuthBlob(
   //     warning; a transient failure keeps B unverified (codex pattern);
   //     a success that rotates to C writes C (retaining the marker that
   //     links the still-stale vault A, until the vault itself advances).
-  return await withProxySeedLock(opts.secretsDir, fileName, async () => {
+  try {
+    const run = await withProxySeedLock(opts.secretsDir, fileName, async (isCompromised) => {
     const existingBlob = readProxyOAuthBlob(opts.secretsDir, fileName);
     const alreadyVerified = existingBlob?.verified_from === refresh;
     // The refresh token the blob will carry: the vault row's original, its
@@ -1380,16 +1471,25 @@ export async function seedProxyOAuthBlob(
           // write-back is receivable — the blob still carries the rotated
           // token for THIS seed (the proxy works until the next re-seed).
           const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
-          try {
-            await persistRotated(provider, rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }));
+          // Bound the write-back (issue #283 High): a hanging broker must not
+          // wedge the cross-process lock holder. A timeout OR failure is
+          // RECEIVABLE — the blob still carries the rotated token for this
+          // seed (the atomic write below), so warn + continue. The shared
+          // runBounded observes a late settle (never an unhandled rejection).
+          const p = await runBounded(
+            () => persistRotated(provider, rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret })),
+            persistTimeoutMs,
+          );
+          if (p.kind === "ok") {
             notes.push(
               `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed; ` +
                 "rotated token written back to the vault)",
             );
-          } catch (err) {
+          } else {
+            const reason = p.kind === "error" ? errorMessage(p.error) : `timed out after ${persistTimeoutMs}ms`;
             warnings.push(
               `bottega proxy: ${fileName} rotated refresh token could not be written back to the vault ` +
-                `(${errorMessage(err)}) — the next boot will re-read the consumed token; reconnect ${provider} if it fails`,
+                `(${reason}) — the next boot will re-read the consumed token; reconnect ${provider} if it fails`,
             );
             notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed)`);
           }
@@ -1457,19 +1557,28 @@ export async function seedProxyOAuthBlob(
       } else {
         if (outcome.refreshToken !== existingBlob!.refresh_token) {
           const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
-          try {
-            await persistRotated(
-              provider,
-              rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }),
-            );
+          // Bound the write-back (issue #283 High): a hanging broker must not
+          // wedge the cross-process lock holder. Timeout/failure is
+          // RECEIVABLE (the blob keeps the live token); runBounded observes a
+          // late settle (never an unhandled rejection).
+          const p = await runBounded(
+            () =>
+              persistRotated(
+                provider,
+                rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }),
+              ),
+            persistTimeoutMs,
+          );
+          if (p.kind === "ok") {
             notes.push(
               `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token re-verified and rotated; ` +
                 "rotated token written back to the vault)",
             );
-          } catch (err) {
+          } else {
+            const reason = p.kind === "error" ? errorMessage(p.error) : `timed out after ${persistTimeoutMs}ms`;
             warnings.push(
               `bottega proxy: ${fileName} re-verified rotated refresh token could not be written back to the vault ` +
-                `(${errorMessage(err)}) — the next boot will re-probe the blob's live token`,
+                `(${reason}) — the next boot will re-probe the blob's live token`,
             );
             notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant re-verified)`);
           }
@@ -1491,9 +1600,44 @@ export async function seedProxyOAuthBlob(
       // written when this seed actually verified the grant.
       ...(verifiedFrom !== undefined ? { verified_from: verifiedFrom } : {}),
     };
-    writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
-    return { notes, warnings, wrote: true };
-  });
+    // A known-lost lock NEVER writes: once the heartbeat reports our
+      // cross-process lock was stolen/compromised, do not seed a grant we can
+      // no longer vouch for — refuse (preserve the existing blob, warn loudly)
+      // rather than write a possibly-double-consumed token.
+      const lost = isCompromised();
+      if (lost) {
+        warnings.push(
+          `bottega proxy: ${fileName} NOT written — ${provider} cross-process lock COMPROMISED (${lost.message}); ` +
+            `preserving the existing blob; reconnect ${provider} if it fails`,
+        );
+        return { notes, warnings, wrote: false };
+      }
+      writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
+      return { notes, warnings, wrote: true };
+    });
+    // A compromise detected after the critical section (the heartbeat fired
+    // just after the before-write check) still surfaces: the blob is written
+    // but the lock was lost — the proxy should be re-connected to be safe.
+    if (run.compromised !== undefined) {
+      warnings.push(
+        `bottega proxy: ${fileName} ${provider} cross-process lock COMPROMISED after seed (${run.compromised.message}); ` +
+          `reconnect ${provider} if it fails`,
+      );
+    }
+    return run.value;
+  } catch (err) {
+    // A lock the seed cannot acquire (another boot root holds a fresh lock
+    // past its lease) must NOT hard-fail the whole boot: warn + preserve the
+    // existing blob so the proxy keeps serving, per provider.
+    if (isLockAcquireFailure(err)) {
+      warnings.push(
+        `bottega proxy: ${fileName} seed SKIPPED — could not acquire the ${provider} cross-process lock ` +
+          `(${errorMessage(err)}); preserving the existing blob`,
+      );
+      return { notes, warnings, wrote: false };
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1575,6 +1719,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
       refreshOAuthToken: opts.refreshOAuthToken,
       persistRotatedToken: opts.persistRotatedToken,
       probeTimeoutMs: opts.probeTimeoutMs,
+      persistTimeoutMs: opts.persistTimeoutMs,
     });
     for (const note of result.notes) log(note);
     for (const warning of result.warnings) log(warning);

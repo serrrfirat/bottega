@@ -22,7 +22,12 @@ import {
   writeCodexAuthTokens,
 } from "./proxy-seed";
 import type { JsonValue } from "./manifest";
-import type { McpOAuthRefreshInput, McpOAuthRefreshProbe, VaultOAuthCredential } from "./proxy-seed";
+import type {
+  McpOAuthRefreshInput,
+  McpOAuthRefreshOutcome,
+  McpOAuthRefreshProbe,
+  VaultOAuthCredential,
+} from "./proxy-seed";
 
 const NO_VAULT = (): Promise<Map<string, string>> => Promise.resolve(new Map());
 const NO_KEYCHAIN = (): Promise<string | null> => Promise.resolve(null);
@@ -853,6 +858,48 @@ describe("MCP OAuth rotation persistence (issue #269)", () => {
     }
   });
 
+  test("a probe rejection after its timeout is observed: the blob stays unverified and no unhandled rejection escapes (issue #283)", async () => {
+    const s = tempSecretsDir();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const late = Promise.withResolvers<void>();
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        readOAuthRows: async (provider) =>
+          provider === "notion"
+            ? [{ id: 9, refresh: "notion-refresh-1", clientId: "cli_notion", clientSecret: "cs_notion" }]
+            : [],
+        log: SILENT,
+        refreshOAuthToken: async () => {
+          const probe = Promise.withResolvers<McpOAuthRefreshOutcome>();
+          // Real timer required: this contract is specifically that a platform
+          // promise rejects after the production timeout has already won.
+          setTimeout(() => {
+            probe.reject(new Error("late token endpoint failure"));
+            late.resolve();
+          }, 30);
+          return await probe.promise;
+        },
+        persistRotatedToken: async () => {},
+        probeTimeoutMs: 5,
+      });
+      await late.promise;
+      expect(unhandled).toEqual([]);
+      const blob = JSON.parse(
+        readFileSync(join(s.dir, proxyOAuthBlobFileName("notion")), "utf8"),
+      ) as { refresh_token: string; client_id: string; client_secret: string; verified_from?: string };
+      expect(blob).toEqual({ refresh_token: "notion-refresh-1", client_id: "cli_notion", client_secret: "cs_notion" });
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      s.cleanup();
+    }
+  });
+
   test("a dead holder's STALE lock is recovered: a seeder steals it, runs its critical section, and leaves no lock behind (proper-lockfile stale behavior) (issue #283 High)", async () => {
     // Correct cross-process lock ownership relies on the library's stale
     // mechanism, not our own nonce bookkeeping (AGENTS.md off-the-shelf
@@ -965,6 +1012,63 @@ describe("MCP OAuth rotation persistence (issue #269)", () => {
       };
       expect(blob.refresh_token).toBe("notion-refresh-2-rotated");
       expect(blob.verified_from).toBe("notion-refresh-1");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a hung vault write-back times out and releases the lock so a concurrent boot preserves the rotated grant (issue #283)", async () => {
+    const s = tempSecretsDir();
+    try {
+      const logs: string[] = [];
+      let aProbes = 0;
+      let bProbes = 0;
+      const endpoint = async (input: McpOAuthRefreshInput): Promise<McpOAuthRefreshOutcome> => {
+        if (input.refreshToken === "notion-refresh-1") {
+          aProbes += 1;
+          return {
+            minted: true,
+            accessToken: "access-a",
+            refreshToken: "notion-refresh-2-rotated",
+            expiresInMs: 3_600_000,
+          };
+        }
+        expect(input.refreshToken).toBe("notion-refresh-2-rotated");
+        bProbes += 1;
+        return {
+          minted: true,
+          accessToken: "access-b",
+          refreshToken: "notion-refresh-2-rotated",
+          expiresInMs: 3_600_000,
+        };
+      };
+      const seed = () =>
+        syncProxyCredentialsFromEnv({
+          env: {},
+          secretsDir: s.dir,
+          fetchVault: NO_VAULT,
+          readKeychain: NO_KEYCHAIN,
+          readOAuthRows: async (provider) =>
+            provider === "notion"
+              ? [{ id: 9, refresh: "notion-refresh-1", clientId: "cli_notion", clientSecret: "cs_notion" }]
+              : [],
+          log: (line) => logs.push(line),
+          refreshOAuthToken: endpoint,
+          persistRotatedToken: async () => await Promise.withResolvers<never>().promise,
+          probeTimeoutMs: 1_000,
+          persistTimeoutMs: 20,
+        });
+
+      await Promise.all([seed(), seed()]);
+
+      expect(aProbes).toBe(1);
+      expect(bProbes).toBe(1);
+      expect(logs.some((line) => line.includes("timed out after 20ms"))).toBe(true);
+      const blobPath = join(s.dir, proxyOAuthBlobFileName("notion"));
+      const blob = JSON.parse(readFileSync(blobPath, "utf8")) as { refresh_token: string; verified_from?: string };
+      expect(blob.refresh_token).toBe("notion-refresh-2-rotated");
+      expect(blob.verified_from).toBe("notion-refresh-1");
+      expect(existsSync(blobPath + ".lock")).toBe(false);
     } finally {
       s.cleanup();
     }
