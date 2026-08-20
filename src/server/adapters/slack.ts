@@ -99,8 +99,8 @@ export interface SlackAdapter {
     text: string,
     opts?: { threadTs?: string; blocks?: unknown[] },
   ): Promise<string | undefined>;
-  /** Replaces the text of an already-posted message (chat.update). */
-  updateMessage(spaceId: string, ts: string, text: string): Promise<void>;
+  /** Replaces the text of an already-posted message (chat.update); optional blocks mirror postMessage. */
+  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void>;
   /** Downloads a Slack file and returns its normalized metadata and bytes. */
   downloadFile(
     fileId: string,
@@ -447,14 +447,22 @@ export function buildPostMessageArgs(
 /**
  * Maps adapter arguments onto `chat.update` arguments. Pure so the
  * in-place edit rendering is testable without a live Slack connection. Text
- * is rendered to Slack mrkdwn (issue #84) before it leaves the adapter.
+ * is rendered to Slack mrkdwn (issue #84) before it leaves the adapter;
+ * optional blocks (issue #296, the DM status card) pass through like
+ * postMessage.
  */
 export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
   text: string,
+  opts?: { blocks?: unknown[] },
 ) {
-  return { channel: channelFromSpaceId(spaceId), ts, text: renderSlackText(text) };
+  return {
+    channel: channelFromSpaceId(spaceId),
+    ts,
+    text: renderSlackText(text),
+    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
+  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[] };
 }
 
 /**
@@ -1073,8 +1081,12 @@ export function createSlackAdapter(opts: {
       const res = await app.client.chat.postMessage(args);
       return res.ts;
     },
-    async updateMessage(spaceId, ts, text) {
-      await app.client.chat.update(buildUpdateMessageArgs(spaceId, ts, text));
+    async updateMessage(spaceId, ts, text, updateOpts) {
+      // Same SAFETY as postMessage: buildUpdateMessageArgs returns only chat.update
+      // fields the builder checked against its args contract; widening to the SDK
+      // args type only adds options this adapter leaves unset.
+      const args = buildUpdateMessageArgs(spaceId, ts, text, updateOpts) as Parameters<WebClient["chat"]["update"]>[0];
+      await app.client.chat.update(args);
     },
     async downloadFile(fileId) {
       let info: FilesInfoResponse;

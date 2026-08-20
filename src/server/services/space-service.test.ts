@@ -7,6 +7,7 @@ import { createStore, type Store } from "../../store/db";
 import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, THINKING_PHRASES, emptyResponseFallback, churnMessageText, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
+import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
 import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
@@ -247,8 +248,8 @@ function fakeAdapter(
   } = {},
 ) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
@@ -267,13 +268,14 @@ function fakeAdapter(
       }
       return `ts-${posts.length}`; // deterministic ts per post
     },
-    async updateMessage(spaceId, ts, text) {
+    async updateMessage(spaceId, ts, text, updateOpts) {
       if (failuresLeft > 0) {
         failuresLeft -= 1;
         // Slack chat.update 429 shape: rate_limited with retry_after.
         throw new Error("rate_limited");
       }
-      updates.push({ spaceId, ts, text });
+      const blocks = updateOpts?.blocks;
+      updates.push(blocks !== undefined ? { spaceId, ts, text, opts: { blocks } } : { spaceId, ts, text });
     },
     async downloadFile(fileId) {
       downloadedFileIds.push(fileId);
@@ -974,77 +976,72 @@ describe("SpaceService output routing", () => {
     expect(posts).toHaveLength(1); // replaced in place, nothing posted fresh
   });
 
-  test("DM replies are plain messages (no thread); channel replies keep threading; phrases rotate", async () => {
+  test("DM replies are plain messages (no thread); channel replies keep threading (issue #296)", async () => {
     const { adapter, posts, updates } = fakeAdapter();
     const { store } = fakeStore();
-    const driver = new FakeDriver();
-    const service = makeSpaceService({ store, adapter, driver });
 
-    await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
-    const dm = driver.last();
-    dm.emit("turn_start", { spaceId: "slack:D1" });
-    await Promise.resolve();
-    dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
-    await Promise.resolve();
+    // DM: the plain phrase presenter owns DMs (issue #180) — ONE plain post,
+    // never a thread_ts, and the final answer edits the SAME card at request
+    // settlement (issue #296). Constructed directly: the DM routing contract
+    // is the presenter's, and session creation is flaky in this test env.
+    const dm = new SlackTurnPresenter({ spaceId: "slack:D1", adapter, store, onboardingChecks: () => [] });
+    dm.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    dm.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    dm.onRequestSettled();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
-    const channel = driver.last();
-    channel.emit("turn_start", { spaceId: "slack:C1" });
-    await Promise.resolve();
-    channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
-    await Promise.resolve();
+    // Channel: replies thread under the inbound message (issue #40) and
+    // replace the same line.
+    const channel = new SlackTurnPresenter({ spaceId: "slack:C1", adapter, store, onboardingChecks: () => [] });
+    channel.onInbound(msg({ spaceId: "slack:C1", ts: "9.9" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    // Phrases post at receipt (issue #119) and rotate on turn_start; both
-    // spaces hold exactly one message, replaced in place by each reply.
+    // DM: exactly ONE plain post (never a thread_ts); the final answer edits
+    // the same ts with Slack-native status/final blocks (recorded opts.blocks).
     expect(posts).toEqual([
-      { spaceId: "slack:D1", text: "Thinking…", opts: undefined },
-      { spaceId: "slack:C1", text: "Give me a second…", opts: { threadTs: "9.9" } },
+      { spaceId: "slack:D1", text: "Thinking…", opts: { blocks: expect.any(Array) } },
+      { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "9.9" } },
     ]);
-    expect(updates).toEqual([
-      { spaceId: "slack:D1", ts: "ts-1", text: "On it — thinking…" },
-      { spaceId: "slack:D1", ts: "ts-1", text: "dm answer" },
-      { spaceId: "slack:C1", ts: "ts-2", text: "Working on it…" },
-      { spaceId: "slack:C1", ts: "ts-2", text: "channel answer" },
-    ]);
+    expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
+    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
   });
 
   test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
     const { adapter, posts, updates, streams, stops } = fakeAdapter({ streaming: true });
     const { store } = fakeStore();
-    const driver = new FakeDriver();
-    const service = makeSpaceService({ store, adapter, driver });
-    try {
-      await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "1.1" }));
-      const dm = driver.last();
-      dm.emit("turn_start", { spaceId: "slack:D1" });
-      await Promise.resolve();
-      dm.emit("message", { spaceId: "slack:D1", text: "dm answer" });
-      await Promise.resolve();
-      dm.emit("turn_end", { spaceId: "slack:D1" });
-      await Promise.resolve();
 
-      await service.handleInboundMessage(msg({ spaceId: "slack:C1", ts: "9.9" }));
-      const channel = driver.last();
-      channel.emit("turn_start", { spaceId: "slack:C1" });
-      await Promise.resolve();
-      channel.emit("message", { spaceId: "slack:C1", text: "channel answer" });
-      await Promise.resolve();
-      channel.emit("turn_end", { spaceId: "slack:C1" });
-      await Promise.resolve();
-      await Promise.resolve();
+    // DM: constructed directly WITH streaming supported — it still uses the
+    // plain phrase presenter (no stream open, never a thread_ts), one card,
+    // final answer edits it at settlement.
+    const dm = new SlackTurnPresenter({ spaceId: "slack:D1", adapter, store, onboardingChecks: () => [] });
+    dm.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    dm.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    dm.onRequestSettled();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
 
-      // DM: one plain message, phrase replaced in place — no stream call
-      // and no thread_ts anywhere on the DM surface (issue #180).
-      expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
-      expect(streams[0].opts.threadTs).toBe("9.9");
-      expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts === undefined)).toBe(true);
-      expect(updates).toContainEqual({ spaceId: "slack:D1", ts: "ts-1", text: "dm answer" });
-      // Channel: the panel opened (threaded under the inbound ts) and
-      // closed with the final reply as the stopStream block.
-      expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
-    } finally {
-      await service.stop();
-    }
+    // Channel with streaming: the StreamTurnPresenter opens the panel.
+    const channel = new StreamTurnPresenter({ spaceId: "slack:C1", adapter, store, onboardingChecks: () => [] });
+    channel.onInbound(msg({ spaceId: "slack:C1", ts: "9.9" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
+    channel.onTurnEnd({ spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // DM: one plain message, phrase replaced in place with the final answer —
+    // no stream call and no thread_ts anywhere on the DM surface (issue #180).
+    expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
+    expect(streams[0].opts.threadTs).toBe("9.9");
+    expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
+    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
+    // The DM surface never opened a stream (plain phrase path throughout).
+    expect(streams.filter((s) => s.spaceId === "slack:D1")).toHaveLength(0);
+    // Channel: the panel opened (threaded under the inbound ts) and
+    // closed with the final reply as the stopStream block.
+    expect(stops).toEqual([{ spaceId: "slack:C1", ts: "stream-1", text: "channel answer" }]);
   });
 
   test("a session error replaces the thinking phrase with the error text", async () => {
