@@ -17,6 +17,7 @@ import {
   createPhraseRotation,
   SlackTurnPresenter,
   StreamTurnPresenter,
+  type SearchResultRow,
   type ToolStepEvent,
   type TurnPresenterDeps,
 } from "./slack-turn-presenter";
@@ -33,7 +34,7 @@ export {
   emptyResponseFallback,
   churnMessageText,
 } from "./slack-turn-presenter";
-export type { ToolStepEvent, ToolStepSink } from "./slack-turn-presenter";
+export type { ToolStepEvent, ToolStepSink, SearchResultRow } from "./slack-turn-presenter";
 
 /** Digests kept per space; older ones are still in the transcript (issue #42). */
 export const DIGEST_CAP = 20;
@@ -362,6 +363,18 @@ export class SpaceService {
    */
   postChart(spaceId: string, block: unknown): void {
     this.#presenterFor(spaceId).postChartBlock(block);
+  }
+
+  /**
+   * Cited-search-result bridge (issue #278): the driver's withPolicyGate
+   * wrapper forwards a successful search_web call's parsed rows here; the
+   * space's presenter posts exactly ONE cited table to the turn's thread.
+   * Unknown spaces and headless calls are dropped — like a tool step, a
+   * search result can only follow an inbound message, so a presenter
+   * exists by then.
+   */
+  routeSearchResults(spaceId: string, results: readonly SearchResultRow[]): void {
+    this.#presenters.get(spaceId)?.presentSearchResults(results);
   }
 
   /**

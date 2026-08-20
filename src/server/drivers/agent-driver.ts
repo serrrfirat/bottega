@@ -44,7 +44,7 @@ import { loadSpacePolicy, resolveTier } from "../../policy/config";
 import { evaluatePolicyGate, summarizeArgs, type PolicyGateOutcome } from "../../policy/gate";
 import type { PolicyExtensionDeps } from "../../policy/extension";
 import type { Store } from "../../store/db";
-import { emitToolStep, nextToolStepId, toolStepTitle } from "../services/slack-turn-presenter";
+import { emitToolStep, nextToolStepId, toolStepTitle, parseSearchResultRows } from "../services/slack-turn-presenter";
 
 /**
  * Driver-level memory-context wiring (issue #42): org memories flagged
@@ -671,6 +671,21 @@ export function isBusySettlementError(err: Error): boolean {
 }
 
 /**
+ * Extracts the first text content item from a tool result (issue #278),
+ * for forwarding search_web's JSON payload to the presenter seam. The
+ * search tool's only text item carries the full `{query,count,results}`
+ * payload; concatenated text items are returned as one string so a
+ * multi-item result still parses. Unshaped results yield "".
+ */
+function searchTextFromResult(result: { content?: Array<{ type?: string; text?: string }> }): string {
+  if (!result || !Array.isArray(result.content)) return "";
+  return result.content
+    .filter((c) => c && c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("");
+}
+
+/**
  * Wraps a tool definition so every call crosses the shared policy gate
  * (issue #69): load the space's effective policy, decide (tier × action),
  * audit, and route ask-human through the approval router — then run the
@@ -794,6 +809,22 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
         // behavior). The pre-#224 run could not: no tool results/errors
         // were logged and the temp transcripts were deleted at cleanup.
         console.log(`[tool] ${def.name} → ok`);
+        // Cited-search dispatch (issue #278): a SUCCESSFUL search_web call
+        // forwards its parsed cited rows to the turn-presenter seam so the
+        // citations reach the human as a table. Fail closed: no sink, a
+        // non-search tool, an error result, or rows that fail to parse
+        // NEVER dispatch — a missing key already surfaced as the tool's own
+        // unavailable error, so nothing fabricated ever posts. All other
+        // generic tool-step behavior is untouched.
+        if (def.name === "search_web" && !result.isError) {
+          const onSearchResults = deps.onSearchResults;
+          if (onSearchResults) {
+            const text = searchTextFromResult(result);
+            const rows = parseSearchResultRows(text);
+            // Fail closed: a headless call (no space) never dispatches.
+            if (rows.length > 0 && spaceId !== undefined) onSearchResults(spaceId, rows);
+          }
+        }
         return result;
       } catch (err) {
         // A human-confirmed write that then FAILED (issue #277) is posted

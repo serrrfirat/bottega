@@ -35,6 +35,8 @@ import {
   spaceAgentToolNames,
   withPolicyGate,
 } from "./agent-driver";
+import { searchWebToolDefinition, SEARCH_PROVIDER } from "../../tools/search-web";
+import type { SearchResultRow } from "../services/slack-turn-presenter";
 
 /**
  * Session event shapes the driver consumes, as injected by the stub
@@ -2212,6 +2214,89 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
       const joined = steps.map((s) => s.output ?? "").join(" ");
       expect(joined).not.toContain("sk-ant-api03-0123456789abcdef");
       expect(joined).toContain("[REDACTED]");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// search_web cited-table dispatch (issue #278): a SUCCESSFUL search_web call
+// through the policy gate must hand its parsed cited rows to the
+// onSearchResults sink (the presenter's blocks seam) — the acceptance is
+// "the cited table reaches the human", not just JSON to the model. Fail
+// closed: a missing key or a non-search tool never dispatches.
+// ---------------------------------------------------------------------------
+
+describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
+  function searchToolHarness(opts: { sink?: (spaceId: string, results: readonly SearchResultRow[]) => void } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "search-dispatch-"));
+    const store = createStore(join(dir, "test.db"));
+    const audit = createAudit(store);
+    const orgPolicy = parseOrgConfigYaml("tools:\n  search_web: allow\n");
+    const secretDir = join(dir, "secrets");
+    mkdirSync(secretDir, { recursive: true });
+    writeFileSync(join(secretDir, `${SEARCH_PROVIDER}.secret`), "tvly-stub", { mode: 0o600 });
+    const calls: Array<{ spaceId: string; results: readonly SearchResultRow[] }> = [];
+    const sink = opts.sink ?? ((spaceId, results) => void calls.push({ spaceId, results }));
+    const server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        Response.json({
+          results: [
+            { title: "Bottega", url: "https://example.com/bottega", content: "The harness." },
+            { title: "Proxy", url: "https://example.com/proxy", snippet: "Keys ride a seam." },
+          ],
+        }),
+    });
+    const tool = withPolicyGate(
+      searchWebToolDefinition({ baseUrl: `http://127.0.0.1:${server.port}`, secretsDir: secretDir }),
+      {
+        orgPolicy,
+        audit,
+        router: DenyRouter,
+        store,
+        onSearchResults: sink,
+      },
+    );
+    const cleanup = () => {
+      server.stop(true);
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    };
+    // SAFETY: execute() reads only ctx.sessionManager.getSessionFile(); the
+    // stub provides exactly that and the rest is never touched.
+    const ctx = { sessionManager: { getSessionFile: () => join(dir, "sessions", "slack:C1.jsonl") } } as never;
+    return { tool, calls, ctx, cleanup, secretDir };
+  }
+
+  test("a successful search_web call dispatches its parsed cited rows to the sink", async () => {
+    const { tool, calls, ctx, cleanup } = searchToolHarness();
+    try {
+      const res = await tool.execute("c1", { query: "bottega" }, undefined, undefined, ctx);
+      expect(res.isError).toBeFalsy();
+      // The acceptance: the cited table actually reached the human, so the
+      // gate forwarded the rows (the presenter posts them as blocks).
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.spaceId).toBe("slack:C1");
+      expect(calls[0]!.results).toHaveLength(2);
+      expect(calls[0]!.results[0]!.url).toBe("https://example.com/bottega");
+      expect(calls[0]!.results[1]!.url).toBe("https://example.com/proxy");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an unseeded key fails closed AND never dispatches (fail closed end-to-end)", async () => {
+    const { tool, calls, ctx, cleanup, secretDir } = searchToolHarness();
+    try {
+      // Remove the seeded key: the tool must report unavailable and the
+      // sink must NOT fire (a fabricated/empty result must never post).
+      rmSync(join(secretDir, `${SEARCH_PROVIDER}.secret`));
+      const res = await tool.execute("c1", { query: "bottega" }, undefined, undefined, ctx);
+      expect(res.isError).toBe(true);
+      expect((res.content[0] as { text: string }).text).toContain("unavailable");
+      expect(calls).toHaveLength(0);
     } finally {
       cleanup();
     }
