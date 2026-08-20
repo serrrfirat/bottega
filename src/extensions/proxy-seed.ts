@@ -558,6 +558,19 @@ export interface ProxyCredentialSyncOpts {
   mintCodexRefreshToken?: CodexMintProbe;
   /** Proxy management API base + bearer (the reload half); default from env. */
   proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
+  /**
+   * Reload fetch seam (tests): performs the POST to the proxy management
+   * API. Default: the global `fetch`. Injected so a test can pin the reload
+   * outcome to its own stub regardless of whether another test file mutated
+   * the GLOBAL `fetch` (test isolation — issue #300): the reload must
+   * observe the injected outcome, never a cross-file substitution. Typed as
+   * fetch's CALLABLE signature (not `typeof fetch`, which carries the
+   * `preconnect` static a plain stub cannot satisfy).
+   */
+  fetchReload?: (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => Promise<Response>;
   /** Boot log sink; defaults to console.log. */
   log?: (line: string) => void;
 }
@@ -599,6 +612,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
   const fetchVault = opts.fetchVault ?? (() => fetchVaultApiKeysFromEnv(env));
   const readKeychain = opts.readKeychain ?? keychainReaderFromEnv(env);
   const control = opts.proxyControl ?? proxyBoundaryControlFromEnv(env);
+  const fetchReload = opts.fetchReload ?? fetch;
 
   const vault = await fetchVault();
 
@@ -661,7 +675,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
   }
   let res: Response;
   try {
-    res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
+    res = await fetchReload(`${control.proxyControlUrl}/v1/reload`, {
       method: "POST",
       headers: { Authorization: `Bearer ${control.proxyControlToken}` },
     });
