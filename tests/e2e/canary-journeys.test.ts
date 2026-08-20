@@ -21,7 +21,7 @@
  *     line shapes.
  */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PostedSlackMessage, SlackApiMessage } from "./slack-live";
@@ -73,7 +73,9 @@ import {
   CANARY_OAUTH_EXTENSION_ID,
   CANARY_ORG_CONFIG,
   canaryFixtureMcpTransport,
+  canaryFixturePinFetch,
   createCanaryRegistry,
+  FIXTURE_PIN_MCP_URL,
   defaultModelIdFor,
   defaultModelProviderFor,
   journeySemanticPickup,
@@ -935,7 +937,7 @@ describe("extension-pin journey mechanism (issue #195)", () => {
           vendor: "bottega-fixtures",
           kind: "mcp",
           domains: ["fixture-pin.example.com"],
-          mcp: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+          mcp: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
           credentialSchema: { type: "oauth", scopes: ["read"] },
           tools: [],
         },
@@ -950,11 +952,15 @@ describe("extension-pin journey mechanism (issue #195)", () => {
         catalogSnapshotsDir: snapshotsDir,
         devEgressConfigPath: devEgressPath,
         egressConfigPath: egressPath,
+        // Issue #291: the fixture endpoint is a placeholder domain — the
+        // #286 validation probe must see the injected SDK-valid verdict,
+        // not a real network attempt (which fails and refuses the pin).
+        catalog: { fetchImpl: canaryFixturePinFetch() },
       }).find((t) => t.name === "catalog_browser")!;
       const params = {
         action: "pin",
         spec,
-        binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+        binding: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
         credential_schema: { type: "api_key", domains: ["fixture-pin.example.com"] },
         vendor_official: true,
       } as const;
@@ -1024,7 +1030,7 @@ describe("extension-pin journey mechanism (issue #195)", () => {
           vendor: "bottega-fixtures",
           kind: "mcp",
           domains: ["fixture-pin.example.com"],
-          mcp: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+          mcp: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
           credentialSchema: { type: "oauth", scopes: ["read"] },
           tools: [],
         },
@@ -1039,6 +1045,10 @@ describe("extension-pin journey mechanism (issue #195)", () => {
         catalogSnapshotsDir: snapshotsDir,
         devEgressConfigPath: devEgressPath,
         egressConfigPath: egressPath,
+        // Issue #291: the fixture endpoint is a placeholder domain — the
+        // #286 validation probe must see the injected SDK-valid verdict,
+        // not a real network attempt (which fails and refuses the pin).
+        catalog: { fetchImpl: canaryFixturePinFetch() },
       }).find((t) => t.name === "catalog_browser")!;
       // The journey's pin params: OAuth credential schema (issue #195 —
       // hosted OAuth is the preferred binding; the api_key variant the
@@ -1047,7 +1057,7 @@ describe("extension-pin journey mechanism (issue #195)", () => {
       const params = {
         action: "pin",
         spec,
-        binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+        binding: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
         credential_schema: { type: "oauth", scopes: ["read"] },
         vendor_official: true,
       } as const;
@@ -1080,6 +1090,100 @@ describe("extension-pin journey mechanism (issue #195)", () => {
       expect(egress).not.toContain('token_endpoint: "https://fixture-pin.example.com/token"');
       expect(egress).toContain('- "fixture-pin.example.com"');
       expect(readFileSync(devEgressPath, "utf8")).not.toContain("- name: oauth_token");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("a rejected probe verdict refuses the pin — zero snapshot/egress/hot-register mutation (issue #291)", async () => {
+    // The #286 validation probe runs BEFORE the review gate: even with the
+    // human's confirm=true the pin must refuse when the injected endpoint
+    // fails validation (HTTP 404 here) — no snapshot, no egress regen, no
+    // hot-register, and an auditable pin_refused row. This pins the
+    // hermetic seam's invalid leg through the real catalog_browser tool
+    // (the admin-tool probe refusal is also covered in admin.test.ts).
+    const tempRoot = mkdtempSync(join(tmpdir(), "bottega-canary-pin-refused-"));
+    const draftsDir = join(tempRoot, "drafts");
+    const snapshotsDir = join(tempRoot, "snapshots");
+    const egressPath = join(tempRoot, "egress.yml");
+    const devEgressPath = join(tempRoot, "egress.dev.yml");
+    const spec = "fixture.pin";
+    const h = await bootHarness({ registry: createCanaryRegistry() });
+    try {
+      const dm = h.slack.dmChannelId;
+      const spaceId = `slack:${dm}`;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: dm });
+      const draft: SnapshotDraft = {
+        schema: SNAPSHOT_SCHEMA,
+        extensionId: spec,
+        pinnedAt: new Date().toISOString(),
+        source: { catalog: "canary://fixture", specId: spec, vendorOfficial: true, reviewed: false },
+        manifest: {
+          id: spec,
+          label: "Fixture Pin MCP",
+          vendor: "bottega-fixtures",
+          kind: "mcp",
+          domains: ["fixture-pin.example.com"],
+          mcp: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
+          credentialSchema: { type: "oauth", scopes: ["read"] },
+          tools: [],
+        },
+      };
+      mkdirSync(draftsDir, { recursive: true });
+      writeFileSync(join(draftsDir, `${spec}.draft.json`), JSON.stringify(draft, null, 2) + "\n");
+
+      const catalogBrowser = adminToolDefinitions(h.store, {
+        audit: h.audit,
+        registry: h.extensionRegistry,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        devEgressConfigPath: devEgressPath,
+        egressConfigPath: egressPath,
+        // The invalid leg: the fixture endpoint answers HTTP 404 — the
+        // real validator rejects the probe before the review gate.
+        catalog: { fetchImpl: canaryFixturePinFetch("invalid") },
+      }).find((t) => t.name === "catalog_browser")!;
+
+      // confirm=true is passed on purpose: the probe gate runs BEFORE the
+      // review gate, so even the human's confirmation cannot pin a
+      // rejected endpoint.
+      const refused = await catalogBrowser.execute(
+        "tc-refused",
+        {
+          action: "pin",
+          spec,
+          binding: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
+          credential_schema: { type: "oauth", scopes: ["read"] },
+          vendor_official: true,
+          confirm: true,
+        },
+        undefined,
+        undefined,
+        toolCtxFor(h, spaceId),
+      );
+      expect(refused.isError).toBe(true);
+      // The pin tool replies with a single text block whose text carries
+      // the refusal + probe evidence (the tool's own serialization); the
+      // guard narrows the SDK content union to the text member.
+      const refusedBlock = refused.content[0];
+      const text = refusedBlock !== undefined && refusedBlock.type === "text" ? refusedBlock.text : "";
+      expect(text).toContain("failed the MCP validation probe");
+      expect(text).toContain("HTTP 404");
+      expect(text).toContain("no snapshot was written and egress is unchanged");
+      // Fail closed: nothing persisted, no egress regen, no hot-register.
+      expect(existsSync(join(snapshotsDir, "fixture.pin.json"))).toBe(false);
+      expect(existsSync(egressPath)).toBe(false);
+      expect(existsSync(devEgressPath)).toBe(false);
+      expect(h.extensionRegistry.resolve(spec)).toBeUndefined();
+      // The refusal is auditable (action=pin_refused with the evidence).
+      const audit = await h.store.listAudit({ event_type: ADMIN_CATALOG_BROWSER_EVENT });
+      const refusedRow = audit.find((r) => {
+        // SAFETY: the admin audit payload carries the action + reason
+        // fields (the tool's own serialization); the filter reads only those.
+        const p = JSON.parse(r.payload) as { action?: unknown; reason?: unknown };
+        return p.action === "pin_refused" && p.reason === "mcp_validation_probe_failed";
+      });
+      expect(refusedRow).toBeDefined();
     } finally {
       await h.cleanup();
     }

@@ -49,7 +49,7 @@
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
@@ -316,6 +316,54 @@ export function canaryFixtureMcpTransport(_binding: McpBinding): Transport {
  */
 export function canaryFixtureBoundary(): CredentialBoundary {
   return createSecretFileBoundary({ resolveSecret: async () => "canary-fixture-secret" });
+}
+
+/**
+ * The #195 pin fixture's MCP endpoint. A placeholder domain (there is no
+ * real server): issue #286's endpoint probe would otherwise fail it as a
+ * network error before the review gate — the journey's pin is about the
+ * review → hot-register → egress-regen mechanics, not endpoint reality.
+ */
+export const FIXTURE_PIN_MCP_URL = "https://fixture-pin.example.com/mcp";
+
+/**
+ * The SDK-valid initialize result the hermetic probe serves: the exact
+ * accepted wire shape (the same body probeMcpEndpoint's own tests serve),
+ * parsed by the SDK's InitializeResultSchema — the real validator accepts
+ * it and the full pin flow runs deterministically.
+ */
+const FIXTURE_PIN_INITIALIZE_RESULT = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  result: {
+    protocolVersion: LATEST_PROTOCOL_VERSION,
+    capabilities: { tools: {} },
+    serverInfo: { name: "bottega-canary-fixture", version: "1.0.0" },
+  },
+});
+
+/**
+ * Hermetic endpoint-probe fetch for the #195 pin journeys (issue #291):
+ * the fixture's serverUrl is a placeholder domain that does not exist, so
+ * the #286 probe must see an injected SDK-valid verdict instead of a real
+ * network attempt. `"valid"` serves the accepted MCP initialize result
+ * (the journeys reach the review gate and the pinned assertions);
+ * `"invalid"` serves HTTP 404 so the refusal leg is exercised (nothing
+ * pins — no snapshot, no egress, no hot-register). Any request to any
+ * OTHER url 404s — fail closed. Inject via the catalog_browser tool's
+ * `catalog: { fetchImpl }` option.
+ */
+export function canaryFixturePinFetch(verdict: "valid" | "invalid" = "valid"): typeof fetch {
+  // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>.
+  return (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url !== FIXTURE_PIN_MCP_URL) return new Response("", { status: 404 });
+    if (verdict === "invalid") return new Response("", { status: 404 });
+    return new Response(FIXTURE_PIN_INITIALIZE_RESULT, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,7 +1781,7 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
         vendor: "bottega-fixtures",
         kind: "mcp",
         domains: ["fixture-pin.example.com"],
-        mcp: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+        mcp: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
         credentialSchema: { type: "oauth", scopes: ["read"] },
         tools: [],
       },
@@ -1748,12 +1796,16 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
       catalogSnapshotsDir: snapshotsDir,
       devEgressConfigPath: devEgressPath,
       egressConfigPath: egressPath,
+      // Issue #291: the fixture endpoint is a placeholder domain — the
+      // #286 validation probe must see the injected SDK-valid verdict, not
+      // a real network attempt (which would fail and refuse the pin).
+      catalog: { fetchImpl: canaryFixturePinFetch() },
     }).find((t) => t.name === "catalog_browser")!;
 
     const pinParams = {
       action: "pin",
       spec,
-      binding: { serverUrl: "https://fixture-pin.example.com/mcp", transport: "streamable-http" },
+      binding: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
       credential_schema: { type: "oauth", scopes: ["read"] },
       vendor_official: true,
     } as const;
