@@ -3,6 +3,7 @@ import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import type { WorkItemState } from "../store/db";
 import { sha256Hex } from "../tools/memory";
 import { errorMessage } from "../tools/helpers";
+import { tableBlock, type SlackBlock } from "../server/adapters/blocks";
 import { DIGEST_CAP } from "../server/services/space-service";
 import { proactiveEnabled } from "./proactive-config";
 import type { SchedulerAction } from "./types";
@@ -20,6 +21,26 @@ type DigestRow = {
 function itemLine(item: DigestRow): string {
   const pullRequest = item.pr_url ? ` — ${item.pr_url}` : "";
   return `- ${item.id} [${item.state}] ${item.description} (requester: ${item.requester})${pullRequest}`;
+}
+
+/**
+ * Issue #279: render one standup section as a Block Kit table (id | state |
+ * description | requester | PR). Returns undefined for an empty section so
+ * the post keeps a text-only fallback. The description and requester cells
+ * are stripped of pipe characters so a ragged column can never leak through.
+ */
+function digestTable(rows: DigestRow[]): SlackBlock[] | undefined {
+  if (rows.length === 0) return undefined;
+  return tableBlock({
+    headers: ["id", "state", "description", "requester", "pr"],
+    rows: rows.map((row) => [
+      row.id,
+      row.state,
+      row.description,
+      row.requester,
+      row.pr_url ?? "",
+    ]),
+  });
 }
 
 /** Daily behavior-derived standup digest for explicitly opted-in spaces (#92). */
@@ -71,7 +92,24 @@ export const standupDigestAction: SchedulerAction = {
       if (blocked.length > 0) sections.push("Blocked:\n" + blocked.map(itemLine).join("\n"));
       const digest = sections.join("\n\n");
 
-      await ctx.postMessage(spaceId, digest);
+      // Issue #279: render each non-empty section as a table card alongside
+      // the text (the text stays the fallback and the saved memory content).
+      const blocks: SlackBlock[] = [
+        { type: "section", text: { type: "mrkdwn", text: sections[0]! } },
+      ];
+      for (const [title, rows] of [
+        ["Finished yesterday", finished],
+        ["Still open", open],
+        ["Blocked", blocked],
+      ] as const) {
+        const label = title.toUpperCase();
+        const table = digestTable(rows);
+        if (table) {
+          blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${label}*` } }, ...table);
+        }
+      }
+
+      await ctx.postMessage(spaceId, digest, blocks.length > 0 ? { blocks } : undefined);
       const memory = await ctx.memoryProvider.save({
         scope: "org",
         content: digest,

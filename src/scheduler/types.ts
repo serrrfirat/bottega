@@ -65,8 +65,8 @@ export interface SchedulerActionContext {
   store: Store;
   audit: AuditModule;
   memoryProvider: MemoryProvider;
-  /** SlackAdapter.postMessage-compatible (spaceId, text) → message ts. */
-  postMessage: (spaceId: string, text: string) => Promise<string | undefined>;
+  /** SlackAdapter.postMessage-compatible (spaceId, text[, opts.blocks]) → message ts. */
+  postMessage: (spaceId: string, text: string, opts?: { blocks?: unknown[] }) => Promise<string | undefined>;
   /** Effective (org floor + space overlay) policy for a space. */
   loadPolicy: (spaceId: string) => Promise<PolicyConfig>;
   log: (line: string) => void;

@@ -67,7 +67,7 @@ function insertWorkItem(
 /** The context fixture: the scheduler action context plus posted messages. */
 interface StandupTestContext {
   ctx: SchedulerActionContext;
-  posted: Array<{ space: string; text: string }>;
+  posted: Array<{ space: string; text: string; blocks?: unknown[] }>;
 }
 
 function context(
@@ -77,15 +77,15 @@ function context(
     memoryProvider?: MemoryProvider;
   } = {},
 ): StandupTestContext {
-  const posted: Array<{ space: string; text: string }> = [];
+  const posted: Array<{ space: string; text: string; blocks?: unknown[] }> = [];
   return {
     posted,
     ctx: {
       store,
       audit: createAudit(store),
       memoryProvider: options.memoryProvider ?? createSqliteMemoryProvider(store.getDb()),
-      async postMessage(space, text) {
-        posted.push({ space, text });
+      async postMessage(space, text, opts) {
+        posted.push({ space, text, blocks: opts?.blocks });
         return "171.001";
       },
       async loadPolicy() {
@@ -212,6 +212,15 @@ describe("standupDigestAction (issue #92)", () => {
     expect(digest).toContain("wi_blocked");
     expect(digest).not.toContain("wi_done_today");
     expect(digest).not.toContain("wi_other");
+    // Issue #279: the same facts render as table cards alongside the text.
+    const blocks = posted[0].blocks as Array<{ text?: { text?: string } }>;
+    expect(blocks).toBeDefined();
+    const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
+    expect(tableText).toContain("wi_done_yesterday");
+    expect(tableText).toContain("Ship scheduler");
+    expect(tableText).toContain("wi_open");
+    expect(tableText).toContain("wi_blocked");
+    expect(tableText).not.toContain("wi_other");
 
     const memories = memoryRows(store);
     expect(memories).toHaveLength(20);
@@ -232,6 +241,34 @@ describe("standupDigestAction (issue #92)", () => {
       id: saved!.id,
       content_hash: sha256Hex(digest),
     });
+  });
+
+  test("caps the table renders at the row cap and notes the elided tail (issue #279)", async () => {
+    const store = freshStore();
+    const space = await createSpace(store, "CAP", JSON.stringify({ proactive: { standup: true } }));
+    // More open items than the table row cap (12) so the elided-tail note fires.
+    for (let i = 0; i < 20; i++) {
+      insertWorkItem(store, {
+        id: `wi_open_${i}`,
+        space,
+        state: "working",
+        description: `Open work ${i}`,
+        requester: "U_WORKER",
+        updatedAt: PREVIOUS_DAY_START - 60_000 + i,
+      });
+    }
+    const { ctx, posted } = context(store);
+
+    await standupDigestAction.run({ space }, ctx);
+
+    expect(posted).toHaveLength(1);
+    const blocks = posted[0].blocks as Array<{ text?: { text?: string } }>;
+    const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
+    expect(tableText).toContain("wi_open_0");
+    expect(tableText).toContain("wi_open_11");
+    // Tail is elided, not rendered row-by-row.
+    expect(tableText).not.toContain("wi_open_12");
+    expect(tableText).toContain("8 more not shown");
   });
 
   test("audits a failure and never throws past the runner", async () => {
