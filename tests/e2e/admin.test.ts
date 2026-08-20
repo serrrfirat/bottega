@@ -48,6 +48,16 @@ async function harness(turns: StubTurn[], orgConfigYaml: string): Promise<Harnes
           composePs: async () => ({ available: false }),
           httpGet: async (url) => ({ ok: true, evidence: `GET ${url} -> HTTP 200` }),
           tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+          // #282: the callback chain must stay hermetic too — the journey
+          // must not TCP-probe the host's BOTTEGA_CALLBACK_PORT nor GET the
+          // real data/public-base-url tunnel (both would leak the host's
+          // live callback infrastructure into the e2e run). Deterministic
+          // local-success evidence, matching the other probes above.
+          callbackListener: async (port) => ({
+            ok: true,
+            evidence: `callback listener on :${port} accepting`,
+          }),
+          publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 200` }),
         },
         // Hermetic catalog: the journey must not hit integrations.sh.
         catalog: {
