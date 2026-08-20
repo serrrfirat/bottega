@@ -210,6 +210,10 @@ export function renderOutboxBlocks(row: OutboxRow): SlackBlock[] | undefined {
     payload = null;
   }
   if (payload === null) return undefined;
+  // A whitespace-only description parses the schema but cannot fill the card
+  // title; drop to the text fallback rather than let issueCard throw (which
+  // postRow would misread as a Slack post failure and retry/terminal-fail).
+  if (payload.description.trim().length === 0) return undefined;
   return issueCard({
     title: payload.description,
     state: payload.state,

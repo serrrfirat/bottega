@@ -72,6 +72,16 @@ describe("tableBlock", () => {
     expect(text).toContain("5 more");
   });
 
+  test("renders a literal pipe in a cell as-is inside the code block (no visible backslash)", () => {
+    const blocks = tableBlock({
+      headers: ["id", "state"],
+      rows: [["wi|1", "blocked"]],
+    });
+    const text = allText(blocks);
+    expect(text).toContain("wi|1");
+    expect(text).not.toContain("wi\\|1");
+  });
+
   test("fails closed on ragged rows (column count mismatch)", () => {
     expect(() =>
       tableBlock({

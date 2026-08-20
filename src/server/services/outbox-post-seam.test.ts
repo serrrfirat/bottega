@@ -249,6 +249,30 @@ describe("postPendingOutboxRows", () => {
     expect(JSON.parse(posted[0]!.payload)).toEqual({ id: "wi_x:blocked", kind: "work_item", space: SPACE });
   });
 
+  test("a work_item row with an empty description posts the text fallback, never a render failure (issue #279)", async () => {
+    const store = freshStore();
+    const adapter = new FakeAdapter();
+    const t = clock();
+    // A whitespace-only description passes the notification schema but lacks
+    // the card title; the seam must post the plain-text line and mark the
+    // row posted — a card-render validation error is NOT a Slack post failure.
+    postOutboxRow(
+      store,
+      { id: "wi_blank", kind: "work_item", payload: { state: "blocked", workItemId: "wi_blank", description: "   " }, space: SPACE },
+      { now: t.now },
+    );
+
+    const result = await postPendingOutboxRows(store, adapter, { now: t.now });
+
+    expect(result.posted).toBe(1);
+    expect(adapter.posted).toHaveLength(1);
+    expect(adapter.posted[0]!.text).toBe("Blocked:    ");
+    expect(adapter.posted[0]!.blocks).toBeUndefined();
+    expect(outboxRow(store, "wi_blank")!.status).toBe("posted");
+    expect(await store.listAudit({ event_type: OUTBOX_FAILED_EVENT })).toHaveLength(0);
+    expect(await store.listAudit({ event_type: OUTBOX_POSTED_EVENT })).toHaveLength(1);
+  });
+
   test("a failing post audits outbox.failed and retries within bounds, then fails terminal", async () => {
     const store = freshStore();
     const adapter = new FakeAdapter();

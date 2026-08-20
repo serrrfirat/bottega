@@ -74,8 +74,9 @@ export function tableBlock(input: { headers: string[]; rows: string[][] }): Slac
       throw new Error(`tableBlock: row ${i} has ${input.rows[i]!.length} columns; expected ${input.headers.length}`);
     }
   }
-  const cell = (value: string): string => value.replaceAll("|", "\\|");
-  const line = (values: string[]): string => `| ${values.map(cell).join(" | ")} |`;
+  // Pipes render literally inside the fenced code block — no escaping needed
+  // (a `\|` would surface a visible backslash in Slack).
+  const line = (values: string[]): string => `| ${values.join(" | ")} |`;
   const header = line(input.headers);
   const rows = input.rows.slice(0, TABLE_ROW_CAP).map(line);
   const elided = input.rows.length - rows.length;
