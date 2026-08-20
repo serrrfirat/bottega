@@ -6,23 +6,19 @@
  *
  *   real:     SQLite store (temp file), policy (org floor + space overlay),
  *             audit trail, connect capability, extension runtime, policy
- *             gate, Slack-backed approval router, space-service
- *             connect-intent seam.
- *   emulated: auth broker (scripted RecordingBroker), extension MCP
- *             transport (in-memory stub), Slack message surface (recording
- *             adapter).
+ *             gate, Slack-backed approval router.
+ *   emulated: extension MCP transport (in-memory stub).
  *
  * The harness contract (tests/e2e/harness.ts, issue #66) is the same shape;
  * while it is not on main yet this file carries a minimal local fixture and
  * merges into the shared harness when it lands. The stub MCP transport is a
- * journey-local boundary by contract.
+ * journey-local boundary by contract. (The connect capability's own flows —
+ * personal/org, gate, catalog — are covered at the capability level in
+ * src/extensions/connect.test.ts; since #273 the connect-intent regex
+ * pre-route is gone, so there is no space-service seam to journey here.)
  *
  * Coverage:
- *   1. connect as me — user message → connect intent → connect_extension
- *      (personal) → broker seam → registry row + audit → reply posted;
- *   2. connect as org — approval required (real Slack buttons) → denied
- *      without approval (no broker call, no row, full gate audit trail);
- *   3. extension tool call — runtime through the stub MCP transport with
+ *   1. extension tool call — runtime through the stub MCP transport with
  *      the credential ladder (org / me / auto) and the policy gate
  *      (deny-before-tier: an extension outside the space allowlist denies
  *      before any credential resolution) + audit rows.
@@ -36,28 +32,19 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createAudit } from "../../src/policy/audit";
-import { DenyRouter, type ApprovalRouter } from "../../src/policy/approval-router";
-import { loadSpacePolicy, parseOrgConfigYaml, type PolicyConfig } from "../../src/policy/config";
+import { DenyRouter } from "../../src/policy/approval-router";
+import { parseOrgConfigYaml, type PolicyConfig } from "../../src/policy/config";
 import { createStore, type AuditRow, type ExtensionCredential, type Store } from "../../src/store/db";
 import {
-  APPROVAL_REQUESTED_EVENT,
-  APPROVAL_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
-  EXTENSION_CONNECTED_EVENT,
   EXTENSION_CREDENTIAL_RESOLVED_EVENT,
   POLICY_DECISION_EVENT,
 } from "../../src/store/audit-events";
-import { CONNECT_EXTENSION_TOOL, type BrokerConnectResult, type ConnectExtensionDeps } from "../../src/extensions/connect";
 import type { CallScope } from "../../src/extensions/credentials";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "../../src/extensions/fixture";
 import type { ExtensionManifest, JsonObject, McpBinding } from "../../src/extensions/manifest";
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "../../src/extensions/runtime";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
-import { SpaceService } from "../../src/server/services/space-service";
-import { THINKING_PHRASES } from "../../src/server/services/space-service";
-import type { AgentDriver, AgentSessionDriver } from "../../src/server/drivers/agent-driver";
-import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAdapter } from "../../src/server/adapters/slack";
-import { SlackApprovalRouter } from "../../src/server/adapters/approval-router";
 
 // ---------------------------------------------------------------------------
 // Local harness (mirrors the issue #66 contract until tests/e2e/harness.ts
@@ -82,24 +69,6 @@ function parse(row: AuditRow): JsonObject {
   // SAFETY: every audit payload is written via JSON.stringify as a JSON
   // object (the audit writers all serialize records).
   return JSON.parse(row.payload) as JsonObject;
-}
-
-// Polls a condition on real time because the awaited signals live on the
-// adapter wire (the approval router's posted message) — fake timers cannot
-// drive them.
-async function waitFor(fn: () => boolean, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      if (fn()) return;
-    } catch {
-      // e.g. the fake server's logfile does not exist yet
-    }
-    const { promise, resolve } = Promise.withResolvers<void>();
-    setTimeout(resolve, 20);
-    await promise;
-  }
-  throw new Error(`timed out after ${timeoutMs}ms waiting for condition`);
 }
 
 function seedOrgCredential(store: Store, provider = FIXTURE_EXTENSION_ID): Promise<ExtensionCredential> {
@@ -138,261 +107,6 @@ function secondManifest(): ExtensionManifest {
     ],
   };
 }
-
-/** Scripted auth-broker seam (the connect capability's vault boundary). */
-class RecordingBroker {
-  readonly calls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
-  constructor(private readonly result: BrokerConnectResult = { identityKey: null, brokerCredentialId: 9 }) {}
-  async connect(input: Parameters<ConnectExtensionDeps["broker"]>[0]): Promise<BrokerConnectResult> {
-    this.calls.push(input);
-    return this.result;
-  }
-}
-
-/** Slack message surface double: records posts/updates, resolves ts like the real adapter. */
-function recordingAdapter() {
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
-  const adapter: SlackAdapter = {
-    async postMessage(spaceId, text, opts) {
-      posts.push({ spaceId, text, opts });
-      return `ts-${posts.length}`;
-    },
-    async updateMessage(spaceId, ts, text) {
-      updates.push({ spaceId, ts, text });
-    },
-    async downloadFile() {
-      throw new Error("not used");
-    },
-    async uploadFile() {
-      return undefined;
-    },
-    async addReaction() {},
-    async removeReaction() {},
-    async startStream() {
-      throw new Error("not used");
-    },
-    async appendText() {},
-    async appendTask() {},
-    async stopStream() {},
-    // The Slack emulator has no chat.startStream/appendStream surface
-    // (issue #168), so `streamingSupported` is always false here: the
-    // phrase + in-place-edit fallback path is what these journeys exercise,
-    // exactly as a workspace without the Agents feature would behave.
-    streamingSupported: () => false,
-    async start() {},
-    async stop() {},
-  };
-  return { adapter, posts, updates };
-}
-
-/**
- * Agent driver double for the connect-intent journeys: connect intents are
- * agent-free (issue #61), so sessions never spawn; non-connect messages are
- * recorded to prove they stayed agent territory.
- */
-class RecordingDriver implements AgentDriver {
-  readonly prompts: Array<{ spaceId: string; text: string }> = [];
-  async createSession(opts: { spaceId: string; transcriptDir: string; onOutput: (spaceId: string, text: string) => void }): Promise<AgentSessionDriver> {
-    const spaceId = opts.spaceId;
-    const prompts = this.prompts;
-    return {
-      async prompt(text) {
-        prompts.push({ spaceId, text });
-      },
-      async abort() {},
-      isStreaming: () => false,
-      on: () => () => {},
-      async dispose() {},
-      getTodoPhases: () => [],
-    };
-  }
-}
-
-interface ConnectJourney {
-  service: SpaceService;
-  store: Store;
-  broker: RecordingBroker;
-  posts: ConnectJourneyPosts;
-  updates: ConnectJourneyUpdates;
-  driver: RecordingDriver;
-}
-
-type ConnectJourneyPosts = Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
-type ConnectJourneyUpdates = Array<{ spaceId: string; ts: string; text: string }>;
-
-function makeConnectJourney(opts: { policy?: PolicyConfig; router?: ApprovalRouter } = {}): ConnectJourney {
-  const store = freshStore();
-  const registry = createFixtureRegistry();
-  const { adapter, posts, updates } = recordingAdapter();
-  const broker = new RecordingBroker();
-  const router = opts.router ?? DenyRouter;
-  const orgPolicy = opts.policy ?? parseOrgConfigYaml(""); // fail-closed default: connect_extension denied
-  const driver = new RecordingDriver();
-  const service = new SpaceService({
-    store,
-    adapter,
-    driver,
-    audit: createAudit(store),
-    orgPolicy,
-    idleTimeoutMs: 60_000,
-    transcriptDir: join(dir, "sessions"),
-    connect: {
-      registry,
-      store,
-      audit: createAudit(store),
-      broker: broker.connect.bind(broker),
-      gate: {
-        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
-        router,
-      },
-    },
-  });
-  return { service, store, broker, posts, updates, driver };
-}
-
-// ---------------------------------------------------------------------------
-// 1. Connect as me / as org — the user journey over the real space-service
-//    connect-intent seam (issue #61) + real connect capability (issue #52).
-// ---------------------------------------------------------------------------
-
-describe("journey 3: connect as me / as org (space-service connect intent)", () => {
-  test("'connect fixture.weather' connects the sender's account: broker seam → registry row → audit → reply", async () => {
-    const h = makeConnectJourney();
-    await h.service.handleInboundMessage({
-      spaceId: "slack:C1",
-      principal: "UADA",
-      text: "connect fixture.weather",
-      ts: "1.1",
-    });
-
-    // The broker seam was invoked for the provider's credential type.
-    expect(h.broker.calls).toEqual([{ provider: FIXTURE_EXTENSION_ID, credentialType: "api_key" }]);
-    // A registry row exists: personal scope, owned by the sender, referencing
-    // the vault row the broker recorded (secrets never enter our store).
-    const rows = await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      provider: FIXTURE_EXTENSION_ID,
-      owner: "UADA",
-      scope: "personal",
-      broker_credential_id: 9,
-      identity_key: "api-key:UADA",
-    });
-    // Audit: extension.connected with the actor and the space.
-    const connected = await h.store.listAudit({ event_type: EXTENSION_CONNECTED_EVENT });
-    expect(connected).toHaveLength(1);
-    expect(connected[0]!.space_id).toBe("slack:C1");
-    expect(connected[0]!.actor).toBe("UADA");
-    expect(parse(connected[0]!)).toMatchObject({ extension: FIXTURE_EXTENSION_ID, scope: "personal", owner: "UADA" });
-    // The outcome was posted back into the space, threaded under the intent.
-    expect(h.posts).toEqual([
-      { spaceId: "slack:C1", text: "Fixture Weather connected as @UADA", opts: { threadTs: "1.1" } },
-    ]);
-  });
-
-  test("'connect fixture.weather as org' requires approval: buttons posted, deny click blocks the connect", async () => {
-    const { adapter, posts, updates } = recordingAdapter();
-    const router = new SlackApprovalRouter({ adapter, timeoutMs: 5_000 });
-    const h = makeConnectJourney({ policy: parseOrgConfigYaml("tools:\n  connect_extension: allow\n"), router });
-
-    const pending = h.service.handleInboundMessage({
-      spaceId: "slack:C1",
-      principal: "UADA",
-      text: "connect fixture.weather as org",
-      ts: "1.2",
-    });
-    await waitFor(() => posts.length === 1);
-    const prompt = posts[0]!;
-    expect(prompt).toMatchObject({
-      spaceId: "slack:C1",
-      // Issue #160: the prompt carries the payload (the connect args), not
-      // just the tool name — an informed approval decision.
-      text: 'Approval required for connect_extension — {"extension":"fixture.weather","scope":"org"}',
-    });
-    // The interactive prompt carries the approval blocks (the router posts
-    // to the channel, not threaded — the threaded reply comes with the
-    // outcome below).
-    // SAFETY: the router's approval prompt always carries an actions block
-    // with approve/deny buttons (the buttons assertions below depend on it),
-    // and the recorded posts surface is the router's own block payload.
-    const actions = (prompt.opts!.blocks as Array<{
-      type?: string;
-      elements?: Array<{ type: string; action_id: string; value: string }>;
-    }>).find((b) => b.type === "actions") as {
-      elements: Array<{ type: string; action_id: string; value: string }>;
-    };
-    const buttons = actions.elements;
-    expect(buttons.map((b) => b.action_id).sort()).toEqual([APPROVE_ACTION_ID, DENY_ACTION_ID]);
-    expect(buttons[0]!.value).toBe(buttons[1]!.value);
-
-    // A human denies via the button.
-    await router.handleAction({
-      actionId: DENY_ACTION_ID,
-      value: buttons[0]!.value,
-      spaceId: "slack:C1",
-      principal: "U_ADMIN",
-      messageTs: "ts-1",
-    });
-    await pending;
-
-    // Denied: the broker was never touched, no registry row, failure posted.
-    expect(h.broker.calls).toHaveLength(0);
-    expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
-    expect(h.posts.at(-1)!.text).toContain("approval denied");
-    // The prompt message was rewritten in place with the outcome.
-    expect(updates).toHaveLength(1);
-    expect(updates[0]).toMatchObject({ spaceId: "slack:C1", ts: "ts-1" });
-    // Full gate audit trail for the privileged connect.
-    const decisions = await h.store.listAudit({ event_type: POLICY_DECISION_EVENT });
-    expect(parse(decisions.at(-1)!)).toMatchObject({
-      tool: CONNECT_EXTENSION_TOOL,
-      tier: "exec",
-      decision: "ask-human",
-    });
-    const requested = await h.store.listAudit({ event_type: APPROVAL_REQUESTED_EVENT });
-    expect(parse(requested.at(-1)!)).toMatchObject({ tool: CONNECT_EXTENSION_TOOL });
-    const resolved = await h.store.listAudit({ event_type: APPROVAL_RESOLVED_EVENT });
-    expect(parse(resolved.at(-1)!)).toMatchObject({
-      tool: CONNECT_EXTENSION_TOOL,
-      approved: false,
-      approver: "U_ADMIN",
-    });
-  });
-
-  test("'connect X as org' without an approval channel denies (DenyRouter)", async () => {
-    const h = makeConnectJourney({ policy: parseOrgConfigYaml("tools:\n  connect_extension: allow\n") });
-    await h.service.handleInboundMessage({
-      spaceId: "slack:C1",
-      principal: "UADA",
-      text: "connect fixture.weather as org",
-      ts: "1.3",
-    });
-    expect(h.broker.calls).toHaveLength(0);
-    expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
-    expect(h.posts.at(-1)!.text).toContain("approval denied");
-    expect(await h.store.listAudit({ event_type: APPROVAL_RESOLVED_EVENT })).toHaveLength(1);
-  });
-
-  test("natural-language mentions of connect stay agent territory (narrow seam)", async () => {
-    const h = makeConnectJourney();
-    await h.service.handleInboundMessage({
-      spaceId: "slack:C1",
-      principal: "UADA",
-      text: "can you connect github please",
-      ts: "1.4",
-    });
-    // The seam is narrow: the message went to the agent (recorded by the
-    // driver double) and the connect capability was never touched. The
-    // receipt phrase (issue #119) is the ONLY post — a status phrase, not
-    // a connect action.
-    expect(h.driver.prompts).toEqual([{ spaceId: "slack:C1", text: "can you connect github please" }]);
-    expect(h.broker.calls).toHaveLength(0);
-    expect(await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID)).toHaveLength(0);
-    expect(h.posts).toHaveLength(1);
-    expect(THINKING_PHRASES).toContain(h.posts[0]!.text);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // 2. Extension tool call through the real runtime (issue #53) with the stub

@@ -802,12 +802,12 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
 });
 
 describe("connectExtension api_key no-key redirect (issue #247)", () => {
-  // Chat/intent connects never carry an api_key (parseConnectIntent has no
-  // key capture and the paste guard refuses pasted keys), so an api_key
-  // connect with `apiKey` omitted must NEVER fall into the broker's bare
-  // "needs its API key" throw: an existing personal/org credential means
-  // the provider is ALREADY connected, and otherwise the honest next step
-  // is the #196 one-time upload link.
+  // Chat connects never carry an api_key (the removed #61 connect-intent
+  // regex pre-route captured none, and the paste guard refuses pasted
+  // keys), so an api_key connect with `apiKey` omitted must NEVER fall
+  // into the broker's bare "needs its API key" throw: an existing
+  // personal/org credential means the provider is ALREADY connected, and
+  // otherwise the honest next step is the #196 one-time upload link.
 
   test("A: personal, existing credential → already connected (replace pointer), never 'needs its API key'", async () => {
     const h = makeDeps();

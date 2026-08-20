@@ -554,11 +554,6 @@ export class SlackTurnPresenter {
     return this.lastInboundTs;
   }
 
-  /** Connect-intent path (issue #61): record the inbound ts for threading only — no phrase/reaction/audit. */
-  onConnectIntent(msg: SlackMessage): void {
-    this.lastInboundTs = msg.ts;
-  }
-
   /** turn_start: rotate the phrase in place (or, streaming, keep the stream opening). */
   onTurnStart(): void {
     this.#postThinkingPhrase();

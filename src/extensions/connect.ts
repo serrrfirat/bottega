@@ -197,25 +197,12 @@ export async function connectExtension(
      * from the one-time upload POST (src/extensions/upload-link.ts) — the
      * secret went straight from the user's browser into this call, never
      * through chat or a transcript, and the single-use token consumption
-     * IS the authorization. Every other surface (chat tool, MCP, Slack
-     * connect intent) omits this, so the paste guard stays on by default:
-     * a credential-shaped api_key is refused fail-closed unless this exact
-     * browser seam opted in.
+     * IS the authorization. Every other surface (chat tool, MCP) omits
+     * this, so the paste guard stays on by default: a credential-shaped
+     * api_key is refused fail-closed unless this exact browser seam opted
+     * in.
      */
     fromUpload?: boolean;
-    /**
-     * Slack connect-intent seam (issue #66/#255): true ONLY when the
-     * connect is driven by the space-service connect intent (a chat
-     * "connect <ext>" message). The hermetic seam contract pins that the
-     * intent INVOKES the broker seam (issue #66 journey 3); #247's
-     * redirect-before-broker shortcut exists for the tool/direct surfaces
-     * that never carry a key, and the intent seam skips it — the broker is
-     * the oracle there (issue #255). Every tool/MCP/direct caller omits
-     * this, so #247's no-key redirect is unchanged for those surfaces. The
-     * paste guard above still applies: an intent connect never carries an
-     * api_key, so no value can leak into a transcript on this path.
-     */
-    fromIntent?: boolean;
   },
   deps: ConnectExtensionDeps,
 ): Promise<ConnectOutcome> {
@@ -226,8 +213,8 @@ export async function connectExtension(
   // The safe path is the one-time upload link: the secret goes straight
   // from the user's browser into the vault. Issue #222: the upload POST is
   // that exact path — its api_key arrives via `fromUpload` (see the flag's
-  // doc) and skips the guard; every chat/MCP/intent caller omits the flag,
-  // so the guard is unchanged there.
+  // doc) and skips the guard; every chat/MCP caller omits the flag, so the
+  // guard is unchanged there.
   if (input.apiKey !== undefined && !input.fromUpload && looksLikeObviousSecret(input.apiKey)) {
     return { ok: false, message: SECRET_PASTE_REDIRECT };
   }
@@ -307,15 +294,13 @@ export async function connectExtension(
           "restart the server and retry the connect.",
       };
     }
-    // api_key extensions need the key to connect; the chat/intent path has
-    // none (and pasting one is refused), so after the registration the
-    // honest next step is the #196 one-time upload link — never a silent
-    // stall.
+    // api_key extensions need the key to connect; the chat path has none
+    // (and pasting one is refused), so after the registration the honest
+    // next step is the #196 one-time upload link — never a silent stall.
     if (
       resolved.manifest.credentialSchema.type === "api_key" &&
       input.apiKey === undefined &&
-      !input.fromUpload &&
-      !input.fromIntent
+      !input.fromUpload
     ) {
       return {
         ok: false,
@@ -349,24 +334,20 @@ export async function connectExtension(
   // connect reconciles the proxy plane with zero composition-root wiring.
   const reconcileEgress = deps.reconcileEgress ?? createReconcileEgress({ store: deps.store });
 
-  // Issue #247: a chat/intent api_key connect carries no key (the intent
-  // regex captures none, and the paste guard above refuses pasted keys),
-  // so BEFORE the broker — whose only answer is the bare "needs its API
-  // key" throw with no way forward — resolve what the user actually can
-  // do. The org-scope policy gate above already ran (a denied org connect
+  // Issue #247: a chat api_key connect carries no key (the intent regex is
+  // gone since #273 — every connect arrives through the agent tool, which
+  // captures no key — and the paste guard above refuses pasted keys), so
+  // BEFORE the broker — whose only answer is the bare "needs its API key"
+  // throw with no way forward — resolve what the user actually can do.
+  // The org-scope policy gate above already ran (a denied org connect
   // never reaches here); OAuth/upload connects skip this block by
   // construction. An existing personal/org credential row means the
   // provider is ALREADY connected — the honest reply names the replace
   // path — and otherwise the #196 one-time upload link is the next step.
-  // The Slack connect-intent seam (input.fromIntent, issue #66/#255) skips
-  // this shortcut: the hermetic seam contract pins that the intent reaches
-  // the broker, which is the real oracle there (see the broker catch
-  // below for the key-required redirect).
   if (
     manifest.credentialSchema.type === "api_key" &&
     input.apiKey === undefined &&
-    !input.fromUpload &&
-    !input.fromIntent
+    !input.fromUpload
   ) {
     let existing: ExtensionCredential[];
     try {
@@ -459,40 +440,6 @@ export async function connectExtension(
   try {
     brokerResult = await deps.broker({ provider, credentialType: manifest.credentialSchema.type, apiKey: input.apiKey });
   } catch (err) {
-    // Issue #255: the connect-intent seam reaches the broker even key-less
-    // (issue #66 pins the seam invokes the broker; the hermetic broker
-    // accepts a key-less connect and the connect proceeds). A REAL broker
-    // refuses with "needs its API key" — do not echo that bare throw to
-    // chat: the honest #196 one-time upload link (or the replace path when
-    // already connected) is the next step, exactly as #247 established for
-    // the tool/direct surfaces that skip straight here.
-    if (
-      input.fromIntent &&
-      manifest.credentialSchema.type === "api_key" &&
-      input.apiKey === undefined &&
-      errorMessage(err).includes("needs its API key")
-    ) {
-      let existing: ExtensionCredential[];
-      try {
-        existing = await deps.store.listExtensionCredentials(provider);
-      } catch {
-        existing = [];
-      }
-      const target = existing.find((row) =>
-        input.scope === "personal"
-          ? row.scope === "personal" && row.owner === input.actor
-          : row.scope === "org",
-      );
-      const who = input.scope === "org" ? "as an organization" : `for @${input.actor}`;
-      const replacePath =
-        "use connect_upload_link for a one-time browser upload, or re-run connect with the key — never paste a live key in chat";
-      return {
-        ok: false,
-        message: target
-          ? `${label} is already connected ${who} — to replace the key, ${replacePath}.`
-          : `connect ${label} now: ${replacePath}.`,
-      };
-    }
     return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
   }
 

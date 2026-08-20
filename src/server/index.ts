@@ -723,30 +723,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     digestPrune: (spaceId, keep) => {
       pruneDigestMemories(store.getDb(), spaceId, keep);
     },
-    // Connect intent seam (issue #61): `connect X` / `connect X as org|me`
-    // messages route straight to the connect capability — no agent tool
-    // call. Org connects gate through the same Slack approval router as
-    // every exec-tier tool call; personal connects run for the sender.
-    connect: {
-      registry: extensionRegistry,
-      store,
-      audit,
-      broker: connectViaAuthBroker,
-      // Issue #198: hosted OAuth MCPs (Notion, GitHub, Linear) connect
-      // through the generic MCP OAuth flow — no broker provider
-      // registration; the broker stays a vault.
-      mcpOAuth: mcpOAuthConnector,
-      // Issue #232/#233: "connect X" for an UNREGISTERED extension drives
-      // the deterministic catalog flow (lookup → draft → register at
-      // runtime + egress regen + hot-register) and continues the connect
-      // in the same turn — the model is never the driver.
-      catalogRegister: catalogRegisterDeps,
-      gate: {
-        loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
-        router: approvalRouter,
-        timeoutMs: orgPolicy.timeoutMinutes * 60_000,
-      },
-    },
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
   });

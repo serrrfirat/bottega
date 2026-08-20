@@ -9,7 +9,6 @@ import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
 import { resolveSpaceSkills } from "../skills";
-import { connectExtension, type ConnectExtensionDeps, type ConnectScope } from "../../extensions/connect";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
@@ -75,14 +74,6 @@ export interface SpaceServiceDeps {
    */
   responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   /**
-   * Connect capability (issue #61): when wired, inbound messages matching
-   * the narrow connect patterns ({@link parseConnectIntent}) route directly
-   * to the connect capability — no agent tool call, no session. Works
-   * identically for OMP and any future surface; humans never depend on the
-   * agent having the tool. Everything else stays agent territory.
-   */
-  connect?: ConnectExtensionDeps;
-  /**
    * Live-session registry (issue #64): each created session is registered
    * under its space id and removed on dispose, so the `use_model` tool can
    * reach the session's setModelRole hook. Absent → no registration.
@@ -106,37 +97,6 @@ export interface SpaceServiceDeps {
    * model seam) — ambiguous input ALWAYS queues (fail-safe).
    */
   classifier?: CorrectionClassifier;
-}
-
-/** A connect-intent message parsed by {@link parseConnectIntent}. */
-export interface ConnectIntent {
-  extension: string;
-  scope: ConnectScope;
-}
-
-/**
- * Parses a Slack message into a connect intent (issue #61). Narrow, exact
- * shapes only — everything else is natural-language agent territory:
- *
- *   `connect <extension>`         → scope "personal" (the sender's account)
- *   `connect my <extension>`      → scope "personal" (issue #233: the
- *                                   natural phrasing "connect my docs"
- *                                   routes to the docs tool; the token
- *                                   resolves semantically by name/alias in
- *                                   the catalog lookup)
- *   `connect <extension> as org`  → scope "org" (privileged: policy gate +
- *                                   approval via the space's router)
- *   `connect <extension> as me`   → scope "personal"
- *
- * Matching is case-insensitive over the whole trimmed phrase; the
- * extension token is a registry-style id (`[A-Za-z0-9._-]`). Any
- * deviation — extra words, punctuation, `connect X Y`, api keys — returns
- * null and stays with the agent.
- */
-export function parseConnectIntent(text: string): ConnectIntent | null {
-  const match = /^connect\s+(?:my\s+)?([A-Za-z0-9._-]+)(?:\s+as\s+(org|me))?$/i.exec(text.trim());
-  if (!match) return null;
-  return { extension: match[1]!, scope: match[2]?.toLowerCase() === "org" ? "org" : "personal" };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +258,6 @@ export class SpaceService {
   readonly #digestPrune: ((spaceId: string, keep: number) => Promise<void> | void) | undefined;
   readonly #digestTimeoutMs: number;
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
-  readonly #connect: ConnectExtensionDeps | undefined;
   readonly #modelRoles: SessionModelRoleRegistry | undefined;
   readonly #learning: LearningService | undefined;
   readonly #onboardingChecks: () => WizardCheck[];
@@ -340,7 +299,6 @@ export class SpaceService {
     this.#digestPrune = deps.digestPrune;
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
-    this.#connect = deps.connect;
     this.#modelRoles = deps.modelRoles;
     this.#learning = deps.learning;
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
@@ -435,20 +393,6 @@ export class SpaceService {
       // no-reply stall to a stage — dropped before the service, stalled in
       // the session, or lost in delivery.
       console.log(`[space-service] inbound ${msg.spaceId} ${msg.ts}`);
-      // Connect intent seam (issue #61): exact `connect X` / `connect X as
-      // org|me` shapes route straight to the connect capability — no agent
-      // tool call, no session cold-start. Non-matching messages (anything
-      // with extra words, punctuation, or keys) stay agent territory. The
-      // connect path answers immediately (no cold start), so it gets no
-      // phrase, no receipt reaction, and no message.in row (issue #119).
-      const connect = this.#connect;
-      if (connect) {
-        const intent = parseConnectIntent(msg.text);
-        if (intent) {
-          await this.#handleConnectIntent(msg, intent, connect);
-          return;
-        }
-      }
       // Session mid-dispose: drop BEFORE any receipt activity. The message
       // will never be answered, so it gets no phrase and no reaction — a
       // receipt claim ("working on it") must not outlive a message that is
@@ -585,31 +529,6 @@ export class SpaceService {
     await Promise.all(live.map((entry) => this.#disposeSession(entry.spaceId)));
     await this.#learning?.drain();
     this.#learning?.close();
-  }
-
-  /**
-   * Runs a parsed connect intent against the connect capability and posts
-   * the outcome to the space (threaded under the intent message, like a
-   * normal reply). Personal connects run for the sender with no gate; org
-   * connects cross the capability's policy gate (Slack approval router).
-   * Failures inside connectExtension are outcomes — posted, never thrown.
-   */
-  async #handleConnectIntent(msg: SlackMessage, intent: ConnectIntent, deps: ConnectExtensionDeps): Promise<void> {
-    this.#presenterFor(msg.spaceId).onConnectIntent(msg);
-    const outcome = await connectExtension(
-      {
-        extension: intent.extension,
-        scope: intent.scope,
-        actor: msg.principal,
-        spaceId: msg.spaceId,
-        // Issue #255: the connect-intent seam reaches the broker seam (the
-        // issue #66 hermetic contract); the tool/direct surfaces keep #247's
-        // key-less redirect instead.
-        fromIntent: true,
-      },
-      deps,
-    );
-    await this.#adapter.postMessage(msg.spaceId, outcome.message, this.#presenterFor(msg.spaceId).replyOpts());
   }
 
   /** Returns null when the space's session is mid-dispose (message must be dropped). */

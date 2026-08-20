@@ -946,7 +946,6 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     transcriptDir,
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
-    ...(connectDeps !== undefined ? { connect: connectDeps } : undefined),
   });
 
   // --- inbound Bolt app (the #29 seam) ----------------------------------------

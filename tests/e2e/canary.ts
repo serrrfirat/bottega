@@ -9,7 +9,10 @@
  * mode: the deployment model catalog config/omp/models.yml, keys from
  * env/Keychain) and drives product journeys AS the QA user over the real
  * API: chat replies, memory save/search, work-item creation (always-
- * approve), the connect intent seam, the scheduled standup digest (issue
+ * approve), connect-shaped messages reaching the agent (issue #273 — the
+ * #61 regex pre-route is gone; the agent drives connect via the
+ * connect_extension tool, whose mint the mcp-oauth journey proves), the
+ * scheduled standup digest (issue
  * #175 — a real scheduler run posts it; the journey that would have caught
  * #150), the fixture extension tool call through the real extension
  * runtime (policy gate → credential ladder → boundary → MCP → audit), and
@@ -68,6 +71,7 @@ import {
   DELIVERY_RESOLVED_EVENT,
   EXTENSION_CALL_EVENT,
   EXTENSION_CONNECTED_EVENT,
+  MESSAGE_RECEIVED_EVENT,
   MODEL_SETTINGS_CHANGED_EVENT,
   MODEL_SWITCHED_EVENT,
   WORK_ITEM_CREATED_EVENT,
@@ -898,23 +902,45 @@ async function journeyWorkItem(h: Harness, channelId: string, runId: string): Pr
 
 async function journeyConnect(h: Harness, channelId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
   try {
-    // The connect intent seam (issue #61) routes `connect <extension>`
-    // straight to the capability — no model turn. The shape must be EXACT
-    // (parseConnectIntent rejects extra words), and the outcome is posted
-    // back regardless of broker/key state; a reply IS the surface working.
-    const { reply } = await postAndWait(h, channelId, "connect github", {
-      label: "connect intent",
+    // Issue #273: the system-level connect-intent regex pre-route (#61) is
+    // GONE — a connect-shaped message ("connect my X") must reach the AGENT
+    // turn, never a silent short-circuit. The agent owns the connect flow
+    // via the connect_extension tool (the per-session tool path, issue
+    // #52); the mcp-oauth journey below proves that tool call's mint
+    // end-to-end. The deterministic proof here: the message.in audit row
+    // for the inbound message — the session path (and ONLY the session
+    // path) writes it at receipt, the old seam never did — plus the agent
+    // replied. A direct connect outcome would have written an
+    // extension.connected row instead.
+    const beforeConnected = (await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT })).length;
+    const { inboundTs, reply } = await postAndWait(h, channelId, "connect my notion", {
+      label: "connect-shaped message",
     });
     const permalink = await live.permalink(channelId, reply.ts);
+    await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: MESSAGE_RECEIVED_EVENT });
+        return rows.some((r) => (JSON.parse(r.payload) as { ts?: string }).ts === inboundTs) ? rows : undefined;
+      },
+      STORE_TIMEOUT_MS,
+      "a message.in audit row for the connect-shaped message",
+    );
+    const connected = await h.store.listAudit({ space: spaceId, event_type: EXTENSION_CONNECTED_EVENT });
+    if (connected.length > beforeConnected) {
+      throw new Error("the space service short-circuited the connect directly (extension.connected without an agent turn)");
+    }
     return {
-      name: "connect-intent",
+      name: "connect-reaches-agent",
       status: "pass",
-      details: [`intent routed to the connect capability; outcome: "${snippet(reply.text)}"`],
+      details: [
+        `"connect my notion" reached the agent turn (message.in row present) and the agent replied: "${snippet(reply.text)}"`,
+      ],
       permalink,
     };
   } catch (err) {
-    return { name: "connect-intent", status: "fail", details: [errorMessage(err)] };
+    return { name: "connect-reaches-agent", status: "fail", details: [errorMessage(err)] };
   }
 }
 
@@ -1798,9 +1824,11 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
  * one-time-link posture — the token never touches chat). The browser leg
  * (the vendor's authorization server + the SDK's PKCE exchange + the
  * callback endpoint) is SKIP-GATED with evidence: it needs a real browser.
- * The mint → URL-shown leg runs live through the connect capability; the
- * callback's first gate (single-use state, fail closed) is proven
- * hermetically by consuming the flow token twice.
+ * The mint → URL-shown leg runs live: since #273 the message reaches the
+ * AGENT, whose connect_extension tool call (the per-session tool path,
+ * issue #52) drives the capability — the mint row is the deterministic
+ * proof the tool ran. The callback's first gate (single-use state, fail
+ * closed) is proven hermetically by consuming the flow token twice.
  */
 async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
