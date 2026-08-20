@@ -328,6 +328,26 @@ const ORG_CONFIG = [
   "",
 ].join("\n");
 
+/**
+ * Test-level deadline for the full journey-2 loop (issue #300). This test
+ * boots a real HTTP GitHub emulator, a real OMP agent session, and the real
+ * executor doing real git clone/branch/commit/push, then synchronizes
+ * several live loops (executor poll 10ms, delivery poller 20ms) on the real
+ * clock — measured at 4.4–5.2s alone, and past 5s under the full serial
+ * coverage suite. Bun's implicit default test deadline (5s) therefore kills
+ * a completing journey, so it must be declared explicitly.
+ *
+ * 30s is the file's own longest sync bound (waitForState / findOpenItem
+ * already wait up to 30s for the same journey's real transitions). It does
+ * NOT mask a hang: every internal wait has a tighter bounded deadline that
+ * throws on genuine failure (findOpenItem/waitForState 30s, waitForMessage
+ * 20s, waitForDeliveryRequested 10s, modelStub.waitForRequests 20s), so a
+ * stuck loop fails via those long before this outer deadline; this deadline
+ * only guards the legitimate SUM of those waits plus instrumented git work,
+ * which measured ~5s (max observed 5.2s alone, >5s in the full-suite gate).
+ */
+const JOURNEY2_TIMEOUT_MS = 30_000;
+
 describe("journey 2: work items + approvals + executor", () => {
   test("DM with a GitHub issue URL → item → PR → delivery announcement → approve click → done", async () => {
     const gh = bootGithub();
@@ -486,7 +506,7 @@ describe("journey 2: work items + approvals + executor", () => {
       gh.cleanup();
       restoreEnv();
     }
-  });
+  }, JOURNEY2_TIMEOUT_MS);
 
   test("#47 conversation-derived repo: the model derives repo from the message", async () => {
     const turns: StubTurn[] = [

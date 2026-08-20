@@ -5,9 +5,22 @@
  * the parser/evaluator contract of scripts/check-coverage.ts — same units on
  * both sides, fail-closed parsing, and a failing test run fails the gate.
  * They never spawn the suite: only the pure parser/evaluator is exercised.
+ *
+ * Also pins the failing-suite diagnostics (issue #300): the coverage wrapper
+ * must surface bounded, secret-scrubbed failing-test snippets (test name +
+ * assertion/timeout) rather than swallowing the child output — so a red run
+ * is diagnosable from CI output alone.
  */
 import { describe, expect, test } from "bun:test";
-import { FLOOR, decideGate, meetsFloor, parseAllFilesRow } from "./check-coverage";
+import {
+  FLOOR,
+  MAX_FAILURES,
+  decideGate,
+  meetsFloor,
+  parseAllFilesRow,
+  scrubSecrets,
+  summarizeSuiteFailure,
+} from "./check-coverage";
 
 /** A realistic `bun test --coverage` table, with the given percentages. */
 function bunReport(lines: number, functions: number): string {
@@ -70,5 +83,106 @@ describe("meetsFloor / decideGate (issue #290)", () => {
     const result = decideGate("some output without a coverage table", 0);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/All files/);
+  });
+});
+
+// --- Failing-suite diagnostics (issue #300) ---------------------------------
+// The coverage wrapper used to swallow ALL child output and print only "the
+// suite itself failed", leaving a red run undiagnosable from CI alone. These
+// tests pin the bounded, scrubbed failing-test diagnostics a failing suite
+// now carries.
+
+/** The exact failure shape seen in CI for issue #300 (a 5s-default timeout). */
+function timeoutReport(): string {
+  return [
+    "bun test v1.3.14 (0d9b296a) 1x PARALLEL",
+    "--------------------------|---------|---------|",
+    "File                      | % Funcs | % Lines |",
+    "--------------------------|---------|---------|",
+    "All files                 |   91.20 |   90.15 |",
+    "(fail) journey 2: work items + approvals + executor > DM with a GitHub issue URL [5000.97ms]",
+    "this test timed out after 5000ms.",
+    " 1 pass",
+    " 1 fail",
+  ].join("\n");
+}
+
+/** An assertion failure with detail lines (the other common red-run shape). */
+function assertionReport(): string {
+  return [
+    "tests/e2e/work-items.test.ts:",
+    "1 | test(\"a > failing branch\", () => {",
+    "error: expect(received).toBe(expected)",
+    "Expected: 2",
+    "Received: 1",
+    "(fail) suite a > failing branch [3.12ms]",
+    " 0 pass",
+    " 1 fail",
+  ].join("\n");
+}
+
+describe("summarizeSuiteFailure (issue #300)", () => {
+  test("names the timed-out journey and its timeout on a suite failure", () => {
+    const failures = summarizeSuiteFailure(timeoutReport());
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("DM with a GitHub issue URL");
+    expect(failures[0]).toMatch(/timed out after 5000ms/i);
+  });
+
+  test("carries assertion detail (error:/Expected:/Received:) for a failed test", () => {
+    const failures = summarizeSuiteFailure(assertionReport());
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("suite a > failing branch");
+    expect(failures[0]).toContain("Expected: 2");
+    expect(failures[0]).toContain("Received: 1");
+  });
+
+  test("is bounded to the first MAX_FAILURES failures", () => {
+    const many = Array.from(
+      { length: MAX_FAILURES + 3 },
+      (_, i) => `error: boom\n(fail) suite > failing #${i} [1.00ms]`,
+    ).join("\n");
+    expect(summarizeSuiteFailure(many)).toHaveLength(MAX_FAILURES);
+    // Each snippet carries its own test name; no more than the bound.
+    expect(summarizeSuiteFailure(many)[0]).toContain("failing #0");
+  });
+
+  test("scrubs token-shaped secrets from child output", () => {
+    // The e2e fixture's PAT / Bearer auth / long blobs must never reach CI.
+    expect(scrubSecrets("github_pat_e2e_journey_secret_456")).toBe("[redacted]");
+    expect(scrubSecrets("Bearer abcdefghijklmnopqrstuvwxyz123456")).toBe("[redacted]");
+    expect(scrubSecrets("aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666")).toBe("[redacted]");
+  });
+
+  test("a report with no failures yields [] (caller still fails closed)", () => {
+    expect(summarizeSuiteFailure("All files | 91.20 | 90.15 |")).toEqual([]);
+  });
+});
+
+describe("decideGate failure diagnostics (issue #300)", () => {
+  test("a failing suite names the failing test in the gate message", () => {
+    // The regression: the old gate printed only "the suite itself failed";
+    // the message now carries the failing journey + its timeout.
+    const result = decideGate(timeoutReport(), 1);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/suite itself failed/);
+    expect(result.message).toContain("DM with a GitHub issue URL");
+    expect(result.message).toMatch(/timed out after 5000ms/i);
+  });
+
+  test("failing-suite diagnostics never leak token-shaped secrets", () => {
+    const report = [
+      "All files |   91.20 |   90.15 |",
+      "error: Bearer abcdefghijklmnopqrstuvwxyz123456 rejected",
+      "(fail) suite > live auth [12.00ms]",
+    ].join("\n");
+    expect(decideGate(report, 1).message).not.toContain("abcdefghijklmnopqrstuvwxyz123456");
+    expect(decideGate(report, 1).message).toContain("[redacted]");
+  });
+
+  test("a failing suite with no recognizable failure still fails closed", () => {
+    const result = decideGate("bun test v1.3.14\n 0 pass\n 1 fail\n", 1);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/suite itself failed/);
   });
 });
