@@ -474,6 +474,12 @@ export async function defaultPublicBaseProbe(
   }
 }
 
+/** One stack service's probe target. `fromHost` marks a target that is an
+ * explicitly configured, host-reachable URL (broker from OMP_AUTH_BROKER_URL,
+ * or a configured mem0 base) as opposed to a Docker-internal default name
+ * (auth-gateway, iron-proxy, default mem0) that only resolves inside compose. */
+type ServiceTarget = { kind: "http" | "tcp"; host?: string; port?: number; url?: string; fromHost?: boolean };
+
 /**
  * Probes one service: compose state when docker is available, local
  * HTTP/TCP probes otherwise. Returns up/down/unknown with evidence.
@@ -481,7 +487,7 @@ export async function defaultPublicBaseProbe(
 async function probeService(
   service: string,
   seams: Required<Pick<HealthProbeSeams, "composePs" | "httpGet" | "tcpConnect">>,
-  target: { kind: "http" | "tcp"; host?: string; port?: number; url?: string },
+  target: ServiceTarget,
 ): Promise<ServiceStatus> {
   const compose = await seams.composePs(service);
   if (compose.available && compose.state !== undefined) {
@@ -500,13 +506,15 @@ async function probeService(
     };
   }
   // Compose is available but produced no row: the service is simply not
-  // part of the running project (not running / not enabled), so it is
-  // honestly unknown — never "down". Do NOT fall back to a Docker-internal
-  // hostname HTTP/TCP probe: from the macOS host those names do not resolve
-  // (ENOTFOUND), which would falsely report a healthy local dev stack as
-  // down. The fallback probes below run only when docker/compose itself is
-  // unavailable here.
-  if (compose.available) {
+  // part of the running project (not running / not enabled). A target that
+  // is a Docker-internal default name (gateway, iron-proxy, default mem0)
+  // is reported unknown — those names do not resolve from the macOS host
+  // (ENOTFOUND), so a DNS/HTTP fallback would falsely report a healthy local
+  // dev stack as down. A target with an explicitly configured host-reachable
+  // URL (broker from OMP_AUTH_BROKER_URL, or a configured mem0 base) may
+  // legitimately run outside compose in local dev, so it falls through to
+  // probe that configured URL below.
+  if (compose.available && !target.fromHost) {
     return {
       service,
       status: "unknown",
@@ -536,13 +544,19 @@ async function runStackHealth(store: Store, opts: AdminToolsOpts): Promise<Servi
     publicBase: opts.health?.publicBase ?? defaultPublicBaseProbe,
   };
   const brokerUrl = (process.env.OMP_AUTH_BROKER_URL ?? "http://auth-broker:8765").replace(/\/+$/, "");
+  // An explicitly configured OMP_AUTH_BROKER_URL (dev.sh exports
+  // http://127.0.0.1:8765) is host-reachable from the macOS host even when
+  // the compose service (named auth-broker) has no `broker` row; the default
+  // http://auth-broker:8765 is a Docker-internal name only.
+  const brokerFromHost = Boolean(process.env.OMP_AUTH_BROKER_URL?.trim());
   const settings = store.getOrgSettings();
+  const mem0FromHost = Boolean(settings?.memoryBackend?.baseUrl?.trim());
   const mem0Base = settings?.memoryBackend?.baseUrl?.trim().replace(/\/+$/, "") ?? "http://mem0:8000";
-  const targets: Array<{ service: string; target: { kind: "http" | "tcp"; host?: string; port?: number; url?: string } }> = [
-    { service: "broker", target: { kind: "http", url: `${brokerUrl}/v1/healthz` } },
+  const targets: Array<{ service: string; target: ServiceTarget }> = [
+    { service: "broker", target: { kind: "http", url: `${brokerUrl}/v1/healthz`, fromHost: brokerFromHost } },
     { service: "gateway", target: { kind: "tcp", host: "auth-gateway", port: 4000 } },
     { service: "iron-proxy", target: { kind: "tcp", host: "iron-proxy", port: 8080 } },
-    { service: "mem0", target: { kind: "http", url: `${mem0Base}/openapi.json` } },
+    { service: "mem0", target: { kind: "http", url: `${mem0Base}/openapi.json`, fromHost: mem0FromHost } },
   ];
   const results: ServiceStatus[] = [];
   for (const { service, target } of targets) {

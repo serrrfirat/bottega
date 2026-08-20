@@ -1800,6 +1800,59 @@ describe("stack_health (issue #73)", () => {
       cleanup();
     }
   });
+
+  test("dev topology: broker absent from compose by name but reachable on its configured host URL reports up (issue #297)", async () => {
+    const { store, cleanup } = freshStore();
+    const env = backupEnv();
+    try {
+      // scripts/dev.sh starts the vault as compose service `auth-broker`, so
+      // `docker compose ps --format json broker` has no row; but it exports
+      // OMP_AUTH_BROKER_URL=http://127.0.0.1:8765, which IS host-reachable and
+      // must report up rather than unknown/down. iron-proxy runs in compose.
+      process.env.OMP_AUTH_BROKER_URL = "http://127.0.0.1:8765";
+      process.env.BOTTEGA_CALLBACK_PORT = "18783";
+      process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = "https://tunnel-a.trycloudflare.com";
+      const composeState = new Map<string, { state: string; health: string; restartCount: number }>([
+        ["iron-proxy", { state: "running", health: "", restartCount: 0 }],
+      ]);
+      const probed: string[] = [];
+      const probes: Required<HealthProbeSeams> = {
+        composePs: async (service) => {
+          const s = composeState.get(service);
+          return s ? { available: true, state: s.state, health: s.health, restartCount: s.restartCount } : { available: true };
+        },
+        httpGet: async (url) => {
+          probed.push(url);
+          return { ok: true, evidence: `GET ${url} -> HTTP 200` };
+        },
+        tcpConnect: async (host, port) => ({ ok: true, evidence: `tcp ${host}:${port} connected` }),
+        callbackListener: async (port) => ({ ok: true, evidence: `tcp 127.0.0.1:${port} connected; GET /oauth/callback -> HTTP 400` }),
+        publicBase: async (base) => ({ ok: true, evidence: `GET ${base} -> HTTP 404` }),
+      };
+      const tool = findTool(loadTools(store, { health: probes }), "stack_health");
+      const res = await call(tool, {});
+      // SAFETY: stack_health serializes ok + the per-service status array (asserted below).
+      const body = JSON.parse(res.text) as { ok: boolean; services: ServiceStatus[] };
+      expect(res.isError).toBe(false);
+      expect(body.ok).toBe(true);
+      const byService = new Map(body.services.map((s) => [s.service, s]));
+      // broker probed its configured host URL (not a compose row, not a
+      // Docker-internal name).
+      expect(byService.get("broker")!.status).toBe("up");
+      expect(byService.get("broker")!.method).toBe("http");
+      expect(probed.some((url) => url.startsWith("http://127.0.0.1:8765"))).toBe(true);
+      // iron-proxy up via compose; Docker-internal-only targets stay unknown.
+      expect(byService.get("iron-proxy")!.status).toBe("up");
+      expect(byService.get("gateway")!.status).toBe("unknown");
+      expect(byService.get("mem0")!.status).toBe("unknown");
+      expect(byService.get("executor")!.status).toBe("unknown");
+      // No Docker-internal hostname was DNS-probed from the host.
+      expect(probed.every((url) => !url.includes("auth-gateway") && !url.includes("auth-broker") && !url.includes(":4000"))).toBe(true);
+    } finally {
+      restoreEnv(env);
+      cleanup();
+    }
+  });
 });
 
 describe("defaultComposePs (issue #297)", () => {
