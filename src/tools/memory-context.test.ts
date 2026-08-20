@@ -13,9 +13,8 @@ type TestMessage = { role: "user" | "developer" | "assistant"; content: string; 
 
 function entry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
   return {
-    id: "mem_1",
-    scope: "org",
-    principal: null,
+    id: `mem_${Math.random()}`,
+    key: { kind: "org" },
     content: "the org ships bottega weekly",
     metadata: {},
     createdAt: 1000,
@@ -28,7 +27,7 @@ class FakeProvider implements MemoryProvider {
   hits: MemoryEntry[] = [];
 
   async save(input: MemorySaveInput): Promise<MemoryEntry> {
-    return entry({ content: input.content, scope: input.scope, principal: input.principal ?? null, metadata: input.metadata ?? {} });
+    return entry({ content: input.content, key: input.scope, metadata: input.metadata ?? {} });
   }
 
   async search(query: MemorySearchQuery): Promise<MemoryEntry[]> {
@@ -96,7 +95,9 @@ describe("memoryContextExtension", () => {
     h.provider.hits = [entry({ content: "deploys happen on fridays" }), entry({ content: "rollbacks use git revert" })];
     const result = await h.context(conversation());
 
-    expect(h.provider.searches).toEqual([{ query: "what did we decide about deploys?", scope: "org", limit: 5 }]);
+    expect(h.provider.searches).toEqual([
+      { query: "what did we decide about deploys?", scope: { kind: "org" }, limit: 5 },
+    ]);
     expect(result).toBeDefined();
     const messages = result!.messages;
     expect(messages.length).toBe(4); // injected + 3 originals
@@ -109,24 +110,28 @@ describe("memoryContextExtension", () => {
     expect(messages.slice(1)).toEqual(conversation());
   });
 
-  test("searches user scope for the session principal and merges both scopes", async () => {
-    const h = loadExtension({ getPrincipal: () => "U42" });
-    h.provider.hits = [entry({ content: "org fact" }), entry({ scope: "user", principal: "U42", content: "alice fact" })];
+  test("searches the session principal's person scope and merges both scopes", async () => {
+    const h = loadExtension({
+      getScopeContext: () => ({ spaceId: "", principal: "U42", directMessage: true, teamId: undefined }),
+    });
+    h.provider.hits = [entry({ content: "org fact" }), entry({ key: { kind: "person", principal: "U42" }, content: "alice fact" })];
     await h.context(conversation());
 
     expect(h.provider.searches).toEqual([
-      { query: "what did we decide about deploys?", scope: "org", limit: 5 },
-      { query: "what did we decide about deploys?", scope: "user", principal: "U42", limit: 5 },
+      { query: "what did we decide about deploys?", scope: { kind: "org" }, limit: 5 },
+      { query: "what did we decide about deploys?", scope: { kind: "person", principal: "U42" }, limit: 5 },
     ]);
     const result = await h.context(conversation()); // re-run: this time skipped (already injected)
     expect(result).toBeUndefined();
   });
 
-  test("falls back to defaultPrincipal when the session has no live principal", async () => {
-    const h = loadExtension({ defaultPrincipal: "U7" });
+  test("a DM with no live principal fails closed to the org floor", async () => {
+    const h = loadExtension({
+      getScopeContext: () => ({ spaceId: "", principal: undefined, directMessage: true, teamId: undefined }),
+    });
     h.provider.hits = [entry({ content: "x" })];
     await h.context(conversation());
-    expect(h.provider.searches.some((s) => s.scope === "user" && s.principal === "U7")).toBe(true);
+    expect(h.provider.searches).toEqual([{ query: "what did we decide about deploys?", scope: { kind: "org" }, limit: 5 }]);
   });
 
   test("entry budget: at most maxEntries lines, deduped by content", async () => {
@@ -195,7 +200,7 @@ describe("memoryContextExtension", () => {
     expect(await h.context([{ role: "assistant", content: "only assistant text", timestamp: 1 }])).toBeUndefined();
     expect(await h.context(conversation("   "))).toBeUndefined(); // blank latest user text
     expect(await h.context(conversation())).toBeUndefined(); // no hits
-    expect(h.provider.searches).toHaveLength(2); // blank text skipped the search; the last one searched
+    expect(h.provider.searches).toHaveLength(2); // "hello" + "what did we decide...", each org-only
   });
 
   test("latest user message wins as the query (steering included)", async () => {

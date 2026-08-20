@@ -909,7 +909,7 @@ async function journeyMemory(h: Harness, channelId: string, runId: string): Prom
     });
     const stored = await waitFor(
       async () => {
-        const entries = await h.memory.search({ query: word, scope: "org", limit: 5 });
+        const entries = await h.memory.search({ query: word, scope: { kind: "org" }, limit: 5 });
         return entries.find((e) => e.content.includes(word));
       },
       STORE_TIMEOUT_MS,

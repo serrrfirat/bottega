@@ -58,6 +58,13 @@ export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
 export const MEMORY_WRITE_EVENT = "memory.write";
 /** Automatic memory extraction completed (payload {scope, count}; actor = system). */
 export const MEMORY_AUTO_SAVED_EVENT = "memory.auto_saved";
+/**
+ * Permission-aware memory recall (issue #137): payload {scopes:[{scope,key,count}]}
+ * with actor = requester principal, space_id = the space — scopes only, never
+ * query or memory content. Appended after every successful recall (even zero
+ * results) by the derived-scope recall layer.
+ */
+export const MEMORY_RECALLED_EVENT = "memory.recalled";
 /** Observer read/post/failure (payload {scope, metadata, count}, {pulse_space, posted}, or {error}). */
 export const OBSERVER_READ_EVENT = "observer.read";
 /** Scheduler job created (payload {id, action, cron, space_id?}). */

@@ -88,7 +88,7 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
         expect(saveDecision!.decision).toBe("deny");
 
         // ...and the denied call never ran: nothing reached the provider.
-        const found = await h.memory.search({ query: "denied", scope: "org" });
+        const found = await h.memory.search({ query: "denied", scope: { kind: "org" } });
         expect(found.map((e) => e.content)).not.toContain("denied payload");
       } finally {
         await h.cleanup();
@@ -173,7 +173,7 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
     async () => {
       const h = await harness([{ type: "text", text: "injected" }], "");
       try {
-        await h.memory.save({ scope: "org", content: "the build runs on arm64", metadata: { inject: "1" } });
+        await h.memory.save({ scope: { kind: "org" }, content: "the build runs on arm64", metadata: { inject: "1" } });
         await h.deliverMessage(h.slack.dmChannelId, "deploy");
         await h.modelStub.waitForRequests(1);
 

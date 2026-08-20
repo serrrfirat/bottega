@@ -88,7 +88,7 @@ describe("resolveMemoryProvider (issue #43)", () => {
         { MEM0_BASE_URL: "http://127.0.0.1:1", MEM0_API_KEY: "m0sk-test" },
       );
       expect(provider.backend).toBe("mem0");
-      const saved = await provider.save({ scope: "org", content: "selection test fact" });
+      const saved = await provider.save({ scope: { kind: "org" }, content: "selection test fact" });
       expect(saved.content).toBe("selection test fact");
       // Wire contract: org scope maps to a fixed agent_id, key travels as
       // X-API-Key, and the request hit the configured base URL.
@@ -97,7 +97,7 @@ describe("resolveMemoryProvider (issue #43)", () => {
       expect(stub.requests[0].apiKey).toBe("m0sk-test");
       expect(stub.requests[0].body.agent_id).toBe("bottega");
 
-      await provider.search({ scope: "org", query: "selection test" });
+      await provider.search({ scope: { kind: "org" }, query: "selection test" });
       expect(stub.requests[1].path).toBe("/search");
       expect(stub.requests[1].apiKey).toBe("m0sk-test");
     } finally {
@@ -114,7 +114,7 @@ describe("resolveMemoryProvider (issue #43)", () => {
         { MEM0_BASE_URL: stub.server.url.href },
       );
       expect(provider.backend).toBe("mem0");
-      await provider.save({ scope: "org", content: "environment fallback fact" });
+      await provider.save({ scope: { kind: "org" }, content: "environment fallback fact" });
       expect(stub.requests).toHaveLength(1);
       expect(stub.requests[0].path).toBe("/memories");
     } finally {
@@ -126,13 +126,13 @@ describe("resolveMemoryProvider (issue #43)", () => {
     const db = freshDb();
     const provider = resolveMemoryProvider(null, db, {});
     expect(provider.backend).toBe("sqlite");
-    const saved = await provider.save({ scope: "org", content: "sqlite fallback fact" });
+    const saved = await provider.save({ scope: { kind: "org" }, content: "sqlite fallback fact" });
     expect(saved.id).toBeTruthy();
-    const hits = await provider.search({ scope: "org", query: "sqlite fallback" });
+    const hits = await provider.search({ scope: { kind: "org" }, query: "sqlite fallback" });
     expect(hits.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
     // Same database handle: a second provider sees the same rows.
     const again = resolveMemoryProvider({}, db, {});
-    const more = await again.search({ scope: "org", query: "sqlite fallback" });
+    const more = await again.search({ scope: { kind: "org" }, query: "sqlite fallback" });
     expect(more.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
   });
 });

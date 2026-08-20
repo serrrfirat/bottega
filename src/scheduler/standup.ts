@@ -111,7 +111,7 @@ export const standupDigestAction: SchedulerAction = {
 
       await ctx.postMessage(spaceId, digest, blocks.length > 0 ? { blocks } : undefined);
       const memory = await ctx.memoryProvider.save({
-        scope: "org",
+        scope: { kind: "org" },
         content: digest,
         metadata: {
           kind: "digest",

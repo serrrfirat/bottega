@@ -24,13 +24,15 @@
  *    `/search` (docs.mem0.ai/open-source/features/rest-api states this
  *    explicitly).
  *  - The OSS server has NO `org_id` param — mem0 only scopes by user_id,
- *    agent_id, run_id. Scope mapping:
- *      org  → `agent_id` = opts.agentId ?? MEM0_ORG_AGENT_ID (a fixed agent
+ *    agent_id, run_id. Scope mapping (issue #137: SQLite and Mem0 share the
+ *    same logical mapping):
+ *      org   → `agent_id` = opts.agentId ?? MEM0_ORG_AGENT_ID (a fixed agent
  *             id makes org memory shared across all principals, matching
- *             the MemoryProvider contract). A principal passed for org scope
- *             is ignored (types.ts: "ignored for org scope").
- *      user → `user_id` = principal, plus `agent_id` passthrough when
- *             opts.agentId is configured.
+ *             the MemoryProvider contract).
+ *      other → `user_id` = the logical key's physical principal composite
+ *             (person → the raw principal; channel → `channel:<spaceId>`;
+ *             team → `team:<teamId>`), so result rows decode to the same
+ *             logical keys SQLite returns.
  *  - `text` does not exist on add; content travels as the single
  *    `messages[0].content` (the SDK accepts a bare string as shorthand).
  *
@@ -51,6 +53,8 @@
 import { z } from "zod";
 import {
   MEMORY_LIMIT_DEFAULT,
+  decodeScopeKey,
+  encodeScopeKey,
   validateSaveInput,
   validateSearchQuery,
 } from "./types";
@@ -59,7 +63,7 @@ import type {
   MemoryProvider,
   MemorySaveInput,
   MemorySearchQuery,
-  MemoryScope,
+  MemoryScopeKey,
 } from "./types";
 
 export interface Mem0Options {
@@ -157,20 +161,17 @@ function snippet(text: string, max = 200): string {
 
 /** Scope mapping, see module docstring. */
 function scopeParams(
-  scope: MemoryScope,
-  principal: string | undefined,
+  scope: MemoryScopeKey,
   agentId: string | undefined,
-) {
-  if (scope === "org") {
+): Record<string, string> {
+  if (scope.kind === "org") {
     // Org memory is shared across principals: pin it to one agent id.
     return { agent_id: agentId ?? MEM0_ORG_AGENT_ID };
   }
-  // user scope: user_id is only set when a principal is given (an omitted
-  // principal means "all users", matching the sqlite backend).
-  const params: Record<string, string> = {};
-  if (principal !== undefined) params.user_id = principal;
-  if (agentId) params.agent_id = agentId;
-  return params;
+  // Non-org logical scopes map to the physical principal composite key
+  // (person → raw principal; channel/team → prefixed), matching SQLite.
+  const physical = encodeScopeKey(scope);
+  return { user_id: physical.principal ?? "" };
 }
 
 /** Strip identity keys from caller metadata (mirrors the SDK's behavior). */
@@ -330,14 +331,25 @@ async function requestWithOptionalGraph(
 }
 
 /** Parse one mem0 result dict (add or search) into a MemoryEntry. */
-function parseEntry(result: JsonValue, scope: MemoryScope, principal: string | null): MemoryEntry {
+function parseEntry(result: JsonValue, scope: MemoryScopeKey): MemoryEntry {
   const parsed = Mem0ResultSchema.safeParse(result);
   const row = parsed.success ? parsed.data : Mem0ResultSchema.parse({});
   const meta = stringifyMetadata(row.metadata);
+  // The identity field holds the physical principal composite key; decode it
+  // back to the logical key (matches the SQLite decode, so both backends
+  // expose identical logical scope behavior). The requested scope is the
+  // authority; the row's user_id only refines the person key when present.
+  const identity = row.user_id ?? undefined;
+  let key = scope;
+  if (scope.kind === "org") {
+    key = { kind: "org" };
+  } else {
+    const physical = identity !== undefined ? identity : encodeScopeKey(scope).principal ?? "";
+    key = decodeScopeKey("user", physical);
+  }
   return {
     id: String(row.id ?? ""),
-    scope,
-    principal: scope === "user" ? (row.user_id ?? meta.user_id ?? principal) : null,
+    key,
     content: row.memory ?? "",
     metadata: meta,
     createdAt: row.created_at,
@@ -352,7 +364,7 @@ async function saveToMem0(
   getGraphCapabilities: () => Promise<GraphCapabilities>,
   input: MemorySaveInput,
 ): Promise<MemoryEntry> {
-  const identity = scopeParams(input.scope, input.principal, agentId);
+  const identity = scopeParams(input.scope, agentId);
   const metadata = input.metadata ? stripIdentityKeys(input.metadata) : undefined;
   const body = {
     messages: [{ role: "user", content: input.content }],
@@ -389,8 +401,7 @@ async function saveToMem0(
   }
   return {
     id: String(id),
-    scope: input.scope,
-    principal: input.scope === "user" ? (row.user_id ?? (input.principal ?? null)) : null,
+    key: input.scope,
     // NOOP entries carry memory: null — fall back to the input text.
     content: row.memory !== undefined && row.memory !== "" ? row.memory : input.content,
     metadata: stringifyMetadata(row.metadata),
@@ -409,7 +420,7 @@ async function searchMem0(
   // Scope first, then exact-match metadata filters. Identity keys in caller
   // metadata cannot override the scope (mirrors the SDK).
   const filters = {
-    ...scopeParams(query.scope, query.principal, agentId),
+    ...scopeParams(query.scope, agentId),
     ...(query.metadata ? stripIdentityKeys(query.metadata) : undefined),
   };
   const body = {
@@ -431,9 +442,7 @@ async function searchMem0(
   );
   const results = asRecord(data).results;
   if (!Array.isArray(results)) return [];
-  return results.map((result) =>
-    parseEntry(result, query.scope, query.scope === "user" ? (query.principal ?? null) : null),
-  );
+  return results.map((result) => parseEntry(result, query.scope));
 }
 
 export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {

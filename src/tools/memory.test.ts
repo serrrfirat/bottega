@@ -8,6 +8,7 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
 import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
+import type { MemoryScopeContext } from "../memory/scope";
 import { memoryToolsExtension, sha256Hex } from "./memory";
 
 /** The memory tools never read the extension context; only the arity needs it. */
@@ -22,8 +23,7 @@ class FakeProvider implements MemoryProvider {
     this.saved.push(input);
     return {
       id: `mem_${this.next++}`,
-      scope: input.scope,
-      principal: input.principal ?? null,
+      key: input.scope,
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: 1000,
@@ -35,8 +35,7 @@ class FakeProvider implements MemoryProvider {
     return [
       {
         id: "mem_1",
-        scope: query.scope,
-        principal: query.principal ?? null,
+        key: query.scope,
         content: "found",
         metadata: {},
         createdAt: 2000,
@@ -51,12 +50,13 @@ interface AuditRow {
   payload: AuditPayload;
 }
 
-/** The `memory.write` audit payload memory.ts appends (hash-only, never the content). */
+/** Audit payload shapes the memory tools append (hash-only, never the content). */
 interface AuditPayload {
   scope?: string;
-  principal?: string | null;
   id?: string;
   content_hash?: string;
+  /** `memory.recalled` per-scope counts (issue #137); never query or memory content. */
+  scopes?: Array<{ scope: string; key: string; count: number }>;
 }
 
 function fakeAudit() {
@@ -75,7 +75,7 @@ function fakeAudit() {
 
 function loadTools(
   provider: MemoryProvider,
-  opts?: { defaultPrincipal?: string; audit?: Pick<AuditModule, "appendAudit"> },
+  opts?: { getScopeContext?: (spaceId: string) => MemoryScopeContext; audit?: Pick<AuditModule, "appendAudit"> },
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   // SAFETY: loadTools only exercises the extension's registerTool seam; the rest of the ExtensionAPI surface is never touched by the memory extension.
@@ -124,14 +124,13 @@ describe("memory.save", () => {
     expect(id).toBe("mem_1");
 
     expect(provider.saved).toHaveLength(1);
-    expect(provider.saved[0]).toEqual({ scope: "org", content: "the vault combination is 1234", metadata: { topic: "vault" } });
+    expect(provider.saved[0]).toEqual({ scope: { kind: "org" }, content: "the vault combination is 1234", metadata: { topic: "vault" } });
 
     expect(rows).toHaveLength(1);
     expect(rows[0]!.actor).toBe("agent");
     expect(rows[0]!.event_type).toBe("memory.write");
     const payload = rows[0]!.payload;
     expect(payload.scope).toBe("org");
-    expect(payload.principal).toBeNull();
     expect(payload.id).toBe("mem_1");
     // Hash only — the raw content must never land in the audit row.
     expect(payload.content_hash).toBe(sha256Hex("the vault combination is 1234"));
@@ -140,37 +139,67 @@ describe("memory.save", () => {
     expect(auditText).not.toContain("1234");
   });
 
-  test("user scope uses the explicit principal and audits it as actor", async () => {
+  test("person scope derives the principal from the DM context and audits it as actor", async () => {
     const provider = new FakeProvider();
     const { audit, rows } = fakeAudit();
-    const [saveTool] = loadTools(provider, { audit });
+    const [saveTool] = loadTools(provider, {
+      audit,
+      getScopeContext: () => ({ spaceId: "", principal: "U123", directMessage: true, teamId: undefined }),
+    });
 
-    const res = await saveTool.execute("tc1", { content: "prefers dark mode", scope: "user", principal: "U123" }, undefined, undefined, noopCtx);
+    const res = await saveTool.execute("tc1", { content: "prefers dark mode", scope: "person" }, undefined, undefined, noopCtx);
     expect(res.isError).not.toBe(true);
-    expect(provider.saved[0]!.principal).toBe("U123");
+    expect(provider.saved[0]).toEqual({ scope: { kind: "person", principal: "U123" }, content: "prefers dark mode", metadata: undefined });
     expect(rows[0]!.actor).toBe("U123");
-    expect(rows[0]!.payload.principal).toBe("U123");
+    expect(rows[0]!.payload.scope).toBe("person");
   });
 
-  test("user scope without principal falls back to defaultPrincipal", async () => {
+  test("person scope without an explicit principal is derived from the DM context", async () => {
     const provider = new FakeProvider();
     const { audit, rows } = fakeAudit();
-    const [saveTool] = loadTools(provider, { audit, defaultPrincipal: "U9" });
+    const [saveTool] = loadTools(provider, {
+      audit,
+      getScopeContext: () => ({ spaceId: "", principal: "U9", directMessage: true, teamId: undefined }),
+    });
 
-    const res = await saveTool.execute("tc1", { content: "likes llamas", scope: "user" }, undefined, undefined, noopCtx);
+    const res = await saveTool.execute("tc1", { content: "likes llamas", scope: "person" }, undefined, undefined, noopCtx);
     expect(res.isError).not.toBe(true);
-    expect(provider.saved[0]!.principal).toBe("U9");
+    expect(provider.saved[0]).toEqual({ scope: { kind: "person", principal: "U9" }, content: "likes llamas", metadata: undefined });
     expect(rows[0]!.actor).toBe("U9");
   });
 
-  test("user scope without principal and no default errors, saves nothing, audits nothing", async () => {
+  test("person scope without a DM context errors, saves nothing, audits nothing", async () => {
     const provider = new FakeProvider();
     const { audit, rows } = fakeAudit();
     const [saveTool] = loadTools(provider, { audit });
 
-    const res = await saveTool.execute("tc1", { content: "orphaned", scope: "user" }, undefined, undefined, noopCtx);
+    const res = await saveTool.execute("tc1", { content: "orphaned", scope: "person" }, undefined, undefined, noopCtx);
     expect(res.isError).toBe(true);
-    expect(resultText(res)).toMatch(/principal/);
+    expect(resultText(res)).toMatch(/cannot write that scope/);
+    expect(provider.saved).toHaveLength(0);
+    expect(rows).toHaveLength(0);
+  });
+
+  test("a DM with no authenticated principal derives NO writable scope; person and channel saves fail closed", async () => {
+    // Issue #137 fail-closed edge: a direct-message context without a bound
+    // principal (a turn nobody started, or a broken identity seam) must not
+    // fall back to writing a channel key. Both person and channel requests
+    // error, nothing is written, nothing is audited.
+    const provider = new FakeProvider();
+    const { audit, rows } = fakeAudit();
+    const [saveTool] = loadTools(provider, {
+      audit,
+      getScopeContext: () => ({ spaceId: "slack:D1", principal: undefined, directMessage: true, teamId: undefined }),
+    });
+
+    const person = await saveTool.execute("tc1", { content: "orphaned", scope: "person" }, undefined, undefined, noopCtx);
+    expect(person.isError).toBe(true);
+    expect(resultText(person)).toMatch(/cannot write that scope/);
+
+    const channel = await saveTool.execute("tc1", { content: "orphaned", scope: "channel" }, undefined, undefined, noopCtx);
+    expect(channel.isError).toBe(true);
+    expect(resultText(channel)).toMatch(/cannot write that scope/);
+
     expect(provider.saved).toHaveLength(0);
     expect(rows).toHaveLength(0);
   });
@@ -246,34 +275,31 @@ describe("memory.save", () => {
 });
 
 describe("memory.search", () => {
-  test("passes the query through and returns entries", async () => {
+  test("passes the query through the derived readable scopes and returns entries", async () => {
     const provider = new FakeProvider();
-    const { audit, rows } = fakeAudit();
-    const [, searchTool] = loadTools(provider, { audit });
+    const [, searchTool] = loadTools(provider, {
+      getScopeContext: () => ({ spaceId: "", principal: "U9", directMessage: true, teamId: undefined }),
+    });
 
-    const res = await searchTool.execute(
-      "tc1",
-      { query: "llamas", scope: "user", principal: "U9", limit: 3 },
-      undefined,
-      undefined,
-      noopCtx,
-    );
+    const res = await searchTool.execute("tc1", { query: "llamas", scope: "all", limit: 3 }, undefined, undefined, noopCtx);
     expect(res.isError).not.toBe(true);
-    expect(provider.searched).toEqual([{ query: "llamas", scope: "user", principal: "U9", limit: 3 }]);
+    // A DM recall fans across the org floor and the session principal's person scope.
+    expect(provider.searched).toEqual([
+      { query: "llamas", scope: { kind: "org" }, limit: 3 },
+      { query: "llamas", scope: { kind: "person", principal: "U9" }, limit: 3 },
+    ]);
     const entries = JSON.parse(resultText(res));
     expect(entries).toHaveLength(1);
     expect(entries[0].content).toBe("found");
     expect(entries[0].createdAt).toBe(2000);
-    // Search is read-tier: policy decisions are audited by the gate, the tool appends nothing.
-    expect(rows).toHaveLength(0);
   });
 
-  test("org-scope search without principal passes nothing through", async () => {
+  test("org-scope search without context searches the org floor first", async () => {
     const provider = new FakeProvider();
     const [, searchTool] = loadTools(provider);
     const res = await searchTool.execute("tc1", { query: "anything", scope: "org" }, undefined, undefined, noopCtx);
     expect(res.isError).not.toBe(true);
-    expect(provider.searched[0]!.principal).toBeUndefined();
+    expect(provider.searched[0]!.scope).toEqual({ kind: "org" });
   });
 
   test("rejects an empty query and out-of-range limits", async () => {
@@ -319,27 +345,25 @@ describe("memory tools against the real SQLite provider (issue #29)", () => {
       expect(entries).toHaveLength(1);
       expect(entries[0]).toMatchObject({
         id,
-        scope: "org",
-        principal: null,
+        key: { kind: "org" },
         content: "the vault combination is 1234",
         metadata: { topic: "vault" },
       });
 
       // Audit carries only the content hash — the raw content never lands in
-      // the trail, even though the real provider holds it in SQLite.
-      expect(rows).toHaveLength(1);
-      expect(rows[0]!.event_type).toBe("memory.write");
-      expect(rows[0]!.payload.content_hash).toBe(sha256Hex("the vault combination is 1234"));
-      expect(JSON.stringify(rows[0]!.payload)).not.toContain("vault combination");
+      // the trail, even though the real provider holds it in SQLite. The save
+      // wrote `memory.write` and the recall wrote `memory.recalled`.
+      expect(rows).toHaveLength(2);
+      const writeRow = rows.find((r) => r.event_type === "memory.write")!;
+      expect(writeRow.payload.content_hash).toBe(sha256Hex("the vault combination is 1234"));
+      expect(JSON.stringify(writeRow.payload)).not.toContain("vault combination");
+      const recalled = rows.find((r) => r.event_type === "memory.recalled")!;
+      expect(recalled.payload.scopes).toEqual([{ scope: "org", key: "org", count: 1 }]);
 
-      // Principal isolation through the real provider: a user never sees
-      // another user's memory, and org rows stay org-scoped.
-      const userSave = await saveTool.execute("tc1", { content: "prefers dark mode", scope: "user", principal: "U123" }, undefined, undefined, noopCtx);
-      expect(userSave.isError).not.toBe(true);
-      const other = await searchTool.execute("tc1", { query: "dark mode", scope: "user", principal: "U456" }, undefined, undefined, noopCtx);
-      expect(JSON.parse(resultText(other))).toHaveLength(0);
-      const own = await searchTool.execute("tc1", { query: "dark mode", scope: "user", principal: "U123" }, undefined, undefined, noopCtx);
-      expect(JSON.parse(resultText(own))).toHaveLength(1);
+      // The recalled row never carries query or memory content.
+      expect(JSON.stringify(rows)).not.toContain("vault combination");
+      expect(JSON.stringify(rows)).not.toContain('"build');
+
       db.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

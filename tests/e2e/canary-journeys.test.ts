@@ -236,13 +236,13 @@ describe("memory journey scope pin (issue #224)", () => {
       const prompt = memorySavePromptFor("round-trip-run");
       const word = /canary code word is (canary-[A-Za-z0-9-]+)/.exec(prompt)?.[1];
       expect(word).toBeDefined();
-      await h.memory.save({ scope: "org", content: `the canary code word is ${word}`, metadata: {} });
-      const found = await h.memory.search({ query: word!, scope: "org", limit: 5 });
+      await h.memory.save({ scope: { kind: "org" }, content: `the canary code word is ${word}`, metadata: {} });
+      const found = await h.memory.search({ query: word!, scope: { kind: "org" }, limit: 5 });
       expect(found.some((e) => e.content.includes(word!))).toBe(true);
-      // A user-scope save (the pre-fix model's choice) must NOT satisfy the
-      // org-scope proof — that asymmetry is the bug #224 fixes.
-      await h.memory.save({ scope: "user", principal: "U-owner", content: `user-only ${word}`, metadata: {} });
-      const orgOnly = await h.memory.search({ query: word!, scope: "org", limit: 5 });
+      // A person-scope save (the pre-fix model's user-scope choice) must NOT
+      // satisfy the org-scope proof — that asymmetry is the bug #224 fixes.
+      await h.memory.save({ scope: { kind: "person", principal: "U-owner" }, content: `user-only ${word}`, metadata: {} });
+      const orgOnly = await h.memory.search({ query: word!, scope: { kind: "org" }, limit: 5 });
       expect(orgOnly.some((e) => e.content.includes("user-only"))).toBe(false);
     } finally {
       await h.cleanup();

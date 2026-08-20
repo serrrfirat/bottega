@@ -287,6 +287,30 @@ settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the switch
 applies on the next server start. `MEM0_API_KEY` stays an optional env
 secret for mem0 auth.
 
+**Permission-aware memory scopes (issue #137).** Every memory belongs to one
+logical scope derived from the authenticated conversation, never from a
+prompt/tool argument: `org` (company floor), `person:<principal>` (one human,
+DM only), `channel:<spaceId>` (the current channel), or `team:<teamId>`
+(channels sharing the same explicit policy value). A DM recall reads its
+person's facts + org; a channel recall reads its channel facts + its
+configured team + org — a channel can never read a person's private facts.
+Existing `scope='user'` rows (the pre-#137 format) remain readable as the
+matching `person:` key with no migration.
+
+To share memory across channels, set the optional space policy field
+`memory.team` to a stable identifier (letters/digits/`-`/`_`, ≤64 chars);
+malformed values fail closed (no team scope is granted). Example overlay:
+`{"memory":{"team":"eng"}}`. `extensions.org_credentials` is unrelated and
+never affects memory visibility. Every successful recall appends an
+append-only `memory.recalled` audit row with the requester/space and per-scope
+counts — never the query or memory content.
+
+Facts the agent auto-learns from a shared channel are now stored channel-local
+(`channel:<spaceId>`): they are recalled only in that channel unless the space
+also configures a `memory.team`, which extends recall to the team's shared
+pool. Existing org-scope facts remain org-readable everywhere; nothing about
+existing org or per-person rows changes.
+
 ### Public ingress for browser legs (issues #196, #198, #249)
 
 The connect flows have two browser legs served by in-process listeners on

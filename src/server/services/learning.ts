@@ -1,7 +1,7 @@
 import { channelFromSpaceId, isDmChannel, type SlackMessage } from "../adapters/slack";
 import type { AgentDriver, AgentSessionDriver } from "../drivers/agent-driver";
-import { buildExtractionPrompt, createBurstBuffer, filterFacts, parseFacts, type BurstBuffer } from "../../memory/extraction";
-import type { MemoryProvider, MemoryScope } from "../../memory/types";
+import { buildExtractionPrompt, createBurstBuffer, filterFacts, parseFacts, type BurstBuffer, type ExtractionScope } from "../../memory/extraction";
+import type { MemoryProvider, MemoryScopeKey } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import { MEMORY_AUTO_SAVED_EVENT } from "../../store/audit-events";
 
@@ -58,12 +58,18 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
   const extract = async (spaceId: string, turns: readonly { input: string; reply: string }[]): Promise<void> => {
     if (!enabled || turns.length === 0) return;
     const directMessage = isDmChannel(channelFromSpaceId(spaceId));
-    const scope: MemoryScope = directMessage ? "user" : "org";
+    // Extraction-prompt wording: "user" = DM (personal facts), "org" = shared channel facts.
+    const promptScope: ExtractionScope = directMessage ? "user" : "org";
     const principal = directMessage ? principalBySpace.get(spaceId) : undefined;
     if (directMessage && !principal) {
       logger.error(`[learning] missing principal for direct-message burst in ${spaceId}`);
       return;
     }
+    // Issue #137: DMs save to the authenticated person's key; channel turns
+    // save to the current channel key. Facts are never auto-promoted to team/org.
+    const saveScope: MemoryScopeKey = directMessage
+      ? { kind: "person", principal: principal! }
+      : { kind: "channel", spaceId };
 
     let reply = "";
     let sideSession: AgentSessionDriver | undefined;
@@ -85,7 +91,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
         const text = (data as { text?: string } | null)?.text;
         if (text && text.trim()) reply = text;
       });
-      await sideSession.prompt(buildExtractionPrompt(turns, scope));
+      await sideSession.prompt(buildExtractionPrompt(turns, promptScope));
     } catch (error) {
       logger.error(`[learning] extraction failed for ${spaceId}`, toError(error));
       return;
@@ -105,8 +111,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
     for (const fact of filtered.facts) {
       try {
         await deps.memory.save({
-          scope,
-          ...(principal ? { principal } : undefined),
+          scope: saveScope,
           content: fact,
           metadata: { source: "auto_extract" },
         });
@@ -124,7 +129,7 @@ export function createLearningService(deps: LearningServiceDeps): LearningServic
         space_id: spaceId,
         actor: "system",
         event_type: MEMORY_AUTO_SAVED_EVENT,
-        payload: { scope, count: saved },
+        payload: { scope: saveScope.kind, count: saved },
       });
     } catch (error) {
       logger.error(`[learning] audit write failed for ${spaceId}`, toError(error));

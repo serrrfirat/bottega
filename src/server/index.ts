@@ -62,9 +62,11 @@ import { startOutboxPostSeam } from "./services/outbox-post-seam";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
 import {
+  channelFromSpaceId,
   createSlackAdapter,
   DELIVERY_APPROVE_ACTION_ID,
   DELIVERY_DENY_ACTION_ID,
+  isDmChannel,
   type SlackAction,
   type SlackAdapter,
 } from "./adapters/slack";
@@ -566,7 +568,25 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // by default), every write is audited, and the space's cached skills are
     // busted so the NEXT session claims the skill.
     writeSpaceSkillToolDefinition(store, { audit }),
-    ...memoryToolDefinitions(memoryProvider, { audit }),
+    // Memory tools (issue #137): recall/save scopes derive from the
+    // authenticated invocation context — space id (from the session file),
+    // the TURN principal (getTurnPrincipal, the same seam the connect tool
+    // uses), the DM/channel classification, and the space's effective
+    // `memory.team`. A prompt/tool argument can never widen access. spaceService
+    // is late-bound (constructed after the driver); the closure reads it only
+    // at call time (same pattern as extensionCaller/onToolStep).
+    ...memoryToolDefinitions(memoryProvider, {
+      audit,
+      getScopeContext: async (spaceId) => {
+        const policy = await loadSpacePolicy(orgPolicy, store, spaceId);
+        return {
+          spaceId,
+          principal: spaceService.getTurnPrincipal(spaceId),
+          directMessage: isDmChannel(channelFromSpaceId(spaceId)),
+          teamId: policy.memory.team,
+        };
+      },
+    }),
     ...sessionSearchToolDefinitions(store.getDb(), "data/sessions"),
     ...objectToolDefinitions(store, { orgPolicy, audit, adapter }),
     ...modelToolsDefinitions(store, { audit, modelRoles, agentDir }),

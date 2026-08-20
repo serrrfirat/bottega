@@ -123,8 +123,7 @@ class RecordingMemory implements MemoryProvider {
     this.saved.push(input);
     return {
       id: `m-${this.saved.length}`,
-      scope: input.scope,
-      principal: input.principal ?? null,
+      key: input.scope,
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: Date.now(),
@@ -207,13 +206,12 @@ describe("learning service", () => {
       expect(h.driver.created).toHaveLength(2);
       expect(h.memory.saved).toEqual([
         {
-          scope: "org",
+          scope: { kind: "channel", spaceId: "slack:C123" },
           content: "The Atlas team prefers small pull requests.",
           metadata: { source: "auto_extract" },
         },
         {
-          scope: "user",
-          principal: "U-ADA",
+          scope: { kind: "person", principal: "U-ADA" },
           content: "Ada prefers concise status updates.",
           metadata: { source: "auto_extract" },
         },
@@ -225,8 +223,8 @@ describe("learning service", () => {
 
       const rows = await h.store.listAudit({ event_type: MEMORY_AUTO_SAVED_EVENT });
       expect(rows.map((row) => ({ actor: row.actor, space: row.space_id, payload: JSON.parse(row.payload) }))).toEqual([
-        { actor: "system", space: "slack:C123", payload: { scope: "org", count: 1 } },
-        { actor: "system", space: "slack:D456", payload: { scope: "user", count: 1 } },
+        { actor: "system", space: "slack:C123", payload: { scope: "channel", count: 1 } },
+        { actor: "system", space: "slack:D456", payload: { scope: "person", count: 1 } },
       ]);
     } finally {
       h.cleanup();
@@ -294,7 +292,7 @@ describe("learning service", () => {
       expect(h.logger.errors[0].message).toContain("memory save rejected");
       const rows = await h.store.listAudit({ event_type: MEMORY_AUTO_SAVED_EVENT });
       expect(rows).toHaveLength(1);
-      expect(JSON.parse(rows[0].payload)).toEqual({ scope: "user", count: 1 });
+      expect(JSON.parse(rows[0].payload)).toEqual({ scope: "person", count: 1 });
     } finally {
       h.cleanup();
     }

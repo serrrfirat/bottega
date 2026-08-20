@@ -200,7 +200,7 @@ export const reflectionAction: SchedulerAction = {
 
       for (const entry of entries) {
         const memory = await ctx.memoryProvider.save({
-          scope: "org",
+          scope: { kind: "org" },
           content: entry.content,
           metadata: { kind: "reflection", space: spaceId, date, topic: entry.topic },
         });
