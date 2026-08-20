@@ -621,6 +621,59 @@ describe("full connect round trip — mint → browser → callback → vault + 
     }
   });
 
+  // Issue #281: a browser connect completes (credential + audit + egress all
+  // land) but the running server must ALSO refresh the connected space's live
+  // toolset — the freshly-connected provider's tools have to appear on the
+  // SAME space's next turn WITHOUT a restart. The callback is the only place
+  // that knows when the browser leg actually finished, so it must surface
+  // the connected space to the composition root (which owns the sessions).
+  // RED on old code: the callback never signals the connected space, so a
+  // same-space turn stays starved of the new tools until a restart.
+  test("a successful callback signals the connected space so its toolset can refresh without a restart", async () => {
+    const stub = new StubOAuthMcp();
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const connected: Array<{ provider: string; spaceId: string | null }> = [];
+      const callback = startOAuthCallbackServer({
+        store,
+        audit: createAudit(store),
+        tokenStore: vault,
+        port: 0,
+        // The composition-root seam (server/index.ts wires this to the
+        // space's session refresh). The callback must invoke it with the
+        // space whose connect started the flow, so that space's toolset
+        // refresh lands in the running server — no restart.
+        onConnected: (info) => {
+          connected.push(info);
+        },
+      });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA", spaceId: "slack:C1" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+
+        // The callback succeeded — credential + audit landed.
+        expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
+        // ...and the connected space was surfaced exactly once so the running
+        // server can refresh its toolset without a restart.
+        expect(connected).toEqual([{ provider: "fixture.oauthmcp", spaceId: "slack:C1" }]);
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
   test("a rejected exchange (bad code) fails closed: no vault write, no registry row", async () => {
     const stub = new StubOAuthMcp();
     try {

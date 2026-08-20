@@ -452,6 +452,23 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // WITHOUT a configured org channel the leg is NOT mounted — /webhooks/*
     // 404s, fail closed: an undeliverable delivery is never accepted.
     ...(ingestWebhooks !== undefined ? { webhooks: ingestWebhooks } : undefined),
+    // Issue #281: the browser leg is the only place that knows the connect
+    // actually completed — surface the connected space so its live session
+    // toolset refreshes WITHOUT a restart. Late-bound (spaceService is
+    // constructed below this listener) and read at callback time, exactly
+    // like the other cross-layer closures in this root. Null spaceId (a
+    // connect not tied to a space, e.g. the MCP surface) → no session to
+    // refresh; refreshExtensionTools no-ops. A refresh failure is surfaced
+    // as a receivable warning, never a callback failure.
+    onConnected: ({ provider, spaceId }) => {
+      if (spaceId === null) return;
+      void spaceService.refreshExtensionTools(spaceId, provider).catch((err) => {
+        console.error(
+          `[bottega] post-connect toolset refresh failed for ${spaceId} (${provider}): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    },
   });
   // The connect seam's generic MCP OAuth connector (issue #198): shared by
   // the space-service connect path and the per-session connect tool. The

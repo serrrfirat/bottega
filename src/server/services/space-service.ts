@@ -675,7 +675,21 @@ export class SpaceService {
     }
   }
 
-  async #disposeSession(spaceId: string): Promise<void> {
+  /**
+   * Refreshes a space's live session toolset after a successful extension
+   * connect (issue #281). The SDK session toolset is fixed at creation, so
+   * the connected provider's tools can't be mounted mid-session — dispose
+   * the long-lived session (WITHOUT the idle-digest: this is not an idle
+   * timeout) and the next inbound message cold-starts it from the SAME
+   * transcript file with the refreshed extension surfaces, exactly like a
+   * server restart but without one. No-op when the space has no live
+   * session (nothing stale to refresh).
+   */
+  async refreshExtensionTools(spaceId: string, _provider: string): Promise<void> {
+    await this.#disposeSession(spaceId, { skipDigest: true });
+  }
+
+  async #disposeSession(spaceId: string, opts: { skipDigest?: boolean } = {}): Promise<void> {
     const live = this.#sessions.get(spaceId);
     if (!live || live.disposing) return;
     live.disposing = true;
@@ -683,8 +697,10 @@ export class SpaceService {
     live.detachLearning();
     // Digest-on-idle (#42): summarize the conversation into org memory
     // before the session is gone. Fail-soft — never blocks disposal
-    // (#maybeDigestOnIdle audits its own failures).
-    await this.#maybeDigestOnIdle(live);
+    // (#maybeDigestOnIdle audits its own failures). Skipped for an explicit
+    // connect-refresh (issue #281): that is not an idle event, and a
+    // silent summary turn right after a connect would be surprising.
+    if (!opts.skipDigest) await this.#maybeDigestOnIdle(live);
     try {
       await live.session.dispose();
     } catch (err) {

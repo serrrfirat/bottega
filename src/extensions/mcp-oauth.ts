@@ -917,6 +917,16 @@ export async function completeMcpOAuthFlow(
      * warnings fold into the result — the connect stays successful.
      */
     reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
+    /**
+     * Post-connect same-space refresh (issue #281): invoked after a
+     * successful connect (credential + registry + audit + egress all
+     * landed) with the extension's provider and the SPACE whose connect
+     * started the flow. The composition root wires this to refresh that
+     * space's live session toolset so the freshly-connected provider's
+     * tools appear on that space's next turn WITHOUT a restart. Absent →
+     * no session refresh (the callback still succeeds).
+     */
+    onConnected?: (info: { provider: string; spaceId: string | null }) => void | Promise<void>;
   },
 ): Promise<{ brokerCredentialId: number; warnings: string[] }> {
   let persisted: PersistedOAuthFlow;
@@ -1038,6 +1048,22 @@ export async function completeMcpOAuthFlow(
       warnings = result.warnings;
     } catch (err) {
       warnings = [`connect ${flowRow.label} failed to reconcile egress: ${errorMessage(err)}`];
+    }
+  }
+  // Issue #281: the browser leg is the ONLY place that knows the connect
+  // actually completed, so surface the connected space to the composition
+  // root HERE — it refreshes that space's live session toolset so the new
+  // provider's tools appear without a restart. Fire-and-forget-safe (a
+  // disposed session cold-starts on the next turn, resuming the transcript),
+  // awaited so the success page never precedes an unfinished refresh.
+  if (deps.onConnected !== undefined) {
+    try {
+      await deps.onConnected({ provider: flowRow.provider, spaceId: flowRow.space_id });
+    } catch (err) {
+      warnings = [
+        ...warnings,
+        `connect ${flowRow.label} connected but the session toolset refresh failed: ${errorMessage(err)}`,
+      ];
     }
   }
   return { brokerCredentialId, warnings };

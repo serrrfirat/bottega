@@ -755,6 +755,48 @@ describe("SpaceService session lifecycle", () => {
     }
   });
 
+  // Issue #281: after a successful connect, the connected space's session
+  // toolset must refresh WITHOUT a restart. The SDK mounts a session's tools
+  // once, so the refresh disposes the stale long-lived session and the next
+  // inbound message cold-starts it from the SAME transcript file with the
+  // refreshed extension surfaces (exactly what a server restart does, minus
+  // the restart). No-op when there is no live session for the space.
+  test("refreshExtensionTools disposes the stale session so the next turn cold-starts with refreshed tools", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ text: "first" }));
+    const first = driver.last();
+    expect(driver.created).toHaveLength(1);
+
+    // A connect for this space completes → refresh the toolset without a
+    // restart: the stale session is disposed.
+    await service.refreshExtensionTools("slack:C1", "notion");
+
+    for (let i = 0; i < 5; i++) await Promise.resolve(); // flush the dispose promise chain
+    expect(first.disposed).toBe(true);
+
+    // The next turn cold-starts a FRESH session (new toolset) that resumes
+    // the space's transcript.
+    await service.handleInboundMessage(msg({ text: "second", ts: "2.2" }));
+    expect(driver.created).toHaveLength(2);
+    expect(driver.last()).not.toBe(first);
+    expect(driver.last().spaceId).toBe("slack:C1");
+    expect(driver.last().prompts).toEqual([{ text: "second", opts: { principal: "U1" } }]);
+  });
+
+  test("refreshExtensionTools no-ops when the space has no live session", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.refreshExtensionTools("slack:C1", "notion");
+    expect(driver.created).toHaveLength(0); // nothing created/disposed
+  });
+
   test("sessions are file-backed under the transcript dir, one file per space", async () => {
     const { adapter } = fakeAdapter();
     const { store } = fakeStore();

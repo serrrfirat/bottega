@@ -74,6 +74,16 @@ export interface OAuthCallbackEndpointDeps {
    */
   reconcileEgress?: (provider: string) => Promise<{ warnings: string[] }>;
   /**
+   * Post-connect same-space refresh (issue #281): invoked after a
+   * successful callback (credential + registry + audit + egress all
+   * landed) with the extension's provider and the SPACE whose connect
+   * started the flow. The composition root wires this to refresh that
+   * space's live session toolset so the freshly-connected provider's
+   * tools appear without a restart. Absent → no session refresh (the
+   * callback still succeeds).
+   */
+  onConnected?: (info: { provider: string; spaceId: string | null }) => void | Promise<void>;
+  /**
    * The PUBLIC base URL the browser reaches the callback at (deployment:
    * BOTTEGA_OAUTH_CALLBACK_BASE_URL; default: the loopback server URL).
    */
@@ -149,7 +159,13 @@ async function handleCallback(
   }
   const row: OAuthFlow = consumed.row;
   try {
-    await completeMcpOAuthFlow(row, code, { store: deps.store, audit: deps.audit, tokenStore, reconcileEgress });
+    await completeMcpOAuthFlow(row, code, {
+      store: deps.store,
+      audit: deps.audit,
+      tokenStore,
+      reconcileEgress,
+      onConnected: deps.onConnected,
+    });
   } catch (err) {
     return page(500, "Connect failed", `Connecting ${row.label} failed: ${errorMessage(err)} — ask the agent to try again.`);
   }
