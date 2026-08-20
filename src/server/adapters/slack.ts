@@ -97,10 +97,10 @@ export interface SlackAdapter {
   postMessage(
     spaceId: string,
     text: string,
-    opts?: { threadTs?: string; blocks?: unknown[] },
+    opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
   ): Promise<string | undefined>;
-  /** Replaces the text of an already-posted message (chat.update); optional blocks mirror postMessage. */
-  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void>;
+  /** Replaces the text of an already-posted message (chat.update); optional blocks/attachments mirror postMessage. */
+  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void>;
   /** Downloads a Slack file and returns its normalized metadata and bytes. */
   downloadFile(
     fileId: string,
@@ -433,14 +433,15 @@ export function renderSlackText(markdown: string): string {
 export function buildPostMessageArgs(
   spaceId: string,
   text: string,
-  opts?: { threadTs?: string; blocks?: unknown[] },
+  opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
 ) {
   const args = {
     channel: channelFromSpaceId(spaceId),
     text: renderSlackText(text),
     ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : undefined),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[] };
+    ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
+  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[]; attachments?: unknown[] };
   return args;
 }
 
@@ -455,14 +456,15 @@ export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
   text: string,
-  opts?: { blocks?: unknown[] },
+  opts?: { blocks?: unknown[]; attachments?: unknown[] },
 ) {
   return {
     channel: channelFromSpaceId(spaceId),
     ts,
     text: renderSlackText(text),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[] };
+    ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
+  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[]; attachments?: unknown[] };
 }
 
 /**

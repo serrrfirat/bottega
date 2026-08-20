@@ -436,6 +436,15 @@ describe("buildPostMessageArgs", () => {
       blocks,
     });
   });
+
+  test("passes the visible-attachment container through when provided (issue #296)", () => {
+    const attachments = [{ color: "#5B7DB1", fallback: "working…", blocks: [{ type: "section", text: { type: "mrkdwn", text: "working…" } }] }];
+    expect(buildPostMessageArgs("slack:D123ABC", "working…", { attachments })).toEqual({
+      channel: "D123ABC",
+      text: "working…",
+      attachments,
+    });
+  });
 });
 
 describe("buildUpdateMessageArgs", () => {
@@ -452,6 +461,16 @@ describe("buildUpdateMessageArgs", () => {
       channel: "D123ABC",
       ts: "1.1",
       text: "updated",
+    });
+  });
+
+  test("preserves the visible-attachment container across update (issue #296)", () => {
+    const attachments = [{ color: "#5B7DB1", fallback: "answer", blocks: [{ type: "section", text: { type: "mrkdwn", text: "answer" } }] }];
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", "answer", { attachments })).toEqual({
+      channel: "D123ABC",
+      ts: "1723700000.000100",
+      text: "answer",
+      attachments,
     });
   });
 });

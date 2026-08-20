@@ -55,8 +55,8 @@ interface RecordedAdapter {
   texts: Array<{ spaceId: string; ts: string; text: string }>;
   tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }>;
   stops: Array<{ spaceId: string; ts: string; text?: string }>;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
-  updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[] } }>;
+  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }>;
+  updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
 }
 
@@ -73,8 +73,8 @@ function recordingAdapter(
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
   const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let tsSeq = 0;
   let startStreamRequests = 0;
@@ -82,13 +82,18 @@ function recordingAdapter(
     async postMessage(spaceId, text, replyOpts) {
       // SAFETY: the presenter passes { threadTs } as post options; issue #278
       // carries cited-search blocks on the same seam, so record opts fully.
-      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string; blocks?: unknown[] } | undefined });
+      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } | undefined });
       tsSeq += 1;
       return `post-${tsSeq}`;
     },
     async updateMessage(spaceId, ts, text, opts) {
       const blocks = opts?.blocks;
-      updates.push(blocks !== undefined ? { spaceId, ts, text, opts: { blocks } } : { spaceId, ts, text });
+      const attachments = opts?.attachments;
+      updates.push(
+        blocks !== undefined || attachments !== undefined
+          ? { spaceId, ts, text, opts: { ...(blocks !== undefined ? { blocks } : {}), ...(attachments !== undefined ? { attachments } : {}) } }
+          : { spaceId, ts, text },
+      );
     },
     async downloadFile() {
       throw new Error("not used");
@@ -1470,7 +1475,7 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
     await flush();
     expect(rec.posts).toHaveLength(1); // a single status card — nothing else
-    expect(rec.posts[0]!.opts?.blocks).toBeDefined(); // Slack-native Block Kit throughout
+    expect(rec.posts[0]!.opts?.attachments).toBeDefined(); // Slack-native visible container throughout
 
     // A long plan that would qualify for the separate #228 message in a
     // channel must NOT post one here: the todo progress folds into the one
@@ -1480,10 +1485,10 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
     expect(rec.posts).toHaveLength(1); // still one card — no plan message post
-    // The todo progress still surfaces on the single status line (folded in), as blocks.
+    // The todo progress still surfaces on the single status line (folded in), as attachments.
     const lastStatus = rec.updates.at(-1)!;
     expect(lastStatus.text).toMatch(/🛠 3\/3 \u2014 Push \+ PR$/);
-    expect(lastStatus.opts?.blocks).toBeDefined();
+    expect(lastStatus.opts?.attachments).toBeDefined();
 
     // The request completes by settling the SAME card, never a second post.
     presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
@@ -1491,6 +1496,46 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     await flush();
     expect(rec.posts).toHaveLength(1);
     expect(rec.updates.at(-1)!.ts).toBe("post-1");
+  });
+
+  test("the status card renders as a Slack attachment container, never a lone top-level section (issue #296 regression)", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    // The OPENING post carries the visible container on the Slack-supported
+    // `attachments` seam — a lone top-level section renders flat as plain
+    // text in the real client (issue #296's reopened evidence).
+    const post = rec.posts[0]!;
+    expect(post.opts?.blocks).toBeUndefined(); // nothing duplicated top-level
+    expect(post.opts?.attachments).toBeDefined(); // Slack-native visible container
+    const postAttach = (post.opts!.attachments! as { color: string; fallback: string; blocks: unknown[] }[])[0]!;
+    expect(postAttach.color).toMatch(/^#/); // a restrained border color keeps the container visible
+    expect(postAttach.fallback).toBe(THINKING_PHRASES[0]); // accessible plain-text fallback
+    expect(Array.isArray(postAttach.blocks)).toBe(true); // Block Kit nests INSIDE the attachment
+    expect(postAttach.blocks[0]).toMatchObject({ type: "section", text: { type: "mrkdwn", text: THINKING_PHRASES[0] } });
+    // No top-level blocks ride the same message — they live in the attachment only.
+    expect(rec.posts[0]!.opts).not.toHaveProperty("blocks");
+
+    // The final answer lands on the SAME message (chat.update) with the SAME
+    // attachment container, so the card never collapses to flat text.
+    const id = nextToolStepId();
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "in_progress" });
+    presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "succeeded" });
+    await flush();
+    presenter.onMessage({ spaceId: "slack:D1", text: "Here is the answer" });
+    presenter.onRequestSettled();
+    await flush();
+    expect(rec.posts).toHaveLength(1);
+    const update = rec.updates.at(-1)!;
+    expect(update.ts).toBe("post-1");
+    expect(update.opts?.blocks).toBeUndefined();
+    expect(update.opts?.attachments).toBeDefined();
+    const updAttach = (update.opts!.attachments! as { color: string; fallback: string; blocks: unknown[] }[])[0]!;
+    expect(updAttach.color).toMatch(/^#/);
+    expect(updAttach.fallback).toBe("Here is the answer\n\n1 action completed");
+    expect(updAttach.blocks[0]).toMatchObject({ type: "section", text: { type: "mrkdwn", text: "Here is the answer" } });
   });
 
   test("raw model reasoning NEVER surfaces: thinking renders no 🧠 line, only the elapsed/step status (issue #296)", async () => {
@@ -1555,7 +1600,7 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     expect(final.text).not.toContain("grep");
     expect(final.text).not.toContain("search");
     expect(final.text).not.toContain("Let me search");
-    expect(final.opts?.blocks).toBeDefined(); // final is Slack-native Block Kit with accessible fallback
+    expect(final.opts?.attachments).toBeDefined(); // final is a Slack-native visible container with accessible fallback
   });
 
   test("a second user request owns a NEW message and cannot mutate the prior request (issue #296)", async () => {

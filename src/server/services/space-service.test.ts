@@ -261,8 +261,8 @@ function fakeAdapter(
   } = {},
 ) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
@@ -288,7 +288,12 @@ function fakeAdapter(
         throw new Error("rate_limited");
       }
       const blocks = updateOpts?.blocks;
-      updates.push(blocks !== undefined ? { spaceId, ts, text, opts: { blocks } } : { spaceId, ts, text });
+      const attachments = updateOpts?.attachments;
+      updates.push(
+        blocks !== undefined || attachments !== undefined
+          ? { spaceId, ts, text, opts: { ...(blocks !== undefined ? { blocks } : {}), ...(attachments !== undefined ? { attachments } : {}) } }
+          : { spaceId, ts, text },
+      );
     },
     async downloadFile(fileId) {
       downloadedFileIds.push(fileId);
@@ -1013,9 +1018,10 @@ describe("SpaceService output routing", () => {
     for (let i = 0; i < 3; i++) await Promise.resolve();
 
     // DM: exactly ONE plain post (never a thread_ts); the final answer edits
-    // the same ts with Slack-native status/final blocks (recorded opts.blocks).
+    // the same ts with the Slack-native status/final ATTACHMENT container
+    // (recorded opts.attachments — a lone section would render flat).
     expect(posts).toEqual([
-      { spaceId: "slack:D1", text: "Thinking…", opts: { blocks: expect.any(Array) } },
+      { spaceId: "slack:D1", text: "Thinking…", opts: { attachments: expect.any(Array) } },
       { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "9.9" } },
     ]);
     expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
