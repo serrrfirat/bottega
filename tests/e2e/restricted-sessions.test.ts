@@ -16,6 +16,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { z } from "zod";
+import { z as sdkZ, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, type EmulatorMessage, type Harness, type StubTurn } from "./harness";
 import { APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../../src/store/audit-events";
 
@@ -183,6 +184,77 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
         expect(system).toBeDefined();
         expect(String(system!.content)).toContain("Relevant memory:");
         expect(String(system!.content)).toContain("the build runs on arm64");
+      } finally {
+        await h.cleanup();
+      }
+    },
+    30_000,
+  );
+});
+
+describe("multi-tool streaming (issue #292)", () => {
+  /**
+   * Chat-discovered regression: the harness stub's SSE serializer streamed
+   * every tool-call argument delta at `index: 0`, so the REAL OMP SDK
+   * session (openai-completions.ts routes deltas by `toolCall.index`)
+   * concatenated the second call's arguments onto the first call's buffer
+   * and left the second call with `{}`. One scripted turn with two distinct
+   * tools proves each executes exactly once with its OWN nested arguments.
+   */
+  test(
+    "one streamed turn with two tool calls delivers each tool exactly once with its own nested arguments",
+    async () => {
+      const received: Array<{ name: string; args: unknown }> = [];
+      const recorder = (name: string, parameters: ToolDefinition["parameters"]): ToolDefinition => ({
+        name,
+        label: name,
+        description: `records the arguments of ${name} calls`,
+        parameters,
+        approval: "read",
+        async execute(_toolCallId, params) {
+          received.push({ name, args: params });
+          return { content: [{ type: "text", text: `ran ${name}` }] };
+        },
+      });
+      const alphaArgs = { filters: { region: "us-east", tags: ["a", "b"] }, limit: 5 };
+      const betaArgs = { query: { terms: [{ field: "status", value: "open" }] }, page: 2 };
+      const h = await bootHarness({
+        modelTurns: [
+          {
+            type: "tool_calls",
+            calls: [
+              { name: "alpha", args: alphaArgs },
+              { name: "beta", args: betaArgs },
+            ],
+          },
+          { type: "text", text: "both tools ran" },
+        ],
+        customTools: [
+          recorder(
+            "alpha",
+            sdkZ.object({ filters: sdkZ.object({ region: sdkZ.string(), tags: sdkZ.array(sdkZ.string()) }), limit: sdkZ.number() }),
+          ),
+          recorder(
+            "beta",
+            sdkZ.object({ query: sdkZ.object({ terms: sdkZ.array(sdkZ.object({ field: sdkZ.string(), value: sdkZ.string() })) }), page: sdkZ.number() }),
+          ),
+        ],
+      });
+      try {
+        await h.deliverMessage(h.slack.dmChannelId, "run both tools");
+        // Request 1 = the two-tool-call turn; request 2 = the follow-up text
+        // turn (its body carries both tool results, so the recorders have
+        // already run by the time this resolves).
+        await h.modelStub.waitForRequests(2);
+
+        // Each tool executed exactly once, each with its OWN nested args.
+        expect(received).toEqual([
+          { name: "alpha", args: alphaArgs },
+          { name: "beta", args: betaArgs },
+        ]);
+
+        const reply = await waitForReply(h, "both tools ran");
+        expect(reply).toBeDefined();
       } finally {
         await h.cleanup();
       }

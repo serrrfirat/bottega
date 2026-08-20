@@ -289,12 +289,16 @@ function streamingSseBody(turn: StubTurn, includeUsage: boolean): string {
         },
       ]),
     );
-    for (const call of turn.calls) {
+    // The OpenAI SSE contract routes tool-call deltas by `toolCall.index`
+    // (the SDK accumulates arguments per index); issue #292 hardcoded the
+    // argument deltas to index 0, so the second call's args concatenated
+    // onto the first call's buffer and the second call executed with `{}`.
+    for (const [callIndex, call] of turn.calls.entries()) {
       chunks.push(
         sseChunk([
           {
             index: 0,
-            delta: { tool_calls: [{ index: 0, function: { name: call.name, arguments: JSON.stringify(call.args) } }] },
+            delta: { tool_calls: [{ index: callIndex, function: { name: call.name, arguments: JSON.stringify(call.args) } }] },
             finish_reason: null,
           },
         ]),
