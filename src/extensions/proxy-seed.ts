@@ -18,6 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { lock as lockFile } from "proper-lockfile";
 import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { resolveAuthBrokerConfig } from "@oh-my-pi/pi-coding-agent/session/auth-broker-config";
@@ -94,6 +95,39 @@ interface ProxyOAuthBlob {
    * (notion) carry the real secret.
    */
   client_secret: string;
+  /**
+   * The ORIGINAL vault refresh token that a successful app-side probe
+   * verified to produce `refresh_token` (issue #283). Present only when
+   * the seed's refresh-grant probe ACCEPTED the renewable grant and
+   * wrote the (possibly rotated) `refresh_token` here. A repeat sync
+   * reading the SAME pre-rotation token from a stale broker snapshot
+   * skips the redundant probe — the single-use grant was already
+   * consumed by the probe that originally wrote this blob — and reuses
+   * the live `refresh_token`. Absent for unverified verbatim writes,
+   * access-only (non-renewable) credentials, and rejections (fail
+   * closed — the blob is deleted, so nothing to mark).
+   */
+  verified_from?: string;
+}
+
+/**
+ * Reads the existing proxy OAuth blob for a provider (issue #283), or
+ * undefined when none is present/unparseable. The seed consults it to tell
+ * whether the vault token it is about to probe was ALREADY verified by a
+ * prior sync in this rotation cycle — the durable, cross-process record
+ * (the blob file is the shared boundary every boot root writes atomically).
+ */
+function readProxyOAuthBlob(secretsDir: string, fileName: string): ProxyOAuthBlob | undefined {
+  try {
+    const raw = readFileSync(join(secretsDir, fileName), "utf8");
+    const parsed = JSON.parse(raw) as Partial<ProxyOAuthBlob>;
+    if (typeof parsed.refresh_token === "string" && typeof parsed.client_id === "string") {
+      return parsed as ProxyOAuthBlob;
+    }
+  } catch {
+    // Absent or malformed blob — nothing to reuse; the seed probes fresh.
+  }
+  return undefined;
 }
 
 /**
@@ -681,6 +715,12 @@ export interface ProxyCredentialSyncOpts {
    */
   refreshOAuthToken?: McpOAuthRefreshProbe;
   /**
+   * Max ms a single MCP refresh probe may run before the seed treats it as
+   * TRANSIENT (issue #283 High). Forwarded to the OAuth blob seed; bounds
+   * the cross-process lock holder. Tests inject a small value.
+   */
+  probeTimeoutMs?: number;
+  /**
    * Rotated-token write-back seam (issue #269): persists the endpoint's
    * rotated refresh token to the vault row (the broker write seam
    * connect.ts uses). Default: the production broker-aware writer; tests
@@ -813,6 +853,126 @@ function deleteSecretFile(secretsDir: string, fileName: string): void {
 }
 
 /**
+ * Lock staleness (ms): a lock whose heartbeat is OLDER than this is stolen
+ * by a waiter (issue #283 High). Set ABOVE the single probe bound + broker
+ * write so a healthy holder's critical section (one token POST + file ops +
+ * a vault write) never collides with stale-stealing; on a LIVE holder the
+ * heartbeat (update) below refreshes the lock regardless of how long the
+ * work takes. Only a DEAD holder (no more heartbeats) is ever stolen.
+ */
+export const PROXY_SEED_LOCK_STALE_MS = 30_000;
+/**
+ * Lock heartbeat (ms): how often a LIVE holder refreshes its lock's mtime
+ * (proper-lockfile `update`; the library clamps it to [1000, stale/2]).
+ * A healthy holder whose probe+broker write outlives the stale ceiling is
+ * kept alive by this — the 15s probe and any broker write stay within the
+ * lease (issue #283 High).
+ */
+const PROXY_SEED_LOCK_UPDATE_MS = 10_000;
+/**
+ * Bounded wait to ACQUIRE the lock (retry options, ~30s): a waiter retries
+ * acquiring a lock another process briefly holds, and steals a genuinely
+ * stale one. `factor:1` + equal min/max gives a constant 50ms cadence →
+ * ~30s before an un-stealable (wedged) lock fails closed.
+ */
+const PROXY_SEED_LOCK_RETRIES = { retries: 600, factor: 1, minTimeout: 50, maxTimeout: 50, randomize: false };
+/**
+ * Time (ms) a single refresh-grant PROBE may take before the seed treats it
+ * as a transient failure (issue #283 High): a hanging token endpoint must
+ * NOT wedge the lock holder forever — a waiter would steal the lock and
+ * re-probe the same single-use token, consuming it twice (two HTTP POSTs to
+ * a rotating grant, the loser 400s and deletes a working blob). The probe
+ * bound is set BELOW the lock's stale threshold (15s < 30s) and the
+ * heartbeat refreshes a live holder, so a healthy critical section never
+ * collides with stale-stealing. A timeout is a TRANSIENT outcome
+ * (unreachable, like a transport error) — the blob is kept unverified,
+ * never deleted/rejected.
+ */
+const PROXY_SEED_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * Runs `fn` while holding an exclusive, cross-PROCESS mutex on one proxy
+ * OAuth blob (issue #283). Correct cross-process stale-lock ownership +
+ * heartbeat is infrastructure we must not roll ourselves, so we use the
+ * exact-pinned `proper-lockfile` (package.json): its atomic-mkdir lock,
+ * mtime heartbeat refresh (stale/update), and age-based stale-steal are
+ * battle-tested. The lock file is `<blob>.lock`; a LIVE holder's heartbeat
+ * keeps it fresh whatever the critical section takes (the 15s probe + any
+ * broker write stay within the lease), and a waiter steals it only when it
+ * is genuinely stale — so the seed's read → choose-probe-token → probe →
+ * write/delete decision is serialized ACROSS the independent OS processes
+ * (server root + per-session MCP/executor child) that race the same shared
+ * blob. The lock is always released in `finally`.
+ */
+async function withProxySeedLock<A>(
+  secretsDir: string,
+  fileName: string,
+  fn: () => Promise<A>,
+): Promise<A> {
+  // The secrets dir may not exist on a first-ever seed (the model-key / blob
+  // writes mkdir it lazily); the lock dir needs the parent.
+  mkdirSync(secretsDir, { recursive: true });
+  // Lock the blob file itself (the shared boundary). realpath:false so the
+  // file needn't exist yet — the atomic mkdir lock is placed at `<file>.lock`.
+  const release = await lockFile(join(secretsDir, fileName), {
+    realpath: false,
+    stale: PROXY_SEED_LOCK_STALE_MS,
+    update: PROXY_SEED_LOCK_UPDATE_MS,
+    retries: PROXY_SEED_LOCK_RETRIES,
+    // A compromised lock means the probe/lock state is no longer trusted —
+    // fail closed loudly rather than write a possibly-stale grant (AGENTS.md).
+    onCompromised: (err) => {
+      throw new Error(
+        `bottega proxy: ${fileName} cross-process lock COMPROMISED (${err.message}) — bailing, not writing a stale grant`,
+        { cause: err },
+      );
+    },
+  });
+  try {
+    return await fn();
+  } finally {
+    // Best-effort release; the holder's own cleanup must not mask a real
+    // failure of the critical section.
+    await release();
+  }
+}
+
+/**
+ * Runs a refresh-grant PROBE under a hard time bound (issue #283 High):
+ * a hanging token endpoint must not wedge the cross-process lock holder
+ * (and thus block every other boot root forever). On timeout the probe is
+ * treated exactly like a transport error — a TRANSIENT outcome
+ * (`minted:false`, no `status`) that the seed maps to "keep the blob
+ * unverified", NEVER a rejection that deletes it. Passing this bound is
+ * safe because the lock's stale-steal ceiling is well above it (and the
+ * heartbeat refreshes a live holder): no healthy holder lingers long enough
+ * to be mis-stolen. `probeTimeoutMs` is a real production config option
+ * (default {@link PROXY_SEED_PROBE_TIMEOUT_MS}) — not a test-only seam.
+ */
+async function probeWithTimeout(
+  probe: McpOAuthRefreshProbe,
+  input: McpOAuthRefreshInput,
+  probeTimeoutMs: number,
+): Promise<McpOAuthRefreshOutcome> {
+  // Sentinel the timer resolves to — the probe never returns it, so the race
+  // loser's side effect is unambiguously attributable.
+  const TIMEOUT: unique symbol = Symbol("probe-with-timeout");
+  const raced: McpOAuthRefreshOutcome | typeof TIMEOUT = await Promise.race<
+    McpOAuthRefreshOutcome | typeof TIMEOUT
+  >([
+    probe(input),
+    new Promise<typeof TIMEOUT>((resolve) => setTimeout(() => resolve(TIMEOUT), probeTimeoutMs)),
+  ]);
+  if (raced === TIMEOUT) {
+    // The endpoint hung past the bound: TRANSIENT — keep the blob
+    // unverified (the !minted, no-status path the seed maps to "keep the
+    // existing token unverified"), NEVER a rejection that deletes it.
+    return { minted: false, refreshToken: input.refreshToken };
+  }
+  return raced;
+}
+
+/**
  * One MCP OAuth refresh-grant probe outcome (issue #269): the token
  * endpoint's verdict on the seeded refresh token, the freshly minted
  * ACCESS token, and the refresh token to persist — the endpoint's rotation
@@ -845,6 +1005,14 @@ export interface McpOAuthRefreshInput {
   tokenEndpoint: string;
   /** The connect-negotiated token-endpoint auth method (issue #257), when persisted. */
   authMethod?: string;
+  /**
+   * Max ms the underlying token POST may run before the probe aborts it with
+   * an AbortSignal (issue #283 High). A hanging endpoint must not wedge the
+   * cross-process lock holder. Defaults to {@link PROXY_SEED_PROBE_TIMEOUT_MS}
+   * (set by the seed). An aborted fetch is a TRANSIENT outcome (unreachable),
+   * never a rejection.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -891,7 +1059,18 @@ async function probeMcpOAuthRefresh(input: McpOAuthRefreshInput): Promise<McpOAu
   }
   let res: Response;
   try {
-    res = await fetch(input.tokenEndpoint, { method: "POST", headers, body: params });
+    res = await fetch(input.tokenEndpoint, {
+      method: "POST",
+      headers,
+      body: params,
+      // Bound the POST (issue #283 High): a hanging endpoint must not wedge
+      // the cross-process lock holder / block a waiter forever. The abort
+      // rejects below and is caught as TRANSIENT (unreachable) — the seed
+      // treats a timeout like a transport error (keep unverified), never a
+      // rejection/delete. The seed-level race uses the same timeout as a
+      // belt-and-suspenders for injected probes.
+      signal: input.timeoutMs !== undefined ? AbortSignal.timeout(input.timeoutMs) : undefined,
+    });
   } catch {
     return { minted: false, refreshToken: input.refreshToken };
   }
@@ -1009,6 +1188,15 @@ export async function seedProxyOAuthBlob(
      */
     refreshOAuthToken?: McpOAuthRefreshProbe;
     /**
+     * Max ms a single refresh-grant probe may run before the seed treats it
+     * as a TRANSIENT failure (issue #283 High). Bounds the critical section
+     * so a hanging endpoint never wedges the cross-process lock holder (the
+     * probe bound is below the stale-lock ceiling). Defaults to
+     * {@link PROXY_SEED_PROBE_TIMEOUT_MS}; tests inject a small value with
+     * a hanging probe to exercise the transient path deterministically.
+     */
+    probeTimeoutMs?: number;
+    /**
      * Rotated-token write-back seam (issue #269): persists the endpoint's
      * rotated refresh token to the vault row (the broker write seam).
      * Default: the production broker-aware writer; tests stub it (never a
@@ -1026,6 +1214,9 @@ export async function seedProxyOAuthBlob(
   const known = OAUTH_PROXY_CREDENTIALS.find((c) => c.provider === provider);
   const clientIdEnv = opts.clientIdEnv ?? known?.clientIdEnv;
   const clientSecretEnv = opts.clientSecretEnv ?? known?.clientSecretEnv;
+  // Issue #283 High: the probe time bound (below the lock's stale ceiling);
+  // a test may override it with a small value to exercise the timeout path.
+  const probeTimeoutMs = opts.probeTimeoutMs ?? PROXY_SEED_PROBE_TIMEOUT_MS;
   const fileName = proxyOAuthBlobFileName(provider);
   const notes: string[] = [];
   const warnings: string[] = [];
@@ -1110,70 +1301,199 @@ export async function seedProxyOAuthBlob(
   // OAUTH_TOKEN_ENDPOINTS map — the SAME verified endpoints the oauth_token
   // transform mints through, never a guessed URL.
   const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[provider];
-  let refreshToken = refresh;
-  if (clientSecret !== "" && tokenEndpoint !== undefined) {
-    const refreshProbe = opts.refreshOAuthToken ?? probeMcpOAuthRefresh;
-    const outcome = await refreshProbe({
-      refreshToken: refresh,
-      clientId,
-      clientSecret,
-      tokenEndpoint,
-      authMethod: row?.tokenEndpointAuthMethod,
-    });
-    if (
-      !outcome.minted &&
-      outcome.status !== undefined &&
-      outcome.status >= 400 &&
-      outcome.status < 500 &&
-      outcome.status !== 429
-    ) {
-      // The grant is dead (invalid_grant / revoked): fail closed — never a
-      // blob that mints nothing. The warning NAMES the reconnect path.
-      deleteSecretFile(opts.secretsDir, fileName);
-      warnings.push(
-        `bottega proxy: ${fileName} REMOVED — ${provider} refresh token REJECTED (HTTP ${outcome.status}); ` +
-          `reconnect ${provider} to mint a fresh grant (fail closed)`,
+  // Issue #283 — the whole read → choose-probe-token → probe → write/delete
+  // decision is ONE atomic critical section, serialized ACROSS the
+  // independent OS processes (server root + per-session MCP/executor child)
+  // that race the same shared blob. The proxy OAuth blob is the durable
+  // boundary every root writes atomically, and the cross-process lock (the
+  // exact-pinned `proper-lockfile` atomic lock at `${blob}.lock`, released
+  // in `finally`) makes the read-check-write marker race-free: without it
+  // two processes can both
+  // read "no marker", both probe the single-use A, and the loser's HTTP 400
+  // DELETES the winner's blob. Within the lock:
+  //   - the durable `verified_from` marker records "I already probed the
+  //     vault token X and the blob's `refresh_token` is the live result";
+  //   - when vault A == verified_from, the seed NEVER re-probes the consumed
+  //     A — it probes the blob's LIVE rotated token B instead, so a B the
+  //     vault write-back failed to persist is not silently trusted as valid.
+  //     A REJECTED B (revoked) deletes the blob fail-closed with a receivable
+  //     warning; a transient failure keeps B unverified (codex pattern);
+  //     a success that rotates to C writes C (retaining the marker that
+  //     links the still-stale vault A, until the vault itself advances).
+  return await withProxySeedLock(opts.secretsDir, fileName, async () => {
+    const existingBlob = readProxyOAuthBlob(opts.secretsDir, fileName);
+    const alreadyVerified = existingBlob?.verified_from === refresh;
+    // The refresh token the blob will carry: the vault row's original, its
+    // verified rotation, or the live rotated token behind a stale marker.
+    let refreshToken = refresh;
+    // The ORIGINAL vault token whose verification produced the blob's
+    // `refresh_token`, recorded as the durable `verified_from` marker.
+    // `undefined` → nothing verified this seed (unverified verbatim write,
+    // a non-renewable credential, or a rejection).
+    let verifiedFrom: string | undefined = undefined;
+    if (clientSecret !== "" && tokenEndpoint !== undefined && !alreadyVerified) {
+      const refreshProbe = opts.refreshOAuthToken ?? probeMcpOAuthRefresh;
+      // Bound the probe (issue #283 High): a hanging endpoint must not wedge
+      // the lock holder. On timeout → TRANSIENT (kept unverified, not
+      // deleted). The production probe also aborts its fetch at `timeoutMs`.
+      const outcome = await probeWithTimeout(
+        refreshProbe,
+        {
+          refreshToken: refresh,
+          clientId,
+          clientSecret,
+          tokenEndpoint,
+          authMethod: row?.tokenEndpointAuthMethod,
+          timeoutMs: probeTimeoutMs,
+        },
+        probeTimeoutMs,
       );
-      return { notes, warnings, wrote: false };
-    }
-    if (!outcome.minted) {
-      notes.push(
-        `bottega proxy: ${fileName} seeded (${provider} OAuth refresh could not be verified ` +
-          `${outcome.status === undefined ? "token endpoint unreachable" : `HTTP ${outcome.status}`} — ` +
-          "writing the existing refresh token unverified)",
-      );
-    } else {
-      refreshToken = outcome.refreshToken;
-      if (outcome.refreshToken !== refresh) {
-        // Rotation write-back (issue #269): persist the endpoint's rotated
-        // refresh token to the vault row (the broker write seam connect.ts
-        // uses) so a later boot/reconnect re-reads a LIVE token. A failed
-        // write-back is receivable — the blob still carries the rotated
-        // token for THIS seed (the proxy works until the next re-seed).
-        const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
-        try {
-          await persistRotated(provider, rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }));
-          notes.push(
-            `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed; ` +
-              "rotated token written back to the vault)",
-          );
-        } catch (err) {
-          warnings.push(
-            `bottega proxy: ${fileName} rotated refresh token could not be written back to the vault ` +
-              `(${errorMessage(err)}) — the next boot will re-read the consumed token; reconnect ${provider} if it fails`,
-          );
-          notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed)`);
-        }
-      } else {
-        notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant verified)`);
+      if (
+        !outcome.minted &&
+        outcome.status !== undefined &&
+        outcome.status >= 400 &&
+        outcome.status < 500 &&
+        outcome.status !== 429
+      ) {
+        // The grant is dead (invalid_grant / revoked): fail closed — never a
+        // blob that mints nothing. The warning NAMES the reconnect path.
+        deleteSecretFile(opts.secretsDir, fileName);
+        warnings.push(
+          `bottega proxy: ${fileName} REMOVED — ${provider} refresh token REJECTED (HTTP ${outcome.status}); ` +
+            `reconnect ${provider} to mint a fresh grant (fail closed)`,
+        );
+        return { notes, warnings, wrote: false };
       }
+      if (!outcome.minted) {
+        notes.push(
+          `bottega proxy: ${fileName} seeded (${provider} OAuth refresh could not be verified ` +
+            `${outcome.status === undefined ? "token endpoint unreachable" : `HTTP ${outcome.status}`} — ` +
+            "writing the existing refresh token unverified)",
+        );
+      } else {
+        verifiedFrom = refresh;
+        refreshToken = outcome.refreshToken;
+        if (outcome.refreshToken !== refresh) {
+          // Rotation write-back (issue #269): persist the endpoint's rotated
+          // refresh token to the vault row (the broker write seam connect.ts
+          // uses) so a later boot/reconnect re-reads a LIVE token. A failed
+          // write-back is receivable — the blob still carries the rotated
+          // token for THIS seed (the proxy works until the next re-seed).
+          const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
+          try {
+            await persistRotated(provider, rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }));
+            notes.push(
+              `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed; ` +
+                "rotated token written back to the vault)",
+            );
+          } catch (err) {
+            warnings.push(
+              `bottega proxy: ${fileName} rotated refresh token could not be written back to the vault ` +
+                `(${errorMessage(err)}) — the next boot will re-read the consumed token; reconnect ${provider} if it fails`,
+            );
+            notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token refreshed)`);
+          }
+        } else {
+          notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant verified)`);
+        }
+      }
+    } else if (alreadyVerified) {
+      // Vault still reads the stale pre-rotation A (the broker snapshot has
+      // not caught up), and this blob records `verified_from === A`. The
+      // single-use A is CONSUMED — re-probing it would 400. Re-verify the
+      // blob's LIVE rotated token B instead (never blindly trust it: the
+      // write-back of B to the vault may have failed, and B could be
+      // revoked). Under the cross-process lock this runs at most once per
+      // blob.
+      const refreshProbe = opts.refreshOAuthToken ?? probeMcpOAuthRefresh;
+      // Bound the probe (issue #283 High): a hanging endpoint must not wedge
+      // the lock holder. On timeout → TRANSIENT (keep B unverified below).
+      const outcome = await probeWithTimeout(
+        refreshProbe,
+        {
+          refreshToken: existingBlob!.refresh_token,
+          clientId,
+          clientSecret,
+          tokenEndpoint,
+          authMethod: row?.tokenEndpointAuthMethod,
+          timeoutMs: probeTimeoutMs,
+        },
+        probeTimeoutMs,
+      );
+      if (
+        !outcome.minted &&
+        outcome.status !== undefined &&
+        outcome.status >= 400 &&
+        outcome.status < 500 &&
+        outcome.status !== 429
+      ) {
+        // The blob's rotated token B is dead (revoked / consumed): fail
+        // closed loudly — never seed a blob that mints nothing. The warning
+        // NAMES the reconnect path. The vault token A is not re-probed (it
+        // was already consumed), so the whole chain is dead until a fresh
+        // authorization lands.
+        deleteSecretFile(opts.secretsDir, fileName);
+        warnings.push(
+          `bottega proxy: ${fileName} REMOVED — ${provider} refresh token REJECTED on re-verification ` +
+            `(HTTP ${outcome.status}); reconnect ${provider} to mint a fresh grant (fail closed)`,
+        );
+        return { notes, warnings, wrote: false };
+      }
+      // B is (still) reachable. Keep the durable marker linking the stale
+      // vault A to this blob, and carry the LIVE token — B if unchanged,
+      // or C if this re-verification rotated it (persisting C, the same
+      // #269 write-back, so the vault advances once it re-observes).
+      refreshToken = outcome.refreshToken;
+      verifiedFrom = refresh;
+      if (!outcome.minted) {
+        // Transient (unreachable / 5xx / 429): keep B unverified — the codex
+        // #230 posture.
+        refreshToken = existingBlob!.refresh_token;
+        notes.push(
+          `bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant re-verified ` +
+            `${outcome.status === undefined ? "token endpoint unreachable" : `HTTP ${outcome.status}`} — ` +
+            "keeping the live rotated token unverified)",
+        );
+      } else {
+        if (outcome.refreshToken !== existingBlob!.refresh_token) {
+          const persistRotated = opts.persistRotatedToken ?? persistRotatedTokenToVault;
+          try {
+            await persistRotated(
+              provider,
+              rotatedVaultCredential({ row, refreshToken, outcome, clientId, clientSecret }),
+            );
+            notes.push(
+              `bottega proxy: ${fileName} seeded (${provider} OAuth refresh token re-verified and rotated; ` +
+                "rotated token written back to the vault)",
+            );
+          } catch (err) {
+            warnings.push(
+              `bottega proxy: ${fileName} re-verified rotated refresh token could not be written back to the vault ` +
+                `(${errorMessage(err)}) — the next boot will re-probe the blob's live token`,
+            );
+            notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant re-verified)`);
+          }
+        } else {
+          notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh grant re-verified)`);
+        }
+      }
+    } else {
+      notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
     }
-  } else {
-    notes.push(`bottega proxy: ${fileName} seeded (${provider} OAuth refresh token)`);
-  }
-  const blob: ProxyOAuthBlob = { refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret };
-  writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
-  return { notes, warnings, wrote: true };
+    const blob: ProxyOAuthBlob = {
+      refresh_token: refreshToken,
+      client_id: clientId,
+      client_secret: clientSecret,
+      // Issue #283: record that `refresh_token` was PRODUCED by a successful
+      // app-side probe of the ORIGINAL `refresh` (verifiedFrom) — the durable
+      // cross-process marker a repeat (stale-snapshot) sync uses to re-verify
+      // the LIVE token instead of re-consuming the single-use original. Only
+      // written when this seed actually verified the grant.
+      ...(verifiedFrom !== undefined ? { verified_from: verifiedFrom } : {}),
+    };
+    writeSecretFile(opts.secretsDir, fileName, JSON.stringify(blob));
+    return { notes, warnings, wrote: true };
+  });
 }
 
 /**
@@ -1254,6 +1574,7 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
       log,
       refreshOAuthToken: opts.refreshOAuthToken,
       persistRotatedToken: opts.persistRotatedToken,
+      probeTimeoutMs: opts.probeTimeoutMs,
     });
     for (const note of result.notes) log(note);
     for (const warning of result.warnings) log(warning);

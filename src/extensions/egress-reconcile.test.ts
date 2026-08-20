@@ -380,11 +380,13 @@ describe("connect-time egress reconcile (#250)", () => {
             refresh_token?: string;
             client_id?: string;
             client_secret?: string;
+            verified_from?: string;
           };
           expect(blob).toEqual({
             refresh_token: "rt-notion-broker",
             client_id: "cli_notion_broker",
             client_secret: "cs_notion_broker",
+            verified_from: "rt-notion-broker",
           });
         },
       );

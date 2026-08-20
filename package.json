@@ -18,6 +18,7 @@
     "@emulators/slack": "^0.9.0",
     "@oxlint/plugins": "1.78.0",
     "@types/bun": "latest",
+    "@types/proper-lockfile": "4.1.4",
     "oxlint": "1.78.0",
     "typescript": "^5.5.0"
   },
@@ -25,6 +26,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@oh-my-pi/pi-coding-agent": "^17.3.4",
     "@slack/bolt": "^5.0.0",
+    "proper-lockfile": "4.1.2",
     "undici": "^8.10.0",
     "zod": "^4.4.3"
   }
