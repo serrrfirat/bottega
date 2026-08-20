@@ -2,8 +2,8 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { pruneDigestMemories } from "../memory/sqlite";
-import { maintainMemory, type ConsolidationModelCall } from "../memory/consolidation";
 import { sessionSearchToolDefinitions } from "../memory/session-search";
+import { createMemoryConsolidationTrigger } from "./services/memory-consolidation-trigger";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
@@ -19,7 +19,6 @@ import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../t
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
 import { loadKbConfig } from "../kb/config";
-import { z } from "zod";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
@@ -53,7 +52,6 @@ import {
   SessionModelRoleRegistry,
   sessionIdFromFilePath,
   type AgentDriver,
-  type AgentSessionDriver,
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { startOutboxPostSeam } from "./services/outbox-post-seam";
@@ -697,60 +695,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // model from OUR models.yml.
   const available = await assertAgentDirModelAvailable(agentDir);
   console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
-  let consolidationSequence = 0;
-  const consolidationModelCall: ConsolidationModelCall = async (systemPrompt, input) => {
-    let reply: string | undefined;
-    let sideSession: AgentSessionDriver | undefined;
-    let offMessage: (() => void) | undefined;
-    try {
-      sideSession = await driver.createSession({
-        spaceId: `memory-consolidation:${++consolidationSequence}`,
-        transcriptDir: "data/memory-consolidation",
-        allowTools: [],
-        appendSystemPrompt: systemPrompt,
-        onOutput: (_spaceId, text) => {
-          if (text.trim()) reply = text;
-        },
-      });
-      offMessage = sideSession.on("message", (data) => {
-        // The driver emits { spaceId, text } payloads; parse at the event boundary so
-        // only string text is captured (defensive against other message shapes).
-        const text = z.object({ text: z.string().optional() }).safeParse(data);
-        if (text.success && text.data.text && text.data.text.trim()) reply = text.data.text;
-      });
-      await sideSession.prompt(input);
-      return reply;
-    } finally {
-      offMessage?.();
-      if (sideSession) {
-        try {
-          await sideSession.dispose();
-        } catch (error) {
-          console.error("[memory-consolidation] side-session dispose failed:", error);
-        }
-      }
-    }
-  };
-
-  let consolidationInFlight: Promise<void> | undefined;
-  const runMemoryMaintenance = (): void => {
-    if (memoryProvider.backend !== "sqlite" || consolidationInFlight) return;
-    consolidationInFlight = (async () => {
-      try {
-        await maintainMemory(store.getDb(), consolidationModelCall);
-      } catch (error) {
-        console.error("[memory-consolidation] maintenance failed:", error);
-      } finally {
-        consolidationInFlight = undefined;
-      }
-    })();
-  };
-  const memoryMaintenanceInterval =
-    memoryProvider.backend === "sqlite"
-      ? setInterval(runMemoryMaintenance, 6 * 60 * 60 * 1_000)
-      : undefined;
-  memoryMaintenanceInterval?.unref?.();
-  runMemoryMaintenance();
+  // Memory consolidation trigger (issue #272, epic #229 P2): the sqlite
+  // backend enqueues a `scheduled` memory_consolidation WORKER job at boot
+  // and every 6 hours — the LLM leg (the side session this process used to
+  // run) moved into the executor's job-context model-call seam. The trigger
+  // semantics (sqlite backend gate + the pipeline's compaction threshold)
+  // are unchanged; this process only enqueues.
+  const memoryConsolidationTrigger = createMemoryConsolidationTrigger({
+    store,
+    memoryProvider,
+    log: (line) => console.log(line),
+  });
+  memoryConsolidationTrigger.start();
   spaceService = new SpaceService({
     store,
     adapter,
@@ -838,7 +794,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       scheduler.start();
     },
     async stop() {
-      if (memoryMaintenanceInterval) clearInterval(memoryMaintenanceInterval);
+      memoryConsolidationTrigger.stop();
       // The upload-link leg has no listener of its own — it mounts onto the
       // callback's shared surface, stopped here.
       oauthCallback.stop();
@@ -846,7 +802,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       outboxPostSeam.stop();
       scheduler.stop();
       await spaceService.stop();
-      await consolidationInFlight;
       await adapter.stop();
       store.close();
     },
