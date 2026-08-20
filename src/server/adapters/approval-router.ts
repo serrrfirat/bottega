@@ -21,12 +21,22 @@ import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../../
 import { redact } from "../../policy/audit";
 import { DEFAULT_TIMEOUT_MINUTES } from "../../policy/config";
 import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
+import { emitToolStep, nextToolStepId, toolStepTitle, type ToolStepSink } from "../services/slack-turn-presenter";
 
-/** Cap for the args summary rendered in the approval prompt (redacted first). */
+/** Cap for the args summary text rendered in the approval prompt (redacted first). */
 export const ARGS_SUMMARY_MAX_CHARS = 2000;
+
+/** Per-row cap for an argument value rendered in the approval prompt. */
+export const ARGS_ROW_VALUE_MAX = 300;
+
+/** Rows rendered before a "… and N more fields" note on the approval prompt. */
+export const ARGS_ROW_MAX = 12;
 
 /** Registry bound: at capacity the oldest pending request is evicted (denied). */
 export const MAX_PENDING_REQUESTS = 64;
+
+/** Cap for the confirmed-write-failure memory; the oldest entry is evicted at capacity. */
+export const FAILURE_MEMORY_MAX = 64;
 
 interface PendingRequest {
   id: string;
@@ -48,68 +58,195 @@ export interface SlackApprovalRouterDeps {
   timeoutMs?: number;
   /** Bounded-registry cap; oldest entry evicted (denied) beyond this. Default {@link MAX_PENDING_REQUESTS}. */
   maxPending?: number;
+  /** Complexity cap for the confirmed-write-failure memory. Default {@link FAILURE_MEMORY_MAX}. */
+  maxFailures?: number;
+  /**
+   * Presenter/step path (issue #277): when present, a confirmed write that
+   * fails posts a failure step card through this sink — the SAME path tool
+   * steps already use, never a parallel messaging API.
+   */
+  onToolStep?: ToolStepSink;
   /** Observability seam; defaults to console.log. */
   log?: (line: string) => void;
 }
 
+/** One human-readable row of a would-be-write payload. */
+export interface ApprovalArgRow {
+  label: string;
+  value: string;
+}
+
 /**
- * Redacted, capped args summary shared by the prompt's block and text
- * surfaces (issue #160): the payload a human approves, never the raw args.
+ * Humanizes an arg key: camelCase / snake_case / kebab-case become spaced
+ * title words ('addTeams'/'due_date' → 'Add teams' / 'Due date').
+ */
+export function humanizeKey(key: string): string {
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2") // camelCase → "camel Case"
+    .replace(/[_-]+/g, " ") // snake/kebab → spaces
+    .replace(/\s+/g, " ") // collapse whitespace
+    .trim()
+    .toLowerCase(); // 'addTeams' → 'add teams' (title-caps the first letter below)
+  return words.length === 0 ? key : words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** True for values that carry no information on an approval card (elided). */
+function isEmptyValue(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (typeof v === "string") return v === "";
+  if (typeof v === "number" || typeof v === "boolean") return false;
+  if (Array.isArray(v)) return v.length === 0;
+  if (v instanceof Set) return v.size === 0;
+  if (v instanceof Map) return v.size === 0;
+  return Object.keys(v).length === 0;
+}
+
+/**
+ * One arg value rendered for the prompt: redacted FIRST (the same redaction
+ * the audit module applies — secret-shaped values never reach the card),
+ * then capped per value with an ellipsis.
+ */
+function renderArgValue(v: unknown): string {
+  let text: string;
+  if (typeof v === "string") text = v;
+  else if (typeof v === "number" || typeof v === "boolean") text = String(v);
+  else text = JSON.stringify(v) ?? "";
+  text = redact(text);
+  return text.length > ARGS_ROW_VALUE_MAX ? `${text.slice(0, ARGS_ROW_VALUE_MAX)}…` : text;
+}
+
+/**
+ * Humanized, redacted, capped rows for the would-be-write payload (issue
+ * #277): keys become title words, empty values are elided, values are
+ * redacted then capped, and the row list is capped.
+ */
+export function humanizeArgsRows(args: unknown): ApprovalArgRow[] {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return [];
+  const entries = Object.entries(args as Record<string, unknown>);
+  const rows: ApprovalArgRow[] = [];
+  for (const [key, value] of entries) {
+    if (isEmptyValue(value)) continue;
+    rows.push({ label: humanizeKey(key), value: renderArgValue(value) });
+  }
+  return rows;
+}
+
+/**
+ * Mrkdwn lines for the humanized rows, capped at ARGS_ROW_MAX with a "…
+ * and N more fields" note for the rest.
+ */
+export function renderArgsRowsText(rows: readonly ApprovalArgRow[]): string {
+  const shown = rows.slice(0, ARGS_ROW_MAX);
+  const lines = shown.map((row) => `• *${row.label}:* ${row.value}`);
+  if (rows.length > ARGS_ROW_MAX) lines.push(`… and ${rows.length - ARGS_ROW_MAX} more fields`);
+  return lines.join("\n");
+}
+
+/**
+ * Redacted, capped, humanized args summary shared by the prompt's block and
+ * text surfaces (issue #277): the payload a human approves — labeled rows,
+ * never raw flat JSON.
  */
 export function approvalArgsSummary(d: ApprovalRequest): string {
-  const argsText = redact(JSON.stringify(d.args) ?? "");
-  return argsText.length > ARGS_SUMMARY_MAX_CHARS ? `${argsText.slice(0, ARGS_SUMMARY_MAX_CHARS)}...[truncated]` : argsText;
+  const text = renderArgsRowsText(humanizeArgsRows(d.args));
+  return text.length > ARGS_SUMMARY_MAX_CHARS ? `${text.slice(0, ARGS_SUMMARY_MAX_CHARS)}...[truncated]` : text;
 }
 
 /**
  * Plain-text form of the approval prompt (the fallback under the blocks):
- * tool name + the redacted payload, so an approval decides the actual call,
- * not the tool name alone (issue #160).
+ * tool name + the redacted, humanized payload, so an approval decides the
+ * actual call, not the tool name alone (issue #160/#277).
  */
 export function approvalPromptText(d: ApprovalRequest): string {
   return `Approval required for ${d.tool} — ${approvalArgsSummary(d)}`;
 }
 
 /**
- * Renders the interactive approval prompt blocks: tool + reason + redacted
- * args summary, then Approve/Deny buttons carrying the request id. Pure so
- * the outbound rendering is testable without Slack.
+ * Bounded memory of confirmed-write failures per (space, tool): at most
+ * {@link FAILURE_MEMORY_MAX} entries, evicting the OLDEST (insertion-ordered
+ * Map, refreshed on record) at capacity — never unbounded. A later approval
+ * card for the same tool surfaces 'last confirmed write failed: <reason>'.
  */
-export function buildApprovalBlocks(d: ApprovalRequest, id: string): unknown[] {
-  const args = approvalArgsSummary(d);
-  return [
+export class ApprovalFailureMemory {
+  private readonly entries = new Map<string, string>();
+  private readonly max: number;
+
+  constructor(max = FAILURE_MEMORY_MAX) {
+    this.max = max;
+  }
+
+  /** Number of remembered failures (observability for the bounded-memory test). */
+  get size(): number {
+    return this.entries.size;
+  }
+
+  record(spaceId: string, tool: string, reason: string): void {
+    const key = `${spaceId}\u0000${tool}`;
+    // Delete + re-set refreshes recency (oldest-first iteration order).
+    this.entries.delete(key);
+    this.entries.set(key, reason);
+    while (this.entries.size > this.max) {
+      this.entries.delete(this.entries.keys().next().value as string);
+    }
+  }
+
+  /** The last confirmed-write failure reason for (space, tool), if any. */
+  lastFailure(spaceId: string, tool: string): string | undefined {
+    return this.entries.get(`${spaceId}\u0000${tool}`);
+  }
+}
+
+/**
+ * Renders the interactive approval prompt blocks: tool + reason + the
+ * humanized would-be-write payload (labeled rows), an optional
+ * 'last confirmed write failed' banner, then Approve/Deny buttons carrying
+ * the request id. Pure so the outbound rendering is testable without Slack.
+ */
+export function buildApprovalBlocks(d: ApprovalRequest, id: string, rememberedFailure?: string): unknown[] {
+  const args = renderArgsRowsText(humanizeArgsRows(d.args));
+  const blocks: unknown[] = [
     {
       type: "section",
       text: { type: "mrkdwn", text: `*Approval required* — \`${d.tool}\`` },
     },
     {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*Reason:* ${d.reason}\n*Args:* \`\`\`${args}\`\`\``,
-      },
-    },
-    {
-      type: "actions",
-      block_id: "bottega_approval",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Approve" },
-          action_id: APPROVE_ACTION_ID,
-          value: id,
-          style: "primary",
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Deny" },
-          action_id: DENY_ACTION_ID,
-          value: id,
-          style: "danger",
-        },
-      ],
+      text: { type: "mrkdwn", text: `*Reason:* ${d.reason}` },
     },
   ];
+  if (args.length > 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Would-be write:*\n${args}` },
+    });
+  }
+  if (rememberedFailure !== undefined && rememberedFailure.length > 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Last confirmed write failed:* ${redact(rememberedFailure)}` },
+    });
+  }
+  blocks.push({
+    type: "actions",
+    block_id: "bottega_approval",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Approve" },
+        action_id: APPROVE_ACTION_ID,
+        value: id,
+        style: "primary",
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Deny" },
+        action_id: DENY_ACTION_ID,
+        value: id,
+        style: "danger",
+      },
+    ],
+  });
+  return blocks;
 }
 
 /**
@@ -131,12 +268,16 @@ export class SlackApprovalRouter implements ApprovalRouter {
   private readonly adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
   private readonly timeoutMs: number;
   private readonly maxPending: number;
+  private readonly failures: ApprovalFailureMemory;
+  private readonly onToolStep: ToolStepSink | undefined;
   private readonly log: (line: string) => void;
 
   constructor(deps: SlackApprovalRouterDeps) {
     this.adapter = deps.adapter;
     this.timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MINUTES * 60_000;
     this.maxPending = deps.maxPending ?? MAX_PENDING_REQUESTS;
+    this.failures = new ApprovalFailureMemory(deps.maxFailures ?? FAILURE_MEMORY_MAX);
+    this.onToolStep = deps.onToolStep;
     this.log = deps.log ?? ((line) => console.log(line));
   }
 
@@ -145,14 +286,42 @@ export class SlackApprovalRouter implements ApprovalRouter {
     return this.pending.size;
   }
 
-  /**
-   * The unresolved prompts (issue #228): one entry per outstanding
-   * approval, carrying the request's space and tool. The `list_todos`
-   * snapshot reads this to report pending approvals; a settled or expired
-   * request is never listed.
-   */
+  /** Number of remembered confirmed-write failures (bounded-memory observability). */
+  get failureMemorySize(): number {
+    return this.failures.size;
+  }
+
+  /** Number of unresolved pending requests (registry observability for tests). */
   pendingPrompts(): ReadonlyArray<{ spaceId: string; tool: string }> {
     return [...this.pending.values()].map((entry) => ({ spaceId: entry.spaceId, tool: entry.tool }));
+  }
+
+  /**
+   * The last confirmed-write failure reason for (space, tool), if any — the
+   * bounded memory a later approval card surfaces (issue #277).
+   */
+  lastConfirmedWriteFailure(spaceId: string, tool: string): string | undefined {
+    return this.failures.lastFailure(spaceId, tool);
+  }
+
+  /**
+   * Records a confirmed write whose execution FAILED (issue #277): remembered
+   * per (space, tool) in the BOUNDED memory, and — when a step sink is wired —
+   * posted back into the thread as a failure step card through the existing
+   * presenter/step path (never a parallel messaging API). The decision policy
+   * is untouched: this only reports a downstream failure.
+   */
+  recordConfirmedWriteFailure(spaceId: string, tool: string, reason: string): void {
+    const text = reason && reason.trim().length > 0 ? reason.trim() : "confirmed write failed";
+    this.failures.record(spaceId, tool, text);
+    emitToolStep(this.onToolStep, {
+      spaceId: spaceId === "" ? undefined : spaceId,
+      taskId: nextToolStepId(),
+      title: toolStepTitle(tool, "confirmed write failed"),
+      status: "complete",
+      output: redact(text),
+    });
+    this.log(`[approvals] confirmed write failed for ${tool}: ${text}`);
   }
 
   async request(d: ApprovalRequest): Promise<ApprovalResolution> {
@@ -191,7 +360,7 @@ export class SlackApprovalRouter implements ApprovalRouter {
     this.pending.set(id, entry);
     try {
       const messageTs = await this.adapter.postMessage(d.spaceId, approvalPromptText(d), {
-        blocks: buildApprovalBlocks(d, id),
+        blocks: buildApprovalBlocks(d, id, this.failures.lastFailure(d.spaceId, d.tool)),
       });
       if (messageTs === undefined) {
         // Fail closed: an unroutable prompt denies the request.
