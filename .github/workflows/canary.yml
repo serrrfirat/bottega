@@ -67,12 +67,16 @@ jobs:
       - run: bun install --frozen-lockfile
 
       # CI-strict (--ci): missing secrets fail loudly instead of skipping.
-      # The focused layer/journey/role inputs are passed through as filters.
+      # The focused layer/journey/role inputs flow as ENV (never interpolated
+      # into shell source — finding #7); the canary CLI parses them itself.
       - name: Run the live-API canary (CI-strict)
         id: canary
         env:
           CI: "true"
           CANARY_CI: "1"
+          CANARY_INPUT_LAYER: ${{ inputs.layer }}
+          CANARY_INPUT_JOURNEY: ${{ inputs.journey }}
+          CANARY_INPUT_ROLE: ${{ inputs.role }}
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_QA_USER_TOKEN: ${{ secrets.SLACK_QA_USER_TOKEN }}
@@ -80,17 +84,22 @@ jobs:
           SLACK_QA_APPROVER_TOKEN: ${{ secrets.SLACK_QA_APPROVER_TOKEN }}
           SLACK_QA_MEMBER_TOKEN: ${{ secrets.SLACK_QA_MEMBER_TOKEN }}
           SLACK_QA_SECOND_MEMBER_TOKEN: ${{ secrets.SLACK_QA_SECOND_MEMBER_TOKEN }}
+          SLACK_QA_REQUESTER_ID: ${{ secrets.SLACK_QA_REQUESTER_ID }}
+          SLACK_QA_APPROVER_ID: ${{ secrets.SLACK_QA_APPROVER_ID }}
+          SLACK_QA_MEMBER_ID: ${{ secrets.SLACK_QA_MEMBER_ID }}
+          SLACK_QA_SECOND_MEMBER_ID: ${{ secrets.SLACK_QA_SECOND_MEMBER_ID }}
           SLACK_QA_USER_ID: ${{ secrets.SLACK_QA_USER_ID }}
           SLACK_QA_CHANNEL: ${{ secrets.SLACK_QA_CHANNEL }}
           NEAR_API_KEY: ${{ secrets.NEAR_API_KEY }}
           CANARY_MODEL_REF: ${{ secrets.CANARY_MODEL_REF }}
         run: |
           set -o pipefail
-          ARGS="--live-slack --ci"
-          if [[ -n "${{ inputs.layer }}" ]]; then ARGS="$ARGS --layer ${{ inputs.layer }}"; fi
-          if [[ -n "${{ inputs.journey }}" ]]; then ARGS="$ARGS --journey ${{ inputs.journey }}"; fi
-          if [[ -n "${{ inputs.role }}" ]]; then ARGS="$ARGS --role ${{ inputs.role }}"; fi
-          bun run canary $ARGS 2>&1 | tee canary-report.txt
+          ARGS=(--live-slack --ci)
+          # env-carried inputs → positional args (quoted; never evaluated as shell).
+          if [[ -n "${CANARY_INPUT_LAYER:-}" ]]; then ARGS+=("--layer" "$CANARY_INPUT_LAYER"); fi
+          if [[ -n "${CANARY_INPUT_JOURNEY:-}" ]]; then ARGS+=("--journey" "$CANARY_INPUT_JOURNEY"); fi
+          if [[ -n "${CANARY_INPUT_ROLE:-}" ]]; then ARGS+=("--role" "$CANARY_INPUT_ROLE"); fi
+          bun run canary "${ARGS[@]}" 2>&1 | tee canary-report.txt
 
       # One ISOLATED rerun on failure (issue #298): classify a flake. The
       # ORIGINAL report is preserved (canary-report.txt) and the rerun's
@@ -122,19 +131,28 @@ jobs:
       # Machine-readable status artifact for release automation (issue #298):
       # green + younger than 24h. NOT a merge gate — the scheduled canary is
       # a release gate only; this artifact is what release automation checks.
+      # The one-isolated-rerun classification (scripts/canary-rerun.ts) feeds
+      # it: the ORIGINAL verdict stays release-blocking; a recovered-on-rerun
+      # flake is reported distinctly (finding #5).
       - name: Write the machine-readable status artifact
         id: status
         run: |
-          if [ -f canary-rerun.txt ]; then RERUN="true"; else RERUN="false"; fi
-          STATUS="failed"
-          if grep -q "live-slack canary PASSED" canary-report.txt 2>/dev/null; then STATUS="passed"; fi
-          # The ORIGINAL verdict drives the release-blocking status; a rerun
-          # that recovered (green) is reported distinctly via the rerun flag.
+          set -o pipefail
+          ORIGINAL_STATUS="failed"
+          if grep -q "live-slack canary PASSED" canary-report.txt 2>/dev/null; then ORIGINAL_STATUS="passed"; fi
+          RECOVERED="false"
+          if [[ -f canary-rerun.txt ]] && [[ -f canary-report.txt ]]; then
+            # Classify: recovered-on-rerun when the original failed but the isolated rerun passed.
+            VERDICT="$(bun run scripts/canary-rerun.ts canary-report.txt canary-rerun.txt || true)"
+            case "$VERDICT" in *RECOVERED*) RECOVERED="true" ;; esac
+          fi
+          STATUS="$ORIGINAL_STATUS"
+          [[ "$STATUS" == "failed" && "$RECOVERED" == "true" ]] && STATUS="recovered-on-rerun"
           AT="$(date +%s)000"
           jq -n \
             --arg layer "live-api" \
             --arg status "$STATUS" \
-            --arg rerun "$RERUN" \
+            --arg rerun "$RECOVERED" \
             --arg at "$AT" \
             '{layer:$layer,status:$status,rerun:$rerun,at:$at}' \
             > canary-status.json
@@ -149,12 +167,16 @@ jobs:
           if-no-files-found: ignore
 
       # Failure notifies loudly (the QA channel gets the per-journey report
-      # + permalinks + run URL + layer/actors; see scripts/canary-notify.ts).
+      # + permalinks + run URL + layer/actors + rerun context; see
+      # scripts/canary-notify.ts). CANARY_RERUN_REPORT lets the notify show
+      # when the isolated rerun recovered (flake) while the original failure
+      # stays release-blocking (finding #5).
       - name: Notify the QA channel on failure
         if: failure() && steps.canary.outcome == 'failure'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_QA_CHANNEL: ${{ secrets.SLACK_QA_CHANNEL }}
+          CANARY_RERUN_REPORT: canary-rerun.txt
         run: bun run scripts/canary-notify.ts canary-report.txt
 
   # ---------------------------------------------------------------------------
@@ -170,39 +192,47 @@ jobs:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
 
-      # Preflight both authenticated profiles (runner-local paths, NOT
-      # secrets). The profiles hold the workspace sessions pre-authenticated.
-      # A missing/unauthenticated profile fails the job loudly — never a
+      # Preflight every Chrome profile the selected journeys use (requester +
+      # approver + member; runner-local paths from vars, NOT secrets). A
+      # missing/unauthenticated profile fails the job loudly — never a
       # silent skip or a fabricated browser pass.
       - name: Preflight the runner Chrome profiles
         env:
           BROWSER_PROFILE_REQUESTER: ${{ vars.BROWSER_PROFILE_REQUESTER }}
           BROWSER_PROFILE_APPROVER: ${{ vars.BROWSER_PROFILE_APPROVER }}
-          BROWSER_APPROVER: ${{ vars.BROWSER_APPROVER }}
+          BROWSER_PROFILE_MEMBER: ${{ vars.BROWSER_PROFILE_MEMBER }}
         run: |
           set -euo pipefail
-          for p in "$BROWSER_PROFILE_REQUESTER" "$BROWSER_PROFILE_APPROVER"; do
-            if [[ -z "$p" || ! -d "$p" ]]; then
-              echo "::error::browser canary preflight: profile dir '$p' missing — configure the runner-local profile paths (issues/vars.BROWSER_PROFILE_*)"
+          for p in "$BROWSER_PROFILE_REQUESTER" "$BROWSER_PROFILE_APPROVER" "${BROWSER_PROFILE_MEMBER:-}"; do
+            if [[ -z "$p" ]]; then continue; fi
+            if [[ ! -d "$p" ]]; then
+              echo "::error::browser canary preflight: profile dir '$p' missing — configure the runner-local profile variable"
               exit 1
             fi
             echo "preflight OK: $p"
           done
 
-      # Run the five browser journeys. --layer browser / --journey / --role
-      # focus the run when dispatched manually; the runner-local Chrome +
-      # workspace URL come from runner vars (never secrets).
+      # Run the browser journeys. Focused --journey / --role flow as ENV
+      # (never interpolated into shell source — finding #7); the runner-local
+      # Chrome profiles + workspace URL come from runner vars (never secrets).
+      # Every second profile a journey uses must be wired (finding #2).
       - name: Run the browser canary
         id: browser
         env:
-          BROWSER_PROFILE_DIR: ${{ vars.BROWSER_PROFILE_REQUESTER }}
+          BROWSER_PROFILE_REQUESTER: ${{ vars.BROWSER_PROFILE_REQUESTER }}
+          BROWSER_PROFILE_APPROVER: ${{ vars.BROWSER_PROFILE_APPROVER }}
+          BROWSER_PROFILE_MEMBER: ${{ vars.BROWSER_PROFILE_MEMBER }}
           BROWSER_EVIDENCE_DIR: browser-evidence
           SLACK_WORKSPACE_URL: ${{ vars.SLACK_WORKSPACE_URL }}
+          CANARY_INPUT_JOURNEY: ${{ inputs.journey }}
+          CANARY_INPUT_ROLE: ${{ inputs.role }}
+          CANARY_INPUT_LAYER: ${{ inputs.layer }}
         run: |
-          ARGS=""
-          if [[ -n "${{ inputs.journey }}" ]]; then ARGS="--journey ${{ inputs.journey }}"; fi
-          if [[ -n "${{ inputs.role }}" ]]; then ARGS="$ARGS --role ${{ inputs.role }}"; fi
-          bun run tests/e2e/browser-canary.ts $ARGS
+          ARGS=()
+          if [[ -n "${CANARY_INPUT_JOURNEY:-}" ]]; then ARGS+=("--journey" "$CANARY_INPUT_JOURNEY"); fi
+          if [[ -n "${CANARY_INPUT_ROLE:-}" ]]; then ARGS+=("--role" "$CANARY_INPUT_ROLE"); fi
+          if [[ -n "${CANARY_INPUT_LAYER:-}" ]]; then ARGS+=("--layer" "$CANARY_INPUT_LAYER"); fi
+          bash scripts/canary.sh --layer browser "${ARGS[@]}"
         continue-on-error: true
 
       # Upload the evidence (screenshots + traces + status) regardless of

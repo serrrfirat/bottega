@@ -188,8 +188,10 @@ export interface TokenDeps {
 
 export interface ResolvedLiveTokens {
   tokens?: LiveSlackTokens;
-  /** Env var names (env + Keychain both empty) that blocked the run. */
+  /** Env var names (env + Keychain both empty) that blocked the BASE run (app/bot/qa). */
   missing: string[];
+  /** Fixed-identity tokens that are missing (issue #298, finding #6/#9). */
+  identityMissing: string[];
 }
 
 /** Reads each token from env first, then the macOS Keychain service. */
@@ -214,7 +216,11 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
   if (!appToken) missing.push("SLACK_APP_TOKEN");
   if (!botToken) missing.push("SLACK_BOT_TOKEN");
   if (!qaUserToken) missing.push("SLACK_QA_USER_TOKEN");
-  if (!appToken || !botToken || !qaUserToken) return { missing };
+  if (!appToken || !botToken || !qaUserToken) return { missing, identityMissing: [] };
+  const identityMissing: string[] = [];
+  for (const { envKey, service } of IDENTITY_TOKEN_SLOTS) {
+    if (read(envKey, service) === undefined) identityMissing.push(envKey);
+  }
   const qaUserId = deps.env.SLACK_QA_USER_ID?.trim() || undefined;
   return {
     tokens: {
@@ -230,19 +236,21 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
       channelName: deps.env.SLACK_QA_CHANNEL?.trim() || "bottega-qa",
     },
     missing,
+    identityMissing,
   };
 }
 
 /**
- * The fixed-identity env slots, in a stable order (issue #298). Used by the
- * CI-strict gate to report exactly which identity tokens are missing.
+ * The four fixed-identity token slots: env key + Keychain service (issue
+ * #298). Used by {@link resolveLiveTokens} so CI-strict reports exactly
+ * which identity tokens are missing (finding #6/#9).
  */
-export const FIXED_IDENTITY_ENV = [
-  "SLACK_QA_REQUESTER_TOKEN",
-  "SLACK_QA_APPROVER_TOKEN",
-  "SLACK_QA_MEMBER_TOKEN",
-  "SLACK_QA_SECOND_MEMBER_TOKEN",
-] as const;
+export const IDENTITY_TOKEN_SLOTS: ReadonlyArray<{ envKey: string; service: string }> = [
+  { envKey: "SLACK_QA_REQUESTER_TOKEN", service: "bottega-slack-requester" },
+  { envKey: "SLACK_QA_APPROVER_TOKEN", service: "bottega-slack-approver" },
+  { envKey: "SLACK_QA_MEMBER_TOKEN", service: "bottega-slack-member" },
+  { envKey: "SLACK_QA_SECOND_MEMBER_TOKEN", service: "bottega-slack-second-member" },
+];
 
 /**
  * The real model's key (issue #71 semantics), env first then Keychain:
@@ -2436,6 +2444,19 @@ export async function runCanary(
     return {
       status: "skipped",
       message: `live-slack canary skipped — --layer ${filters.layer} does not target the live API leg; the browser layer runs on the self-hosted runner (issue #298)`,
+      journeys: [],
+    };
+  }
+  // CI-strict identity gate (findings #6/#9): the role/multiplayer matrix
+  // needs all four fixed identity tokens. Missing any → FAIL loudly in
+  // CI-strict (never a silent skip); locally it stays skip-gated.
+  if (resolved.identityMissing.length > 0 && ciStrict) {
+    return {
+      status: "failed",
+      message:
+        `live-slack canary FAILED in CI-strict mode — missing fixed-identity token(s): ${resolved.identityMissing.join(", ")} ` +
+        "(the role/multiplayer matrix (issue #298) needs all four; set them as GitHub Actions repository secrets — " +
+        "SLACK_QA_REQUESTER_TOKEN / SLACK_QA_APPROVER_TOKEN / SLACK_QA_MEMBER_TOKEN / SLACK_QA_SECOND_MEMBER_TOKEN)",
       journeys: [],
     };
   }

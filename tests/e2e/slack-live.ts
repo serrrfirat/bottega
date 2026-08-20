@@ -56,11 +56,11 @@ export interface LiveSlackTokens {
 export type FixedIdentity = "requester" | "approver" | "member" | "second-member";
 
 /** The token slot + user-id slot for one of the four fixed identities. */
-const FIXED_IDENTITY_SLOTS: Record<FixedIdentity, { tokenKey: "requesterToken" | "approverToken" | "memberToken" | "secondMemberToken"; userNameEnv: string }> = {
-  requester: { tokenKey: "requesterToken", userNameEnv: "SLACK_QA_REQUESTER_NAME" },
-  approver: { tokenKey: "approverToken", userNameEnv: "SLACK_QA_APPROVER_NAME" },
-  member: { tokenKey: "memberToken", userNameEnv: "SLACK_QA_MEMBER_NAME" },
-  "second-member": { tokenKey: "secondMemberToken", userNameEnv: "SLACK_QA_SECOND_MEMBER_NAME" },
+const FIXED_IDENTITY_SLOTS: Record<FixedIdentity, { tokenKey: "requesterToken" | "approverToken" | "memberToken" | "secondMemberToken"; userIdEnv: string; userNameEnv: string }> = {
+  requester: { tokenKey: "requesterToken", userIdEnv: "SLACK_QA_REQUESTER_ID", userNameEnv: "SLACK_QA_REQUESTER_NAME" },
+  approver: { tokenKey: "approverToken", userIdEnv: "SLACK_QA_APPROVER_ID", userNameEnv: "SLACK_QA_APPROVER_NAME" },
+  member: { tokenKey: "memberToken", userIdEnv: "SLACK_QA_MEMBER_ID", userNameEnv: "SLACK_QA_MEMBER_NAME" },
+  "second-member": { tokenKey: "secondMemberToken", userIdEnv: "SLACK_QA_SECOND_MEMBER_ID", userNameEnv: "SLACK_QA_SECOND_MEMBER_NAME" },
 };
 
 /** A raw message row as Slack's history APIs return it. */
@@ -280,9 +280,23 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
     const token = tokens[slot.tokenKey];
     if (!token) continue;
     identityClients.set(identity, new SlackApiClient(token));
-    const name = process.env[slot.userNameEnv]?.trim() || identity.replace("-", "-");
-    const found = usersCache.find((m) => m.name === name || m.real_name === name)?.user_id;
+    // An explicit workspace user id from the workflow secret wins (finding #6);
+    // otherwise resolve by display name from users.list.
+    const explicitId = process.env[slot.userIdEnv]?.trim();
+    let found = explicitId ?? undefined;
+    if (!found) {
+      const name = process.env[slot.userNameEnv]?.trim() ?? identity.replace("-", "-");
+      found = usersCache.find((m) => m.name === name || m.real_name === name)?.user_id;
+    }
     if (found) identityUserIds.set(identity, found);
+    else if (identityClients.has(identity)) {
+      // A token was wired but the user could not be resolved — the role
+      // journey must fail loudly, never silently skip (issue #298).
+      throw new Error(
+        `live-slack: identity "${identity}" token is wired but its user id could not be resolved — ` +
+          `set ${slot.userIdEnv} (repository secret) or create the ${slot.userNameEnv} user in the workspace (issue #298)`,
+      );
+    }
   }
 
   // QA DM: conversations.open with the bot token; fall back to im.open with

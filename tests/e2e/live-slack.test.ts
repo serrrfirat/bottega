@@ -23,6 +23,10 @@ const CANARY_ENV_KEYS = [
   "SLACK_APP_TOKEN",
   "SLACK_BOT_TOKEN",
   "SLACK_QA_USER_TOKEN",
+  "SLACK_QA_REQUESTER_TOKEN",
+  "SLACK_QA_APPROVER_TOKEN",
+  "SLACK_QA_MEMBER_TOKEN",
+  "SLACK_QA_SECOND_MEMBER_TOKEN",
   "SLACK_QA_USER_ID",
   "SLACK_QA_USER_NAME",
   "SLACK_QA_CHANNEL",
@@ -127,6 +131,51 @@ describe("live-slack canary skip gates (issue #79)", () => {
       expect(result.message).toContain("NEAR_API_KEY");
       expect(result.message).toContain("CODEX_AUTH_PATH");
       expect(result.message).toContain("CANARY_MODEL_REF");
+    });
+  });
+
+  test("CI-strict mode fails with a clear diagnostic when the fixed-identity tokens are missing (issue #298)", async () => {
+    await withScrubbedEnv(async () => {
+      process.env.CI = "true";
+      process.env.SLACK_APP_TOKEN = "xapp-test";
+      process.env.SLACK_BOT_TOKEN = "xoxb-test";
+      process.env.SLACK_QA_USER_TOKEN = "xoxp-test";
+      process.env.CANARY_MODEL_REF = "near/example/model";
+      const result = await runCanary(["--live-slack", "--ci"], { env: process.env, keychain: () => null });
+      expect(result.status).toBe("failed");
+      expect(result.message).toMatch(/FAILED in CI-strict mode/);
+      // The diagnostic names the missing identity token(s) (findings #6/#9).
+      expect(result.message).toContain("SLACK_QA_REQUESTER_TOKEN");
+      expect(result.message).toContain("fixed-identity");
+    });
+  });
+
+  test("with all four identity tokens wired, resolveLiveTokens reports no missing identity (finding #6/#9)", async () => {
+    await withScrubbedEnv(async () => {
+      process.env.SLACK_APP_TOKEN = "xapp-test";
+      process.env.SLACK_BOT_TOKEN = "xoxb-test";
+      process.env.SLACK_QA_USER_TOKEN = "xoxp-test";
+      process.env.SLACK_QA_REQUESTER_TOKEN = "xoxp-r";
+      process.env.SLACK_QA_APPROVER_TOKEN = "xoxp-a";
+      process.env.SLACK_QA_MEMBER_TOKEN = "xoxp-m";
+      process.env.SLACK_QA_SECOND_MEMBER_TOKEN = "xoxp-m2";
+      const resolved = resolveLiveTokens({ env: process.env, keychain: () => null });
+      expect(resolved.tokens).toBeDefined();
+      expect(resolved.missing).toEqual([]);
+      expect(resolved.identityMissing).toEqual([]);
+      // Without the identity tokens, each is reported under identityMissing.
+      delete process.env.SLACK_QA_REQUESTER_TOKEN;
+      delete process.env.SLACK_QA_APPROVER_TOKEN;
+      delete process.env.SLACK_QA_MEMBER_TOKEN;
+      delete process.env.SLACK_QA_SECOND_MEMBER_TOKEN;
+      const partial = resolveLiveTokens({ env: process.env, keychain: () => null });
+      expect(partial.missing).toEqual([]); // base tokens still present
+      expect(partial.identityMissing).toEqual([
+        "SLACK_QA_REQUESTER_TOKEN",
+        "SLACK_QA_APPROVER_TOKEN",
+        "SLACK_QA_MEMBER_TOKEN",
+        "SLACK_QA_SECOND_MEMBER_TOKEN",
+      ]);
     });
   });
 
