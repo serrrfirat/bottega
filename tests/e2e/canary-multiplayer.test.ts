@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { bootHarness, type StubTurn } from "./harness";
 import { workItemToolDefinitions } from "../../src/tools/work-items";
 import { memoryToolDefinitions } from "../../src/tools/memory";
+import type { MemoryScopeContext } from "../../src/memory/scope";
 import {
   APPROVAL_RESOLVED_EVENT,
   EXTENSION_CONNECTED_EVENT,
@@ -295,35 +296,61 @@ describe("multiplayer: personal credential isolation (issue #298)", () => {
 });
 
 describe("multiplayer: personal-vs-org memory isolation (issue #298)", () => {
-  test("a member's personal memory write is audited under the member; org writes are un-attributed", async () => {
+  test("a member's PERSON memory is audited to the member and invisible to the second member; ORG memory is shared", async () => {
     const store = createStore(":memory:");
     const provider = createSqliteMemoryProvider(store.getDb());
     const memberId = "U-member";
     const secondId = "U-member2";
     const audit = createAudit(store);
+    const spaceId = "slack:C1";
 
-    // Member-bound tools: personal scope resolves to the member's principal.
-    const memberTools = memoryToolDefinitions(provider, { audit, defaultPrincipal: memberId });
-    const secondTools = memoryToolDefinitions(provider, { audit, defaultPrincipal: secondId });
+    // Issue #137 scope model: the tools derive concrete scope keys from the
+    // authenticated context (getScopeContext), never from a tool argument —
+    // a composite key for another user is impossible to express.
+    const memberCtx: MemoryScopeContext = { spaceId, principal: memberId, directMessage: true, teamId: undefined };
+    const secondCtx: MemoryScopeContext = { spaceId, principal: secondId, directMessage: true, teamId: undefined };
+    const memberTools = memoryToolDefinitions(provider, {
+      audit,
+      getScopeContext: () => memberCtx,
+    });
+    const secondTools = memoryToolDefinitions(provider, {
+      audit,
+      getScopeContext: () => secondCtx,
+    });
     const save = memberTools.find((t) => t.name === "memory.save")!;
 
-    const res = await save.execute("s1", { content: "member-secret", scope: "user" }, undefined, undefined, ctx("slack:C1"));
+    // Member saves PERSON memory in their DM → derived {person, memberId}.
+    const res = await save.execute("s1", { content: "member-secret", scope: "person" }, undefined, undefined, ctx(spaceId));
     expect(res.isError).not.toBe(true);
-
     const writes = await store.listAudit({ event_type: MEMORY_WRITE_EVENT });
-    // The personal write is audited with the member's principal.
+    // The person write is audited with the member's principal.
     expect(writes.map((r) => r.actor)).toContain(memberId);
 
-    // Org writes are attributed to nobody (scope org), so the second member
-    // reading org memory would still NOT see the member's personal row.
-    const orgSave = secondTools.find((t) => t.name === "memory.save")!;
-    const orgRes = await orgSave.execute("s2", { content: "org-shared", scope: "org" }, undefined, undefined, ctx("slack:C1"));
-    expect(orgRes.isError).not.toBe(true);
-    const saved = await provider.search({ query: "org-shared", scope: "org", limit: 5 });
-    expect(saved.length).toBeGreaterThan(0);
-    // The member's personal memory is NOT in the org scope.
-    const orgSearch = await provider.search({ query: "member-secret", scope: "org", limit: 5 });
+    // Member's personal memory is NOT in the org scope (shared by everyone).
+    const orgSearch = await provider.search({ query: "member-secret", scope: { kind: "org" }, limit: 5 });
     expect(orgSearch).toHaveLength(0);
+    // The second member's readable scopes (org + their OWN person) do NOT see
+    // the first member's personal row — identity isolation holds.
+    const secondPersonSearch = await provider.search({
+      query: "member-secret",
+      scope: { kind: "person", principal: secondId },
+      limit: 5,
+    });
+    expect(secondPersonSearch).toHaveLength(0);
+    // Only the owning member's person key sees it.
+    const ownSearch = await provider.search({
+      query: "member-secret",
+      scope: { kind: "person", principal: memberId },
+      limit: 5,
+    });
+    expect(ownSearch.length).toBeGreaterThan(0);
+
+    // ORG memory is shared: saved by the member, visible to the second member.
+    const orgSave = secondTools.find((t) => t.name === "memory.save")!;
+    const orgRes = await orgSave.execute("s2", { content: "org-shared", scope: "org" }, undefined, undefined, ctx(spaceId));
+    expect(orgRes.isError).not.toBe(true);
+    const saved = await provider.search({ query: "org-shared", scope: { kind: "org" }, limit: 5 });
+    expect(saved.length).toBeGreaterThan(0);
   }, 20_000);
 });
 
