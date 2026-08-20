@@ -60,6 +60,20 @@ describe("renderModelsConfig (issue #67)", () => {
     })!;
     expect(yaml2.match(/id: "deepseek-ai\/DeepSeek-V4-Flash"/g)?.length).toBe(1);
   });
+
+  test("near-prefixed settings id renders as the bare wire model name (issue #267)", () => {
+    // Settings may carry the SDK catalog id with the provider prefix
+    // (near/deepseek-ai/DeepSeek-V4-Flash); the generated near entry must
+    // carry the gateway's wire model name (deepseek-ai/DeepSeek-V4-Flash) —
+    // a prefixed id leaks onto the HTTP model and the gateway 400s.
+    const yaml = renderModelsConfig({
+      models: { default: "near/deepseek-ai/DeepSeek-V4-Flash" },
+    })!;
+    expect(yaml).not.toBeNull();
+    expect(yaml).toContain('- id: "deepseek-ai/DeepSeek-V4-Flash"');
+    expect(yaml).toContain('        name: "deepseek-ai/DeepSeek-V4-Flash"');
+    expect(yaml).not.toContain("near/deepseek-ai/DeepSeek-V4-Flash");
+  });
 });
 
 describe("regenerateModelsConfig (issue #67)", () => {

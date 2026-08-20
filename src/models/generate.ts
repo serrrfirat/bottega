@@ -51,18 +51,25 @@ export function configuredModelIds(settings: ModelCatalogSettings): string[] {
  * Renders the agent-dir model catalog from the org settings blob.
  * Returns null when settings carry no model ids — the caller then leaves
  * the committed template in place (no-settings default).
+ *
+ * Model ids are normalized for the wire: settings may carry the SDK catalog
+ * id with the provider prefix (near/deepseek-ai/DeepSeek-V4-Flash); the
+ * generated near entry must carry the gateway's wire model name, so a
+ * leading "near/" is stripped (bare ids pass through unchanged).
  */
 export function renderModelsConfig(settings: ModelCatalogSettings): string | null {
   const ids = configuredModelIds(settings);
   if (ids.length === 0) return null;
   const modelLines = ids
-    .map(
-      (id) =>
-        `      - id: "${id}"\n` +
-        `        name: "${id}"\n` +
+    .map((id) => {
+      const wireId = id.startsWith("near/") ? id.slice("near/".length) : id;
+      return (
+        `      - id: "${wireId}"\n` +
+        `        name: "${wireId}"\n` +
         `        contextWindow: 128000\n` +
-        `        maxTokens: 8192`,
-    )
+        `        maxTokens: 8192`
+      );
+    })
     .join("\n");
   return `# Model catalog for a bottega deployment (generated from DB settings, issue #67).
 # Written at boot from the org_settings blob (models.default/fast/reasoning).
