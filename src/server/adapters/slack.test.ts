@@ -18,6 +18,7 @@ import {
   isBotMessage,
   isDmChannel,
   isStreamingCapabilityError,
+  isStreamRequestValidationError,
   markdownChunk,
   messageDropReason,
   normalizeActionEvent,
@@ -27,6 +28,7 @@ import {
   registerActionHandler,
   registerMessageHandler,
   renderSlackText,
+  SlackStreamRequestError,
   spaceIdFromChannel,
   STREAM_RETRY_CONFIG,
   STREAM_TASK_OUTPUT_MAX,
@@ -517,6 +519,36 @@ describe("stream arg builders (issue #168)", () => {
     });
   });
 
+  test("buildStartStreamArgs: channel streams carry the initiating user as recipient_user_id (issue #287)", () => {
+    expect(
+      buildStartStreamArgs(
+        "slack:C123ABC",
+        { threadTs: "1.1", openingText: "Thinking…", recipientUserId: "U456" },
+        "T123",
+      ),
+    ).toEqual({
+      channel: "C123ABC",
+      thread_ts: "1.1",
+      recipient_team_id: "T123",
+      recipient_user_id: "U456",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+  });
+
+  test("buildStartStreamArgs: DMs reject the recipient ids — omitted even when known (issue #287)", () => {
+    expect(
+      buildStartStreamArgs(
+        "slack:D123ABC",
+        { threadTs: "1.1", openingText: "Thinking…", recipientUserId: "U456" },
+        "T123",
+      ),
+    ).toEqual({
+      channel: "D123ABC",
+      thread_ts: "1.1",
+      chunks: [{ type: "markdown_text", text: "Thinking…" }],
+    });
+  });
+
   test("buildStartStreamArgs: no team id yet → channels omit recipient_team_id (startStream fails once, then falls back)", () => {
     expect(buildStartStreamArgs("slack:C123ABC", { threadTs: "1.1", openingText: "x" }, undefined)).toEqual({
       channel: "C123ABC",
@@ -611,6 +643,21 @@ describe("streaming capability probe (issue #181)", () => {
     expect(isStreamingCapabilityError(undefined)).toBe(false);
   });
 
+  test("request-validation errors are per-message, never capability failures (issue #287)", () => {
+    // A request-local rejection (missing/invalid recipient or thread args)
+    // must NOT disable streaming for the boot.
+    expect(isStreamRequestValidationError({ data: { error: "missing_recipient_user_id" } })).toBe(true);
+    expect(isStreamRequestValidationError({ data: { error: "channel_not_found" } })).toBe(true);
+    expect(isStreamRequestValidationError({ data: { error: "invalid_ts" } })).toBe(true);
+    expect(isStreamRequestValidationError({ data: { error: "not_in_channel" } })).toBe(true);
+    expect(isStreamRequestValidationError(new SlackStreamRequestError("no recipient"))).toBe(true);
+    // Scope/token-level failures are capability failures, never request-local.
+    expect(isStreamRequestValidationError({ data: { error: "missing_required_scope" } })).toBe(false);
+    expect(isStreamRequestValidationError({ data: { error: "not_allowed_token_type" } })).toBe(false);
+    expect(isStreamRequestValidationError({ data: { error: "invalid_auth" } })).toBe(false);
+    expect(isStreamRequestValidationError(new Error("network down"))).toBe(false);
+  });
+
   test("the stream client is configured with NO retries — a failure must arrive fast, never a ~30-minute retry storm", () => {
     expect(STREAM_RETRY_CONFIG.retries).toBe(0);
   });
@@ -681,7 +728,9 @@ describe("stream calls fail fast and flip the per-boot cache (issue #181)", () =
     const { adapter, hits, server } = bootStreamlessApi();
     try {
       expect(adapter.streamingSupported()).toBe(true);
-      await expect(adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "Thinking…" })).rejects.toThrow();
+      await expect(
+        adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "Thinking…", recipientUserId: "U456" }),
+      ).rejects.toThrow();
       expect(hits["chat.startStream"]).toBe(1); // no SDK retry storm
       expect(adapter.streamingSupported()).toBe(false); // cached per boot
     } finally {
@@ -722,6 +771,85 @@ describe("stream calls fail fast and flip the per-boot cache (issue #181)", () =
       await expect(adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "x" })).rejects.toThrow(
         "chat streaming unsupported",
       );
+    } finally {
+      server.stop();
+    }
+  });
+});
+
+describe("channel stream recipient (issue #287)", () => {
+  const BOT_TOKEN = "xoxb-recipient-test-token";
+
+  /** Boots the real adapter against a mock Web API recording startStream form fields. */
+  function bootRecipientApi(handler: (hit: number) => Response) {
+    const seen: Array<{ channel: string | null; thread_ts: string | null; recipient_user_id: string | null; recipient_team_id: string | null }> = [];
+    let hit = 0;
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const method = url.pathname.replace("/api/", "");
+        if (method !== "chat.startStream") return Response.json({ ok: false, error: "not_found" });
+        hit += 1;
+        const form = new URLSearchParams(await request.text());
+        seen.push({
+          channel: form.get("channel"),
+          thread_ts: form.get("thread_ts"),
+          recipient_user_id: form.get("recipient_user_id"),
+          recipient_team_id: form.get("recipient_team_id"),
+        });
+        return handler(hit);
+      },
+    });
+    const adapter = createSlackAdapter({
+      appToken: "xapp-recipient-test-token",
+      botToken: BOT_TOKEN,
+      onMessage: async () => {},
+      clientOptions: { slackApiUrl: `http://127.0.0.1:${server.port}/api` },
+    });
+    return { adapter, seen, server };
+  }
+
+  test("a channel startStream carries the initiating user as recipient_user_id", async () => {
+    const { adapter, seen, server } = bootRecipientApi(() => Response.json({ ok: true, ts: "1.000001" }));
+    try {
+      await expect(
+        adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "Thinking…", recipientUserId: "U456" }),
+      ).resolves.toBe("1.000001");
+      expect(seen).toEqual([
+        { channel: "C1", thread_ts: "1.1", recipient_user_id: "U456", recipient_team_id: null },
+      ]);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("a channel startStream without a recipient is never attempted — streaming stays enabled (issue #287)", async () => {
+    const { adapter, seen, server } = bootRecipientApi(() => Response.json({ ok: true, ts: "1.000001" }));
+    try {
+      expect(adapter.streamingSupported()).toBe(true);
+      await expect(adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "x" })).rejects.toThrow(
+        SlackStreamRequestError,
+      );
+      expect(seen).toHaveLength(0); // zero chat.startStream calls — the caller posts phrase+edit
+      expect(adapter.streamingSupported()).toBe(true); // NOT a capability failure
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("Slack's missing_recipient_user_id rejection stays local: a later valid stream still opens (issue #287)", async () => {
+    const { adapter, server } = bootRecipientApi((hit) =>
+      hit === 1 ? Response.json({ ok: false, error: "missing_recipient_user_id" }) : Response.json({ ok: true, ts: "1.000002" }),
+    );
+    try {
+      await expect(
+        adapter.startStream("slack:C1", { threadTs: "1.1", openingText: "x", recipientUserId: "U456" }),
+      ).rejects.toThrow("missing_recipient_user_id");
+      expect(adapter.streamingSupported()).toBe(true); // request-level rejection, not capability
+      await expect(
+        adapter.startStream("slack:C1", { threadTs: "2.2", openingText: "y", recipientUserId: "U456" }),
+      ).resolves.toBe("1.000002"); // the boot's streaming cache survived
     } finally {
       server.stop();
     }

@@ -20,7 +20,7 @@ import type { Store } from "../../store/db";
 import type { OrgSettings } from "../../store/org-settings";
 import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
 import { redact } from "../../policy/audit";
-import type { SlackAdapter, SlackMessage, SlackStreamTask } from "../adapters/slack";
+import { SlackStreamRequestError, type SlackAdapter, type SlackMessage, type SlackStreamTask } from "../adapters/slack";
 import {
   STREAM_FINAL_RETRY_LIMIT,
   STREAM_UPDATE_INTERVAL_MS,
@@ -44,7 +44,7 @@ import {
 
 interface StreamCall {
   spaceId: string;
-  opts: { threadTs: string; openingText: string };
+  opts: { threadTs: string; openingText: string; recipientUserId?: string };
 }
 
 interface RecordedAdapter {
@@ -59,7 +59,13 @@ interface RecordedAdapter {
 }
 
 function recordingAdapter(
-  opts: { failStart?: boolean; streaming?: boolean; failAppend?: boolean; failStop?: boolean } = {},
+  opts: {
+    failStart?: boolean;
+    failStartRequest?: boolean;
+    streaming?: boolean;
+    failAppend?: boolean;
+    failStop?: boolean;
+  } = {},
 ): RecordedAdapter {
   const streams: StreamCall[] = [];
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
@@ -69,6 +75,7 @@ function recordingAdapter(
   const updates: Array<{ spaceId: string; ts: string; text: string }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let tsSeq = 0;
+  let startStreamRequests = 0;
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, replyOpts) {
       // SAFETY: the presenter passes { threadTs } as post options; issue #278
@@ -94,6 +101,10 @@ function recordingAdapter(
     },
     async startStream(spaceId, streamOpts) {
       if (opts.failStart) throw new Error("invalid_stream_arguments: Agents feature not enabled");
+      if (opts.failStartRequest) {
+        startStreamRequests += 1;
+        if (startStreamRequests === 1) throw new SlackStreamRequestError("missing_recipient_user_id");
+      }
       streams.push({ spaceId, opts: streamOpts });
       return `stream-${streams.length}`;
     },
@@ -358,6 +369,86 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     await flush();
     expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: "post-1", text: "Here is the final answer" }]);
     expect(rec.stops).toHaveLength(0);
+  });
+
+  test("a channel stream open carries the initiating user as recipientUserId (issue #287)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    presenter.onInbound(msg({ ts: "1.1", principal: "U456" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.streams[0]).toMatchObject({
+      spaceId: "slack:C1",
+      opts: { threadTs: "1.1", openingText: THINKING_PHRASES[0], recipientUserId: "U456" },
+    });
+  });
+
+  test("a channel turn with no initiating identity bypasses streaming: phrase+edit posts, zero startStream calls (issue #287)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // SlackMessage.principal is zod-required on the wire, but the presenter
+    // must not depend on it: with the identity unavailable, the turn takes
+    // the phrase+edit path WITHOUT ever attempting chat.startStream.
+    presenter.onInbound({ ...msg({ ts: "1.1" }), principal: undefined } as unknown as SlackMessage);
+    await flush();
+    expect(rec.streams).toHaveLength(0); // zero startStream calls
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+
+    // The reply still lands phrase+edit — never dropped.
+    presenter.onMessage({ spaceId: "slack:C1", text: "final answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: "post-1", text: "final answer" }]);
+    expect(rec.stops).toHaveLength(0);
+  });
+
+  test("a request-rejected stream stays local: this turn falls back, the NEXT turn still opens a stream (issue #287)", async () => {
+    const rec = recordingAdapter({ failStartRequest: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // Turn one: chat.startStream rejects THIS request (missing recipient)
+    // — the phrase lands via postMessage and streaming stays enabled.
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(0);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+    presenter.onMessage({ spaceId: "slack:C1", text: "first answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: "post-1", text: "first answer" });
+
+    // Turn two: the identity is available again — the stream OPENS, so the
+    // request rejection never poisoned streaming for the boot. The extra
+    // flush drains turn one's async finalize (the pending phrase is only
+    // cleared once its in-place delivery settles).
+    await flush();
+    presenter.onInbound(msg({ ts: "2.2", principal: "U456" }));
+    await flush();
+    expect(rec.streams).toHaveLength(1);
+    expect(rec.streams[0]).toMatchObject({
+      spaceId: "slack:C1",
+      opts: { threadTs: "2.2", recipientUserId: "U456" },
+    });
   });
 
   test("a mid-boot appendStream failure flips to the phrase+edit path without dropping the reply", async () => {

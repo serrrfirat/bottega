@@ -687,7 +687,7 @@ export class SpaceService {
     // live line BEFORE the fresh turn opens; the drained message's ts
     // becomes the threading base so the reply lands under it.
     presenter.setQueueLength(queue.length);
-    presenter.onQueueDrain(entry.ts);
+    presenter.onQueueDrain(entry.ts, entry.principal);
     try {
       // The drain IS a fresh turn (issue #189): hot-swap the default model
       // role like any other fresh turn, then prompt without a streaming

@@ -234,7 +234,7 @@ interface FakeDownloadedFile {
 
 interface FakeStreamCall {
   spaceId: string;
-  opts: { threadTs: string; openingText: string };
+  opts: { threadTs: string; openingText: string; recipientUserId?: string };
 }
 
 function fakeAdapter(

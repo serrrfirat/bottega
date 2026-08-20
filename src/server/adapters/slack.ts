@@ -118,15 +118,20 @@ export interface SlackAdapter {
    * markdown_text chunk (the thinking phrase becomes the stream opening).
    * Slack streams are ALWAYS threaded replies (`thread_ts` required), so
    * the caller supplies the inbound message ts — channels thread under it
-   * as today, DMs become threaded only while streaming is active. Resolves
+   * as today, DMs become threaded only while streaming is active. Channel
+   * streams REQUIRE the initiating user as `recipient_user_id` (issue
+   * #287); without it the request is invalid, so the adapter throws
+   * {@link SlackStreamRequestError} WITHOUT calling Slack and streaming
+   * stays enabled for later turns that do carry a recipient. Resolves
    * with the stream's message ts once the stream opens. Throws when the
-   * workspace/app lacks the Agents feature (or the call fails); the
-   * failure is remembered for the boot so callers fall back to the
-   * phrase+edit path without retrying per message.
+   * workspace/app lacks the Agents feature (or the call fails); a
+   * scope/token-level failure is remembered for the boot so callers fall
+   * back to the phrase+edit path without retrying per message, while a
+   * request-local rejection never disables streaming for the boot.
    */
   startStream(
     spaceId: string,
-    opts: { threadTs: string; openingText: string },
+    opts: { threadTs: string; openingText: string; recipientUserId?: string },
   ): Promise<string | undefined>;
   /** Appends a markdown_text chunk to the stream at `ts` (chat.appendStream). */
   appendText(spaceId: string, ts: string, text: string): Promise<void>;
@@ -140,10 +145,12 @@ export interface SlackAdapter {
   stopStream(spaceId: string, ts: string, text?: string): Promise<void>;
   /**
    * Whether the workspace/app supports chat streaming (issue #168).
-   * Feature-detected once per boot: true until the first startStream
-   * failure flips it false for the rest of the process. Callers check it
-   * BEFORE opening a stream so an unsupported workspace never pays the
-   * failed call more than once.
+   * Feature-detected once per boot: true until a stream call fails with a
+   * scope/token-level (capability) error flips it false for the rest of
+   * the process. Request-local rejections (missing recipient or thread
+   * args, issue #287) never flip it. Callers check it BEFORE opening a
+   * stream so an unsupported workspace never pays the failed call more
+   * than once.
    */
   streamingSupported(): boolean;
   start(): Promise<void>;
@@ -494,25 +501,35 @@ export function taskUpdateChunk(task: SlackStreamTask): StreamTaskUpdateChunk {
  * Pure so the outbound rendering is testable without a live Slack
  * connection. Streams are always threaded replies; `recipient_team_id` is
  * required when streaming outside a DM (channels) — supplied by the real
- * adapter from auth.test, absent for DMs.
+ * adapter from auth.test, absent for DMs. Channel streams ALSO require
+ * the initiating user as `recipient_user_id` (issue #287) — carried by
+ * the caller (the presenter threads the inbound message's principal).
+ * DMs reject both recipient fields, so they stay absent there.
  */
 export function buildStartStreamArgs(
   spaceId: string,
-  opts: { threadTs: string; openingText: string },
+  opts: { threadTs: string; openingText: string; recipientUserId?: string },
   teamId?: string,
 ) {
   const channel = channelFromSpaceId(spaceId);
   const args = {
     channel,
     thread_ts: opts.threadTs,
-    // Channels (C/G) require the team id; DMs reject it. The presenter
-    // decides the thread ts; the adapter owns the Slack-side requirement.
-    ...(isDmChannel(channel) ? undefined : teamId !== undefined ? { recipient_team_id: teamId } : undefined),
+    // Channels (C/G) require both the team id and the recipient user id;
+    // DMs reject them. The presenter decides the thread ts and the
+    // recipient; the adapter owns the Slack-side requirement.
+    ...(isDmChannel(channel)
+      ? undefined
+      : {
+          ...(teamId !== undefined ? { recipient_team_id: teamId } : undefined),
+          ...(opts.recipientUserId !== undefined ? { recipient_user_id: opts.recipientUserId } : undefined),
+        }),
     chunks: [markdownChunk(opts.openingText)],
   } satisfies {
     channel: string;
     thread_ts: string;
     recipient_team_id?: string;
+    recipient_user_id?: string;
     chunks: StreamMarkdownChunk[];
   };
   return args;
@@ -599,6 +616,58 @@ export function isStreamingCapabilityError(err: SlackApiError): boolean {
 }
 
 /**
+ * A `chat.startStream` request was invalid FOR THIS MESSAGE — not a
+ * workspace capability failure (issue #287). Thrown by the adapter when a
+ * channel stream call carries no recipient user id: the request could not
+ * succeed, so it is never attempted. Callers (the presenter) fall back to
+ * phrase+edit for THIS turn; streaming stays enabled for later turns.
+ */
+export class SlackStreamRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SlackStreamRequestError";
+  }
+}
+
+/**
+ * Slack `chat.startStream` error codes that mean the REQUEST was invalid
+ * for this particular message (missing/invalid recipient, channel, or
+ * thread arguments) — never that the workspace cannot stream (issue #287).
+ * A failed call carrying one of these must not disable streaming for the
+ * boot: the next message with valid arguments can still open a panel.
+ */
+const STREAM_REQUEST_VALIDATION_CODES = new Set([
+  "missing_recipient_user_id",
+  "invalid_channel",
+  "channel_not_found",
+  "not_in_channel",
+  "is_in_trash",
+  "ts_missing",
+  "invalid_ts",
+  "thread_not_found",
+]);
+
+/**
+ * Whether a `chat.startStream` failure was the REQUEST's fault — a missing
+ * or invalid recipient/thread argument for THIS message — rather than the
+ * workspace's (issue #287). Request-validation failures stay local: the
+ * caller falls back to phrase+edit for the turn while the per-boot
+ * streaming cache stays enabled. Scope/token-level failures are capability
+ * failures (see {@link isStreamingCapabilityError}); everything else keeps
+ * the fail-closed cache flip.
+ */
+export function isStreamRequestValidationError(err: unknown): boolean {
+  if (err instanceof SlackStreamRequestError) return true;
+  if (err === undefined || typeof err !== "object") return false;
+  // @slack/web-api's PlatformError extends Error but ALSO carries the
+  // `{ ok, error, ... }` payload on `data` — decode it like the probe
+  // does, so a request code on a thrown PlatformError is recognized.
+  const parsed = slackApiErrorSchema.safeParse(err);
+  if (parsed.success) return STREAM_REQUEST_VALIDATION_CODES.has(parsed.data.data.error);
+  return false;
+}
+
+/**
  * PRODUCTION streaming feature-detect (issue #181): a FAST, bounded probe —
  * one no-retry `chat.startStream` attempt against a deliberately invalid
  * channel, so a supported workspace fails with a channel-level error and
@@ -616,6 +685,10 @@ export async function probeStreamingSupport(client: WebClient, teamId: string | 
       channel: "C00000000", // deliberately invalid: never opens a visible stream
       thread_ts: "1.000000",
       ...(teamId !== undefined ? { recipient_team_id: teamId } : undefined),
+      // Channel streams require the recipient user id (issue #287); the
+      // probe is a well-formed request that fails only on the bogus
+      // channel, so the failure code stays classifiable.
+      recipient_user_id: "U00000000",
       chunks: [{ type: "markdown_text", text: "streaming capability probe" }],
     });
     // Unreachable with an invalid channel; fail open regardless.
@@ -960,10 +1033,13 @@ export function createSlackAdapter(opts: {
    * start() with a fast, bounded capability probe; assumed true until the
    * first stream call failure flips it false for the rest of the process —
    * a workspace without the Agents feature is detected once, never probed
-   * per message. Fail closed: any failure (missing feature, missing scope,
-   * missing recipient_team_id, rate limit, network) degrades to the
-   * phrase+edit path, and the no-retry stream client guarantees the
+   * per message. Fail closed: any scope/token-level or unclassifiable
+   * failure (missing feature, missing scope, rate limit, network) degrades
+   * to the phrase+edit path, and the no-retry stream client guarantees the
    * failure arrives fast instead of a ~30-minute SDK retry storm.
+   * Request-local rejections (missing/invalid recipient or thread args,
+   * issue #287) never flip the cache: they are the message's fault, not
+   * the workspace's, so a later valid request can still open a panel.
    */
   let streamingCapable = true;
 
@@ -1068,6 +1144,15 @@ export function createSlackAdapter(opts: {
       if (!streamingCapable || (opts.streamingSupported !== undefined && !opts.streamingSupported())) {
         throw new Error("slack: chat streaming unsupported in this workspace (cached from an earlier failure)");
       }
+      // Channels require the initiating user as recipient_user_id (issue
+      // #287): without it the request could never succeed, so it is never
+      // attempted — the caller falls back to phrase+edit for THIS turn
+      // while streaming stays enabled for later turns with a recipient.
+      if (!isDmChannel(channelFromSpaceId(spaceId)) && streamOpts.recipientUserId === undefined) {
+        throw new SlackStreamRequestError(
+          `slack: chat.startStream needs a recipient_user_id for channel ${channelFromSpaceId(spaceId)} — skipping the stream`,
+        );
+      }
       try {
         // SAFETY: buildStartStreamArgs emits only chat.startStream fields the
         // builder checked against its args contract; widening to the SDK args
@@ -1076,11 +1161,23 @@ export function createSlackAdapter(opts: {
         const res = await streamClient.chat.startStream(args);
         return res.ts;
       } catch (err) {
-        // Fail closed + cached: any stream failure degrades the workspace
-        // to the phrase+edit path for the rest of the boot. The caller
-        // falls back immediately, so no reply is dropped. The dedicated
-        // no-retry client guarantees the failure arrives fast — never a
-        // ~30-minute SDK retry storm (issue #181).
+        // A request-local rejection (missing/invalid recipient or thread
+        // arguments, issue #287) is the REQUEST's fault, not the
+        // workspace's: fall back to phrase+edit for this turn and keep
+        // streaming enabled — a later message with valid arguments can
+        // still open a panel.
+        if (isStreamRequestValidationError(err)) {
+          console.error(
+            `[slack] chat.startStream rejected this request (${err instanceof Error ? err.message : String(err)}) — ` +
+              "falling back to phrase+edit for this turn; streaming stays enabled",
+          );
+          throw err;
+        }
+        // Fail closed + cached: any other stream failure degrades the
+        // workspace to the phrase+edit path for the rest of the boot. The
+        // caller falls back immediately, so no reply is dropped. The
+        // dedicated no-retry client guarantees the failure arrives fast —
+        // never a ~30-minute SDK retry storm (issue #181).
         streamingCapable = false;
         console.error(
           `[slack] chat.startStream failed (${err instanceof Error ? err.message : String(err)}) — ` +

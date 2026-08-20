@@ -51,6 +51,7 @@ import { codexMintFailureText } from "../../extensions/proxy-seed";
 import {
   channelFromSpaceId,
   isDmChannel,
+  isStreamRequestValidationError,
   type SlackAdapter,
   type SlackMessage,
 } from "../adapters/slack";
@@ -530,6 +531,13 @@ export class SlackTurnPresenter {
   /** ts of the latest inbound message; agent replies thread under it. */
   protected lastInboundTs: string | undefined;
   /**
+   * Principal (Slack user id) of the latest inbound message — the channel
+   * stream's recipient_user_id (issue #287). Set alongside
+   * {@link lastInboundTs}; undefined until the first inbound (or after
+   * dispose), in which case the turn cannot open a channel stream.
+   */
+  protected lastInboundPrincipal: string | undefined;
+  /**
    * ts of the in-place thinking phrase (or the open stream, in streaming
    * mode) per space; consumed when the reply lands. NOTE: the ts is only
    * known after postMessage/startStream resolves — the posting guard below
@@ -640,6 +648,7 @@ export class SlackTurnPresenter {
    */
   onInbound(msg: SlackMessage): void {
     this.lastInboundTs = msg.ts;
+    this.lastInboundPrincipal = msg.principal;
     // A new turn: the previous turn's progress state is stale (#193). The
     // opening phrase (and the elapsed tick) take over from here.
     this.#currentStepTitle = undefined;
@@ -813,10 +822,12 @@ export class SlackTurnPresenter {
    * already landed; this opens the drained turn's OWN visible line (fresh
    * phrase, threaded under the drained message) and re-arms the live
    * progress. The receipt reaction and message.in audit already happened
-   * at queue time (onInbound), so neither repeats here.
+   * at queue time (onInbound), so neither repeats here. `principal` is the
+   * drained message's sender — the channel stream's recipient (issue #287).
    */
-  onQueueDrain(msgTs: string): void {
+  onQueueDrain(msgTs: string, principal: string): void {
     this.lastInboundTs = msgTs;
+    this.lastInboundPrincipal = principal;
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
@@ -924,6 +935,7 @@ export class SlackTurnPresenter {
 
   dispose(): void {
     this.lastInboundTs = undefined;
+    this.lastInboundPrincipal = undefined;
     this.pendingTs = undefined;
     this.#phrasePosting = false;
     this.#emptyTurnCount = 0;
@@ -1553,19 +1565,26 @@ export class SlackTurnPresenter {
  * the same coalescing cadence as the phrase renderer; turn_end closes with
  * chat.stopStream carrying the final reply as the closing block.
  *
- * Fallback (fail closed): ANY stream call failure — opening, appending, or
- * closing — a workspace without the Agents feature, missing
- * recipient_team_id, a rate limit — switches this renderer to the
- * phrase+edit path PERMANENTLY (per boot) and the adapter remembers the
- * failure, so no turn ever pays the failed call twice and no reply is
- * dropped: the final text lands as a stopStream closing block when the
- * stream is healthy, or as an in-place chat.update when a stream call
- * fails (issue #181).
+ * Fallback (fail closed): a scope/token-level stream call failure —
+ * opening, appending, or closing — a workspace without the Agents
+ * feature, a rate limit — switches this renderer to the phrase+edit path
+ * PERMANENTLY (per boot) and the adapter remembers the failure, so no
+ * turn ever pays the failed call twice and no reply is dropped: the final
+ * text lands as a stopStream closing block when the stream is healthy, or
+ * as an in-place chat.update when a stream call fails (issue #181).
+ * Channel turns without an initiating user, and REQUEST-local rejections
+ * (missing/invalid recipient or thread args, issue #287), fall back for
+ * THAT TURN only — streaming stays enabled, so the next turn with a valid
+ * recipient opens a fresh panel.
  */
 export class StreamTurnPresenter extends SlackTurnPresenter {
   /** ts of the OPEN stream; undefined between turns / after a fallback. */
   #streamTs: string | undefined;
-  /** False once a stream call failed: the phrase renderer takes over for the boot. */
+  /**
+   * False once a scope/token-level stream call failed: the phrase renderer
+   * takes over for the boot. Request-local rejections never flip it
+   * (issue #287) — the per-turn fallback is keyed off `#streamTs`.
+   */
   #streamMode = true;
 
   constructor(deps: TurnPresenterDeps) {
@@ -1578,18 +1597,42 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
    * streams are ALWAYS threaded replies, so SpaceService never routes DMs
    * here (issue #180): the plain phrase+edit path owns DM spaces, and this
    * renderer only ever sees channel spaces (or a fallback, which keeps
-   * top-level posts). A failed open falls back to the phrase post — the
-   * reply path never depends on streaming.
+   * top-level posts). Channel streams require the initiating user as the
+   * recipient (issue #287): with no identity the turn bypasses streaming —
+   * phrase+edit posts without ever attempting chat.startStream. A failed
+   * open falls back to the phrase post — the reply path never depends on
+   * streaming. A REQUEST-local rejection (missing/invalid recipient or
+   * thread args) falls back for THIS turn only; streaming stays enabled
+   * for later turns, while a scope/token-level failure flips the renderer
+   * to the phrase path for the boot.
    */
   protected async openTurn(openingText: string): Promise<string | undefined> {
     if (!this.#streamMode || !this.adapter.streamingSupported()) return super.openTurn(openingText);
     const threadTs = this.lastInboundTs;
     if (threadTs === undefined) return super.openTurn(openingText);
+    // Channel streams NEED the initiating user as recipient_user_id (issue
+    // #287): without it the request is invalid, so streaming is bypassed
+    // for this turn — the phrase+edit path posts, never a startStream call.
+    const recipientUserId = this.lastInboundPrincipal;
+    if (recipientUserId === undefined) return super.openTurn(openingText);
     try {
-      const ts = await this.adapter.startStream(this.spaceId, { threadTs, openingText });
+      const ts = await this.adapter.startStream(this.spaceId, { threadTs, openingText, recipientUserId });
       if (ts !== undefined) this.#streamTs = ts;
       return ts;
     } catch (err) {
+      if (isStreamRequestValidationError(err)) {
+        // The REQUEST was rejected for this message (missing/invalid
+        // recipient or thread args) — not a workspace capability failure:
+        // fall back to phrase+edit for THIS turn and keep streaming
+        // enabled so a later valid request can still open a panel (issue
+        // #287).
+        console.error(
+          `[slack-turn-presenter] chat.startStream rejected this request in ${this.spaceId} — ` +
+            "phrase+edit for this turn; streaming stays enabled:",
+          err,
+        );
+        return super.openTurn(openingText);
+      }
       this.#streamMode = false;
       console.error(
         `[slack-turn-presenter] chat.startStream failed in ${this.spaceId} — falling back to phrase+edit for the boot:`,
@@ -1601,7 +1644,12 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
 
   /** Interim reply text appends to the stream (markdown_text) on the cadence. */
   protected async sendTextChunk(ts: string, text: string): Promise<void> {
-    if (!this.#streamMode) return super.sendTextChunk(ts, text);
+    // #streamTs guards the per-turn surface: a turn whose stream never
+    // opened (missing recipient, request rejection, or a boot fallback)
+    // edits the phrase in place — appendStream can never target a plain
+    // post, and a per-turn fallback must not flip streaming off for the
+    // boot (issue #287).
+    if (!this.#streamMode || this.#streamTs === undefined) return super.sendTextChunk(ts, text);
     try {
       await this.adapter.appendText(this.spaceId, ts, text);
     } catch (err) {
@@ -1619,11 +1667,21 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
   /**
    * turn_end: the final reply lands as the stopStream closing block (the
    * pending coalesced append is dropped — it was superseded by the final).
-   * In fallback mode the base flush delivers it via chat.update as before.
+   * With no open stream the base flush delivers it via chat.update as
+   * before — and a per-turn fallback (missing recipient / request
+   * rejection, issue #287) additionally clears the pending phrase so the
+   * NEXT turn opens a fresh stream instead of rotating the fallback post.
    */
   protected async finalizeTurn(finalText: string | undefined): Promise<void> {
-    if (!this.#streamMode || this.#streamTs === undefined) {
-      return super.finalizeTurn(finalText);
+    if (!(this.#streamMode && this.#streamTs !== undefined)) {
+      // Boot-fallback mode (#streamMode false) keeps the pending ts so the
+      // phrase rotates in place across turns (one-message rule). A per-turn
+      // fallback keeps streaming enabled, so its phrase must NOT become the
+      // next turn's rotating opening — clear it and let the next turn open
+      // a fresh stream (issue #287).
+      await super.finalizeTurn(finalText);
+      if (this.#streamMode) this.pendingTs = undefined;
+      return;
     }
     // The stream is the turn message: a pending coalesced append is
     // superseded by the final stopStream block, so drop it. The pending
