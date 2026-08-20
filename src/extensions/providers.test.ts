@@ -49,17 +49,17 @@ import { resetToolSurfaceCache, resolveExtensionSurfaces, type ExtensionSurfaces
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
-const PROVIDERS = ["linear", "github", "attio"] as const;
+const PROVIDERS = ["linear", "github", "attio", "gmail-googleapis-com"] as const;
 
 /** The WIRE tool surface per provider (issue #148): the names the hosted
  * servers expose (github live-verified; attio per official docs; linear
- * unprefixed). The hermetic transports below serve these from tools/list,
- * so discovery yields the namespaced manifest names with these wire
- * providerNames. */
+ * unprefixed; gmail per the reviewed /mcp/v1 binding's published surface —
+ * the hermetic stubs serve exactly these from tools/list). */
 const WIRE_SURFACE = {
   linear: ["search_issues", "create_issue", "update_status"],
   github: ["search_issues", "issue_write", "add_issue_comment"],
   attio: ["search-records", "create-record", "update-record"],
+  "gmail-googleapis-com": ["get_profile", "search_messages", "send_message"],
 } as const;
 
 /** The conservative tiers the #157 heuristic assigns each provider's wire
@@ -69,6 +69,8 @@ const WIRE_TIERS = {
   linear: ["read", "write", "write"],
   github: ["read", "write", "write"],
   attio: ["read", "write", "write"],
+  // get_/search_ are read verbs; send_ mutates → write (approval).
+  "gmail-googleapis-com": ["read", "read", "write"],
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
@@ -122,6 +124,7 @@ function stubTransports(seen?: { tool: string[] }) {
     const url = binding.transport === "streamable-http" ? (binding.serverUrl ?? "") : "";
     if (url.includes("linear.app")) return stubMcpTransport("linear", seen)(binding);
     if (url.includes("attio.com")) return stubMcpTransport("attio", seen)(binding);
+    if (url.includes("gmailmcp.googleapis.com")) return stubMcpTransport("gmail-googleapis-com", seen)(binding);
     return stubMcpTransport("github", seen)(binding);
   };
 }
@@ -247,12 +250,17 @@ describe("issue #54 pinned providers", () => {
 
   test("the egress allowlist contains the pinned providers' domains", () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
-    // Snapshot files load in sorted order (attio, github, linear) — the
-    // committed SEED (issue #233: notion's pin is gone; its domains land
-    // via the runtime registry when a connect registers it).
+    // Snapshot files load in sorted order (attio, github,
+    // gmail-googleapis-com, linear — "github" < "gmail-" lexicographically)
+    // — the committed SEED (issue #233: notion's pin is gone; its domains
+    // land via the runtime registry when a connect registers it; issue
+    // #286: the reviewed Gmail override allowlists both gmail.googleapis.com
+    // and the validated mcp host).
     expect(registry.egressDomains()).toEqual([
       "mcp.attio.com",
       "api.githubcopilot.com",
+      "gmail.googleapis.com",
+      "gmailmcp.googleapis.com",
       "mcp.linear.app",
     ]);
   });

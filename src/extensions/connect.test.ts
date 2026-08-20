@@ -641,8 +641,35 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     domain: "acme.example.com",
   };
 
-  /** Catalog doc + well-known probe routing: hermetic, no network. */
-  function stubCatalogFetch(records: unknown[], wellKnownStatus: number): typeof fetch {
+  /** A valid MCP initialize result the endpoint doubles serve (issue #286). */
+  const INITIALIZE_RESULT = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      protocolVersion: "2025-11-25",
+      capabilities: { tools: {} },
+      serverInfo: { name: "stub-mcp", version: "1.0.0" },
+    },
+  });
+
+  /** One URL (or prefix) → a scripted response for the endpoint doubles. */
+  interface Route {
+    match: string;
+    status: number;
+    body?: string;
+    headers?: Record<string, string>;
+  }
+
+  /** The derived candidate endpoints for a catalog record's domain (issue #286 §3). */
+  function derivedCandidates(record: unknown): string[] {
+    const domain = (record as { domain: string }).domain;
+    const host = domain.startsWith("mcp.") ? domain : `mcp.${domain}`;
+    return [`https://${host}/mcp`, `https://${host}/mcp/v1`];
+  }
+
+  /** Catalog doc + probe double routing: hermetic, no network. */
+  function stubCatalogFetch(records: unknown[], opts: { wellKnownStatus?: number; routes?: Route[] } = {}): typeof fetch {
+    const routes = [...(opts.routes ?? []), ...records.flatMap((record) => derivedCandidates(record).map((url) => ({ match: url, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } } as Route)))];
     // SAFETY: the stub implements fetch's call contract; Bun's fetch also
     // exposes fetch.preconnect, which the catalog client never calls.
     return (async (input: string | URL | Request) => {
@@ -650,7 +677,14 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
       if (url === DEFAULT_CATALOG_URL) {
         return new Response(JSON.stringify({ version: 1, data: records }), { status: 200 });
       }
-      return new Response("", { status: wellKnownStatus });
+      const exact = routes.find((r) => r.match === url);
+      const route =
+        exact ?? routes.filter((r) => url.startsWith(r.match)).sort((a, b) => b.match.length - a.match.length)[0];
+      if (route !== undefined) {
+        return new Response(route.body ?? "", { status: route.status, headers: route.headers });
+      }
+      if (url.includes("/.well-known/")) return new Response("", { status: opts.wellKnownStatus ?? 404 });
+      return new Response("", { status: 404 });
     }) as typeof fetch;
   }
 
@@ -677,6 +711,7 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     router?: RecordingRouter;
     records?: unknown[];
     wellKnownStatus?: number;
+    routes?: Route[];
     policy?: PolicyConfig;
   } = {}): CatalogHarness {
     const base = makeDeps({
@@ -698,7 +733,12 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
         ...base.deps,
         registry,
         catalogRegister: {
-          catalog: { fetchImpl: stubCatalogFetch(opts.records ?? [NOTION_RECORD], opts.wellKnownStatus ?? 200) },
+          catalog: {
+            fetchImpl: stubCatalogFetch(opts.records ?? [NOTION_RECORD], {
+              wellKnownStatus: opts.wellKnownStatus ?? 200,
+              routes: opts.routes,
+            }),
+          },
           snapshotsDir,
           egressPath,
           devEgressPath,
@@ -812,6 +852,73 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     const outcome = await connect(h, "com.nope", "personal", "UADA");
     expect(outcome.ok).toBe(false);
     if (outcome.ok === false) expect(outcome.message).toContain("unknown extension");
+  });
+
+  test("every endpoint candidate failing the probe fails the full connect closed — no runtime row, no egress, no audit (issue #286)", async () => {
+    // §9 #9: the deterministic catalog connect must never register an
+    // endpoint the probe could not prove. Both derived candidates 404.
+    const h = makeCatalogHarness({
+      records: [NOTION_RECORD],
+      routes: [
+        { match: "https://mcp.notion.com/mcp", status: 404 },
+        { match: "https://mcp.notion.com/mcp/v1", status: 404 },
+      ],
+    });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "notion", "personal", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      // The lookup failure surfaces the probe evidence + the reviewed
+      // override instruction (§8) — never a silent stall.
+      expect(outcome.message).toContain("validation probe");
+      expect(outcome.message).toContain("HTTP 404");
+      expect(outcome.message).toContain("no other candidate accepted");
+      expect(outcome.message).toContain("reviewed official endpoint");
+    }
+    // Fail closed: no store row, no egress, no OAuth start, no hot-register.
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(existsSync(join(h.snapshotsDir, "notion.json"))).toBe(false);
+    expect(existsSync(h.egressPath)).toBe(false);
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+    expect(h.deps.registry.resolve("notion")).toBeUndefined();
+  });
+
+  test("an oauth_challenge endpoint registers an OAuth-gated tools-less manifest whose domains include the VALIDATED host (issue #286)", async () => {
+    // §9 #10: the endpoint answers 401 + a standards-compliant Bearer
+    // challenge → the connect registers OAuth-gated without the RFC 8414
+    // metadata probe, and the egress allowlist follows the validated URL's
+    // host.
+    const h = makeCatalogHarness({
+      records: [NOTION_RECORD],
+      wellKnownStatus: 404,
+      routes: [
+        {
+          match: "https://mcp.notion.com/mcp",
+          status: 401,
+          headers: { "www-authenticate": 'Bearer error="invalid_token"' },
+        },
+      ],
+    });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "notion", "personal", "UADA");
+
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.message).toBe("Open this link to authorize");
+    // The durable store row is OAuth-gated and tools-less (the #231
+    // notion pattern) with the validated host allowlisted.
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    const persisted = h.runtimeRegistry.rows[0]!;
+    expect(persisted.manifest.credentialSchema).toEqual({ type: "oauth" });
+    expect(persisted.manifest.tools).toBeUndefined();
+    expect(persisted.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
+    // The connect continued into the OAuth flow (the runtime discovers the
+    // surface at boot).
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+    expect(h.deps.registry.resolve("notion")).toBeDefined();
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"mcp.notion.com"');
   });
 });
 

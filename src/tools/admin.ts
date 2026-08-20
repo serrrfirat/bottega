@@ -100,6 +100,7 @@ import { uploadLinkPublicBase } from "../extensions/upload-link";
 import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
 import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
+import { probeMcpEndpoint } from "../extensions/mcp-endpoint-probe";
 import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
 import {
   DEV_EGRESS_CONFIG_PATH,
@@ -956,6 +957,38 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 "when web-search verified NO official hosted variant exists — then confirm with " +
                 "no_hosted_variant: true.",
             );
+          }
+          // Issue #286 — THE ENDPOINT VALIDATION PROBE. A hosted
+          // streamable-http binding's exact serverUrl is probed with a raw
+          // JSON-RPC initialize BEFORE the human's review gate: nothing pins
+          // an endpoint the probe cannot prove speaks MCP (or returns a
+          // standards-compliant Bearer challenge). HTTPS-only, redirects
+          // never followed, no credentials sent — a rejected endpoint is a
+          // loud refusal with the probe evidence, no snapshot, no egress
+          // regen, no hot-register, and an auditable pin_refused row.
+          if (hosted && completed.manifest.mcp !== undefined && completed.manifest.mcp.transport === "streamable-http") {
+            const mcpBinding = completed.manifest.mcp;
+            const verdict = await probeMcpEndpoint(mcpBinding.serverUrl, { fetchImpl: catalogOpts.fetchImpl });
+            if (!verdict.ok) {
+              await audit?.appendAudit({
+                actor,
+                event_type: ADMIN_CATALOG_BROWSER_EVENT,
+                payload: {
+                  action: "pin_refused",
+                  spec: params.spec.trim(),
+                  reason: "mcp_validation_probe_failed",
+                  endpoint: mcpBinding.serverUrl,
+                  evidence: verdict.evidence,
+                },
+              });
+              return toolError(
+                `refusing to pin "${params.spec.trim()}": the binding endpoint ${mcpBinding.serverUrl} failed the ` +
+                  `MCP validation probe (${verdict.evidence}); no snapshot was written and egress is unchanged. ` +
+                  "Provide the vendor's official endpoint (web-search the vendor's OFFICIAL MCP spec per #146) and " +
+                  "pin again — the probe must see a valid MCP initialize response or a standards-compliant Bearer " +
+                  "challenge.",
+              );
+            }
           }
           // THE REVIEW GATE: the tool surfaces the draft summary and the
           // human must confirm in-channel. Nothing pins without the

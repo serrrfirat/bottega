@@ -180,11 +180,59 @@ interface StubCatalogDoc {
   data?: unknown[];
 }
 
-function stubFetch(catalog: StubCatalogDoc = CATALOG): typeof fetch {
+/** A valid MCP initialize result the endpoint doubles serve (issue #286). */
+const INITIALIZE_RESULT = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  result: {
+    protocolVersion: "2025-11-25",
+    capabilities: { tools: {} },
+    serverInfo: { name: "stub-mcp", version: "1.0.0" },
+  },
+});
+
+/** One URL (or prefix) → a scripted response for the endpoint doubles. */
+interface StubRoute {
+  match: string;
+  status: number;
+  body?: string;
+  headers?: Record<string, string>;
+}
+
+/** The endpoint doubles the pin tests rely on by default (the draft bindings
+ * the completed-draft fixtures pin). Explicit routes passed by a test win. */
+const DEFAULT_STUB_ROUTES: StubRoute[] = [
+  {
+    match: "https://mcp.linear.app/mcp",
+    status: 200,
+    body: INITIALIZE_RESULT,
+    headers: { "content-type": "application/json" },
+  },
+  {
+    match: "https://mcp.notion.com/mcp",
+    status: 200,
+    body: INITIALIZE_RESULT,
+    headers: { "content-type": "application/json" },
+  },
+];
+
+function stubFetch(catalog: StubCatalogDoc = CATALOG, routes: StubRoute[] = []): typeof fetch {
+  const allRoutes = [...routes, ...DEFAULT_STUB_ROUTES];
   // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
   // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
-  return (async (_input: string | URL | Request, _init?: RequestInit) =>
-    new Response(JSON.stringify(catalog), { status: 200 })) as typeof fetch;
+  return (async (input: string | URL | Request, _init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === "https://integrations.sh/api.json") {
+      return new Response(JSON.stringify(catalog), { status: 200 });
+    }
+    const exact = allRoutes.find((r) => r.match === url);
+    const route =
+      exact ?? allRoutes.filter((r) => url.startsWith(r.match)).sort((a, b) => b.match.length - a.match.length)[0];
+    if (route !== undefined) {
+      return new Response(route.body ?? "", { status: route.status, headers: route.headers });
+    }
+    return new Response(JSON.stringify(catalog), { status: 200 });
+  }) as typeof fetch;
 }
 
 /**
@@ -213,6 +261,69 @@ function writeCompletedDraft(draftsDir: string, overrides: Record<string, JsonVa
   mkdirSync(draftsDir, { recursive: true });
   writeFileSync(join(draftsDir, "linear.draft.json"), JSON.stringify(draft, null, 2) + "\n");
 }
+
+/** The gmailDraft helper's typed shape (the pin action's draft contract). */
+interface GmailDraftShape {
+  schema: string;
+  extensionId: string;
+  pinnedAt: string;
+  source: Record<string, JsonValue>;
+  manifest: {
+    id: string;
+    label: string;
+    vendor: string;
+    kind: string;
+    mcp: { serverUrl: string; transport: string };
+    credentialSchema: { type: string; scopes?: string[] };
+    domains: string[];
+  };
+}
+
+/**
+ * A gmail-googleapis-com draft carrying the REVIEWED official /mcp/v1
+ * binding (issue #286 §7) — the exact override the corrected snapshot
+ * pins. The catalog record only links documentation; the endpoint is a
+ * human-reviewed fact, never derived.
+ */
+function gmailDraft(overrides: Record<string, JsonValue> = {}): GmailDraftShape {
+  return {
+    schema: "bottega.extension-snapshot.v1",
+    extensionId: "gmail-googleapis-com",
+    pinnedAt: "2026-08-20T00:00:00.000Z",
+    source: { catalog: "https://integrations.sh/api.json", specId: "gmail-googleapis-com", vendorOfficial: false, reviewed: false },
+    manifest: {
+      id: "gmail-googleapis-com",
+      label: "Gmail",
+      vendor: "Google",
+      kind: "mcp",
+      mcp: { serverUrl: "https://gmailmcp.googleapis.com/mcp/v1", transport: "streamable-http" },
+      credentialSchema: { type: "oauth", scopes: ["https://www.googleapis.com/auth/gmail.readonly"] },
+      domains: ["gmail.googleapis.com"],
+    },
+    ...overrides,
+  };
+}
+
+/** Writes a draft JSON to `draftsDir/<spec>.draft.json` (the pin action's file contract). */
+function writeDraft(draftsDir: string, spec: string, draft: object): void {
+  mkdirSync(draftsDir, { recursive: true });
+  writeFileSync(join(draftsDir, `${spec}.draft.json`), JSON.stringify(draft, null, 2) + "\n");
+}
+
+/** The catalog doc the gmail pin's provenance re-check needs (issue #286 §7). */
+const GMAIL_CATALOG: StubCatalogDoc = {
+  version: 1,
+  data: [
+    {
+      id: "mcp/gmail-googleapis-com",
+      slug: "gmail-googleapis-com",
+      kind: "mcp",
+      name: "Gmail",
+      url: "https://developers.google.com/gmail/api",
+      domain: "gmail.googleapis.com",
+    },
+  ],
+};
 
 /** A personal-scope connect never crosses the policy gate — this seam is never invoked. */
 function minimalConnectGate(): ConnectExtensionDeps["gate"] {
@@ -1072,6 +1183,164 @@ describe("catalog_browser pin (issue #195)", () => {
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv(env);
+      cleanup();
+    }
+  });
+
+  test("pin accepts an exact reviewed override endpoint the probe validates (Gmail /mcp/v1) and pins it verbatim (issue #286)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      writeDraft(draftsDir, "gmail-googleapis-com", gmailDraft());
+      const { audit, rows } = fakeAudit();
+      const tools = loadTools(store, {
+        audit,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: {
+          fetchImpl: stubFetch(GMAIL_CATALOG, [
+            {
+              match: "https://gmailmcp.googleapis.com/mcp/v1",
+              status: 200,
+              body: INITIALIZE_RESULT,
+              headers: { "content-type": "application/json" },
+            },
+          ]),
+        },
+      });
+
+      const res = await call(tools[0], {
+        action: "pin",
+        spec: "gmail-googleapis-com",
+        confirm: true,
+        vendor_official: true,
+      });
+      expect(res.isError).toBe(false);
+      // SAFETY: the completed pin serializes written_to/reviewed/egress_regenerated (asserted below).
+      const body = JSON.parse(res.text) as { written_to: string; reviewed: boolean; egress_regenerated: string[] };
+      expect(body.written_to).toBe(join(snapshotsDir, "gmail-googleapis-com.json"));
+      expect(body.reviewed).toBe(true);
+      expect(body.egress_regenerated).toContain(egressPath);
+
+      // The pinned snapshot carries the EXACT reviewed /mcp/v1 override —
+      // never a derived mcp.gmail.googleapis.com, never /mcp.
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "gmail-googleapis-com.json"), "utf8"));
+      expect(snapshot.source.reviewed).toBe(true);
+      expect(snapshot.source.vendorOfficial).toBe(true);
+      expect(snapshot.source.specId).toBe("gmail-googleapis-com");
+      expect(snapshot.manifest.mcp).toEqual({
+        serverUrl: "https://gmailmcp.googleapis.com/mcp/v1",
+        transport: "streamable-http",
+      });
+      expect(snapshot.manifest.credentialSchema).toEqual({
+        type: "oauth",
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      });
+      expect(snapshot.manifest.domains).toEqual(["gmail.googleapis.com", "gmailmcp.googleapis.com"]);
+
+      // Egress allowlists the VALIDATED binding host (OAuth — no secrets
+      // entry, no mint transform; the SDK owns the bearer).
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain('"gmailmcp.googleapis.com"');
+      expect(egress).toContain('"gmail.googleapis.com"');
+      expect(egress).not.toContain("- name: oauth_token");
+      expect(egress).not.toContain("gmail-oauth.json");
+      expect(existsSync(devEgressPath)).toBe(true);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.payload["action"]).toBe("pin");
+      expect(rows[0]!.payload["spec"]).toBe("gmail-googleapis-com");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin REFUSES a binding endpoint that fails the probe (Gmail /mcp 404) — no snapshot, no egress, auditable (issue #286)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      // The broken pin: https://gmailmcp.googleapis.com/mcp (a 404).
+      writeDraft(draftsDir, "gmail-googleapis-com", gmailDraft({ manifest: { ...gmailDraft().manifest, mcp: { serverUrl: "https://gmailmcp.googleapis.com/mcp", transport: "streamable-http" } } }));
+      const { audit, rows } = fakeAudit();
+      const tools = loadTools(store, {
+        audit,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: {
+          fetchImpl: stubFetch(GMAIL_CATALOG, [{ match: "https://gmailmcp.googleapis.com/mcp", status: 404 }]),
+        },
+      });
+
+      // The refusal fires even WITH the human's confirmation — the probe is
+      // the gate that runs BEFORE the review gate.
+      const res = await call(tools[0], {
+        action: "pin",
+        spec: "gmail-googleapis-com",
+        confirm: true,
+        vendor_official: true,
+      });
+      expect(res.isError).toBe(true);
+      // §8: the refusal carries the probe evidence and the recovery step.
+      expect(res.text).toContain('refusing to pin "gmail-googleapis-com"');
+      expect(res.text).toContain("failed the MCP validation probe");
+      expect(res.text).toContain("HTTP 404");
+      expect(res.text).toContain("no snapshot was written and egress is unchanged");
+      // Fail closed: nothing persisted, no egress, no hot-register.
+      expect(existsSync(join(snapshotsDir, "gmail-googleapis-com.json"))).toBe(false);
+      expect(existsSync(egressPath)).toBe(false);
+      expect(existsSync(devEgressPath)).toBe(false);
+      // The refusal is auditable (action=pin_refused with the evidence).
+      const refused = rows.find((r) => r.payload["action"] === "pin_refused");
+      expect(refused).toBeDefined();
+      expect(refused!.payload["reason"]).toBe("mcp_validation_probe_failed");
+      expect(refused!.payload["endpoint"]).toBe("https://gmailmcp.googleapis.com/mcp");
+      expect(String(refused!.payload["evidence"])).toContain("HTTP 404");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin REFUSES a plain-http binding endpoint (HTTPS-only) without ever probing it (issue #286)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      writeDraft(draftsDir, "gmail-googleapis-com", gmailDraft({ manifest: { ...gmailDraft().manifest, mcp: { serverUrl: "http://gmailmcp.googleapis.com/mcp/v1", transport: "streamable-http" } } }));
+      let probed = false;
+      // SAFETY: the counting stub implements fetch's call contract.
+      const countingFetch = (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url === "https://integrations.sh/api.json") {
+          return new Response(JSON.stringify(GMAIL_CATALOG), { status: 200 });
+        }
+        probed = true;
+        return new Response("", { status: 200 });
+      }) as typeof fetch;
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        catalog: { fetchImpl: countingFetch },
+      });
+
+      const res = await call(tools[0], { action: "pin", spec: "gmail-googleapis-com", confirm: true });
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("refusing to pin");
+      expect(res.text).toContain("must be https");
+      expect(probed).toBe(false); // never a byte to an unencrypted endpoint
+      expect(existsSync(join(snapshotsDir, "gmail-googleapis-com.json"))).toBe(false);
+      expect(existsSync(egressPath)).toBe(false);
+    } finally {
       cleanup();
     }
   });

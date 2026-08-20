@@ -73,13 +73,16 @@ describe("egress config generation", () => {
 
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
-    // The committed SEED fixtures (issue #233): github/linear/attio pins —
-    // notion is gone (its registration is a runtime connect, merged into
-    // the egress only when registered at runtime). Copy before sorting:
-    // EXTENSION_DOMAINS is a module-level constant later byte-pin tests
-    // render with (in-place sort would corrupt the registration order).
+    // The committed SEED fixtures (issue #233 + #286): github/linear/attio
+    // pins plus the reviewed Gmail override — notion is gone (its
+    // registration is a runtime connect, merged into the egress only when
+    // registered at runtime). Copy before sorting: EXTENSION_DOMAINS is a
+    // module-level constant later byte-pin tests render with (in-place sort
+    // would corrupt the registration order).
     expect([...EXTENSION_DOMAINS].sort()).toEqual([
       "api.githubcopilot.com",
+      "gmail.googleapis.com",
+      "gmailmcp.googleapis.com",
       "mcp.attio.com",
       "mcp.linear.app",
     ]);
@@ -488,5 +491,60 @@ describe("OAuth extension egress contract (issue #284)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
+  test("the committed Gmail snapshot's domains are allowlisted with ZERO credential-injection entries (OAuth — the SDK owns the bearer)", () => {
+    // The corrected snapshot pins https://gmailmcp.googleapis.com/mcp/v1
+    // with domains gmail.googleapis.com + gmailmcp.googleapis.com. The
+    // regenerated committed config must keep both hosts allowlisted and
+    // emit no oauth_token transform, no blob seed, no token_endpoint, and
+    // no secrets-file entry for gmail (the #284 invariant: OAuth
+    // extensions get no egress entry of any kind — the SDK sends its own
+    // bearer through the allowlisted host).
+    const domains = allowlistDomains(COMMITTED_EGRESS);
+    expect(domains).toContain("gmail.googleapis.com");
+    expect(domains).toContain("gmailmcp.googleapis.com");
+    const entries = secretsEntries(COMMITTED_EGRESS);
+    expect(entries).not.toBeNull();
+    // github (api_key) + the six model-gateway keys — gmail adds nothing.
+    expect(entries!.length).toBe(7);
+    for (const entry of entries!) {
+      const source = entry["source"] as Record<string, YamlNode>;
+      expect(String(source["path"])).not.toContain("gmail");
+    }
+    expect(COMMITTED_EGRESS).not.toContain("- name: oauth_token");
+    expect(COMMITTED_EGRESS).not.toContain("gmail-oauth.json");
+    expect(COMMITTED_EGRESS).not.toContain("token_endpoint:");
+  });
+
+  test("a validated Gmail-shaped runtime registration allowlists its domains and never mints (issue #284 invariant)", () => {
+    const gmailSnapshot: PinnedSnapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: "gmail-googleapis-com",
+      pinnedAt: "2026-08-20T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api.json", specId: "gmail-googleapis-com", vendorOfficial: true, reviewed: true },
+      manifest: {
+        id: "gmail-googleapis-com",
+        label: "Gmail",
+        vendor: "Google",
+        kind: "mcp",
+        mcp: { serverUrl: "https://gmailmcp.googleapis.com/mcp/v1", transport: "streamable-http" },
+        credentialSchema: { type: "oauth", scopes: ["https://www.googleapis.com/auth/gmail.readonly"] },
+        domains: ["gmail.googleapis.com", "gmailmcp.googleapis.com"],
+      },
+    };
+    const yaml = renderEgressConfig(
+      mergedEgressDomains(gmailSnapshot.manifest.domains),
+      apiKeyExtensionEntries([gmailSnapshot]),
+    );
+    const domains = allowlistDomains(yaml);
+    expect(domains).toContain("gmail.googleapis.com");
+    expect(domains).toContain("gmailmcp.googleapis.com");
+    expect(yaml).not.toContain("- name: oauth_token");
+    expect(yaml).not.toContain("gmail-oauth.json");
+    expect(yaml).not.toContain("token_endpoint:");
+    expect(yaml).not.toContain("gmail.secret");
   });
 });

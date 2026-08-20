@@ -54,6 +54,7 @@ import {
   type SnapshotDraft,
 } from "./fetch-catalog";
 import { validateManifest, type CredentialSchema } from "./manifest";
+import { probeMcpEndpoint } from "./mcp-endpoint-probe";
 import type { ExtensionRegistry, PinnedSnapshot } from "./registry";
 import {
   DEV_EGRESS_CONFIG_PATH,
@@ -86,27 +87,37 @@ export type CatalogMcpDiscoverer = (entry: CatalogEntry, opts?: FetchCatalogOpti
 const OAUTH_AS_METADATA_PATH = "/.well-known/oauth-authorization-server";
 
 /**
- * Deterministic official MCP endpoint discovery (issue #232): the
- * official HOSTED server follows the vendor-domain convention every pinned
- * hosted provider uses (linear → mcp.linear.app/mcp, attio →
- * mcp.attio.com/mcp, notion → mcp.notion.com/mcp) — derived from the
- * catalog record's OWN domain, never a community URL. The auth mode comes
- * from the vendor's published RFC 8414 metadata (the same discovery the
- * SDK's `auth()` runs): an OAuth resource/authorization-server metadata
- * document → OAuth-gated; none → api_key. Issue #284: no token endpoint
- * is carried on the record — the SDK performs its own RFC 8414 discovery
- * at connect/call time and the egress proxy never mints. An
- * unreachable/5xx probe fails loudly — an endpoint or auth mode is never
- * guessed.
+ * The finite, strictly-ordered MCP endpoint candidates for one catalog
+ * entry (issue #286 §3). Trust is encoded in the order:
+ *
+ *   1. Trusted explicit endpoint metadata — `entry.mcpEndpoint`, honored
+ *      verbatim (the catalog's machine-readable published endpoint). Wins
+ *      over ALL derivation.
+ *   2. Derived candidates — `https://mcp.<domain>/mcp`, then the SAME
+ *      host's `/mcp/v1` (two paths, never a synthesized vendor-specific
+ *      host like "gmailmcp" — such facts are exactly what a reviewed
+ *      override is for). The existing `mcp.`-prefix guard stays: a domain
+ *      that is already the MCP host is never double-prefixed.
+ *
+ * A candidate is USED only when {@link probeMcpEndpoint} accepts it;
+ * otherwise the next candidate is tried. When the set is exhausted the
+ * discovery fails closed with the probe evidence.
  */
-export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalogOptions = {}): Promise<DiscoveredCatalogMcp> {
+function mcpCandidates(entry: CatalogEntry): string[] {
+  if (entry.mcpEndpoint !== undefined && entry.mcpEndpoint.trim() !== "") {
+    return [entry.mcpEndpoint.trim()];
+  }
   const host = entry.domain.startsWith("mcp.") ? entry.domain : `mcp.${entry.domain}`;
-  const serverUrl = `https://${host}/mcp`;
-  const origin = `https://${host}`;
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  // RFC 8414 discovery paths: the MCP OAuth resource metadata (the MCP auth
-  // spec's canonical signal) and the authorization-server metadata (the
-  // fallback some vendors serve instead — e.g. linear/attio).
+  return [`https://${host}/mcp`, `https://${host}/mcp/v1`];
+}
+
+/**
+ * The RFC 8414 auth-classification probe (issue #232, unchanged semantics):
+ * an OAuth resource/authorization-server metadata document on the
+ * validated MCP origin → OAuth-gated; clean 404s on both paths → api_key;
+ * any other status fails loudly (an auth mode is never guessed).
+ */
+async function classifyOAuthFromMetadata(origin: string, slug: string, fetchImpl: typeof fetch): Promise<boolean> {
   const metadataPaths = [
     `${origin}/.well-known/oauth-protected-resource/mcp`,
     `${origin}${OAUTH_AS_METADATA_PATH}`,
@@ -117,24 +128,18 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
       res = await fetchImpl(metadataUrl);
     } catch (err) {
       throw new CatalogError(
-        `official MCP endpoint discovery for "${entry.slug}" failed probing ${metadataUrl}: ${errorMessage(err)}`,
+        `official MCP endpoint discovery for "${slug}" failed probing ${metadataUrl}: ${errorMessage(err)}`,
       );
     }
     if (res.status === 200) {
       // OAuth-gated: tools-less manifest, the #231 notion pattern — the
       // runtime discovers the surface from tools/list at boot, the OAuth
       // flow mints at connect (SDK-owned, issue #284).
-      return {
-        serverUrl,
-        host,
-        transport: "streamable-http",
-        credentialSchema: { type: "oauth" },
-        oauthGated: true,
-      };
+      return true;
     }
     if (res.status !== 404) {
       throw new CatalogError(
-        `official MCP endpoint discovery for "${entry.slug}": ${metadataUrl} returned HTTP ${res.status} — ` +
+        `official MCP endpoint discovery for "${slug}": ${metadataUrl} returned HTTP ${res.status} — ` +
           "cannot classify the auth mode (never guessed)",
       );
     }
@@ -143,7 +148,75 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
   // API key at connect (the #196 upload-link path). A server that omits
   // RFC 8414 metadata is never guessed as OAuth (that would mint an OAuth
   // flow against a server that does not speak it).
-  return { serverUrl, host, transport: "streamable-http", credentialSchema: { type: "api_key" }, oauthGated: false };
+  return false;
+}
+
+/**
+ * Deterministic official MCP endpoint discovery (issue #232 + #286): every
+ * candidate endpoint is PROBED with a raw JSON-RPC `initialize` before it
+ * can register — a synthesized or hand-typed URL is never persisted
+ * unproven (the broken Gmail pin bound /mcp while the official endpoint is
+ * /mcp/v1). Candidates come from the finite ordered set in
+ * {@link mcpCandidates}; the first accepted verdict wins:
+ *
+ *   - `mcp` verdict → the endpoint speaks MCP; the auth mode comes from
+ *     the vendor's published RFC 8414 metadata on the VALIDATED origin
+ *     (the same discovery the SDK's `auth()` runs): a metadata document →
+ *     OAuth-gated; none → api_key. Issue #284: no token endpoint is
+ *     carried on the record — the SDK performs its own RFC 8414 discovery
+ *     at connect/call time and the egress proxy never mints.
+ *   - `oauth_challenge` verdict → the endpoint exists and is OAuth-gated
+ *     (a standards-compliant Bearer challenge); the metadata probe is
+ *     unnecessary.
+ *
+ * The allowlist host is the VALIDATED URL's host — never a redirect
+ * target, never a well-known metadata origin. Fail closed: an endpoint
+ * that fails every candidate probe (or a metadata probe that is neither
+ * 200 nor 404) is a loud {@link CatalogError} carrying the probe evidence
+ * and the reviewed-override instruction — an endpoint or auth mode is
+ * never guessed.
+ */
+export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalogOptions = {}): Promise<DiscoveredCatalogMcp> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs;
+  const failures: Array<{ url: string; evidence: string }> = [];
+  for (const serverUrl of mcpCandidates(entry)) {
+    const verdict = await probeMcpEndpoint(serverUrl, {
+      fetchImpl,
+      ...(timeoutMs !== undefined ? { timeoutMs } : undefined),
+    });
+    if (!verdict.ok) {
+      failures.push({ url: serverUrl, evidence: verdict.evidence });
+      continue;
+    }
+    const host = new URL(serverUrl).host;
+    if (verdict.kind === "oauth_challenge") {
+      return {
+        serverUrl,
+        host,
+        transport: "streamable-http",
+        credentialSchema: { type: "oauth" },
+        oauthGated: true,
+      };
+    }
+    const oauthGated = await classifyOAuthFromMetadata(`https://${host}`, entry.slug, fetchImpl);
+    return {
+      serverUrl,
+      host,
+      transport: "streamable-http",
+      credentialSchema: oauthGated ? { type: "oauth" } : { type: "api_key" },
+      oauthGated,
+    };
+  }
+  throw new CatalogError(
+    `official MCP endpoint discovery for "${entry.slug}" failed: ` +
+      failures.map((f) => `candidate ${f.url} failed the MCP validation probe (${f.evidence})`).join("; ") +
+      " and no other candidate accepted — nothing was registered. The vendor's hosted MCP endpoint could not be " +
+      "validated. If you have a reviewed official endpoint, register it via catalog_browser action=pin " +
+      `spec=${entry.slug} binding={serverUrl: "<reviewed https url>", transport: "streamable-http"} ` +
+      "credential_schema={...} confirm=true — the pin path probes the endpoint the same way. Browse the " +
+      "integrations.sh catalog with catalog_browser to find the right id.",
+  );
 }
 
 /** The connect capability's optional catalog wiring (issue #232). */
@@ -259,11 +332,11 @@ export async function lookupCatalogExtension(
   try {
     discovered = await discoverMcp(entry, catalogOpts);
   } catch (err) {
+    // Issue #286: the discovery failure carries the probe evidence and the
+    // reviewed-override instruction (§8) — nothing was registered.
     return {
       ok: false,
-      message:
-        `cannot register "${extensionId}" from the catalog: ${errorMessage(err)} — nothing was registered. ` +
-        "Fix the discovery failure (the vendor's hosted MCP endpoint or OAuth metadata) and retry.",
+      message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
     };
   }
   const scaffold = buildSnapshotDraft(entry);

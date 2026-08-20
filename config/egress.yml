@@ -73,6 +73,8 @@ transforms:
         - "api.github.com"
         - "mcp.attio.com"
         - "api.githubcopilot.com"
+        - "gmail.googleapis.com"
+        - "gmailmcp.googleapis.com"
         - "mcp.linear.app"
 
   # 2. Judge: LLM policy gate. Fires on every request that passed the

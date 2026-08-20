@@ -1,0 +1,26 @@
+{
+  "schema": "bottega.extension-snapshot.v1",
+  "extensionId": "gmail-googleapis-com",
+  "pinnedAt": "2026-08-20T00:00:00.000Z",
+  "source": {
+    "catalog": "https://integrations.sh/api.json",
+    "specId": "gmail-googleapis-com",
+    "vendorOfficial": true,
+    "reviewed": true
+  },
+  "manifest": {
+    "id": "gmail-googleapis-com",
+    "label": "Gmail",
+    "vendor": "Google",
+    "kind": "mcp",
+    "mcp": {
+      "serverUrl": "https://gmailmcp.googleapis.com/mcp/v1",
+      "transport": "streamable-http"
+    },
+    "credentialSchema": {
+      "type": "oauth",
+      "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
+    },
+    "domains": ["gmail.googleapis.com", "gmailmcp.googleapis.com"]
+  }
+}

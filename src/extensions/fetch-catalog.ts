@@ -89,12 +89,24 @@ export interface CatalogEntry {
    */
   url?: string;
   description?: string;
+  /**
+   * Trusted explicit hosted MCP endpoint metadata (issue #286): when a
+   * catalog record publishes the vendor's machine-readable MCP endpoint,
+   * the deterministic connect honors it VERBATIM over any derivation. The
+   * live integrations.sh catalog carries none today (the field is inert),
+   * but it is load-bearing for forward compatibility: a catalog-published
+   * endpoint is always probed before it registers, exactly like a derived
+   * one.
+   */
+  mcpEndpoint?: string;
 }
 
 export interface FetchCatalogOptions {
   catalogUrl?: string;
   /** Test seam: default is global fetch. */
   fetchImpl?: typeof fetch;
+  /** The MCP endpoint probe's wall-clock bound (issue #286); default MCP_DISCOVERY_TIMEOUT_MS. */
+  timeoutMs?: number;
 }
 
 /**
@@ -194,6 +206,7 @@ function parseListableRecord(record: JsonObject): CatalogEntry {
   const domain = requireString(record, "domain", specId);
   const url = optionalString(record["url"]);
   const description = optionalString(record["description"]);
+  const mcpEndpoint = optionalString(record["mcpEndpoint"]);
   return {
     id,
     slug,
@@ -202,6 +215,7 @@ function parseListableRecord(record: JsonObject): CatalogEntry {
     domain,
     ...(url !== null && url.trim() !== "" ? { url } : undefined),
     ...(description !== null ? { description } : undefined),
+    ...(mcpEndpoint !== null && mcpEndpoint.trim() !== "" ? { mcpEndpoint } : undefined),
   };
 }
 

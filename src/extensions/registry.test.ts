@@ -138,16 +138,30 @@ describe("extension registry", () => {
     expect(linear!.snapshot?.source.vendorOfficial).toBe(true);
   });
 
-  test("every committed pinned snapshot registers (issue #231)", () => {
+  test("every committed pinned snapshot registers (issue #231 + #286)", () => {
     // A dropped or malformed snapshot must not silently shrink the seeded
     // registry: the boot resolves the whole committed set, and the
-    // connect/extension tools key off registry.resolve.
+    // connect/extension tools key off registry.resolve. The set is the
+    // #233 seed (attio/github/linear) plus the reviewed Gmail override
+    // (issue #286 §7).
     const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
     const ids = registry.list().map((entry) => entry.manifest.id);
-    expect(ids).toEqual(["attio", "github", "linear"]);
+    // Filename sort order: "github" < "gmail-googleapis-com" (i < m).
+    expect(ids).toEqual(["attio", "github", "gmail-googleapis-com", "linear"]);
     for (const id of ids) {
       expect(registry.resolve(id)).toBeDefined();
     }
+    // The Gmail override carries the reviewed official /mcp/v1 binding.
+    const gmail = registry.resolve("gmail-googleapis-com");
+    expect(gmail?.manifest.mcp).toEqual({
+      serverUrl: "https://gmailmcp.googleapis.com/mcp/v1",
+      transport: "streamable-http",
+    });
+    expect(gmail?.manifest.credentialSchema).toEqual({
+      type: "oauth",
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
+    expect(gmail?.snapshot?.source.reviewed).toBe(true);
   });
 });
 
