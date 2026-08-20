@@ -73,7 +73,9 @@ import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver } from "../../src/server/drivers/agent-driver";
 import { createOmpSdkDriver, SessionModelRoleRegistry } from "../../src/server/drivers/agent-driver";
 import {
+  channelFromSpaceId,
   createSlackAdapter,
+  isDmChannel,
   registerActionHandler,
   registerMessageHandler,
   type SlackAction,
@@ -872,7 +874,22 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // restricted SDK sessions drop extension-registered tools, so the shared
   // definitions (the same ones the extensions register) surface here and
   // cross the driver-level policy gate before executing.
-  const memoryTools = memoryToolDefinitions(memoryProvider, { audit });
+  const memoryTools = memoryToolDefinitions(memoryProvider, {
+    audit,
+    // Issue #137: recall/save scopes derive from the authenticated invocation
+    // context — space id, TURN principal, DM/channel classification, effective
+    // `memory.team` — never from a prompt/tool argument. spaceService is
+    // late-bound; the closure reads it only at call time (mirrors index.ts).
+    getScopeContext: async (spaceId) => {
+      const policy = await loadSpacePolicy(orgPolicy, store, spaceId);
+      return {
+        spaceId,
+        principal: spaceService.getTurnPrincipal(spaceId),
+        directMessage: isDmChannel(channelFromSpaceId(spaceId)),
+        teamId: policy.memory.team,
+      };
+    },
+  });
   const workItemTools = workItemToolDefinitions(store, { orgPolicy });
   // Model tools (issue #64): use_model reaches the live session through
   // the registry the server wires (the harness mirrors index.ts so the

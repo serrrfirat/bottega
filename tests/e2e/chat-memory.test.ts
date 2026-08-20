@@ -84,7 +84,7 @@ describe("e2e journey 1: chat + memory", () => {
         // Request 1 = save call, 2 = search call, 3 = final text.
         await h.modelStub.waitForRequests(3);
 
-        const found = await h.memory.search({ query: "build", scope: "org" });
+        const found = await h.memory.search({ query: "build", scope: { kind: "org" } });
         expect(found.map((e) => e.content)).toContain("the build runs with bun test");
 
         // The tool calls executed through the real provider and were
@@ -115,7 +115,7 @@ describe("e2e journey 1: chat + memory", () => {
         // turn's start) into the model's context via the driver's
         // appendSystemPrompt seam; the harness lists them through the real
         // provider and renders with the extension's own renderer.
-        await h.memory.save({ scope: "org", content: "the team deploys on Tuesdays", metadata: { inject: "1" } });
+        await h.memory.save({ scope: { kind: "org" }, content: "the team deploys on Tuesdays", metadata: { inject: "1" } });
         await h.deliverMessage(h.slack.dmChannelId, "deploy");
         await h.modelStub.waitForRequests(1);
 
@@ -156,7 +156,7 @@ describe("e2e journey 1: chat + memory", () => {
         const digests = await waitFor(async () => {
           const entries = await h.memory.search({
             query: "",
-            scope: "org",
+            scope: { kind: "org" },
             metadata: { kind: "digest", space: spaceId },
           });
           return entries.length > 0 ? entries : undefined;

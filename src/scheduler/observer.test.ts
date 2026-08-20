@@ -25,7 +25,7 @@ class FakeMemoryProvider implements MemoryProvider {
     if (this.searchError) throw this.searchError;
 
     return this.entries
-      .filter((entry) => entry.scope === query.scope)
+      .filter((entry) => entry.key.kind === (query.scope as { kind: string }).kind)
       .filter((entry) =>
         Object.entries(query.metadata ?? {}).every(([key, value]) => entry.metadata[key] === value),
       )
@@ -43,8 +43,7 @@ function memory(
 ): MemoryEntry {
   return {
     id,
-    scope: "org",
-    principal: null,
+    key: { kind: "org" },
     content,
     metadata: { kind, ...metadata },
     createdAt,
@@ -147,8 +146,8 @@ describe("orgPulseAction", () => {
 
     expect(orgPulseAction.name).toBe("org_pulse");
     expect(provider.searches).toEqual([
-      { query: "", scope: "org", metadata: { kind: "reflection" }, limit: 20 },
-      { query: "", scope: "org", metadata: { kind: "digest" }, limit: 20 },
+      { query: "", scope: { kind: "org" }, metadata: { kind: "reflection" }, limit: 20 },
+      { query: "", scope: { kind: "org" }, metadata: { kind: "digest" }, limit: 20 },
     ]);
     expect(posts).toHaveLength(1);
     expect(posts[0]!.spaceId).toBe("pulse");

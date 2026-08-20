@@ -34,6 +34,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { EXTENSION_ID_RE, type JsonObject, type JsonValue } from "../extensions/manifest";
+import { isValidTeamId } from "../memory/types";
 import type { Store } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
@@ -252,6 +253,19 @@ export interface MemoryInjectionConfig {
   maxEntries: number;
 }
 
+export interface MemoryConfig {
+  injection: MemoryInjectionConfig;
+  /**
+   * Permission-aware memory (issue #137): the optional team id a channel
+   * space shares memory with (`memory.team` in the org config floor and/or
+   * the space's per-space policy overlay). A valid id grants `team:<id>`
+   * recall alongside the channel + org floor; an invalid value fails closed
+   * (undefined → no team scope is granted). `extensions.org_credentials` is
+   * unrelated and never affects memory visibility.
+   */
+  team: string | undefined;
+}
+
 export interface LearningConfig {
   /** Automatic durable-fact extraction after human conversation bursts. Default true. */
   autoExtract: boolean;
@@ -277,7 +291,7 @@ export interface PolicyConfig {
    */
   alwaysApprove: string[];
   /** Memory-context injection settings (issue #42); org floor only — the overlay cannot change them. */
-  memory: { injection: MemoryInjectionConfig };
+  memory: MemoryConfig;
   /** Automatic learning settings; org floor only. */
   learning: LearningConfig;
   /** Durable object limits from the org config; space overlays cannot change them. */
@@ -330,7 +344,7 @@ export function defaultPolicy(): PolicyConfig {
     timeoutMinutes: DEFAULT_TIMEOUT_MINUTES,
     approvers: [],
     alwaysApprove: [],
-    memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES } },
+    memory: { injection: { enabled: true, maxEntries: DEFAULT_MEMORY_INJECTION_MAX_ENTRIES }, team: undefined },
     learning: { autoExtract: true },
     objects: { maxSizeBytes: DEFAULT_OBJECT_MAX_SIZE_BYTES },
 
@@ -639,6 +653,18 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
           policy.warnings.push("memory.injection.max_entries: invalid — using default");
         }
       }
+      // Permission-aware memory (issue #137): optional `memory.team` sets the
+      // team id a space shares memory with. A malformed value fails closed
+      // (no `team:<id>` scope is granted) with a warning.
+      const team = scalarOrUndefined(entries.team);
+      if (team !== undefined) {
+        if (isValidTeamId(team)) {
+          policy.memory.team = team;
+        } else {
+          policy.memory.team = undefined;
+          policy.warnings.push(`memory.team: invalid id '${team}' — no team scope granted (fail closed)`);
+        }
+      }
     } else if (name === "learning") {
       const autoExtract = parseBoolean(scalarOrUndefined(entries.auto_extract));
       if (autoExtract !== undefined) {
@@ -754,7 +780,7 @@ function clonePolicy(p: PolicyConfig): PolicyConfig {
   return {
     ...p,
     tools: { ...p.tools },
-    memory: { injection: { ...p.memory.injection } },
+    memory: { injection: { ...p.memory.injection }, team: p.memory.team },
     learning: { ...p.learning },
     objects: { ...p.objects },
     errors: [...p.errors],
@@ -884,6 +910,29 @@ export function applySpaceOverlay(org: PolicyConfig, policyJson: string): Policy
         );
       } else {
         out.orgCredentials = stricterOrgCredentials(out.orgCredentials, mode);
+      }
+    }
+  }
+
+  // Memory policy (issue #137): the space overlay may set `memory.team`
+  // (a channel's explicit team). The overlay can only tighten memory access —
+  // it can grant a team only for THIS space and never touches person/channel
+  // keys or org. A malformed team value fails closed (grants nothing).
+  const memoryEntry = overlay["memory"];
+  if (memoryEntry !== undefined) {
+    if (!isConfigMapping(memoryEntry)) {
+      return structuralError(defaultPolicy(), "spaces.policy_json: memory must be an object");
+    }
+    const mem = memoryEntry;
+    const teamEntry = mem["team"];
+    if (teamEntry !== undefined) {
+      const team = scalarOrUndefined(teamEntry);
+      if (team !== undefined && isValidTeamId(team)) {
+        out.memory.team = team;
+      } else {
+        const shown = scalarOrUndefined(teamEntry) ?? "<non-scalar>";
+        out.memory.team = undefined;
+        out.warnings.push(`overlay memory.team: invalid id '${shown}' — no team scope granted (fail closed)`);
       }
     }
   }

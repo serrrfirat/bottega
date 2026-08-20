@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import type { MemoryScope } from "./types";
 
 export const DEFAULT_COMPACT_AFTER = 10;
 
@@ -312,7 +311,7 @@ export async function maintainMemory(
        WHERE scope = 'org' OR (scope = 'user' AND principal IS NOT NULL)
        ORDER BY scope ASC, principal ASC`,
     )
-    .all() as { scope: MemoryScope; principal: string | null }[];
+    .all() as { scope: "org" | "user"; principal: string | null }[];
 
   const results: ConsolidationResult[] = [];
   for (const row of pools) {

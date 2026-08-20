@@ -251,14 +251,23 @@ describe("canary journeys with the real model (issue #71)", () => {
     try {
       await withTranscript(h, spaceId, async () => {
         h.deliverMessage(dm, `remember that ${token} is the marker for this canary run`).catch(() => {});
-        // The real model must call memory.save; the row may land in org or
-        // user scope — search both scopes for the fact token.
+        // The real model must call memory.save; a DM save defaults to the
+        // requester's person scope (issue #137), so search person + org for
+        // the fact token (org in case the model chose the org floor).
+        const person = h.liveSlack?.qaUserId;
         const found = await waitFor(
           async () => {
-            const org = await h.memory.search({ scope: "org", query: token });
-            if (org.some((e) => e.content.includes(token))) return org;
-            const user = await h.memory.search({ scope: "user", query: token });
-            return user.some((e) => e.content.includes(token)) ? user : undefined;
+            const scopes: Array<{ scope: "person" | "org"; principal?: string }> = person
+              ? [{ scope: "person", principal: person }, { scope: "org" }]
+              : [{ scope: "org" }];
+            for (const s of scopes) {
+              const hits = await h.memory.search({
+                query: token,
+                scope: s.scope === "org" ? { kind: "org" } : { kind: "person", principal: s.principal! },
+              });
+              if (hits.some((e) => e.content.includes(token))) return hits;
+            }
+            return undefined;
           },
           150_000,
           "a memory row containing the fact",

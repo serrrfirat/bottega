@@ -190,7 +190,7 @@ describe("standupDigestAction (issue #92)", () => {
     const memoryProvider = createSqliteMemoryProvider(store.getDb());
     for (let i = 0; i < 20; i++) {
       await memoryProvider.save({
-        scope: "org",
+        scope: { kind: "org" },
         content: `old digest ${i}`,
         metadata: { kind: "digest", space, since: "", until: String(i) },
       });

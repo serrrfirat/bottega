@@ -142,7 +142,7 @@ export const orgPulseAction: SchedulerAction = {
 
       const reflections = await ctx.memoryProvider.search({
         query: "",
-        scope: "org",
+        scope: { kind: "org" },
         metadata: { kind: "reflection" },
         limit: 20,
       });
@@ -155,7 +155,7 @@ export const orgPulseAction: SchedulerAction = {
 
       const digests = await ctx.memoryProvider.search({
         query: "",
-        scope: "org",
+        scope: { kind: "org" },
         metadata: { kind: "digest" },
         limit: 20,
       });

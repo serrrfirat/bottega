@@ -10,6 +10,8 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
   MEMORY_LIMIT_DEFAULT,
+  decodeScopeKey,
+  encodeScopeKey,
   validateSaveInput,
   validateSearchQuery,
   type MemoryEntry,
@@ -95,9 +97,10 @@ type MemoryRow = {
 function rowToEntry(row: MemoryRow): MemoryEntry {
   return {
     id: row.id,
-    // SAFETY: validateSaveInput rejects any scope other than "org"/"user" before a row is written.
-    scope: row.scope as MemoryEntry["scope"],
-    principal: row.principal,
+    // SAFETY: rows are written through validateSaveInput with a logical
+    // scope key; decodeScopeKey is total over every persisted (scope,
+    // principal) pair (legacy user rows decode to person).
+    key: decodeScopeKey(row.scope as "org" | "user", row.principal),
     content: row.content,
     // SAFETY: save() writes metadata_json from the validated metadata map (string values), so parsing a stored row's JSON yields a string map.
     metadata: JSON.parse(row.metadata_json) as Record<string, string>,
@@ -168,20 +171,19 @@ export function createSqliteMemoryProvider(
   function save(input: MemorySaveInput): Promise<MemoryEntry> {
     validateSaveInput(input);
     const id = `mem_${randomUUID()}`;
-    const principal = input.scope === "user" ? input.principal! : null;
+    const physical = encodeScopeKey(input.scope);
     const createdAt = now();
     insertStmt.run(
       id,
-      input.scope,
-      principal,
+      physical.scope,
+      physical.principal,
       input.content,
       JSON.stringify(input.metadata ?? {}),
       createdAt,
     );
     return Promise.resolve({
       id,
-      scope: input.scope,
-      principal,
+      key: input.scope,
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt,
@@ -204,11 +206,12 @@ export function createSqliteMemoryProvider(
   }
 
   function likeRows(query: MemorySearchQuery): MemoryRow[] {
+    const physical = encodeScopeKey(query.scope);
     const clauses = ["scope = ?", "content LIKE ? ESCAPE '\\'"];
-    const params: (string | number)[] = [query.scope, `%${escapeLike(query.query)}%`];
-    if (query.scope === "user" && query.principal !== undefined) {
+    const params: (string | number)[] = [physical.scope, `%${escapeLike(query.query)}%`];
+    if (physical.scope === "user" && physical.principal !== null) {
       clauses.push("principal = ?");
-      params.push(query.principal);
+      params.push(physical.principal);
     }
     // SAFETY: the SELECT column list exactly matches MemoryRow; bun:sqlite returns plain objects with those columns.
     return db
@@ -222,6 +225,7 @@ export function createSqliteMemoryProvider(
   }
 
   function ftsRows(query: MemorySearchQuery, match: string): MemoryRow[] {
+    const physical = encodeScopeKey(query.scope);
     const clauses = ["memories_fts MATCH ?", "m.scope = ?"];
     const params: (string | number)[] = [
       RECENCY_WEIGHT,
@@ -229,11 +233,11 @@ export function createSqliteMemoryProvider(
       RECENCY_DECAY_MS,
       now(),
       match,
-      query.scope,
+      physical.scope,
     ];
-    if (query.scope === "user" && query.principal !== undefined) {
+    if (physical.scope === "user" && physical.principal !== null) {
       clauses.push("m.principal = ?");
-      params.push(query.principal);
+      params.push(physical.principal);
     }
     // SAFETY: the SELECT column list exactly matches MemoryRow; bun:sqlite returns plain objects with those columns (blended_rank is an extra column the cast ignores).
     return db

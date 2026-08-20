@@ -1,4 +1,5 @@
-import type { MemoryScope } from "./types";
+/** Physical scope for extraction-prompt wording: "org" = shared channel, "user" = DM. */
+export type ExtractionScope = "org" | "user";
 type BurstTimer = Timer;
 
 export interface ExtractionTurn {
@@ -37,7 +38,7 @@ interface PendingBurst {
  * Builds the deliberately narrow extraction turn. Assistant text is context,
  * never evidence: only facts explicitly stated in a human message are valid.
  */
-export function buildExtractionPrompt(turns: readonly ExtractionTurn[], scope: MemoryScope): string {
+export function buildExtractionPrompt(turns: readonly ExtractionTurn[], scope: ExtractionScope): string {
   const scopeRule = scope === "org"
     ? "Write shared channel facts in third person about the person, team, or organization."
     : "Write direct-message facts in third person about the human user.";

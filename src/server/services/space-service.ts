@@ -799,7 +799,7 @@ export class SpaceService {
         return;
       }
       await provider.save({
-        scope: "org",
+        scope: { kind: "org" },
         content: summary,
         metadata: { kind: "digest", space: spaceId, since: marker ?? "", until: lastTs },
       });
@@ -813,7 +813,7 @@ export class SpaceService {
   async #newestDigestUntil(provider: MemoryProvider, spaceId: string): Promise<string | null> {
     const [newest] = await provider.search({
       query: "",
-      scope: "org",
+      scope: { kind: "org" },
       metadata: { kind: "digest", space: spaceId },
       limit: 1,
     });

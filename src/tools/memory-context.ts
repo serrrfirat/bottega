@@ -28,6 +28,7 @@
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { MEMORY_LIMIT_MAX, type MemoryEntry, type MemoryProvider } from "../memory/types";
+import { recallMemories, type MemoryScopeContext } from "../memory/scope";
 
 /** Fixed label of the injected message; also the "already injected" marker. */
 export const MEMORY_INJECTION_PREFIX = "Relevant memory:";
@@ -43,6 +44,13 @@ export interface MemoryContextExtensionOpts {
   enabled?: boolean;
   /** Per-session principal getter (driver opts seam, issue #42). */
   getPrincipal?: () => string | undefined;
+  /**
+   * Authenticated invocation context (issue #137): how the recall derives its
+   * readable scopes. Falls back to org-only when absent (fail closed — no
+   * person/channel scopes can leak). When wired, the recall searches exactly
+   * the derived readable scopes and appends `memory.recalled`.
+   */
+  getScopeContext?: () => MemoryScopeContext | Promise<MemoryScopeContext>;
 }
 
 export function memoryContextExtension(
@@ -52,6 +60,16 @@ export function memoryContextExtension(
   const maxEntries = opts.maxEntries ?? 5;
   const maxBytes = opts.maxBytes ?? 4096;
   const enabled = opts.enabled ?? true;
+  // Issue #137: the recall runs in the authenticated invocation context. When
+  // none is wired, fail closed to an org-only context (never guess person or
+  // channel scopes): a DM with no principal derives exactly the org floor.
+  const scopeContext = async (): Promise<MemoryScopeContext> =>
+    (await opts.getScopeContext?.()) ?? {
+      spaceId: "",
+      principal: undefined,
+      directMessage: true,
+      teamId: undefined,
+    };
   return (pi) => {
     // The injected message exists only in the LLM-visible copy, so a
     // "already injected" scan of the conversation cannot see it on the next
@@ -66,17 +84,13 @@ export function memoryContextExtension(
       if (event.messages.some(isInjectionMessage)) return;
       const query = latestUserText(event.messages);
       if (!query) return;
-      const principal = opts.getPrincipal?.() ?? opts.defaultPrincipal;
-      // Search itself caps at MEMORY_LIMIT_MAX; honor a larger maxEntries for
-      // the combined budget, but never ask the provider for more than it allows.
+      // Issue #137: recall searches exactly the authenticated invocation
+      // context's derived readable scopes (person+org for DMs, channel+team+org
+      // for channels). A prompt or tool argument can never widen access; when
+      // no context is wired, the recall fails closed to org only.
       const limit = Math.min(maxEntries, MEMORY_LIMIT_MAX);
-      const [orgHits, userHits] = await Promise.all([
-        provider.search({ query, scope: "org", limit }),
-        principal
-          ? provider.search({ query, scope: "user", principal, limit })
-          : Promise.resolve<MemoryEntry[]>([]),
-      ]);
-      const body = renderInjection([...orgHits, ...userHits], maxEntries, maxBytes);
+      const hits = await recallMemories(provider, await scopeContext(), query, { limit });
+      const body = renderInjection(hits, maxEntries, maxBytes);
       if (!body) return;
       injectedThisTurn = true;
       return {

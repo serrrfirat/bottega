@@ -229,7 +229,7 @@ export async function ingestSource(
   let saved = 0;
   for (const chunk of chunks) {
     const entry = await memoryProvider.save({
-      scope: "org",
+      scope: { kind: "org" },
       content: chunk,
       metadata: { kind: "kb", source: source.id, url: source.url },
     });

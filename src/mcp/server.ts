@@ -72,8 +72,9 @@ import {
 import type { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z, type ExtensionContext, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
-import { validateSaveInput, validateSearchQuery } from "../memory/types";
+import type { MemoryProvider, MemorySaveInput, MemoryScopeKey } from "../memory/types";
+import { validateSaveInput } from "../memory/types";
+import { recallMemories, scopedSave, type MemoryScopeContext } from "../memory/scope";
 import {
   indexSessionFiles,
   searchSessions,
@@ -418,6 +419,18 @@ function parseMintUploadLinkArgs(
 export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
   const actor = "agent";
 
+  /** Issue #137: derive the authenticated invocation context for memory recall. */
+  const scopeContext = (): MemoryScopeContext => {
+    const spaceId = opts.spaceId ?? "";
+    const channel = spaceId.replace(/^slack:/, "");
+    return {
+      spaceId,
+      directMessage: channel.startsWith("D"),
+      principal: opts.defaultPrincipal,
+      teamId: opts.policy.memory.team,
+    };
+  };
+
   /** Every tool call audits its policy decision, like the in-session gate. */
   const auditDecision = (
     tool: string,
@@ -445,10 +458,25 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
     if (gate.error) throw gate.error;
 
-    const principal = args.principal ?? opts.defaultPrincipal;
-    const input: MemorySaveInput = { scope: args.scope, content: args.content, metadata: args.metadata };
-    if (principal) input.principal = principal;
+    const ctx = scopeContext();
+    // Issue #137: the model names the writable scope KIND; the concrete key is
+    // always derived from the authenticated context. Default = the session's
+    // writable scope (person in a DM, channel in a shared channel).
+    let scope: MemoryScopeKey;
+    if (args.scope === undefined) {
+      scope = ctx.directMessage
+        ? { kind: "person", principal: ctx.principal ?? "" }
+        : { kind: "channel", spaceId: ctx.spaceId };
+    } else if (args.scope === "org") {
+      scope = { kind: "org" };
+    } else if (args.scope === "person") {
+      scope = { kind: "person", principal: ctx.principal ?? "" };
+    } else {
+      scope = { kind: "channel", spaceId: ctx.spaceId };
+    }
+    let input: MemorySaveInput;
     try {
+      input = scopedSave(scope, args.content, ctx, args.metadata);
       validateSaveInput(input);
     } catch (err) {
       throw new McpError(ErrorCode.InvalidParams, errorMessage(err));
@@ -457,16 +485,15 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       const entry = await opts.provider.save(input);
       await opts.audit.appendAudit({
         space_id: opts.spaceId ?? null,
-        actor: principal ?? actor,
+        actor: ctx.principal ?? actor,
         event_type: MEMORY_WRITE_EVENT,
         payload: {
-          scope: entry.scope,
-          principal: entry.principal,
+          scope: entry.key.kind,
           id: entry.id,
           content_hash: sha256Hex(entry.content),
         },
       });
-      return { content: [{ type: "text", text: JSON.stringify({ id: entry.id }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ id: entry.id, scope: entry.key.kind }) }] };
     } catch (err) {
       // Provider failures surface as tool errors, not protocol errors.
       return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
@@ -484,20 +511,25 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
     if (gate.error) throw gate.error;
 
-    const query: MemorySearchQuery = {
-      query: args.query,
-      scope: args.scope,
-      principal: args.principal,
-      limit: args.limit,
-    };
-    try {
-      validateSearchQuery(query);
-    } catch (err) {
-      throw new McpError(ErrorCode.InvalidParams, errorMessage(err));
+    // Validate before recall so contextual errors surface as MCP protocol
+    // errors (the old contract), not tool isError outcomes.
+    if (!args.query.trim()) {
+      throw new McpError(ErrorCode.InvalidParams, "memory.search: query must be non-empty");
     }
+    if (args.limit !== undefined && (args.limit < 1 || args.limit > 20)) {
+      throw new McpError(ErrorCode.InvalidParams, "memory.search: limit must be 1..20");
+    }
+
     try {
-      const entries = await opts.provider.search(query);
-      return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+      const entries = await recallMemories(opts.provider, scopeContext(), args.query, {
+        limit: args.limit,
+        audit: opts.audit,
+      });
+      // Optional scope-kind filter: narrows only (recall already restricted to
+      // the derived readable set — it can never widen to another user/channel/team).
+      const filtered =
+        args.scope && args.scope !== "all" ? entries.filter((e) => e.key.kind === args.scope) : entries;
+      return { content: [{ type: "text", text: JSON.stringify(filtered) }] };
     } catch (err) {
       return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
     }

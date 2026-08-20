@@ -1308,7 +1308,7 @@ export function createOmpSdkDriver(
         const limit = Math.min(maxEntries, MEMORY_LIMIT_MAX);
         const flagged = await opts.memoryContext.provider.search({
           query: "",
-          scope: "org",
+          scope: { kind: "org" },
           metadata: { inject: "1" },
           limit,
         });

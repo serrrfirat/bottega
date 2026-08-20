@@ -288,7 +288,7 @@ describe("mem0 provider (stub-backed)", () => {
 
   test("save maps org scope to agent_id and parses the response", async () => {
     const saved = await provider.save({
-      scope: "org",
+      scope: { kind: "org" },
       content: "The org deploys bottega per company.",
       metadata: { source: "slack" },
     });
@@ -303,8 +303,7 @@ describe("mem0 provider (stub-backed)", () => {
     });
     expect(body.metadata).toEqual({ source: "slack" });
     expect(saved.id).toBe("mem-1");
-    expect(saved.scope).toBe("org");
-    expect(saved.principal).toBeNull();
+    expect(saved.key).toEqual({ kind: "org" });
     expect(saved.content).toBe("The org deploys bottega per company.");
     expect(saved.metadata).toEqual({ source: "slack" });
     expect(saved.createdAt).toEqual(expect.any(Number));
@@ -313,52 +312,53 @@ describe("mem0 provider (stub-backed)", () => {
 
   test("org scope defaults to the org agent id when agentId is unset", async () => {
     const p = createMem0MemoryProvider({ baseUrl: stub.server.url.href });
-    await p.save({ scope: "org", content: "default org memory" });
+    await p.save({ scope: { kind: "org" }, content: "default org memory" });
     const body = stub.addBodies.at(-1)!;
     expect(body.agent_id).toBe(MEM0_ORG_AGENT_ID);
     expect(body.user_id).toBeUndefined();
   });
 
-  test("save maps user scope to user_id plus agent_id passthrough", async () => {
-    await provider.save({ scope: "user", principal: "alice", content: "alice prefers kebab case" });
+  test("save maps person scope to user_id (the physical key) with no agent passthrough", async () => {
+    await provider.save({ scope: { kind: "person", principal: "alice" }, content: "alice prefers kebab case" });
     const body = stub.addBodies.at(-1)!;
+    // Issue #137: a person row carries ONLY the person key in user_id — no
+    // agent_id, so it cannot be cross-queryable via the org agent id.
     expect(body.user_id).toBe("alice");
-    expect(body.agent_id).toBe("acme-agent");
+    expect(body.agent_id).toBeUndefined();
   });
 
   test("search sends query, scope filters and top_k, and parses entries", async () => {
-    await provider.save({ scope: "org", content: "search probe zero" });
-    await provider.save({ scope: "org", content: "search probe one" });
-    await provider.save({ scope: "org", content: "search probe two" });
-    const hits = await provider.search({ scope: "org", query: "search probe", limit: 2 });
+    await provider.save({ scope: { kind: "org" }, content: "search probe zero" });
+    await provider.save({ scope: { kind: "org" }, content: "search probe one" });
+    await provider.save({ scope: { kind: "org" }, content: "search probe two" });
+    const hits = await provider.search({ scope: { kind: "org" }, query: "search probe", limit: 2 });
     const body = stub.searchBodies.at(-1)!;
     expect(body.query).toBe("search probe");
     expect(body.filters).toEqual({ agent_id: "acme-agent" });
     expect(body.top_k).toBe(2);
     expect(hits.length).toBe(2);
     expect(hits[0].id).toBeTruthy();
-    expect(hits[0].scope).toBe("org");
-    expect(hits[0].principal).toBeNull();
+    expect(hits[0].key).toEqual({ kind: "org" });
     expect(hits[0].content).toContain("search probe");
     expect(hits[0].createdAt).toEqual(expect.any(Number));
   });
 
   test("search filters by user scope principal", async () => {
-    await provider.save({ scope: "user", principal: "alice", content: "alice likes pie" });
-    await provider.save({ scope: "user", principal: "bob", content: "bob likes cake" });
-    const alice = await provider.search({ scope: "user", principal: "alice", query: "likes" });
+    await provider.save({ scope: { kind: "person", principal: "alice" }, content: "alice likes pie" });
+    await provider.save({ scope: { kind: "person", principal: "bob" }, content: "bob likes cake" });
+    const alice = await provider.search({ scope: { kind: "person", principal: "alice" }, query: "likes" });
     const body = stub.searchBodies.at(-1)!;
-    expect(body.filters).toEqual({ user_id: "alice", agent_id: "acme-agent" });
+    expect(body.filters).toEqual({ user_id: "alice" });
     expect(alice.length).toBe(1);
-    expect(alice[0].principal).toBe("alice");
+    expect(alice[0].key).toEqual({ kind: "person", principal: "alice" });
     expect(alice[0].content).toContain("pie");
   });
 
   test("search merges exact-match metadata filters", async () => {
-    await provider.save({ scope: "org", content: "tagged fact", metadata: { source: "slack" } });
-    await provider.save({ scope: "org", content: "untagged fact" });
+    await provider.save({ scope: { kind: "org" }, content: "tagged fact", metadata: { source: "slack" } });
+    await provider.save({ scope: { kind: "org" }, content: "untagged fact" });
     const hits = await provider.search({
-      scope: "org",
+      scope: { kind: "org" },
       query: "fact",
       metadata: { source: "slack" },
     });
@@ -369,18 +369,17 @@ describe("mem0 provider (stub-backed)", () => {
   });
 
   test("search drops identity-key metadata instead of overwriting the scope", async () => {
-    await provider.save({ scope: "user", principal: "alice", content: "identity probe" });
+    await provider.save({ scope: { kind: "person", principal: "alice" }, content: "identity probe" });
     const hits = await provider.search({
-      scope: "user",
-      principal: "alice",
+      scope: { kind: "person", principal: "alice" },
       query: "identity probe",
       metadata: { user_id: "mallory" },
     });
     const body = stub.searchBodies.at(-1)!;
-    // The scope's user_id wins; the caller's metadata cannot widen the scope.
-    expect(body.filters).toEqual({ user_id: "alice", agent_id: "acme-agent" });
+// The scope's user_id wins; the caller's metadata cannot widen the scope.
+    expect(body.filters).toEqual({ user_id: "alice" });
     expect(hits.length).toBe(1);
-    expect(hits[0].principal).toBe("alice");
+    expect(hits[0].key).toEqual({ kind: "person", principal: "alice" });
   });
 
   test("enables graph add and search when OpenAPI advertises support, preserving user scope", async () => {
@@ -388,21 +387,19 @@ describe("mem0 provider (stub-backed)", () => {
     try {
       const p = createMem0MemoryProvider({ baseUrl: graph.server.url.href, agentId: "graph-agent" });
       const saved = await p.save({
-        scope: "user",
-        principal: "alice",
+        scope: { kind: "person", principal: "alice" },
         content: "Alice works with Bob on Bottega.",
       });
-      const hits = await p.search({ scope: "user", principal: "alice", query: "Who works with Alice?" });
+      const hits = await p.search({ scope: { kind: "person", principal: "alice" }, query: "Who works with Alice?" });
 
       expect(graph.addBodies).toHaveLength(1);
       expect(graph.addBodies[0].enable_graph).toBe(true);
       expect(graph.addBodies[0].user_id).toBe("alice");
-      expect(graph.addBodies[0].agent_id).toBe("graph-agent");
+      expect(graph.addBodies[0].agent_id).toBeUndefined();
       expect(graph.searchBodies).toHaveLength(1);
       expect(graph.searchBodies[0].enable_graph).toBe(true);
       expect(graph.searchBodies[0].filters).toEqual({
         user_id: "alice",
-        agent_id: "graph-agent",
       });
       expect(hits.map((hit) => hit.id)).toContain(saved.id);
     } finally {
@@ -411,8 +408,8 @@ describe("mem0 provider (stub-backed)", () => {
   });
 
   test("uses normal vector-shaped requests when graph is not advertised", async () => {
-    await provider.save({ scope: "org", content: "ordinary memory" });
-    await provider.search({ scope: "org", query: "ordinary" });
+    await provider.save({ scope: { kind: "org" }, content: "ordinary memory" });
+    await provider.search({ scope: { kind: "org" }, query: "ordinary" });
 
     expect(stub.addBodies.at(-1)!.enable_graph).toBeUndefined();
     expect(stub.searchBodies.at(-1)!.enable_graph).toBeUndefined();
@@ -422,14 +419,14 @@ describe("mem0 provider (stub-backed)", () => {
     const stale = createStub({ graphSupport: true, rejectGraph: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: stale.server.url.href });
-      const saved = await p.save({ scope: "org", content: "fallback fact" });
-      const hits = await p.search({ scope: "org", query: "fallback" });
+      const saved = await p.save({ scope: { kind: "org" }, content: "fallback fact" });
+      const hits = await p.search({ scope: { kind: "org" }, query: "fallback" });
 
       expect(stale.addBodies.map((body) => body.enable_graph)).toEqual([true, undefined]);
       expect(stale.searchBodies.map((body) => body.enable_graph)).toEqual([true, undefined]);
       expect(hits.map((hit) => hit.id)).toContain(saved.id);
 
-      await p.save({ scope: "org", content: "second fallback fact" });
+      await p.save({ scope: { kind: "org" }, content: "second fallback fact" });
       expect(stale.addBodies.at(-1)!.enable_graph).toBeUndefined();
     } finally {
       await stale.stop();
@@ -440,9 +437,9 @@ describe("mem0 provider (stub-backed)", () => {
     const consolidating = createStub({ consolidateDuplicates: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: consolidating.server.url.href });
-      const first = await p.save({ scope: "org", content: "Bottega deploys once per company." });
-      const duplicate = await p.save({ scope: "org", content: "Bottega deploys once per company." });
-      const hits = await p.search({ scope: "org", query: "deploys" });
+      const first = await p.save({ scope: { kind: "org" }, content: "Bottega deploys once per company." });
+      const duplicate = await p.save({ scope: { kind: "org" }, content: "Bottega deploys once per company." });
+      const hits = await p.search({ scope: { kind: "org" }, query: "deploys" });
 
       expect(duplicate.id).toBe(first.id);
       expect(consolidating.memories).toHaveLength(1);
@@ -456,7 +453,7 @@ describe("mem0 provider (stub-backed)", () => {
     const authed = createStub({ requireApiKey: "m0sk-secret" });
     try {
       const p = createMem0MemoryProvider({ baseUrl: authed.server.url.href, apiKey: "m0sk-secret" });
-      const saved = await p.save({ scope: "org", content: "authed fact" });
+      const saved = await p.save({ scope: { kind: "org" }, content: "authed fact" });
       expect(saved.id).toBeTruthy();
     } finally {
       await authed.stop();
@@ -464,7 +461,7 @@ describe("mem0 provider (stub-backed)", () => {
   });
 
   test("omits X-API-Key when apiKey is unset", async () => {
-    await provider.save({ scope: "org", content: "header probe" });
+    await provider.save({ scope: { kind: "org" }, content: "header probe" });
     const lastHeaders = stub.headers.at(-1)!;
     expect(lastHeaders.has("x-api-key")).toBe(false);
   });
@@ -473,10 +470,10 @@ describe("mem0 provider (stub-backed)", () => {
     const failing = createStub({ failAdd: true, failSearch: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: failing.server.url.href });
-      await expect(p.save({ scope: "org", content: "x" })).rejects.toThrow(/HTTP 500/);
-      await expect(p.save({ scope: "org", content: "x" })).rejects.toThrow(/upstream extraction failed/);
-      await expect(p.search({ scope: "org", query: "x" })).rejects.toThrow(/HTTP 500/);
-      await expect(p.search({ scope: "org", query: "x" })).rejects.toThrow(/upstream search failed/);
+      await expect(p.save({ scope: { kind: "org" }, content: "x" })).rejects.toThrow(/HTTP 500/);
+      await expect(p.save({ scope: { kind: "org" }, content: "x" })).rejects.toThrow(/upstream extraction failed/);
+      await expect(p.search({ scope: { kind: "org" }, query: "x" })).rejects.toThrow(/HTTP 500/);
+      await expect(p.search({ scope: { kind: "org" }, query: "x" })).rejects.toThrow(/upstream search failed/);
     } finally {
       await failing.stop();
     }
@@ -488,7 +485,7 @@ describe("mem0 provider (stub-backed)", () => {
     const slow = createStub({ slow: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: slow.server.url.href, timeoutMs: 100 });
-      await expect(p.save({ scope: "org", content: "x" })).rejects.toThrow(/timed out after 100ms/);
+      await expect(p.save({ scope: { kind: "org" }, content: "x" })).rejects.toThrow(/timed out after 100ms/);
     } finally {
       await slow.stop();
     }
@@ -498,7 +495,7 @@ describe("mem0 provider (stub-backed)", () => {
     const empty = createStub({ emptyAdd: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: empty.server.url.href });
-      await expect(p.save({ scope: "org", content: "x" })).rejects.toThrow(/no result/);
+      await expect(p.save({ scope: { kind: "org" }, content: "x" })).rejects.toThrow(/no result/);
     } finally {
       await empty.stop();
     }
@@ -508,7 +505,7 @@ describe("mem0 provider (stub-backed)", () => {
     const bare = createStub({ noCreatedAt: true });
     try {
       const p = createMem0MemoryProvider({ baseUrl: bare.server.url.href });
-      const saved = await p.save({ scope: "org", content: "timestamp probe" });
+      const saved = await p.save({ scope: { kind: "org" }, content: "timestamp probe" });
       expect(saved.createdAt).toBe(0);
     } finally {
       await bare.stop();
@@ -657,8 +654,8 @@ describe("mem0 docker leg (skip-gated)", () => {
           // The server runs WITHOUT an LLM key (e.g. operator-configured
           // embedder): exercise the provider end to end.
           const provider = createMem0MemoryProvider({ baseUrl: BASE });
-          const saved = await provider.save({ scope: "org", content: "docker leg probe fact" });
-          const hits = await provider.search({ scope: "org", query: "probe fact" });
+          const saved = await provider.save({ scope: { kind: "org" }, content: "docker leg probe fact" });
+          const hits = await provider.search({ scope: { kind: "org" }, query: "probe fact" });
           if (hits.some((h) => h.id === saved.id)) {
             console.log("[mem0 docker leg] PASS: real server save+search round-trip");
             return;

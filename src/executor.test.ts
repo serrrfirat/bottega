@@ -1906,7 +1906,7 @@ describe("worker job envelope (epic #170)", () => {
           // The parsed content actually landed in org memory with source metadata.
           const memories = await createSqliteMemoryProvider(fx.store.getDb()).search({
             query: "",
-            scope: "org",
+            scope: { kind: "org" },
             metadata: { kind: "kb", source: "handbook" },
             limit: 20,
           });

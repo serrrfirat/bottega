@@ -196,8 +196,7 @@ class FakeMemoryProvider implements MemoryProvider {
     }
     return {
       id: `mem_${this.saved.length}`,
-      scope: input.scope,
-      principal: input.principal ?? null,
+      key: input.scope,
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: 1000,
@@ -212,8 +211,7 @@ class FakeMemoryProvider implements MemoryProvider {
         ? [
             {
               id: "mem_digest",
-              scope: "org" as const,
-              principal: null,
+              key: { kind: "org" } as const,
               content: "digest",
               metadata: { kind: "digest", space: newest.space, since: newest.since, until: newest.until },
               createdAt: 1000,
@@ -2065,7 +2063,7 @@ describe("SpaceService digest-on-idle", () => {
     expect(first.prompts[1].opts).toEqual({ silent: true });
     expect(provider.saved).toEqual([
       {
-        scope: "org",
+        scope: { kind: "org" },
         content: "- first digest",
         metadata: { kind: "digest", space: "slack:C1", since: "", until: "1.1" },
       },

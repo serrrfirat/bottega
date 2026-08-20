@@ -457,7 +457,6 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(rows[0]!.space_id).toBeNull();
       const p = payload(rows[0]!);
       expect(p.scope).toBe("org");
-      expect(p.principal).toBeNull();
       expect(p.id).toBe(id);
       expect(p.content_hash).toBe(sha256Hex("the vault combination is 1234"));
       const auditText = rows[0]!.payload;
@@ -473,32 +472,29 @@ describe("MCP server conformance (spawned entrypoint)", () => {
     }
   });
 
-  test("user-scope save requires and audits the principal; search scopes by principal", async () => {
-    const h = await launch({ configYaml: ALLOW_ALL });
+  test("channel-scope save writes to the current channel key; person scope in a channel fails closed", async () => {
+    const h = await launch({ configYaml: ALLOW_ALL, policyJson: "{\"response_mode\":\"always\"}" });
     try {
-      const res = await h.client.callTool({
+      // The MCP server runs pinned to slack:C1 (a shared channel). A channel
+      // save derives the channel:<spaceId> key.
+      const ch = await h.client.callTool({
         name: "memory.save",
-        arguments: { scope: "user", principal: "U123", content: "prefers dark mode" },
+        arguments: { scope: "channel", content: "our channel deploys on Tuesdays" },
       });
-      expect(res.isError).not.toBe(true);
+      expect(ch.isError).not.toBe(true);
 
       const rows = await auditRows(h.store, "memory.write");
       expect(rows).toHaveLength(1);
-      expect(rows[0]!.actor).toBe("U123");
-      expect(payload(rows[0]!).principal).toBe("U123");
-      expect(payload(rows[0]!).scope).toBe("user");
-    } finally {
-      await h.cleanup();
-    }
-  });
+      expect(payload(rows[0]!).scope).toBe("channel");
 
-  test("user-scope save without principal fails as an MCP error and saves nothing", async () => {
-    const h = await launch({ configYaml: ALLOW_ALL });
-    try {
+      // A person-scope save in a shared channel is NOT writable — fail closed
+      // (issue #137: a channel cannot derive person). It saves nothing.
       await expect(
-        h.client.callTool({ name: "memory.save", arguments: { scope: "user", content: "orphaned" } }),
-      ).rejects.toThrow(/principal/);
-      expect(await auditRows(h.store, "memory.write")).toHaveLength(0);
+        h.client.callTool({
+          name: "memory.save",
+          arguments: { scope: "person", content: "someone's private fact" },
+        }),
+      ).rejects.toThrow(/not writable/);
     } finally {
       await h.cleanup();
     }
@@ -536,40 +532,41 @@ describe("MCP server conformance (spawned entrypoint)", () => {
     }
   });
 
-  test("search scopes org vs user and filters by principal", async () => {
-    const h = await launch({ configYaml: ALLOW_ALL });
+  test("search scopes org + channel; a channel never retrieves a person's fact", async () => {
+    const h = await launch({ configYaml: ALLOW_ALL, policyJson: "{\"response_mode\":\"always\"}" });
     try {
       await h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "alpha org fact" } });
-      await h.client.callTool({ name: "memory.save", arguments: { scope: "user", principal: "U1", content: "alpha user fact" } });
-      await h.client.callTool({ name: "memory.save", arguments: { scope: "user", principal: "U2", content: "alpha other user" } });
+      await h.client.callTool({ name: "memory.save", arguments: { scope: "channel", content: "alpha channel fact" } });
+      // Seed a person fact directly (the MCP channel cannot derive a person key).
+      h.store
+        .getDb()
+        .query(
+          "INSERT INTO memories (id, scope, principal, content, metadata_json, created_at) VALUES ('p1', 'user', 'U1', 'alpha person fact', '{}', ?)",
+        )
+        .run(Date.now());
 
-      const org = await callTool(h.client, "memory.search", { scope: "org", query: "alpha" });
-      // SAFETY: memory.search results are MemoryEntry-shaped; the assertion reads only the scope field.
-      const orgEntries = JSON.parse(org.content[0]!.text!) as Array<{ scope: string }>;
-      expect(orgEntries.map((e) => e.scope)).toEqual(["org"]);
-
-      const mine = await callTool(h.client, "memory.search", {
-        scope: "user",
-        query: "alpha",
-        principal: "U1",
-      });
-      // SAFETY: memory.search results are MemoryEntry-shaped; the assertion reads only the principal field.
-      const mineEntries = JSON.parse(mine.content[0]!.text!) as Array<{ principal: string | null }>;
-      expect(mineEntries.map((e) => e.principal)).toEqual(["U1"]);
+      const all = await callTool(h.client, "memory.search", { scope: "all", query: "alpha" });
+      // SAFETY: memory.search results are MemoryEntry-shaped; read the logical key kind.
+      const entries = JSON.parse(all.content[0]!.text!) as Array<{ key: { kind: string } }>;
+      const kinds = entries.map((e) => e.key.kind).sort();
+      // The channel recall derives channel + org — never the person's key.
+      expect(kinds).toEqual(["channel", "org"]);
+      expect(entries.some((e) => JSON.stringify(e).includes("person fact"))).toBe(false);
     } finally {
       await h.cleanup();
     }
   });
 
-  test("defaultPrincipal from env applies to user-scope saves that omit principal", async () => {
+  test("defaultPrincipal is the recall actor (org save in a channel session)", async () => {
     const h = await launch({ configYaml: ALLOW_ALL, defaultPrincipal: "U9" });
     try {
-      const res = await h.client.callTool({ name: "memory.save", arguments: { scope: "user", content: "likes llamas" } });
+      const res = await h.client.callTool({ name: "memory.save", arguments: { scope: "org", content: "likes llamas" } });
       expect(res.isError).not.toBe(true);
       const rows = await auditRows(h.store, "memory.write");
       expect(rows).toHaveLength(1);
+      // The MCP session's principal (defaultPrincipal) is the actor.
       expect(rows[0]!.actor).toBe("U9");
-      expect(payload(rows[0]!).principal).toBe("U9");
+      expect(payload(rows[0]!).scope).toBe("org");
     } finally {
       await h.cleanup();
     }

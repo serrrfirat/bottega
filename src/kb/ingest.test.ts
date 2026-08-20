@@ -105,12 +105,12 @@ describe("KB ingestion", () => {
     expect(result.saved).toBe(result.chunks);
     const memories = await memory.search({
       query: "",
-      scope: "org",
+      scope: { kind: "org" },
       metadata: { kind: "kb", source: "handbook" },
       limit: 20,
     });
     expect(memories).toHaveLength(result.saved);
-    expect(memories.every((entry) => entry.principal === null)).toBe(true);
+    expect(memories.every((entry) => entry.key.kind === "org")).toBe(true);
     expect(memories.every((entry) => entry.metadata.kind === "kb")).toBe(true);
     expect(memories.every((entry) => entry.metadata.source === "handbook")).toBe(true);
     expect(memories.every((entry) => entry.metadata.url === kbSource.url)).toBe(true);
@@ -143,7 +143,7 @@ describe("KB ingestion", () => {
 
     const memories = await memory.search({
       query: "",
-      scope: "org",
+      scope: { kind: "org" },
       metadata: { kind: "kb", source: "handbook" },
       limit: 20,
     });
