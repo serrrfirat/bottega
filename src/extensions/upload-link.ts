@@ -37,10 +37,16 @@ import { readFileSync } from "node:fs";
 import { z, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage, toolError } from "../tools/helpers";
 import type { Store, UploadToken } from "../store/db";
+import type { ExtensionManifest } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import { connectExtension, storeBootSecret, type ConnectExtensionDeps, type ConnectScope } from "./connect";
 import { bootSecretForProvider } from "../server/boot-secrets";
 import { callbackPort } from "./oauth-callback";
+import {
+  createStaticOAuthClientStore,
+  provisionStaticOAuthClient,
+  type StaticOAuthClientStore,
+} from "./static-oauth-client";
 
 /** The mint tool's name (exec-tier surface, issue #196). */
 export const MINT_UPLOAD_LINK_TOOL = "connect_upload_link";
@@ -286,14 +292,30 @@ export interface MintUploadLinkDeps {
 }
 
 export type MintUploadLinkOutcome =
-  | { ok: true; url: string; warning?: string }
+  | { ok: true; url: string; warning?: string; mode?: "secret" | "static_client" }
   | { ok: false; message: string };
 
+/** Whether the manifest is a HOSTED OAuth MCP (issue #198 shape: streamable-http + oauth credential). */
+function isHostedOAuthMcp(manifest: ExtensionManifest): boolean {
+  return (
+    manifest.kind === "mcp" &&
+    manifest.mcp !== undefined &&
+    manifest.mcp.transport === "streamable-http" &&
+    manifest.credentialSchema.type === "oauth"
+  );
+}
+
 /**
- * The mint core: resolves the extension (api_key-type only — OAuth has no
- * secret to upload), rate-checks, and returns the single-use URL. Shared by
- * the session tool definition and the MCP surface so both surfaces mint
+ * The mint core: resolves the extension (api_key-type OR — issue #288 —
+ * a hosted OAuth MCP whose authorization server needs a provisioned static
+ * client), rate-checks, and returns the single-use URL. Shared by the
+ * session tool definition and the MCP surface so both surfaces mint
  * identically.
+ *
+ * Issue #288: hosted OAuth MCPs mint a STATIC-CLIENT provisioning link
+ * (org scope ONLY; the browser form asks for the pre-registered client ID
+ * and client secret — two fields). Personal-scope mints for them fail
+ * closed, exactly like every other non-org provisioning posture.
  */
 export async function mintUploadLink(
   input: { extension: string; scope: ConnectScope; actor: string; spaceId?: string },
@@ -310,10 +332,22 @@ export async function mintUploadLink(
     return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
   }
   const label = boot?.label ?? resolved!.manifest.label;
-  if (boot === undefined && resolved!.manifest.credentialSchema.type !== "api_key") {
+  // Issue #288: a HOSTED OAuth MCP mints a static-client provisioning link
+  // (org scope; two browser fields). Every other OAuth shape (stdio,
+  // broker-login) has no upload surface at all.
+  const staticClientMode = boot === undefined && isHostedOAuthMcp(resolved!.manifest);
+  if (boot === undefined && resolved!.manifest.credentialSchema.type !== "api_key" && !staticClientMode) {
     return {
       ok: false,
       message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
+    };
+  }
+  if (staticClientMode && input.scope !== "org") {
+    return {
+      ok: false,
+      message:
+        `${label} connects via OAuth — its static client provisioning is org-scoped: request ` +
+        `connect_upload_link extension=${input.extension} scope=org`,
     };
   }
   // Issue #211: the public base is HEALTH-CHECKED at mint time — a quick
@@ -332,7 +366,12 @@ export async function mintUploadLink(
     ttlMs: deps.ttlMs,
   });
   if (!minted.ok) return { ok: false, message: minted.reason };
-  return { ok: true, url: `${base}/upload/${minted.token}`, warning: publicBase.warning };
+  return {
+    ok: true,
+    url: `${base}/upload/${minted.token}`,
+    warning: publicBase.warning,
+    ...(staticClientMode ? { mode: "static_client" as const } : {}),
+  };
 }
 
 /**
@@ -351,12 +390,21 @@ export function uploadLinkRelayText(url: string): string {
 /**
  * The mint's full reply (issue #211): the relay text plus any public-base
  * staleness warning prepended — the user must see WHY the link is
- * loopback-only (a dead tunnel URL in .env). Shared by the session tool
- * and the MCP surface so both reply identically.
+ * loopback-only (a dead tunnel URL in .env). Issue #288: a STATIC-CLIENT
+ * link (mode "static_client") appends the two-field browser instruction —
+ * the URL line stays verbatim (the relay contract) and no value is ever
+ * echoed.
  */
-export function uploadLinkReplyText(outcome: { url: string; warning?: string }): string {
+export function uploadLinkReplyText(outcome: { url: string; warning?: string; mode?: "secret" | "static_client" }): string {
   const relay = uploadLinkRelayText(outcome.url);
-  return outcome.warning === undefined ? relay : `${outcome.warning}\n\n${relay}`;
+  const modeText =
+    outcome.mode === "static_client"
+      ? "This link provisions the extension's pre-registered OAuth client (org-scoped): " +
+        "open it in a browser and enter the client ID and client secret — they go straight " +
+        "into the vault, never through chat."
+      : undefined;
+  const warningBlock = outcome.warning === undefined ? "" : `${outcome.warning}\n\n`;
+  return `${warningBlock}${relay}${modeText === undefined ? "" : `\n${modeText}`}`;
 }
 
 /** Issue #210: description guidance for both mint surfaces — the returned link is final. */
@@ -417,12 +465,20 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
   };
 }
 
-/** The upload form: a password field, no scripts, no styles, no echo. */
-function uploadForm(token: string, store: UploadLinkStore): Response {
+/**
+ * The upload form: password fields, no scripts, no styles, no echo.
+ * Issue #288: a STATIC-CLIENT token (a hosted OAuth MCP provisioned at org
+ * scope) renders TWO separate fields — the pre-registered client ID and
+ * client secret; every other token renders the single api-key field.
+ */
+function uploadForm(token: string, store: UploadLinkStore, deps: UploadLinkEndpointDeps): Response {
   const row = store.peek(token);
   if (!row) return new Response("this upload link is invalid, expired, or already used", { status: 404 });
   const label = `${row.label} `;
   const ttlMinutes = Math.max(1, Math.round(store.ttlMs / 60_000));
+  const boot = bootSecretForProvider(row.extension);
+  const resolved = deps.registry.resolve(row.extension);
+  const staticClient = boot === undefined && resolved !== undefined && isHostedOAuthMcp(resolved.manifest);
   const html =
     `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n` +
     `<title>Connect — secret upload</title>\n</head>\n<body>\n` +
@@ -430,8 +486,16 @@ function uploadForm(token: string, store: UploadLinkStore): Response {
     `<p>This link is single-use and expires in ${ttlMinutes} minutes. ` +
     `The value you paste goes straight into the organization's vault — it is never stored in chat or transcripts.</p>\n` +
     `<form method="post" action="/upload/${token}">\n` +
-    `<label for="secret">API key or token</label>\n` +
-    `<input type="password" name="secret" id="secret" required autocomplete="off" spellcheck="false">\n` +
+    (staticClient
+      ? `<p>This extension's authorization server has no dynamic client registration — it needs the ` +
+        `PRE-REGISTERED OAuth client (deployment-level, org-scoped). Enter the client ID and client ` +
+        `secret from the vendor's console:</p>\n` +
+        `<label for="client_id">OAuth client ID</label>\n` +
+        `<input type="password" name="client_id" id="client_id" required autocomplete="off" spellcheck="false">\n` +
+        `<label for="client_secret">OAuth client secret</label>\n` +
+        `<input type="password" name="client_secret" id="client_secret" required autocomplete="off" spellcheck="false">\n`
+      : `<label for="secret">API key or token</label>\n` +
+        `<input type="password" name="secret" id="secret" required autocomplete="off" spellcheck="false">\n`) +
     `<button type="submit">Save to vault</button>\n` +
     `</form>\n</body>\n</html>\n`;
   return new Response(html, {
@@ -458,6 +522,13 @@ export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
   // `listRuntimeExtensions` (issue #250): the connect-time egress reconcile
   // default derives the runtime half of the egress superset from the store.
   store: UploadLinkStoreSlice & Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
+  /**
+   * The static-client vault seam (issue #288): the POST of an org-scoped
+   * hosted-OAuth link stores the pre-registered client here — an opaque
+   * api_key row under the extension's synthetic provider key. Defaults to
+   * the production store (broker-or-local, exactly like the api_key path).
+   */
+  staticOAuthClientStore?: StaticOAuthClientStore;
 };
 
 /** The upload-link surface's route handler + store, without a listener —
@@ -492,7 +563,7 @@ export function mountUploadLink(deps: UploadLinkEndpointDeps, opts: UploadLinkSt
       const match = /^\/upload\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
       if (!match) return new Response("not found", { status: 404 });
       const token = match[1]!;
-      if (req.method === "GET") return uploadForm(token, store);
+      if (req.method === "GET") return uploadForm(token, store, deps);
       if (req.method === "POST") return handleUpload(req, token, store, deps);
       return new Response("method not allowed", { status: 405 });
     },
@@ -544,6 +615,37 @@ async function handleUpload(
     });
   }
   const form = await req.formData();
+  const boot = bootSecretForProvider(consumed.row.extension);
+  const resolved = deps.registry.resolve(consumed.row.extension);
+  // Issue #288: a HOSTED OAuth MCP's upload token provisions its static
+  // OAuth client (the org-scoped deployment client the no-DCR connect
+  // needs). The endpoint stores it DIRECTLY through the static-client
+  // vault seam — never through the connect path (there is no per-user
+  // credential or registry row to write).
+  if (boot === undefined && resolved !== undefined && isHostedOAuthMcp(resolved.manifest)) {
+    const clientIdField = z.string().safeParse(form.get("client_id"));
+    const clientSecretField = z.string().safeParse(form.get("client_secret"));
+    if (!clientIdField.success || !clientSecretField.success) {
+      return new Response("enter both the OAuth client ID and the client secret", { status: 400 });
+    }
+    const outcome = await provisionStaticOAuthClient(
+      {
+        extension: resolved.manifest.id,
+        clientId: clientIdField.data,
+        clientSecret: clientSecretField.data,
+        scope: consumed.row.scope,
+        actor: consumed.row.actor,
+        spaceId: consumed.row.space_id ?? undefined,
+      },
+      {
+        store: deps.staticOAuthClientStore ?? createStaticOAuthClientStore(),
+        audit: deps.audit,
+        gate: deps.gate,
+      },
+    );
+    if (!outcome.ok) return new Response(outcome.message, { status: 400 });
+    return new Response("Saved to the vault — you can close this window.", { status: 200 });
+  }
   // The secret field is a plain-text input: the domain value is a non-blank
   // string; anything else (a file, null, whitespace-only) is rejected at the
   // boundary before the value is stored.
@@ -559,7 +661,6 @@ async function handleUpload(
     // posture as the connect path, minus the registry row (there is no
     // extension). Everything else runs the SAME connect path as the
     // connect flow: gate (org) → broker upload → registry upsert → audit.
-    const boot = bootSecretForProvider(consumed.row.extension);
     const outcome = boot
       ? await storeBootSecret(
           {

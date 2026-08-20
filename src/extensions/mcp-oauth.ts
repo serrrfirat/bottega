@@ -46,6 +46,7 @@ import type { ExtensionCredential, OAuthFlow, Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { oauthIdentityKey, pickNewestBrokerEntry, type ConnectScope } from "./connect";
+import { createStaticOAuthClientStore, type StaticOAuthClient, type StaticOAuthClientStore } from "./static-oauth-client";
 import type { ExtensionRegistry } from "./registry";
 import type { ReconcileEgress } from "./egress-reconcile";
 
@@ -516,6 +517,13 @@ export interface McpOAuthFlowDeps {
   callbackBaseUrl: () => string;
   /** Token persistence; defaults to the production vault store. */
   tokenStore?: McpOAuthTokenStore;
+  /**
+   * The static-client vault seam (issue #288): consulted ONLY when the
+   * connect's negotiation discovers an authorization server WITHOUT a
+   * usable dynamic-registration endpoint. Defaults to the production
+   * store over the broker's opaque api-key vault rows.
+   */
+  staticClientStore?: StaticOAuthClientStore;
   /** Flow lifetime in ms (default {@link MCP_OAUTH_FLOW_TTL_MS}). */
   flowTtlMs?: number;
   /** Max live flows per actor (default {@link MCP_OAUTH_MAX_OUTSTANDING_PER_ACTOR}). */
@@ -650,6 +658,33 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
 }
 
 /**
+ * Whether the authorization server's advertised dynamic-registration
+ * endpoint is USABLE (issue #288): present, a parseable absolute http(s)
+ * URL, and not plain-http on a NON-loopback host (RFC 7591 requires TLS —
+ * a remote registration endpoint over the wire would expose the client
+ * metadata; fail closed to the static-client path). Loopback http is the
+ * hermetic-test / local-dev posture, unchanged. Anything else is NOT
+ * usable → the connect requires a provisioned static client.
+ */
+function registrationEndpointUsable(registrationEndpoint: unknown): boolean {
+  if (typeof registrationEndpoint !== "string" || registrationEndpoint === "") return false;
+  let url: URL;
+  try {
+    url = new URL(registrationEndpoint);
+  } catch {
+    return false; // malformed → unusable (fail closed)
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname)) return false;
+  return true;
+}
+
+/** Loopback hostnames (the http-allowed set for registration endpoints). */
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+/**
  * The connect's negotiated server contract (issue #256 + issue #257 +
  * issue #262): SEP-835 resolves the OAuth scope as: auth() `scope` option →
  * WWW-Authenticate scope → the resource's advertised `scopes_supported` →
@@ -683,6 +718,15 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
  * that would silently degrade a refresh-advertising server to a
  * non-refreshable grant is logged loudly instead (never silent).
  *
+ * Issue #288 adds the DYNAMIC-REGISTRATION verdict: `dynamicRegistration`
+ * is true exactly when the authorization server advertises a usable
+ * registration endpoint (see {@link registrationEndpointUsable}). A
+ * no-DCR server (the Gmail class) makes the connect consult the
+ * provisioned static client instead. A transient discovery failure keeps
+ * the pre-#288 posture (proceed; auth() re-discovers and fails closed
+ * there) and is treated as DCR-capable — a healthy DCR server must not be
+ * refused because the first probe hiccuped.
+ *
  * This costs an extra discovery round trip on the connect path (not hot);
  * in exchange no provider/state plumbing is needed and every server that
  * supports refreshable grants gets a token that can actually be refreshed.
@@ -690,7 +734,7 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
 async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
-): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string }> {
+): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; dynamicRegistration: boolean }> {
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
@@ -706,7 +750,11 @@ async function connectServerNegotiation(
         "proceeding without offline_access and without a negotiated token-endpoint auth method; " +
         "the connect will fail closed in auth() if the server is unreachable",
     );
-    return { scope: undefined, tokenEndpointAuthMethod: "none" };
+    // Issue #288: unknown DCR capability is treated as DCR-capable — the
+    // SDK's re-discovery is the authoritative check, and a genuinely
+    // no-DCR server fails closed there with the SDK's own error. A healthy
+    // DCR server must never be refused over a transient first probe.
+    return { scope: undefined, tokenEndpointAuthMethod: "none", dynamicRegistration: true };
   }
   const supportedMethods = info.authorizationServerMetadata?.token_endpoint_auth_methods_supported;
   const supports = (method: string) => supportedMethods?.includes(method) === true;
@@ -717,7 +765,8 @@ async function connectServerNegotiation(
       : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod };
+  const dynamicRegistration = registrationEndpointUsable(info.authorizationServerMetadata?.registration_endpoint);
+  if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, dynamicRegistration };
   // Issue #262: choose the scope BASE without ever building it out of the
   // "default" placeholder Notion (and similar AS) advertise in
   // `scopes_supported`. A placeholder/absent resource scope is discarded in
@@ -734,7 +783,7 @@ async function connectServerNegotiation(
       : undefined) ??
     (clientScopes !== undefined && clientScopes.length > 0 ? clientScopes.join(" ") : undefined);
   const scope = base === undefined || base === "" ? "offline_access" : `${base} offline_access`;
-  return { scope, tokenEndpointAuthMethod };
+  return { scope, tokenEndpointAuthMethod, dynamicRegistration };
 }
 
 /**
@@ -789,6 +838,42 @@ export async function startMcpOAuthFlow(
       authorizationUrl = url;
     },
   });
+  // Issue #288: a NO-DCR authorization server (the Gmail class — OAuth
+  // metadata without a usable registration endpoint) cannot register a
+  // client dynamically; the SDK must use the deployment's PRE-REGISTERED
+  // static client instead. Load it, combine it with the already-negotiated
+  // token-endpoint auth method, and preload it on the provider BEFORE
+  // auth() — the SDK's authInternal sees `clientInformation()` present and
+  // SKIPS registerClient entirely (the `selectClientAuthMethod` seam then
+  // chooses the token-endpoint authentication, unchanged). Missing static
+  // client → a clear fail-closed provisioning instruction and NO flow row.
+  if (!negotiation.dynamicRegistration) {
+    const staticStore = deps.staticClientStore ?? createStaticOAuthClientStore();
+    let staticClient: StaticOAuthClient | null;
+    try {
+      staticClient = await staticStore.load(manifest.id);
+    } catch (err) {
+      return {
+        ok: false,
+        message: `connect ${manifest.label} failed: the static OAuth client lookup failed (${errorMessage(err)})`,
+      };
+    }
+    if (staticClient === null) {
+      return {
+        ok: false,
+        message:
+          `connect ${manifest.label} failed: ${manifest.id}'s authorization server does not support ` +
+          `dynamic client registration — provision its static OAuth client first: request ` +
+          `"connect_upload_link extension=${manifest.id} scope=org", open the link in a browser, and enter ` +
+          `the pre-registered client ID and client secret, then re-run connect.`,
+      };
+    }
+    provider.saveClientInformation({
+      client_id: staticClient.client_id,
+      client_secret: staticClient.client_secret,
+      token_endpoint_auth_method: negotiation.tokenEndpointAuthMethod,
+    });
+  }
   let result: AuthResult;
   try {
     result = await auth(provider, {

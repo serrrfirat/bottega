@@ -332,7 +332,9 @@ clients.
   metadata → audit — without returning it to Slack or the agent. Tokens are
   persisted in SQLite for cross-process use, capped per actor, consumed
   atomically, and POST attempts are rate-limited per client IP. OAuth
-  extensions use their normal broker login and cannot mint an upload link.
+  extensions use their normal broker login and cannot mint an API-key link
+  (hosted OAuth MCPs without dynamic client registration instead mint an
+  org-scoped static-client link — see the next bullet).
   The minted link's public base — the durable store `data/public-base-url`
   (written by `scripts/tunnel.sh` on every rotation, issue #249), else
   `BOTTEGA_OAUTH_CALLBACK_BASE_URL` as a deployment-only override — is
@@ -340,6 +342,30 @@ clients.
   (dead tunnel) falls back to the loopback URL with a loud warning in the
   reply. Because the store is re-read on every mint, a rotated quick-tunnel
   host self-heals the next mint instead of waiting for an `.env` edit.
+- **Hosted OAuth MCPs without dynamic client registration use a
+  pre-registered static OAuth client** (#288) — the Gmail class
+  (`gmail-googleapis-com`): the server advertises RFC 9728/8414 OAuth
+  metadata but NO RFC 7591 dynamic-registration endpoint, so the MCP SDK
+  cannot register a client at connect time. The connect's discovery
+  detects this (an absent, malformed, or plain-http non-loopback
+  `registration_endpoint` is UNUSABLE — fail closed) and requires a
+  deployment-level PRE-REGISTERED OAuth client, provisioned through the
+  SAME one-time upload browser path:
+  `connect_upload_link extension=gmail-googleapis-com scope=org` → open
+  the link → enter the pre-registered client ID and client secret (two
+  separate form fields; org scope only). The values go straight from the
+  browser into the auth-broker vault as an opaque api-key row under a
+  deterministic synthetic provider key (`static-oauth-client:<extension>`)
+  — never through chat or a transcript, and never into the audit trail
+  (which records extension/scope/actor/status only). The connect then
+  preloads the static client into the SDK's OAuth client: DCR is skipped,
+  the authorization URL carries the configured client id, and the code
+  exchange + refresh reuse the SAME identity — per-user token rows stay
+  under the real extension id, unchanged. A missing static client fails
+  the connect closed with the `connect_upload_link ... scope=org`
+  instruction; DCR-capable providers never consult the static client. The
+  callback URI registered in the vendor console MUST match Bottega's
+  public `/oauth/callback` URI.
 - **Draft and pin from chat (non-MCP / manual bindings)** — `catalog_browser`
   writes an unreviewed
   draft outside the registry, tells the agent to use `web_search` for the

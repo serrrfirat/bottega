@@ -24,9 +24,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
+import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
 import { createAudit } from "../policy/audit";
+import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
 import { createStore, type Store } from "../store/db";
-import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, STATIC_CLIENT_PROVISIONED_EVENT } from "../store/audit-events";
 import type { ExtensionManifest } from "./manifest";
 import type { JsonValue } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
@@ -42,7 +44,9 @@ import {
   type PersistedOAuthFlow,
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";
-import { uploadLinkPublicBase } from "./upload-link";
+import { mountUploadLink, uploadLinkPublicBase } from "./upload-link";
+import { connectExtension, type ConnectExtensionDeps } from "./connect";
+import type { StaticOAuthClientStore } from "./static-oauth-client";
 import type { VaultOAuthCredential } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-oauth-"));
@@ -180,6 +184,20 @@ class StubOAuthMcp {
    * returning scope undefined (issue #262 (d)).
    */
   negotiationDiscoveryFails = false;
+  /**
+   * Set false to model a NO-DCR authorization server (issue #288 — the
+   * Gmail class): the RFC 8414 metadata OMITS `registration_endpoint`
+   * (and /register 404s), so the SDK cannot dynamically register a
+   * client and the connect must use a provisioned static client instead.
+   */
+  registrationEndpoint = true;
+  /**
+   * Overrides the advertised `registration_endpoint` URL (issue #288
+   * insecure-URL leg): when set, the metadata advertises THIS value —
+   * e.g. a plain-http NON-loopback endpoint, which the connect must treat
+   * as UNUSABLE (fail closed to the static-client path).
+   */
+  registrationEndpointOverride: string | undefined = undefined;
 
   constructor() {
     this.server = Bun.serve({
@@ -192,6 +210,11 @@ class StubOAuthMcp {
 
   stop(): void {
     this.server.stop(true);
+  }
+
+  /** Seeds a pre-registered static client's credentials (issue #288): the AS validates them on /token. */
+  addStaticClient(clientId: string, clientSecret: string): void {
+    this.#clientSecrets.set(clientId, clientSecret);
   }
 
   /** The MCP endpoint URL the extension manifest binds to. */
@@ -233,14 +256,20 @@ class StubOAuthMcp {
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       if (!this.oauthMetadata) return new Response("not found", { status: 404 });
       // Issue #262 (d): a transient discovery failure (HTTP 500, not a clean
-      // 404) makes the SDK's discovery REJECT — the negotiation must log the
-      // resulting no-offline_access connect loudly, never silently.
+      // 404) makes the SDK's discovery REJECT — the negotiation must log
+      // the resulting no-offline_access connect loudly, never silently.
       if (this.negotiationDiscoveryFails) return json({ error: "internal server error" }, 500);
+      // Issue #288: a no-DCR server (the Gmail class) omits
+      // registration_endpoint entirely — /register 404s and the SDK cannot
+      // dynamically register, so the connect needs a static client.
+      const registrationEndpoint =
+        this.registrationEndpointOverride ??
+        (this.registrationEndpoint ? `${this.baseUrl}/register` : undefined);
       return json({
         issuer: this.baseUrl,
         authorization_endpoint: `${this.baseUrl}/authorize`,
         token_endpoint: `${this.baseUrl}/token`,
-        registration_endpoint: `${this.baseUrl}/register`,
+        ...(registrationEndpoint !== undefined ? { registration_endpoint: registrationEndpoint } : {}),
         scopes_supported: ["default"],
         response_types_supported: ["code"],
         response_modes_supported: ["query"],
@@ -250,7 +279,7 @@ class StubOAuthMcp {
       });
     }
     if (url.pathname === "/register") {
-      if (!this.oauthMetadata) return new Response("not found", { status: 404 });
+      if (!this.oauthMetadata || !this.registrationEndpoint) return new Response("not found", { status: 404 });
       this.state.registerCalls += 1;
       // SAFETY: the DCR request carries these optional fields (RFC 7591);
       // the stub defaults each missing one in the registration response.
@@ -422,13 +451,42 @@ class FakeVaultStore implements McpOAuthTokenStore {
   }
 }
 
-function flowDeps(store: Store, registry: ExtensionRegistry, vault: FakeVaultStore, baseUrl: string) {
+/**
+ * A fake static-client vault store (issue #288): mirrors the production
+ * seam — saves keyed by extension, loads the newest saved row. Loads honor
+ * a scripted `loadResult` override: `undefined` (default) reads the saved
+ * row, `null` scripts a genuinely missing client, an object scripts a
+ * specific client.
+ */
+class FakeStaticClientStore implements StaticOAuthClientStore {
+  rows = new Map<string, { client_id: string; client_secret: string }>();
+  saves: Array<{ extension: string; client: { client_id: string; client_secret: string } }> = [];
+  #nextId = 501;
+  loadResult: { client_id: string; client_secret: string } | null | undefined = undefined;
+  /** How many times the connect consulted the static client (DCR servers must never load). */
+  loadCalls = 0;
+  async save(extension: string, client: { client_id: string; client_secret: string }): Promise<{ brokerCredentialId: number }> {
+    this.rows.set(extension, client);
+    this.saves.push({ extension, client });
+    const id = this.#nextId;
+    this.#nextId += 1;
+    return { brokerCredentialId: id };
+  }
+  async load(extension: string): Promise<{ client_id: string; client_secret: string } | null> {
+    this.loadCalls += 1;
+    if (this.loadResult !== undefined) return this.loadResult;
+    return this.rows.get(extension) ?? null;
+  }
+}
+
+function flowDeps(store: Store, registry: ExtensionRegistry, vault: FakeVaultStore, baseUrl: string, staticStore?: FakeStaticClientStore) {
   return {
     registry,
     store,
     audit: createAudit(store),
     callbackBaseUrl: () => baseUrl,
     tokenStore: vault,
+    ...(staticStore !== undefined ? { staticClientStore: staticStore } : {}),
   };
 }
 
@@ -1694,6 +1752,350 @@ describe("production connector probeCallbackBase — the connect-side gate (issu
       }
     } finally {
       live.stop();
+    }
+  });
+});
+
+describe("issue #288 — static OAuth clients for no-DCR authorization servers", () => {
+  const STATIC_CLIENT_ID = "static-client-123.apps.example";
+  const STATIC_CLIENT_SECRET = "static-secret-456";
+
+  class RecordingRouter implements ApprovalRouter {
+    readonly requests: ApprovalRequest[] = [];
+    constructor(private resolution: ApprovalResolution = { approved: true }) {}
+    async request(d: ApprovalRequest): Promise<ApprovalResolution> {
+      this.requests.push(d);
+      return this.resolution;
+    }
+  }
+
+  /** POSTs client_id + client_secret to the one-time upload URL (the browser leg). */
+  function postStaticClient(url: string, clientId: string, clientSecret: string): Promise<Response> {
+    const body = new FormData();
+    body.append("client_id", clientId);
+    body.append("client_secret", clientSecret);
+    return fetch(url, { method: "POST", body });
+  }
+
+  /** The caller-level connect deps: the REAL connector (probe + mint) over the stub. */
+  function callerDeps(store: Store, registry: ExtensionRegistry, vault: FakeVaultStore, staticStore: FakeStaticClientStore, baseUrl: string) {
+    const router = new RecordingRouter({ approved: true });
+    const policy: PolicyConfig = parseOrgConfigYaml("tools:\n  connect_extension: allow\n");
+    const connector = createMcpOAuthConnector({
+      registry,
+      store,
+      audit: createAudit(store),
+      callbackBaseUrl: () => baseUrl,
+      tokenStore: vault,
+      staticClientStore: staticStore,
+    });
+    const deps: ConnectExtensionDeps = {
+      registry,
+      store,
+      audit: createAudit(store),
+      broker: async () => {
+        throw new Error("the hosted-OAuth connect must never touch the broker");
+      },
+      mcpOAuth: connector,
+      gate: { loadPolicy: async () => policy, router },
+      reconcileEgress: async () => ({ warnings: [] }),
+    };
+    return { deps, router };
+  }
+
+  test("caller-level RED: a no-DCR connect fails with the connect_upload_link instruction and writes no flow", async () => {
+    const stub = new StubOAuthMcp();
+    stub.registrationEndpoint = false; // the Gmail class: OAuth metadata, NO registration endpoint
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const { deps } = callerDeps(store, registryWith(stub.mcpUrl), vault, staticStore, callback.baseUrl);
+
+        const red = await connectExtension({ extension: "fixture.oauthmcp", scope: "personal", actor: "UADA" }, deps);
+
+        // Old code fails with the SDK's bare "does not support dynamic
+        // client registration"; the fix must name the provisioning path.
+        expect(red.ok).toBe(false);
+        if (!red.ok) {
+          expect(red.message).toContain("connect_upload_link");
+          expect(red.message).toContain("scope=org");
+          expect(red.message).toContain("fixture.oauthmcp");
+        }
+        expect(stub.state.registerCalls).toBe(0);
+        expect(store.countActiveOAuthFlows("UADA")).toBe(0); // no flow row written
+        expect(staticStore.loadCalls).toBe(1); // the no-DCR connect consulted the static client
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("caller-level GREEN: after provisioning through the real one-time upload HTTP path, the no-DCR connect returns an authorization URL with zero registration requests", async () => {
+    const stub = new StubOAuthMcp();
+    stub.registrationEndpoint = false;
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      const registry = registryWith(stub.mcpUrl);
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const { deps, router } = callerDeps(store, registry, vault, staticStore, callback.baseUrl);
+
+        // Provision through the REAL one-time upload HTTP path (the boot's
+        // wiring: the upload mount rides the callback server's listener).
+        const upload = mountUploadLink({
+          registry,
+          store,
+          audit: createAudit(store),
+          broker: async () => {
+            throw new Error("the fake static-client store owns the vault here");
+          },
+          staticOAuthClientStore: staticStore,
+          gate: { loadPolicy: async () => parseOrgConfigYaml("tools:\n  connect_extension: allow\n"), router },
+        });
+        const uploadServer = startOAuthCallbackServer({ store, audit: createAudit(store), uploadLink: upload, port: 0 });
+        try {
+          const minted = upload.store.mint({
+            extension: "fixture.oauthmcp",
+            scope: "org",
+            actor: "UADA",
+            label: "Fixture OAuth MCP",
+          });
+          expect(minted.ok).toBe(true);
+          if (!minted.ok) return;
+          const uploadUrl = `${uploadServer.baseUrl}/upload/${minted.token}`;
+
+          // The form renders TWO separate fields (client ID + client secret).
+          const form = await fetch(uploadUrl);
+          expect(form.status).toBe(200);
+          const formHtml = await form.text();
+          expect(formHtml).toContain('name="client_id"');
+          expect(formHtml).toContain('name="client_secret"');
+          expect(formHtml).not.toContain(STATIC_CLIENT_ID);
+          expect(formHtml).not.toContain(STATIC_CLIENT_SECRET);
+
+          const uploaded = await postStaticClient(uploadUrl, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+          expect(uploaded.status).toBe(200);
+          expect(await uploaded.text()).toContain("Saved to the vault");
+          expect(staticStore.saves).toEqual([
+            { extension: "fixture.oauthmcp", client: { client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET } },
+          ]);
+          // The org-scoped store crossed the connect_extension gate.
+          expect(router.requests).toHaveLength(1);
+          expect(router.requests[0]!.tool).toBe("connect_extension");
+          // The audit row carries METADATA ONLY — never the client values.
+          const audit = await store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT });
+          expect(audit).toHaveLength(1);
+          expect(JSON.parse(audit[0]!.payload)).toEqual({
+            extension: "fixture.oauthmcp",
+            scope: "org",
+            owner: null,
+            status: "provisioned",
+          });
+          const auditText = JSON.stringify(JSON.parse(audit[0]!.payload));
+          expect(auditText).not.toContain(STATIC_CLIENT_ID);
+          expect(auditText).not.toContain(STATIC_CLIENT_SECRET);
+        } finally {
+          uploadServer.stop();
+        }
+
+        // GREEN: the same caller now connects — the authorize request
+        // carries the configured client id + the correct redirect/state/PKCE,
+        // and the server recorded ZERO registration requests.
+        const green = await connectExtension({ extension: "fixture.oauthmcp", scope: "personal", actor: "UADA" }, deps);
+        expect(green.ok).toBe(true);
+        if (!green.ok) return;
+        const match = green.message.match(/https?:\/\/\S+/);
+        expect(match).toBeTruthy();
+        const url = new URL(match![0]);
+        expect(url.searchParams.get("client_id")).toBe(STATIC_CLIENT_ID);
+        expect(url.searchParams.get("redirect_uri")).toBe(`${callback.baseUrl}/oauth/callback`);
+        expect(url.searchParams.get("state")).toBeTruthy();
+        expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+        expect(url.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+        expect(stub.state.registerCalls).toBe(0);
+        // No SECRET appears in the connect reply or audit trail (the client
+        // id is public — it is the authorize URL's own client_id param).
+        expect(green.message).not.toContain(STATIC_CLIENT_SECRET);
+        const connectedAudit = await store.listAudit({ event_type: EXTENSION_CONNECTED_EVENT });
+        expect(connectedAudit).toHaveLength(0); // the callback has not run yet
+
+        // The flow row persisted the static client identity (client id +
+        // secret + negotiated auth method) so the callback can exchange.
+        const state = url.searchParams.get("state")!;
+        const row = store.getOAuthFlow(state);
+        expect(row).not.toBeNull();
+        if (row) {
+          const flow = JSON.parse(row.flow) as PersistedOAuthFlow;
+          expect(flow.clientInformation).toMatchObject({
+            client_id: STATIC_CLIENT_ID,
+            client_secret: STATIC_CLIENT_SECRET,
+            token_endpoint_auth_method: "none", // public stub: the negotiated method
+          });
+          expect(flow.codeVerifier).toBeTruthy();
+        }
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("a DCR-capable server still registers dynamically — the static client is never loaded", async () => {
+    const stub = new StubOAuthMcp(); // registrationEndpoint defaults true
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9", staticStore);
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      expect(stub.state.registerCalls).toBe(1); // DCR happened, unchanged
+      expect(staticStore.loadCalls).toBe(0); // the static client was never consulted
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("an INSECURE registration endpoint (plain-http, non-loopback) is treated as no-DCR — fail closed to the static client", async () => {
+    const stub = new StubOAuthMcp();
+    stub.registrationEndpointOverride = "http://insecure.example/register";
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9", staticStore);
+
+      // No static client → the provisioning instruction, never a POST to
+      // the insecure endpoint.
+      const red = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(red.ok).toBe(false);
+      if (!red.ok) {
+        expect(red.message).toContain("connect_upload_link");
+        expect(red.message).toContain("scope=org");
+      }
+      expect(stub.state.registerCalls).toBe(0);
+      expect(store.countActiveOAuthFlows("UADA")).toBe(0);
+
+      // With a static client provisioned the connect succeeds — and still
+      // never POSTs to the insecure registration endpoint.
+      staticStore.rows.set("fixture.oauthmcp", { client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET });
+      const green = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(green.ok).toBe(true);
+      if (!green.ok) return;
+      expect(new URL(green.authorizationUrl).searchParams.get("client_id")).toBe(STATIC_CLIENT_ID);
+      expect(stub.state.registerCalls).toBe(0);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("the callback exchanges with the persisted static client and writes the per-user token under the EXTENSION provider — never the synthetic client provider", async () => {
+    const stub = new StubOAuthMcp();
+    stub.registrationEndpoint = false;
+    stub.confidential = true; // the AS requires client_secret_basic on /token
+    stub.addStaticClient(STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      staticStore.rows.set("fixture.oauthmcp", { client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET });
+      const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
+      try {
+        const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl, staticStore);
+        const minted = await startMcpOAuthFlow(
+          { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+          deps,
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+        expect(stub.state.registerCalls).toBe(0);
+
+        const authorize = await fetch(minted.authorizationUrl, { redirect: "manual" });
+        expect(authorize.status).toBe(302);
+        const done = await fetch(authorize.headers.get("location")!);
+        expect(done.status).toBe(200);
+
+        // The per-user token rows landed under the REAL extension provider
+        // (exchange + connect-time probe) — the synthetic client provider
+        // was never written by the callback.
+        expect(vault.saves).toHaveLength(2);
+        for (const save of vault.saves) expect(save.provider).toBe("fixture.oauthmcp");
+        expect(staticStore.saves).toHaveLength(0);
+        const lastSave = vault.saves[vault.saves.length - 1]!;
+        const saved = lastSave.credential;
+        // The persisted static client identity rode the vault round-trip:
+        // the SDK exchanged AND refreshed with it via Basic auth.
+        expect(saved).toMatchObject({
+          client_id: STATIC_CLIENT_ID,
+          client_secret: STATIC_CLIENT_SECRET,
+          token_endpoint_auth_method: "client_secret_basic",
+        });
+        expect(stub.state.clientAuthMethodsUsed).toEqual(["client_secret_basic", "client_secret_basic"]);
+
+        // The registry row references the extension-provider vault row.
+        const rows = await store.listExtensionCredentials("fixture.oauthmcp");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.broker_credential_id).toBe(lastSave.brokerCredentialId);
+
+        // The RUNTIME mint reuses the persisted identity: an expired access
+        // token refreshes through the SDK with the static client's secret.
+        vault.loadResult = { ...saved, access: "access-stale", expires: Date.now() - 60_000 };
+        const provider = await createRuntimeMcpOAuthProvider({ credential: { ...rows[0], id: "ec_test" }, tokenStore: vault });
+        const result = await auth(provider, { serverUrl: stub.mcpUrl });
+        expect(result).toBe("AUTHORIZED");
+        expect(stub.state.refreshCalls).toBe(2); // connect-time probe + this runtime mint
+        expect(stub.state.clientAuthMethodsUsed.at(-1)).toBe("client_secret_basic");
+      } finally {
+        callback.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("a missing static client row reads fail-closed (null) — the connect names the provisioning path", async () => {
+    const stub = new StubOAuthMcp();
+    stub.registrationEndpoint = false;
+    try {
+      const store = freshStore();
+      const vault = new FakeVaultStore();
+      const staticStore = new FakeStaticClientStore();
+      staticStore.loadResult = null; // no row at all
+      const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, "http://127.0.0.1:9", staticStore);
+
+      const outcome = await startMcpOAuthFlow(
+        { extension: "fixture.oauthmcp", provider: "fixture.oauthmcp", label: "Fixture OAuth MCP", scope: "personal", actor: "UADA" },
+        deps,
+      );
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.message).toContain("connect_upload_link");
+        expect(outcome.message).toContain("scope=org");
+      }
+      expect(store.countActiveOAuthFlows("UADA")).toBe(0);
+      expect(stub.state.registerCalls).toBe(0);
+    } finally {
+      stub.stop();
     }
   });
 });

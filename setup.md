@@ -322,6 +322,37 @@ the webhook route — so the tunnel forwards to that single port and both
 connect flows work through it. Local dev with `bun run dev` needs nothing
 set.
 
+### Static OAuth clients for no-DCR servers (issue #288, Gmail)
+
+Some hosted OAuth MCPs (Gmail — `gmail-googleapis-com`) advertise OAuth
+metadata but NO dynamic client registration endpoint, so the MCP SDK
+cannot register a client at connect time. These need a deployment-level
+PRE-REGISTERED OAuth client, provisioned once through the one-time upload
+browser path:
+
+1. Create a "web application" OAuth client for the Gmail MCP in the
+   Google Cloud console, with the callback URI set to Bottega's PUBLIC
+   `/oauth/callback` URI (the same public base the OAuth callback leg
+   uses — see above; e.g. `https://bottega.example.com/oauth/callback`).
+2. Ask the agent for `connect_upload_link extension=gmail-googleapis-com
+   scope=org` — org scope is REQUIRED for static-client provisioning.
+3. Open the single-use link in a browser and enter the pre-registered
+   client ID and client secret (two separate fields). They go straight
+   from the browser into the auth-broker vault — an opaque api-key row
+   under the synthetic provider key `static-oauth-client:gmail-googleapis-com`
+   — never through chat, a transcript, or the audit trail.
+4. Connect normally: run personal `connect_extension` (`connect
+   gmail-googleapis-com as me`, or `as org` for the shared account). The
+   connect detects the missing registration endpoint, loads the static
+   client, and returns the authorization URL; the code exchange and
+   refresh reuse the same pre-registered client.
+
+A connect for a no-DCR extension WITHOUT a provisioned static client
+fails closed with the `connect_upload_link extension=<id> scope=org`
+instruction. DCR-capable providers (Notion, Linear, ...) are unaffected —
+they register dynamically exactly as before and never consult a static
+client.
+
 ### 3. First boot
 
 ```bash

@@ -12,13 +12,18 @@ import { join } from "node:path";
 import { createAudit } from "../policy/audit";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
-import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT } from "../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT, STATIC_CLIENT_PROVISIONED_EVENT } from "../store/audit-events";
 import { BOOT_SECRETS } from "../server/boot-secrets";
 import { createStore, type Store } from "../store/db";
 import { CONNECT_EXTENSION_TOOL, type BrokerConnectResult } from "./connect";
 import { fixtureManifest } from "./fixture";
 import type { ExtensionManifest } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
+import {
+  createStaticOAuthClientStore,
+  staticOAuthClientProviderKey,
+  type StaticOAuthClient,
+} from "./static-oauth-client";
 import {
   mintUploadLink,
   mintUploadLinkToolDefinition,
@@ -119,6 +124,9 @@ function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; 
       store,
       audit: createAudit(store),
       broker: broker.connect.bind(broker),
+      // Issue #288: the static-client store rides the SAME broker seam the
+      // boot wires — the recording broker is the vault for these tests.
+      staticOAuthClientStore: createStaticOAuthClientStore({ broker: broker.connect.bind(broker) }),
       gate: { loadPolicy: () => Promise.resolve(policy), router },
     },
     store,
@@ -876,6 +884,261 @@ describe("upload link public base liveness (issue #211)", () => {
         if (saved === undefined) delete process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL;
         else process.env.BOTTEGA_OAUTH_CALLBACK_BASE_URL = saved;
       }
+    } finally {
+      endpoint.stop();
+    }
+  });
+});
+
+describe("static OAuth client provisioning via the upload link (issue #288)", () => {
+  const STATIC_CLIENT_ID = "static-client-123.apps.example";
+  const STATIC_CLIENT_SECRET = "static-secret-456";
+
+  /** POSTs client_id + client_secret to the one-time upload URL (the browser leg). */
+  function postStaticClient(url: string, clientId: string, clientSecret: string): Promise<Response> {
+    const body = new FormData();
+    body.append("client_id", clientId);
+    body.append("client_secret", clientSecret);
+    return fetch(url, { method: "POST", body });
+  }
+
+  /** The recorded opaque api_key payload the vault store writes. */
+  function expectedOpaqueJson(client: StaticOAuthClient): string {
+    return JSON.stringify({ client_id: client.client_id, client_secret: client.client_secret });
+  }
+
+  test("hosted OAuth extensions mint an ORG-scoped static-client link (two-field browser form), and the POST stores the opaque api_key under the synthetic provider key", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = await mintUploadLink(
+        { extension: "com.example.oauth", scope: "org", actor: "UADA", spaceId: "slack:C1" },
+        { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
+      );
+      expect(minted.ok).toBe(true);
+      if (!minted.ok) return;
+      expect(minted.mode).toBe("static_client");
+      const url = minted.url;
+
+      // The form renders TWO separate fields — client ID + client secret —
+      // and never echoes a value.
+      const form = await fetch(url);
+      expect(form.status).toBe(200);
+      const html = await form.text();
+      expect(html).toContain("Example OAuth");
+      expect(html).toContain('name="client_id"');
+      expect(html).toContain('name="client_secret"');
+      expect(html).toContain("PRE-REGISTERED OAuth client");
+      expect(html).not.toContain(STATIC_CLIENT_ID);
+      expect(html).not.toContain(STATIC_CLIENT_SECRET);
+
+      // POST → the ORG gate → the vault store seam: the broker saw an
+      // OPAQUE api_key under the SYNTHETIC provider key, never the real
+      // extension id (per-user OAuth token rows stay separate).
+      const upload = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(upload.status).toBe(200);
+      expect(await upload.text()).toContain("Saved to the vault");
+      expect(h.router.requests).toHaveLength(1);
+      expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
+      expect(h.router.requests[0]!.spaceId).toBe("slack:C1");
+      expect(h.broker.calls).toEqual([
+        {
+          provider: staticOAuthClientProviderKey("com.example.oauth"),
+          credentialType: "api_key",
+          apiKey: expectedOpaqueJson({ client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET }),
+        },
+      ]);
+      // No extension registry row: the static client is deployment state,
+      // not a per-user credential (the same ladder as boot secrets).
+      expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+      // The audit row carries METADATA ONLY — extension/scope/owner/status,
+      // never the client values.
+      const audit = await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT });
+      expect(audit).toHaveLength(1);
+      expect(JSON.parse(audit[0]!.payload)).toEqual({
+        extension: "com.example.oauth",
+        scope: "org",
+        owner: null,
+        status: "provisioned",
+      });
+      const auditText = JSON.stringify(JSON.parse(audit[0]!.payload));
+      expect(auditText).not.toContain(STATIC_CLIENT_ID);
+      expect(auditText).not.toContain(STATIC_CLIENT_SECRET);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("static-client provisioning is ORG-only: a personal-scope mint is refused and a personal-scope POST fails closed", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      // The mint refuses personal scope for a hosted OAuth extension.
+      const minted = await mintUploadLink(
+        { extension: "com.example.oauth", scope: "personal", actor: "UADA" },
+        { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
+      );
+      expect(minted.ok).toBe(false);
+      if (!minted.ok) {
+        expect(minted.message).toContain("OAuth");
+        expect(minted.message).toContain("org-scoped");
+      }
+
+      // Defense in depth: a PERSONAL-scope static token (minted directly,
+      // bypassing the mint gate) still fails closed at the POST.
+      const personal = endpoint.store.mint({
+        extension: "com.example.oauth",
+        scope: "personal",
+        actor: "UADA",
+        label: "Example OAuth",
+      });
+      expect(personal.ok).toBe(true);
+      if (!personal.ok) return;
+      const res = await postStaticClient(`${endpoint.baseUrl}/upload/${personal.token}`, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("org-scoped");
+      expect(h.broker.calls).toHaveLength(0);
+      expect(await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT })).toHaveLength(0);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("malformed / empty / oversized client values are refused with 400 and store nothing", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const cases: Array<[string, string]> = [
+        ["", STATIC_CLIENT_SECRET], // empty client id
+        [STATIC_CLIENT_ID, ""], // empty client secret
+        ["   ", STATIC_CLIENT_SECRET], // whitespace-only client id
+        ["c".repeat(513), STATIC_CLIENT_SECRET], // oversized client id
+        [STATIC_CLIENT_ID, "s".repeat(513)], // oversized client secret
+      ];
+      for (const [clientId, clientSecret] of cases) {
+        const minted = endpoint.store.mint({
+          extension: "com.example.oauth",
+          scope: "org",
+          actor: "UADA",
+          label: "Example OAuth",
+        });
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+        const res = await postStaticClient(`${endpoint.baseUrl}/upload/${minted.token}`, clientId, clientSecret);
+        expect(res.status).toBe(400);
+      }
+      expect(h.broker.calls).toHaveLength(0);
+      expect(await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT })).toHaveLength(0);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("single-use: a replayed static-client POST stores nothing twice", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "com.example.oauth",
+        scope: "org",
+        actor: "UADA",
+        label: "Example OAuth",
+      });
+      expect(minted.ok).toBe(true);
+      if (!minted.ok) return;
+      const url = `${endpoint.baseUrl}/upload/${minted.token}`;
+
+      const first = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(first.status).toBe(200);
+      const replay = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(replay.status).toBe(404); // fail closed: the consumed token is gone
+
+      expect(h.broker.calls).toHaveLength(1);
+      expect(await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT })).toHaveLength(1);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("a denied org gate stores nothing (fail closed)", async () => {
+    const router = new RecordingRouter({ approved: false });
+    const h = makeDeps({ policy: allowedPolicy(), router });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "com.example.oauth",
+        scope: "org",
+        actor: "UADA",
+        label: "Example OAuth",
+      });
+      expect(minted.ok).toBe(true);
+      if (!minted.ok) return;
+
+      const res = await postStaticClient(`${endpoint.baseUrl}/upload/${minted.token}`, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(res.status).toBe(400);
+      expect(h.broker.calls).toHaveLength(0);
+      expect(await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT })).toHaveLength(0);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("the mint reply for a static-client link relays the URL verbatim and names the two fields — no values", async () => {
+    const h = makeDeps();
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const tool = mintUploadLinkToolDefinition({
+        registry: h.deps.registry,
+        store: endpoint.store,
+        baseUrl: () => endpoint.baseUrl,
+        resolvePublicBase: noPublicBase,
+        getPrincipal: () => "UADA",
+      });
+      const result = await tool.execute(
+        "t1",
+        { extension: "com.example.oauth", scope: "org" },
+        undefined,
+        undefined,
+        // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
+        { sessionManager: { getSessionFile: () => null } } as never,
+      );
+      expect(result.isError).toBeUndefined();
+      // SAFETY: the tool replies with a single text content block carrying the upload URL.
+      const text = (result.content[0] as { text: string }).text;
+      const url = text.split("\n")[0]!;
+      expect(url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+      // The reply names the two browser fields and never carries values.
+      expect(text).toContain("client ID");
+      expect(text).toContain("client secret");
+      expect(text).not.toContain("static-secret");
+      const token = url.slice(endpoint.baseUrl.length + "/upload/".length);
+      expect(endpoint.store.consume(token).ok).toBe(true);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("vault provider separation: the static client row never collides with per-user OAuth rows under the real extension id", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "com.example.oauth",
+        scope: "org",
+        actor: "UADA",
+        label: "Example OAuth",
+      });
+      expect(minted.ok).toBe(true);
+      if (!minted.ok) return;
+      const res = await postStaticClient(`${endpoint.baseUrl}/upload/${minted.token}`, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+      expect(res.status).toBe(200);
+
+      // The synthetic provider key is deterministic and distinct from the
+      // extension id (a personal connect's OAuth row lives under the real id).
+      expect(staticOAuthClientProviderKey("com.example.oauth")).toBe("static-oauth-client:com.example.oauth");
+      expect(h.broker.calls).toHaveLength(1);
+      expect(h.broker.calls[0]!.provider).toBe("static-oauth-client:com.example.oauth");
+      expect(h.broker.calls[0]!.provider).not.toBe("com.example.oauth");
     } finally {
       endpoint.stop();
     }

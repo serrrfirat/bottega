@@ -36,6 +36,7 @@ import { connectViaAuthBroker } from "../extensions/connect";
 import type { CatalogRegisterDeps } from "../extensions/catalog-register";
 import { storeRuntimeRegistrySeam } from "../extensions/runtime-registry";
 import { mountUploadLink, uploadLinkPublicBase } from "../extensions/upload-link";
+import { createStaticOAuthClientStore } from "../extensions/static-oauth-client";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import { callbackPort, startOAuthCallbackServer } from "../extensions/oauth-callback";
 import type { McpOAuthTokenStore } from "../extensions/mcp-oauth";
@@ -410,11 +411,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // leg — /upload/*, /oauth/callback, and the #57 webhook route — so the
   // tunnel's target port survives restarts.
   const stablePort = callbackPort();
+  // Issue #288: the deployment-level static OAuth client seam (hosted MCPs
+  // whose AS has no dynamic client registration — the Gmail class). ONE
+  // production store serves both the upload POST (provisioning) and the
+  // connect mint (lookup): the broker's opaque api-key vault rows under
+  // the extension's synthetic provider key.
+  const staticOAuthClientStore = createStaticOAuthClientStore();
   const uploadMount = mountUploadLink({
     registry: extensionRegistry,
     store,
     audit,
     broker: connectViaAuthBroker,
+    staticOAuthClientStore,
     gate: {
       loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
       router: approvalRouter,
@@ -503,6 +511,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     registry: extensionRegistry,
     store,
     audit,
+    // Issue #288: the no-DCR connect mint consults the same static-client
+    // store the upload POST provisions into.
+    staticClientStore: staticOAuthClientStore,
     callbackBaseUrl: () => uploadLinkPublicBase() ?? oauthCallback.baseUrl,
   });
   // Issue #232/#233: the deterministic catalog seam for UNREGISTERED

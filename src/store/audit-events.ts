@@ -81,6 +81,14 @@ export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolve
 /** Extension connected through the connect capability (payload {extension, scope, owner}). */
 export const EXTENSION_CONNECTED_EVENT = "extension.connected";
 /**
+ * Deployment-level static OAuth client provisioned (issue #288): payload
+ * {extension, scope, owner, status} — metadata ONLY, never client values
+ * (the pre-registered client id/secret live in the vault, not the audit
+ * trail). Written by the one-time upload POST's static-client leg after a
+ * successful policy-gated store.
+ */
+export const STATIC_CLIENT_PROVISIONED_EVENT = "static_client.provisioned";
+/**
  * Boot secret provisioned into the vault (issue #201): payload {secret,
  * scope, owner}. Written by the connect_upload_link endpoint when a boot
  * secret (Slack token / provider key) is stored as the provider's api_key
