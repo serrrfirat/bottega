@@ -264,14 +264,6 @@ export function nextToolStepId(): string {
 const STEP_TITLE_MAX = 256;
 
 /**
- * Max completed-action titles a top-level DM's completion footer lists
- * before collapsing into a "+N more" tail (issue #295). Titles are already
- * redacted and bounded at the source ({@link toolStepTitle}), so the footer
- * stays human-readable and secret-free.
- */
-const DM_COMPLETED_ACTIONS_MAX = 3;
-
-/**
  * Composes a thinking-step card title and applies the SAME redaction the
  * audit module applies to payloads (issue #168): secret-shaped values in
  * tool names/qualifiers render `[REDACTED]`, never raw.
@@ -489,6 +481,55 @@ export function parseSearchResultRows(text: string): SearchResultRow[] {
 }
 
 // ---------------------------------------------------------------------------
+// Top-level DM status card (issue #296): a top-level Slack DM (slack:D*)
+// shows EXACTLY ONE Slack-native Block Kit card that spans the whole agent
+// request — preamble, tool rounds, retries, and final answer all own one
+// message timestamp. During the request the card renders only TRUSTED
+// status (the rotating thinking phrase / live progress line — never raw
+// model reasoning, intermediate assistant preambles, or tool internals); at
+// request settlement the same timestamp is replaced with the final answer
+// plus ONE subdued `N actions completed` context line when N > 0 (never a
+// per-tool checkmark list). Both builders are pure so the surface is
+// unit-testable without Slack; the block shapes match renderSearchResultBlocks.
+// ---------------------------------------------------------------------------
+
+/** One mrkdwn section block — the reusable block shell for both DM surfaces. */
+function dmSectionBlock(mrkdwn: string): unknown {
+  return { type: "section", text: { type: "mrkdwn", text: mrkdwn } };
+}
+
+/**
+ * The live status card blocks for a top-level DM (issue #296): a single
+ * section carrying the trusted status line (the rotating thinking phrase or
+ * the live progress line). The same mrkdwn is the accessible fallback text,
+ * so a non-rendering Slack surface still reads the status.
+ */
+export function renderDmStatusBlocks(status: string): unknown[] {
+  return [dmSectionBlock(status)];
+}
+
+/**
+ * The final answer blocks for a top-level DM (issue #296): the answer
+ * section plus — when {@link actionsCompleted} > 0 — one subdued context
+ * line `N actions completed`. Never individual tool names. Returns both the
+ * blocks and the accessible plain-mrkdwn fallback (the answer, with the
+ * count appended when present).
+ */
+export function renderDmFinalBlocks(
+  answer: string,
+  actionsCompleted: number,
+): { blocks: unknown[]; fallback: string } {
+  const blocks: unknown[] = [dmSectionBlock(answer)];
+  let fallback = answer;
+  if (actionsCompleted > 0) {
+    const line = `${actionsCompleted} ${actionsCompleted === 1 ? "action" : "actions"} completed`;
+    blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `_${line}_` }] });
+    fallback = `${answer}\n\n${line}`;
+  }
+  return { blocks, fallback };
+}
+
+// ---------------------------------------------------------------------------
 // Presenter
 // ---------------------------------------------------------------------------
 
@@ -670,21 +711,34 @@ export class SlackTurnPresenter {
   /** The last rendered plan body; identical snapshots skip the edit. */
   #lastPlanText: string | undefined;
   /**
-   * Completed gated tool-step LABELS for the CURRENT turn (top-level DMs
-   * only, issue #295): the compact completion footer lists what was done —
-   * human-readable labels, never internal tool identifiers — bounded to
-   * {@link DM_COMPLETED_ACTIONS_MAX} labels plus a "+N more" count. Only
-   * genuinely-successful executions (outcome === "succeeded") land here.
-   * Reset at each turn start so a prior turn's footer never leaks into the
-   * next card.
+   * Requests are in flight for a TOP-LEVEL DM (issue #296): true from a
+   * top-level DM turn's open (activateInbound / onQueueDrain, which are
+   * never threaded because {@link #dmTopLevel} requires no root) until the
+   * opening `session.prompt` promise settles ({@link onRequestSettled}) or
+   * the presenter is disposed. While true, the SDK's per-round
+   * {@link onTurnEnd} events are internal ROUND boundaries, not the request
+   * end: intermediate {@link onMessage} assistant preambles are buffered
+   * (never posted) and the one Block Kit status card stays up until the
+   * true request end. Channels/threads never set it (their turn_end stays
+   * the request boundary).
    */
-  #completedActions: string[] = [];
-  /** Completed actions beyond {@link #completedActions} (the "+N more" tail). */
-  #completedActionsExtra = 0;
+  #requestActive = false;
+  /** The latest buffered final-assistant message text during a pending top-level DM request (issue #296). */
+  #bufferedDMReply: string | undefined;
+  /** The latest buffered session error / empty-fallback during a pending top-level DM request (issue #296). */
+  #bufferedDMError: string | undefined;
   /**
-   * taskIds whose SUCCEEDED terminal already contributed a footer label
-   * (issue #295): a redelivered/replayed terminal for the same taskId is
-   * deduped so a retry can never double-count an action.
+   * Count of genuinely-successful gated tool actions for the CURRENT
+   * top-level DM request (issue #296): the single subdued `N actions
+   * completed` context line. Only executions with outcome === "succeeded"
+   * count. Reset at each request start so a prior request's count never
+   * leaks into the next card.
+   */
+  #completedActionsCount = 0;
+  /**
+   * taskIds whose SUCCEEDED terminal already contributed to the action
+   * count (issue #295→#296): a redelivered/replayed terminal for the same
+   * taskId is deduped so a retry can never double-count an action.
    */
   #recordedActionTaskIds = new Set<string>();
 
@@ -744,10 +798,13 @@ export class SlackTurnPresenter {
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
-    // #295: a fresh top-level turn starts with no completed actions — a
-    // prior turn's footer must never leak into this turn's card.
-    this.#completedActions = [];
-    this.#completedActionsExtra = 0;
+    // #296: a fresh top-level turn arms a DM REQUEST — one Block Kit card
+    // owning the whole agent loop until the opening prompt settles. The
+    // prior request's buffered reply/error and action count never leak in.
+    this.#requestActive = this.#dmTopLevel;
+    this.#bufferedDMReply = undefined;
+    this.#bufferedDMError = undefined;
+    this.#completedActionsCount = 0;
     this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
@@ -777,6 +834,31 @@ export class SlackTurnPresenter {
     const text = data.text;
     if (text === undefined) return;
     this.#turnDelivered = true;
+    // Issue #296: a top-level DM REQUEST is pending — the opening prompt
+    // has not settled. Intermediate assistant message events (the
+    // speculative preamble) and the final answer are BUFFERED, never
+    // posted: the one Block Kit status card stays up until
+    // {@link onRequestSettled} delivers the final reply. The real reply
+    // supersedes any earlier buffered error (an SDK recovery after an
+    // error), and an empty completion buffers the visible fallback/churn
+    // text for settlement. Nothing reaches Slack here.
+    if (this.#dmTopLevel && this.#requestActive) {
+      this.cancelStreamUpdate();
+      this.#cancelProgressTimer();
+      if (!text.trim()) {
+        const cause = data.error?.trim() || undefined;
+        this.#emptyTurnCount = this.#emptyTurnCount + 1;
+        this.#bufferedDMError =
+          this.#emptyTurnCount > EMPTY_TURN_LIMIT ? churnMessageText(cause) : emptyResponseFallback(cause);
+        if (this.#emptyTurnCount > EMPTY_TURN_LIMIT) this.#churnActive = true;
+        return;
+      }
+      this.#emptyTurnCount = 0;
+      this.#churnActive = false;
+      this.#bufferedDMReply = text;
+      this.#bufferedDMError = undefined;
+      return;
+    }
     if (!text.trim()) {
       // Empty completion (#60): surface a visible fallback so the retry
       // loop is never silent, and count it for the churn guard. The pending
@@ -811,11 +893,9 @@ export class SlackTurnPresenter {
       this.#scheduleStreamUpdate(text);
       return;
     }
-    // #295: a top-level DM's completed reply is "answer + completed-action
-    // footer" (when >= 1 action completed), still editing the one card.
-    this.#replaceOrPost(this.#withCompletionFooter(text));
     // The reply landed: the receipt reaction comes off and the reply
     // latency is audited (issue #119).
+    this.#replaceOrPost(text);
     this.#clearReactions();
     this.#auditReply();
   }
@@ -825,6 +905,17 @@ export class SlackTurnPresenter {
     console.error(`[slack-turn-presenter] session error (${this.spaceId}):`, data);
     if (this.digesting) return;
     this.#turnDelivered = true;
+    // Issue #296: a pending top-level DM request buffers the error too —
+    // the one card only changes at request settlement. The SDK may recover
+    // from an error with a later answer (onMessage clears the buffered
+    // error), so the error is held, not posted mid-request.
+    if (this.#dmTopLevel && this.#requestActive) {
+      this.cancelStreamUpdate();
+      this.#cancelProgressTimer();
+      const base = codexMintFailureText(data.message) ?? data.message ?? "Something went wrong while thinking.";
+      this.#bufferedDMError = base;
+      return;
+    }
     // An error supersedes any coalesced streaming text (#120): cancel the
     // pending update so its timer can never overwrite the error surface.
     this.cancelStreamUpdate();
@@ -859,15 +950,18 @@ export class SlackTurnPresenter {
    */
   onTurnEnd(data: TurnEndEvent): void {
     if (this.digesting) return;
+    // Issue #296: while a top-level DM REQUEST is pending, an SDK
+    // `turn_end` is an internal tool-round boundary (the SDK emits it after
+    // EVERY tool round — the agent-driver documents this). It is NOT the
+    // request end: do not finalize the card, do not open a new surface, do
+    // not count a silent round as churn — the one Block Kit card stays up
+    // and the request finalizes only when the opening prompt settles
+    // ({@link onRequestSettled}).
+    if (this.#dmTopLevel && this.#requestActive) {
+      return;
+    }
     if (!this.#turnDelivered) {
       this.#countEmptyTurn(data.error?.trim() || undefined);
-    }
-    // #295: a top-level DM's ~streamed~ (steer) final reply carries the
-    // completed-action footer too — append it to the pending coalesced
-    // text right before the final flush so it lands on the one card.
-    if (this.streamingTurns && this.#dmTopLevel) {
-      const entry = this.#streamUpdate;
-      if (entry) entry.text = this.#withCompletionFooter(entry.text);
     }
     const finalText = this.#latestStreamedText();
     const finalized = this.finalizeTurn(finalText);
@@ -895,7 +989,11 @@ export class SlackTurnPresenter {
    * mid-turn.
    */
   setSteered(streaming: boolean): void {
-    if (streaming && !this.alwaysStream) {
+    // Issue #296: a steered top-level DM keeps its ONE card — the steer
+    // continues the same pending request, so no fresh steer phrase posts
+    // (the opening card already spans the whole request); it only marks
+    // the turn streaming so live progress coalesces.
+    if (streaming && !this.alwaysStream && !this.isDmRequestPending()) {
       this.#postSteerPhrase();
     }
     this.streamingTurns = streaming;
@@ -911,6 +1009,77 @@ export class SlackTurnPresenter {
    */
   canSteer(): boolean {
     return !this.digesting && !this.#turnDelivered && !this.toolStepInFlight;
+  }
+
+  /**
+   * Whether a top-level DM REQUEST is currently pending (issue #296):
+   * true from a top-level DM turn's open until its opening
+   * `session.prompt` promise settles. SpaceService uses this to gate the
+   * per-round {@link onTurnEnd} queue drain — a DM queue must not start a
+   * second request while the first is still mid-loop (the SDK emits
+   * turn_end after every tool round). Channels/threads always report
+   * false; their turn_end stays the request boundary.
+   */
+  isDmRequestPending(): boolean {
+    return this.#requestActive && this.#dmTopLevel;
+  }
+
+  /**
+   * The true end of a top-level DM request (issue #296): called by
+   * SpaceService AFTER the opening `session.prompt(...)` promise settles —
+   * the SDK agent loop's per-round `turn_end` events are NOT the request
+   * end. Replaces the one Block Kit status card (that same timestamp) with
+   * the FINAL answer plus a single subdued `N actions completed` context
+   * line when N > 0 (never individual tool names or a checkmark list), or
+   * with the buffered error/fallback when the request ended without a real
+   * reply. Clears the pending-request state and resolves the receipt
+   * reaction + latency audit. Idempotent: only the FIRST call settles (a
+   * steered request's prompt and the original prompt both resolve on the
+   * single underlying run, so both paths call this; the second is a no-op
+   * that reports false so the queue drains exactly once).
+   */
+  onRequestSettled(): boolean {
+    if (!this.#dmTopLevel || !this.#requestActive) return false;
+    this.#requestActive = false;
+    this.cancelStreamUpdate();
+    this.#cancelProgressTimer();
+    const pendingTs = this.pendingTs;
+    this.pendingTs = undefined;
+    // The final answer wins over a buffered error (an SDK recovery after an
+    // error); a reply carries the action-count line, an error does not —
+    // an error replaces the card with the error text only (issue #295).
+    const reply = this.#bufferedDMReply;
+    const error = this.#bufferedDMError;
+    this.#bufferedDMReply = undefined;
+    this.#bufferedDMError = undefined;
+    const text = reply ?? error ?? "Done.";
+    // Only a REAL reply carries the `N actions completed` context line —
+    // errors and empty completions show no count.
+    const actionsCompleted = reply !== undefined ? this.#completedActionsCount : 0;
+    if (pendingTs !== undefined) {
+      const { blocks, fallback } = renderDmFinalBlocks(text, actionsCompleted);
+      console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
+      void this.adapter
+        .updateMessage(this.spaceId, pendingTs, fallback, { blocks })
+        .catch((err) => {
+          console.error(`[slack-turn-presenter] failed to update DM reply in ${this.spaceId}:`, err);
+        });
+    } else {
+      const { blocks, fallback } = renderDmFinalBlocks(text, actionsCompleted);
+      void this.adapter
+        .postMessage(this.spaceId, fallback, { ...this.replyOpts(), blocks })
+        .then((ts) => {
+          if (ts !== undefined) console.log(`presenter: final reply posted/edited ${this.spaceId} ${ts}`);
+        })
+        .catch((err) => {
+          console.error(`[slack-turn-presenter] failed to post DM reply to ${this.spaceId}:`, err);
+        });
+    }
+    // The final answer/error landed: the receipt reaction comes off and
+    // the reply latency is audited (issue #119).
+    this.#clearReactions();
+    this.#auditReply();
+    return true;
   }
 
   /**
@@ -946,9 +1115,13 @@ export class SlackTurnPresenter {
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
-    // #295: a drained turn is a FRESH turn — no carried-over completed actions.
-    this.#completedActions = [];
-    this.#completedActionsExtra = 0;
+    // #296: a drained turn is a FRESH request — a top-level drain arms a DM
+    // REQUEST (one Block Kit card, buffer intermediate messages) and resets
+    // the prior request's buffered reply/error and action count.
+    this.#requestActive = this.#dmTopLevel;
+    this.#bufferedDMReply = undefined;
+    this.#bufferedDMError = undefined;
+    this.#completedActionsCount = 0;
     this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
@@ -1108,9 +1281,11 @@ export class SlackTurnPresenter {
     this.#planTs = undefined;
     this.#planPosting = false;
     this.#lastPlanText = undefined;
-    // #295: completed-action tracking dies with the session too.
-    this.#completedActions = [];
-    this.#completedActionsExtra = 0;
+    // #296: request-phase state and the action count die with the session.
+    this.#requestActive = false;
+    this.#bufferedDMReply = undefined;
+    this.#bufferedDMError = undefined;
+    this.#completedActionsCount = 0;
     this.#recordedActionTaskIds.clear();
   }
 
@@ -1130,16 +1305,24 @@ export class SlackTurnPresenter {
     // Turn-lifecycle INFO (issue #212 follow-up): an inbound that never
     // opens a turn is attributable — adapter drop, service entry, or here.
     console.log(`presenter: openTurn ${this.spaceId}`);
-    return this.adapter.postMessage(this.spaceId, openingText, this.replyOpts());
+    const opts = this.replyOpts();
+    // Issue #296: a top-level DM's opening card is Slack-native Block Kit —
+    // the trusted status line with the same mrkdwn as the accessible
+    // fallback text. The final answer replaces this same timestamp.
+    if (this.#dmTopLevel) {
+      return this.adapter.postMessage(this.spaceId, openingText, { ...opts, blocks: renderDmStatusBlocks(openingText) });
+    }
+    return this.adapter.postMessage(this.spaceId, openingText, opts);
   }
 
   /**
-   * One text chunk to the turn's message. Phrase: chat.update in place.
+   * One text chunk to the turn's message. Phrase: chat.update in place
+   * (optional blocks for the top-level DM status card, issue #296).
    * Streaming: chat.appendStream markdown_text. Not async in the base for
    * the same microtask-timing reason as {@link openTurn}.
    */
-  protected sendTextChunk(ts: string, text: string): Promise<void> {
-    return this.adapter.updateMessage(this.spaceId, ts, text);
+  protected sendTextChunk(ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void> {
+    return this.adapter.updateMessage(this.spaceId, ts, text, opts);
   }
 
   /**
@@ -1167,20 +1350,20 @@ export class SlackTurnPresenter {
     // The in-flight flag (issue #219) gates the steer safe window.
     this.toolStepInFlight = step.status === "in_progress";
     this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
-    // #295: a top-level DM's completed footer records only GENUINELY
-    // SUCCESSFUL executions (outcome === "succeeded") with a human-readable
-    // label — denied / approval-only / failed completions never get a ✅,
-    // and internal identifiers never reach Slack. Deduped by taskId so a
-    // replay cannot double-count. Channels/threads don't track a footer.
+    // Issue #296: a top-level DM's action count records only GENUINELY
+    // SUCCESSFUL executions (outcome === "succeeded") — denied /
+    // approval-only / failed completions never count, and internal tool
+    // identifiers never reach Slack (the final shows a plain `N actions
+    // completed` line, not labels). Deduped by taskId so a replay cannot
+    // double-count. Channels/threads don't track a count.
     if (
       this.#dmTopLevel &&
       step.status === "complete" &&
       step.outcome === "succeeded" &&
-      step.label &&
       !this.#recordedActionTaskIds.has(step.taskId)
     ) {
       this.#recordedActionTaskIds.add(step.taskId);
-      this.#recordCompletedAction(step.label);
+      this.#completedActionsCount += 1;
     }
     this.#renderProgressNow();
   }
@@ -1249,40 +1432,6 @@ export class SlackTurnPresenter {
   #tailSnippet(text: string): string {
     if (text.length <= THINKING_SNIPPET_MAX) return text;
     return `…${text.slice(-(THINKING_SNIPPET_MAX - 1))}`;
-  }
-
-  /**
-   * The compact completed-action footer for a top-level DM's final reply
-   * (issue #295): one "✅ <label>" line per genuinely-successful gated tool
-   * action, bounded to {@link DM_COMPLETED_ACTIONS_MAX} labels plus a
-   * "+N more" tail. Only present when >= 1 action succeeded; absent for
-   * errors and empty completions (the card then holds the error/fallback
-   * only). Labels are humanized at the source, so no raw tool identifiers,
-   * args, or secrets leak.
-   */
-  #completionFooter(): string | undefined {
-    if (!this.#dmTopLevel) return undefined;
-    const labels = this.#completedActions;
-    if (labels.length === 0) return undefined;
-    const lines = labels.map((name) => `  ✅ ${name}`);
-    if (this.#completedActionsExtra > 0) lines.push(`  … +${this.#completedActionsExtra} more`);
-    return `\n\n${lines.join("\n")}`;
-  }
-
-  /** Appends the #295 completed-action footer to a final reply text when one is due. */
-  #withCompletionFooter(text: string): string {
-    const footer = this.#completionFooter();
-    return footer === undefined ? text : `${text}${footer}`;
-  }
-
-  /** Records a completed gated tool action for the #295 footer, bounded. */
-  /** Records a succeeded action's humanized label for the #295 footer, bounded; the caller pre-dedupes by taskId. */
-  #recordCompletedAction(label: string): void {
-    if (this.#completedActions.length < DM_COMPLETED_ACTIONS_MAX) {
-      this.#completedActions.push(label);
-    } else {
-      this.#completedActionsExtra += 1;
-    }
   }
 
   /**
@@ -1438,6 +1587,12 @@ export class SlackTurnPresenter {
 
   /** Rotates an already-pending phrase in place; streaming keeps its opening, so it does nothing. */
   protected rotateTurnOpening(pendingTs: string): Promise<void> {
+    // Issue #296: a top-level DM's rotating status edits the ONE Block Kit
+    // card (status blocks); channels/threads keep the plain-text rotation.
+    if (this.#dmTopLevel) {
+      const phrase = this.#nextPhrase();
+      return this.sendTextChunk(pendingTs, phrase, { blocks: renderDmStatusBlocks(phrase) });
+    }
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
   }
 
@@ -1675,7 +1830,14 @@ export class SlackTurnPresenter {
       entry.timer = null;
     }
     try {
-      await this.sendTextChunk(entry.ts, entry.text);
+      // Issue #296: a top-level DM's live progress edits the ONE Block Kit
+      // status card (trusted status line as blocks); channels/threads keep
+      // the plain-text in-place update.
+      if (this.#dmTopLevel) {
+        await this.sendTextChunk(entry.ts, entry.text, { blocks: renderDmStatusBlocks(entry.text) });
+      } else {
+        await this.sendTextChunk(entry.ts, entry.text);
+      }
     } catch (err) {
       console.error(
         `[slack-turn-presenter] streaming phrase update failed in ${this.spaceId} (${err instanceof Error ? err.message : String(err)}); keeping for the next attempt`,
@@ -1862,13 +2024,13 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
   }
 
   /** Interim reply text appends to the stream (markdown_text) on the cadence. */
-  protected async sendTextChunk(ts: string, text: string): Promise<void> {
+  protected async sendTextChunk(ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void> {
     // #streamTs guards the per-turn surface: a turn whose stream never
     // opened (missing recipient, request rejection, or a boot fallback)
     // edits the phrase in place — appendStream can never target a plain
     // post, and a per-turn fallback must not flip streaming off for the
     // boot (issue #287).
-    if (!this.#streamMode || this.#streamTs === undefined) return super.sendTextChunk(ts, text);
+    if (!this.#streamMode || this.#streamTs === undefined) return super.sendTextChunk(ts, text, opts);
     try {
       await this.adapter.appendText(this.spaceId, ts, text);
     } catch (err) {
@@ -1879,7 +2041,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
         `[slack-turn-presenter] chat.appendStream failed in ${this.spaceId} — falling back to phrase+edit for the boot:`,
         err,
       );
-      await super.sendTextChunk(ts, text);
+      await super.sendTextChunk(ts, text, opts);
     }
   }
 

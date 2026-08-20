@@ -489,6 +489,12 @@ export class SpaceService {
           presenter.activateInbound(msg);
           presenter.setSteered(true);
           await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
+          // Issue #296: a steered DM request also owns one card — settle it
+          // (idempotent: the original prompt settles the same run) and
+          // drain one queued message when it was the effective settlement.
+          if (presenter.onRequestSettled()) {
+            await this.#drainQueue(msg.spaceId);
+          }
           return;
         }
         // Queued: the receipt (👀 reaction, message.in audit) already
@@ -516,6 +522,13 @@ export class SpaceService {
         // the turn on a model misconfiguration.
         await live.session.reapplyDefaultModelRole?.();
         await live.session.prompt(turnText, { principal: msg.principal });
+        // Issue #296: the opening prompt's resolution is the true request
+        // end — NOT the SDK's per-round turn_end events. Finalize the DM
+        // card (if this was a top-level DM request) and drain ONE queued
+        // message as its own fresh turn when the request settled.
+        if (presenter.onRequestSettled()) {
+          await this.#drainQueue(msg.spaceId);
+        }
       }
     } catch (err) {
       console.error(`[space-service] failed to handle message in ${msg.spaceId}:`, err);
@@ -666,7 +679,14 @@ export class SpaceService {
       // Issue #219: after the running turn finishes, drain ONE queued
       // message as its own fresh turn; that turn's turn_end re-enters
       // here, so the queue empties one message per turn in arrival order.
-      void this.#drainQueue(spaceId);
+      // Issue #296: a pending top-level DM request emits turn_end after
+      // EVERY internal SDK tool round — that is NOT the request end. Drain
+      // only when no DM request is pending (channels/threads keep the
+      // turn_end drain; a DM drains once its opening prompt settles, at
+      // the call sites signaling onRequestSettled).
+      if (!this.#presenterFor(spaceId).isDmRequestPending()) {
+        void this.#drainQueue(spaceId);
+      }
     });
     // Issue #193: live reasoning chunks render as the in-place progress
     // phrase on the plain path (the panel path ignores them).
@@ -723,6 +743,13 @@ export class SpaceService {
       // behavior — own phrase, own reply, own principal (issue #152).
       await live.session.reapplyDefaultModelRole?.();
       await live.session.prompt(entry.text, { principal: entry.principal });
+      // Issue #296: the drained turn's request ends when its opening prompt
+      // settles (a top-level DM doesn't drain on the per-round turn_end).
+      // Settle the card, then drain the NEXT queued message if any — the
+      // recursion empties the queue one fresh turn per message.
+      if (presenter.onRequestSettled()) {
+        await this.#drainQueue(spaceId);
+      }
     } catch (err) {
       console.error(`[space-service] queue drain failed in ${spaceId}:`, err);
     }
