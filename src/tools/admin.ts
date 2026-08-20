@@ -221,6 +221,11 @@ export const catalogBrowserArgsSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe("The completed credentialSchema ({type: oauth|api_key, scopes?})"),
+  /** Pin: the provider's OAuth token endpoint (HTTPS, RFC 8414 metadata; carried on the record — issue #275). */
+  token_endpoint: z
+    .string()
+    .optional()
+    .describe("The provider's OAuth token endpoint (https:// — from its RFC 8414 authorization-server metadata)"),
   /** Pin: the explicit tool surface (optional — absent → runtime discovery of the provider's tools/list, issue #158). */
   tools: z
     .array(z.record(z.string(), z.unknown()))
@@ -292,6 +297,8 @@ interface DraftSummary {
   kind: ExtensionKind;
   binding: McpBinding | CliBinding | undefined;
   credential_schema: CredentialSchema | undefined;
+  /** The record-carried OAuth token endpoint (issue #275); null when the binding carries none. */
+  token_endpoint: string | null;
   tools_count: number | null;
   domains: string[];
   vendor_official: boolean;
@@ -301,16 +308,21 @@ interface DraftSummary {
 /**
  * The review-gate summary for a completed draft: everything the human must
  * see before confirming a pin (id, label, kind, binding, credential schema,
- * tool count, domains, provenance). One source shared by the
- * confirm-required refusal and the audit trail.
+ * record-carried token endpoint, tool count, domains, provenance). One
+ * source shared by the confirm-required refusal and the audit trail.
  */
 function draftSummary(draft: SnapshotDraft): DraftSummary {
+  const binding = draft.manifest.kind === "mcp" ? draft.manifest.mcp : draft.manifest.cli;
   return {
     id: draft.manifest.id,
     label: draft.manifest.label,
     kind: draft.manifest.kind,
-    binding: draft.manifest.kind === "mcp" ? draft.manifest.mcp : draft.manifest.cli,
+    binding,
     credential_schema: draft.manifest.credentialSchema,
+    token_endpoint:
+      draft.manifest.kind === "mcp" && draft.manifest.mcp !== undefined
+        ? (draft.manifest.mcp.tokenEndpoint ?? null)
+        : null,
     tools_count: draft.manifest.tools?.length ?? null,
     domains: draft.manifest.domains,
     vendor_official: draft.source.vendorOfficial,
@@ -779,7 +791,9 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
       "(serverUrl + transport + credentialSchema from the vendor's published MCP spec; vendor-official URLs " +
       "only — never guess or use community URLs). `pin` completes the draft IN-CHANNEL and REQUIRES the human's " +
       "confirmation (the review gate): pass `spec` + the completed `binding` / `credential_schema` (+ optional " +
-      "`tools` / `domains` / `vendor_official`) and FIRST call WITHOUT confirm to surface the draft summary, then " +
+      "`tools` / `domains` / `vendor_official` / `token_endpoint` — the OAuth provider's HTTPS token endpoint " +
+      "from its RFC 8414 metadata, carried on the record) and FIRST call WITHOUT confirm to surface the draft " +
+      "summary, then " +
       "call WITH confirm=true after the human confirms in-channel — the confirmation IS the review, the snapshot " +
       "records source.reviewed: true, the pinned snapshot is written to config/extensions via the fetch-catalog " +
       "pin flow (same review gate: unconfirmed/unreviewed drafts always refuse, fail closed), and " +
@@ -900,6 +914,22 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             // SAFETY: validateManifest below is the fail-closed authority on
             // credentialSchema before any write or registration.
             manifest.credentialSchema = JSON.parse(JSON.stringify(params.credential_schema)) as CredentialSchema;
+          }
+          if (params.token_endpoint !== undefined) {
+            // Issue #275: the OAuth token endpoint rides on the MCP binding
+            // (the record-carried primary source the egress generation
+            // resolves before the legacy map). A cli binding has no token
+            // endpoint slot — fail closed instead of silently dropping the
+            // agent's fact. validateManifest below is the authority on the
+            // https-only contract before any write or registration.
+            if (manifest.kind !== "mcp" || manifest.mcp === undefined) {
+              return toolError(
+                `refusing to pin "${params.spec.trim()}": token_endpoint applies only to an mcp binding — ` +
+                  "a cli binding has no OAuth token endpoint to carry (the egress oauth_token mint is a " +
+                  "hosted-MCP transform). Drop the token_endpoint param for cli bindings.",
+              );
+            }
+            manifest.mcp = { ...manifest.mcp, tokenEndpoint: params.token_endpoint };
           }
           if (params.tools !== undefined) {
             // SAFETY: validateManifest below is the fail-closed authority on
@@ -1090,6 +1120,11 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 hosted_variant: hosted,
                 no_hosted_variant: params.no_hosted_variant === true,
                 vendor_official: reviewed.source.vendorOfficial,
+                ...(reviewed.manifest.kind === "mcp" &&
+                reviewed.manifest.mcp !== undefined &&
+                reviewed.manifest.mcp.tokenEndpoint !== undefined
+                  ? { token_endpoint: reviewed.manifest.mcp.tokenEndpoint }
+                  : undefined),
                 live_registry: liveRegistry,
                 ...(liveError !== undefined ? { live_error: liveError } : undefined),
                 proxy_reload: proxyReload,

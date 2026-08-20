@@ -638,3 +638,68 @@ describe("oauth_token rule scoping (issue #246)", () => {
     }
   });
 });
+
+describe("record-carried token endpoints (issue #275)", () => {
+  /** A snapshot whose mcp binding carries the provider's OAuth token endpoint — the pin/register record shape. */
+  function recordEndpointSnapshot(extensionId: string, tokenEndpoint: string): PinnedSnapshot {
+    return {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId,
+      pinnedAt: "2026-08-20T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api", specId: extensionId, vendorOfficial: true, reviewed: true },
+      manifest: {
+        id: extensionId,
+        label: extensionId,
+        vendor: extensionId,
+        kind: "mcp",
+        mcp: {
+          serverUrl: `https://mcp.${extensionId}.example.com/mcp`,
+          transport: "streamable-http",
+          tokenEndpoint,
+        },
+        credentialSchema: { type: "oauth" },
+        domains: [`mcp.${extensionId}.example.com`],
+      },
+    };
+  }
+
+  test("a snapshot's record token endpoint is the primary source — no OAUTH_TOKEN_ENDPOINTS entry needed (issue #275)", () => {
+    // The endpoint rides on the record (pinned snapshot / runtime
+    // registration); the hardcoded map has no entry for this id — the
+    // generation must use the record, never fail closed on the map.
+    const entries = oauthTokenEntries([
+      recordEndpointSnapshot("record.oauth", "https://record.example.com/oauth/token"),
+    ]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.tokenEndpoint).toBe("https://record.example.com/oauth/token");
+    const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS, [], entries);
+    expect(yaml).toContain('token_endpoint: "https://record.example.com/oauth/token"');
+  });
+
+  test("the record endpoint beats the legacy map fallback (issue #275)", () => {
+    // notion IS in OAUTH_TOKEN_ENDPOINTS — a record endpoint on the snapshot
+    // must win (the map is the legacy fallback for records that carry none).
+    const entries = oauthTokenEntries([
+      ...SNAPSHOTS,
+      recordEndpointSnapshot("notion", "https://mcp.notion.com/record-token"),
+    ]);
+    const notion = entries.find((e) => e.extensionId === "notion");
+    expect(notion?.tokenEndpoint).toBe("https://mcp.notion.com/record-token");
+  });
+
+  test("a runtime-registered snapshot carrying the endpoint renders it through the merged generation (issue #275)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-record-endpoint-"));
+    try {
+      const outPath = join(dir, "egress.yml");
+      const runtime = [
+        recordEndpointSnapshot("runtime.oauth", "https://mcp.runtime-oauth.example.com/oauth/token"),
+      ];
+      const yaml = regenerateEgressConfig(join(dir, "missing-snapshots"), outPath, runtime);
+      expect(readFileSync(outPath, "utf8")).toBe(yaml);
+      expect(yaml).toContain('token_endpoint: "https://mcp.runtime-oauth.example.com/oauth/token"');
+      expect(yaml).toContain("runtime.oauth-oauth.json");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

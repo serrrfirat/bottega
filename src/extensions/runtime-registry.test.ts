@@ -125,6 +125,49 @@ describe("store-backed runtime extension registry (issue #233)", () => {
     expect(() => runtimeRecordFromRow(broken)).toThrow(/not valid JSON/);
   });
 
+  test("a record-carried token endpoint survives the store round-trip (issue #275)", async () => {
+    // The runtime registration's snapshot carries the OAuth token endpoint
+    // on the mcp binding (the #275 record shape); the persisted row must
+    // keep it through the registry's fail-closed parse — the egress regen
+    // reads the endpoint from exactly this record.
+    const store = freshStore();
+    // The notion binding with the #275 record shape: the endpoint rides on the mcp binding.
+    const snapshot: PinnedSnapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: "notion",
+      pinnedAt: "2026-08-18T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api", specId: "notion", vendorOfficial: true, reviewed: true },
+      manifest: {
+        id: "notion",
+        label: "Notion",
+        vendor: "Notion",
+        kind: "mcp",
+        mcp: {
+          serverUrl: "https://mcp.notion.com/mcp",
+          transport: "streamable-http",
+          tokenEndpoint: "https://mcp.notion.com/token",
+        },
+        credentialSchema: { type: "oauth" },
+        domains: ["notion.com", "mcp.notion.com"],
+      },
+    };
+    await store.upsertRuntimeExtension({
+      extensionId: snapshot.extensionId,
+      snapshot: JSON.stringify(snapshot),
+      registeredBy: "UADA",
+    });
+    const rows = await store.listRuntimeExtensions();
+    expect(rows).toHaveLength(1);
+    const record = runtimeRecordFromRow(rows[0]!);
+    // SAFETY: the notion manifest is kind mcp — the binding carries the endpoint.
+    expect(record.snapshot.manifest.kind).toBe("mcp");
+    if (record.snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
+    expect(record.snapshot.manifest.mcp.tokenEndpoint).toBe("https://mcp.notion.com/token");
+    const set = await runtimeSnapshotsFromStore(store);
+    if (set[0]!.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
+    expect(set[0]!.manifest.mcp.tokenEndpoint).toBe("https://mcp.notion.com/token");
+  });
+
   test("runtimeSnapshotsFromStore returns the validated runtime set for the egress merge", async () => {
     const store = freshStore();
     await store.upsertRuntimeExtension({

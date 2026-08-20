@@ -822,6 +822,90 @@ describe("catalog_browser pin (issue #195)", () => {
     }
   });
 
+  test("pin with token_endpoint carries it onto the snapshot, the review summary, and the audit (issue #275)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      // A DISTINCT value (not the legacy map's linear endpoint) proves the
+      // record — not the OAUTH_TOKEN_ENDPOINTS fallback — is what renders.
+      const endpoint = "https://mcp.linear.app/record-token";
+      writeCompletedDraft(draftsDir);
+      const { audit, rows } = fakeAudit();
+      const tools = loadTools(store, {
+        audit,
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+
+      // 1. the review-gate summary surfaces the endpoint the agent supplied
+      const refused = await call(tools[0], { action: "pin", spec: "linear", token_endpoint: endpoint });
+      expect(refused.isError).toBe(true);
+      // SAFETY: the review-gated pin serializes the draft summary (asserted below).
+      const refusedBody = JSON.parse(refused.text) as { summary: { token_endpoint: string | null } };
+      expect(refusedBody.summary.token_endpoint).toBe(endpoint);
+
+      // 2. the confirmed pin writes the endpoint onto the snapshot + audit
+      const pinned = await call(tools[0], {
+        action: "pin",
+        spec: "linear",
+        confirm: true,
+        vendor_official: true,
+        token_endpoint: endpoint,
+      });
+      expect(pinned.isError).toBe(false);
+      const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
+      // SAFETY: linear is a hosted mcp snapshot — the binding carries the endpoint.
+      expect(snapshot.manifest.kind).toBe("mcp");
+      if (snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
+      expect(snapshot.manifest.mcp.tokenEndpoint).toBe(endpoint);
+      // The regenerated egress renders the RECORD endpoint (not the map's).
+      const egress = readFileSync(egressPath, "utf8");
+      expect(egress).toContain(`token_endpoint: "${endpoint}"`);
+      expect(egress).not.toContain('token_endpoint: "https://mcp.linear.app/token"');
+      // The audit row carries it.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.payload["token_endpoint"]).toBe(endpoint);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin refuses a non-https token_endpoint — fail closed (issue #275)", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      writeCompletedDraft(draftsDir);
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        // Temp egress outputs: a WRONG pin must never reach the repo's configs.
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: stubFetch() },
+      });
+      const refused = await call(tools[0], {
+        action: "pin",
+        spec: "linear",
+        confirm: true,
+        token_endpoint: "http://insecure.example/token",
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.text).toContain("tokenEndpoint");
+      expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("pin hot-reloads: registers the snapshot into the LIVE registry — a following session's toolset includes the extension without a restart", async () => {
     const { store, dir, cleanup } = freshStore();
     try {

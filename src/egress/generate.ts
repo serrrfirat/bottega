@@ -213,22 +213,28 @@ export interface OAuthTokenEntry {
 }
 
 /**
- * Verified token endpoints for the OAuth extensions (the #198 providers;
- * RFC 8414 authorization-server metadata, fetched 2026-08-18):
+ * The LEGACY token-endpoint fallback for the OAuth extensions (issue
+ * #275): the PRIMARY source is now the record itself — the snapshot's
+ * mcp binding carries the provider's token endpoint (pinned snapshot
+ * manifest at pin time, store-backed runtime registration row at register
+ * time; RFC 8414 authorization-server metadata, never guessed). This map
+ * keeps the #198 pinned seed providers (linear/attio/notion) working
+ * WITHOUT re-pinning: their committed snapshots carry no record endpoint,
+ * so resolution falls back here byte-stably.
  *   linear — https://mcp.linear.app/.well-known/oauth-authorization-server
  *   attio  — https://mcp.attio.com/.well-known/oauth-authorization-server
- * An oauth-type extension without an endpoint here FAILS config generation
- * (never a guessed URL — a wrong token endpoint would mint garbage). The
- * canary's test fixtures (issue #212) are the exception: `fixture.`-
- * prefixed ids (tests/e2e/canary.ts — fixture.pin, fixture.oauth) are
- * test-only and synthesize their endpoint from their own allowlisted
- * domain in {@link oauthTokenEntries} — they never appear in
- * config/extensions, so the production map stays fake-domain-free.
+ * An oauth-type extension with neither a record endpoint NOR an entry here
+ * FAILS config generation (never a guessed URL — a wrong token endpoint
+ * would mint garbage). The canary's test fixtures (issue #212) are the
+ * exception: `fixture.`-prefixed ids (tests/e2e/canary.ts — fixture.pin,
+ * fixture.oauth) are test-only and synthesize their endpoint from their
+ * own allowlisted domain in {@link oauthTokenEntries} — they never appear
+ * in config/extensions, so the production map stays fake-domain-free.
  * (The codex endpoint moved out under issue #230: the SEED calls
  * auth.openai.com/oauth/token directly — see CODEX_TOKEN_ENDPOINT in
  * src/extensions/proxy-seed.ts — the proxy never mints for codex.)
  */
-/** Verified token endpoints keyed by OAuth extension id (the #198 providers). */
+/** Verified token endpoints keyed by OAuth extension id (the #198 providers — legacy fallback). */
 interface VerifiedTokenEndpoints {
   [extensionId: string]: string;
 }
@@ -318,13 +324,16 @@ export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSn
 
 /**
  * The oauth_token entries for the pinned snapshots' OAuth extensions
- * (issue #208): each needs a VERIFIED token endpoint (OAUTH_TOKEN_ENDPOINTS
- * — RFC 8414 discovery metadata); an OAuth extension without one fails
- * generation closed (never a guessed URL). The canary's `fixture.`-prefixed
- * OAuth fixtures (issue #212) are test-only: their endpoint is synthesized
- * from the fixture's own allowlisted domain (there is no real
- * authorization server behind a fixture domain), so the #195 extension-pin
- * journey's egress regeneration runs deterministically.
+ * (issue #208): each needs a VERIFIED token endpoint. Issue #275: the
+ * endpoint resolves RECORD-FIRST — the snapshot's mcp binding carries it
+ * (pinned snapshot manifest at pin time; store-backed runtime registration
+ * row at register time) — then the LEGACY OAUTH_TOKEN_ENDPOINTS map
+ * (the #198 seed providers, whose committed snapshots carry no record
+ * endpoint), then FAILS generation closed (never a guessed URL). The
+ * canary's `fixture.`-prefixed OAuth fixtures (issue #212) are test-only:
+ * their endpoint is synthesized from the fixture's own allowlisted domain
+ * (there is no real authorization server behind a fixture domain), so the
+ * #195 extension-pin journey's egress regeneration runs deterministically.
  *
  * Decision B (issue #265): `excluded` names providers whose CURRENT vault
  * credential is non-renewable (access-only — no refresh grant anywhere).
@@ -362,12 +371,18 @@ export function oauthTokenEntries(
           paths,
         };
       }
-      const tokenEndpoint = OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
+      // Issue #275: the record is the PRIMARY source — the snapshot's mcp
+      // binding carries the provider's token endpoint (pinned at pin time,
+      // store-backed at register time). The hardcoded map is the legacy
+      // fallback for records that carry none (the #198 seed providers).
+      const recordEndpoint = s.manifest.kind === "mcp" ? s.manifest.mcp.tokenEndpoint : undefined;
+      const tokenEndpoint = recordEndpoint ?? OAUTH_TOKEN_ENDPOINTS[s.manifest.id];
       if (tokenEndpoint === undefined) {
         throw new Error(
           `egress config generation: the OAuth extension "${s.manifest.id}" has no verified token endpoint — ` +
-            "add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC 8414 discovery metadata) " +
-            "before regenerating",
+            "carry one on the extension record (the mcp binding's tokenEndpoint, supplied at pin/register " +
+            "time — issue #275) or add one to OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts (from its RFC " +
+            "8414 discovery metadata) before regenerating",
         );
       }
       return { extensionId: s.manifest.id, domains: s.manifest.domains, tokenEndpoint, paths };
@@ -490,18 +505,21 @@ ${extensionBlock}${gatewayEntries}
 /**
  * Renders the `oauth_token` transform (iron-proxy v0.49.0, issue #208):
  * one refresh_token-grant entry per OAuth extension (#198 providers —
- * linear/attio/notion). The proxy holds the provider's refresh token +
- * client credentials (from the sync's JSON blob) and mints the access
- * token at egress; inbound requests to the configured token_endpoint are
- * stubbed with a synthetic token so the app's SDK can complete its own
- * OAuth dance against the proxy (the GCP stub pattern). require: true —
- * an unmintable credential rejects the request (502), never an
- * unauthenticated upstream call. Issue #246: every rule is scoped with
- * `paths` to the provider's MCP resource subtree — the RFC 8414/9207
- * public discovery endpoints (`/.well-known/*`) must load before any
- * credential exists, so the mint rules never match them. The codex model
- * provider is NOT here (issue #230): it is a STATIC secrets entry — the
- * seed owns the refresh, the proxy injects the access token at egress.
+ * linear/attio/notion, plus any extension whose record carries its own
+ * token endpoint — issue #275: the endpoint is resolved record-first,
+ * OAUTH_TOKEN_ENDPOINTS is the legacy fallback). The proxy holds the
+ * provider's refresh token + client credentials (from the sync's JSON
+ * blob) and mints the access token at egress; inbound requests to the
+ * configured token_endpoint are stubbed with a synthetic token so the
+ * app's SDK can complete its own OAuth dance against the proxy (the GCP
+ * stub pattern). require: true — an unmintable credential rejects the
+ * request (502), never an unauthenticated upstream call. Issue #246:
+ * every rule is scoped with `paths` to the provider's MCP resource
+ * subtree — the RFC 8414/9207 public discovery endpoints (`/.well-known/*`)
+ * must load before any credential exists, so the mint rules never match
+ * them. The codex model provider is NOT here (issue #230): it is a STATIC
+ * secrets entry — the seed owns the refresh, the proxy injects the access
+ * token at egress.
  *
  * client_secret is sent UNCONDITIONALLY for every entry (issue #268): the
  * sync's blob always carries the key ("" for public clients), so the

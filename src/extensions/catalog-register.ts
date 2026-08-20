@@ -36,9 +36,11 @@
  *      continues in the same turn.
  *
  * The egress regeneration fails closed for an OAuth extension without a
- * VERIFIED token endpoint (OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts
- * — never a guessed URL): the runtime registration still lands (the
- * approved durable change) and the failure is LOUD in the result.
+ * VERIFIED token endpoint (the record-carried one from the RFC 8414
+ * metadata, or the OAUTH_TOKEN_ENDPOINTS legacy map in
+ * src/egress/generate.ts — never a guessed URL): the runtime registration
+ * still lands (the approved durable change) and the failure is LOUD in
+ * the result.
  */
 import type { AuditModule } from "../policy/audit";
 import { errorMessage } from "../tools/helpers";
@@ -73,21 +75,84 @@ export interface DiscoveredCatalogMcp {
   credentialSchema: CredentialSchema;
   /** True when OAuth-gated → tools-less manifest (the #231 notion pattern). */
   oauthGated: boolean;
+  /**
+   * The provider's OAuth token endpoint, extracted from its RFC 8414
+   * authorization-server metadata (issue #275) — the vendor's own
+   * published document, never guessed. Absent (metadata malformed or
+   * carrying no https token_endpoint) → the runtime registration still
+   * lands and the egress regen fails closed loudly, exactly like an
+   * extension with no verified endpoint.
+   */
+  tokenEndpoint?: string;
 }
 
 /** The discovery seam; default {@link discoverCatalogMcp} (deterministic). */
 export type CatalogMcpDiscoverer = (entry: CatalogEntry, opts?: FetchCatalogOptions) => Promise<DiscoveredCatalogMcp>;
 
 /**
- * Deterministic official MCP endpoint discovery (issue #232): the official
- * HOSTED server follows the vendor-domain convention every pinned hosted
- * provider uses (linear → mcp.linear.app/mcp, attio → mcp.attio.com/mcp,
- * notion → mcp.notion.com/mcp) — derived from the catalog record's OWN
- * domain, never a community URL. The auth mode comes from the vendor's
- * published RFC 8414 metadata (the same discovery the SDK's `auth()` runs):
- * an OAuth resource/authorization-server metadata document → OAuth-gated;
- * none → api_key. An unreachable/5xx probe fails loudly — an endpoint or
- * auth mode is never guessed.
+ * The standard RFC 8414 metadata path for an authorization-server origin.
+ */
+const OAUTH_AS_METADATA_PATH = "/.well-known/oauth-authorization-server";
+
+/**
+ * The token endpoint from an RFC 8414 authorization-server metadata
+ * document, when it carries one as a valid HTTPS URL (issue #275). LENIENT
+ * by design: malformed JSON, a missing/non-string/non-https token_endpoint
+ * → undefined (never guessed; the egress regen fails closed loudly at
+ * generation, the #265 posture — the runtime registration still lands).
+ */
+async function tokenEndpointFromMetadata(res: Response, fetchImpl: typeof fetch): Promise<string | undefined> {
+  try {
+    const doc = (await res.json()) as { token_endpoint?: unknown; authorization_servers?: unknown };
+    if (typeof doc.token_endpoint === "string" && doc.token_endpoint.trim() !== "") {
+      try {
+        const parsed = new URL(doc.token_endpoint);
+        if (parsed.protocol === "https:") return doc.token_endpoint;
+      } catch {
+        // malformed URL → not adopted (fail closed at generation).
+      }
+      return undefined;
+    }
+    // The protected-resource document (RFC 9728) carries no token_endpoint —
+    // it lists the authorization-server ORIGINS. Follow the first origin's
+    // standard AS metadata path (bounded, one hop; deterministic).
+    const origins = doc.authorization_servers;
+    if (Array.isArray(origins) && origins.length > 0 && typeof origins[0] === "string") {
+      const origin = origins[0];
+      try {
+        const originUrl = new URL(origin);
+        if (originUrl.protocol !== "https:") return undefined;
+        const asRes = await fetchImpl(`${originUrl.origin}${OAUTH_AS_METADATA_PATH}`);
+        if (asRes.status !== 200) return undefined;
+        const asDoc = (await asRes.json()) as { token_endpoint?: unknown };
+        if (typeof asDoc.token_endpoint !== "string" || asDoc.token_endpoint.trim() === "") return undefined;
+        const parsed = new URL(asDoc.token_endpoint);
+        if (parsed.protocol !== "https:") return undefined;
+        return asDoc.token_endpoint;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Deterministic official MCP endpoint discovery (issue #232 + #275): the
+ * official HOSTED server follows the vendor-domain convention every pinned
+ * hosted provider uses (linear → mcp.linear.app/mcp, attio →
+ * mcp.attio.com/mcp, notion → mcp.notion.com/mcp) — derived from the
+ * catalog record's OWN domain, never a community URL. The auth mode comes
+ * from the vendor's published RFC 8414 metadata (the same discovery the
+ * SDK's `auth()` runs): an OAuth resource/authorization-server metadata
+ * document → OAuth-gated; none → api_key. For an OAuth-gated server the
+ * TOKEN ENDPOINT is extracted from the same metadata (the vendor's own
+ * document — never guessed) and carried on the record, so the egress
+ * oauth_token generation resolves it without the hardcoded map (issue
+ * #275). An unreachable/5xx probe fails loudly — an endpoint or auth mode
+ * is never guessed.
  */
 export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalogOptions = {}): Promise<DiscoveredCatalogMcp> {
   const host = entry.domain.startsWith("mcp.") ? entry.domain : `mcp.${entry.domain}`;
@@ -100,7 +165,7 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
   // src/egress/generate.ts).
   const metadataPaths = [
     `${origin}/.well-known/oauth-protected-resource/mcp`,
-    `${origin}/.well-known/oauth-authorization-server`,
+    `${origin}${OAUTH_AS_METADATA_PATH}`,
   ];
   for (const metadataUrl of metadataPaths) {
     let res: Response;
@@ -114,8 +179,17 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
     if (res.status === 200) {
       // OAuth-gated: tools-less manifest, the #231 notion pattern — the
       // runtime discovers the surface from tools/list at boot, the OAuth
-      // flow mints at connect.
-      return { serverUrl, host, transport: "streamable-http", credentialSchema: { type: "oauth" }, oauthGated: true };
+      // flow mints at connect. The token endpoint rides on the record when
+      // the metadata carries one (issue #275).
+      const tokenEndpoint = await tokenEndpointFromMetadata(res, fetchImpl);
+      return {
+        serverUrl,
+        host,
+        transport: "streamable-http",
+        credentialSchema: { type: "oauth" },
+        oauthGated: true,
+        ...(tokenEndpoint !== undefined ? { tokenEndpoint } : undefined),
+      };
     }
     if (res.status !== 404) {
       throw new CatalogError(
@@ -185,6 +259,12 @@ export interface CatalogDraftFacts {
   domains: string[];
   /** The discovered official hosted MCP endpoint. */
   mcpEndpoint: string;
+  /**
+   * The provider's OAuth token endpoint from its RFC 8414 metadata (issue
+   * #275) — the record the runtime registration will carry; absent when
+   * the metadata exposes none (the egress regen fails closed loudly).
+   */
+  tokenEndpoint?: string;
   credentialSchema: CredentialSchema;
   oauthGated: boolean;
 }
@@ -254,7 +334,15 @@ export async function lookupCatalogExtension(
   const scaffold = buildSnapshotDraft(entry);
   const manifest = {
     ...scaffold.manifest,
-    mcp: { serverUrl: discovered.serverUrl, transport: discovered.transport },
+    // Issue #275: the OAuth token endpoint rides on the record — the
+    // vendor's RFC 8414 metadata value extracted by the discovery (never
+    // guessed), carried onto the store-backed runtime registration so the
+    // egress generation resolves it without the hardcoded map.
+    mcp: {
+      serverUrl: discovered.serverUrl,
+      transport: discovered.transport,
+      ...(discovered.tokenEndpoint !== undefined ? { tokenEndpoint: discovered.tokenEndpoint } : undefined),
+    },
     credentialSchema: discovered.credentialSchema,
     // Egress allowlist: the vendor host + the official MCP host (notion →
     // ["notion.com", "mcp.notion.com"]).
@@ -291,6 +379,7 @@ export async function lookupCatalogExtension(
       kind: entry.kind,
       domains: manifest.domains,
       mcpEndpoint: discovered.serverUrl,
+      ...(discovered.tokenEndpoint !== undefined ? { tokenEndpoint: discovered.tokenEndpoint } : undefined),
       credentialSchema: discovered.credentialSchema,
       oauthGated: discovered.oauthGated,
     },
@@ -372,9 +461,9 @@ export async function registerExtensionAtRuntime(
   } catch (err) {
     warnings.push(
       `EGRESS REGEN FAILED — "${snapshot.extensionId}" is registered at runtime but ${egressPath} was NOT ` +
-        `regenerated: ${errorMessage(err)}. Fix the cause (e.g. a verified OAuth token endpoint in ` +
-        `OAUTH_TOKEN_ENDPOINTS, src/egress/generate.ts) and run "bun run src/egress/generate.ts" — until ` +
-        `then the new domains are NOT allowlisted.`,
+        `regenerated: ${errorMessage(err)}. Fix the cause (e.g. a verified OAuth token endpoint on the record ` +
+        `— the mcp binding's tokenEndpoint, or OAUTH_TOKEN_ENDPOINTS in src/egress/generate.ts) and run "bun ` +
+        `run src/egress/generate.ts" — until then the new domains are NOT allowlisted.`,
     );
   }
   let liveRegistry: "registered" | "failed" | "absent" = "absent";
@@ -427,6 +516,9 @@ export async function registerExtensionAtRuntime(
       egress_config: egressPath,
       hosted_variant: true,
       vendor_official: true,
+      ...(snapshot.manifest.kind === "mcp" && snapshot.manifest.mcp.tokenEndpoint !== undefined
+        ? { token_endpoint: snapshot.manifest.mcp.tokenEndpoint }
+        : undefined),
       live_registry: liveRegistry,
     },
   });

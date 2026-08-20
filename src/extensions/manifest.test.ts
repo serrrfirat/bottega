@@ -176,6 +176,41 @@ describe("extension manifest validation (fail closed)", () => {
       .toBeDefined();
   });
 
+  test("an mcp binding carries an optional HTTPS tokenEndpoint on the record (issue #275)", () => {
+    const manifest = validateManifest(
+      asJsonDoc({
+        ...fixtureManifest(),
+        mcp: { ...fixtureManifest().mcp, tokenEndpoint: "https://mcp.linear.app/token" },
+      }),
+    );
+    // SAFETY: the fixture manifest is kind mcp — the typed binding carries the endpoint.
+    expect(manifest.kind).toBe("mcp");
+    if (manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
+    expect(manifest.mcp.tokenEndpoint).toBe("https://mcp.linear.app/token");
+    // Absent → the binding stays endpoint-free (legacy records byte-stable).
+    const plain = validateManifest(asJsonDoc(fixtureManifest()));
+    if (plain.kind !== "mcp") throw new Error("expected an mcp manifest");
+    expect(plain.mcp.tokenEndpoint).toBeUndefined();
+  });
+
+  test("a non-https or malformed tokenEndpoint fails closed (issue #275)", () => {
+    // The egress mint POSTs the refresh grant to this URL — a non-https
+    // endpoint would ship credentials over plaintext, so the record refuses it.
+    expectInvalid(
+      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: "http://insecure.example/token" } },
+      "tokenEndpoint must be an https URL",
+    );
+    expectInvalid(
+      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: "not a url" } },
+      "tokenEndpoint must be a valid URL",
+    );
+    // A PRESENT-but-non-string value fails too (never silently dropped).
+    expectInvalid(
+      { ...fixtureManifest(), mcp: { ...fixtureManifest().mcp, tokenEndpoint: 42 } },
+      "tokenEndpoint must be a non-empty string",
+    );
+  });
+
   test("mcp serverUrl must be an http(s) URL", () => {
     expectInvalid(
       { ...fixtureManifest(), mcp: { serverUrl: "ftp://x", transport: "streamable-http" } },
