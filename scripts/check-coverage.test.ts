@@ -157,6 +157,34 @@ describe("summarizeSuiteFailure (issue #300)", () => {
   test("a report with no failures yields [] (caller still fails closed)", () => {
     expect(summarizeSuiteFailure("All files | 91.20 | 90.15 |")).toEqual([]);
   });
+
+  test("does not attribute a passing test's logged error: to the next failure", () => {
+    // Regression (issue #300): bun prints a PASSING test's console.error
+    // line into the shared buffer, then the failing test's real error and
+    // (fail) anchor. The older extractor buffered 'error:' lines across
+    // tests and dumped them onto the NEXT anchor — so a red suite's
+    // diagnostics could show 'error: slack unreachable' (from an unrelated
+    // passing test) attached to the actual failing test. Detail must be
+    // contiguous with its own anchor; source-preview/caret lines break it.
+    const report = [
+      "tests/e2e/foo.test.ts:",
+      "error: slack unreachable", // a passing test that logs an error: line
+      "1 | test(\"a > unrelated\", async () => {});",
+      "2 | test(\"b > the real failure\", () => {",
+      "  ^",
+      "error: expect(received).toBe(expected)",
+      "Expected: 2",
+      "      at <anonymous> (tests/e2e/foo.test.ts:2:8)",
+      "(fail) suite b > the real failure [3.12ms]",
+    ].join("\n");
+    const failures = summarizeSuiteFailure(report);
+    expect(failures).toHaveLength(1);
+    // The real failure's detail is present…
+    expect(failures[0]).toContain("expect(received).toBe(expected)");
+    expect(failures[0]).toContain("the real failure");
+    // …and the unrelated passing test's log line is NOT attributed.
+    expect(failures[0]).not.toContain("slack unreachable");
+  });
 });
 
 describe("decideGate failure diagnostics (issue #300)", () => {

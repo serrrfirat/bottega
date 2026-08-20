@@ -93,8 +93,12 @@ export const MAX_SNIPPET_LINES = 4;
 
 /** Anchors a failing test report: `(fail) <test name> [<duration>ms]`. */
 const FAIL_ANCHOR = /^\s*\(fail\)\s+.+?\s+\[\d+(?:\.\d+)?ms\]\s*$/;
-/** Detail lines that name the failure for the test anchored below/above. */
+/** A line that names the failure and is contiguous with its own `(fail)` anchor. */
 const FAIL_DETAIL = /^(?:error[: ]|Expected:|Received:|AssertionError|this test timed out|✗ )/i;
+/** Stack/continuation lines inside the same failure block (kept contiguous with the anchor). */
+const FAIL_CONNECTOR = /^(\s*at\s+<|^\s*$)/;
+/** A signal that a new test's context began (breaks detail association with the next anchor). */
+const CONTEXT_BREAK = /^\s*[\d]+\s+\||^\s*[\^~-]+\s*$|\.test\.ts:|\.run\.ts:/;
 /** A timeout message: `this test timed out after 5000ms.` */
 const TIMEOUT_RE = /timed out after\s+\d+\s*ms/i;
 /** Long token-shaped runs: Bearer tokens, github_pat_* secrets, hex/base64 blobs. */
@@ -119,22 +123,32 @@ export function scrubSecrets(text: string): string {
 export function summarizeSuiteFailure(report: string): string[] {
   const lines = report.split("\n");
   const out: string[] = [];
-  // Detail lines observed since the last fail anchor, capped per snippet.
-  let detail: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (FAIL_ANCHOR.test(line)) {
-      // Collect a timeout bun prints on the line(s) right AFTER the anchor
-      // (`this test timed out after 5000ms.`) so it rides with its test.
-      const following = lines.slice(i + 1, i + 3).find((l) => TIMEOUT_RE.test(l));
-      const snippet = [...detail, line.trim(), ...(following ? [following.trim()] : [])].join("\n");
-      out.push(scrubSecrets(snippet));
-      detail = [];
-      if (out.length >= MAX_FAILURES) break;
-    } else if (out.length < MAX_FAILURES && FAIL_DETAIL.test(line.trim())) {
-      // Collect recent detail lines (error:/Expected:/timeout...) and cap.
-      if (detail.length < MAX_SNIPPET_LINES) detail.push(line.trim());
+  for (let i = 0; i < lines.length && out.length < MAX_FAILURES; i++) {
+    const anchor = lines[i];
+    if (!FAIL_ANCHOR.test(anchor)) continue;
+    // Associate ONLY the detail/stack lines contiguous with THIS anchor —
+    // scanning upward, stopping at the first line that begins a different
+    // context (source preview, caret, file header). A passing test's logged
+    // `error: ...` line (console.error) is separated by source/caret lines,
+    // so it never bleeds into a later test's failure snippet.
+    const upward: string[] = [anchor.trim()];
+    for (let j = i - 1; j >= 0 && upward.length < MAX_SNIPPET_LINES; j--) {
+      const t = lines[j].trim();
+      if (FAIL_DETAIL.test(t) || FAIL_CONNECTOR.test(lines[j])) {
+        upward.unshift(t);
+      } else if (CONTEXT_BREAK.test(lines[j])) {
+        break;
+      } else {
+        // A non-detail, non-connector, non-break line (e.g. a coverage row,
+        // a summary line) ends association.
+        break;
+      }
     }
+    // A timeout bun prints on the line(s) right AFTER the anchor
+    // (`this test timed out after 5000ms.`) belongs to this same test.
+    const following = lines.slice(i + 1, i + 3).find((l) => TIMEOUT_RE.test(l));
+    if (following !== undefined) upward.push(following.trim());
+    out.push(scrubSecrets(upward.join("\n")));
   }
   return out;
 }

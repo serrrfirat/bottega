@@ -577,33 +577,49 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
 describe("proxy reload half (issue #123/#197 seam)", () => {
   test("a configured control pair reloads the proxy once after the writes", async () => {
     const s = tempSecretsDir();
-    const reloads: string[] = [];
-    const mgmt = Bun.serve({
-      port: 0,
-      fetch: async (req) => {
-        reloads.push(req.headers.get("authorization") ?? "");
-        return new Response("ok", { status: 200 });
-      },
-    });
+    const reloadCalls: Array<{ url: string; auth: string }> = [];
+    // Isolate the reload from the AMBIENT global `fetch` (issue #300): an
+    // earlier test file mutating globalThis.fetch must never steer this
+    // test's reload. The seam feeds the reload the deterministic 200 it
+    // expects and records what the sync POSTs (url + bearer).
+    const fetchReload: (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => Promise<Response> = async (input, init) => {
+      reloadCalls.push({
+        url: input instanceof Request ? input.url : String(input),
+        auth: (init?.headers as Record<string, string> | undefined)?.["Authorization"] ?? "",
+      });
+      return new Response("ok", { status: 200 });
+    };
     try {
       await syncProxyCredentialsFromEnv({
         env: { NEAR_API_KEY: "near-env" },
         secretsDir: s.dir,
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
-        proxyControl: { proxyControlUrl: `http://127.0.0.1:${mgmt.port}`, proxyControlToken: "mgmt-token" },
+        proxyControl: { proxyControlUrl: "http://iron-proxy:9092", proxyControlToken: "mgmt-token" },
+        fetchReload,
         log: SILENT,
       });
-      expect(reloads).toEqual(["Bearer mgmt-token"]);
+      expect(reloadCalls).toEqual([
+        { url: "http://iron-proxy:9092/v1/reload", auth: "Bearer mgmt-token" },
+      ]);
     } finally {
-      mgmt.stop(true);
       s.cleanup();
     }
   });
 
   test("a failed reload throws (a boot that cannot push its credentials must fail)", async () => {
     const s = tempSecretsDir();
-    const mgmt = Bun.serve({ port: 0, fetch: () => new Response("denied", { status: 401 }) });
+    // Isolate the reload from the AMBIENT global `fetch` (issue #300): a
+    // prior test replacing globalThis.fetch (e.g. admin's management-API
+    // stub) must never turn this 401 into a 200 or an unrelated error. The
+    // injected seam deterministically yields the 401 the contract expects.
+    const fetchReload: (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => Promise<Response> = async () => new Response("denied", { status: 401 });
     try {
       await expect(
         syncProxyCredentialsFromEnv({
@@ -611,12 +627,12 @@ describe("proxy reload half (issue #123/#197 seam)", () => {
           secretsDir: s.dir,
           fetchVault: NO_VAULT,
           readKeychain: NO_KEYCHAIN,
-          proxyControl: { proxyControlUrl: `http://127.0.0.1:${mgmt.port}`, proxyControlToken: "wrong" },
+          proxyControl: { proxyControlUrl: "http://iron-proxy:9092", proxyControlToken: "wrong" },
+          fetchReload,
           log: SILENT,
         }),
       ).rejects.toThrow(/proxy credential sync reload failed \(401\)/);
     } finally {
-      mgmt.stop(true);
       s.cleanup();
     }
   });
