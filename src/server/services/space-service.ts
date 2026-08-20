@@ -354,6 +354,17 @@ export class SpaceService {
   }
 
   /**
+   * Posts ONE Slack-native chart block into the space's turn thread (issue
+   * #276): the render_chart tool's post sink routes through this, which
+   * forwards to the space's presenter. Unknown/headless spaces have no
+   * presenter yet and are dropped — a chart can only follow an inbound
+   * message, so a presenter exists by then.
+   */
+  postChart(spaceId: string, block: unknown): void {
+    this.#presenterFor(spaceId).postChartBlock(block);
+  }
+
+  /**
    * The live session's todo plan (issue #228, pull path): the `list_todos`
    * tool reads the space agent's plan through this seam — the driver's
    * getTodoPhases on the space's LIVE session (the SDK rehydrates the

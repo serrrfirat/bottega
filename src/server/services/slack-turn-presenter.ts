@@ -787,6 +787,22 @@ export class SlackTurnPresenter {
     return threadTs === undefined ? undefined : { threadTs };
   }
 
+  /**
+   * Posts ONE Slack-native data-visualization (type: chart) block into the
+   * turn's thread (issue #276). Exactly one blocks-bearing message per call —
+   * the render_chart tool posts once per result, never per streamed chunk.
+   * Reuses the adapter's postMessage blocks path and the SAME threading rule
+   * as replyOpts(), so the chart lands beside the reply (DMs post plainly).
+   * Fire-and-forget: a Slack failure logs and never throws into the turn.
+   */
+  postChartBlock(block: unknown): void {
+    void this.adapter
+      .postMessage(this.spaceId, "", { ...this.replyOpts(), blocks: [block] })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] failed to post chart in ${this.spaceId}:`, err);
+      });
+  }
+
   dispose(): void {
     this.lastInboundTs = undefined;
     this.pendingTs = undefined;
