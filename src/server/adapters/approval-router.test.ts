@@ -28,7 +28,9 @@ import {
 } from "./slack";
 import {
   ARGS_ROW_VALUE_MAX,
+  ARGS_SECTION_TEXT_MAX,
   FAILURE_MEMORY_MAX,
+  SLACK_SECTION_TEXT_MAX,
   SlackApprovalRouter,
   buildApprovalBlocks,
 } from "./approval-router";
@@ -404,6 +406,35 @@ describe("buildApprovalBlocks", () => {
     expect(rendered).toContain("*Last confirmed write failed:* write-blob: disk full");
   });
 
+  test("dense rows and a long failure sticker stay under Slack's section text cap (issue #277)", () => {
+    // A payload pushing max-size values in many rows would, uncapped, blow
+    // past Slack's 3000-char section limit and reject the whole card (the
+    // approval would then auto-deny). The rendered sections must stay bounded.
+    const args: Record<string, string> = {};
+    for (let i = 0; i < 40; i += 1) args[`field_${i}`] = "x".repeat(ARGS_ROW_VALUE_MAX);
+    const blocks = buildApprovalBlocks({ ...REQUEST, args }, "req-123", "y".repeat(10_000));
+
+    const sectionTexts = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => (s.text?.text ?? "").length);
+
+    expect(sectionTexts.length).toBeGreaterThan(0);
+    // Every section stays within Slack's limit; the row budget also never
+    // climbs past its own, smaller cap.
+    expect(Math.max(...sectionTexts)).toBeLessThanOrEqual(SLACK_SECTION_TEXT_MAX);
+    expect(Math.max(...sectionTexts)).toBeLessThan(ARGS_SECTION_TEXT_MAX + 64);
+
+    // And the failure banner reason was truncated, not echoed in full.
+    const rendered = (blocks as Block[])
+      .filter((b) => b.type === "section")
+      .map((s) => s.text?.text ?? "")
+      .join("\n");
+    expect(rendered).toContain("*Last confirmed write failed:*");
+    const ys = (rendered.match(/y/g) ?? []).length;
+    expect(ys).toBeGreaterThan(0);
+    expect(ys).toBeLessThan(10_000); // the 10k 'y' reason was truncated, not echoed in full
+  });
+
   test("an empty args payload omits the would-be-write section", () => {
     const blocks = buildApprovalBlocks({ ...REQUEST, args: {} }, "req-123");
     const rendered = (blocks as Block[])
@@ -530,7 +561,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
 
   test("a confirmed write that fails posts the failure to the thread and a later card surfaces it (issue #277)", async () => {
     const postedSignal = Promise.withResolvers<void>();
-    const steps: Array<{ spaceId?: string; title: string; output?: string }> = [];
+    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string }> = [];
     const { adapter, posted } = fakeAdapter({ onPosted: () => postedSignal.resolve() });
     const router = new SlackApprovalRouter({
       adapter,
@@ -551,11 +582,17 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
     // …then its execution fails: the caller reports the failure to the router.
     router.recordConfirmedWriteFailure("slack:C1", "create_work_item", "duplicate work item");
 
-    // The failure is posted back through the step emit seam.
-    const failureStep = steps.find((s) => s.title.includes("confirmed write failed"));
-    expect(failureStep).toBeDefined();
-    expect(failureStep!.spaceId).toBe("slack:C1");
-    expect(failureStep!.output).toContain("duplicate work item");
+    // The failure is posted back through the step emit seam as a VALID step
+    // lifecycle — opened in_progress then completed, sharing one taskId — so
+    // the phrase/stream renderer surfaces a visible failure instead of
+    // swallowing an orphaned complete card (issue #277).
+    const failureSteps = steps.filter((s) => s.title.includes("confirmed write failed"));
+    expect(failureSteps).toHaveLength(2);
+    expect(failureSteps.map((s) => s.status)).toEqual(["in_progress", "complete"]);
+    // Shared taskId: the complete checks off the card the in_progress opened.
+    expect(failureSteps[0].taskId).toBe(failureSteps[1].taskId);
+    expect(failureSteps[0].spaceId).toBe("slack:C1");
+    for (const s of failureSteps) expect(s.output).toContain("duplicate work item");
 
     // A later approval card for the same tool surfaces the remembered failure.
     void router.request({ ...REQUEST, args: { title: "y" } });

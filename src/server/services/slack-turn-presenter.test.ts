@@ -563,6 +563,62 @@ describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => 
     expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the final answer" });
   });
 
+  test("a confirmed-write failure step is a visible ⚙️ line in the DM/phrase path and resolves (issue #277)", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.streams).toHaveLength(0); // DM → phrase path, no panel
+    const phraseTs = "post-1";
+
+    // A confirmed write that FAILED (issue #277): the router opens the step
+    // as in_progress (the failing tool is the CURRENT step)…
+    const taskId = nextToolStepId();
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId,
+      title: toolStepTitle("create_work_item", "confirmed write failed"),
+      status: "in_progress",
+      output: "disk full",
+    });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    // …and the phrase renderer makes the failure VISIBLE as the progress line.
+    expect(rec.updates).toContainEqual({
+      spaceId: "slack:C1",
+      ts: phraseTs,
+      text: "⚙️ create_work_item — confirmed write failed",
+    });
+
+    // …then completes it with the same taskId: valid lifecycle, no orphaned
+    // complete, and the line still resolves onward.
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId,
+      title: toolStepTitle("create_work_item", "confirmed write failed"),
+      status: "complete",
+      output: "disk full",
+    });
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
+    await flush();
+    expect(rec.updates.at(-1)?.text).not.toContain("confirmed write failed");
+
+    // The final reply replaces the progress line in place.
+    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the answer" });
+    await flush();
+    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the answer" });
+  });
+
   test("a turn with tool steps + thinking blocks renders progress updates in place, throttled (issue #193)", async () => {
     vi.useFakeTimers();
     fakeTimers = true;
