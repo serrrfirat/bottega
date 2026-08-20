@@ -38,7 +38,16 @@ export interface SlackMessage {
   spaceId: string;
   principal: string;
   text: string;
+  /** The inbound message's own Slack ts; the reply/receipt anchor. */
   ts: string;
+  /**
+   * The ROOT conversation thread when the inbound message is itself a
+   * thread reply (the event's `thread_ts`). Undefined for top-level
+   * messages. Preserved through to the turn presenter (issue #289) so a
+   * threaded request's reply lands in the same conversation thread instead
+   * of nesting a new thread under the latest inbound reply.
+   */
+  threadTs?: string;
   files?: Array<{ id: string; name: string; mimeType: string; size: number }>;
 }
 
@@ -248,6 +257,7 @@ const slackMessageEventSchema = z.object({
   text: z.string().optional(),
   subtype: z.string().optional(),
   bot_id: z.string().optional(),
+  thread_ts: z.string().optional(),
   files: z.array(z.unknown()).optional(),
 });
 
@@ -268,7 +278,7 @@ export function normalizeMessage(
 ): SlackMessage | null {
   const parsed = slackMessageEventSchema.safeParse(event);
   if (!parsed.success) return null;
-  const { channel, user, text, ts, subtype, bot_id, files } = parsed.data;
+  const { channel, user, text, ts, subtype, bot_id, thread_ts, files } = parsed.data;
   if (isBotMessage({ bot_id, subtype, user }, botUserId)) return null;
   const normalizedFiles: NonNullable<SlackMessage["files"]> = [];
   if (files !== undefined) {
@@ -285,6 +295,7 @@ export function normalizeMessage(
     principal: user,
     text: text ?? "",
     ts,
+    ...(thread_ts !== undefined ? { threadTs: thread_ts } : undefined),
     ...(normalizedFiles.length > 0 ? { files: normalizedFiles } : undefined),
   };
 }

@@ -239,6 +239,13 @@ interface PendingTurn {
   principal: string;
   /** Slack ts; the drain turn's phrase/reply thread under this message. */
   ts: string;
+  /**
+   * The conversation ROOT when the queued message is itself a Slack
+   * thread reply (issue #289); undefined for top-level messages. Carried
+   * so the drained turn's reply lands in the same thread the request came
+   * from, exactly like a non-queued thread request.
+   */
+  rootThreadTs?: string;
 }
 
 /**
@@ -473,7 +480,7 @@ export class SpaceService {
         // the message was received; the "+N waiting" indicator makes
         // "and is next" visible on the live line.
         const queue = this.#queues.get(msg.spaceId) ?? [];
-        queue.push({ text: turnText, principal: msg.principal, ts: msg.ts });
+        queue.push({ text: turnText, principal: msg.principal, ts: msg.ts, rootThreadTs: msg.threadTs });
         this.#queues.set(msg.spaceId, queue);
         presenter.setQueueLength(queue.length);
       } else {
@@ -687,7 +694,10 @@ export class SpaceService {
     // live line BEFORE the fresh turn opens; the drained message's ts
     // becomes the threading base so the reply lands under it.
     presenter.setQueueLength(queue.length);
-    presenter.onQueueDrain(entry.ts, entry.principal);
+    // Issue #289: the drained message's own root thread (when it is a
+    // thread reply) travels with the turn so its reply stays in the same
+    // conversation thread the request came from.
+    presenter.onQueueDrain(entry.ts, entry.principal, entry.rootThreadTs);
     try {
       // The drain IS a fresh turn (issue #189): hot-swap the default model
       // role like any other fresh turn, then prompt without a streaming

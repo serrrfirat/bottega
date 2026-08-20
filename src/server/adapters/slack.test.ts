@@ -130,12 +130,13 @@ describe("normalizeMessage", () => {
     });
   });
 
-  test("thread replies share the channel space in v1", () => {
+  test("thread replies share the channel space in v1 and carry the root thread_ts (issue #289)", () => {
     expect(normalizeMessage({ ...channelEvent, thread_ts: "1723700000.000100" })).toEqual({
       spaceId: "slack:C123ABC",
       principal: "U456",
       text: "hello bottega",
       ts: "1723700000.000100",
+      threadTs: "1723700000.000100",
     });
   });
 
@@ -1032,13 +1033,13 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
     expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "hello", ts: "1.1" }]);
   });
 
-  test("thread replies share the channel space in v1", async () => {
+  test("thread replies share the channel space in v1 and carry the root thread_ts (issue #289)", async () => {
     const received: SlackMessage[] = [];
     const { deliver } = bootApp(async (m) => { received.push(m); });
 
     await deliver({ type: "message", channel: "C123", user: "U1", text: "reply", ts: "1.2", thread_ts: "1.1" });
 
-    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "reply", ts: "1.2" }]);
+    expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "reply", ts: "1.2", threadTs: "1.1" }]);
   });
 
   test("drops bot-authored messages and logs the drop", async () => {

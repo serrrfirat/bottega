@@ -989,6 +989,163 @@ describe("Codex mint-failure surface (issue #218)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Threaded inbound turns (issue #289): a user request that is itself a
+// Slack thread reply (inbound carries thread_ts) gets a reaction-only
+// receipt — NO thinking placeholder, NO stream open, NO progress line —
+// and the final/error reply posts as a NEW message under the conversation
+// ROOT thread, never an edit of a placeholder and never a nested thread
+// under the latest inbound reply. Top-level channel turns and DMs keep
+// their existing placeholder+edit / plain-message behavior.
+// ---------------------------------------------------------------------------
+
+describe("SlackTurnPresenter: threaded inbound turns (issue #289)", () => {
+  function threadedPresenter(rec: RecordedAdapter): SlackTurnPresenter {
+    const { store } = recordingStore();
+    return new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+  }
+
+  test("a thread reply gets a reaction-only receipt; the final reply posts NEW under the root, never an edit", async () => {
+    const rec = recordingAdapter();
+    const { store, audit } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    // Receipt: the inbound is a reply inside root thread ts=1.0.
+    presenter.onInbound(msg({ ts: "1.1", threadTs: "1.0" }));
+    await flush();
+    expect(rec.posts).toHaveLength(0); // no thinking placeholder
+    expect(rec.streams).toHaveLength(0); // no stream open
+    expect(rec.reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+
+    // turn_start must not re-arm a placeholder on the threaded turn.
+    presenter.onTurnStart();
+    await flush();
+    expect(rec.posts).toHaveLength(0);
+
+    // The final reply is a NEW message under the ROOT — never chat.update.
+    presenter.onMessage({ spaceId: "slack:C1", text: "the answer" });
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: "the answer", opts: { threadTs: "1.0" } }]);
+    expect(rec.updates).toHaveLength(0);
+
+    // The receipt reaction comes off and the audits remain (issue #119).
+    expect(rec.reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
+    ]);
+    const types = audit.map((a) => a.event_type);
+    expect(types).toContain(MESSAGE_RECEIVED_EVENT);
+    expect(types).toContain(MESSAGE_REPLIED_EVENT);
+  });
+
+  test("an error on a threaded turn posts a fresh terminal reply under the root", async () => {
+    const rec = recordingAdapter();
+    const presenter = threadedPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1", threadTs: "1.0" }));
+    await flush();
+    expect(rec.posts).toHaveLength(0);
+
+    presenter.onError({ spaceId: "slack:C1", message: "provider exploded" });
+    await flush();
+
+    expect(rec.posts).toHaveLength(1);
+    expect(rec.posts[0]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "1.0" } });
+    expect(rec.posts[0]!.text).toContain("provider exploded");
+    expect(rec.updates).toHaveLength(0); // fresh post, never an edit
+  });
+
+  test("a drained thread message answers under the root with no placeholder", async () => {
+    const rec = recordingAdapter();
+    const presenter = threadedPresenter(rec);
+    // The drained message is itself a thread reply (ts=2.1 inside root 1.0).
+    presenter.onQueueDrain("2.1", "U1", "1.0");
+    await flush();
+    expect(rec.posts).toHaveLength(0); // reaction-only drain, no placeholder
+
+    presenter.onTurnStart();
+    await flush();
+    expect(rec.posts).toHaveLength(0);
+
+    presenter.onMessage({ spaceId: "slack:C1", text: "queued answer" });
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: "queued answer", opts: { threadTs: "1.0" } }]);
+    expect(rec.updates).toHaveLength(0);
+  });
+
+  test("top-level channel turns keep the placeholder + in-place-edit path (issue #289 must not regress them)", async () => {
+    const rec = recordingAdapter();
+    const presenter = threadedPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+
+    presenter.onMessage({ spaceId: "slack:C1", text: "plain answer" });
+    await flush();
+    expect(rec.updates).toEqual([{ spaceId: "slack:C1", ts: "post-1", text: "plain answer" }]);
+    expect(rec.posts).toHaveLength(1); // the placeholder was edited, never stacked
+  });
+
+  test("a DM thread reply still posts plainly (DMs never thread; issue #180 unchanged)", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:D1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1", threadTs: "1.0" }));
+    await flush();
+    expect(rec.posts).toHaveLength(0); // reaction-only receipt
+
+    presenter.onMessage({ spaceId: "slack:D1", text: "dm answer" });
+    await flush();
+    expect(rec.posts).toEqual([{ spaceId: "slack:D1", text: "dm answer", opts: undefined }]);
+    expect(rec.updates).toHaveLength(0);
+  });
+
+  test("the STREAMING renderer is reaction-only for threaded turns too: no stream opens, the final reply posts under the root", async () => {
+    const rec = recordingAdapter({ streaming: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store,
+      onboardingChecks: () => [],
+    });
+
+    presenter.onInbound(msg({ ts: "1.1", threadTs: "1.0" }));
+    await flush();
+    presenter.onTurnStart();
+    await flush();
+    expect(rec.streams).toHaveLength(0); // zero startStream calls
+    expect(rec.posts).toHaveLength(0); // zero placeholder posts
+
+    // Completion: the final reply posts as a NEW message under the root —
+    // no stream to append to, no phrase to edit.
+    presenter.onMessage({ spaceId: "slack:C1", text: "the answer" });
+    presenter.onTurnEnd({ spaceId: "slack:C1" });
+    await flush();
+    expect(rec.streams).toHaveLength(0);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: "the answer", opts: { threadTs: "1.0" } }]);
+    expect(rec.updates).toHaveLength(0);
+    expect(rec.reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Live todo tiers (issue #228): the phrase line's "🛠 N/M — current step"
 // indicator for multi-step turns, and the in-place "🛠 Agent's plan"
 // message for long turns (>= 3 steps across >= 2 phases), edited as steps

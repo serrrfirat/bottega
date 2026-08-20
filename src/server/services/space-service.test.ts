@@ -1788,6 +1788,122 @@ describe("SpaceService queue-by-default (issue #219)", () => {
   });
 });
 
+describe("SpaceService threaded inbound turns (issue #289)", () => {
+  test("two sequential requests in one Slack thread get reaction-only receipts and two distinct final replies under the same root", async () => {
+    const { adapter, posts, updates, reactions, streams } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    // Request 1: a reply inside the root thread (root ts=1.0, reply ts=1.1).
+    await service.handleInboundMessage(msg({ text: "first", ts: "1.1", threadTs: "1.0" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // Reaction-only receipt: NO placeholder post, NO stream open — the old
+    // behavior posted a thinking phrase threaded under the inbound reply.
+    expect(posts).toHaveLength(0);
+    expect(streams).toHaveLength(0);
+    expect(reactions).toEqual([{ kind: "add", spaceId: "slack:C1", ts: "1.1" }]);
+
+    // Answer 1: a NEW message under the ROOT — never an edit of a placeholder.
+    session.emit("message", { spaceId: "slack:C1", text: "answer one" });
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(posts).toEqual([{ spaceId: "slack:C1", text: "answer one", opts: { threadTs: "1.0" } }]);
+    expect(updates).toHaveLength(0);
+
+    // Request 2 in the SAME thread: its own fresh turn answering under the
+    // same root — no placeholder, no reuse/edit of request 1's line.
+    await service.handleInboundMessage(msg({ text: "second", ts: "2.1", threadTs: "1.0" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(posts).toHaveLength(1); // still no placeholder posted
+    session.emit("message", { spaceId: "slack:C1", text: "answer two" });
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // Two DISTINCT final postMessage calls under the same root, request order.
+    expect(posts).toEqual([
+      { spaceId: "slack:C1", text: "answer one", opts: { threadTs: "1.0" } },
+      { spaceId: "slack:C1", text: "answer two", opts: { threadTs: "1.0" } },
+    ]);
+    expect(updates).toHaveLength(0); // no final updateMessage calls
+
+    // Both receipts acked and removed; message.in + message.reply audits for both.
+    expect(reactions).toEqual([
+      { kind: "add", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "1.1" },
+      { kind: "add", spaceId: "slack:C1", ts: "2.1" },
+      { kind: "remove", spaceId: "slack:C1", ts: "2.1" },
+    ]);
+    const inAudits = audit.filter((a) => a.event_type === MESSAGE_RECEIVED_EVENT);
+    expect(inAudits.map((a) => JSON.parse(a.payload).ts)).toEqual(["1.1", "2.1"]);
+    expect(audit.filter((a) => a.event_type === MESSAGE_REPLIED_EVENT)).toHaveLength(2);
+  });
+
+  test("queued thread requests drain one fresh turn each: request1 → answer1 → request2 → answer2, all under the same root", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    vi.useFakeTimers();
+    try {
+      // Turn 1 runs (threaded request 1).
+      await service.handleInboundMessage(msg({ text: "first", ts: "1.1", threadTs: "1.0" }));
+      const session = driver.last();
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      session.streaming = true;
+
+      // Request 2 in the same thread QUEUES (reaction-only; no second prompt).
+      await service.handleInboundMessage(msg({ text: "second", ts: "2.1", threadTs: "1.0" }));
+      expect(session.prompts).toHaveLength(1);
+
+      // Turn 1 answers; its turn_end drains request 2 as its own fresh turn.
+      session.emit("message", { spaceId: "slack:C1", text: "answer one" });
+      session.streaming = false;
+      session.emit("turn_end", { spaceId: "slack:C1" });
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      expect(session.prompts[1]).toEqual({ text: "second", opts: { principal: "U1" } });
+
+      session.emit("message", { spaceId: "slack:C1", text: "answer two" });
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+
+      // FIFO: request1 → answer1 → request2 → answer2, each reply a distinct
+      // post under the SAME root — never an edit and never a nested thread.
+      expect(session.prompts.map((p) => p.text)).toEqual(["first", "second"]);
+      expect(posts).toEqual([
+        { spaceId: "slack:C1", text: "answer one", opts: { threadTs: "1.0" } },
+        { spaceId: "slack:C1", text: "answer two", opts: { threadTs: "1.0" } },
+      ]);
+      expect(updates).toHaveLength(0);
+      expect(posts[0]).not.toEqual(posts[1]); // distinct messages, distinct ts
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a threaded request that errors still lands a fresh terminal reply under the root", async () => {
+    const { adapter, posts, updates, reactions } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+
+    await service.handleInboundMessage(msg({ text: "do it", ts: "1.1", threadTs: "1.0" }));
+    const session = driver.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(posts).toHaveLength(0); // reaction-only receipt
+
+    session.emit("error", { spaceId: "slack:C1", message: "provider exploded" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "1.0" } });
+    expect(posts[0]!.text).toContain("provider exploded");
+    expect(updates).toHaveLength(0);
+    expect(reactions.at(-1)).toEqual({ kind: "remove", spaceId: "slack:C1", ts: "1.1" });
+  });
+});
+
 describe("SpaceService run settlement after a stream/panel turn (issue #183)", () => {
   test("a stream/panel turn followed by another message: the second turn runs fresh and its reply lands — no busy wedge", async () => {
     const { adapter, posts, updates } = fakeAdapter();

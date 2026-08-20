@@ -538,6 +538,17 @@ export class SlackTurnPresenter {
    */
   protected lastInboundPrincipal: string | undefined;
   /**
+   * The ROOT conversation thread the CURRENT turn's replies must target
+   * (issue #289). Set from the inbound message's own `threadTs` when the
+   * request is itself a Slack thread reply; undefined for top-level
+   * messages (the reply then threads under {@link lastInboundTs} as
+   * before). A threaded turn is reaction-only: no thinking placeholder and
+   * no stream open — the final/error reply posts as a NEW message under
+   * this root, so two requests in one thread never reuse or edit a shared
+   * placeholder. Reset on every inbound / queue drain and on dispose.
+   */
+  protected turnThreadTs: string | undefined;
+  /**
    * ts of the in-place thinking phrase (or the open stream, in streaming
    * mode) per space; consumed when the reply lands. NOTE: the ts is only
    * known after postMessage/startStream resolves — the posting guard below
@@ -649,12 +660,27 @@ export class SlackTurnPresenter {
   onInbound(msg: SlackMessage): void {
     this.lastInboundTs = msg.ts;
     this.lastInboundPrincipal = msg.principal;
+    // Issue #289: an inbound that is itself a thread reply carries the
+    // conversation ROOT (thread_ts). The turn's replies must target that
+    // root — never a nested thread under this latest reply — and the
+    // receipt is reaction-only: no thinking placeholder, no stream open
+    // (the final reply posts as a NEW message under the root).
+    this.turnThreadTs = msg.threadTs;
     // A new turn: the previous turn's progress state is stale (#193). The
     // opening phrase (and the elapsed tick) take over from here.
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
-    this.#postThinkingPhrase();
+    if (this.turnThreadTs === undefined) {
+      this.#postThinkingPhrase();
+    } else {
+      // Reaction-only receipt: no placeholder to edit, so drop any stale
+      // pending ts (a leftover phrase from a previous top-level turn must
+      // never become this turn's edit target) and keep the fresh-turn
+      // bookkeeping the steer safe-window depends on (#219).
+      this.#turnDelivered = false;
+      this.pendingTs = undefined;
+    }
     this.#addReceiptReaction(msg);
     this.#auditReceipt(msg);
   }
@@ -824,10 +850,14 @@ export class SlackTurnPresenter {
    * progress. The receipt reaction and message.in audit already happened
    * at queue time (onInbound), so neither repeats here. `principal` is the
    * drained message's sender — the channel stream's recipient (issue #287).
+   * Issue #289: a drained message that is itself a thread reply
+   * (rootThreadTs set) stays reaction-only — its reply targets the
+   * conversation root.
    */
-  onQueueDrain(msgTs: string, principal: string): void {
+  onQueueDrain(msgTs: string, principal: string, rootThreadTs?: string): void {
     this.lastInboundTs = msgTs;
     this.lastInboundPrincipal = principal;
+    this.turnThreadTs = rootThreadTs;
     this.#currentStepTitle = undefined;
     this.#latestThinking = undefined;
     this.#lastProgressText = undefined;
@@ -910,10 +940,15 @@ export class SlackTurnPresenter {
     this.#renderPlanMessage();
   }
 
-  /** DMs read naturally as a plain message — no thread. Team channels (C/G) keep replies threaded. */
+  /**
+   * DMs read naturally as a plain message — no thread. Team channels (C/G)
+   * keep replies threaded: under the conversation ROOT when the request
+   * was itself a thread reply (issue #289), otherwise under the inbound
+   * message (issue #40).
+   */
   replyOpts(): { threadTs?: string } | undefined {
     if (isDmChannel(channelFromSpaceId(this.spaceId))) return undefined;
-    const threadTs = this.lastInboundTs;
+    const threadTs = this.turnThreadTs ?? this.lastInboundTs;
     return threadTs === undefined ? undefined : { threadTs };
   }
 
@@ -936,6 +971,7 @@ export class SlackTurnPresenter {
   dispose(): void {
     this.lastInboundTs = undefined;
     this.lastInboundPrincipal = undefined;
+    this.turnThreadTs = undefined;
     this.pendingTs = undefined;
     this.#phrasePosting = false;
     this.#emptyTurnCount = 0;
@@ -1147,6 +1183,11 @@ export class SlackTurnPresenter {
    */
   #postThinkingPhrase(): void {
     if (this.digesting) return;
+    // Issue #289: threaded turns are reaction-only — no placeholder
+    // message, no stream open. The final reply posts as a NEW message
+    // under the conversation root; a placeholder would become a stale
+    // edit target that a later request in the same thread must not reuse.
+    if (this.turnThreadTs !== undefined) return;
     this.#turnDelivered = false;
     if (this.#churnActive) return;
     // Live progress (#193): the elapsed tick keeps the phrase live from the
@@ -1202,6 +1243,10 @@ export class SlackTurnPresenter {
    */
   #postSteerPhrase(): void {
     if (this.digesting || this.#churnActive) return;
+    // Issue #289: a steered message inside a thread is reaction-only like
+    // any other threaded request — no placeholder; the combined turn's
+    // reply posts fresh under the root.
+    if (this.turnThreadTs !== undefined) return;
     if (this.#phrasePosting) return; // a phrase post is in flight — it becomes the pending phrase
     this.#phrasePosting = true;
     // The steer's fresh phrase supersedes the original turn's phrase as the
@@ -1608,7 +1653,10 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
    */
   protected async openTurn(openingText: string): Promise<string | undefined> {
     if (!this.#streamMode || !this.adapter.streamingSupported()) return super.openTurn(openingText);
-    const threadTs = this.lastInboundTs;
+    // Issue #289: a threaded request's stream (when one opens at all —
+    // threaded turns are reaction-only, so this is the steer/top-level
+    // path) targets the conversation ROOT, never the latest inbound reply.
+    const threadTs = this.turnThreadTs ?? this.lastInboundTs;
     if (threadTs === undefined) return super.openTurn(openingText);
     // Channel streams NEED the initiating user as recipient_user_id (issue
     // #287): without it the request is invalid, so streaming is bypassed
