@@ -684,6 +684,39 @@ function isLoopbackHostname(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
 }
 
+/** The dynamic-registration capability verdict (issue #288), shared by the connect mint and the upload-link mint. */
+export type McpOAuthRegistrationCapability = "dcr" | "no-dcr" | "unknown";
+
+/**
+ * Pure verdict from a discovered authorization-server metadata payload
+ * (issue #288): `"dcr"` exactly when the advertised registration endpoint
+ * is USABLE, `"no-dcr"` otherwise. The SINGLE seam both the connect's
+ * negotiation and the upload-link mint use — never a provider flag.
+ */
+export function registrationCapabilityFromMetadata(registrationEndpoint: unknown): "dcr" | "no-dcr" {
+  return registrationEndpointUsable(registrationEndpoint) ? "dcr" : "no-dcr";
+}
+
+/**
+ * Discovery-backed dynamic-registration capability (issue #288): resolves
+ * the verdict through the SAME RFC 9728/8414 discovery the connect uses.
+ * `"unknown"` when discovery cannot establish the verdict — the SDK's
+ * discovery returns UNDEFINED metadata (not a throw) when the server
+ * serves no well-known metadata at all, and absent metadata establishes
+ * nothing (a static-client link is only minted when no-DCR is actually
+ * established; a DCR-capable server is never refused a direct connect over
+ * a hiccuped probe).
+ */
+export async function resolveMcpOAuthRegistrationCapability(serverUrl: string): Promise<McpOAuthRegistrationCapability> {
+  try {
+    const info = await discoverOAuthServerInfo(serverUrl);
+    if (info.authorizationServerMetadata === undefined) return "unknown";
+    return registrationCapabilityFromMetadata(info.authorizationServerMetadata.registration_endpoint);
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * The connect's negotiated server contract (issue #256 + issue #257 +
  * issue #262): SEP-835 resolves the OAuth scope as: auth() `scope` option →
@@ -765,7 +798,18 @@ async function connectServerNegotiation(
       : "none";
   const grantsRefresh =
     info.authorizationServerMetadata?.grant_types_supported?.includes("refresh_token") === true;
-  const dynamicRegistration = registrationEndpointUsable(info.authorizationServerMetadata?.registration_endpoint);
+  // Issue #288: the SAME typed seam the upload-link mint uses. ABSENT
+  // metadata (the SDK's discovery returns undefined rather than throwing
+  // when the server serves no well-known metadata at all) establishes
+  // NOTHING — no registration endpoint is usable, but no OAuth contract is
+  // proven either — so the connect keeps the pre-#288 posture (proceed;
+  // auth() re-discovers and fails closed with its own error). Only a
+  // server whose metadata genuinely advertises no usable registration
+  // endpoint is treated as no-DCR.
+  const dynamicRegistration =
+    info.authorizationServerMetadata === undefined
+      ? true
+      : registrationCapabilityFromMetadata(info.authorizationServerMetadata.registration_endpoint) === "dcr";
   if (!grantsRefresh) return { scope: undefined, tokenEndpointAuthMethod, dynamicRegistration };
   // Issue #262: choose the scope BASE without ever building it out of the
   // "default" placeholder Notion (and similar AS) advertise in

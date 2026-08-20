@@ -70,6 +70,72 @@ function oauthManifest(): ExtensionManifest {
   };
 }
 
+/** The OAuth manifest bound to a SPECIFIC server URL (issue #288 mint capability tests). */
+function oauthManifestAt(serverUrl: string): ExtensionManifest {
+  const manifest = oauthManifest();
+  // Narrow the kind union: the OAuth fixture is the mcp arm by construction.
+  if (manifest.kind !== "mcp" || manifest.mcp === undefined) {
+    throw new Error("the oauth fixture manifest must be the mcp kind");
+  }
+  return { ...manifest, mcp: { serverUrl, transport: "streamable-http" } };
+}
+
+/** A registry holding the fixture + an OAuth manifest at the given server URL. */
+function registryWithOauthAt(serverUrl: string): ExtensionRegistry {
+  const r = createExtensionRegistry();
+  r.register(fixtureManifest());
+  r.register(oauthManifestAt(serverUrl));
+  return r;
+}
+
+/**
+ * Hermetic discovery stub (issue #288): serves the RFC 9728 protected-
+ * resource metadata + RFC 8414 authorization-server metadata the mint's
+ * dynamic-registration capability check discovers. `registrationEndpoint`
+ * true → DCR-capable; false → the Gmail-class no-DCR shape; `metadata`
+ * false → discovery cannot establish a verdict ("unknown", fail closed).
+ */
+class CapabilityStub {
+  readonly server: ReturnType<typeof Bun.serve>;
+  readonly baseUrl: string;
+  registrationEndpoint = true;
+  metadata = true;
+  constructor() {
+    this.server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => this.handle(req) });
+    this.baseUrl = `http://127.0.0.1:${this.server.port}`;
+  }
+  get mcpUrl(): string {
+    return `${this.baseUrl}/mcp`;
+  }
+  stop(): void {
+    this.server.stop(true);
+  }
+  handle(req: Request): Response {
+    const url = new URL(req.url);
+    const json = (body: Record<string, unknown>, status = 200): Response =>
+      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    if (url.pathname.startsWith("/.well-known/oauth-protected-resource/")) {
+      return json({ resource: this.mcpUrl, authorization_servers: [this.baseUrl], scopes_supported: ["default"] });
+    }
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      if (!this.metadata) return new Response("not found", { status: 404 });
+      return json({
+        issuer: this.baseUrl,
+        authorization_endpoint: `${this.baseUrl}/authorize`,
+        token_endpoint: `${this.baseUrl}/token`,
+        ...(this.registrationEndpoint ? { registration_endpoint: `${this.baseUrl}/register` } : {}),
+        scopes_supported: ["default"],
+        response_types_supported: ["code"],
+        response_modes_supported: ["query"],
+        grant_types_supported: ["authorization_code"],
+        token_endpoint_auth_methods_supported: ["none"],
+        code_challenge_methods_supported: ["S256"],
+      });
+    }
+    return new Response("not found", { status: 404 });
+  }
+}
+
 function registry(): ExtensionRegistry {
   const r = createExtensionRegistry();
   r.register(fixtureManifest());
@@ -113,14 +179,14 @@ interface Harness {
   broker: RecordingBroker;
 }
 
-function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; broker?: RecordingBroker } = {}): Harness {
+function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; broker?: RecordingBroker; registry?: ExtensionRegistry } = {}): Harness {
   const store = freshStore();
   const router = overrides.router ?? new RecordingRouter();
   const broker = overrides.broker ?? new RecordingBroker();
   const policy = overrides.policy ?? defaultPolicy();
   return {
     deps: {
-      registry: registry(),
+      registry: overrides.registry ?? registry(),
       store,
       audit: createAudit(store),
       broker: broker.connect.bind(broker),
@@ -908,64 +974,121 @@ describe("static OAuth client provisioning via the upload link (issue #288)", ()
   }
 
   test("hosted OAuth extensions mint an ORG-scoped static-client link (two-field browser form), and the POST stores the opaque api_key under the synthetic provider key", async () => {
-    const h = makeDeps({ policy: allowedPolicy() });
-    const endpoint = startUploadLinkServer(h.deps);
+    const stub = new CapabilityStub();
+    stub.registrationEndpoint = false; // the Gmail-class no-DCR shape
     try {
-      const minted = await mintUploadLink(
-        { extension: "com.example.oauth", scope: "org", actor: "UADA", spaceId: "slack:C1" },
-        { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
-      );
-      expect(minted.ok).toBe(true);
-      if (!minted.ok) return;
-      expect(minted.mode).toBe("static_client");
-      const url = minted.url;
+      const h = makeDeps({ registry: registryWithOauthAt(stub.mcpUrl), policy: allowedPolicy() });
+      const endpoint = startUploadLinkServer(h.deps);
+      try {
+        const minted = await mintUploadLink(
+          { extension: "com.example.oauth", scope: "org", actor: "UADA", spaceId: "slack:C1" },
+          { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
+        );
+        expect(minted.ok).toBe(true);
+        if (!minted.ok) return;
+        expect(minted.mode).toBe("static_client");
+        const url = minted.url;
 
-      // The form renders TWO separate fields — client ID + client secret —
-      // and never echoes a value.
-      const form = await fetch(url);
-      expect(form.status).toBe(200);
-      const html = await form.text();
-      expect(html).toContain("Example OAuth");
-      expect(html).toContain('name="client_id"');
-      expect(html).toContain('name="client_secret"');
-      expect(html).toContain("PRE-REGISTERED OAuth client");
-      expect(html).not.toContain(STATIC_CLIENT_ID);
-      expect(html).not.toContain(STATIC_CLIENT_SECRET);
+        // The form renders TWO separate fields — client ID + client secret —
+        // and never echoes a value.
+        const form = await fetch(url);
+        expect(form.status).toBe(200);
+        const html = await form.text();
+        expect(html).toContain("Example OAuth");
+        expect(html).toContain('name="client_id"');
+        expect(html).toContain('name="client_secret"');
+        expect(html).toContain("PRE-REGISTERED OAuth client");
+        expect(html).not.toContain(STATIC_CLIENT_ID);
+        expect(html).not.toContain(STATIC_CLIENT_SECRET);
 
-      // POST → the ORG gate → the vault store seam: the broker saw an
-      // OPAQUE api_key under the SYNTHETIC provider key, never the real
-      // extension id (per-user OAuth token rows stay separate).
-      const upload = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
-      expect(upload.status).toBe(200);
-      expect(await upload.text()).toContain("Saved to the vault");
-      expect(h.router.requests).toHaveLength(1);
-      expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
-      expect(h.router.requests[0]!.spaceId).toBe("slack:C1");
-      expect(h.broker.calls).toEqual([
-        {
-          provider: staticOAuthClientProviderKey("com.example.oauth"),
-          credentialType: "api_key",
-          apiKey: expectedOpaqueJson({ client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET }),
-        },
-      ]);
-      // No extension registry row: the static client is deployment state,
-      // not a per-user credential (the same ladder as boot secrets).
-      expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
-      // The audit row carries METADATA ONLY — extension/scope/owner/status,
-      // never the client values.
-      const audit = await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT });
-      expect(audit).toHaveLength(1);
-      expect(JSON.parse(audit[0]!.payload)).toEqual({
-        extension: "com.example.oauth",
-        scope: "org",
-        owner: null,
-        status: "provisioned",
-      });
-      const auditText = JSON.stringify(JSON.parse(audit[0]!.payload));
-      expect(auditText).not.toContain(STATIC_CLIENT_ID);
-      expect(auditText).not.toContain(STATIC_CLIENT_SECRET);
+        // POST → the ORG gate → the vault store seam: the broker saw an
+        // OPAQUE api_key under the SYNTHETIC provider key, never the real
+        // extension id (per-user OAuth token rows stay separate).
+        const upload = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
+        expect(upload.status).toBe(200);
+        expect(await upload.text()).toContain("Saved to the vault");
+        expect(h.router.requests).toHaveLength(1);
+        expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
+        expect(h.router.requests[0]!.spaceId).toBe("slack:C1");
+        expect(h.broker.calls).toEqual([
+          {
+            provider: staticOAuthClientProviderKey("com.example.oauth"),
+            credentialType: "api_key",
+            apiKey: expectedOpaqueJson({ client_id: STATIC_CLIENT_ID, client_secret: STATIC_CLIENT_SECRET }),
+          },
+        ]);
+        // No extension registry row: the static client is deployment state,
+        // not a per-user credential (the same ladder as boot secrets).
+        expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+        // The audit row carries METADATA ONLY — extension/scope/owner/status,
+        // never the client values.
+        const audit = await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT });
+        expect(audit).toHaveLength(1);
+        expect(JSON.parse(audit[0]!.payload)).toEqual({
+          extension: "com.example.oauth",
+          scope: "org",
+          owner: null,
+          status: "provisioned",
+        });
+        const auditText = JSON.stringify(JSON.parse(audit[0]!.payload));
+        expect(auditText).not.toContain(STATIC_CLIENT_ID);
+        expect(auditText).not.toContain(STATIC_CLIENT_SECRET);
+      } finally {
+        endpoint.stop();
+      }
     } finally {
-      endpoint.stop();
+      stub.stop();
+    }
+  });
+
+  test("a DCR-capable hosted OAuth extension REFUSES the static-client mint — the old direct-connect guidance, nothing minted or stored", async () => {
+    const stub = new CapabilityStub(); // registrationEndpoint defaults true
+    try {
+      const h = makeDeps({ registry: registryWithOauthAt(stub.mcpUrl) });
+      const endpoint = startUploadLinkServer(h.deps);
+      try {
+        const outcome = await mintUploadLink(
+          { extension: "com.example.oauth", scope: "org", actor: "UADA" },
+          { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
+        );
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) {
+          // DCR-capable servers keep the pre-#288 guidance: connect directly.
+          expect(outcome.message).toContain("connect it directly");
+          expect(outcome.message).toContain("no secret to upload");
+        }
+        // Nothing minted (no upload token), nothing stored (no vault row).
+        expect(h.store.countActiveUploadTokens("UADA")).toBe(0);
+        expect(h.broker.calls).toHaveLength(0);
+        expect(await h.store.listAudit({ event_type: STATIC_CLIENT_PROVISIONED_EVENT })).toHaveLength(0);
+      } finally {
+        endpoint.stop();
+      }
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("an UNKNOWN dynamic-registration capability (discovery failure) fails closed — no static-client link is minted", async () => {
+    const stub = new CapabilityStub();
+    stub.metadata = false; // the AS metadata 404s → discovery cannot establish no-DCR
+    try {
+      const h = makeDeps({ registry: registryWithOauthAt(stub.mcpUrl) });
+      const endpoint = startUploadLinkServer(h.deps);
+      try {
+        const outcome = await mintUploadLink(
+          { extension: "com.example.oauth", scope: "org", actor: "UADA" },
+          { registry: h.deps.registry, store: endpoint.store, baseUrl: () => endpoint.baseUrl, resolvePublicBase: noPublicBase },
+        );
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) expect(outcome.message).toContain("no secret to upload");
+        expect(h.store.countActiveUploadTokens("UADA")).toBe(0);
+        expect(h.broker.calls).toHaveLength(0);
+      } finally {
+        endpoint.stop();
+      }
+    } finally {
+      stub.stop();
     }
   });
 
@@ -1084,37 +1207,43 @@ describe("static OAuth client provisioning via the upload link (issue #288)", ()
   });
 
   test("the mint reply for a static-client link relays the URL verbatim and names the two fields — no values", async () => {
-    const h = makeDeps();
-    const endpoint = startUploadLinkServer(h.deps);
+    const stub = new CapabilityStub();
+    stub.registrationEndpoint = false; // no-DCR → the static-client link mints
     try {
-      const tool = mintUploadLinkToolDefinition({
-        registry: h.deps.registry,
-        store: endpoint.store,
-        baseUrl: () => endpoint.baseUrl,
-        resolvePublicBase: noPublicBase,
-        getPrincipal: () => "UADA",
-      });
-      const result = await tool.execute(
-        "t1",
-        { extension: "com.example.oauth", scope: "org" },
-        undefined,
-        undefined,
-        // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
-        { sessionManager: { getSessionFile: () => null } } as never,
-      );
-      expect(result.isError).toBeUndefined();
-      // SAFETY: the tool replies with a single text content block carrying the upload URL.
-      const text = (result.content[0] as { text: string }).text;
-      const url = text.split("\n")[0]!;
-      expect(url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
-      // The reply names the two browser fields and never carries values.
-      expect(text).toContain("client ID");
-      expect(text).toContain("client secret");
-      expect(text).not.toContain("static-secret");
-      const token = url.slice(endpoint.baseUrl.length + "/upload/".length);
-      expect(endpoint.store.consume(token).ok).toBe(true);
+      const h = makeDeps({ registry: registryWithOauthAt(stub.mcpUrl) });
+      const endpoint = startUploadLinkServer(h.deps);
+      try {
+        const tool = mintUploadLinkToolDefinition({
+          registry: h.deps.registry,
+          store: endpoint.store,
+          baseUrl: () => endpoint.baseUrl,
+          resolvePublicBase: noPublicBase,
+          getPrincipal: () => "UADA",
+        });
+        const result = await tool.execute(
+          "t1",
+          { extension: "com.example.oauth", scope: "org" },
+          undefined,
+          undefined,
+          // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
+          { sessionManager: { getSessionFile: () => null } } as never,
+        );
+        expect(result.isError).toBeUndefined();
+        // SAFETY: the tool replies with a single text content block carrying the upload URL.
+        const text = (result.content[0] as { text: string }).text;
+        const url = text.split("\n")[0]!;
+        expect(url.startsWith(`${endpoint.baseUrl}/upload/`)).toBe(true);
+        // The reply names the two browser fields and never carries values.
+        expect(text).toContain("client ID");
+        expect(text).toContain("client secret");
+        expect(text).not.toContain("static-secret");
+        const token = url.slice(endpoint.baseUrl.length + "/upload/".length);
+        expect(endpoint.store.consume(token).ok).toBe(true);
+      } finally {
+        endpoint.stop();
+      }
     } finally {
-      endpoint.stop();
+      stub.stop();
     }
   });
 

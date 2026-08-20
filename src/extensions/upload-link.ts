@@ -42,6 +42,7 @@ import type { ExtensionRegistry } from "./registry";
 import { connectExtension, storeBootSecret, type ConnectExtensionDeps, type ConnectScope } from "./connect";
 import { bootSecretForProvider } from "../server/boot-secrets";
 import { callbackPort } from "./oauth-callback";
+import { resolveMcpOAuthRegistrationCapability } from "./mcp-oauth";
 import {
   createStaticOAuthClientStore,
   provisionStaticOAuthClient,
@@ -332,23 +333,52 @@ export async function mintUploadLink(
     return { ok: false, message: `unknown extension "${input.extension}" — register it before connecting` };
   }
   const label = boot?.label ?? resolved!.manifest.label;
-  // Issue #288: a HOSTED OAuth MCP mints a static-client provisioning link
-  // (org scope; two browser fields). Every other OAuth shape (stdio,
-  // broker-login) has no upload surface at all.
-  const staticClientMode = boot === undefined && isHostedOAuthMcp(resolved!.manifest);
-  if (boot === undefined && resolved!.manifest.credentialSchema.type !== "api_key" && !staticClientMode) {
+  // Issue #288: a HOSTED OAuth MCP can mint a static-client provisioning
+  // link (org scope; two browser fields) ONLY when its authorization
+  // server's discovered metadata actually LACKS a usable registration
+  // endpoint. The capability verdict comes from the SAME typed discovery
+  // seam the connect uses — never a provider flag. DCR-capable servers
+  // keep the old refusal (connect directly, nothing minted or stored), and
+  // an UNKNOWN verdict fails closed: a static-client link is only minted
+  // when no-DCR is established.
+  const staticClientCandidate = boot === undefined && isHostedOAuthMcp(resolved!.manifest);
+  if (boot === undefined && resolved!.manifest.credentialSchema.type !== "api_key" && !staticClientCandidate) {
     return {
       ok: false,
       message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
     };
   }
-  if (staticClientMode && input.scope !== "org") {
+  if (staticClientCandidate && input.scope !== "org") {
     return {
       ok: false,
       message:
         `${label} connects via OAuth — its static client provisioning is org-scoped: request ` +
         `connect_upload_link extension=${input.extension} scope=org`,
     };
+  }
+  let staticClientMode = false;
+  if (staticClientCandidate) {
+    const serverUrl = resolved!.manifest.mcp?.serverUrl;
+    // Fail closed: a hosted OAuth MCP manifest without a server URL is
+    // malformed — never mint a link for it.
+    if (serverUrl === undefined) {
+      return {
+        ok: false,
+        message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
+      };
+    }
+    const capability = await resolveMcpOAuthRegistrationCapability(serverUrl);
+    if (capability === "no-dcr") {
+      staticClientMode = true;
+    } else {
+      // DCR-capable (register dynamically, connect directly) or UNKNOWN
+      // (cannot establish no-DCR → fail closed): the old refusal, nothing
+      // minted, nothing stored.
+      return {
+        ok: false,
+        message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
+      };
+    }
   }
   // Issue #211: the public base is HEALTH-CHECKED at mint time — a quick
   // tunnel rotates, so the env value goes stale between boots. A reachable
@@ -439,8 +469,11 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
     description:
       `Mints a single-use, expiring HTTPS link for an api_key-type extension. ` +
       `The user opens the link in a browser and pastes the secret there; the server stores it DIRECTLY ` +
-      `into the vault — never through chat, this tool, or a transcript. OAuth extensions have no secret ` +
-      `to upload and should be connected directly. ` +
+      `into the vault — never through chat, this tool, or a transcript. ` +
+      `Hosted OAuth MCPs whose authorization server has NO dynamic client registration (e.g. ` +
+      `gmail-googleapis-com) mint an ORG-SCOPED static-client link instead: the browser form asks for the ` +
+      `pre-registered OAuth client ID and client secret (scope org required). Every other OAuth extension ` +
+      `has no secret to upload — connect it directly. ` +
       `Boot secrets (issue #201) mint the same way by their provider id: the Slack tokens ` +
       `(slack-app / slack-bot), the model provider keys (opencode / near / openai / anthropic), ` +
       `and the GitHub webhook shared secret (github-webhook — issue #57) ` +
