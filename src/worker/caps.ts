@@ -15,7 +15,7 @@ export interface JobCapKnob {
 }
 
 /** Raw org override shape — only the kinds an org may tune. */
-export type OrgCapKind = "git" | "extension" | "kb" | "ingest_poll";
+export type OrgCapKind = "git" | "extension" | "kb" | "ingest_poll" | "scheduled";
 
 export type OrgJobCaps = Partial<Record<OrgCapKind, Partial<JobCapKnob>>>;
 
@@ -31,6 +31,10 @@ const DEFAULT_CAPS: Record<OrgCapKind, JobCapKnob> = {
   extension: { timeoutMinutes: 15, memoryMb: 512 },
   kb: { timeoutMinutes: 30, memoryMb: 256 },
   ingest_poll: { timeoutMinutes: 10, memoryMb: 128 },
+  // Issue #272: scheduled jobs run an LLM leg (memory consolidation) — the
+  // per-pool model call is the long pole, so the ceiling is a memory-heavy
+  // 30-minute window, never the git fallback.
+  scheduled: { timeoutMinutes: 30, memoryMb: 512 },
 };
 
 /**

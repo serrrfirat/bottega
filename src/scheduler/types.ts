@@ -14,6 +14,7 @@
 import type { Store } from "../store/db";
 import type { AuditModule } from "../policy/audit";
 import type { MemoryProvider } from "../memory/types";
+import type { ConsolidationModelCall } from "../memory/consolidation";
 import type { PolicyConfig } from "../policy/config";
 
 /**
@@ -28,7 +29,8 @@ export type SchedulerActionName =
   | "recurring_work"
   | "ingest_poll"
   | "kb_ingest"
-  | "send_message";
+  | "send_message"
+  | "memory_consolidation";
 
 /**
  * A durable scheduler job (issue #86). Stored in the `scheduler_jobs`
@@ -70,12 +72,25 @@ export interface SchedulerActionContext {
   log: (line: string) => void;
   /** Injectable clock (ms epoch) for hermetic time-skipping tests. */
   now: () => number;
+  /**
+   * The consolidation model-call seam (issue #272): how a
+   * `memory_consolidation` scheduled job drives the LLM leg. Present ONLY
+   * in the executor job context — the server never wires it (the server
+   * enqueues the job instead of running side sessions). Actions that need
+   * it fail loudly when absent.
+   */
+  consolidationModelCall?: ConsolidationModelCall;
 }
 
-/** One registered scheduled action. `run` must never throw past the runner's audit. */
+/**
+ * One registered scheduled action. `run` must never throw past the runner's
+ * audit. The return value is the worker dispatch's outbox result (issue
+ * #272): in-process scheduler actions ignore it; the executor job body
+ * serializes it into the completion outbox row + audit.
+ */
 export interface SchedulerAction {
   name: SchedulerActionName;
-  run(params: Record<string, string>, ctx: SchedulerActionContext): Promise<void>;
+  run(params: Record<string, string>, ctx: SchedulerActionContext): Promise<void | unknown>;
 }
 
 /** Action registry: name → handler. Unknown names fail closed. */

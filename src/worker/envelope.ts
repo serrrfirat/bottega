@@ -52,8 +52,20 @@ export const workItemJobPayloadSchema = z.object({ workItemId: z.string() });
  */
 export const kbJobPayloadSchema = z.object({ url: z.string() }).passthrough();
 
-/** The scheduled envelope payload (future dispatchers, Wave 2+). */
-export const scheduledJobPayloadSchema = z.object({ action: z.string() }).passthrough();
+/**
+ * The scheduled envelope payload (issue #272, epic #229 P2): the
+ * dispatcher's action dispatch. `action` names a handler in the executor's
+ * scheduled-action registry (unknown names fail the job LOUDLY, never a
+ * silent no-op); `params` are the action's own arguments, mirroring the
+ * scheduler job row's params so the same handler shape runs in the worker.
+ * Parsed strictly enough to fail closed on a malformed dispatch.
+ */
+export const scheduledJobPayloadSchema = z
+  .object({
+    action: z.string().min(1),
+    params: z.record(z.string(), z.string()).optional().default({}),
+  })
+  .passthrough();
 
 /**
  * The ingest_poll envelope payload (issue #101): the polling leg split —

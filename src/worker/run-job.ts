@@ -31,7 +31,8 @@ import type { Store } from "../store/db";
 import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
 import { postOutboxRow } from "../store/outbox";
 import { createAudit, type AuditModule } from "../policy/audit";
-import { workItemJobPayloadSchema, type WorkerJob } from "./envelope";
+import type { SchedulerActionName } from "../scheduler/types";
+import { scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import { resolveKindCaps, type JobResourceCaps } from "./caps";
 
@@ -68,15 +69,21 @@ export function capsFor(kind: WorkerJob["kind"], store: Store): JobResourceCaps 
 
 /**
  * The runner the boss loop is handed when none was injected: executes the
- * job through {@link runJobSandboxBody} — the SAME body the child process
- * entrypoint runs — with the store RE-WIRED to the job-scoped facade, so
- * the whole run (processItem's internal transitions included) writes like
- * the production child (which constructs its own deps.store as the facade).
+ * job through the per-kind body — {@link runJobSandboxBody} for the
+ * work-item kinds, {@link runScheduledJobBody} for the scheduled kind (the
+ * runner's DISPATCH MODE, issue #272) — with the store RE-WIRED to the
+ * job-scoped facade, so the whole run writes like the production child
+ * (which constructs its own deps.store as the facade).
  */
 export function inProcessSandboxRunner(): SandboxRunner {
   return async (job, ctx) => {
-    const deps: ExecutorDeps = { ...ctx.deps, store: createJobScopedStore(ctx.deps.store, jobScopeFromEnvelope(job)) };
-    return runJobSandboxBody(deps, ctx.cfg, ctx.caps, job);
+    const deps: ExecutorDeps = {
+      ...ctx.deps,
+      store: createJobScopedStore(ctx.deps.store, jobScopeFromEnvelope(job)),
+    };
+    return job.kind === "scheduled"
+      ? runScheduledJobBody(deps, ctx.cfg, ctx.caps, job)
+      : runJobSandboxBody(deps, ctx.cfg, ctx.caps, job);
   };
 }
 
@@ -134,6 +141,80 @@ export async function runJobSandboxBody(
     // Loud self-fail: the sandbox owns its failure — job.failed audit +
     // the item lands blocked (never stuck at working).
     await failSelf(store, audit, job, workItemId, err);
+    return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
+  }
+}
+
+/**
+ * One scheduled job's isolated run body (issue #272, epic #229 P2): the
+ * dispatcher-dispatch leg. Re-derives the scope from the envelope id (fail
+ * closed: the facade permits ONLY this job's rows), resolves the named
+ * action in the executor's scheduled-action registry (an unknown action
+ * fails LOUDLY naming it — never a silent no-op), runs it against the
+ * job-scoped store facade with the model-call seam from the job context,
+ * and writes ITS OWN terminal lifecycle (completeJob + own outbox row +
+ * audit) through the scoped facade. The action's return value rides the
+ * completion outbox row + audit as the result. Worker actions never post to
+ * Slack — the outbox seam is the post path — and have no policy context.
+ */
+export async function runScheduledJobBody(
+  deps: ExecutorDeps,
+  _cfg: ExecutorConfig,
+  _caps: JobResourceCaps,
+  job: WorkerJob,
+): Promise<SandboxResult> {
+  const scope = jobScopeFromEnvelope(job);
+  const store = createJobScopedStore(deps.store, scope);
+  const audit = createAudit(store);
+
+  const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
+  if (!parsed.success) {
+    // Malformed envelope → loud crash (parent fails the job).
+    throw new Error(
+      `job ${job.id} (scheduled) payload must be { action, ... } — failing closed: ${parsed.error.message}`,
+    );
+  }
+  const { action: actionName, params } = parsed.data;
+  // The envelope action is an arbitrary string; the registry is keyed by the
+  // statically known names. A name outside the union simply misses the map —
+  // the loud unknown-action failure below is the fail-closed gate.
+  const action = deps.scheduledActions?.get(actionName as SchedulerActionName);
+  if (!action) {
+    throw new Error(`scheduled job ${job.id} failed: unknown action "${actionName}" — no silent no-op`);
+  }
+
+  try {
+    const result = await action.run(params, {
+      store,
+      audit,
+      memoryProvider: deps.memoryProvider,
+      postMessage: () => {
+        throw new Error(
+          `scheduled action ${actionName} attempted to post to Slack — the worker holds no tokens; the outbox seam is the post path`,
+        );
+      },
+      loadPolicy: async () => {
+        throw new Error(`scheduled action ${actionName} has no policy context in the worker`);
+      },
+      log: (line) => console.log(`[${job.id}] ${line}`),
+      now: Date.now,
+      consolidationModelCall: deps.consolidationModelCall,
+    });
+    await completeSelf(store, audit, job, { state: "completed", result: result ?? null });
+    return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
+  } catch (err) {
+    // Loud self-fail: the action body owns its failure — job.failed audit,
+    // no outbox row (the job bus surfaces the failure).
+    const message = err instanceof Error ? err.message : String(err);
+    await store.failJob(job.id);
+    await audit.appendAudit({
+      ts: Date.now(),
+      space_id: job.spaceId ?? null,
+      actor: "executor",
+      event_type: JOB_FAILED_EVENT,
+      payload: JSON.stringify({ id: job.id, kind: job.kind, error: message.slice(0, 2000) }),
+    });
+    console.log(`[${job.id}] scheduled job failed (${actionName}): ${message}`);
     return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
   }
 }

@@ -410,7 +410,7 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       const parsed: OrgJobCaps = {};
       let sectionOk = true;
       for (const [kind, raw] of Object.entries(section.data)) {
-        if (kind !== "git" && kind !== "extension" && kind !== "kb" && kind !== "ingest_poll") {
+        if (kind !== "git" && kind !== "extension" && kind !== "kb" && kind !== "ingest_poll" && kind !== "scheduled") {
           sectionOk = false;
           fail(`caps.${kind}: unknown kind`);
           continue;

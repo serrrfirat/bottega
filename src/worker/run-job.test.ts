@@ -85,6 +85,12 @@ describe("job-scoped store facade (issue #101)", () => {
       workItemId: null,
     });
     expect(jobScopeFromEnvelope({ ...git, kind: "kb", payload: {} })).toEqual({ jobId: "job_1", workItemId: null });
+    // Scheduled jobs (issue #272) own no store work item — the facade's
+    // work-item guards are inert, and the job row guard is the firewall.
+    expect(jobScopeFromEnvelope({ ...git, kind: "scheduled", payload: { action: "memory_consolidation" } })).toEqual({
+      jobId: "job_1",
+      workItemId: null,
+    });
   });
 });
 
@@ -124,9 +130,12 @@ describe("resource caps (issue #101)", () => {
     });
     // ...but floors hold: below-minimum values fall back to the default.
     expect(resolveKindCaps("git", { git: { timeoutMinutes: 0, memoryMb: 8 } })).toEqual(git);
-    // The extension default is 15m / 512MB; unknown kinds resolve to git's caps.
+    // The extension default is 15m / 512MB; the scheduled kind (issue #272)
+    // has its own caps entry — never the git fallback.
     expect(resolveKindCaps("extension", null).timeoutMs).toBe(15 * 60_000);
-    expect(resolveKindCaps("scheduled", null)).toEqual(git);
+    expect(resolveKindCaps("scheduled", null)).toEqual({ timeoutMs: 30 * 60_000, memoryMb: 512 });
+    // Unknown kinds still resolve to git's caps.
+    expect(resolveKindCaps("no_such_kind", null)).toEqual(git);
   });
 });
 

@@ -64,13 +64,17 @@ import {
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
 import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
-import { runJobInSandbox, type SandboxRunner } from "./worker/run-job";
+import { inProcessSandboxRunner, runJobInSandbox, type SandboxRunner } from "./worker/run-job";
 import type { Poller } from "./ingest/types";
 import { getWatermarkedPoller } from "./ingest/registry";
 import { createAudit } from "./policy/audit";
 import { loadKbConfig } from "./kb/config";
 import { ingestSource } from "./kb/ingest";
 import type { MemoryProvider } from "./memory/types";
+import type { ConsolidationModelCall } from "./memory/consolidation";
+import { buildRegistry } from "./scheduler/actions";
+import { memoryConsolidationAction } from "./scheduler/memory-consolidation";
+import type { SchedulerActionRegistry } from "./scheduler/types";
 import { DenyRouter } from "./policy/approval-router";
 import {
   assertAgentDirModelAvailable,
@@ -244,6 +248,22 @@ export interface ExecutorDeps {
    * registry with a durable ingest watermark. Tests inject fakes.
    */
   ingestPollers?: Record<string, () => Poller>;
+  /**
+   * The scheduled-action registry the `scheduled` job kind dispatches
+   * through (issue #272, epic #229 P2). Defaults to the executor's own
+   * registry of worker-runnable actions (memory_consolidation). An action
+   * absent from the registry fails its job LOUDLY naming it — never a
+   * silent no-op. Tests inject custom/empty registries.
+   */
+  scheduledActions?: SchedulerActionRegistry;
+  /**
+   * The consolidation model-call seam (issue #272): how a
+   * `memory_consolidation` scheduled job drives the LLM leg. Defaults to a
+   * side session over the executor's driver — the model call runs in the
+   * WORKER process, never the server (the server only enqueues the job).
+   * Tests stub it.
+   */
+  consolidationModelCall?: ConsolidationModelCall;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -568,9 +588,65 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
       if (!parsed.success) {
         throw new Error(`scheduled job payload must be { action, ... } — failing closed: ${parsed.error.message}`);
       }
-      throw new Error("scheduled job kind is not implemented yet (epic #170 Wave 2) — failing closed");
+      // Issue #272 (epic #229 P2): the scheduled kind dispatches to the
+      // executor's action registry under the job-scoped sandbox runner. The
+      // model-call seam (memory consolidation's LLM leg) rides the job
+      // context — it runs HERE, never in the server process. The default
+      // registry holds the worker-runnable actions (memory_consolidation);
+      // pure scheduler actions stay in-process in the server.
+      const scheduledDeps: ExecutorDeps = {
+        ...deps,
+        scheduledActions: deps.scheduledActions ?? buildRegistry([memoryConsolidationAction()]),
+        consolidationModelCall: deps.consolidationModelCall ?? defaultConsolidationModelCall(deps.driver),
+      };
+      return runJobInSandbox(scheduledDeps, cfg, job, deps.sandboxRunner ?? inProcessSandboxRunner());
     }
   }
+}
+
+/**
+ * The default consolidation model call (issue #272): a driver side session
+ * with no tools — the same shape the server used before the move, but bound
+ * to the EXECUTOR's driver so the LLM leg runs in the worker process. The
+ * driver resolves lazily on first call. Tests stub the seam instead.
+ */
+function defaultConsolidationModelCall(driver: AgentDriver | Promise<AgentDriver>): ConsolidationModelCall {
+  let consolidationSequence = 0;
+  return async (systemPrompt, input) => {
+    const resolved = await driver;
+    let reply: string | undefined;
+    let sideSession: AgentSessionDriver | undefined;
+    let offMessage: (() => void) | undefined;
+    try {
+      sideSession = await resolved.createSession({
+        spaceId: `memory-consolidation:${++consolidationSequence}`,
+        transcriptDir: "data/memory-consolidation",
+        allowTools: [],
+        appendSystemPrompt: systemPrompt,
+        onOutput: (_spaceId, text) => {
+          if (text.trim()) reply = text;
+        },
+      });
+      offMessage = sideSession.on("message", (data) => {
+        // The driver emits { spaceId, text } payloads; parse at the event
+        // boundary so only string text is captured (defensive against other
+        // message shapes).
+        const text = z.object({ text: z.string().optional() }).safeParse(data);
+        if (text.success && text.data.text && text.data.text.trim()) reply = text.data.text;
+      });
+      await sideSession.prompt(input);
+      return reply;
+    } finally {
+      offMessage?.();
+      if (sideSession) {
+        try {
+          await sideSession.dispose();
+        } catch (error) {
+          console.error("[memory-consolidation] side-session dispose failed:", error);
+        }
+      }
+    }
+  };
 }
 
 /**
