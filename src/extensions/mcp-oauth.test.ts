@@ -37,6 +37,7 @@ import {
   createMcpOAuthConnector,
   createRuntimeMcpOAuthProvider,
   OAuthFlowStore,
+  resolveMcpOAuthRegistrationCapability,
   startMcpOAuthFlow,
   tokensToVaultCredential,
   vaultCredentialToTokens,
@@ -2096,6 +2097,25 @@ describe("issue #288 — static OAuth clients for no-DCR authorization servers",
       expect(stub.state.registerCalls).toBe(0);
     } finally {
       stub.stop();
+    }
+  });
+});
+
+describe("issue #288 — the mint's capability discovery is bounded (P2 review)", () => {
+  test("a never-responding authorization server maps the capability check to UNKNOWN within the injected timeout — never an OS-level hang", async () => {
+    // A server that ACCEPTS the connection but never responds: the mint's
+    // discovery fetch must abort at the bounded timeout, not hang until the
+    // OS-level fetch timeout. The timeout is injected (150ms) so the test
+    // completes in milliseconds — production uses the 5s probe constant.
+    const hanging = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Promise<Response>(() => {}) });
+    try {
+      const started = Date.now();
+      const capability = await resolveMcpOAuthRegistrationCapability(`http://127.0.0.1:${hanging.port}/mcp`, 150);
+      const elapsed = Date.now() - started;
+      expect(capability).toBe("unknown"); // fail closed: no no-DCR verdict, no mint
+      expect(elapsed).toBeLessThan(3_000); // far below an OS-level timeout
+    } finally {
+      hanging.stop(true);
     }
   });
 });

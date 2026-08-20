@@ -706,10 +706,27 @@ export function registrationCapabilityFromMetadata(registrationEndpoint: unknown
  * nothing (a static-client link is only minted when no-DCR is actually
  * established; a DCR-capable server is never refused a direct connect over
  * a hiccuped probe).
+ *
+ * Bounded by the connect's own probe convention (issue #271,
+ * {@link MCP_OAUTH_BASE_PROBE_TIMEOUT_MS}): the mint's discovery must never
+ * hang on a never-responding authorization server — the abort/transport
+ * failure maps to `"unknown"` (fail closed, no token minted). `timeoutMs`
+ * is the ONLY injection point (tests shrink it; production uses the 5s
+ * constant — no new configurable default).
  */
-export async function resolveMcpOAuthRegistrationCapability(serverUrl: string): Promise<McpOAuthRegistrationCapability> {
+export async function resolveMcpOAuthRegistrationCapability(
+  serverUrl: string,
+  timeoutMs: number = MCP_OAUTH_BASE_PROBE_TIMEOUT_MS,
+): Promise<McpOAuthRegistrationCapability> {
   try {
-    const info = await discoverOAuthServerInfo(serverUrl);
+    const info = await discoverOAuthServerInfo(serverUrl, {
+      // Abort the discovery fetch after the bound; a hanging server then
+      // REJECTS and maps to "unknown" below. The arrow is exactly the
+      // SDK's FetchLike signature — no Bun-specific members needed.
+      fetchFn: async (input: string | URL, init?: RequestInit): Promise<Response> => {
+        return fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      },
+    });
     if (info.authorizationServerMetadata === undefined) return "unknown";
     return registrationCapabilityFromMetadata(info.authorizationServerMetadata.registration_endpoint);
   } catch {
