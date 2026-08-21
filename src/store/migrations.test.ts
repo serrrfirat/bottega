@@ -7,7 +7,7 @@ import { createStore } from "./db";
 import { MIGRATIONS, runMigrations, type Migration } from "./migrations";
 
 const dirs: string[] = [];
-const EXPECTED_MIGRATION_IDS = [
+const EXPECTED_MIGRATION_IDS: string[] = [
   "001_create_latest_schema",
   "002_add_work_items_repo",
   "003_add_work_items_delivery",

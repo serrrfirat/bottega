@@ -31,7 +31,7 @@ const PolicyOverlaySchema = z.object({
   extensions: z.unknown().optional(),
 });
 
-interface AuditSearchPayload {
+type AuditSearchPayload = {
   space: string;
   limit: number;
   event?: string;

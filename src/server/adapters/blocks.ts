@@ -7,10 +7,10 @@
  * postMessage`'s `opts.blocks` and the approval router (approval-router.ts
  * buildApprovalBlocks) already use; no adapter dependency is introduced.
  */
-export interface SlackBlock {
+export type SlackBlock = {
   type: string;
   text?: { type: "mrkdwn" | "plain_text"; text: string };
-}
+};
 
 /** How many table rows render before the remainder is elided into a count note. */
 export const TABLE_ROW_CAP = 12;

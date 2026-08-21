@@ -579,7 +579,7 @@ describe("upload link minting (issue #196)", () => {
 
       const result = await tool.execute(
         "t1",
-        { extension: "fixture.weather", scope: "personal" },
+        { extension: "fixture.weather", scope: "personal", connection_id: undefined, expected_revision: undefined },
         undefined,
         undefined,
         // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
@@ -630,7 +630,7 @@ describe("upload link minting (issue #196)", () => {
         });
         const result = await tool.execute(
           "t1",
-          { extension: "fixture.weather", scope: "personal" },
+          { extension: "fixture.weather", scope: "personal", connection_id: undefined, expected_revision: undefined },
           undefined,
           undefined,
           // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
@@ -890,7 +890,7 @@ describe("upload link public base liveness (issue #211)", () => {
         });
         const result = await tool.execute(
           "t1",
-          { extension: "fixture.weather", scope: "personal" },
+          { extension: "fixture.weather", scope: "personal", connection_id: undefined, expected_revision: undefined },
           undefined,
           undefined,
           // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.
@@ -1286,7 +1286,7 @@ describe("static OAuth client provisioning via the upload link (issue #288)", ()
         });
         const result = await tool.execute(
           "t1",
-          { extension: "com.example.oauth", scope: "org" },
+          { extension: "com.example.oauth", scope: "org", connection_id: undefined, expected_revision: undefined },
           undefined,
           undefined,
           // SAFETY: the upload-link tool never reads the execute context; a minimal sessionManager fake satisfies the arity.

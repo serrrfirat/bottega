@@ -4,7 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext, ToolDefinition, zod } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import { createAudit } from "../policy/audit";
 import { MAX_COMPANION_FILE_BYTES, type SkillsResolveOpts } from "../server/skills";
@@ -127,15 +127,18 @@ describe("space-skill lifecycle tools", () => {
     expect(byName.list_space_skills?.approval).toBe("read");
     expect(byName.get_space_skill?.approval).toBe("read");
 
+    // SAFETY: the tool parameters are built from z.object schemas, so the
+    // TSchema-typed field is an omptype ZodLikeSchema at runtime.
+    const createParams = byName.create_space_skill?.parameters as zod.ZodLikeSchema<unknown>;
     expect(
-      byName.create_space_skill?.parameters.safeParse({
+      createParams.safeParse({
         name: "review",
         document: DOC_V1,
         companion_files: { "../outside": { encoding: "text", content: "bad" } },
       }).success,
     ).toBe(false);
     expect(
-      byName.create_space_skill?.parameters.safeParse({
+      createParams.safeParse({
         name: "review",
         document: DOC_V1,
         companion_files: { "data.bin": { encoding: "base64", content: "A".repeat(Math.ceil(MAX_COMPANION_FILE_BYTES / 3) * 4 + 1) } },
@@ -143,7 +146,7 @@ describe("space-skill lifecycle tools", () => {
     ).toBe(false);
     const cappedChunk = "x".repeat(MAX_COMPANION_FILE_BYTES);
     expect(
-      byName.create_space_skill?.parameters.safeParse({
+      createParams.safeParse({
         name: "review",
         document: DOC_V1,
         companion_files: {

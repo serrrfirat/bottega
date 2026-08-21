@@ -273,7 +273,9 @@ describe("scheduled worker job kind (issue #272)", () => {
           await tryOp("enqueue", () => ctx.store.enqueueJob({ id: "j2", kind: "git", payload: {} }));
           await tryOp("workItem", () => ctx.store.getWorkItem("w_other"));
           await tryOp("listWorkItems", () => ctx.store.listWorkItems());
-          return out;
+          // SchedulerActionResult is void | ConsolidationResult[]; the probe's
+          // findings ride the audit instead of the action result.
+          await ctx.store.appendAudit({ actor: "probe", event_type: "probe.scope", payload: JSON.stringify(out) });
         },
       };
       const registry: SchedulerActionRegistry = buildRegistry([probe]);
@@ -287,14 +289,10 @@ describe("scheduled worker job kind (issue #272)", () => {
       await runLoopUntil(fx, "mc_scope_1", "completed", makeDeps(fx, { scheduledActions: registry }));
       await waitForJobAudit(fx.store, JOB_COMPLETED_EVENT, "mc_scope_1");
 
-      const raw = fx.store.getDb().query("SELECT payload FROM outbox WHERE id = 'mc_scope_1'").get() as {
-        payload: string;
-      };
-      // SAFETY: the outbox payload is the scheduled body's JSON
-      // serialization of the action's return value.
-      const payload = JSON.parse(raw.payload) as { state: string; result: Record<string, string> };
-      expect(payload.state).toBe("completed");
-      expect(payload.result).toEqual({
+      const probes = await fx.store.listAudit({ event_type: "probe.scope" });
+      expect(probes).toHaveLength(1);
+      // SAFETY: the probe wrote its own JSON payload through appendAudit.
+      expect(JSON.parse(probes[0]!.payload)).toEqual({
         ownJobWrite: "allowed",
         foreignJob: "denied",
         enqueue: "denied",

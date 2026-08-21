@@ -128,9 +128,11 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
   async function call(actor: string, name: string, args: LifecycleToolArgs) {
     const tool = tools(actor).get(name);
     if (!tool) throw new Error(`missing tool ${name}`);
+    // SAFETY: the lifecycle tools only read ctx.sessionManager.getSessionFile();
+    // a minimal fake satisfies the ExtensionContext arity.
     return tool.execute("call", args, undefined, undefined, {
       sessionManager: { getSessionFile: () => "slack:C1.jsonl" },
-    });
+    } as never);
   }
 
   return { store, authority, boundary, registry, seed, call };

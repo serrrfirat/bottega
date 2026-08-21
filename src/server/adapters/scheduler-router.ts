@@ -17,7 +17,7 @@ import {
   type SlackAdapter,
 } from "./slack";
 
-interface SchedulerButton {
+type SchedulerButton = {
   type: "button";
   text: { type: "plain_text"; text: string };
   action_id: string;
@@ -25,7 +25,7 @@ interface SchedulerButton {
   style?: "primary" | "danger";
 }
 
-export interface SchedulerBlock {
+export type SchedulerBlock = {
   type: "header" | "section" | "actions" | "divider";
   text?: { type: "plain_text" | "mrkdwn"; text: string };
   elements?: SchedulerButton[];

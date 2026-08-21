@@ -139,7 +139,7 @@ function identityLabel(identityKey: string): string {
   return "connected account";
 }
 
-function toConnectionReadModel(connection: ExtensionCredential, registry: ExtensionRegistry): ConnectionReadModel {
+function toConnectionReadModel(connection: ExtensionCredential, registry: Pick<ExtensionRegistry, "resolve">): ConnectionReadModel {
   return {
     id: connection.id,
     provider: connection.provider,
@@ -522,69 +522,68 @@ export function connectionLifecycleToolDefinitions(deps: ConnectionLifecycleTool
   const actor = () => deps.getPrincipal?.() ?? deps.defaultActor ?? "agent";
   const spaceId = (ctx: { sessionManager: { getSessionFile(): string | null | undefined } }) =>
     deps.spaceIdFromFile?.(ctx.sessionManager.getSessionFile());
-  return [
-    {
-      name: LIST_CONNECTIONS_TOOL,
-      label: "List connections",
-      description: "Lists the caller-visible extension connections. Returns metadata only; never credentials or tokens.",
-      parameters: EMPTY_PARAMS,
-      approval: "read",
-      async execute(_id, _params, _signal, _update, ctx) {
-        const outcome = await listConnections({ actor: actor(), spaceId: spaceId(ctx) }, deps);
-        return { content: [{ type: "text", text: outcome.message }] };
-      },
+  const list: ToolDefinition<typeof EMPTY_PARAMS> = {
+    name: LIST_CONNECTIONS_TOOL,
+    label: "List connections",
+    description: "Lists the caller-visible extension connections. Returns metadata only; never credentials or tokens.",
+    parameters: EMPTY_PARAMS,
+    approval: "read",
+    async execute(_id, _params, _signal, _update, ctx) {
+      const outcome = await listConnections({ actor: actor(), spaceId: spaceId(ctx) }, deps);
+      return { content: [{ type: "text", text: outcome.message }] };
     },
-    {
-      name: INSPECT_CONNECTION_TOOL,
-      label: "Inspect connection",
-      description: "Inspects one caller-visible stable connection id. Returns redacted metadata only.",
-      parameters: TARGET_PARAMS,
-      approval: "read",
-      async execute(_id, params, _signal, _update, ctx) {
-        const outcome = await inspectConnection(
-          { connectionId: params.connection_id, actor: actor(), spaceId: spaceId(ctx) },
-          deps,
-        );
-        return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
-      },
+  };
+  const inspect: ToolDefinition<typeof TARGET_PARAMS> = {
+    name: INSPECT_CONNECTION_TOOL,
+    label: "Inspect connection",
+    description: "Inspects one caller-visible stable connection id. Returns redacted metadata only.",
+    parameters: TARGET_PARAMS,
+    approval: "read",
+    async execute(_id, params, _signal, _update, ctx) {
+      const outcome = await inspectConnection(
+        { connectionId: params.connection_id, actor: actor(), spaceId: spaceId(ctx) },
+        deps,
+      );
+      return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
     },
-    {
-      name: REPLACE_CONNECTION_TOOL,
-      label: "Replace connection",
-      description: "Replaces exactly one stable connection using expected-revision compare-and-swap. Organization changes require approval.",
-      parameters: MUTATION_PARAMS,
-      approval: "exec",
-      async execute(_id, params, _signal, _update, ctx) {
-        const outcome = await replaceConnection(
-          {
-            connectionId: params.connection_id,
-            expectedRevision: params.expected_revision,
-            actor: actor(),
-            spaceId: spaceId(ctx),
-          },
-          deps,
-        );
-        return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
-      },
+  };
+  const replace: ToolDefinition<typeof MUTATION_PARAMS> = {
+    name: REPLACE_CONNECTION_TOOL,
+    label: "Replace connection",
+    description: "Replaces exactly one stable connection using expected-revision compare-and-swap. Organization changes require approval.",
+    parameters: MUTATION_PARAMS,
+    approval: "exec",
+    async execute(_id, params, _signal, _update, ctx) {
+      const outcome = await replaceConnection(
+        {
+          connectionId: params.connection_id,
+          expectedRevision: params.expected_revision,
+          actor: actor(),
+          spaceId: spaceId(ctx),
+        },
+        deps,
+      );
+      return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
     },
-    {
-      name: DISCONNECT_CONNECTION_TOOL,
-      label: "Disconnect connection",
-      description: "Immediately denies and durably disconnects exactly one stable connection. Safe to retry after partial failure.",
-      parameters: MUTATION_PARAMS,
-      approval: "exec",
-      async execute(_id, params, _signal, _update, ctx) {
-        const outcome = await disconnectConnection(
-          {
-            connectionId: params.connection_id,
-            expectedRevision: params.expected_revision,
-            actor: actor(),
-            spaceId: spaceId(ctx),
-          },
-          deps,
-        );
-        return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
-      },
+  };
+  const disconnect: ToolDefinition<typeof MUTATION_PARAMS> = {
+    name: DISCONNECT_CONNECTION_TOOL,
+    label: "Disconnect connection",
+    description: "Immediately denies and durably disconnects exactly one stable connection. Safe to retry after partial failure.",
+    parameters: MUTATION_PARAMS,
+    approval: "exec",
+    async execute(_id, params, _signal, _update, ctx) {
+      const outcome = await disconnectConnection(
+        {
+          connectionId: params.connection_id,
+          expectedRevision: params.expected_revision,
+          actor: actor(),
+          spaceId: spaceId(ctx),
+        },
+        deps,
+      );
+      return outcome.ok ? { content: [{ type: "text", text: outcome.message }] } : toolError(outcome.message);
     },
-  ];
+  };
+  return [list, inspect, replace, disconnect];
 }

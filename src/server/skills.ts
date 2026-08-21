@@ -264,8 +264,11 @@ export function validateCompanionPath(path: string): string {
 }
 
 function decodeCompanion(value: CompanionFileInput, path: string): Uint8Array {
-  const text = stringValueSchema.safeParse(value);
-  if (text.success) return Buffer.from(text.data, "utf8");
+  if (typeof value === "string") {
+    const text = stringValueSchema.safeParse(value);
+    if (!text.success) throw new Error(`companion file '${path}' has invalid text content`);
+    return Buffer.from(text.data, "utf8");
+  }
   if (value instanceof Uint8Array) return value;
   if (value.encoding === "text") return Buffer.from(value.content, "utf8");
   const encoded = value.content;

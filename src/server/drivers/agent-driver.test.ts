@@ -15,6 +15,7 @@ import type { McpBinding, JsonObject, JsonValue } from "../../extensions/manifes
 import { createExtensionRuntime } from "../../extensions/runtime";
 import { extensionToolDefinitions } from "../../extensions/tools";
 import type { ExtensionRuntime } from "../../extensions/runtime";
+import type { MemoryProvider } from "../../memory/types";
 import { createAudit } from "../../policy/audit";
 import { DenyRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
@@ -130,11 +131,15 @@ describe("omp sdk agent driver", () => {
     // and dispose cleanly (the extension only acts on LLM calls, so no prompt).
     const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
     try {
-      const provider = {
+      const provider: MemoryProvider = {
+        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
         save: async () => {
           throw new Error("unused");
         },
         search: async () => [],
+        pruneDigests: async () => {
+          throw new Error("unused");
+        },
       };
       const driver = createOmpSdkDriver({
         agentDir: join(dir, "agent"),
@@ -1271,7 +1276,9 @@ describe("OmpSessionDriver todo read seam (issue #228)", () => {
   function todoResult(phases: TodoPhase[]): JsonObject {
     return {
       content: [{ type: "text", text: "ok" }],
-      details: { op: "init", phases, storage: "session" },
+      // SAFETY: TodoPhase objects are plain JSON data (name + task list); the
+      // cast only satisfies JsonObject's index signature on the stub event bus.
+      details: { op: "init", phases, storage: "session" } as unknown as JsonValue,
     };
   }
 

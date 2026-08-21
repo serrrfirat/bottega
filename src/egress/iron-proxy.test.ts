@@ -548,7 +548,7 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
       // 3. Local upstream: records {host, Authorization} per request so the
       //    leg can prove who got the injected header — and who never did.
       const seen: Array<{ host: string; path: string; auth: string }> = [];
-      const target = Bun.serve({
+      const target: Bun.Server<undefined> = Bun.serve({
         hostname: "0.0.0.0",
         port: 0,
         fetch: (req) => {

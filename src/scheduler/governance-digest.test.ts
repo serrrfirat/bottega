@@ -23,11 +23,15 @@ function freshStore(): Store {
 }
 
 const memory: MemoryProvider = {
+  capabilities: { consolidation: "explicit", digestPruning: "explicit" },
   async save(input): Promise<MemoryEntry> {
     return { id: "unused", key: input.scope, content: input.content, metadata: input.metadata ?? {}, createdAt: 0 };
   },
   async search(): Promise<MemoryEntry[]> {
     return [];
+  },
+  async pruneDigests(): Promise<number> {
+    return 0;
   },
 };
 

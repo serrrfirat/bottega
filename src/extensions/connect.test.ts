@@ -751,7 +751,7 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
 
   function makeCatalogHarness(opts: {
     router?: RecordingRouter;
-    records?: unknown[];
+    records?: CatalogRecordFixture[];
     wellKnownStatus?: number;
     routes?: Route[];
     policy?: PolicyConfig;
