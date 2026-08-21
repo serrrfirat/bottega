@@ -388,4 +388,50 @@ describe("development bootstrap caller contract (#311)", () => {
     expect(h.output.join("\n")).not.toContain("proxy-token");
     expect(h.output.join("\n")).not.toContain("broker-token");
   });
+
+  test("local dev opts the server into the existing Keychain seam so the shared proxy-seed leg can resolve a Keychain-held near key (#333)", async () => {
+    // Hermetic caller test: drive the REAL dev composition seam (runBootstrapCli
+    // "dev") with fake commands/probes; the observed contract is the env handed
+    // to the dev server process. The shared proxy-seed leg (keychainReaderFromEnv
+    // in boot-secrets.ts) reads BOTTEGA_KEYCHAIN_SEED off that env: without the
+    // opt-in it returns null for bottega-near/bottega-opencode and the boot
+    // prints "proxy near.secret REMOVED — no near key anywhere (fail closed)".
+    const config = fixture();
+    const h = harness();
+    createReadyFiles(config);
+    h.setProbe(async () => ({ ok: true }));
+    h.setRun(successPrerequisites);
+
+    expect(await runBootstrapCli(["dev"], h.deps, config, {})).toBe(0);
+    expect(h.execs).toHaveLength(1);
+    expect(h.execs[0]!.argv).toEqual(["bun", "run", "src/server/index.ts"]);
+    expect(h.execs[0]!.env.BOTTEGA_KEYCHAIN_SEED).toBe("1");
+  });
+
+  test("the Keychain opt-in is local-only and never reaches the setup/detached environment (fail closed)", async () => {
+    // Non-local (deployment / CI / compose) must never read a developer
+    // Keychain: the opt-in flag is a local-dev-only addition to the dev-server
+    // env. The only detached process the bootstrap starts outside the server is
+    // the local auth-broker fallback (a deployment-adjacent surface); asserting
+    // IT never carries the flag guards the non-local boundary. Hermetic: the
+    // broker image is absent, forcing the local CLI fallback into h.starts.
+    const config = fixture();
+    const h = harness();
+    createReadyFiles(config);
+    rmSync(config.brokerTokenFile);
+    let brokerReady = false;
+    h.setProbe(async (kind) => ({ ok: kind === "proxy" || brokerReady }));
+    h.setRun(async (argv) => {
+      if (argv[0] === "docker" && argv[1] === "image") return { exitCode: 1, stdout: "", stderr: "missing" };
+      return successPrerequisites(argv);
+    });
+    h.setSleep(async () => {
+      brokerReady = true;
+    });
+
+    expect(await runBootstrapCli(["setup", "--apply"], h.deps, config, {})).toBe(0);
+    expect(h.starts.length).toBeGreaterThan(0);
+    for (const start of h.starts) expect(start.env.BOTTEGA_KEYCHAIN_SEED).toBeUndefined();
+    expect(h.execs).toEqual([]);
+  });
 });

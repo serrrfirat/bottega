@@ -631,6 +631,13 @@ async function runDev(
     BOTTEGA_PROXY_CONTROL_TOKEN: proxyToken,
     OMP_AUTH_BROKER_URL: "http://127.0.0.1:8765",
     OMP_AUTH_BROKER_TOKEN: brokerToken,
+    // Issue #333: local dev opts the server into the EXISTING Keychain seam
+    // (boot-secrets.keychainReaderFromEnv, consumed by proxy-seed at egress)
+    // so a Keychain-held `bottega-near`/`bottega-opencode` resolves through
+    // the shared code path instead of dev.sh re-implementing `security`.
+    // Production/CI never set this — hermetic tests and deployment keep the
+    // Keychain leg inert.
+    BOTTEGA_KEYCHAIN_SEED: "1",
   } satisfies Record<string, string>;
   deps.log("bottega dev: prerequisites ready; starting the server (credential values redacted)");
   return deps.commands.exec(
