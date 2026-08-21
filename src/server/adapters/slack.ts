@@ -940,7 +940,12 @@ export const SLACK_BOOT_CONNECT_TIMEOUT_MS = 60_000;
 /** The socket-mode client surface the watchdog drives (real value: SocketModeReceiver#client). */
 export interface SocketModeClientLike {
   on(event: string, listener: () => void): void;
-  start(): Promise<unknown>;
+  /**
+   * Resolves once the client reaches `connected` (Slack hello). The resolved
+   * apps.connections.open payload (its wss url) is intentionally unused by the
+   * watchdog — the connected event listener owns the lifecycle logging.
+   */
+  start(): Promise<{ url?: string } | void>;
 }
 
 export interface ReconnectWatchdogTiming {

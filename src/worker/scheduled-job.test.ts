@@ -11,6 +11,7 @@
  * driver (sessions never run — the model-call seam is stubbed), and the
  * executor loop driving enqueue → claim → run → outbox.
  */
+import { z } from "zod";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -97,6 +98,8 @@ function makeDeps(fx: Fixture, overrides: Partial<ExecutorDeps> = {}): ExecutorD
 // --- Helpers -----------------------------------------------------------------
 
 function jobStatus(store: Store, id: string): Promise<string | null> {
+  // SAFETY: this fixed SELECT aliases the text status column as s; get is null
+  // only when no matching worker_jobs row exists.
   const row = store.getDb().query("SELECT status AS s FROM worker_jobs WHERE id = ?").get(id) as { s: string } | null;
   return Promise.resolve(row?.s ?? null);
 }
@@ -127,6 +130,20 @@ async function runLoopUntil(fx: Fixture, jobId: string, status: string, deps: Ex
     await run.catch(() => {});
   }
 }
+/** True when the audit row's JSON payload decodes to an object naming jobId. */
+function auditPayloadNamesJob(payloadText: string, jobId: string): boolean {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(payloadText);
+  } catch {
+    return false;
+  }
+  const parsed = jobAuditPayloadSchema.safeParse(decoded);
+  return parsed.success && parsed.data.id === jobId;
+}
+
+const jobAuditPayloadSchema = z.object({ id: z.string() }).passthrough();
+
 
 /**
  * Waits for an audit row whose payload names the job id. The scheduled body
@@ -138,15 +155,7 @@ async function waitForJobAudit(store: Store, eventType: string, jobId: string, t
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await store.listAudit({ event_type: eventType });
-    if (rows.some((row) => {
-      let payload: unknown;
-      try {
-        payload = JSON.parse(row.payload);
-      } catch {
-        return false;
-      }
-      return typeof payload === "object" && payload !== null && "id" in payload && payload.id === jobId;
-    })) return;
+    if (rows.some((row) => auditPayloadNamesJob(row.payload, jobId))) return;
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${eventType} of ${jobId}`);
     const { promise, resolve } = Promise.withResolvers<void>();
     setTimeout(resolve, 10);
@@ -208,6 +217,7 @@ describe("scheduled worker job kind (issue #272)", () => {
       expect(modelCalls).toBe(1);
       expect(fx.driver.sessions).toBe(0);
       // The real pipeline applied the model's actions to the org pool.
+      // SAFETY: this fixed SELECT returns rows with exactly one text content column.
       const rows = fx.store.getDb().query("SELECT content FROM memories WHERE scope = 'org' ORDER BY rowid").all() as {
         content: string;
       }[];
@@ -217,6 +227,7 @@ describe("scheduled worker job kind (issue #272)", () => {
       // The worker→server signal: one outbox row + job.completed audit,
       // keyed by the envelope id. Inspect the pending row WITHOUT advancing
       // the watermark — the seam must be the one that consumes it.
+      // SAFETY: SELECT * on outbox returns exactly the declared OutboxRow columns.
       const raw = fx.store.getDb().query("SELECT * FROM outbox WHERE kind = 'scheduled'").get() as OutboxRow;
       expect(raw).toMatchObject({ id: "mc_1", kind: "scheduled", space: space.id });
       // SAFETY: the completion outbox payload is the scheduled body's own
@@ -260,7 +271,7 @@ describe("scheduled worker job kind (issue #272)", () => {
         name: "memory_consolidation",
         async run(params, ctx) {
           const out: Record<string, string> = {};
-          const tryOp = async (label: string, op: () => Promise<unknown>) => {
+          const tryOp = async (label: string, op: () => void) => {
             try {
               await op();
               out[label] = "allowed";

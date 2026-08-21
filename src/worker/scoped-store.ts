@@ -17,6 +17,7 @@
  * real store — those reads are not write-scoped by design, and the facade's
  * job-row/work-item/enqueue guards are the write firewall.
  */
+import { z } from "zod";
 import type { Store, TransitionOpts, WorkItemState } from "../store/db";
 import type { WorkerJob } from "./envelope";
 
@@ -40,11 +41,14 @@ export interface JobScope {
 }
 
 /** The durable envelope kinds that own a work item in the store. */
-const WORK_ITEM_KINDS: Record<string, true> = { git: true, extension: true };
+const WORK_ITEM_KINDS = { git: true, extension: true } as const;
 
 export function isWorkItemKind(job: WorkerJob): boolean {
-  return WORK_ITEM_KINDS[job.kind] === true;
+  return Object.hasOwn(WORK_ITEM_KINDS, job.kind);
 }
+
+/** The envelope payload fields a work-item-bearing job carries. */
+const workItemPayloadSchema = z.object({ workItemId: z.string().min(1) });
 
 /**
  * Derives a job's scope from its envelope: git/extension jobs own the work
@@ -53,12 +57,18 @@ export function isWorkItemKind(job: WorkerJob): boolean {
  * job asked for, the facade only ever exposes THIS scope.
  */
 export function jobScopeFromEnvelope(job: WorkerJob): JobScope {
-  const payload = job.payload as { workItemId?: unknown };
+  const parsed = workItemPayloadSchema.safeParse(job.payload);
   const workItemId =
-    isWorkItemKind(job) && typeof payload.workItemId === "string" && payload.workItemId.length > 0
-      ? payload.workItemId
+    isWorkItemKind(job) && parsed.success && parsed.data.workItemId !== undefined
+      ? parsed.data.workItemId
       : null;
   return { jobId: job.id, workItemId };
+}
+
+/** A proxy trap key that names a Store member (symbols are engine machinery, forwarded verbatim). */
+function isNamedProperty(prop: string | symbol): prop is string {
+  // String(x) returns x itself exactly for string primitives (typeof-free test).
+  return String(prop) === prop;
 }
 
 /**
@@ -78,9 +88,13 @@ export function createJobScopedStore<T extends Store>(base: T, scope: JobScope):
     isOwnItem(scope, id) ? id : deny(`work-item access to ${id}`);
 
   const handler: ProxyHandler<T> = {
-    get(target, prop, receiver) {
-      if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
-      const name = prop as string;
+    get(target, prop) {
+      if (!isNamedProperty(prop)) {
+        // SAFETY: engine-internal symbol keys carry no Store contract; they
+        // are forwarded untouched off the proxied store itself.
+        return target[prop as keyof T];
+      }
+      const name = prop;
 
       if (name === "getJob") {
         return (id: string) => base.getJob(ownJob(id));
@@ -120,11 +134,15 @@ export function createJobScopedStore<T extends Store>(base: T, scope: JobScope):
         return () => deny("markStaleWorkItems — stale-sweep is the boss loop's job");
       }
 
-      const value = Reflect.get(target, prop, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
+      // SAFETY: the trap forwards an arbitrary Store member by name; target is
+      // the proxied store itself, so every named member exists on it.
+      const value = target[name as keyof T];
+      return value instanceof Function ? value.bind(target) : value;
     },
   };
 
+  // SAFETY: the facade's own intercepts above preserve the Store contract; the
+  // proxy forwards to the very store instance passed in, so T is exact.
   return new Proxy(base, handler) as T;
 }
 

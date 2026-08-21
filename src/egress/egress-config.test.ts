@@ -152,14 +152,15 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
 
     const config = asRecord(secrets["config"]);
     const entries = asRecordArray(config["secrets"]);
-    const expectedGatewayTargets: Record<string, readonly string[]> = {
+    // Static secret path → the gateway hosts its entry may serve (config/egress.yml secrets stanza).
+    const expectedGatewayTargets = {
       "/data/proxy-secrets/near.secret": ["cloud-api.near.ai"],
       "/data/proxy-secrets/opencode.secret": ["opencode.ai"],
       "/data/proxy-secrets/openai.secret": ["api.openai.com"],
       "/data/proxy-secrets/anthropic.secret": ["api.anthropic.com"],
       "/data/proxy-secrets/openai-codex.secret": ["chatgpt.com"],
       "/data/proxy-secrets/tavily.secret": ["api.tavily.com"],
-    };
+    } satisfies Record<string, readonly string[]>;
     const actualGatewayPaths = new Set<string>();
 
     for (const entry of entries) {
@@ -167,7 +168,9 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(source["type"]).toBe("file");
       const path = asString(source["path"]);
       expect(path).toMatch(/^\/data\/proxy-secrets\/([a-z-]+)\.secret$/);
-      const expectedHosts = expectedGatewayTargets[path];
+      // SAFETY: the regex above constrains path to /data/proxy-secrets/*.secret;
+      // a path outside the fixture's set reads undefined and the assertion below fails.
+      const expectedHosts = expectedGatewayTargets[path as keyof typeof expectedGatewayTargets];
       expect(expectedHosts, `unexpected static secret entry ${path}`).toBeDefined();
       actualGatewayPaths.add(path);
 

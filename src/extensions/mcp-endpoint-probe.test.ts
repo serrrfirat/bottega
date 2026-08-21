@@ -41,7 +41,7 @@ interface Route {
   hang?: boolean;
 }
 
-const CHALLENGE_HEADERS = (resource: string): Record<string, string> => ({
+const CHALLENGE_HEADERS = (resource: string) => ({
   "www-authenticate": `Bearer resource_metadata="${resource}", error="invalid_token"`,
 });
 
@@ -50,10 +50,16 @@ const CHALLENGE_HEADERS = (resource: string): Record<string, string> => ({
  * never shadows a more specific `/mcp/v1` route). Every un-routed URL is
  * a 404 — fail closed.
  */
+/** True when fetch delivered its input as a plain URL string (the probe's own calls do). */
+function isUrlString(input: string | URL | Request): input is string {
+  // String(x) boxes to a fresh object, so identity holds exactly for non-string inputs.
+  return Object(input) !== input;
+}
+
 function routeFetch(routes: Route[]): typeof fetch {
   // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>.
   return (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = isUrlString(input) ? input : input instanceof URL ? input.href : input.url;
     const exact = routes.find((r) => r.match === url);
     const route = exact ?? routes.filter((r) => url.startsWith(r.match)).sort((a, b) => b.match.length - a.match.length)[0];
     if (route === undefined) return new Response("", { status: 404 });
@@ -262,11 +268,15 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
   });
 
   test("a network error is rejected with the error evidence", async () => {
-    // SAFETY: the throwing fetch's return type (Promise<never>) does not
-    // overlap typeof fetch structurally, so the cast goes through unknown.
-    const throwing = (async () => {
-      throw new Error("connection refused");
-    }) as unknown as typeof fetch;
+    // SAFETY: the throwing stub implements fetch's call contract (input, init?)
+    // => Promise<Response>; its never-resolving body is the deliberate shape
+    // the probe must reject, and preconnect is never invoked by the probe.
+    const throwing: typeof fetch = Object.assign(
+      (_input: string | URL | Request, _init?: RequestInit) => {
+        throw new Error("connection refused");
+      },
+      { preconnect: () => {} },
+    );
     const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", { fetchImpl: throwing });
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.evidence).toContain("network error");
@@ -274,8 +284,9 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
 
   test("a redirect is rejected and the redirect target is never contacted", async () => {
     let targetHits = 0;
+    // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>.
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const url = isUrlString(input) ? input : input instanceof URL ? input.href : input.url;
       if (url === "https://mcp.linear.app/mcp") {
         if ((init?.redirect ?? "follow") !== "error") throw new Error("the probe must never follow redirects");
         return new Response("moved", { status: 301, headers: { location: "https://evil.example/mcp" } });
@@ -291,12 +302,16 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
 
   test("a non-https URL is refused outright — never probed", async () => {
     let probed = false;
-    // SAFETY: the no-param arrow's signature (no input/init) does not
-    // overlap typeof fetch structurally, so the cast goes through unknown.
-    const fetchImpl = (async () => {
-      probed = true;
-      return new Response("", { status: 200 });
-    }) as unknown as typeof fetch;
+    // SAFETY: the no-param stub implements fetch's call contract (its ignored
+    // input/init still arrive as arguments at runtime); preconnect is never
+    // invoked because the probe refuses non-https URLs before fetching.
+    const fetchImpl: typeof fetch = Object.assign(
+      async () => {
+        probed = true;
+        return new Response("", { status: 200 });
+      },
+      { preconnect: () => {} },
+    );
     const verdict = await probeMcpEndpoint("http://mcp.linear.app/mcp", { fetchImpl });
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.evidence).toContain("must be https");

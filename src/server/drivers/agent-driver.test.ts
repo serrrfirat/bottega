@@ -1276,9 +1276,17 @@ describe("OmpSessionDriver todo read seam (issue #228)", () => {
   function todoResult(phases: TodoPhase[]): JsonObject {
     return {
       content: [{ type: "text", text: "ok" }],
-      // SAFETY: TodoPhase objects are plain JSON data (name + task list); the
-      // cast only satisfies JsonObject's index signature on the stub event bus.
-      details: { op: "init", phases, storage: "session" } as unknown as JsonValue,
+      // The SDK echoes the todo operation under details; phases are plain
+      // JSON (name + content/status tasks), re-literalized so the value meets
+      // JsonObject's index signature without a cast.
+      details: {
+        op: "init",
+        storage: "session",
+        phases: phases.map((phase) => ({
+          name: phase.name,
+          tasks: phase.tasks.map((task) => ({ content: task.content, status: task.status })),
+        })),
+      },
     };
   }
 

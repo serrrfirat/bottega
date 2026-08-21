@@ -263,8 +263,14 @@ export function validateCompanionPath(path: string): string {
   return parts.join("/");
 }
 
+/** True when the companion file arrived as inline text rather than bytes or an encoding envelope. */
+function isTextCompanion(value: CompanionFileInput): value is string {
+  // String(x) returns x itself exactly for string primitives.
+  return String(value) === value;
+}
+
 function decodeCompanion(value: CompanionFileInput, path: string): Uint8Array {
-  if (typeof value === "string") {
+  if (isTextCompanion(value)) {
     const text = stringValueSchema.safeParse(value);
     if (!text.success) throw new Error(`companion file '${path}' has invalid text content`);
     return Buffer.from(text.data, "utf8");

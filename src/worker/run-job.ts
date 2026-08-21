@@ -198,6 +198,17 @@ type SpawnChildResult =
   | { probe: SandboxProbe }
   | SandboxResult;
 
+/**
+ * Environment handed to a sandbox child: the child marker, the two
+ * kind-scoped credential mounts (set only for their own job kind), and the
+ * allowlisted host passthrough names.
+ */
+type SandboxChildEnv = {
+  BOTTEGA_SANDBOX_CHILD: string;
+  EXECUTOR_GIT_TOKEN_FILE?: string;
+  OMP_AUTH_BROKER_TOKEN_FILE?: string;
+} & Partial<{ [K in (typeof SAFE_CHILD_ENV_NAMES)[number]]: string }>;
+
 async function spawnSandboxChild(
   request: SandboxRequest,
   options: {
@@ -217,7 +228,7 @@ async function spawnSandboxChild(
   if ("error" in command) {
     return { exitCode: null, signal: null, timedOut: false, protocolError: command.error };
   }
-  const env: Record<string, string> = { BOTTEGA_SANDBOX_CHILD: "1" };
+  const env: SandboxChildEnv = { BOTTEGA_SANDBOX_CHILD: "1" };
   for (const name of SAFE_CHILD_ENV_NAMES) {
     const value = process.env[name];
     if (value !== undefined) env[name] = value;
@@ -273,16 +284,19 @@ async function spawnSandboxChild(
   try {
     responseBytes = await boundedResponse;
   } catch (error) {
-    return {
+    const invalid: SandboxResult = {
       exitCode: null,
       signal: exited.signal,
       timedOut,
-      ...(leaseLost ? { leaseLost: true } : {}),
       protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}`,
     };
+    if (leaseLost) invalid.leaseLost = true;
+    return invalid;
   }
   if (timedOut || leaseLost) {
-    return { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut, ...(leaseLost ? { leaseLost: true } : {}) };
+    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
+    if (leaseLost) tornDown.leaseLost = true;
+    return tornDown;
   }
   let parsedJson: unknown;
   try {
@@ -394,7 +408,8 @@ export async function runIsolatedJobBody(
         await completeSelf(store, audit, job, outcome);
         return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
       } catch (error) {
-        await failJobSelf(store, audit, job, error);
+        const message = error instanceof Error ? error.message : String(error);
+        await failJobSelf(store, audit, job, message);
         return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
       }
     }
@@ -454,7 +469,8 @@ export async function runJobSandboxBody(
   } catch (err) {
     // Loud self-fail: the sandbox owns its failure — job.failed audit +
     // the item lands blocked (never stuck at working).
-    await failSelf(store, audit, job, workItemId, err);
+    const message = err instanceof Error ? err.message : String(err);
+    await failSelf(store, audit, job, workItemId, message);
     return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
   }
 }
@@ -489,9 +505,9 @@ export async function runScheduledJobBody(
     );
   }
   const { action: actionName, params } = parsed.data;
-  // The envelope action is an arbitrary string; the registry is keyed by the
-  // statically known names. A name outside the union simply misses the map —
-  // the loud unknown-action failure below is the fail-closed gate.
+  // SAFETY: scheduledJobPayloadSchema types action as an arbitrary string; the
+  // registry is keyed by the statically known SchedulerActionName union, so a
+  // name outside it misses the map and the unknown-action throw below fails closed.
   const action = deps.scheduledActions?.get(actionName as SchedulerActionName);
   if (!action) {
     throw new Error(`scheduled job ${job.id} failed: unknown action "${actionName}" — no silent no-op`);
@@ -664,16 +680,14 @@ async function failSelf(
   audit: AuditModule,
   job: WorkerJob,
   workItemId: string,
-  err: unknown,
+  message: string,
 ): Promise<void> {
-  await failJobSelf(store, audit, job, err);
-  const message = err instanceof Error ? err.message : String(err);
+  await failJobSelf(store, audit, job, message);
   await unstickWorkItem(store, workItemId, message);
 }
 
 /** Failure bookkeeping for isolated kinds that do not own a work-item row. */
-async function failJobSelf(store: Store, audit: AuditModule, job: WorkerJob, err: unknown): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
+async function failJobSelf(store: Store, audit: AuditModule, job: WorkerJob, message: string): Promise<void> {
   await store.failJob(job.id);
   await audit.appendAudit({
     ts: Date.now(),
@@ -685,8 +699,11 @@ async function failJobSelf(store: Store, audit: AuditModule, job: WorkerJob, err
   console.log(`[${job.id}] sandbox failed the job (${job.kind}): ${message}`);
 }
 
+/** One decoded JSON document — the domain of a work item's stored result column. */
+type JsonDocument = string | number | boolean | null | JsonDocument[] | { [key: string]: JsonDocument };
+
 /** Parses a work item's result JSON column; null when absent or corrupt. */
-function safeParseJson(text: string | null): unknown {
+function safeParseJson(text: string | null): JsonDocument {
   if (text === null) return null;
   try {
     return JSON.parse(text);

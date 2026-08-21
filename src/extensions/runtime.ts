@@ -509,14 +509,20 @@ export function defaultMcpTransport(
  * array/object pass through; a string that fails to parse stays a string
  * (the provider rejects it with its own clearer error).
  */
+/** True when the model supplied the json-typed param as a string literal. */
+function isJsonString(value: JsonValue | undefined): value is string {
+  // String(x) returns x itself exactly for string primitives.
+  return String(value) === value;
+}
+
 function restoreNativeJsonArgs(args: JsonObject, params: readonly ExtensionToolParam[]): JsonObject {
   const restored: JsonObject = { ...args };
   for (const param of params) {
     if (param.jsonType === undefined) continue;
     const value = args[param.name];
-    if (typeof value !== "string") continue; // already-native / absent — pass through
+    if (!isJsonString(value)) continue; // already-native / absent — pass through
     try {
-      restored[param.name] = JSON.parse(value) as JsonValue;
+      restored[param.name] = JSON.parse(value);
     } catch {
       // Not a JSON literal — leave the raw string for the provider to reject.
     }

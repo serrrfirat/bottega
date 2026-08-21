@@ -47,6 +47,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
 
     // SAFETY: depends_on is a map whose init entry carries its completion condition.
     const dependsOn = service("iron-proxy")["depends_on"] as Record<string, YamlNode>;
+    // SAFETY: each depends_on value is itself a mapping; the init entry declares its condition.
     expect((dependsOn["egress-config-init"] as Record<string, YamlNode>)["condition"]).toBe(
       "service_completed_successfully",
     );

@@ -92,6 +92,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     // its image root is read-only and only durable data + disposable
     // workspace mounts are writable; it creates data/omp-agent at boot on
     // the data volume. deploy.test.ts asserts the same exclusion.
+    // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const executorVolumes = service("executor")["volumes"] as string[];
     expect(executorVolumes).not.toContain("./config/omp:/app/data/omp-agent");
   });

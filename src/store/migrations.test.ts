@@ -30,13 +30,22 @@ function tempDb(name: string): string {
 }
 
 function ledgerIds(db: Database): string[] {
+  // SAFETY: this fixed SELECT returns rows with exactly one text id column.
   return (db.query("SELECT id FROM schema_migrations ORDER BY rowid").all() as Array<{ id: string }>).map(
     ({ id }) => id,
   );
 }
 
-function schemaSnapshot(db: Database): Record<string, unknown> {
+/** One table's structural snapshot as read from sqlite_master + PRAGMA metadata. */
+interface TableSchemaSnapshot {
+  columns: Array<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number }>;
+  foreignKeys: unknown[];
+  indexes: Array<{ name: string; unique: number; partial: number; columns: string[] }>;
+}
+
+function schemaSnapshot(db: Database): Record<string, TableSchemaSnapshot> {
   const tables = (
+  // SAFETY: this fixed sqlite_master query returns rows with exactly one text name column.
     db
       .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
       .all() as Array<{ name: string }>
@@ -44,6 +53,7 @@ function schemaSnapshot(db: Database): Record<string, unknown> {
 
   return Object.fromEntries(
     tables.map((table) => {
+  // SAFETY: PRAGMA table_info returns one row per declared column with exactly these metadata columns.
       const columns = (
         db.query(`PRAGMA table_info(${JSON.stringify(table)})`).all() as Array<{
           name: string;
@@ -56,6 +66,8 @@ function schemaSnapshot(db: Database): Record<string, unknown> {
         .map(({ name, type, notnull, dflt_value, pk }) => ({ name, type, notnull, dflt_value, pk }))
         .sort((a, b) => a.name.localeCompare(b.name));
       const foreignKeys = db.query(`PRAGMA foreign_key_list(${JSON.stringify(table)})`).all();
+  // SAFETY: PRAGMA index_list/index_info return fixed metadata column sets;
+  // only name/unique/partial and the per-index name column are read.
       const indexes = (
         db.query(`PRAGMA index_list(${JSON.stringify(table)})`).all() as Array<{ name: string; unique: number; partial: number }>
       )
@@ -180,6 +192,7 @@ describe("ordered SQLite migrations", () => {
     store.close();
 
     const upgraded = createStore(path);
+    // SAFETY: this fixed sqlite_master query returns rows with exactly one text name column.
     const indexes = upgraded
       .getDb()
       .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_audit_%_ts' ORDER BY name")
@@ -215,6 +228,7 @@ describe("ordered SQLite migrations", () => {
 
     expect(() => runMigrations(db, failing)).toThrow("migration 002_injected_failure failed: injected failure");
     expect(ledgerIds(db)).toEqual(["001_create_probe"]);
+    // SAFETY: PRAGMA table_info(probe) returns one row per surviving column; only name is read.
     expect((db.query("PRAGMA table_info(probe)").all() as Array<{ name: string }>).map(({ name }) => name)).toEqual([
       "id",
       "value",
