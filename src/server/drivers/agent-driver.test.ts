@@ -335,20 +335,23 @@ describe("omp sdk agent driver", () => {
     ).toEqual(["create_work_item", "weather.current"]);
     // Without the opt-in (an executor-style explicit allowTools) nothing is
     // stripped — executors run inside a sandbox and keep bash/write/read.
-    expect(spaceAgentToolNames(["ext.tool"], ["bash", "read", "write"], ["grep"], undefined).sort()).toEqual([
-      "bash",
-      "read",
-      "write",
-      "grep",
-      "ext.tool",
-    ]);
+    // (Both sides are sorted so the membership, not insertion order, is what
+    // is asserted.)
+    expect(
+      spaceAgentToolNames(["ext.tool"], ["bash", "read", "write"], ["grep"], undefined)
+        .slice()
+        .sort(),
+    ).toEqual(["bash", "ext.tool", "grep", "read", "write"]);
   });
 
   test("spaceAgentToolNames merges extension tools after the allowlist", () => {
     expect(spaceAgentToolNames(["weather.current"])).toEqual([...SPACE_AGENT_TOOLS, "weather.current"]);
     // allowTools override still wins; extension tools append to it.
     expect(spaceAgentToolNames(["weather.current"], ["read", "grep"])).toEqual(["read", "grep", "weather.current"]);
-    expect(spaceAgentToolNames(["read"])).toEqual([...SPACE_AGENT_TOOLS]); // deduped
+    // An already-allowlisted extension name dedupes (web_search is in the
+    // space-agent allowlist; read is NOT — it is stripped by the #338 host
+    // boundary on the space-agent path, covered above).
+    expect(spaceAgentToolNames(["web_search"])).toEqual([...SPACE_AGENT_TOOLS]); // deduped
   });
 
   test("fixture extension tool appears in the space agent's toolset", async () => {
@@ -381,8 +384,8 @@ describe("omp sdk agent driver", () => {
       });
       const active = session.getActiveToolNames();
       expect(active).toContain("weather.current");
-      expect(active).toContain("read");
-      expect(active).toContain("grep");
+      expect(active).not.toContain("read"); // #338 host boundary strips read
+      expect(active).not.toContain("grep"); // #338 host boundary strips grep
       expect(active).not.toContain("write"); // restricted: no executor tools
       session.beginDispose();
       await session.dispose();
