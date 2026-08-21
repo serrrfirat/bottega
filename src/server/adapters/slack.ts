@@ -99,22 +99,20 @@ export interface SlackAction {
 export interface SlackAdapter {
   /**
    * Posts a message; resolves with the created message ts (undefined when the
-   * API omits it). `text` is OPTIONAL: when a send carries `blocks`/`attachments`
-   * the top-level `text` can be omitted and the attachment's `fallback` is the
-   * documented notification fallback (chat.postMessage allows text to be absent
-   * when attachments/blocks are present; issue #296).
+   * API omits it). `text` is rendered to Slack mrkdwn (issue #84); optional
+   * `blocks` (Block Kit, e.g. cited-search tables issue #278, approval
+   * prompts) ride the same message alongside the text fallback.
    */
   postMessage(
     spaceId: string,
-    text?: string,
-    opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
+    text: string,
+    opts?: { threadTs?: string; blocks?: unknown[] },
   ): Promise<string | undefined>;
   /**
    * Replaces the text of an already-posted message (chat.update); optional
-   * blocks/attachments mirror postMessage. `text` is OPTIONAL for the same
-   * attachment-carried-surface reason as {@link postMessage} (issue #296).
+   * blocks mirror postMessage.
    */
-  updateMessage(spaceId: string, ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void>;
+  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void>;
   /** Downloads a Slack file and returns its normalized metadata and bytes. */
   downloadFile(
     fileId: string,
@@ -442,23 +440,22 @@ export function renderSlackText(markdown: string): string {
 /**
  * Maps adapter arguments onto `chat.postMessage` arguments. Pure so the
  * outbound rendering is testable without a live Slack connection. Text is
- * rendered to Slack mrkdwn (issue #84) before it leaves the adapter; when
- * the send carries `attachments`/`blocks` the top-level `text` is OMITTED
- * entirely (`undefined` — never an empty string) so real Slack never renders
- * a second, duplicated body above the attachment card (issue #296).
+ * rendered to Slack mrkdwn (issue #84) before it leaves the adapter;
+ * optional `blocks` (Block Kit: cited-search tables issue #278, approval
+ * prompts) ride the same message alongside the text fallback. Top-level DMs
+ * are plain text — no attachment wrapper (owner veto #296-reopened).
  */
 export function buildPostMessageArgs(
   spaceId: string,
-  text?: string,
-  opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
+  text: string,
+  opts?: { threadTs?: string; blocks?: unknown[] },
 ) {
   const args = {
     channel: channelFromSpaceId(spaceId),
-    ...(text !== undefined ? { text: renderSlackText(text) } : undefined),
+    text: renderSlackText(text),
     ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : undefined),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-    ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
-  } satisfies { channel: string; text?: string; thread_ts?: string; blocks?: unknown[]; attachments?: unknown[] };
+  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[] };
   return args;
 }
 
@@ -466,22 +463,20 @@ export function buildPostMessageArgs(
  * Maps adapter arguments onto `chat.update` arguments. Pure so the
  * in-place edit rendering is testable without a live Slack connection. Text
  * is rendered to Slack mrkdwn (issue #84) before it leaves the adapter;
- * optional blocks (issue #296, the DM status card) pass through like
- * postMessage.
+ * optional blocks pass through like postMessage.
  */
 export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
-  text?: string,
-  opts?: { blocks?: unknown[]; attachments?: unknown[] },
+  text: string,
+  opts?: { blocks?: unknown[] },
 ) {
   return {
     channel: channelFromSpaceId(spaceId),
     ts,
-    ...(text !== undefined ? { text: renderSlackText(text) } : undefined),
+    text: renderSlackText(text),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-    ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
-  } satisfies { channel: string; ts: string; text?: string; blocks?: unknown[]; attachments?: unknown[] };
+  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[] };
 }
 
 /**

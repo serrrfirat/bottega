@@ -481,85 +481,18 @@ export function parseSearchResultRows(text: string): SearchResultRow[] {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level DM status card (issue #296): a top-level Slack DM (slack:D*)
-// shows EXACTLY ONE Slack-native card that spans the whole agent request —
-// preamble, tool rounds, retries, and final answer all own one message
-// timestamp. The card is a Slack message ATTACHMENT (a documented
-// `chat.postMessage`/`chat.update` container, see the pinned SDK's
-// `MessageAttachment`) whose left border color keeps the card visibly
-// contained even when a lone top-level section would render flat as plain
-// text (issue #296's reopened evidence). During the request the card renders
-// only TRUSTED status (the rotating thinking phrase / live progress line —
-// never raw model reasoning, intermediate assistant preambles, or tool
-// internals); at request settlement the same timestamp is replaced with the
-// final answer plus ONE subdued `N actions completed` context line when N > 0
-// (never a per-tool checkmark list). Both builders are pure so the surface
-// is unit-testable without Slack; the Block Kit blocks nest INSIDE the
-// attachment and are never duplicated top-level.
+// Top-level DM lifecycle (issues #295/#296, owner veto #296-reopened): a
+// top-level Slack DM (slack:D*) shows EXACTLY ONE PLAIN-TEXT message that
+// spans the whole agent request — preamble, tool rounds, retries, and final
+// answer all own one message timestamp, updated in place as plain Slack
+// text (no attachment wrapper, no color bar, no collapsible content-block
+// card). During the request the message carries only TRUSTED status (the
+// rotating thinking phrase / live progress line — never raw model
+// reasoning, intermediate assistant preambles, or tool internals); at
+// request settlement the same timestamp is replaced with the final answer
+// plus ONE subdued `N actions completed` line when N > 0 (never a per-tool
+// checkmark list).
 // ---------------------------------------------------------------------------
-
-/** One mrkdwn section block — the reusable block shell for both DM surfaces. */
-function dmSectionBlock(mrkdwn: string): unknown {
-  return { type: "section", text: { type: "mrkdwn", text: mrkdwn } };
-}
-
-/**
- * A Slack message attachment (issue #296): the visible container that keeps
- * a top-level DM status/final card from collapsing to flat text. Shape
- * matches the pinned {@link @slack/types!MessageAttachment} — Block Kit
- * blocks nest inside `blocks`, `color` paints the restrained left border,
- * and `fallback` is the plain-text summary for clients that do not render
- * formatting (notifications).
- */
-export interface DmCardAttachment {
-  /** A restrained semantic left-border color; the card stays visibly contained in every state. */
-  color: string;
-  /** Plain-text summary for non-formatting clients; readable without Block Kit. */
-  fallback: string;
-  /** Block Kit blocks nested INSIDE the attachment — never duplicated top-level. */
-  blocks: unknown[];
-}
-
-/**
- * The restrained semantic border color for a top-level DM card: a muted
- * steel blue that reads as a neutral assistant card in every state —
- * status, final, and error alike — without the alarm of red or the
- * misleading success of green.
- */
-export const DM_CARD_COLOR = "#5B7DB1";
-
-/**
- * The live status card for a top-level DM (issue #296): a single attachment
- * carrying the trusted status line (the rotating thinking phrase or the live
- * progress line) as nested Block Kit. The same mrkdwn is the accessible
- * `fallback`, so a non-rendering Slack surface still reads the status, and
- * the bordered container stays visible where a lone section would not.
- */
-export function renderDmStatusCard(status: string): DmCardAttachment[] {
-  return [{ color: DM_CARD_COLOR, fallback: status, blocks: [dmSectionBlock(status)] }];
-}
-
-/**
- * The final answer card for a top-level DM (issue #296): an attachment
- * whose nested blocks hold the answer section plus — when
- * {@link actionsCompleted} > 0 — ONE subdued context line `N actions
- * completed`; never individual tool names. Returns both the attachment and
- * the accessible plain-mrkdwn fallback (the answer, with the count appended
- * when present).
- */
-export function renderDmFinalCard(
-  answer: string,
-  actionsCompleted: number,
-): { attachments: DmCardAttachment[]; fallback: string } {
-  const blocks: unknown[] = [dmSectionBlock(answer)];
-  let fallback = answer;
-  if (actionsCompleted > 0) {
-    const line = `${actionsCompleted} ${actionsCompleted === 1 ? "action" : "actions"} completed`;
-    blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `_${line}_` }] });
-    fallback = `${answer}\n\n${line}`;
-  }
-  return { attachments: [{ color: DM_CARD_COLOR, fallback, blocks }], fallback };
-}
 
 // ---------------------------------------------------------------------------
 // Presenter
@@ -1084,27 +1017,30 @@ export class SlackTurnPresenter {
     const error = this.#bufferedDMError;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
-    const text = reply ?? error ?? "Done.";
+    const base = reply ?? error ?? "Done.";
     // Only a REAL reply carries the `N actions completed` context line —
-    // errors and empty completions show no count.
+    // errors and empty completions show no count (issue #295/#296).
     const actionsCompleted = reply !== undefined ? this.#completedActionsCount : 0;
+    // Plain-text final: the answer (or error) plus — when N > 0 — ONE
+    // subdued `N actions completed` line. No attachment, no color bar, no
+    // Block Kit — top-level DMs render as a normal Slack text message
+    // (owner veto #296-reopened).
+    const text =
+      actionsCompleted > 0
+        ? `${base}\n\n${actionsCompleted} ${actionsCompleted === 1 ? "action" : "actions"} completed`
+        : base;
     if (pendingTs !== undefined) {
-      const { attachments } = renderDmFinalCard(text, actionsCompleted);
-      // Issue #296: card-bearing messages NEVER carry the body as top-level
-      // text — Slack renders top-level text ABOVE the attachment, so any
-      // non-empty value would duplicate the answer in the client. The
-      // attachment's `fallback` is the documented notification/ping surface;
-      // the builder omits the `text` key entirely (never an empty string).
+      // Settle the SAME timestamp: one message per accepted top-level DM
+      // request, updated in place across every internal round.
       console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
       void this.adapter
-        .updateMessage(this.spaceId, pendingTs, undefined, { attachments })
+        .updateMessage(this.spaceId, pendingTs, text)
         .catch((err) => {
           console.error(`[slack-turn-presenter] failed to update DM reply in ${this.spaceId}:`, err);
         });
     } else {
-      const { attachments } = renderDmFinalCard(text, actionsCompleted);
       void this.adapter
-        .postMessage(this.spaceId, undefined, { ...this.replyOpts(), attachments })
+        .postMessage(this.spaceId, text, this.replyOpts())
         .then((ts) => {
           if (ts !== undefined) console.log(`presenter: final reply posted/edited ${this.spaceId} ${ts}`);
         })
@@ -1343,27 +1279,22 @@ export class SlackTurnPresenter {
     // opens a turn is attributable — adapter drop, service entry, or here.
     console.log(`presenter: openTurn ${this.spaceId}`);
     const opts = this.replyOpts();
-    // Issue #296: a top-level DM's opening card is a Slack ATTACHMENT (a
-    // documented visible container) — the trusted status line nested as
-    // Block Kit with the same mrkdwn as the accessible fallback text. The
-    // final answer replaces this same timestamp. Top-level text is OMITTED
-    // (never a duplicate of the status body; the builder drops the key).
-    if (this.#dmTopLevel) {
-      return this.adapter.postMessage(this.spaceId, undefined, { ...opts, attachments: renderDmStatusCard(openingText) });
-    }
+    // Plain text everywhere: a top-level DM's opening line and a channel's
+    // thinking phrase are the SAME surface — one normal Slack text message
+    // (no attachment wrapper, no color bar; owner veto #296-reopened). The
+    // final answer replaces this same timestamp.
     return this.adapter.postMessage(this.spaceId, openingText, opts);
   }
 
   /**
-   * One text chunk to the turn's message. Phrase: chat.update in place
-   * (optional attachment container for the top-level DM status card, issue
-   * #296). Streaming: chat.appendStream markdown_text. `text` is OPTIONAL —
-   * a card-bearing update omits it (the attachment owns the body) while a
-   * plain update passes the body. Not async in the base for the same
+   * One text chunk to the turn's message. Phrase: chat.update in place.
+   * Streaming: chat.appendStream markdown_text. Always plain text — the DM
+   * status surface is a normal message body (no attachment container;
+   * owner veto #296-reopened). Not async in the base for the same
    * microtask-timing reason as {@link openTurn}.
    */
-  protected sendTextChunk(ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
-    return this.adapter.updateMessage(this.spaceId, ts, text, opts);
+  protected sendTextChunk(ts: string, text: string): Promise<void> {
+    return this.adapter.updateMessage(this.spaceId, ts, text);
   }
 
   /**
@@ -1628,13 +1559,9 @@ export class SlackTurnPresenter {
 
   /** Rotates an already-pending phrase in place; streaming keeps its opening, so it does nothing. */
   protected rotateTurnOpening(pendingTs: string): Promise<void> {
-    // Issue #296: a top-level DM's rotating status edits the ONE attachment
-    // card (status blocks nested inside); channels/threads keep the
-    // plain-text rotation.
-    if (this.#dmTopLevel) {
-      const phrase = this.#nextPhrase();
-      return this.sendTextChunk(pendingTs, undefined, { attachments: renderDmStatusCard(phrase) });
-    }
+    // Plain text everywhere: a top-level DM's rotating status and a
+    // channel's phrase are the SAME in-place plain-text edit (no attachment
+    // card; owner veto #296-reopened).
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
   }
 
@@ -1872,14 +1799,10 @@ export class SlackTurnPresenter {
       entry.timer = null;
     }
     try {
-      // Issue #296: a top-level DM's live progress edits the ONE attachment
-      // status card (trusted status line nested as Block Kit); channels/
-      // threads keep the plain-text in-place update.
-      if (this.#dmTopLevel) {
-        await this.sendTextChunk(entry.ts, undefined, { attachments: renderDmStatusCard(entry.text) });
-      } else {
-        await this.sendTextChunk(entry.ts, entry.text);
-      }
+      // Plain text everywhere: a top-level DM's live progress and a
+      // channel's streamed text are the SAME in-place plain-text edit (no
+      // attachment card; owner veto #296-reopened).
+      await this.sendTextChunk(entry.ts, entry.text);
     } catch (err) {
       console.error(
         `[slack-turn-presenter] streaming phrase update failed in ${this.spaceId} (${err instanceof Error ? err.message : String(err)}); keeping for the next attempt`,
@@ -2066,16 +1989,13 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
   }
 
   /** Interim reply text appends to the stream (markdown_text) on the cadence. */
-  protected async sendTextChunk(ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
+  protected async sendTextChunk(ts: string, text: string): Promise<void> {
     // #streamTs guards the per-turn surface: a turn whose stream never
     // opened (missing recipient, request rejection, or a boot fallback)
     // edits the phrase in place — appendStream can never target a plain
     // post, and a per-turn fallback must not flip streaming off for the
-    // boot (issue #287). A card-bearing send (issue #296: `text` omitted
-    // because the attachment owns the body) has nothing to append — edit
-    // the message in place so the attachment lands, never appending
-    // `undefined` markdown_text.
-    if (!this.#streamMode || this.#streamTs === undefined || text === undefined) return super.sendTextChunk(ts, text, opts);
+    // boot (issue #287).
+    if (!this.#streamMode || this.#streamTs === undefined) return super.sendTextChunk(ts, text);
     try {
       await this.adapter.appendText(this.spaceId, ts, text);
     } catch (err) {
@@ -2086,7 +2006,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
         `[slack-turn-presenter] chat.appendStream failed in ${this.spaceId} — falling back to phrase+edit for the boot:`,
         err,
       );
-      await super.sendTextChunk(ts, text, opts);
+      await super.sendTextChunk(ts, text);
     }
   }
 

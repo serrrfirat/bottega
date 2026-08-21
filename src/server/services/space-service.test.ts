@@ -272,8 +272,8 @@ function fakeAdapter(
   } = {},
 ) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
-  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
@@ -299,12 +299,7 @@ function fakeAdapter(
         throw new Error("rate_limited");
       }
       const blocks = updateOpts?.blocks;
-      const attachments = updateOpts?.attachments;
-      updates.push(
-        blocks !== undefined || attachments !== undefined
-          ? { spaceId, ts, text, opts: { ...(blocks !== undefined ? { blocks } : {}), ...(attachments !== undefined ? { attachments } : {}) } }
-          : { spaceId, ts, text },
-      );
+      updates.push(blocks !== undefined ? { spaceId, ts, text, opts: { blocks } } : { spaceId, ts, text });
     },
     async downloadFile(fileId) {
       downloadedFileIds.push(fileId);
@@ -1028,21 +1023,20 @@ describe("SpaceService output routing", () => {
     channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
     for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    // DM: exactly ONE post (never a thread_ts); the card's body lives in the
-    // attachment, so the post carries NO top-level text (issue #296). The
-    // channel reply threads under the inbound (issue #40) and still carries
-    // plain text.
+    // DM: exactly ONE post (never a thread_ts) and the body rides the plain
+    // `text` key — no attachment, no color bar (owner veto #296-reopened).
+    // The channel reply threads under the inbound (issue #40) and carries
+    // plain text too.
     expect(posts).toEqual([
-      { spaceId: "slack:D1", text: undefined, opts: { attachments: expect.any(Array) } },
+      { spaceId: "slack:D1", text: THINKING_PHRASES[0], opts: undefined },
       { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "9.9" } },
     ]);
     expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
-    // The DM final answer edits the SAME card in place with NO top-level
-    // text — the attachment's fallback owns the answer.
+    // The DM final answer edits the SAME message in place as plain text.
     const dmFinal = updates.find((u) => u.spaceId === "slack:D1" && u.ts === "ts-1");
     expect(dmFinal).toBeDefined();
-    expect(dmFinal!.text).toBeUndefined();
-    expect((dmFinal!.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("dm answer");
+    expect(dmFinal!.opts).toBeUndefined();
+    expect(dmFinal!.text).toBe("dm answer");
   });
 
   test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
@@ -1072,12 +1066,12 @@ describe("SpaceService output routing", () => {
     expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
     expect(streams[0].opts.threadTs).toBe("9.9");
     expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
-    // DM final answer: the card EDITS in place with NO top-level text — the
-    // attachment fallback owns the answer (issue #296).
+    // DM final answer: the message EDITS in place as plain text — the body
+    // rides the text key, no attachment (owner veto #296-reopened).
     const dmStreamFinal = updates.find((u) => u.spaceId === "slack:D1" && u.ts === "ts-1");
     expect(dmStreamFinal).toBeDefined();
-    expect(dmStreamFinal!.text).toBeUndefined();
-    expect((dmStreamFinal!.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("dm answer");
+    expect(dmStreamFinal!.opts).toBeUndefined();
+    expect(dmStreamFinal!.text).toBe("dm answer");
     // The DM surface never opened a stream (plain phrase path throughout).
     expect(streams.filter((s) => s.spaceId === "slack:D1")).toHaveLength(0);
     // Channel: the panel opened (threaded under the inbound ts) and
@@ -1102,13 +1096,13 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     // the card to that error and never leave the request wedged.
     session.failPromptError = "provider exploded";
     await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "2.2" }));
-    // The rejected request's error settles as the card's attachment fallback —
-    // no top-level text (issue #296: card sends omit it).
+    // The rejected request's error settles as plain text on the one message —
+    // no attachment, no color bar (owner veto #296-reopened).
     const dmError = updates.filter(
-      (u) => u.spaceId === "slack:D1" && (u.opts?.attachments as { fallback: string }[] | undefined)?.[0]?.fallback === "provider exploded",
+      (u) => u.spaceId === "slack:D1" && u.text === "provider exploded",
     );
-    expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one card
-    expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME card ts, no second post
+    expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one message
+    expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME message ts, no second post
 
     // The request cleared: a THIRD message opens a FRESH card (not a wedged
     // reuse of the stuck request) and settles normally.
@@ -1145,22 +1139,22 @@ describe("SpaceService DM request settlement (issue #296)", () => {
 
     // BOTH queued messages drained as their own fresh requests, and EACH
     // rejected drained request surfaced the buffered error exactly once —
-    // as a same-card edit, or (the reply-races-phrase-post edge) a fresh
-    // final post. The error lands as the card's attachment fallback, never
-    // top-level text (issue #296). This is the regression: a rejected
-    // drained DM must still settle + drain the NEXT queued message exactly
-    // once (issue #296).
-    const carryError = (o?: { attachments?: unknown[] }) => (o?.attachments as { fallback?: string }[] | undefined)?.[0]?.fallback === "drained exploded";
-    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && carryError(u.opts));
-    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && carryError(p.opts));
+    // as a same-message edit, or (the reply-races-phrase-post edge) a
+    // fresh final post. The error lands as plain text — never an
+    // attachment (owner veto #296-reopened). This is the regression: a
+    // rejected drained DM must still settle + drain the NEXT queued message
+    // exactly once (issue #296).
+    const carryError = (u: { text?: string }) => u.text === "drained exploded";
+    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && carryError(u));
+    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && carryError(p));
     expect(explodedUpdates.length + explodedPosts.length).toBe(2); // queued A + queued B
     // The queue fully drained and no request is wedged: a NEW fresh turn runs.
     session.failPromptError = undefined;
     await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "fresh after drain", ts: "4.4" }));
-    expect(posts.filter((p) => p.spaceId === "slack:D1").length).toBeGreaterThanOrEqual(4); // fresh card, not queued/stuck
+    expect(posts.filter((p) => p.spaceId === "slack:D1").length).toBeGreaterThanOrEqual(4); // fresh message, not queued/stuck
     const lastUpdate = updates.at(-1)!;
-    expect(lastUpdate.text).toBeUndefined(); // the fresh turn's card omits top-level text
-    expect((lastUpdate.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("Done."); // settled normally
+    expect(lastUpdate.opts).toBeUndefined(); // the fresh turn's message is plain text
+    expect(lastUpdate.text).toBe("Done."); // settled normally
   });
 });
 

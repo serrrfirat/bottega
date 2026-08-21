@@ -460,15 +460,16 @@ describe("buildPostMessageArgs", () => {
     });
   });
 
-  test("a card-bearing post OMITS top-level text — the attachment owns the body (issue #296)", () => {
-    const attachments = [{ color: "#5B7DB1", fallback: "working…", blocks: [{ type: "section", text: { type: "mrkdwn", text: "working…" } }] }];
-    expect(buildPostMessageArgs("slack:D123ABC", undefined, { attachments })).toEqual({
+  test("a top-level DM post is PLAIN TEXT — the body rides the text key, never an attachment (owner veto #296-reopened)", () => {
+    // THE regression: the DM status card used to send a colored attachment
+    // container; the owner rejects it. A DM post now carries the body as
+    // ordinary text with NO attachments and NO blocks.
+    expect(buildPostMessageArgs("slack:D123ABC", "working…")).toEqual({
       channel: "D123ABC",
-      attachments,
+      text: "working…",
     });
-    // The `text` key is OMITTED, never an empty string — real Slack must not
-    // render a second, duplicated body above the attachment.
-    expect(buildPostMessageArgs("slack:D123ABC", undefined, { attachments })).not.toHaveProperty("text");
+    expect(buildPostMessageArgs("slack:D123ABC", "working…")).not.toHaveProperty("attachments");
+    expect(buildPostMessageArgs("slack:D123ABC", "working…")).not.toHaveProperty("blocks");
   });
 });
 
@@ -489,15 +490,17 @@ describe("buildUpdateMessageArgs", () => {
     });
   });
 
-  test("a card-bearing update OMITS top-level text — the attachment owns the body (issue #296)", () => {
-    const attachments = [{ color: "#5B7DB1", fallback: "answer", blocks: [{ type: "section", text: { type: "mrkdwn", text: "answer" } }] }];
-    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", undefined, { attachments })).toEqual({
+  test("a top-level DM update is PLAIN TEXT — the body rides the text key, never an attachment (owner veto #296-reopened)", () => {
+    // THE regression: the DM final card used to send a colored attachment
+    // container; the owner rejects it. An in-place DM edit now carries the
+    // body as ordinary text with NO attachments and NO blocks.
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", "answer")).toEqual({
       channel: "D123ABC",
       ts: "1723700000.000100",
-      attachments,
+      text: "answer",
     });
-    // The `text` key is OMITTED, never an empty string.
-    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", undefined, { attachments })).not.toHaveProperty("text");
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", "answer")).not.toHaveProperty("attachments");
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", "answer")).not.toHaveProperty("blocks");
   });
 });
 
