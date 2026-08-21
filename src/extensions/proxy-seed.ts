@@ -343,6 +343,12 @@ export const CODEX_REFRESH_WINDOW_MS = 24 * 60 * 60 * 1_000;
  */
 const CODEX_REFRESH_CHECK_INTERVAL_MS = 60 * 60 * 1_000;
 
+const codexJwtPayloadSchema = z.object({
+  exp: z.number().finite(),
+});
+
+type CodexJwtPayload = z.infer<typeof codexJwtPayloadSchema>;
+
 /**
  * Decodes a JWT's `exp` claim (seconds since epoch) from the middle
  * (payload) segment, base64url, WITHOUT verifying the signature — the
@@ -362,8 +368,9 @@ export function decodeCodexJwtExp(accessToken: string): number | null {
     return null;
   }
   try {
-    const parsed = JSON.parse(payload) as { exp?: unknown };
-    if (typeof parsed.exp !== "number" || !Number.isFinite(parsed.exp)) return null;
+    const payloadResult = codexJwtPayloadSchema.safeParse(JSON.parse(payload));
+    if (!payloadResult.success) return null;
+    const parsed: CodexJwtPayload = payloadResult.data;
     return parsed.exp;
   } catch {
     return null;

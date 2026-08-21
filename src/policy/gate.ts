@@ -21,6 +21,7 @@
  * The caller owns the error boundary: an internal gate error (e.g. the
  * policy resolver failing) must deny the call, never let it run.
  */
+import { z } from "zod";
 import { APPROVAL_REQUESTED_EVENT, APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import type { AuditModule } from "./audit";
 import { requestWithTimeout, type ApprovalRequest, type ApprovalRouter } from "./approval-router";
@@ -87,6 +88,34 @@ export interface PolicyGateOutcome {
 /** Cap for the args summary embedded in policy.decision rows (appendAudit redacts + caps too). */
 const ARGS_SUMMARY_MAX = 1000;
 
+const toolArgsPayloadSchema = z.unknown();
+const optionalStringFieldSchema = z.string().optional().catch(undefined);
+const skillMutationArgsSchema = z.object({
+  name: optionalStringFieldSchema,
+  expected_revision: optionalStringFieldSchema,
+  document: optionalStringFieldSchema,
+  companion_files: z.record(z.string(), z.unknown()).optional().catch(undefined),
+});
+const companionFileSchema = z.object({
+  encoding: z.enum(["text", "base64"]),
+  content: z.string(),
+});
+
+/** Untrusted tool-call payload accepted at the policy boundary. */
+export type ToolArgsPayload = z.input<typeof toolArgsPayloadSchema>;
+
+interface SkillMutationSummary {
+  name?: string;
+  expected_revision?: string;
+  document?: { bytes: number; sha256: string };
+  companion_files?: Array<{
+    path: string;
+    encoding: "text" | "base64" | "invalid";
+    bytes: number;
+    sha256: string;
+  }>;
+}
+
 /**
  * One-line summary of tool-call args for audit/step payloads: JSON
  * serialization capped at ARGS_SUMMARY_MAX. Accepts any JSON-serializable
@@ -103,14 +132,15 @@ export function summarizeArgs<T>(input: T): string {
  * executable operator content, so lifecycle mutations expose only byte
  * counts and SHA-256 hashes even before schema validation or approval.
  */
-export function summarizeToolArgs(tool: string, input: unknown): string {
+export function summarizeToolArgs(tool: string, input: ToolArgsPayload): string {
   if (tool !== "create_space_skill" && tool !== "update_space_skill") return summarizeArgs(input);
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return summarizeArgs({});
-  const args = input as Record<string, unknown>;
-  const safe: Record<string, unknown> = {};
-  if (typeof args.name === "string") safe.name = args.name;
-  if (typeof args.expected_revision === "string") safe.expected_revision = args.expected_revision;
-  if (typeof args.document === "string") {
+  const parsedArgs = skillMutationArgsSchema.safeParse(input);
+  if (!parsedArgs.success) return summarizeArgs({});
+  const args = parsedArgs.data;
+  const safe: SkillMutationSummary = {};
+  if (args.name !== undefined) safe.name = args.name;
+  if (args.expected_revision !== undefined) safe.expected_revision = args.expected_revision;
+  if (args.document !== undefined) {
     const hasher = new Bun.CryptoHasher("sha256");
     hasher.update(args.document);
     safe.document = {
@@ -118,23 +148,16 @@ export function summarizeToolArgs(tool: string, input: unknown): string {
       sha256: hasher.digest("hex"),
     };
   }
-  if (args.companion_files !== null && typeof args.companion_files === "object" && !Array.isArray(args.companion_files)) {
-    safe.companion_files = Object.entries(args.companion_files as Record<string, unknown>)
+  if (args.companion_files !== undefined) {
+    safe.companion_files = Object.entries(args.companion_files)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([path, value]) => {
+        const parsedFile = companionFileSchema.safeParse(value);
         let bytes: Uint8Array;
         let encoding: "text" | "base64" | "invalid" = "invalid";
-        if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-          const file = value as Record<string, unknown>;
-          if (file.encoding === "text" && typeof file.content === "string") {
-            bytes = Buffer.from(file.content, "utf8");
-            encoding = "text";
-          } else if (file.encoding === "base64" && typeof file.content === "string") {
-            bytes = Buffer.from(file.content, "base64");
-            encoding = "base64";
-          } else {
-            bytes = Buffer.from("");
-          }
+        if (parsedFile.success) {
+          bytes = Buffer.from(parsedFile.data.content, parsedFile.data.encoding === "text" ? "utf8" : "base64");
+          encoding = parsedFile.data.encoding;
         } else {
           bytes = Buffer.from("");
         }

@@ -27,7 +27,7 @@ import {
   POLICY_DECISION_EVENT,
 } from "../store/audit-events";
 import type { CredentialBoundary } from "./boundary";
-import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "./fixture";
+import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
 import { validateManifest, type ExtensionManifest, type JsonObject, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
 import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
@@ -1059,7 +1059,6 @@ describe("extension runtime: array/object MCP params restore native JSON before 
     expect(Array.isArray(seen[0]!.args["fields"])).toBe(true);
     // …and the genuinely-string param was never re-parsed/retyped.
     expect(seen[0]!.args["note"]).toBe('{"tag":"cherry-picked"}');
-    expect(typeof seen[0]!.args["note"]).toBe("string");
     expect(seen[0]!.args["query"]).toBe("open PRs");
   });
 

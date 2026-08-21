@@ -511,6 +511,8 @@ describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
     // github (api_key) + the six model-gateway keys — gmail adds nothing.
     expect(entries!.length).toBe(6);
     for (const entry of entries!) {
+      // SAFETY: each committed secrets entry is generated with a `source`
+      // mapping; this assertion checks its path remains unrelated to Gmail.
       const source = entry["source"] as Record<string, YamlNode>;
       expect(String(source["path"])).not.toContain("gmail");
     }

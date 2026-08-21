@@ -213,6 +213,8 @@ describe("standupDigestAction (issue #92)", () => {
     expect(digest).not.toContain("wi_done_today");
     expect(digest).not.toContain("wi_other");
     // Issue #279: the same facts render as table cards alongside the text.
+    // SAFETY: standupDigestAction constructs opts.blocks from its typed table-card
+    // renderer; this fixture records that array without transforming its entries.
     const blocks = posted[0].blocks as Array<{ text?: { text?: string } }>;
     expect(blocks).toBeDefined();
     const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
@@ -262,6 +264,8 @@ describe("standupDigestAction (issue #92)", () => {
     await standupDigestAction.run({ space }, ctx);
 
     expect(posted).toHaveLength(1);
+    // SAFETY: standupDigestAction constructs opts.blocks from its typed table-card
+    // renderer; this fixture records that array without transforming its entries.
     const blocks = posted[0].blocks as Array<{ text?: { text?: string } }>;
     const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
     expect(tableText).toContain("wi_open_0");

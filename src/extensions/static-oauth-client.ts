@@ -22,6 +22,7 @@
  *   - Provisioning is org-scoped, policy-gated, and audited with metadata
  *     ONLY (extension/scope/actor/status — never client values).
  */
+import { z } from "zod";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
 import { evaluatePolicyGate } from "../policy/gate";
@@ -34,6 +35,7 @@ import {
   type ConnectExtensionDeps,
   type ConnectScope,
 } from "./connect";
+import type { JsonValue } from "./manifest";
 
 /** The vault provider-key prefix for static OAuth client rows (issue #288). */
 export const STATIC_OAUTH_CLIENT_PROVIDER_PREFIX = "static-oauth-client";
@@ -60,6 +62,26 @@ export interface StaticOAuthClient {
   client_secret: string;
 }
 
+const staticOAuthClientSchema = z.object({
+  client_id: z.string(),
+  client_secret: z.string(),
+});
+
+/** JSON value entering the static-client provisioning boundary. */
+export type StaticOAuthClientPayload = JsonValue | undefined;
+
+export type StaticOAuthClientParseResult =
+  | { ok: true; client: StaticOAuthClient }
+  | { ok: false; message: string };
+
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? -1;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
+}
+
 /**
  * Validates an arbitrary static-client shape: both fields must be
  * non-empty strings within the bounds, free of control characters. Fail
@@ -67,13 +89,19 @@ export interface StaticOAuthClient {
  * value. The returned client is TRIMMED (leading/trailing whitespace
  * around a pasted value is an upload artifact, never part of a secret).
  */
-export function parseStaticOAuthClient(raw: unknown): { ok: true; client: StaticOAuthClient } | { ok: false; message: string } {
-  if (typeof raw !== "object" || raw === null) {
-    return { ok: false, message: "static OAuth client must be a JSON object with client_id and client_secret" };
+export function parseStaticOAuthClient(raw: StaticOAuthClientPayload): StaticOAuthClientParseResult {
+  const parsed = staticOAuthClientSchema.safeParse(raw);
+  if (!parsed.success) {
+    if (parsed.error.issues.some((issue) => issue.path.length === 0)) {
+      return { ok: false, message: "static OAuth client must be a JSON object with client_id and client_secret" };
+    }
+    if (parsed.error.issues.some((issue) => issue.path[0] === "client_id")) {
+      return { ok: false, message: "client_id must be a non-empty string" };
+    }
+    return { ok: false, message: "client_secret must be a non-empty string" };
   }
-  const obj = raw as Record<string, unknown>;
-  const clientId = typeof obj.client_id === "string" ? obj.client_id.trim() : "";
-  const clientSecret = typeof obj.client_secret === "string" ? obj.client_secret.trim() : "";
+  const clientId = parsed.data.client_id.trim();
+  const clientSecret = parsed.data.client_secret.trim();
   if (clientId === "") return { ok: false, message: "client_id must be a non-empty string" };
   if (clientSecret === "") return { ok: false, message: "client_secret must be a non-empty string" };
   if (clientId.length > STATIC_CLIENT_ID_MAX_LENGTH) {
@@ -82,7 +110,7 @@ export function parseStaticOAuthClient(raw: unknown): { ok: true; client: Static
   if (clientSecret.length > STATIC_CLIENT_SECRET_MAX_LENGTH) {
     return { ok: false, message: `client_secret exceeds ${STATIC_CLIENT_SECRET_MAX_LENGTH} characters` };
   }
-  if (/[\u0000-\u001f\u007f]/.test(`${clientId}${clientSecret}`)) {
+  if (containsControlCharacter(`${clientId}${clientSecret}`)) {
     return { ok: false, message: "client values must not contain control characters" };
   }
   return { ok: true, client: { client_id: clientId, client_secret: clientSecret } };

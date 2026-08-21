@@ -157,15 +157,16 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // manifest tools, or the provider's tools/list for tools-less manifests
   // (a per-provider failure is skipped — the runtime's lazy per-call path
   // fails closed instead of the boot dying).
-  const surfaces = await resolveExtensionSurfaces(registry.list(), {
-    ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : {}),
+  const surfaceOptions: NonNullable<Parameters<typeof resolveExtensionSurfaces>[1]> = {
     authProvider: surfaceAuthProvider,
     // Issue #257: a boot discovery failure on a provider that HAS a
     // credential row is a loud fail-closed warning, never the silent skip.
     isConnected:
       deps.isConnected ??
       (async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0),
-  });
+  };
+  if (deps.mcpTransport !== undefined) surfaceOptions.mcpTransport = deps.mcpTransport;
+  const surfaces = await resolveExtensionSurfaces(registry.list(), surfaceOptions);
   // Credential boundary (issues #53/#123/#190): the resolver is the
   // deployment's configured secrets backend (issue #190) — omp-broker by
   // default (the #54/#143 behavior, byte-identical), 1password-connect

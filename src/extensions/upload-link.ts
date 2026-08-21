@@ -415,12 +415,13 @@ export async function mintUploadLink(
     ttlMs: deps.ttlMs,
   });
   if (!minted.ok) return { ok: false, message: minted.reason };
-  return {
+  const outcome: Extract<MintUploadLinkOutcome, { ok: true }> = {
     ok: true,
     url: `${base}/upload/${minted.token}`,
     warning: publicBase.warning,
-    ...(staticClientMode ? { mode: "static_client" as const } : {}),
   };
+  if (staticClientMode) outcome.mode = "static_client";
+  return outcome;
 }
 
 /**

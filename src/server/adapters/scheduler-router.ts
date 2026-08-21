@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { AuditModule } from "../../policy/audit";
 import { describeCron } from "../../scheduler/scheduler-tools";
 import { schedulerJobMetadata } from "../../scheduler/store";
@@ -38,18 +39,22 @@ export function schedulerActionValue(job: Pick<SchedulerJob, "id" | "revision">)
   return JSON.stringify({ id: job.id, revision: job.revision });
 }
 
-function parseSchedulerActionValue(value: string): { id: string; revision: number } | null {
-  let parsed: unknown;
+const schedulerActionValueSchema = z.object({
+  id: z.string().min(1),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+});
+
+type SchedulerActionValue = z.infer<typeof schedulerActionValueSchema>;
+
+function parseSchedulerActionValue(value: string): SchedulerActionValue | null {
+  let payload: z.input<typeof schedulerActionValueSchema>;
   try {
-    parsed = JSON.parse(value);
+    payload = JSON.parse(value);
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const record = parsed as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id.length === 0) return null;
-  if (typeof record.revision !== "number" || !Number.isSafeInteger(record.revision) || record.revision < 1) return null;
-  return { id: record.id, revision: record.revision };
+  const parsed = schedulerActionValueSchema.safeParse(payload);
+  return parsed.success ? parsed.data : null;
 }
 
 function utcTimestamp(ms: number): string {

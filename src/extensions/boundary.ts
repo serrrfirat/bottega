@@ -22,6 +22,7 @@
  * `${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(id)}` (the same
  * volume at /data on the proxy side).
  */
+import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -437,8 +438,13 @@ function replaceScopedAuthorizationBlock(config: string, entries: string): strin
   return `${config.slice(0, afterBegin)}${body}${config.slice(end)}`;
 }
 
-function abortError(reason: unknown): Error {
-  return reason instanceof Error ? reason : new Error(typeof reason === "string" ? reason : "authorization aborted");
+const abortReasonSchema = z.union([z.instanceof(Error), z.string()]);
+type AbortReasonPayload = z.input<typeof abortReasonSchema>;
+
+function abortError(reason: AbortReasonPayload): Error {
+  const parsed = abortReasonSchema.safeParse(reason);
+  if (!parsed.success) return new Error("authorization aborted");
+  return parsed.data instanceof Error ? parsed.data : new Error(parsed.data);
 }
 
 /**

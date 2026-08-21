@@ -34,8 +34,8 @@ const broker = devServices["auth-broker"] as Record<string, YamlNode>;
 const baseBroker = (base["services"] as Record<string, YamlNode>)["auth-broker"] as Record<string, YamlNode>;
 
 describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-broker #143)", () => {
-  test("overrides ONLY iron-proxy and auth-broker (no other service is touched)", () => {
-    expect(Object.keys(devServices).sort()).toEqual(["auth-broker", "iron-proxy"]);
+  test("overrides only the egress init, iron-proxy, and auth-broker services", () => {
+    expect(Object.keys(devServices).sort()).toEqual(["auth-broker", "egress-config-init", "iron-proxy"]);
   });
 
   test("publishes the tunnel + management listeners bound to loopback only", () => {
@@ -44,14 +44,13 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     expect(ports.sort()).toEqual(["127.0.0.1:8080:8080", "127.0.0.1:9092:9092"]);
   });
 
-  test("mounts the dev-permissive config (not the strict one), CA, and the host ./data at /data", () => {
-    // SAFETY: the dev override mounts the dev-permissive config, certs, and ./data (asserted below).
+  test("seeds the dev-permissive config (not the strict one), CA, and the host ./data at /data", () => {
+    // SAFETY: the dev override mounts the dev-permissive seed, certs, and ./data (asserted below).
     const vols = proxy["volumes"] as string[];
-    expect(vols).toContain("./config/egress.dev.yml:/etc/iron-proxy/egress.yml:ro");
-    // The dev proxy must NOT mount the STRICT config/egress.yml: the dev
-    // config (allow-all + no judge, issue #126) is what makes local testing
-    // pass; the strict config stays the deployment contract (base compose).
-    expect(vols).not.toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
+    expect(vols).toContain("./config/egress.dev.yml:/seed/egress.yml:ro");
+    // The init service copies this dev seed into /data/egress.yml before the
+    // proxy starts. The strict config stays the deployment contract.
+    expect(vols).not.toContain("./config/egress.yml:/seed/egress.yml:ro");
     // The MITM CA bind is the CANONICAL certs dir (dev.sh exports
     // BOTTEGA_DEV_CERTS_DIR=shared_certs_dir, issue #301) so every worktree's
     // dev proxy terminates with the SAME CA — never a worktree-local cert the
@@ -159,6 +158,8 @@ describe("local development bootstrap wiring (#143/#301/#311)", () => {
   });
 
   test("renders canonical host paths into Compose and the canonical egress env", () => {
+    // SAFETY: the checked-in iron-proxy service defines `volumes` as a YAML
+    // sequence; the assertions below verify both required string entries.
     const vols = proxy["volumes"] as string[];
     expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
     expect(vols).toContain("${BOTTEGA_DEV_CERTS_DIR:-./certs}:/etc/iron-proxy/certs:ro");

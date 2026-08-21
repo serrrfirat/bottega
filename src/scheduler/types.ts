@@ -14,7 +14,7 @@
 import type { Store } from "../store/db";
 import type { AuditModule } from "../policy/audit";
 import type { MemoryProvider } from "../memory/types";
-import type { ConsolidationModelCall } from "../memory/consolidation";
+import type { ConsolidationModelCall, ConsolidationResult } from "../memory/consolidation";
 import type { PolicyConfig } from "../policy/config";
 
 /**
@@ -103,6 +103,9 @@ export interface SchedulerActionContext {
   consolidationModelCall?: ConsolidationModelCall;
 }
 
+/** JSON-serializable result emitted by the worker-only consolidation action. */
+export type SchedulerActionResult = void | ConsolidationResult[];
+
 /**
  * One registered scheduled action. `run` must never throw past the runner's
  * audit. The return value is the worker dispatch's outbox result (issue
@@ -111,7 +114,7 @@ export interface SchedulerActionContext {
  */
 export interface SchedulerAction {
   name: SchedulerActionName;
-  run(params: Record<string, string>, ctx: SchedulerActionContext): Promise<void | unknown>;
+  run(params: Record<string, string>, ctx: SchedulerActionContext): Promise<SchedulerActionResult>;
 }
 
 /** Action registry: name → handler. Unknown names fail closed. */
