@@ -89,13 +89,18 @@ function runnerDeps(store: Store, registry: SchedulerActionRegistry, now: () => 
   };
 }
 
-async function createJob(store: Store, spaceId = "slack:C1"): Promise<SchedulerJob> {
+async function createJob(
+  store: Store,
+  spaceId = "slack:C1",
+  createdAt?: number,
+): Promise<SchedulerJob> {
   return store.createSchedulerJob({
     action: "send_message",
     cron: "0 * * * *",
     params: { text: "before" },
     spaceId,
     createdBy: "U1",
+    createdAt,
   });
 }
 
@@ -199,8 +204,8 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
     let fires = 0;
     const registry = buildRegistry([{ name: "send_message", run: async () => { fires += 1; } }]);
     const definitions = schedulerToolDefinitions(store, audit, registry, { now: () => now });
-    const created = await createJob(store);
-    const recurringNext = created.nextFireAt;
+    const created = await createJob(store, "slack:C1", now);
+    const recurringNext = nextCronFire(created.cron, now);
     const args = {
       id: created.id,
       expected_revision: created.revision,
@@ -211,8 +216,19 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       call(definitions, "run_scheduler_job_now", args, "slack:C1", "run-call-1"),
       call(definitions, "run_scheduler_job_now", args, "slack:C1", "run-call-2"),
     ]);
-    expect(body<{ invocationId: string }>(first).invocationId).toBe("manual-check-1");
-    expect(body<{ invocationId: string }>(repeated).invocationId).toBe("manual-check-1");
+    expect(body(first)).toEqual({
+      invocationId: "manual-check-1",
+      enqueued: true,
+      status: "pending",
+      jobId: created.id,
+    });
+    expect(body(repeated)).toEqual({
+      invocationId: "manual-check-1",
+      enqueued: false,
+      status: "pending",
+      jobId: created.id,
+    });
+    expect(await store.listSchedulerInvocations({ jobId: created.id })).toHaveLength(1);
     expect((await store.getSchedulerJob(created.id))?.nextFireAt).toBe(recurringNext);
 
     await tickScheduler(runnerDeps(store, registry, () => now));
@@ -220,14 +236,31 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
     expect(fires).toBe(1);
     expect((await store.getSchedulerJob(created.id))?.nextFireAt).toBe(recurringNext);
     expect(await audit.listAudit({ event_type: SCHEDULER_RUN_REQUESTED_EVENT })).toHaveLength(1);
+
+    const distinct = await call(
+      definitions,
+      "run_scheduler_job_now",
+      { ...args, invocation_id: "manual-check-2" },
+      "slack:C1",
+      "run-call-3",
+    );
+    expect(body(distinct)).toMatchObject({ invocationId: "manual-check-2", enqueued: true, status: "pending" });
+    await tickScheduler(runnerDeps(store, registry, () => now));
+    expect(fires).toBe(2);
+    expect(await store.listSchedulerInvocations({ jobId: created.id })).toHaveLength(2);
+    expect(await audit.listAudit({ event_type: SCHEDULER_RUN_REQUESTED_EVENT })).toHaveLength(2);
     const fireRows = await audit.listAudit({ event_type: SCHEDULER_FIRE_EVENT });
-    expect(fireRows).toHaveLength(1);
-    expect(JSON.parse(fireRows[0]!.payload)).toMatchObject({
-      id: created.id,
-      invocation_id: "manual-check-1",
-      source: "manual",
-      result: "ok",
-    });
+    expect(fireRows).toHaveLength(2);
+    expect(
+      fireRows.map((row) => JSON.parse(row.payload)).map(({ invocation_id }) => invocation_id).sort(),
+    ).toEqual(["manual-check-1", "manual-check-2"]);
+    for (const row of fireRows) {
+      expect(JSON.parse(row.payload)).toMatchObject({
+        id: created.id,
+        source: "manual",
+        result: "ok",
+      });
+    }
   });
 
   test("a fire claimed before an edit uses its snapshot while the edit changes future fires", async () => {

@@ -504,6 +504,7 @@ export interface Store {
     params?: Record<string, string>;
     spaceId?: string | null;
     createdBy: string;
+    createdAt?: number;
   }): Promise<SchedulerJob>;
   getSchedulerJob(id: string): Promise<SchedulerJob | null>;
   listSchedulerJobs(): Promise<SchedulerJob[]>;
@@ -1511,13 +1512,15 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     params?: Record<string, string>;
     spaceId?: string | null;
     createdBy: string;
+    createdAt?: number;
   }): Promise<SchedulerJob> {
     if (!isKnownSchedulerAction(input.action)) {
       throw new Error(`unknown scheduler action: ${input.action}`);
     }
     const params = input.params ?? {};
     const id = `sj_${randomUUID()}`;
-    const createdAt = Date.now();
+    const createdAt = input.createdAt ?? Date.now();
+    if (!Number.isSafeInteger(createdAt)) throw new Error("scheduler creation time must be a safe integer");
     const nextFireAt = nextCronFire(input.cron, createdAt);
     // SAFETY: INSERT ... RETURNING * always returns the freshly inserted scheduler_jobs row.
     const row = db

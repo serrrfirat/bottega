@@ -214,6 +214,7 @@ export function schedulerToolDefinitions(
           params: jobParams,
           spaceId,
           createdBy: actor,
+          createdAt: now(),
         });
         await audit.appendAudit({
           space_id: job.spaceId,
