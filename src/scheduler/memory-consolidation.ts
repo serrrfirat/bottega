@@ -15,9 +15,9 @@
  * unknown action instead of silently no-oping.
  */
 import { randomUUID } from "node:crypto";
-import { maintainMemory, type ConsolidationResult } from "../memory/consolidation";
+import { maintainMemory } from "../memory/consolidation";
 import type { Store } from "../store/db";
-import type { SchedulerAction, SchedulerActionContext } from "./types";
+import type { SchedulerAction } from "./types";
 
 const ACTION_NAME = "memory_consolidation" as const;
 
