@@ -607,7 +607,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
 });
 
 
-describe("MCP scheduler lifecycle caller surface (issue #308)", () => {
+describe("MCP scheduler lifecycle caller surface (issues #308, #322)", () => {
   test("drives update, pause, resume, and run-now through the durable runner with fake time", async () => {
     let now = Date.UTC(2026, 7, 21, 12, 34);
     const calls: Array<Record<string, string>> = [];
@@ -681,16 +681,26 @@ describe("MCP scheduler lifecycle caller surface (issue #308)", () => {
       expect(resumed.nextFireAt).toBe(nextCronFire(resumed.cron, now));
       const recurringNext = resumed.nextFireAt;
 
+      await expect(
+        callTool(h.client, "run_scheduler_job_now", {
+          id: created.id,
+          expected_revision: resumed.revision,
+          invocation_id: "   ",
+        }),
+      ).rejects.toThrow(/invocation_id/);
+
       const runArgs = {
         id: created.id,
         expected_revision: resumed.revision,
-        invocation_id: "mcp-manual-1",
+        invocation_id: "  mcp-manual-1  ",
       };
       await Promise.all([
         callTool(h.client, "run_scheduler_job_now", runArgs),
         callTool(h.client, "run_scheduler_job_now", runArgs),
       ]);
-      expect(await h.store.listSchedulerInvocations({ jobId: created.id })).toHaveLength(1);
+      expect((await h.store.listSchedulerInvocations({ jobId: created.id })).map(({ id }) => id)).toEqual([
+        "mcp-manual-1",
+      ]);
       await tickScheduler({
         store: h.store,
         audit: h.audit,
