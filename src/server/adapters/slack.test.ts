@@ -437,13 +437,15 @@ describe("buildPostMessageArgs", () => {
     });
   });
 
-  test("passes the visible-attachment container through when provided (issue #296)", () => {
+  test("a card-bearing post OMITS top-level text — the attachment owns the body (issue #296)", () => {
     const attachments = [{ color: "#5B7DB1", fallback: "working…", blocks: [{ type: "section", text: { type: "mrkdwn", text: "working…" } }] }];
-    expect(buildPostMessageArgs("slack:D123ABC", "working…", { attachments })).toEqual({
+    expect(buildPostMessageArgs("slack:D123ABC", undefined, { attachments })).toEqual({
       channel: "D123ABC",
-      text: "working…",
       attachments,
     });
+    // The `text` key is OMITTED, never an empty string — real Slack must not
+    // render a second, duplicated body above the attachment.
+    expect(buildPostMessageArgs("slack:D123ABC", undefined, { attachments })).not.toHaveProperty("text");
   });
 });
 
@@ -464,14 +466,15 @@ describe("buildUpdateMessageArgs", () => {
     });
   });
 
-  test("preserves the visible-attachment container across update (issue #296)", () => {
+  test("a card-bearing update OMITS top-level text — the attachment owns the body (issue #296)", () => {
     const attachments = [{ color: "#5B7DB1", fallback: "answer", blocks: [{ type: "section", text: { type: "mrkdwn", text: "answer" } }] }];
-    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", "answer", { attachments })).toEqual({
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", undefined, { attachments })).toEqual({
       channel: "D123ABC",
       ts: "1723700000.000100",
-      text: "answer",
       attachments,
     });
+    // The `text` key is OMITTED, never an empty string.
+    expect(buildUpdateMessageArgs("slack:D123ABC", "1723700000.000100", undefined, { attachments })).not.toHaveProperty("text");
   });
 });
 

@@ -669,8 +669,8 @@ describe("delivery-approval journey mechanism (issue #149)", () => {
 
 describe("org-settings approval journey mechanism (issue #151)", () => {
   test("SlackApprovalRouter posts the prompt with buttons and handleAction resolves the click (the journey's seam)", async () => {
-    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
-    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    const posted: Array<{ spaceId: string; text?: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text?: string }> = [];
     const router = new SlackApprovalRouter({
       adapter: {
         postMessage: async (spaceId, text, opts) => {
@@ -714,8 +714,8 @@ describe("org-settings approval journey mechanism (issue #151)", () => {
   });
 
   test("the settled outcome text satisfies the journey's APPROVAL_OUTCOME_PREFIX rewrite predicate (issue #242)", async () => {
-    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
-    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    const posted: Array<{ spaceId: string; text?: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text?: string }> = [];
     const router = new SlackApprovalRouter({
       adapter: {
         postMessage: async (spaceId, text, opts) => {
@@ -753,7 +753,7 @@ describe("org-settings approval journey mechanism (issue #151)", () => {
     // predicate (canary.ts:1382 waits on startsWith(APPROVAL_OUTCOME_PREFIX));
     // the prefix is the router's mrkdwn form, exported as the single source of
     // truth instead of a divergent copy in the canary.
-    expect(updated[0]!.text.startsWith(APPROVAL_OUTCOME_PREFIX)).toBe(true);
+    expect(updated[0]!.text!.startsWith(APPROVAL_OUTCOME_PREFIX)).toBe(true);
   });
 
   test("the policy gate round trip audits approval.requested → approval.resolved", async () => {
@@ -762,7 +762,7 @@ describe("org-settings approval journey mechanism (issue #151)", () => {
       const dm = h.slack.dmChannelId;
       const spaceId = `slack:${dm}`;
       await h.store.getOrCreateSpace({ platform: "slack", channel_id: dm });
-      const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
+      const posted: Array<{ spaceId: string; text?: string; blocks?: unknown[] }> = [];
       const router = new SlackApprovalRouter({
         adapter: {
           postMessage: async (spaceId, text, opts) => {

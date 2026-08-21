@@ -206,7 +206,7 @@ describe("multiplayer: approve/deny actor binding (issue #298)", () => {
       const requesterId = h.slack.user("requester")!;
       const memberId = h.slack.user("member")!;
 
-      const posted: Array<{ text: string; blocks?: unknown[] }> = [];
+      const posted: Array<{ text?: string; blocks?: unknown[] }> = [];
       const router = new SlackApprovalRouter({
         adapter: {
           postMessage: async (_s, text, opts) => {
@@ -222,7 +222,7 @@ describe("multiplayer: approve/deny actor binding (issue #298)", () => {
         { tool: "model_settings", args: { set: { reasoning_effort: "low" } }, spaceId, actor: requesterId },
       );
 
-      let postedPrompt: { text: string; blocks?: unknown[] } | undefined;
+      let postedPrompt: { text?: string; blocks?: unknown[] } | undefined;
       for (let i = 0; i < 200 && !postedPrompt; i++) {
         postedPrompt = posted[0];
         await Bun.sleep(25);

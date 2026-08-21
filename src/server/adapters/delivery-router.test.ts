@@ -23,14 +23,14 @@ const PR_URL = "https://github.com/acme/sandbox/pull/42";
 
 interface Posted {
   spaceId: string;
-  text: string;
+  text?: string;
   blocks?: unknown[];
 }
 
 interface Updated {
   spaceId: string;
   ts: string;
-  text: string;
+  text?: string;
 }
 
 function fakeAdapter(opts: { failUpdate?: boolean } = {}) {

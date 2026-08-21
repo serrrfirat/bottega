@@ -37,8 +37,6 @@ import {
   parseSearchResultRows,
   SEARCH_TABLE_MAX_ROWS,
   emptyResponseFallback,
-  dmCardNotificationText,
-  DM_CARD_NOTIFICATION_LIMIT,
   type ToolStepEvent,
 } from "./slack-turn-presenter";
 
@@ -57,8 +55,8 @@ interface RecordedAdapter {
   texts: Array<{ spaceId: string; ts: string; text: string }>;
   tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }>;
   stops: Array<{ spaceId: string; ts: string; text?: string }>;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }>;
-  updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }>;
+  posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }>;
+  updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
 }
 
@@ -75,8 +73,8 @@ function recordingAdapter(
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
   const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let tsSeq = 0;
   let startStreamRequests = 0;
@@ -796,7 +794,7 @@ describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => 
     await flush();
     expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
     // ...and a 🧠 line NEVER appears (no thinking ever arrived).
-    expect(rec.updates.some((u) => u.text.startsWith("🧠"))).toBe(false);
+    expect(rec.updates.some((u) => u.text?.startsWith("🧠") ?? false)).toBe(false);
   });
 
   test("long reasoning truncates to a ~200-char tail snippet (issue #193)", async () => {
@@ -822,7 +820,7 @@ describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => 
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
 
-    const line = rec.updates.at(-1)!.text;
+    const line = rec.updates.at(-1)!.text!;
     expect(line.startsWith("🧠 …")).toBe(true);
     // The snippet is capped at THINKING_SNIPPET_MAX characters...
     expect(line.length).toBe("🧠 ".length + THINKING_SNIPPET_MAX);
@@ -1263,7 +1261,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
     expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s · 🛠 2\/3 — Draft the section$/);
-    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+    expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(false);
 
     // Step 2 completes, step 3 runs: the indicator advances in place.
     const advanced = [
@@ -1302,8 +1300,8 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
 
-    expect(rec.updates.some((u) => u.text.includes("🛠"))).toBe(false);
-    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+    expect(rec.updates.some((u) => u.text?.includes("🛠") ?? false)).toBe(false);
+    expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(false);
   });
 
   test("a long turn posts the in-place plan message and edits it as steps complete (issue #228)", async () => {
@@ -1366,7 +1364,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
 
     expect(rec.posts).toHaveLength(1); // phrase only — no plan message
-    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(false);
+    expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(false);
   });
 
   test("empty phases are normal: no indicator, no plan message, never an error (issue #228)", async () => {
@@ -1383,7 +1381,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
 
     expect(rec.posts).toHaveLength(1);
-    expect(rec.updates.some((u) => u.text.includes("🛠"))).toBe(false);
+    expect(rec.updates.some((u) => u.text?.includes("🛠") ?? false)).toBe(false);
   });
 
   test("turn end leaves the plan message as the turn's record; the next long turn reuses it in place (issue #228)", async () => {
@@ -1402,7 +1400,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     presenter.onTurnEnd({ spaceId: "slack:C1" });
     await flush();
     expect(rec.posts).toHaveLength(2); // phrase edited to the reply; plan untouched
-    expect(rec.posts.some((p) => p.text.includes("🛠 Agent's plan"))).toBe(true);
+    expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(true);
 
     // A SECOND turn that plans again REUSES the same message (phrase+edit
     // mechanics): no stacked plan messages in the thread.
@@ -1426,7 +1424,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     // the plan was NOT posted again; the second plan edited the existing
     // message in place (phrase+edit mechanics).
     expect(rec.posts).toHaveLength(3);
-    expect(rec.posts.some((p) => p.text.includes("Plan again step"))).toBe(false);
+    expect(rec.posts.some((p) => p.text?.includes("Plan again step") ?? false)).toBe(false);
     expect(rec.updates).toContainEqual({
       spaceId: "slack:C1",
       ts: planTs,
@@ -1489,7 +1487,9 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     expect(rec.posts).toHaveLength(1); // still one card — no plan message post
     // The todo progress still surfaces on the single status line (folded in), as attachments.
     const lastStatus = rec.updates.at(-1)!;
-    expect(lastStatus.text).toMatch(/🛠 3\/3 \u2014 Push \+ PR$/);
+    expect(lastStatus.text).toBeUndefined(); // no top-level text on a card send
+    const lastStatusAttach = (lastStatus.opts!.attachments as { fallback: string }[])[0]!;
+    expect(lastStatusAttach.fallback).toMatch(/🛠 3\/3 \u2014 Push \+ PR$/);
     expect(lastStatus.opts?.attachments).toBeDefined();
 
     // The request completes by settling the SAME card, never a second post.
@@ -1554,10 +1554,19 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
 
-    expect(rec.updates.some((u) => u.text.startsWith("🧠"))).toBe(false);
-    expect(rec.updates.some((u) => u.text.includes("raw chain-of-thought"))).toBe(false);
-    // The card stays alive with a non-content status instead.
-    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking\u2026 \d+s$/);
+    // No card send carries top-level text; the reasoning must never appear
+    // in any attachment fallback/block either.
+    for (const u of rec.updates) expect(u.text).toBeUndefined();
+    const cardBodies = rec.updates.map((u) => {
+      const attach = (u.opts?.attachments as { fallback?: string; blocks?: unknown[] }[] | undefined)?.[0];
+      return `${attach?.fallback ?? ""} ${JSON.stringify(attach?.blocks ?? [])}`;
+    });
+    expect(cardBodies.some((b) => b.includes("🧠"))).toBe(false);
+    expect(cardBodies.some((b) => b.includes("raw chain-of-thought"))).toBe(false);
+    // The card stays alive with a non-content status instead — the elapsed
+    // phrase lives in the attachment's fallback, never top-level text.
+    const lastAttach = (rec.updates.at(-1)!.opts?.attachments as { fallback: string }[])[0]!;
+    expect(lastAttach.fallback).toMatch(/^Thinking\u2026 \d+s$/);
   });
 
   test("THE regression (issue #296): preamble + two grep rounds + final answer own ONE post; all updates target its ts; no preamble/thinking before settlement", async () => {
@@ -1579,8 +1588,8 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     await flush();
     // Still exactly one post; the preamble never reached Slack.
     expect(rec.posts).toHaveLength(1);
-    expect(rec.posts[0]!.text).not.toContain("Let me search");
-    expect(rec.updates.some((u) => u.text.includes("Let me search"))).toBe(false);
+    expect(rec.posts[0]!.text).toBeUndefined(); // the card's body lives in the attachment, never top-level
+    expect(rec.updates.some((u) => u.text !== undefined)).toBe(false); // every card send omits top-level text
 
     // Round 2: another grep tool round, then the FINAL answer — still no
     // second post, still no preamble leak.
@@ -1598,10 +1607,11 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     expect(rec.posts).toHaveLength(1); // exactly one post the whole request
     expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: "post-1" });
     const final = rec.updates.at(-1)!;
-    // Issue #296 (reopened): top-level text is the bounded notification
-    // preview — never a duplicate of the attachment body.
-    expect(final.text).toBe("Here is the answer");
-    expect(final.text).not.toContain("actions completed"); // the count lives in the attachment only
+    // Issue #296 (reopened): a card-bearing send carries NO top-level text —
+    // not a preview, not an empty string. The attachment alone owns the body.
+    expect(final.text).toBeUndefined();
+    // There is no top-level text at all — nothing can carry the count above the card.
+    expect(final.text).toBeUndefined();
     // The attachment carries the full answer + ONE subdued count line.
     expect(final.opts?.attachments).toBeDefined(); // final is a Slack-native visible container with accessible fallback
     const attach = (final.opts!.attachments! as { color: string; fallback: string; blocks: unknown[] }[])[0]!;
@@ -1669,8 +1679,7 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     await flush();
 
     const final = rec.updates.at(-1)!;
-    expect(final.text).toBe("Answer"); // top-level is the bounded preview, not a duplicate
-    expect(final.text).not.toContain("actions completed");
+    expect(final.text).toBeUndefined(); // card-bearing send: no top-level text, the attachment owns the body
     const attach = (final.opts!.attachments! as { fallback: string; blocks: unknown[] }[])[0]!;
     expect(attach.fallback).toBe("Answer\n\n3 actions completed");
     const blockTexts: string[] = [];
@@ -1706,10 +1715,12 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     presenter.onRequestSettled();
     await flush();
 
-    const final = rec.updates.at(-1)!.text;
-    expect(final).toBe("Done"); // zero actions completed — nothing counted
-    expect(final).not.toContain("✅");
-    expect(final).not.toContain("actions completed");
+    const final = rec.updates.at(-1)!;
+    expect(final.text).toBeUndefined(); // no top-level text on a card send
+    const finalAttach = (final.opts!.attachments as { fallback: string }[])[0]!;
+    expect(finalAttach.fallback).toBe("Done"); // zero actions completed — nothing counted
+    expect(finalAttach.fallback).not.toContain("✅");
+    expect(finalAttach.fallback).not.toContain("actions completed");
   });
 
   test("a replayed succeeded terminal for the SAME taskId is deduped — never double-counted (issue #296)", async () => {
@@ -1728,7 +1739,7 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     presenter.onRequestSettled();
     await flush();
 
-    expect(rec.updates.at(-1)!.text).toBe("Done"); // top-level preview, count not duplicated
+    expect(rec.updates.at(-1)!.text).toBeUndefined(); // no top-level text, count not duplicated
     const attach = (rec.updates.at(-1)!.opts!.attachments as { fallback: string }[])[0]!;
     expect(attach.fallback).toBe("Done\n\n1 action completed");
   });
@@ -1744,8 +1755,11 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     presenter.onRequestSettled();
     await flush();
 
-    expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs, text: "Plain answer" });
-    expect(rec.updates.at(-1)!.text).not.toContain("actions completed");
+    expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs });
+    expect(rec.updates.at(-1)!.text).toBeUndefined(); // no top-level text on a card send
+    // The full answer lives in the attachment fallback — no count line.
+    const noCountAttach = (rec.updates.at(-1)!.opts!.attachments as { fallback: string }[])[0]!;
+    expect(noCountAttach.fallback).toBe("Plain answer");
   });
 
   test("an error replaces the SAME card in place with the error text — no count line, no stale status (issue #296)", async () => {
@@ -1769,8 +1783,10 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     // The SAME card now holds the error — no second post, no count line.
     expect(rec.posts).toHaveLength(1);
     expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs });
-    expect(rec.updates.at(-1)!.text).toBe("provider exploded");
-    expect(rec.updates.at(-1)!.text).not.toContain("actions completed");
+    expect(rec.updates.at(-1)!.text).toBeUndefined(); // no top-level text on a card send
+    const errAttach = (rec.updates.at(-1)!.opts!.attachments as { fallback: string }[])[0]!;
+    expect(errAttach.fallback).toBe("provider exploded"); // the error text lives in the attachment
+    expect(errAttach.fallback).not.toContain("actions completed");
   });
 
   test("an empty completion buffers, then lands as the visible fallback at settlement (issue #296)", async () => {
@@ -1790,8 +1806,10 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
 
     expect(rec.posts).toHaveLength(1);
     expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs });
-    expect(rec.updates.at(-1)!.text).toBe(emptyResponseFallback("provider exploded"));
-    expect(rec.updates.at(-1)!.text).not.toContain("actions completed");
+    expect(rec.updates.at(-1)!.text).toBeUndefined(); // no top-level text on a card send
+    const fallbackAttach = (rec.updates.at(-1)!.opts!.attachments as { fallback: string }[])[0]!;
+    expect(fallbackAttach.fallback).toBe(emptyResponseFallback("provider exploded"));
+    expect(fallbackAttach.fallback).not.toContain("actions completed");
   });
 
   test("a threaded DM keeps the reaction-only flow — no status card, no buffering, no count line (issue #296 preserves #289)", async () => {
@@ -1813,28 +1831,16 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
 
   // ---------------------------------------------------------------------------
   // Issue #296 (reopened): real Slack renders TOP-LEVEL text above
-  // attachments, so passing the full body as both the top-level text AND
-  // inside the attachment duplicated every card in the client. The contract:
-  // a card-bearing send's top-level `text` is a bounded notification preview
-  // that never repeats the attachment body; the attachment keeps the full
-  // body (section + context), the color, and the plain-text fallback.
+  // attachments, so passing ANY non-empty body as both the top-level text
+  // AND inside the attachment duplicated every card in the client — even a
+  // short reply (bodies ≤80 chars previously passed through whole). The
+  // contract: a card-bearing send carries NO top-level text at all (the
+  // builder omits the key — never an empty string); the attachment owns the
+  // full body (section + context), the color, and the plain-text fallback,
+  // which IS the documented notification surface.
   // ---------------------------------------------------------------------------
 
-  test("dmCardNotificationText is a bounded, single-space preview — never the full body when long", () => {
-    const long = `${"word ".repeat(200)}end`;
-    const preview = dmCardNotificationText(long);
-    expect(preview.length).toBeLessThanOrEqual(DM_CARD_NOTIFICATION_LIMIT + 1); // +1 for the ellipsis
-    expect(preview.length).toBeLessThan(long.length); // never the full long body
-    expect(preview.endsWith("…")).toBe(true); // a bounded prefix, visibly truncated
-    // Short bodies pass through unchanged (harmless: no jarring duplication).
-    expect(dmCardNotificationText("Here is the answer")).toBe("Here is the answer");
-    // Whitespace collapses so a preview never leaks a newline gap.
-    expect(dmCardNotificationText("line one\nline two\nline three")).toBe("line one line two line three");
-    // It is never empty — notifications stay meaningful.
-    expect(preview).not.toBe("");
-  });
-
-  test("THE duplication regression (issue #296): final reply after two tool rounds posts ONE text that never repeats the attachment body", async () => {
+  test("THE duplication regression (issue #296): final reply after two tool rounds posts ONE text with NO top-level text — the attachment alone carries the body", async () => {
     const rec = recordingAdapter();
     const presenter = dmPresenter(rec);
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
@@ -1875,16 +1881,60 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     const context = attach.blocks.find((b) => (b as { type?: string }).type === "context") as { elements?: { text?: string }[] };
     expect(context.elements?.[0]?.text).toContain("2 actions completed");
 
-    // The TOP-LEVEL text never repeats the attachment body: it is the bounded
-    // preview, and the full answer is absent from it.
-    expect(final.text).toBe(dmCardNotificationText(answer));
-    expect(final.text).not.toContain("complete answer");
-    expect(final.text).not.toContain("duplicate");
+    // The TOP-LEVEL text never repeats the attachment body: it is OMITTED
+    // entirely for a card-bearing send — not a preview, not an empty string.
+    expect(final.text).toBeUndefined();
+    // Non-card fields still carry the message identity the builder needs.
+    expect(final.ts).toBe("post-1");
     // The count lives ONLY in the attachment — never duplicated top-level.
-    expect(final.text).not.toContain("actions completed");
+    expect(final.text).toBeUndefined();
   });
 
-  test("opening + rotating status cards: top-level text is the bounded preview, the attachment owns the status body", async () => {
+  test("THE short-reply regression (issue #296, reopened): a short final reply after tool rounds sends NO top-level text — the attachment alone carries body + fallback + color", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+
+    // The exact owner scenario: two tool rounds succeed, then a SHORT final
+    // reply (35 chars — under the old 80-char notification limit, so it used
+    // to pass through WHOLE as both top-level text AND the attachment body,
+    // duplicating it in real Slack).
+    for (const name of ["github.search_issues", "github.search_issues"]) {
+      const id = nextToolStepId();
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (read)"), label: humanizeToolName(name), status: "in_progress" });
+      presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (read)"), label: humanizeToolName(name), status: "complete", outcome: "succeeded" });
+    }
+    await flush();
+
+    const answer = "Yeah, I'm good. Ready when you are.";
+    presenter.onMessage({ spaceId: "slack:D1", text: answer });
+    presenter.onRequestSettled();
+    await flush();
+
+    // Exactly one post the whole request; the final lands as an in-place
+    // edit of that single card.
+    expect(rec.posts).toHaveLength(1);
+    const final = rec.updates.at(-1)!;
+    expect(final.ts).toBe("post-1");
+
+    // THE FIX: a SHORT body must NOT pass through as top-level text — it is
+    // omitted entirely (never an empty string). Previously (bodies ≤80
+    // chars) it went out as BOTH the top-level text AND the attachment body,
+    // so real Slack rendered the reply twice.
+    expect(final.text).toBeUndefined();
+    expect(rec.posts[0]!.text).toBeUndefined(); // the opening card also omits text
+
+    // The attachment is the SOLE carrier: full body + accessible fallback +
+    // the bordered color.
+    const attach = (final.opts!.attachments! as { color: string; fallback: string; blocks: unknown[] }[])[0]!;
+    expect(attach.color).toMatch(/^#/);
+    expect(attach.fallback).toBe(`${answer}\n\n2 actions completed`);
+    const sections = attach.blocks.filter((b) => (b as { type?: string }).type === "section");
+    expect((sections[0] as { text: { text: string } }).text.text).toBe(answer);
+  });
+
+  test("opening + rotating status cards: NO top-level text — the attachment alone owns the status body", async () => {
     vi.useFakeTimers();
     fakeTimers = true;
     const rec = recordingAdapter();
@@ -1892,17 +1942,19 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
     await flush();
 
-    // Opening post: top-level text is the status preview, not a duplicate.
+    // Opening post: a card-bearing send OMITS top-level text entirely —
+    // never a preview, never a duplicate of the status body.
     const post = rec.posts[0]!;
-    expect(post.text).toBe(dmCardNotificationText(THINKING_PHRASES[0]));
+    expect(post.text).toBeUndefined();
     // SAFETY: renderDmStatusCard always returns one attachment with color/fallback/blocks.
     const postAttach = (post.opts!.attachments! as { color: string; fallback: string; blocks: unknown[] }[])[0]!;
     expect(postAttach.fallback).toBe(THINKING_PHRASES[0]); // full status in the attachment fallback
+    expect(postAttach.color).toMatch(/^#/);
     // SAFETY: the card's first block is the single mrkdwn section for the status.
     expect((postAttach.blocks[0] as { type: string; text: { type: string; text: string } }).text.text).toBe(THINKING_PHRASES[0]);
 
-    // A long inline progress line: the top-level text is a bounded preview
-    // while the attachment holds the full line.
+    // A long inline progress line: the attachment holds the full line, and
+    // the in-place edit STILL omits top-level text (nothing duplicated).
     presenter.onTodoPhases({
       spaceId: "slack:D1",
       phases: [
@@ -1915,9 +1967,8 @@ describe("SlackTurnPresenter: top-level DM status card (issue #296)", () => {
     const update = rec.updates.at(-1)!;
     // SAFETY: renderDmStatusCard always returns one attachment with fallback/blocks.
     const updAttach = (update.opts!.attachments! as { fallback: string; blocks: unknown[] }[])[0]!;
-    // The top-level text is the bounded preview of the SAME status the
-    // attachment owns — never a second, different body.
-    expect(update.text).toBe(dmCardNotificationText(updAttach.fallback));
+    // No top-level text — the attachment is the ONLY carrier of the body.
+    expect(update.text).toBeUndefined();
     // The attachment still holds the full folded status line.
     expect(updAttach.fallback).toMatch(/🛠 1\/5 — in-progress item 0/);
     // SAFETY: the card's first block is the single mrkdwn section mirroring the fallback.

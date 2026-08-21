@@ -259,8 +259,8 @@ function fakeAdapter(
   } = {},
 ) {
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[]; attachments?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
@@ -1015,15 +1015,21 @@ describe("SpaceService output routing", () => {
     channel.onMessage({ spaceId: "slack:C1", text: "channel answer" });
     for (let i = 0; i < 3; i++) await Promise.resolve();
 
-    // DM: exactly ONE plain post (never a thread_ts); the final answer edits
-    // the same ts with the Slack-native status/final ATTACHMENT container
-    // (recorded opts.attachments — a lone section would render flat).
+    // DM: exactly ONE post (never a thread_ts); the card's body lives in the
+    // attachment, so the post carries NO top-level text (issue #296). The
+    // channel reply threads under the inbound (issue #40) and still carries
+    // plain text.
     expect(posts).toEqual([
-      { spaceId: "slack:D1", text: "Thinking…", opts: { attachments: expect.any(Array) } },
+      { spaceId: "slack:D1", text: undefined, opts: { attachments: expect.any(Array) } },
       { spaceId: "slack:C1", text: "Thinking…", opts: { threadTs: "9.9" } },
     ]);
     expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
-    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
+    // The DM final answer edits the SAME card in place with NO top-level
+    // text — the attachment's fallback owns the answer.
+    const dmFinal = updates.find((u) => u.spaceId === "slack:D1" && u.ts === "ts-1");
+    expect(dmFinal).toBeDefined();
+    expect(dmFinal!.text).toBeUndefined();
+    expect((dmFinal!.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("dm answer");
   });
 
   test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
@@ -1053,7 +1059,12 @@ describe("SpaceService output routing", () => {
     expect(streams.map((s) => s.spaceId)).toEqual(["slack:C1"]);
     expect(streams[0].opts.threadTs).toBe("9.9");
     expect(posts.filter((p) => p.spaceId === "slack:D1").every((p) => p.opts?.threadTs === undefined)).toBe(true);
-    expect(updates.some((u) => u.spaceId === "slack:D1" && u.ts === "ts-1" && u.text === "dm answer")).toBe(true);
+    // DM final answer: the card EDITS in place with NO top-level text — the
+    // attachment fallback owns the answer (issue #296).
+    const dmStreamFinal = updates.find((u) => u.spaceId === "slack:D1" && u.ts === "ts-1");
+    expect(dmStreamFinal).toBeDefined();
+    expect(dmStreamFinal!.text).toBeUndefined();
+    expect((dmStreamFinal!.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("dm answer");
     // The DM surface never opened a stream (plain phrase path throughout).
     expect(streams.filter((s) => s.spaceId === "slack:D1")).toHaveLength(0);
     // Channel: the panel opened (threaded under the inbound ts) and
@@ -1078,7 +1089,11 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     // the card to that error and never leave the request wedged.
     session.failPromptError = "provider exploded";
     await service.handleInboundMessage(msg({ spaceId: "slack:D1", ts: "2.2" }));
-    const dmError = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "provider exploded");
+    // The rejected request's error settles as the card's attachment fallback —
+    // no top-level text (issue #296: card sends omit it).
+    const dmError = updates.filter(
+      (u) => u.spaceId === "slack:D1" && (u.opts?.attachments as { fallback: string }[] | undefined)?.[0]?.fallback === "provider exploded",
+    );
     expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one card
     expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME card ts, no second post
 
@@ -1118,16 +1133,21 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     // BOTH queued messages drained as their own fresh requests, and EACH
     // rejected drained request surfaced the buffered error exactly once —
     // as a same-card edit, or (the reply-races-phrase-post edge) a fresh
-    // final post. This is the regression: a rejected drained DM must still
-    // settle + drain the NEXT queued message exactly once (issue #296).
-    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && u.text === "drained exploded");
-    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && p.text === "drained exploded");
+    // final post. The error lands as the card's attachment fallback, never
+    // top-level text (issue #296). This is the regression: a rejected
+    // drained DM must still settle + drain the NEXT queued message exactly
+    // once (issue #296).
+    const carryError = (o?: { attachments?: unknown[] }) => (o?.attachments as { fallback?: string }[] | undefined)?.[0]?.fallback === "drained exploded";
+    const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && carryError(u.opts));
+    const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && carryError(p.opts));
     expect(explodedUpdates.length + explodedPosts.length).toBe(2); // queued A + queued B
     // The queue fully drained and no request is wedged: a NEW fresh turn runs.
     session.failPromptError = undefined;
     await service.handleInboundMessage(msg({ spaceId: "slack:D1", text: "fresh after drain", ts: "4.4" }));
     expect(posts.filter((p) => p.spaceId === "slack:D1").length).toBeGreaterThanOrEqual(4); // fresh card, not queued/stuck
-    expect(updates.at(-1)!.text).toBe("Done."); // the fresh turn settled normally
+    const lastUpdate = updates.at(-1)!;
+    expect(lastUpdate.text).toBeUndefined(); // the fresh turn's card omits top-level text
+    expect((lastUpdate.opts!.attachments as { fallback: string }[])[0]!.fallback).toBe("Done."); // settled normally
   });
 });
 
@@ -1196,7 +1216,7 @@ describe("SpaceService DM request settlement (issue #296)", () => {
 
     // The per-turn fallback and the churn message both carry the remedy.
     for (const u of updates) {
-      if (u.text.includes("codex login")) {
+      if (u.text?.includes("codex login") ?? false) {
         expect(u.text).toContain("restart the server");
       }
     }
@@ -1719,13 +1739,13 @@ describe("SpaceService queue-by-default (issue #219)", () => {
       // The indicator appears on the current phrase line.
       vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
       await Promise.resolve();
-      expect(updates.some((u) => u.text.includes("+1 waiting"))).toBe(true);
+      expect(updates.some((u) => u.text?.includes("+1 waiting") ?? false)).toBe(true);
 
       // A second queued message bumps the count on the same line.
       await service.handleInboundMessage(msg({ text: "and another thing", ts: "3.3" }));
       vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
       await Promise.resolve();
-      expect(updates.some((u) => u.text.includes("+2 waiting"))).toBe(true);
+      expect(updates.some((u) => u.text?.includes("+2 waiting") ?? false)).toBe(true);
 
       // The running turn ends → ONE queued message drains as its own fresh
       // turn (own phrase, own reply, no streamingBehavior), in arrival order.
@@ -2526,13 +2546,13 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
       await flush();
     }
 
-    const nudged = updates.filter((u) => u.text.includes("first_run_wizard"));
+    const nudged = updates.filter((u) => u.text?.includes("first_run_wizard") ?? false);
     expect(nudged).toHaveLength(1);
     expect(nudged[0]!.text).toContain("broker_token");
     expect(nudged[0]!.text).toContain("git_pat");
     // 4 error updates total (each preceded by a phrase rotation): the first
     // carries the pointer, the rest are raw.
-    expect(updates.filter((u) => u.text.startsWith("boom"))).toHaveLength(4);
+    expect(updates.filter((u) => u.text?.startsWith("boom") ?? false)).toHaveLength(4);
     expect(audit.filter((a) => a.event_type === ADMIN_ONBOARDING_NUDGE_EVENT)).toHaveLength(1);
   });
 
@@ -2573,7 +2593,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     session.emit("error", { spaceId: "slack:C1", message: "boom 3" });
     await flush();
     expect(updates.at(-1)!.text).toBe("boom 3");
-    const nudged = updates.filter((u) => u.text.includes("first_run_wizard"));
+    const nudged = updates.filter((u) => u.text?.includes("first_run_wizard") ?? false);
     expect(nudged).toHaveLength(2);
   });
 
@@ -2591,7 +2611,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
       session.emit("error", { spaceId: "slack:C1", message: "boom" });
       await flush();
     }
-    expect(updates.filter((u) => u.text.includes("first_run_wizard"))).toHaveLength(0);
+    expect(updates.filter((u) => u.text?.includes("first_run_wizard") ?? false)).toHaveLength(0);
     // Each error replaces the pending phrase in place (clearing its ts), so
     // only the first turn_start rotates; the rest post fresh.
     expect(updates.filter((u) => u.text === "boom")).toHaveLength(3);

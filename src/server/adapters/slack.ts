@@ -93,14 +93,24 @@ export interface SlackAction {
 }
 
 export interface SlackAdapter {
-  /** Posts a message; resolves with the created message ts (undefined when the API omits it). */
+  /**
+   * Posts a message; resolves with the created message ts (undefined when the
+   * API omits it). `text` is OPTIONAL: when a send carries `blocks`/`attachments`
+   * the top-level `text` can be omitted and the attachment's `fallback` is the
+   * documented notification fallback (chat.postMessage allows text to be absent
+   * when attachments/blocks are present; issue #296).
+   */
   postMessage(
     spaceId: string,
-    text: string,
+    text?: string,
     opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
   ): Promise<string | undefined>;
-  /** Replaces the text of an already-posted message (chat.update); optional blocks/attachments mirror postMessage. */
-  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void>;
+  /**
+   * Replaces the text of an already-posted message (chat.update); optional
+   * blocks/attachments mirror postMessage. `text` is OPTIONAL for the same
+   * attachment-carried-surface reason as {@link postMessage} (issue #296).
+   */
+  updateMessage(spaceId: string, ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void>;
   /** Downloads a Slack file and returns its normalized metadata and bytes. */
   downloadFile(
     fileId: string,
@@ -428,20 +438,23 @@ export function renderSlackText(markdown: string): string {
 /**
  * Maps adapter arguments onto `chat.postMessage` arguments. Pure so the
  * outbound rendering is testable without a live Slack connection. Text is
- * rendered to Slack mrkdwn (issue #84) before it leaves the adapter.
+ * rendered to Slack mrkdwn (issue #84) before it leaves the adapter; when
+ * the send carries `attachments`/`blocks` the top-level `text` is OMITTED
+ * entirely (`undefined` — never an empty string) so real Slack never renders
+ * a second, duplicated body above the attachment card (issue #296).
  */
 export function buildPostMessageArgs(
   spaceId: string,
-  text: string,
+  text?: string,
   opts?: { threadTs?: string; blocks?: unknown[]; attachments?: unknown[] },
 ) {
   const args = {
     channel: channelFromSpaceId(spaceId),
-    text: renderSlackText(text),
+    ...(text !== undefined ? { text: renderSlackText(text) } : undefined),
     ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : undefined),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
     ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
-  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[]; attachments?: unknown[] };
+  } satisfies { channel: string; text?: string; thread_ts?: string; blocks?: unknown[]; attachments?: unknown[] };
   return args;
 }
 
@@ -455,16 +468,16 @@ export function buildPostMessageArgs(
 export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
-  text: string,
+  text?: string,
   opts?: { blocks?: unknown[]; attachments?: unknown[] },
 ) {
   return {
     channel: channelFromSpaceId(spaceId),
     ts,
-    text: renderSlackText(text),
+    ...(text !== undefined ? { text: renderSlackText(text) } : undefined),
     ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
     ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : undefined),
-  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[]; attachments?: unknown[] };
+  } satisfies { channel: string; ts: string; text?: string; blocks?: unknown[]; attachments?: unknown[] };
 }
 
 /**

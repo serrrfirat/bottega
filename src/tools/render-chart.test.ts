@@ -242,11 +242,11 @@ describe("render_chart execute: poster path posts exactly one block (issue #276)
 
 interface ChartAdapter {
   adapter: SlackAdapter;
-  posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
+  posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
 }
 
 function chartAdapter(): ChartAdapter {
-  const posts: Array<{ spaceId: string; text: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, opts) {
       posts.push({ spaceId, text, opts });

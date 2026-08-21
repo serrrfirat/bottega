@@ -37,19 +37,19 @@ import {
 
 interface Posted {
   spaceId: string;
-  text: string;
+  text?: string;
   blocks?: unknown[];
 }
 
 interface FakeAdapterHarness {
   adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
   posted: Posted[];
-  updated: { spaceId: string; ts: string; text: string }[];
+  updated: { spaceId: string; ts: string; text?: string }[];
 }
 
 function fakeAdapter(overrides?: { failPost?: boolean; onPosted?: () => void }): FakeAdapterHarness {
   const posted: Posted[] = [];
-  const updated: { spaceId: string; ts: string; text: string }[] = [];
+  const updated: { spaceId: string; ts: string; text?: string }[] = [];
   return {
     posted,
     updated,
@@ -322,7 +322,7 @@ describe("SlackApprovalRouter resolution", () => {
     // Third request pushes the first out: it resolves denied immediately.
     const third = router.request({ ...REQUEST, tool: "bash" });
     await expect(first).resolves.toEqual({ approved: false });
-    expect(updated.some((u) => u.text.includes("evicted"))).toBe(true);
+    expect(updated.some((u) => u.text?.includes("evicted") ?? false)).toBe(true);
     expect(router.pendingCount).toBe(2);
 
     // The evicted request's buttons no longer resolve anything.
@@ -554,7 +554,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
     } else {
       expect.unreachable("expected a block result");
     }
-    expect(updated.some((u) => u.text.includes("expired"))).toBe(true);
+    expect(updated.some((u) => u.text?.includes("expired") ?? false)).toBe(true);
     const resolved = await resolvedAuditRows();
     expect(resolved.at(-1)).toMatchObject({ tool: "bash", approved: false });
   });

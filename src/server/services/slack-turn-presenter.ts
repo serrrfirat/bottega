@@ -529,31 +529,6 @@ export interface DmCardAttachment {
 export const DM_CARD_COLOR = "#5B7DB1";
 
 /**
- * How many characters of a DM card's body may appear as the top-level
- * `text` (issue #296). Real Slack renders top-level text ABOVE attachments,
- * so repeating the full body there duplicates it in the client: a bordered
- * color-bar attachment copy plus the plain copy. A SHORT bounded preview
- * keeps push notifications readable (Slack uses top-level text for the
- * mobile/ping surface) while the attachment owns the full body.
- */
-export const DM_CARD_NOTIFICATION_LIMIT = 80;
-
-/**
- * The top-level `text` for any card-bearing DM send (issue #296): a bounded,
- * whitespace-collapsed notification preview of the body. The attachment —
- * NOT this text — carries the full body as nested Block Kit plus the
- * plain-text `fallback`. Keeping a single space here (never an empty
- * string) preserves Slack's notification/ping surface without duplicating
- * the body in the client. Bodies already shorter than the limit pass
- * through unchanged.
- */
-export function dmCardNotificationText(body: string): string {
-  const single = body.replace(/\s+/g, " ").trim();
-  if (single.length <= DM_CARD_NOTIFICATION_LIMIT) return single;
-  return `${single.slice(0, DM_CARD_NOTIFICATION_LIMIT).trimEnd()}…`;
-}
-
-/**
  * The live status card for a top-level DM (issue #296): a single attachment
  * carrying the trusted status line (the rotating thinking phrase or the live
  * progress line) as nested Block Kit. The same mrkdwn is the accessible
@@ -1115,19 +1090,21 @@ export class SlackTurnPresenter {
     const actionsCompleted = reply !== undefined ? this.#completedActionsCount : 0;
     if (pendingTs !== undefined) {
       const { attachments } = renderDmFinalCard(text, actionsCompleted);
-      // Issue #296: top-level text is a bounded notification preview — the
-      // full answer already lives in the attachment; repeating it above the
-      // attachment would render it twice in real Slack.
+      // Issue #296: card-bearing messages NEVER carry the body as top-level
+      // text — Slack renders top-level text ABOVE the attachment, so any
+      // non-empty value would duplicate the answer in the client. The
+      // attachment's `fallback` is the documented notification/ping surface;
+      // the builder omits the `text` key entirely (never an empty string).
       console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
       void this.adapter
-        .updateMessage(this.spaceId, pendingTs, dmCardNotificationText(text), { attachments })
+        .updateMessage(this.spaceId, pendingTs, undefined, { attachments })
         .catch((err) => {
           console.error(`[slack-turn-presenter] failed to update DM reply in ${this.spaceId}:`, err);
         });
     } else {
       const { attachments } = renderDmFinalCard(text, actionsCompleted);
       void this.adapter
-        .postMessage(this.spaceId, dmCardNotificationText(text), { ...this.replyOpts(), attachments })
+        .postMessage(this.spaceId, undefined, { ...this.replyOpts(), attachments })
         .then((ts) => {
           if (ts !== undefined) console.log(`presenter: final reply posted/edited ${this.spaceId} ${ts}`);
         })
@@ -1369,10 +1346,10 @@ export class SlackTurnPresenter {
     // Issue #296: a top-level DM's opening card is a Slack ATTACHMENT (a
     // documented visible container) — the trusted status line nested as
     // Block Kit with the same mrkdwn as the accessible fallback text. The
-    // final answer replaces this same timestamp. Top-level text stays a
-    // bounded notification preview (never a duplicate of the status body).
+    // final answer replaces this same timestamp. Top-level text is OMITTED
+    // (never a duplicate of the status body; the builder drops the key).
     if (this.#dmTopLevel) {
-      return this.adapter.postMessage(this.spaceId, dmCardNotificationText(openingText), { ...opts, attachments: renderDmStatusCard(openingText) });
+      return this.adapter.postMessage(this.spaceId, undefined, { ...opts, attachments: renderDmStatusCard(openingText) });
     }
     return this.adapter.postMessage(this.spaceId, openingText, opts);
   }
@@ -1380,10 +1357,12 @@ export class SlackTurnPresenter {
   /**
    * One text chunk to the turn's message. Phrase: chat.update in place
    * (optional attachment container for the top-level DM status card, issue
-   * #296). Streaming: chat.appendStream markdown_text. Not async in the
-   * base for the same microtask-timing reason as {@link openTurn}.
+   * #296). Streaming: chat.appendStream markdown_text. `text` is OPTIONAL —
+   * a card-bearing update omits it (the attachment owns the body) while a
+   * plain update passes the body. Not async in the base for the same
+   * microtask-timing reason as {@link openTurn}.
    */
-  protected sendTextChunk(ts: string, text: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
+  protected sendTextChunk(ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
     return this.adapter.updateMessage(this.spaceId, ts, text, opts);
   }
 
@@ -1654,7 +1633,7 @@ export class SlackTurnPresenter {
     // plain-text rotation.
     if (this.#dmTopLevel) {
       const phrase = this.#nextPhrase();
-      return this.sendTextChunk(pendingTs, dmCardNotificationText(phrase), { attachments: renderDmStatusCard(phrase) });
+      return this.sendTextChunk(pendingTs, undefined, { attachments: renderDmStatusCard(phrase) });
     }
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
   }
@@ -1897,7 +1876,7 @@ export class SlackTurnPresenter {
       // status card (trusted status line nested as Block Kit); channels/
       // threads keep the plain-text in-place update.
       if (this.#dmTopLevel) {
-        await this.sendTextChunk(entry.ts, dmCardNotificationText(entry.text), { attachments: renderDmStatusCard(entry.text) });
+        await this.sendTextChunk(entry.ts, undefined, { attachments: renderDmStatusCard(entry.text) });
       } else {
         await this.sendTextChunk(entry.ts, entry.text);
       }
@@ -2087,13 +2066,16 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
   }
 
   /** Interim reply text appends to the stream (markdown_text) on the cadence. */
-  protected async sendTextChunk(ts: string, text: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
+  protected async sendTextChunk(ts: string, text?: string, opts?: { blocks?: unknown[]; attachments?: unknown[] }): Promise<void> {
     // #streamTs guards the per-turn surface: a turn whose stream never
     // opened (missing recipient, request rejection, or a boot fallback)
     // edits the phrase in place — appendStream can never target a plain
     // post, and a per-turn fallback must not flip streaming off for the
-    // boot (issue #287).
-    if (!this.#streamMode || this.#streamTs === undefined) return super.sendTextChunk(ts, text, opts);
+    // boot (issue #287). A card-bearing send (issue #296: `text` omitted
+    // because the attachment owns the body) has nothing to append — edit
+    // the message in place so the attachment lands, never appending
+    // `undefined` markdown_text.
+    if (!this.#streamMode || this.#streamTs === undefined || text === undefined) return super.sendTextChunk(ts, text, opts);
     try {
       await this.adapter.appendText(this.spaceId, ts, text);
     } catch (err) {

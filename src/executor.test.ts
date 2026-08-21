@@ -1359,8 +1359,8 @@ describe("credential hygiene", () => {
 describe("delivery approval round trip (issue #149)", () => {
   /** Server-side fakes: the poller's message surface + the resolver's rewrite surface. */
   function serverFakes() {
-    const posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
-    const updated: Array<{ spaceId: string; ts: string; text: string }> = [];
+    const posted: Array<{ spaceId: string; text?: string; blocks?: unknown[] }> = [];
+    const updated: Array<{ spaceId: string; ts: string; text?: string }> = [];
     return {
       posted,
       updated,
@@ -1375,8 +1375,8 @@ describe("delivery approval round trip (issue #149)", () => {
       },
     } satisfies {
       adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
-      posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }>;
-      updated: Array<{ spaceId: string; ts: string; text: string }>;
+      posted: Array<{ spaceId: string; text?: string; blocks?: unknown[] }>;
+      updated: Array<{ spaceId: string; ts: string; text?: string }>;
     };
   }
 
