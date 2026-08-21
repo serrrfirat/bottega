@@ -301,6 +301,9 @@ describe("omp sdk agent driver", () => {
         "resume_scheduler_job",
         "run_scheduler_job_now",
         "delete_scheduler_job",
+        // Read-only operator visibility (#161/#320).
+        "audit_search",
+        "explain_policy",
       ].sort(),
     );
     expect(SPACE_AGENT_TOOLS).not.toContain("write");
