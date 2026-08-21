@@ -59,6 +59,67 @@ unit tests over real SQLite — nothing hits a live LLM, Slack, or GitHub. The
 live-Slack QA canary (issue #79) boots the real stack against a real
 workspace — see [features.md](features.md#live-slack-qa-canary-issue-79).
 
+## Org policy (`config.yml`, issue #319)
+
+The org policy floor is the tool-call gate shared by every surface (the
+in-process agent, the policy extension, the headless MCP server). It maps
+each tool to `allow`, `deny`, or `prompt` (ask a human). A fresh deployment
+**ships a committed default `config.yml`** so it is usable out of the box:
+read-only tools run immediately, and every write/exec tool is
+approval-gated (routes to the approval router — an Approve button / prompt —
+before it runs).
+
+**Where it loads from** (`src/policy/config.ts`, `loadOrgConfig`):
+
+1. `BOTTEGA_CONFIG_DIR`/`config.yml` — when that env var is set.
+2. The repo-root `config.yml` — the default (this is the shipped file).
+3. No file at all — a fail-closed default policy where **every** tool denies
+   (nothing is allowed unless explicitly configured).
+
+The shipped default keeps the gate intact — it only `allow`s read-only tools
+and routes every write/exec tool through human approval. Spaces can only
+**tighten** this floor via their `spaces.policy_json` overlay; the org settings
+blob (`settings` tool, issue #67) can override org-floor keys.
+`BOTTEGA_CONFIG_DIR` and an absent file resolve the same floor as documented
+below; here the shipped file is the source of truth.
+
+**Semantics** (the shared decision table): `allow` runs the tool; `deny`
+blocks it; `prompt` routes ask-human. Exec-tier tools (`bash`, `task`,
+`write_space_skill`, `connect_extension`, scheduler mutations, …) ask a human
+**even when action is `allow`** — they never fail open. Write-tier tools
+(`write`, `edit`, `memory.save`, …) only ask a human when their action is
+`prompt`. Unknown/typo'd tool names and any malformed YAML fail the whole
+policy closed (every call denies) — never a silent allow.
+
+**What the shipped default does**:
+
+```yaml
+tools:
+  read: allow            # + glob, grep, session_search, memory.search,
+  # list_todos, list_work_items, object.get, object.list, search_web
+  write: prompt          # + edit, memory.save, object.create, and every
+  # other write/exec tool listed as `prompt` (approval-gated)
+  unknown: deny          # any tool without an entry above is denied
+```
+
+**Tightening for a deployment** — to restrict a tool org-wide, flip its
+action from `allow` to `deny` (block) or `prompt` (require a human); a space
+overlay can only make it stricter. To let a gated tool run **without** a
+human prompt, set its action to `allow` **and** add it to
+`approvals.always_approve` (auto-approve only honors `allow`). Never set
+`unknown: allow` — that fails the fail-closed guarantee for unknown tools.
+
+Verify with the loader, not by eye:
+
+```bash
+bun -e 'import {loadOrgConfig,decidePolicyCall} from "./src/policy/config.ts"; const p=loadOrgConfig(); console.log(decidePolicyCall(p,"read"), decidePolicyCall(p,"write"), decidePolicyCall(p,"some_new_tool"))'
+```
+
+prints `{decision:"allow",…}` for `read`, `{decision:"ask-human",…}` for
+`write`, and `{decision:"deny",…}` for an unknown tool. Deleting `config.yml`
+(back to the absent-file fail-closed default) makes `read` print deny too —
+that behavior is unchanged; shipping the file is the fix.
+
 ## Proactive layer (scheduler, digests, reflections, KB)
 
 The durable scheduler runs registered actions on five-field UTC cron

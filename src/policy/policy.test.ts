@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -326,6 +326,75 @@ memory:
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("committed default config.yml: read tools allow, write/exec gate, unknown denies (issue #319)", () => {
+    const repoRoot = resolve(import.meta.dir, "../..");
+    const shipped = loadOrgConfig(repoRoot);
+    expect(shipped.ok).toBe(true);
+    // unknownAction stays deny: any tool in the tier table without an entry
+    // above resolves to deny (and unknown names fail the policy closed).
+    expect(shipped.unknownAction).toBe("deny");
+    expect(toolAction(shipped, "read")).toBe("allow");
+    // Every read-tier tool in the SHIPPED default is allowed (issue #319).
+    for (const t of [
+      "read",
+      "glob",
+      "grep",
+      "session_search",
+      "memory.search",
+      "list_todos",
+      "list_work_items",
+      "object.get",
+      "object.list",
+      "search_web",
+    ]) {
+      expect(resolveTier(t)).toBe("read");
+      expect(decidePolicyCall(shipped, t).decision, `${t}`).toBe("allow");
+    }
+    // Write/exec tools are approval-gated (ask-human), never silently run.
+    for (const t of [
+      // write-tier
+      "write",
+      "edit",
+      "memory.save",
+      "object.create",
+      "model_settings",
+      "use_model",
+      "settings",
+      "catalog_browser",
+      "stack_health",
+      "first_run_wizard",
+      "kb_ingest",
+      "complete_work_item",
+      // exec-tier
+      "bash",
+      "task",
+      "create_work_item",
+      "work_item_cancel",
+      "write_space_skill",
+      "connect_extension",
+      "register_extension",
+      "settings_org_write",
+      "create_scheduler_job",
+      "delete_scheduler_job",
+    ]) {
+      expect(decidePolicyCall(shipped, t).decision, `${t}`).toBe("ask-human");
+    }
+    // A tool with no entry (unknown to the tier table) is denied.
+    expect(decidePolicyCall(shipped, "some_new_tool").decision).toBe("deny");
+  });
+
+  test("a structural parse failure of the shipped config.yml fails closed (issue #319)", () => {
+    const repoRoot = resolve(import.meta.dir, "../..");
+    const shippedText = readFileSync(join(repoRoot, "config.yml"), "utf8");
+    // Any tab in the YAML is a structural error (they silently change
+    // indentation semantics), so force one into the shipped text: the whole
+    // policy must fail closed — every call denies, whatever `tools:` says.
+    const text = `${shippedText}\n\t# tab-indented line forces a parse failure`;
+    const parsed = parseOrgConfigYaml(text);
+    expect(parsed.ok).toBe(false);
+    expect(decidePolicyCall(parsed, "read").decision).toBe("deny");
   });
 
   test("agent section must be a block mapping", () => {

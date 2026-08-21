@@ -1,0 +1,68 @@
+# Org policy floor (issue #319): the committed default so a fresh
+# deployment is usable out of the box instead of fail-closing on every
+# read tool.
+#
+# Loader precedence (src/policy/config.ts, loadOrgConfig):
+#   1. `BOTTEGA_CONFIG_DIR`/`config.yml`  (when the env var is set)
+#   2. repo-root `config.yml`            (this file; the default)
+#   3. absent file                         -> fail-closed default (ALL deny)
+# spaces tighten this floor via `spaces.policy_json` (per-space overlay,
+# only ever tightens); the org-settings blob overrides the file floor for
+# supported keys (issue #67). This file is the BASE: a space overlay can
+# only make policy stricter, never more permissive.
+#
+# Semantics (shared decision table, decidePolicyCall):
+#   - read-tier `allow`  -> allow (run)
+#   - write-tier `prompt`-> ask-human (routed to the approval router)
+#   - exec-tier `prompt` -> ask-human (never fails open on exec)
+#   - unknown tool        -> deny (unknownAction, below)
+#   - malformed file      -> the whole policy fails closed (every call denies)
+#
+# Tightening: an operator removes a read `allow` here (or flips it to
+# `deny`/`prompt`) to restrict a tool deployment-wide. To auto-approve a
+# write/exec tool WITHOUT a human prompt, flip its action to `allow` AND
+# add it to `approvals.always_approve` (auto-approve only honors `allow`;
+# see setup.md "Org policy"). Never set unknownAction to allow.
+tools:
+  # READ-tier tools — allowed so the agent can read files, search
+  # sessions/memory, list work, and browse objects out of the box.
+  read: allow
+  glob: allow
+  grep: allow
+  session_search: allow
+  memory.search: allow
+  list_todos: allow
+  list_work_items: allow
+  object.get: allow
+  object.list: allow
+  search_web: allow
+  # WRITE-tier tools — approval-gated: every call routes ask-human.
+  write: prompt
+  edit: prompt
+  memory.save: prompt
+  object.create: prompt
+  model_settings: prompt
+  use_model: prompt
+  settings: prompt
+  catalog_browser: prompt
+  stack_health: prompt
+  first_run_wizard: prompt
+  kb_ingest: prompt
+  complete_work_item: prompt
+  # EXEC-tier tools — approval-gated: ask-human even when action is allow
+  # (never fail open on exec); `prompt` keeps that explicit. Org connects,
+  # scheduler mutations, work-item creation, and skill writes all need a
+  # human approval before they run.
+  bash: prompt
+  task: prompt
+  create_work_item: prompt
+  work_item_cancel: prompt
+  write_space_skill: prompt
+  connect_extension: prompt
+  register_extension: prompt
+  settings_org_write: prompt
+  create_scheduler_job: prompt
+  delete_scheduler_job: prompt
+  # unknownAction: a tool with no entry above (a name not yet in the tier
+  # table, or a new tool shipped later) is DENIED. Never weaken this.
+  unknown: deny

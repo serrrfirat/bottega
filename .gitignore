@@ -10,4 +10,9 @@ certs/
 .worktrees/
 
 # Deployment-local policy floor (fail-closed default when absent).
+# The repo-root default config.yml (issue #319) is committed via the
+# negation below so a fresh deployment is usable out of the box; operators
+# can still drop their own config.yml over it (or point BOTTEGA_CONFIG_DIR
+# elsewhere) without tracking deployment-local edits.
 config.yml
+!config.yml
