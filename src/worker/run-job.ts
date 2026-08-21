@@ -441,7 +441,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       volumeStateRoot: options.volumeStateRoot,
       hostStore: options.hostStore,
       memoryProvider: options.memoryProvider,
-      askpassScript: ctx.cfg.askpassScript,
+      askpassScript: options.askpassScript ?? ctx.cfg.askpassScript,
       image,
       network,
       dns: options.dns,

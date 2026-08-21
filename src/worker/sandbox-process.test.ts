@@ -18,7 +18,7 @@ import {
 import { JOB_FAILED_EVENT } from "../store/audit-events";
 import { memoryDenyProvider, MAX_RPC_FRAME_BYTES, connectStoreRpc, JobStoreRpcServer } from "./store-rpc";
 import { jobScopeFromEnvelope } from "./scoped-store";
-import { resolveMemoryProvider } from "../server/memory-provider";
+import { resolveMemoryProvider, type ResolvedMemoryProvider } from "../server/memory-provider";
 
 const dirs: string[] = [];
 const stores: Store[] = [];
@@ -292,6 +292,21 @@ class FakeDocker {
     if (!run?.proc) throw new Error("expected a `docker run` launch — the child runner never issues one");
     return run.proc;
   }
+  /**
+   * Awaits the supervisor's `docker run` launch with a bounded timeout. The
+   * runner reaches `docker.launch` only after the async store-RPC listen
+   * resolves (a real I/O operation), so callers must poll for the observable
+   * launch instead of reading the fake synchronously.
+   */
+  async awaitLaunch(timeoutMs = 5_000): Promise<FakeProc> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const run = this.launches.find((l) => l.args.includes("run"));
+      if (run?.proc) return run.proc;
+      if (Date.now() >= deadline) throw new Error("timed out waiting for a `docker run` launch");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
   /** docker-kill launches issued by the supervisor. */
   killLaunches(): string[][] {
     return this.launches.filter((l) => l.args.includes("kill")).map((l) => l.args);
@@ -307,22 +322,30 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     if (!job) throw new Error("expected claimed job");
     const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
     const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 1_000), job, runner);
-    const run = fake.runLaunch();
-    const runArgs = fake.launches.find((l) => l.args.includes("run"))!.args;
-    run.respond();
+    // Await the observable launch: the runner reaches `docker.launch` only
+    // after the async store-RPC listen resolves, so never read the fake
+    // synchronously. Always settle `pending` (bounded) so no post-test
+    // closed-DB work survives an assertion failure.
+    try {
+      const run = await fake.awaitLaunch();
+      const runArgs = fake.launches.find((l) => l.args.includes("run"))!.args;
+      run.respond();
 
-    const outcome = await pending;
-    expect(outcome.state).toBe("done");
-    // Distinct container identity: a disposable (`--rm`) container with a
-    // unique --name and an inner PID that differs from the host server.
-    expect(runArgs).toContain("--rm");
-    expect(runArgs).toContain("run");
-    const nameIndex = runArgs.indexOf("--name");
-    expect(nameIndex).toBeGreaterThan(-1);
-    expect(runArgs[nameIndex + 1]).toMatch(/bottega-sandbox/);
-    expect(runArgs[nameIndex + 1]).toContain("docker-job");
-    expect(run.innerPid).not.toBe(process.pid);
-    expect(fake.completedRuns).toContain(run.innerPid);
+      const outcome = await pending;
+      expect(outcome.state).toBe("done");
+      // Distinct container identity: a disposable (`--rm`) container with a
+      // unique --name and an inner PID that differs from the host server.
+      expect(runArgs).toContain("--rm");
+      expect(runArgs).toContain("run");
+      const nameIndex = runArgs.indexOf("--name");
+      expect(nameIndex).toBeGreaterThan(-1);
+      expect(runArgs[nameIndex + 1]).toMatch(/bottega-sandbox/);
+      expect(runArgs[nameIndex + 1]).toContain("docker-job");
+      expect(run.innerPid).not.toBe(process.pid);
+      expect(fake.completedRuns).toContain(run.innerPid);
+    } finally {
+      await Promise.race([pending.catch(() => {}), new Promise((r) => setTimeout(r, 2_000))]);
+    }
   });
 
   test("timeout issues a docker kill and fails closed", async () => {
@@ -344,17 +367,22 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     if (!job) throw new Error("expected claimed job");
     const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
     const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 40), job, runner);
-    // Register the container so a lease-abort docker kill can tear it down.
-    fake.runLaunch();
-    // Once the container is "running", lose the lease: the renewal abort must
-    // docker-kill the container tree and fail the job loudly.
-    await store.failJob(job.id);
+    try {
+      // Await the observable launch so the abort listener + container are
+      // registered before the lease is lost (never read the fake synchronously).
+      await fake.awaitLaunch();
+      // Once the container is "running", lose the lease: the renewal abort must
+      // docker-kill the container tree and fail the job loudly.
+      await store.failJob(job.id);
 
-    const outcome = await pending;
-    expect(outcome.state).toBe("blocked");
-    expect(fake.killLaunches().length).toBeGreaterThan(0);
-    const failed = await store.listAudit({ event_type: JOB_FAILED_EVENT });
-    expect(failed.some((row) => JSON.parse(row.payload).error === "sandbox lease lost")).toBe(true);
+      const outcome = await pending;
+      expect(outcome.state).toBe("blocked");
+      expect(fake.killLaunches().length).toBeGreaterThan(0);
+      const failed = await store.listAudit({ event_type: JOB_FAILED_EVENT });
+      expect(failed.some((row) => JSON.parse(row.payload).error === "sandbox lease lost")).toBe(true);
+    } finally {
+      await Promise.race([pending.catch(() => {}), new Promise((r) => setTimeout(r, 2_000))]);
+    }
   });
 
   test("bounded IPC overflow is a crash, never a completion", async () => {
@@ -565,6 +593,46 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       server.close();
     }
   });
+
+  test("the resolved memory provider (readonly capabilities/backend) is observable after ready()", async () => {
+    const { store, dir } = freshStore();
+    const job: WorkerJob = { id: "job_mem", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    const scope = jobScopeFromEnvelope(job);
+    const rpcDir = join(dir, "rpc");
+    mkdirSync(rpcDir, { recursive: true });
+    // A supervisor provider whose resolved identity differs from the client's
+    // default, so passing it through ready() is provable by observation.
+    const supervisorProvider: ResolvedMemoryProvider = {
+      backend: "mem0",
+      capabilities: { consolidation: "auto", digestPruning: "auto" },
+      save: async () => {
+        throw new Error("unused in this test");
+      },
+      search: async () => [],
+      pruneDigests: async () => {
+        throw new Error("unused in this test");
+      },
+    };
+    const server = JobStoreRpcServer.create(store, scope, rpcDir, {
+      memoryProvider: supervisorProvider,
+    });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      // Before ready(), the getter still exposes the unresolved default.
+      expect(session.memoryProvider.backend).toBe("sqlite");
+      await session.ready();
+      // After ready(), the getter reflects the supervisor-reported values —
+      // never a stale by-value snapshot.
+      expect(session.memoryProvider.backend).toBe("mem0");
+      expect(session.memoryProvider.capabilities.consolidation).toBe("auto");
+      expect(session.memoryProvider.capabilities.digestPruning).toBe("auto");
+      expect(session.memoryProvider.save).toBeTypeOf("function");
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -666,14 +734,35 @@ describe("production docker mounts are per-job exact subpaths (no shared roots, 
     });
     const result = await runner(job, runnerContext(store, "", dir, 5_000));
     expect(result.exitCode).toBe(0);
-    const joined = runArgs.join(" ");
-    // No raw DB file mount and no whole shared-root bind mount (no `-v host:cont` short mounts).
-    expect(joined).not.toMatch(/bottega\.db/);
-    expect(joined).not.toContain("-v ");
-    // The per-job RPC socket dir is mounted via an exact volume-subpath.
-    expect(joined).toContain("--mount type=volume");
-    expect(joined).toContain("volume-subpath=");
-    // A whole-volume mount (type=volume without volume-subpath) never appears.
-    expect(joined).not.toContain("type=volume,src=data");
+    // No raw DB file appears anywhere in the run args (never a dbPath mount)
+    // and no whole shared-root bind mount (`-v host:cont` short mounts).
+    expect(runArgs.join(" ")).not.toMatch(/bottega\.db/);
+    expect(runArgs.join(" ")).not.toContain("-v ");
+    // Parse each `--mount` arg (key=value pairs) and assert every volume
+    // mount is an exact per-job subpath: a nonempty `volume-subpath` and a
+    // destination that is not the whole volume root / a raw DB file.
+    const mountArgs = runArgs
+      .map((arg, i) => (arg === "--mount" ? runArgs[i + 1] : undefined))
+      .filter((v): v is string => v !== undefined);
+    expect(mountArgs.length).toBeGreaterThan(0);
+    let volumeMounts = 0;
+    for (const mount of mountArgs) {
+      const fields = new Map<string, string>();
+      for (const kv of mount.split(",")) {
+        const eq = kv.indexOf("=");
+        if (eq === -1) continue;
+        fields.set(kv.slice(0, eq), kv.slice(eq + 1));
+      }
+      if (fields.get("type") === "volume") {
+        volumeMounts += 1;
+        // A whole-volume mount (no exact subpath) is a shared-root leak.
+        expect(fields.get("volume-subpath") ?? "").not.toBe("");
+        const dst = fields.get("dst") ?? "";
+        expect(dst).not.toMatch(/bottega\.db/);
+        // The destination must be a subpath (never the bare volume root).
+        expect(dst.length).toBeGreaterThan(1);
+      }
+    }
+    expect(volumeMounts).toBeGreaterThan(0);
   });
 });
