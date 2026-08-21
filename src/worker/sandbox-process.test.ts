@@ -24,7 +24,7 @@ function tempDir(): string {
   return dir;
 }
 
-function freshStore(): { store: Store; dbPath: string; dir: string } {
+function freshStore() {
   const dir = tempDir();
   const dbPath = join(dir, "store.db");
   const store = createStore(dbPath);
@@ -55,7 +55,9 @@ function deps(store: Store, dbPath: string): ExecutorDeps {
   return {
     store,
     dbPath,
+    // SAFETY: These boundary tests never enter a parent-process memory-provider path.
     memoryProvider: undefined as never,
+    // SAFETY: These boundary tests never enter a parent-process agent-driver path.
     driver: undefined as never,
   };
 }

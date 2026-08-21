@@ -26,7 +26,7 @@ export type JobResourceCaps = {
 };
 
 /** Documented worker defaults per kind (see module doc). */
-const DEFAULT_CAPS: Record<OrgCapKind, JobCapKnob> = {
+const DEFAULT_CAPS = {
   git: { timeoutMinutes: 30, memoryMb: 256 },
   extension: { timeoutMinutes: 15, memoryMb: 512 },
   kb: { timeoutMinutes: 30, memoryMb: 256 },
@@ -35,7 +35,7 @@ const DEFAULT_CAPS: Record<OrgCapKind, JobCapKnob> = {
   // per-pool model call is the long pole, so the ceiling is a memory-heavy
   // 30-minute window, never the git fallback.
   scheduled: { timeoutMinutes: 30, memoryMb: 512 },
-};
+} satisfies Record<OrgCapKind, JobCapKnob>;
 
 /**
  * Resolves the effective caps for a job kind: the org override (if present
@@ -43,8 +43,9 @@ const DEFAULT_CAPS: Record<OrgCapKind, JobCapKnob> = {
  * below a sane floor are ignored, never applied.
  */
 export function resolveKindCaps(kind: WorkerJobKindLike, orgCaps: OrgJobCaps | null): JobResourceCaps {
-  const base = DEFAULT_CAPS[kind as OrgCapKind] ?? DEFAULT_CAPS.git;
-  const override = orgCaps?.[kind as OrgCapKind];
+  const capKind = isOrgCapKind(kind) ? kind : "git";
+  const base = DEFAULT_CAPS[capKind];
+  const override = orgCaps?.[capKind];
   const timeoutSeconds = override?.timeoutMinutes;
   const memoryMb = override?.memoryMb;
   const timeoutMinutes = timeoutSeconds !== undefined && timeoutSeconds >= 1 ? timeoutSeconds : base.timeoutMinutes;
@@ -52,6 +53,10 @@ export function resolveKindCaps(kind: WorkerJobKindLike, orgCaps: OrgJobCaps | n
     timeoutMs: timeoutMinutes * 60_000,
     memoryMb: memoryMb !== undefined && memoryMb >= 32 ? memoryMb : base.memoryMb,
   };
+}
+
+function isOrgCapKind(kind: WorkerJobKindLike): kind is OrgCapKind {
+  return Object.hasOwn(DEFAULT_CAPS, kind);
 }
 
 // Avoid a type import cycle with the envelope: the kind union is the one

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,7 +12,7 @@ import { createStore, type Store } from "../store/db";
 import { INGEST_POLL_DISPATCH_EVENT, WORK_ITEM_CREATED_EVENT } from "../store/audit-events";
 import { consumeOutboxWatermarked } from "../store/outbox";
 import type { OutboxRow } from "../store/outbox";
-import { resolveKindCaps } from "./caps";
+import { resolveKindCaps, type JobResourceCaps } from "./caps";
 import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } from "./scoped-store";
 import type { WorkerJob } from "./envelope";
 import type { SchedulerAction, SchedulerActionName, SchedulerActionRegistry } from "../scheduler/types";
@@ -30,6 +31,17 @@ import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
 
 const stores: Store[] = [];
 const dirs: string[] = [];
+
+const failedAuditPayloadSchema = z
+  .object({
+    id: z.string(),
+    kind: z.string(),
+    error: z.string(),
+    sandbox_crash: z.boolean().optional(),
+  })
+  .passthrough();
+
+const TEST_CAPS = { timeoutMs: 60_000, memoryMb: 64 } satisfies JobResourceCaps;
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
@@ -69,13 +81,11 @@ describe("job-scoped store facade (issue #101)", () => {
     expect(() => scoped.transitionWorkItem("item_other", "open", "working")).toThrow(ScopedStoreAccessError);
 
     // The sandbox may not enqueue, claim, or sweep — that is the boss loop's
-    // job. The facade's get-trap replaces these with loud denies at RUNTIME,
-    // so the test calls them through a narrow cast that accepts any shape.
-    const sandbox = scoped as unknown as {
-      enqueueJob: (input: object) => never;
-      claimNextJob: (leaseMs: number) => never;
-      markStaleWorkItems: (...args: unknown[]) => never;
-    };
+    // job. The facade's get-trap replaces these with loud denies at RUNTIME.
+    // SAFETY: createJobScopedStore proxies the original Store and exposes these
+    // boss-only names solely as throwing deny functions; the test invokes only
+    // those functions and assumes no other hidden Store member.
+    const sandbox = scoped as Pick<Store, "enqueueJob" | "claimNextJob" | "markStaleWorkItems">;
     expect(() => sandbox.enqueueJob({ id: "j", kind: "git", payload: {} })).toThrow(ScopedStoreAccessError);
     expect(() => sandbox.claimNextJob(60_000)).toThrow(ScopedStoreAccessError);
     expect(() => sandbox.markStaleWorkItems()).toThrow(ScopedStoreAccessError);
@@ -204,8 +214,9 @@ describe("ingest_poll split: worker fetches, server dispatch+post stays in-proce
     const deps: ExecutorDeps = {
       sandboxRunner: inProcessSandboxRunner(),
       store,
-      // SAFETY: ingest_poll jobs never touch memory or a driver — stubs.
+      // SAFETY: ingest_poll execution never enters a memory-provider path.
       memoryProvider: undefined as never,
+      // SAFETY: ingest_poll execution never enters an agent-driver path.
       driver: undefined as never,
       orgConfigDir: join(dir, "config"),
       transcriptDir: join(dir, "transcripts"),
@@ -240,6 +251,9 @@ describe("ingest_poll split: worker fetches, server dispatch+post stays in-proce
     // The worker's fetch/validate leg wrote its ingest_poll outbox row.
     // Inspect WITHOUT advancing the watermark — the seam must be the one
     // that consumes it.
+    // SAFETY: This fixed SELECT returns the declared outbox columns, and the
+    // outbox schema stores payload as text; get may return null only when the
+    // preceding executor run failed, which the assertions intentionally expose.
     const pollRow = store
       .getDb()
       .query("SELECT id, kind, space, payload, status AS status FROM outbox WHERE kind = 'ingest_poll'")
@@ -274,6 +288,8 @@ describe("ingest_poll split: worker fetches, server dispatch+post stays in-proce
 });
 
 function jobStatus(store: Store, id: string): Promise<string | null> {
+  // SAFETY: This fixed SELECT aliases the text status column as s; get is null
+  // only when no matching worker_jobs row exists.
   const row = store.getDb().query("SELECT status AS s FROM worker_jobs WHERE id = ?").get(id) as { s: string } | null;
   return Promise.resolve(row?.s ?? null);
 }
@@ -295,11 +311,19 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): P
 
 /** Minimal deps: only the store matters to the supervisor + fail-closed legs under test. */
 function minDeps(store: Store): ExecutorDeps {
-  return { store, memoryProvider: undefined as never, driver: undefined as never };
+  return {
+    store,
+    // SAFETY: These supervisor and fail-closed paths never enter a memory-provider operation.
+    memoryProvider: undefined as never,
+    // SAFETY: These supervisor and fail-closed paths never enter an agent-driver operation.
+    driver: undefined as never,
+  };
 }
 
 /** A job-claim loop config: only jobLeaseMs is consulted by runJobInSandbox. */
 function supervisorCfg(): ExecutorConfig {
+  // SAFETY: The exercised supervisor branches read only jobLeaseMs; the
+  // scheduled body ignores config, and git-body tests stop before processItem.
   return { jobLeaseMs: 60_000 } as ExecutorConfig;
 }
 
@@ -320,10 +344,10 @@ async function claimedRunningJob(store: Store): Promise<{ job: WorkerJob; itemId
   return { job, itemId: item.id };
 }
 
-/** Reads the job.failed audit rows as parsed payloads (the durable evidence). */
-async function failedAuditPayloads(store: Store): Promise<Array<Record<string, unknown>>> {
+/** Reads and validates job.failed audit payloads as durable evidence. */
+async function failedAuditPayloads(store: Store) {
   const rows = await store.listAudit({ event_type: JOB_FAILED_EVENT });
-  return rows.map((row) => JSON.parse(row.payload));
+  return rows.map((row) => failedAuditPayloadSchema.parse(JSON.parse(row.payload)));
 }
 
 describe("boss-loop supervisor exit-code contract (issue #302)", () => {
@@ -430,7 +454,7 @@ describe("runJobSandboxBody fail-closed legs (issue #302)", () => {
       leaseUntil: 0,
       status: "queued",
     };
-    await expect(runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job)).rejects.toThrow(
+    await expect(runJobSandboxBody(minDeps(store), supervisorCfg(), TEST_CAPS, job)).rejects.toThrow(
       /payload must be \{ workItemId \}/,
     );
     // Fail-closed: nothing was claimed, completed, or released.
@@ -461,7 +485,7 @@ describe("runJobSandboxBody fail-closed legs (issue #302)", () => {
       leaseUntil: 0,
       status: "queued",
     };
-    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), TEST_CAPS, job);
 
     // The late sandbox observes the settlement and completes as a no-op so
     // the server still sees the completion via its own outbox row.
@@ -498,7 +522,7 @@ describe("runJobSandboxBody fail-closed legs (issue #302)", () => {
       leaseUntil: 0,
       status: "queued",
     };
-    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), TEST_CAPS, job);
 
     expect(result).toEqual({ exitCode: SANDBOX_EXIT_REQUEUE, signal: null, timedOut: false });
     expect((await store.getWorkItem(item.id))?.state).toBe("working");
@@ -517,7 +541,7 @@ describe("runJobSandboxBody fail-closed legs (issue #302)", () => {
       leaseUntil: 0,
       status: "queued",
     };
-    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), TEST_CAPS, job);
 
     expect(result).toEqual({ exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false });
     expect(await jobStatus(store, job.id)).toBe("failed");
@@ -583,7 +607,7 @@ describe("unstickWorkItem (issue #302)", () => {
 
 describe("runScheduledJobBody (issue #302)", () => {
   function actionDeps(store: Store, actions: SchedulerActionRegistry): ExecutorDeps {
-    return { ...minDeps(store), scheduledActions: actions } as ExecutorDeps;
+    return { ...minDeps(store), scheduledActions: actions };
   }
 
   function scheduledJob(action: string, params: Record<string, string> | undefined = undefined): WorkerJob {
@@ -614,7 +638,7 @@ describe("runScheduledJobBody (issue #302)", () => {
     const result = await runScheduledJobBody(
       actionDeps(store, registry),
       supervisorCfg(),
-      {} as never,
+      TEST_CAPS,
       scheduledJob("memory_consolidation", { spaceId: "s" }),
     );
 
@@ -635,7 +659,7 @@ describe("runScheduledJobBody (issue #302)", () => {
     // (job.failed via the boss loop) — never a silent no-op, never a fake
     // completion.
     await expect(
-      runScheduledJobBody(actionDeps(store, registry), supervisorCfg(), {} as never, scheduledJob("standup_digest")),
+      runScheduledJobBody(actionDeps(store, registry), supervisorCfg(), TEST_CAPS, scheduledJob("standup_digest")),
     ).rejects.toThrow(/unknown action "standup_digest"/);
     // Fail-closed: no completion signal, nothing ran.
     expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
@@ -659,7 +683,7 @@ describe("runScheduledJobBody (issue #302)", () => {
     const result = await runScheduledJobBody(
       actionDeps(store, registry),
       supervisorCfg(),
-      {} as never,
+      TEST_CAPS,
       scheduledJob("memory_consolidation"),
     );
     expect(result.exitCode).toBe(SANDBOX_EXIT_FAILED);
@@ -684,7 +708,7 @@ describe("runScheduledJobBody (issue #302)", () => {
     const policyResult = await runScheduledJobBody(
       actionDeps(policyStore, policyRegistry),
       supervisorCfg(),
-      {} as never,
+      TEST_CAPS,
       scheduledJob("memory_consolidation"),
     );
     expect(policyResult.exitCode).toBe(SANDBOX_EXIT_FAILED);
@@ -711,7 +735,9 @@ describe("issue #302: malformed git envelope fails closed through the real claim
     const deps: ExecutorDeps = {
       store,
       sandboxRunner: inProcessSandboxRunner(),
+      // SAFETY: A malformed git envelope fails before any memory-provider operation.
       memoryProvider: undefined as never,
+      // SAFETY: A malformed git envelope fails before any agent-driver operation.
       driver: undefined as never,
       orgConfigDir: join(dir, "config"),
       transcriptDir: join(dir, "transcripts"),
