@@ -408,7 +408,9 @@ describe("production docker sandbox boundary (#101/#338)", () => {
 // required no-skip lane), while local runs skip it. Proves a genuine
 // container with a distinct inner PID and zero parent-secret leakage.
 const dockerSocketPresent = existsSync("/var/run/docker.sock") || process.env.BOTTEGA_SANDBOX_DOCKER_SOCKET !== undefined;
-describe("real-container Docker sandbox lane (#101/#338)", { skip: !dockerSocketPresent || process.env.BOTTEGA_RUN_INTEGRATION !== "1" }, () => {
+describe.skipIf(!dockerSocketPresent || process.env.BOTTEGA_RUN_INTEGRATION !== "1")(
+  "real-container Docker sandbox lane (#101/#338)",
+  () => {
   test("a real container launches with a distinct inner PID and no parent secrets", async () => {
     const { dir } = freshStore();
     const probe = await probeDockerSandbox({
@@ -534,7 +536,7 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
   });
 
   test("ingest-poll watermark RPC round-trips through the supervisor (store retained there)", async () => {
-    const { store, server } = makeRpc();
+    const { server } = makeRpc();
     await server.listen();
     const session = connectStoreRpc(server.socketPath);
     try {

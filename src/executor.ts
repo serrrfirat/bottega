@@ -109,6 +109,8 @@ import type { Skill, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 import { resolveWorkItemSkills } from "./server/skills";
+import type { ResolvedMemoryProvider } from "./server/memory-provider";
+import type { OrgSettings } from "./store/org-settings";
 import { defaultWorkspaceRoot, WorkspaceLifecycle } from "./worker/workspace-lifecycle";
 
 /** The session driver "message" event payload: { spaceId, text }. */
@@ -350,7 +352,7 @@ export async function bootExecutorRuntime(opts: {
    */
   store?: Store;
   /** Injected scoped memory provider for the sandbox child (no shared-db handle). */
-  memoryProvider?: import("../server/memory-provider").ResolvedMemoryProvider;
+  memoryProvider?: ResolvedMemoryProvider;
   /**
    * Injected, already-scoped org settings for the sandbox child (issue
    * #101): avoids synchronous store reads over the async RPC socket when

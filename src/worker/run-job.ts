@@ -227,7 +227,6 @@ export async function probeChildProcessSandbox(options: {
 const CONTAINER_WORKSPACES_ROOT = "/workspaces";
 const CONTAINER_TRANSCRIPTS_ROOT = "/transcripts";
 const CONTAINER_RPC_DIR = "/rpc";
-const CONTAINER_RPC_SOCKET = "/rpc/store.sock";
 /** The git credential dir (PAT + askpass) mounted exactly for git-authorized jobs. */
 const CONTAINER_GIT_SECRETS_DIR = "/app/data/secrets";
 const CONTAINER_GIT_TOKEN_FILE = "/app/data/secrets/github-pat";
@@ -386,7 +385,7 @@ export async function probeDockerSandbox(options: {
 }): Promise<SandboxProbe> {
   const docker = options.requireDocker ? requireDockerClient() : optionalDockerClient();
   if (docker === null) throw new Error("sandbox unavailable: docker CLI or socket is not available (no container fallback)");
-  const response = await launchDockerContainer(docker, { mode: "probe" }, {
+  const response = await launchDockerContainer(docker, { version: SANDBOX_PROTOCOL_VERSION, mode: "probe" }, {
     workspacesDir: options.workspacesDir,
     transcriptDir: options.transcriptDir,
     volume: options.volume,

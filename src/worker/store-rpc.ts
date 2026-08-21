@@ -528,9 +528,10 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
     },
   };
 
-  // capabilities/backend are read synchronously by job bodies and from an
-  // async probe; expose a mutable holder filled by ready().
-  const memoryProvider: ResolvedMemoryProvider = {
+  // capabilities/backend are fetched from the supervisor when ready() resolves
+  // (always awaited before job bodies read the provider) and the final provider
+  // is then built with correct readonly values — never mutated in place.
+  let memoryProvider: ResolvedMemoryProvider = {
     backend: "sqlite",
     capabilities: { consolidation: "explicit", digestPruning: "explicit" },
     save: (input) => call<MemoryEntry>("memory", "save", [input]),
@@ -547,8 +548,13 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
           call<ResolvedMemoryProvider["capabilities"]>("memory", "capabilities", []),
           call<string>("memory", "backend", []),
         ]);
-        memoryProvider.capabilities = capabilities;
-        memoryProvider.backend = backend === "mem0" ? "mem0" : "sqlite";
+        memoryProvider = {
+          backend: backend === "mem0" ? "mem0" : "sqlite",
+          capabilities,
+          save: (input) => call<MemoryEntry>("memory", "save", [input]),
+          search: (query) => call<MemoryEntry[]>("memory", "search", [query]),
+          pruneDigests: (spaceId, keep) => call<number>("memory", "pruneDigests", [spaceId, keep]),
+        };
         ready.resolve();
       } catch (error) {
         ready.reject(error instanceof Error ? error : new Error(String(error)));
