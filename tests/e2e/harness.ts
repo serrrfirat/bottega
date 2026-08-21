@@ -52,7 +52,7 @@ import { createAudit } from "../../src/policy/audit";
 import type { ApprovalRouter } from "../../src/policy/approval-router";
 import { loadOrgConfig, loadSpacePolicy, type PolicyConfig } from "../../src/policy/config";
 import type { MemoryProvider } from "../../src/memory/types";
-import { createSqliteMemoryProvider, pruneDigestMemories } from "../../src/memory/sqlite";
+import { createSqliteMemoryProvider } from "../../src/memory/sqlite";
 import { workItemToolDefinitions } from "../../src/tools/work-items";
 import { memoryToolDefinitions } from "../../src/tools/memory";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
@@ -1002,9 +1002,6 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     orgPolicy,
     responseModeFor,
     memoryProvider,
-    digestPrune: (spaceId, keep) => {
-      pruneDigestMemories(store.getDb(), spaceId, keep);
-    },
     idleTimeoutMs: cfg.idleTimeoutMs ?? 30_000,
     transcriptDir,
     // Live sessions register here (issue #64) so use_model can reach them.
