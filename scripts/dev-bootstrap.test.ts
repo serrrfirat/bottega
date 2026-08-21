@@ -389,13 +389,18 @@ describe("development bootstrap caller contract (#311)", () => {
     expect(h.output.join("\n")).not.toContain("broker-token");
   });
 
-  test("local dev opts the server into the existing Keychain seam so the shared proxy-seed leg can resolve a Keychain-held near key (#333)", async () => {
-    // Hermetic caller test: drive the REAL dev composition seam (runBootstrapCli
-    // "dev") with fake commands/probes; the observed contract is the env handed
-    // to the dev server process. The shared proxy-seed leg (keychainReaderFromEnv
-    // in boot-secrets.ts) reads BOTTEGA_KEYCHAIN_SEED off that env: without the
-    // opt-in it returns null for bottega-near/bottega-opencode and the boot
-    // prints "proxy near.secret REMOVED — no near key anywhere (fail closed)".
+  test("local dev seeds a Keychain-held near key through the real proxy-seed resolution (#333)", async () => {
+    // Hermetic caller test of the OBSERVABLE contract, not just flag plumbing:
+    // drive the REAL dev composition seam (runBootstrapCli "dev") with fake
+    // commands/probes, capture the env handed to the dev server process, then
+    // feed that EXACT env into the REAL boot-secret/proxy-seed resolution
+    // (syncProxyCredentialsFromEnv) with a FAKE keychain. The regression the
+    // test pins: after #311 made dev.sh a thin launcher, local dev no longer
+    // surfaced the Keychain-held bottega-near, so the real sync printed
+    // "proxy near.secret REMOVED — no near key anywhere (fail closed)" despite
+    // `security find-generic-password -s bottega-near -w` succeeding. Local dev
+    // must opt the server into the shared Keychain leg so a Keychain-held near
+    // value actually lands in near.secret — not merely carry a flag.
     const config = fixture();
     const h = harness();
     createReadyFiles(config);
@@ -405,7 +410,32 @@ describe("development bootstrap caller contract (#311)", () => {
     expect(await runBootstrapCli(["dev"], h.deps, config, {})).toBe(0);
     expect(h.execs).toHaveLength(1);
     expect(h.execs[0]!.argv).toEqual(["bun", "run", "src/server/index.ts"]);
-    expect(h.execs[0]!.env.BOTTEGA_KEYCHAIN_SEED).toBe("1");
+    const serverEnv = h.execs[0]!.env;
+    // The shared Keychain leg (keychainReaderFromEnv in boot-secrets.ts) is
+    // gated on this flag: it is the local-dev opt-in that makes the resolution
+    // below consult bottega-near instead of leaving the leg inert.
+    expect(serverEnv.BOTTEGA_KEYCHAIN_SEED).toBe("1");
+
+    // Drive the REAL proxy-seed resolution against that exact server env with a
+    // fake keychain (hermetic: never touches a real Keychain). A Keychain-held
+    // bottega-near must become a written near.secret in the proxy secrets dir.
+    const { syncProxyCredentialsFromEnv } = await import("../src/extensions/proxy-seed");
+    const secretsDir = join(config.dataDir, "proxy-secrets");
+    mkdirSync(secretsDir, { recursive: true });
+    await syncProxyCredentialsFromEnv({
+      env: serverEnv,
+      secretsDir,
+      fetchVault: async () => new Map(),
+      readKeychain: async (service) => (service === "bottega-near" ? "keychain-near-35" : null),
+      // The composed server env carries the live proxy-control pair
+      // (BOTTEGA_PROXY_CONTROL_URL/TOKEN) so the real sync would reload the
+      // running proxy (and 401 against a foreign token) — stub the reload only,
+      // keeping the near-secret WRITE the object of this assertion hermetic.
+      fetchReload: async () => new Response("{}", { status: 200 }),
+      log: () => {},
+    });
+    expect(readFileSync(join(secretsDir, "near.secret"), "utf8")).toBe("keychain-near-35");
+    expect(statSync(join(secretsDir, "near.secret")).mode & 0o777).toBe(0o600);
   });
 
   test("the Keychain opt-in is local-only and never reaches the setup/detached environment (fail closed)", async () => {
