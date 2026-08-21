@@ -102,6 +102,15 @@ export interface SchedulerActionContext {
    * it fail loudly when absent.
    */
   consolidationModelCall?: ConsolidationModelCall;
+  /**
+   * The disposable-job-container seam for SQLite memory consolidation
+   * (issue #101): when the action runs inside a stateless job container (no
+   * SQLite handle), the container wires this to the supervisor's RPC-routed
+   * `maintainMemory` (LLM leg remoted back into the worker). Absent (real
+   * store / in-process / child-process lanes), the action falls back to
+   * `maintainMemory(ctx.store.getDb(), modelCall)`.
+   */
+  runMemoryConsolidation?: () => Promise<ConsolidationResult[]>;
 }
 
 /** JSON-serializable result emitted by the worker-only consolidation action. */

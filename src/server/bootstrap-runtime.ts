@@ -40,6 +40,7 @@
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createStore, type Store } from "../store/db";
+import type { OrgSettings } from "../store/org-settings";
 import { createAudit, type AuditModule } from "../policy/audit";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadOrgPolicy, type PolicyConfig } from "../policy/config";
@@ -90,6 +91,34 @@ export interface BootstrapRuntimeDeps {
   configDir?: string;
   /** DB path; defaults to "data/bottega.db". */
   dbPath?: string;
+  /**
+   * Sandbox-child isolation seam (issue #101): when set, the supervisor's
+   * job-scoped store is injected instead of opening `dbPath` — the job
+   * container never touches the shared bottega.db bytes. `dbPath` must be
+   * omitted when `store` is supplied (the container opens no SQLite file).
+   */
+  store?: Store;
+  /**
+   * Injected, already-scoped org settings for the sandbox-child boot
+   * (issue #101): the supervisor's parsed {@link OrgSettings} blob, so the
+   * child's `loadOrgPolicy`/secret-resolver never need a synchronous store
+   * read over the async RPC socket. Ignored when `store` is a real store
+   * (sync reads work there).
+   */
+  orgSettings?: OrgSettings | null;
+  /** Injected, already-scoped memory provider for the sandbox child (no
+   * shared-db memory handle); mutually exclusive with opening the store. */
+  memoryProvider?: ResolvedMemoryProvider;
+  /**
+   * Sandbox-child isolation (#101/#338): when true, the boot SKIPS
+   * {@link mergeRuntimeRegistry} (a GLOBAL store write via
+   * upsertRuntimeExtension). The job container's store RPC allowlist denies
+   * that write, so the child boot must not attempt it — the supervisor's
+   * process already holds the merged registry. Only compiled/pinned
+   * extensions remain visible in the child (no runtime-registered ones).
+   * Defaults false (existing roots keep merging).
+   */
+  skipRuntimeRegistryMerge?: boolean;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (binding: McpBinding) => Transport;
   /**
@@ -135,9 +164,9 @@ export interface BootstrapRuntime {
  * memory pool per process, the #172 regression).
  */
 export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<BootstrapRuntime> {
-  const store = createStore(deps.dbPath);
+  const store = deps.store ?? createStore(deps.dbPath);
   const audit = createAudit(store);
-  const orgPolicy = loadOrgPolicy(store, deps.configDir);
+  const orgPolicy = loadOrgPolicy(store, deps.configDir, deps.orgSettings);
   const registry = createExtensionRegistry(
     deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
   );
@@ -145,8 +174,12 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // the pinned seeds + the persisted runtime-registered set into the LIVE
   // registry, so resolve/list surfaces include both. A pinned id wins; a
   // malformed runtime row is a loud skip, never a boot failure (the #205
-  // posture).
-  await mergeRuntimeRegistry(store, registry);
+  // posture). The sandbox child SKIPS this merge: it is a global store write
+  // the job container's RPC allowlist must deny (its supervisor process
+  // already holds the merged registry), and only the child's isolate sees it.
+  if (deps.skipRuntimeRegistryMerge !== true) {
+    await mergeRuntimeRegistry(store, registry);
+  }
   const surfaceAuthProvider = async (manifest: ExtensionManifest): Promise<OAuthClientProvider | undefined> => {
     if (manifest.kind !== "mcp" || manifest.credentialSchema.type !== "oauth") return undefined;
     const credential = (await store.listExtensionCredentials(manifest.id)).at(-1);
@@ -180,7 +213,7 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     ...deps.boundary,
   };
   if (boundaryOpts.resolver === undefined && boundaryOpts.resolveSecret === undefined) {
-    boundaryOpts.resolver = secretResolverFromSettings(store.getOrgSettings());
+    boundaryOpts.resolver = secretResolverFromSettings(deps.orgSettings ?? store.getOrgSettings());
   }
   const boundary = createSecretFileBoundary(boundaryOpts);
   // The runtime's router is a per-call dependency: resolve the supplier at
@@ -204,6 +237,14 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   // the deployment fallback, unset keeps SQLite on the store database —
   // identical in every root (the MCP root's historical SQLite hardwire is
   // the #172 divergence this replaces).
-  const memoryProvider = resolveMemoryProvider(store.getOrgSettings(), store.getDb());
+  const memoryProvider =
+    deps.memoryProvider ??
+    (deps.store !== undefined
+      ? (() => {
+          throw new Error(
+            "bootstrapRuntime: a sandbox child injecting a scoped store must also inject its scoped memoryProvider (no shared-db memory handle)",
+          );
+        })()
+      : resolveMemoryProvider(store.getOrgSettings(), store.getDb()));
   return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary, surfaceAuthProvider };
 }

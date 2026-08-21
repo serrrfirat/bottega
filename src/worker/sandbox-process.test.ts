@@ -16,6 +16,9 @@ import {
   type SandboxRunnerContext,
 } from "./run-job";
 import { JOB_FAILED_EVENT } from "../store/audit-events";
+import { memoryDenyProvider, MAX_RPC_FRAME_BYTES, connectStoreRpc, JobStoreRpcServer } from "./store-rpc";
+import { jobScopeFromEnvelope } from "./scoped-store";
+import { resolveMemoryProvider } from "../server/memory-provider";
 
 const dirs: string[] = [];
 const stores: Store[] = [];
@@ -302,7 +305,7 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     await store.enqueueJob({ id: "docker-job", kind: "scheduled", payload: { action: "memory_consolidation" } });
     const job = await store.claimNextJob(1_000);
     if (!job) throw new Error("expected claimed job");
-    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
     const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 1_000), job, runner);
     const run = fake.runLaunch();
     const runArgs = fake.launches.find((l) => l.args.includes("run"))!.args;
@@ -326,7 +329,7 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     const { store, dbPath, dir } = freshStore();
     const fake = new FakeDocker();
     const job: WorkerJob = { id: "docker-timeout", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
-    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
     const result = await runner(job, runnerContext(store, dbPath, dir, 60));
 
     expect(result.timedOut).toBe(true);
@@ -339,7 +342,7 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     await store.enqueueJob({ id: "docker-lease", kind: "scheduled", payload: { action: "memory_consolidation" } });
     const job = await store.claimNextJob(100);
     if (!job) throw new Error("expected claimed job");
-    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
     const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 40), job, runner);
     // Register the container so a lease-abort docker kill can tear it down.
     fake.runLaunch();
@@ -379,7 +382,7 @@ describe("production docker sandbox boundary (#101/#338)", () => {
         return { stdin: new Writable({ write(_c, _e, cb) { cb(); } }), stdout: new Readable({ read() {} }), stderr: new Readable({ read() {} }), exit: new Promise<{ code: null; signal: null }>(() => {}), kill: () => {} };
       },
     };
-    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: overflowing });
+    const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: overflowing });
     const result = await runner(job, runnerContext(store, dbPath, dir, 2_000));
 
     expect(result.exitCode).toBeNull();
@@ -391,7 +394,7 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     const broken = new FakeDocker();
     broken.broken = true;
     const job: WorkerJob = { id: "docker-missing", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
-    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: broken });
+    const runner = createDockerSandboxRunner({ hostStore: store, memoryProvider: memoryDenyProvider, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: broken });
     const result = await runner(job, runnerContext(store, dbPath, dir, 2_000));
 
     expect(result.exitCode).toBeNull();
@@ -409,7 +412,6 @@ describe("real-container Docker sandbox lane (#101/#338)", { skip: !dockerSocket
   test("a real container launches with a distinct inner PID and no parent secrets", async () => {
     const { dir } = freshStore();
     const probe = await probeDockerSandbox({
-      dbPath: join(dir, "store.db"),
       workspacesDir: join(dir, "workspaces"),
       transcriptDir: join(dir, "transcripts"),
       image: process.env.BOTTEGA_SANDBOX_IMAGE ?? "bottega:local",
@@ -419,5 +421,257 @@ describe("real-container Docker sandbox lane (#101/#338)", { skip: !dockerSocket
     expect(probe.pid).toBeGreaterThan(0);
     expect(probe.pid).not.toBe(process.pid);
     expect(probe.forbiddenEnvNames).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Job-scoped store RPC boundary (#101/#338).
+//
+// The supervisor retains the real Store + memory provider; the container's
+// store/memory are thin clients over a bounded unix-socket RPC surfaced by
+// the ALLOWLIST. These caller-level tests drive the REAL RPC server + client
+// over a real temp socket: a cross-job row, a global write, an unlisted
+// method, the raw DB handle, a malformed frame, and an oversized frame all
+// FAIL CLOSED — never a silent forwarded call or a partial result.
+// ---------------------------------------------------------------------------
+import { connect as netConnect } from "node:net";
+
+/** Sends one raw JSON frame to an RPC socket and returns the first reply. */
+function rawRpc(socketPath: string, frame: string | Buffer, opts: { readReply?: boolean } = {}): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const socket = netConnect(socketPath);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("raw RPC socket timed out"));
+    }, 5000);
+    let dataBuf = "";
+    socket.on("connect", () => socket.write(frame));
+    if (opts.readReply !== false) {
+      socket.on("data", (chunk: Buffer) => {
+        dataBuf += chunk.toString("utf8");
+        if (dataBuf.includes("\n")) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(dataBuf.split("\n")[0]!);
+        }
+      });
+    } else {
+      socket.on("data", () => { /* suppress */ });
+    }
+    socket.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    socket.on("close", () => {
+      clearTimeout(timer);
+      if (dataBuf.length === 0) reject(new Error("raw RPC socket closed without a reply"));
+    });
+  });
+}
+
+describe("job-scoped store RPC boundary (#101/#338)", () => {
+  function makeRpc() {
+    const { store, dir } = freshStore();
+    const job: WorkerJob = { id: "job_1", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    const scope = jobScopeFromEnvelope(job);
+    const rpcDir = join(dir, "rpc");
+    mkdirSync(rpcDir, { recursive: true });
+    const server = JobStoreRpcServer.create(store, scope, rpcDir, {
+      memoryProvider: resolveMemoryProvider(store.getOrgSettings(), store.getDb()),
+    });
+    return { store, dir, job, server };
+  }
+
+  test("cross-job row access is denied loudly through the real scoped-store RPC host", async () => {
+    const { store, job, server } = makeRpc();
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // Another job's row is outside the scoped-store firewall (job-row guard).
+      await expect(session.store.getJob("job_2")).rejects.toThrow(/job-row access/);
+    } finally {
+      session.close();
+      server.close();
+    }
+    void store;
+    void job;
+  });
+
+  test("global writes, raw handle, and unknown methods are denied by the allowlist (fail closed)", async () => {
+    const { server } = makeRpc();
+    await server.listen();
+    try {
+      // enqueueJob is a boss-loop global write, never on the allowlist.
+      const enqueueReply = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 1, method: "enqueueJob", args: [{ id: "x", kind: "scheduled", payload: {} }] })}\n`);
+      expect(enqueueReply).toMatch(/not on the allowlist|denied/);
+      // getDb is the raw handle — never exposed.
+      const getDbReply = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 2, method: "getDb", args: [] })}\n`);
+      expect(getDbReply).toMatch(/raw store handle/);
+      // An unknown store method is not on the allowlist.
+      const unknownReply = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 3, method: "totallyMadeUp", args: [] })}\n`);
+      expect(unknownReply).toBeDefined();
+      // Expect an error reply (not a value reply) — the server replies with ok:false.
+      const parsed = JSON.parse(unknownReply!);
+      expect(parsed.ok).toBe(false);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("a raw malformed frame and an oversized frame tear the connection down (fail closed)", async () => {
+    const { server } = makeRpc();
+    await server.listen();
+    try {
+      // Malformed JSON → loud error reply + teardown.
+      const malformed = await rawRpc(server.socketPath, "this is not json\n");
+      expect(malformed).toMatch(/malformed RPC frame/);
+      // Oversized frame → socket destroyed (no reply; rawRpc sees close/error).
+      await expect(rawRpc(server.socketPath, `${"x".repeat(MAX_RPC_FRAME_BYTES + 4096)}\n`)).rejects.toThrow();
+    } finally {
+      server.close();
+    }
+  });
+
+  test("ingest-poll watermark RPC round-trips through the supervisor (store retained there)", async () => {
+    const { store, server } = makeRpc();
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      await session.store.setIngestWatermark("github", "cursor-1");
+      expect(await session.store.getIngestWatermark("github")).toBe("cursor-1");
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("client-side unknown/global methods never exist on the explicit facade", async () => {
+    const { server } = makeRpc();
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // The facade exposes only allowlisted methods; a global write is absent
+      // (no Proxy fallthrough) and getDb/close throw locally.
+      expect("enqueueJob" in session.store).toBe(false);
+      expect(session.store.getDb).toThrow(/raw store handle/);
+      expect(session.store.close).toThrow(/raw store handle/);
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mount-scope + request regression: the Docker request and `docker run` args
+// must NEVER carry the SQLite DB, a broad data/workspaces/transcripts/secrets
+// root, or a dbPath; each job mounts only exact per-job subpaths.
+// ---------------------------------------------------------------------------
+describe("production docker mounts are per-job exact subpaths (no shared roots, no dbPath)", () => {
+  test("the job request and run args never reveal a dbPath or mount a whole volume / raw DB", async () => {
+    const { store, dbPath, dir } = freshStore();
+    // A git work-item job (uses workspace + transcript + git PAT).
+    const pat = "ghp_ci_test_pat";
+    const tokenFile = join(dir, "secrets", "github-pat");
+    mkdirSync(join(dir, "secrets"), { recursive: true });
+    writeFileSync(tokenFile, `${pat}\n`, { mode: 0o600 });
+    const askpassScript = join(dir, "secrets", "git-askpass.sh");
+    writeFileSync(askpassScript, "#!/bin/sh\nexec cat \"$EXECUTOR_GIT_TOKEN_FILE\"\n", { mode: 0o700 });
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C-git-mounts" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "git mount scoping" });
+    await store.enqueueJob({ id: "git-mounts-job", kind: "git", payload: { workItemId: item.id }, spaceId: space.id });
+    const job = (await store.claimNextJob(1_000))!;
+
+    // Capture the request the supervisor writes to stdin and the run args.
+    let stdinPayload = "";
+    const capturing: DockerClient = {
+      launch(args: string[]) {
+        if (!args.includes("run")) {
+          return new FakeProc(0, new FakeDocker());
+        }
+        const stdin = new Writable({ write(chunk: Buffer, _e, cb) { stdinPayload += chunk.toString("utf8"); cb(); } });
+        const stdout = new Readable({ read() {} });
+        const stderr = new Readable({ read() {} });
+        let resolveExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+        const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => { resolveExit = r; });
+        // Complete the job with a canned but schema-valid response.
+        queueMicrotask(() => {
+          stdout.push(Buffer.from(JSON.stringify({ version: SANDBOX_PROTOCOL_VERSION, mode: "execute", pid: 9999, result: { exitCode: 0, signal: null, timedOut: false } }) + "\n"));
+          stdout.push(null);
+          stderr.push(null);
+          resolveExit({ code: 0, signal: null });
+        });
+        return { stdin, stdout, stderr, exit, kill: () => resolveExit({ code: null, signal: "SIGKILL" }) };
+      },
+    };
+    const runner = createDockerSandboxRunner({
+      hostStore: store,
+      memoryProvider: memoryDenyProvider,
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: join(dir, "transcripts"),
+      volume: "data",
+      volumeWorkspacesRoot: join(dir, "workspaces"),
+      volumeStateRoot: join(dir),
+      gitTokenFile: tokenFile,
+      askpassScript,
+      docker: capturing,
+    });
+    const result = await runner(job, runnerContext(store, dbPath, dir, 2_000));
+    expect(result.exitCode).toBe(0);
+
+    // The request carries NO dbPath and no path into the database.
+    const requestJson = JSON.parse(stdinPayload);
+    expect(requestJson.dbPath).toBeUndefined();
+    expect(JSON.stringify(requestJson)).not.toContain("store.db");
+  });
+
+  test("raw DB / whole-volume mounts never appear in the docker run args", async () => {
+    const { store, dir } = freshStore();
+    let runArgs: string[] = [];
+    const capturing: DockerClient = {
+      launch(args: string[]) {
+        if (args.includes("run")) {
+          runArgs = args;
+          const stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+          const stdout = new Readable({ read() {} });
+          const stderr = new Readable({ read() {} });
+          let resolveExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+          const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => { resolveExit = r; });
+          queueMicrotask(() => {
+            stdout.push(Buffer.from(JSON.stringify({ version: SANDBOX_PROTOCOL_VERSION, mode: "execute", pid: 4242, result: { exitCode: 0, signal: null, timedOut: false } }) + "\n"));
+            stdout.push(null);
+            stderr.push(null);
+            resolveExit({ code: 0, signal: null });
+          });
+          return { stdin, stdout, stderr, exit, kill: () => resolveExit({ code: null, signal: "SIGKILL" }) };
+        }
+        return new FakeProc(0, new FakeDocker());
+      },
+    };
+    const job: WorkerJob = { id: "scheduled-mounts", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    const runner = createDockerSandboxRunner({
+      hostStore: store,
+      memoryProvider: memoryDenyProvider,
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: join(dir, "transcripts"),
+      volume: "data",
+      volumeWorkspacesRoot: join(dir, "workspaces"),
+      volumeStateRoot: join(dir),
+      docker: capturing,
+    });
+    const result = await runner(job, runnerContext(store, "", dir, 5_000));
+    expect(result.exitCode).toBe(0);
+    const joined = runArgs.join(" ");
+    // No raw DB file mount and no whole shared-root bind mount (no `-v host:cont` short mounts).
+    expect(joined).not.toMatch(/bottega\.db/);
+    expect(joined).not.toContain("-v ");
+    // The per-job RPC socket dir is mounted via an exact volume-subpath.
+    expect(joined).toContain("--mount type=volume");
+    expect(joined).toContain("volume-subpath=");
+    // A whole-volume mount (type=volume without volume-subpath) never appears.
+    expect(joined).not.toContain("type=volume,src=data");
   });
 });

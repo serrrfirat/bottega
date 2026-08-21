@@ -89,6 +89,26 @@ jobs:
             'gh --version && jq --version && curl --version && git --version' \
             >/dev/null
 
+      # Real-container per-job sandbox lane (issue #101/#338): runs the
+      # skip-gated real-container runner test against the image built above
+      # (the ACTUAL production `docker run` args + image). Treats any printed
+      # SKIP as a failure — a silently-skipped security boundary test is the
+      # worst outcome, so a skip (no Docker / wrong image) fails this job.
+      - name: Real-container sandbox runner (skip = failure)
+        run: |
+          set +e
+          output="$(BOTTEGA_RUN_INTEGRATION=1 BOTTEGA_SANDBOX_IMAGE=bottega:ci bun test src/worker/sandbox-process.test.ts 2>&1)"
+          status=$?
+          echo "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "real-container sandbox lane failed (exit $status)" >&2
+            exit 1
+          fi
+          if grep -q "SKIP:" <<<"$output"; then
+            echo "real-container sandbox lane skipped — treating as failure" >&2
+            exit 1
+          fi
+
       - name: Per-job sandbox hardening (no skip)
         run: |
           docker run --rm \
