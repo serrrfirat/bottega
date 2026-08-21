@@ -493,7 +493,7 @@ export function parseSearchResultRows(text: string): SearchResultRow[] {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level DM lifecycle (issues #295/#296, owner veto #296-reopened): a
+// Top-level DM lifecycle (issues #295/#296, owner veto #296-reopened, #336): a
 // top-level Slack DM (slack:D*) shows EXACTLY ONE PLAIN-TEXT message that
 // spans the whole agent request — preamble, tool rounds, retries, and final
 // answer all own one message timestamp, updated in place as plain Slack
@@ -501,9 +501,9 @@ export function parseSearchResultRows(text: string): SearchResultRow[] {
 // card). During the request the message carries only TRUSTED status (the
 // rotating thinking phrase / live progress line — never raw model
 // reasoning, intermediate assistant preambles, or tool internals); at
-// request settlement the same timestamp is replaced with the final answer
-// plus ONE subdued `N actions completed` line when N > 0 (never a per-tool
-// checkmark list).
+// request settlement the same timestamp is replaced with the bare final
+// answer — no `N actions completed` context line ever, even after succeeded
+// tool steps (issue #336).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -704,20 +704,6 @@ export class SlackTurnPresenter {
   #bufferedDMReply: string | undefined;
   /** The latest buffered session error / empty-fallback during a pending top-level DM request (issue #296). */
   #bufferedDMError: string | undefined;
-  /**
-   * Count of genuinely-successful gated tool actions for the CURRENT
-   * top-level DM request (issue #296): the single subdued `N actions
-   * completed` context line. Only executions with outcome === "succeeded"
-   * count. Reset at each request start so a prior request's count never
-   * leaks into the next card.
-   */
-  #completedActionsCount = 0;
-  /**
-   * taskIds whose SUCCEEDED terminal already contributed to the action
-   * count (issue #295→#296): a redelivered/replayed terminal for the same
-   * taskId is deduped so a retry can never double-count an action.
-   */
-  #recordedActionTaskIds = new Set<string>();
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -777,12 +763,10 @@ export class SlackTurnPresenter {
     this.#lastProgressText = undefined;
     // #296: a fresh top-level turn arms a DM REQUEST — one Block Kit card
     // owning the whole agent loop until the opening prompt settles. The
-    // prior request's buffered reply/error and action count never leak in.
+    // prior request's buffered reply/error never leak in.
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
-    this.#completedActionsCount = 0;
-    this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -1005,15 +989,14 @@ export class SlackTurnPresenter {
    * The true end of a top-level DM request (issue #296): called by
    * SpaceService AFTER the opening `session.prompt(...)` promise settles —
    * the SDK agent loop's per-round `turn_end` events are NOT the request
-   * end. Replaces the one Block Kit status card (that same timestamp) with
-   * the FINAL answer plus a single subdued `N actions completed` context
-   * line when N > 0 (never individual tool names or a checkmark list), or
-   * with the buffered error/fallback when the request ended without a real
-   * reply. Clears the pending-request state and resolves the receipt
-   * reaction + latency audit. Idempotent: only the FIRST call settles (a
-   * steered request's prompt and the original prompt both resolve on the
-   * single underlying run, so both paths call this; the second is a no-op
-   * that reports false so the queue drains exactly once).
+   * end. Replaces the one plain-text status card (that same timestamp) with
+   * the bare FINAL answer (no `N actions completed` context line ever,
+   * issue #336), or with the buffered error/fallback when the request ended
+   * without a real reply. Clears the pending-request state and resolves the
+   * receipt reaction + latency audit. Idempotent: only the FIRST call
+   * settles (a steered request's prompt and the original prompt both
+   * resolve on the single underlying run, so both paths call this; the
+   * second is a no-op that reports false so the queue drains exactly once).
    */
   onRequestSettled(): boolean {
     if (!this.#dmTopLevel || !this.#requestActive) return false;
@@ -1023,24 +1006,15 @@ export class SlackTurnPresenter {
     const pendingTs = this.pendingTs;
     this.pendingTs = undefined;
     // The final answer wins over a buffered error (an SDK recovery after an
-    // error); a reply carries the action-count line, an error does not —
-    // an error replaces the card with the error text only (issue #295).
+    // error); the reply (or error) lands as plain text (issue #295/#336).
     const reply = this.#bufferedDMReply;
     const error = this.#bufferedDMError;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
-    const base = reply ?? error ?? "Done.";
-    // Only a REAL reply carries the `N actions completed` context line —
-    // errors and empty completions show no count (issue #295/#296).
-    const actionsCompleted = reply !== undefined ? this.#completedActionsCount : 0;
-    // Plain-text final: the answer (or error) plus — when N > 0 — ONE
-    // subdued `N actions completed` line. No attachment, no color bar, no
-    // Block Kit — top-level DMs render as a normal Slack text message
-    // (owner veto #296-reopened).
-    const text =
-      actionsCompleted > 0
-        ? `${base}\n\n${actionsCompleted} ${actionsCompleted === 1 ? "action" : "actions"} completed`
-        : base;
+    // Plain-text final: exactly the answer (or error). No count line, no
+    // attachment, no color bar, no Block Kit — top-level DMs render as a
+    // normal Slack text message (owner veto #296-reopened, #336).
+    const text = reply ?? error ?? "Done.";
     if (pendingTs !== undefined) {
       // Settle the SAME timestamp: one message per accepted top-level DM
       // request, updated in place across every internal round.
@@ -1102,12 +1076,10 @@ export class SlackTurnPresenter {
     this.#lastProgressText = undefined;
     // #296: a drained turn is a FRESH request — a top-level drain arms a DM
     // REQUEST (one Block Kit card, buffer intermediate messages) and resets
-    // the prior request's buffered reply/error and action count.
+    // the prior request's buffered reply/error.
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
-    this.#completedActionsCount = 0;
-    this.#recordedActionTaskIds.clear();
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
@@ -1266,12 +1238,10 @@ export class SlackTurnPresenter {
     this.#planTs = undefined;
     this.#planPosting = false;
     this.#lastPlanText = undefined;
-    // #296: request-phase state and the action count die with the session.
+    // #296: request-phase state dies with the session.
     this.#requestActive = false;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
-    this.#completedActionsCount = 0;
-    this.#recordedActionTaskIds.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -1334,21 +1304,6 @@ export class SlackTurnPresenter {
     // The in-flight flag (issue #219) gates the steer safe window.
     this.toolStepInFlight = step.status === "in_progress";
     this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
-    // Issue #296: a top-level DM's action count records only GENUINELY
-    // SUCCESSFUL executions (outcome === "succeeded") — denied /
-    // approval-only / failed completions never count, and internal tool
-    // identifiers never reach Slack (the final shows a plain `N actions
-    // completed` line, not labels). Deduped by taskId so a replay cannot
-    // double-count. Channels/threads don't track a count.
-    if (
-      this.#dmTopLevel &&
-      step.status === "complete" &&
-      step.outcome === "succeeded" &&
-      !this.#recordedActionTaskIds.has(step.taskId)
-    ) {
-      this.#recordedActionTaskIds.add(step.taskId);
-      this.#completedActionsCount += 1;
-    }
     this.#renderProgressNow();
   }
 

@@ -1436,18 +1436,17 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Top-level DM lifecycle (issues #295/#296, owner veto #296-reopened): a
+// Top-level DM lifecycle (issues #295/#296, owner veto #296-reopened, #336): a
 // top-level Slack DM turn (slack:D*) shows EXACTLY ONE PLAIN-TEXT message —
 // one post, edited in place as ordinary Slack text (no attachment wrapper,
 // no color bar, no collapsible content-block card) — with the todo plan
 // folded into that same line (NO separate "🛠 Agent's plan" message), raw
 // model reasoning (`ThinkingEvent.thinking`) NEVER reaching Slack (only the
 // elapsed/step status), and the request settling on the SAME timestamp with
-// the final answer plus ONE subdued `N actions completed` line ONLY when >= 1
-// gated tool action genuinely succeeded (never a per-tool checkmark list).
-// Errors / empty completions replace the same surface without the count
-// line or any stale status. Channel (slack:C*) and threaded turns are
-// untouched.
+// the bare final answer — NO `N actions completed` context line ever (issue
+// #336 removes it entirely, even after succeeded tool steps). Errors / empty
+// completions replace the same surface without the count line or any stale
+// status. Channel (slack:C*) and threaded turns are untouched.
 // ---------------------------------------------------------------------------
 describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", () => {
   function dmPresenter(rec: RecordedAdapter): SlackTurnPresenter {
@@ -1521,7 +1520,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(post.opts).toBeUndefined(); // no thread, no blocks, no attachments
 
     // The final answer lands on the SAME message (chat.update) as plain text
-    // with the single count line — still no attachment.
+    // with NO count line.
     const id = nextToolStepId();
     presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "in_progress" });
     presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "succeeded" });
@@ -1533,7 +1532,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     const update = rec.updates.at(-1)!;
     expect(update.ts).toBe("post-1");
     expect(update.opts).toBeUndefined();
-    expect(update.text).toBe("Here is the answer\n\n1 action completed");
+    expect(update.text).toBe("Here is the answer");
   });
 
   test("raw model reasoning NEVER surfaces: thinking renders no 🧠 line, only the elapsed/step status (issue #296)", async () => {
@@ -1592,7 +1591,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     await flush();
 
     // The request settles (opening prompt resolution): replace the ONE
-    // message with the final answer + one subdued action-count line.
+    // message with the bare final answer (no action-count line, issue #336).
     expect(presenter.onRequestSettled()).toBe(true);
     await flush();
 
@@ -1602,7 +1601,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // THE regression: the final reply is PLAIN TEXT — the body rides the
     // `text` key (no attachment, no color bar, no blocks).
     expect(final.opts).toBeUndefined();
-    expect(final.text).toBe("Here is the answer\n\n2 actions completed");
+    expect(final.text).toBe("Here is the answer");
     // No tool names ever surface.
     expect(final.text).not.toContain("grep");
     expect(final.text).not.toContain("search");
@@ -1636,7 +1635,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(rec.updates.at(-1)!.ts).not.toBe(firstTs);
   });
 
-  test("final payload carries exactly ONE subdued action-count line; >1 succeeded actions collapse to one count (issue #296)", async () => {
+  test("succeeded tool actions never surface a count line: the final is just the bare answer (issue #336)", async () => {
     const rec = recordingAdapter();
     const presenter = dmPresenter(rec);
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
@@ -1656,8 +1655,9 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
 
     const final = rec.updates.at(-1)!;
     expect(final.opts).toBeUndefined(); // plain-text reply — no attachment/blocks
-    // A single precise count line — never per-tool checkmarks or labels.
-    expect(final.text).toBe("Answer\n\n3 actions completed");
+    // No count line ever — the final is exactly the bare answer (issue #336).
+    expect(final.text).toBe("Answer");
+    expect(final.text).not.toContain("actions completed");
     expect(final.text).not.toContain("✅");
     expect(final.text).not.toContain("Search issues");
     expect(final.text).not.toContain("create_work_item");
@@ -1689,7 +1689,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(final.text).not.toContain("actions completed");
   });
 
-  test("a replayed succeeded terminal for the SAME taskId is deduped — never double-counted (issue #296)", async () => {
+  test("a replayed succeeded terminal for the SAME taskId never surfaces any count (issue #296)", async () => {
     const rec = recordingAdapter();
     const presenter = dmPresenter(rec);
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
@@ -1705,8 +1705,9 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     presenter.onRequestSettled();
     await flush();
 
-    expect(rec.updates.at(-1)!.opts).toBeUndefined(); // plain text, count not duplicated
-    expect(rec.updates.at(-1)!.text).toBe("Done\n\n1 action completed");
+    expect(rec.updates.at(-1)!.opts).toBeUndefined(); // plain text
+    expect(rec.updates.at(-1)!.text).toBe("Done");
+    expect(rec.updates.at(-1)!.text).not.toContain("actions completed");
   });
 
   test("no completed action means no count line: the reply is just the answer (issue #296)", async () => {
@@ -1808,7 +1809,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // A long, realistic final answer.
     const answer =
       "I found the issue: the old DM surface rendered as a collapsible blue-bordered Slack attachment. The fix makes " +
-      "a top-level DM turn a single plain-text message, updated in place, with the full answer plus one count line.";
+      "a top-level DM turn a single plain-text message, updated in place, with the full answer and no count line.";
     presenter.onMessage({ spaceId: "slack:D1", text: answer });
     presenter.onRequestSettled();
     await flush();
@@ -1818,7 +1819,8 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(final.ts).toBe("post-1");
     // THE regression: plain text, no attachment, no color bar.
     expect(final.opts).toBeUndefined();
-    expect(final.text).toBe(`${answer}\n\n2 actions completed`);
+    expect(final.text).toBe(answer);
+    expect(final.text).not.toContain("actions completed");
   });
 
   test("a SHORT final reply after tool rounds is still ONE plain-text message (owner veto #296-reopened regression)", async () => {
@@ -1845,7 +1847,8 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     const final = rec.updates.at(-1)!;
     expect(final.ts).toBe("post-1");
     expect(final.opts).toBeUndefined(); // plain text — the body rides the text key
-    expect(final.text).toBe(`${answer}\n\n2 actions completed`);
+    expect(final.text).toBe(answer);
+    expect(final.text).not.toContain("actions completed");
     expect(rec.posts[0]!.text).toBe(THINKING_PHRASES[0]); // opening is plain text too
   });
 
