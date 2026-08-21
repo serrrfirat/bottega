@@ -344,8 +344,13 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
     const calls: ExtensionCredential[] = [];
     return {
       calls,
-      async authorize(credential: ExtensionCredential) {
-        calls.push(credential);
+      async runWithAuthorization(request, invoke) {
+        calls.push(request.credential);
+        return invoke({
+          callId: request.callId,
+          placeholder: "test-placeholder",
+          signal: new AbortController().signal,
+        });
       },
     };
   }
@@ -848,6 +853,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
         credentialSchema: { type: "api_key" },
         domains: ["discover.me.test"],
+        credentialTargets: [{ host: "discover.me.test", pathPrefix: "/mcp" }],
       }),
     );
     const h = await makeInProcessHarness({

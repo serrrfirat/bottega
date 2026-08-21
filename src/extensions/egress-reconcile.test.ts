@@ -51,6 +51,7 @@ function pinSnapshot(id: string, label: string, domain: string): PinnedSnapshot 
       mcp: { serverUrl: `https://${domain}/mcp`, transport: "streamable-http" },
       credentialSchema: { type: "oauth", scopes: ["read", "write"] },
       domains: [domain],
+      credentialTargets: [{ host: domain, pathPrefix: "/mcp" }],
     },
   };
 }

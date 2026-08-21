@@ -34,6 +34,7 @@ function toolsLessManifest(overrides: Partial<ExtensionManifest> = {}): Extensio
         mcp: BINDING,
         credentialSchema: { type: "api_key" },
         domains: ["mcp.example.test"],
+        credentialTargets: [{ host: "mcp.example.test", pathPrefix: "/mcp" }],
         ...overrides,
       }),
     ),
@@ -154,6 +155,7 @@ describe("extensionToolSurface (issue #158 runtime discovery)", () => {
       cli: { command: "/usr/bin/example" },
       credentialSchema: { type: "api_key" },
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     expect(await extensionToolSurface(cli)).toEqual([]);
   });
@@ -217,6 +219,7 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
             credentialSchema: { type: "api_key" },
             tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
             domains: ["pinned.example"],
+            credentialTargets: [{ host: "pinned.example" }],
           }),
         ),
       ),
@@ -338,6 +341,7 @@ describe("toolOwnerExtensionId (the MCP surface's name→extension seam)", () =>
             credentialSchema: { type: "api_key" },
             tools: [{ name: "pinned.provider.get", tier: "read", description: "d", params: [] }],
             domains: ["pinned.example"],
+            credentialTargets: [{ host: "pinned.example" }],
           }),
         ),
       ),

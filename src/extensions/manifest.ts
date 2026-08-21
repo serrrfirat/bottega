@@ -38,6 +38,11 @@ export interface CliBinding {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /**
+   * Explicit environment variable that receives the opaque per-call proxy
+   * token. The real credential never enters the child environment.
+   */
+  credentialEnv?: string;
 }
 
 /**
@@ -47,6 +52,17 @@ export interface CliBinding {
 export interface CredentialSchema {
   type: CredentialType;
   scopes?: string[];
+}
+
+/**
+ * A reviewed destination that may receive an extension credential.
+ * `domains` controls reachability; this narrower list controls authority.
+ */
+export interface CredentialTarget {
+  /** Exact hostname or an explicitly reviewed `*.` subdomain wildcard. */
+  host: string;
+  /** Optional normalized absolute path prefix, matched on segment boundaries. */
+  pathPrefix?: string;
 }
 
 /** One declarative tool parameter (converted to a zod schema by the bridge). */
@@ -111,6 +127,8 @@ export type ExtensionManifest =
       tools?: ExtensionTool[];
       /** Egress allowlist entries (iron-proxy): hostnames, optional `*.` prefix. */
       domains: string[];
+      /** Reviewed credential authority, separate from the broader egress allowlist. */
+      credentialTargets: CredentialTarget[];
     }
   | {
       id: string;
@@ -122,6 +140,7 @@ export type ExtensionManifest =
       credentialSchema: CredentialSchema;
       tools?: ExtensionTool[];
       domains: string[];
+      credentialTargets: CredentialTarget[];
     };
 
 /**
@@ -192,6 +211,7 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 /** Extension id format (shared with the policy parser, issue #56). */
 export const EXTENSION_ID_RE = NAME_RE;
 const DOMAIN_RE = /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+const ENCODED_PATH_SEPARATOR_OR_DOT_RE = /%(?:2f|5c|2e)/i;
 
 /**
  * Environment variable names that carry credentials. The CLI credential
@@ -381,14 +401,28 @@ function validateCliBinding(value: JsonValue): CliBinding {
     const credentialKey = Object.keys(env).find(isCredentialEnvKey);
     if (credentialKey !== undefined) {
       fail(
-        `cli.env key "${credentialKey}" looks like a credential — CLIs never receive credentials via env (iron-proxy boundary only)`,
+        `cli.env key "${credentialKey}" looks like a credential — use cli.credentialEnv so only the opaque per-call proxy token enters the child`,
       );
+    }
+  }
+  let credentialEnv: string | undefined;
+  if (value["credentialEnv"] !== undefined) {
+    credentialEnv = requiredString(value, "credentialEnv");
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(credentialEnv)) {
+      fail("cli.credentialEnv must be an uppercase environment variable name");
+    }
+    if (!isCredentialEnvKey(credentialEnv)) {
+      fail("cli.credentialEnv must name the CLI's credential variable");
+    }
+    if (env?.[credentialEnv] !== undefined) {
+      fail(`cli.credentialEnv "${credentialEnv}" must not also appear in cli.env`);
     }
   }
   return {
     command,
     ...(args !== undefined ? { args } : undefined),
     ...(env !== undefined ? { env } : undefined),
+    ...(credentialEnv !== undefined ? { credentialEnv } : undefined),
   };
 }
 
@@ -521,6 +555,61 @@ function validateDomains(value: JsonValue): string[] {
   return parsed.data;
 }
 
+function domainCoversTarget(domain: string, host: string): boolean {
+  if (domain === host) return true;
+  if (!domain.startsWith("*.") || host.startsWith("*.")) return false;
+  const suffix = domain.slice(1).toLowerCase();
+  const normalizedHost = host.toLowerCase();
+  return normalizedHost.endsWith(suffix) && normalizedHost.length > suffix.length;
+}
+
+function validateCredentialTargets(value: JsonValue, domains: readonly string[]): CredentialTarget[] {
+  if (!Array.isArray(value)) {
+    fail("credentialTargets must be an array");
+  }
+  if (value.length === 0) {
+    fail("credentialTargets must not be empty for an authenticated extension");
+  }
+  const targets: CredentialTarget[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!isRecord(raw)) fail("each credential target must be an object");
+    const host = requiredString(raw, "host").toLowerCase();
+    if (host === "*" || !DOMAIN_RE.test(host)) {
+      fail(`credential target host "${host}" must be an exact hostname or an explicitly reviewed "*." wildcard`);
+    }
+    if (host.startsWith("*.") && !domains.some((domain) => domain.toLowerCase() === host)) {
+      fail(`wildcard credential target "${host}" must be covered by an identical wildcard in domains`);
+    }
+    if (!domains.some((domain) => domainCoversTarget(domain.toLowerCase(), host))) {
+      fail(`credential target host "${host}" must be covered by domains`);
+    }
+    let pathPrefix: string | undefined;
+    if (raw["pathPrefix"] !== undefined) {
+      pathPrefix = requiredString(raw, "pathPrefix");
+      if (
+        !pathPrefix.startsWith("/") ||
+        (pathPrefix.length > 1 && pathPrefix.endsWith("/")) ||
+        pathPrefix.includes("?") ||
+        pathPrefix.includes("#") ||
+        pathPrefix.includes("\\") ||
+        pathPrefix.includes("//") ||
+        ENCODED_PATH_SEPARATOR_OR_DOT_RE.test(pathPrefix) ||
+        pathPrefix.split("/").some((segment) => segment === "." || segment === "..")
+      ) {
+        fail(
+          `credential target pathPrefix "${pathPrefix}" must be a normalized absolute path without query, fragment, trailing slash, dot segments, or encoded separators`,
+        );
+      }
+    }
+    const key = `${host}\n${pathPrefix ?? ""}`;
+    if (seen.has(key)) fail(`duplicate credential target "${host}${pathPrefix ?? ""}"`);
+    seen.add(key);
+    targets.push({ host, ...(pathPrefix !== undefined ? { pathPrefix } : undefined) });
+  }
+  return targets;
+}
+
 /**
  * Validates an untrusted manifest (snapshot JSON, catalog response) and
  * returns a typed manifest. Throws {@link ExtensionValidationError} on the
@@ -547,6 +636,7 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
   // keeps the distinction: `tools` is absent only when the input omitted it.
   const tools = input["tools"] === undefined ? undefined : validateTools(input["tools"]);
   const domains = validateDomains(input["domains"]);
+  const credentialTargets = validateCredentialTargets(input["credentialTargets"], domains);
   if (kind === "mcp") {
     if (input["cli"] !== undefined) {
       fail("an mcp extension must not declare a cli binding");
@@ -563,6 +653,7 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
       credentialSchema,
       ...(tools !== undefined ? { tools } : undefined),
       domains,
+      credentialTargets,
     };
   }
   if (input["mcp"] !== undefined) {
@@ -580,5 +671,6 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
     credentialSchema,
     ...(tools !== undefined ? { tools } : undefined),
     domains,
+    credentialTargets,
   };
 }

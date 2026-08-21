@@ -33,7 +33,11 @@
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { readPinnedSnapshots, type PinnedSnapshot } from "../extensions/registry";
-import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
+import {
+  PROXY_SECRETS_MOUNT_PATH,
+  SCOPED_AUTHORIZATIONS_BEGIN,
+  SCOPED_AUTHORIZATIONS_END,
+} from "../extensions/boundary";
 
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
  * #36, #37ee2bf) plus the opencode-go gateway (issue #208 — the pinned
@@ -137,11 +141,10 @@ export function hostFromBaseUrl(baseUrl: string): string | undefined {
   }
 }
 
-/** One extension's credential-injection entry for the generated egress config (issue #53). */
+/** Reviewed credential targets retained separately from general egress reachability. */
 export interface ExtensionEgressEntry {
   extensionId: string;
-  /** The extension's allowlisted domains; the proxy injects auth for these hosts. */
-  domains: string[];
+  credentialTargets: PinnedSnapshot["manifest"]["credentialTargets"];
 }
 
 /**
@@ -187,16 +190,14 @@ export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
   { provider: "tavily", host: "api.tavily.com" },
 ] as const;
 
-/**
- * The file-injection entries for the pinned snapshots: ONLY the api_key
- * extensions (issue #208 — since #284 the OAuth extensions get no egress
- * entry at all: the SDK sends its own bearer through the allowlisted
- * host, so the proxy has nothing to inject for them).
- */
-export function apiKeyExtensionEntries(snapshots: ReturnType<typeof readPinnedSnapshots>): ExtensionEgressEntry[] {
-  return snapshots
-    .filter((s) => s.manifest.credentialSchema.type !== "oauth")
-    .map((s) => ({ extensionId: s.manifest.id, domains: s.manifest.domains }));
+/** Reviewed credential-target summaries for authenticated extensions. */
+export function credentialTargetEntries(
+  snapshots: ReturnType<typeof readPinnedSnapshots>,
+): ExtensionEgressEntry[] {
+  return snapshots.map((snapshot) => ({
+    extensionId: snapshot.manifest.id,
+    credentialTargets: snapshot.manifest.credentialTargets,
+  }));
 }
 
 /** Static blocks shared verbatim by the strict and dev renderers (dns, proxy, tls, management). */
@@ -233,22 +234,13 @@ management:
   api_key_env: "IRON_MANAGEMENT_API_KEY"
 `;
 
-/** The indented `- source:` entries of the secrets transform, shared by both renderers. */
-function renderSecretsEntries(extensions: readonly ExtensionEgressEntry[]): string {
-  return extensions
-    .map((extension) => {
-      const hostLines = extension.domains.map((domain) => `            - host: "${domain}"`).join("\n");
-      return `        - source:
-            type: file
-            path: "${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(extension.extensionId)}"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-          rules:
-${hostLines}`;
-    })
-    .join("\n");
+/**
+ * Empty call-scoped region. The runtime boundary atomically fills this
+ * bounded region with opaque-token replacement entries for live calls only.
+ */
+function renderScopedAuthorizationRegion(): string {
+  return `${SCOPED_AUTHORIZATIONS_BEGIN}
+${SCOPED_AUTHORIZATIONS_END}`;
 }
 
 /** The indented `- source:` entries for the model-gateway keys (issue #208). */
@@ -282,33 +274,19 @@ function renderModelGatewayEntries(keys: readonly ModelGatewayKey[]): string {
  * transform runs BEFORE secrets so the LLM judge sees no real credentials
  * (iron-proxy README's recommended ordering).
  */
-export function renderSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
-  const extensionEntries = renderSecretsEntries(extensions);
+export function renderSecretsTransform(_extensions: readonly ExtensionEgressEntry[] = []): string {
   const gatewayEntries = renderModelGatewayEntries(MODEL_GATEWAY_KEYS);
-  const extensionBlock = extensions.length > 0 ? `${extensionEntries}\n` : "";
-  return `  # 3. Secrets: boundary credential injection (issue #53 + #208). Extension
-  #    calls carry no credential — the runtime resolves the caller's
-  #    credential at call time and writes it to the extension's secret file
-  #    on the shared data volume (mode 0600, write-temp + rename); this
-  #    transform INJECTS it as the Authorization header for the extension's
-  #    allowlisted domains before egress. The MODEL GATEWAY entries below
-  #    do the same for the providers config/omp/models.yml declares: the
-  #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
-  #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
-  #    (seeded at boot by src/extensions/proxy-seed). The openai-codex
-  #    provider is one of these entries (issue #230): the seed owns the
-  #    codex refresh and writes the minted access token to
-  #    openai-codex.secret — the proxy injects it for chatgpt.com and never
-  #    touches auth.openai.com. require: true — a missing key rejects the
-  #    request (502) instead of letting the placeholder reach the gateway.
-  #    File sources re-read on config reload and on ttl expiry, so
-  #    credentials rotate on a running proxy. Judge runs BEFORE secrets so
-  #    the LLM judge never sees real credentials (iron-proxy README's
-  #    recommended ordering).
+  return `  # 3. Secrets: request-scoped extension authorization plus static
+  #    model-gateway keys. Extension calls carry a random per-call proxy
+  #    token. The credential boundary installs its token-to-secret mapping
+  #    only for the call lifetime and only for reviewed credential targets,
+  #    then revokes it in finally. Egress domains remain reachability policy
+  #    and never grant credential authority.
   - name: secrets
     config:
       secrets:
-${extensionBlock}${gatewayEntries}
+${renderScopedAuthorizationRegion()}
+${gatewayEntries}
 `;
 }
 
@@ -405,22 +383,10 @@ ${secretsTransform}log:
  * judge precedes it in the dev pipeline).
  */
 function renderDevSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
-  const extensionEntries = renderSecretsEntries(extensions);
-  const gatewayEntries = renderModelGatewayEntries(MODEL_GATEWAY_KEYS);
-  const extensionBlock = extensions.length > 0 ? `${extensionEntries}\n` : "";
-  return `  # 2. Secrets: boundary credential injection (issue #53 + #208) — KEPT in
-  #    the dev config (the core requirement): extension calls carry no
-  #    credential, and this transform INJECTS it as the Authorization
-  #    header for the extension's allowlisted domains before egress; the
-  #    model-gateway entries swap the providers' placeholder bearer for the
-  #    real key (require: true — a missing key rejects the request). File
-  #    sources re-read on config reload and on ttl expiry, so credentials
-  #    rotate on a running proxy.
-  - name: secrets
-    config:
-      secrets:
-${extensionBlock}${gatewayEntries}
-`;
+  return renderSecretsTransform(extensions).replace(
+    "  # 3. Secrets:",
+    "  # 2. Secrets:",
+  );
 }
 
 /**
@@ -497,12 +463,8 @@ export function regenerateEgressConfig(
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   // mergedEgressDomains prepends the base domains and dedupes, so the raw
   // per-snapshot domains pass through as-is (order-stable).
-  const extensionDomains = snapshots.flatMap((s) => s.manifest.domains);
-  // api_key extensions keep the file-injection entry (the boundary writes
-  // their secret file at call time). OAuth extensions get NO entry: the
-  // SDK sends its own bearer (issue #284) — the allowlist above is the
-  // only egress surface they need.
-  const extensionEntries = apiKeyExtensionEntries(snapshots);
+  const extensionDomains = snapshots.flatMap((snapshot) => snapshot.manifest.domains);
+  const extensionEntries = credentialTargetEntries(snapshots);
   const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
@@ -523,7 +485,7 @@ export function regenerateDevEgressConfig(
   runtimeSnapshots: readonly PinnedSnapshot[] = [],
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
-  const extensionEntries = apiKeyExtensionEntries(snapshots);
+  const extensionEntries = credentialTargetEntries(snapshots);
   const yaml = renderDevEgressConfig(extensionEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;

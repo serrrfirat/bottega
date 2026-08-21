@@ -47,12 +47,17 @@
 # same BOTTEGA_DEV_DATA_DIR bind); the CA bind is the canonical certs dir
 # (BOTTEGA_DEV_CERTS_DIR).
 services:
+  egress-config-init:
+    volumes:
+      - ./config/egress.dev.yml:/seed/egress.yml:ro
+      - ${BOTTEGA_DEV_DATA_DIR:-./data}:/data
+
   iron-proxy:
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:9092:9092"
     volumes:
-      - ./config/egress.dev.yml:/etc/iron-proxy/egress.yml:ro
+      - ./config/egress.dev.yml:/seed/egress.yml:ro
       # The shared MITM CA: the CANONICAL certs dir (dev.sh exports
       # BOTTEGA_DEV_CERTS_DIR=shared_certs_dir, issue #301) so every
       # worktree's proxy terminates with the SAME CA — never a

@@ -282,6 +282,7 @@ export async function connectExtension(
             registering_from_catalog: true,
             vendor: lookup.facts.label,
             domains: lookup.facts.domains,
+            credentialTargets: lookup.facts.credentialTargets,
             mcpEndpoint: lookup.facts.mcpEndpoint,
           },
           spaceId: input.spaceId,

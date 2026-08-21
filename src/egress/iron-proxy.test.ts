@@ -31,14 +31,13 @@
  */
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 import { renderDevEgressConfig, renderSecretsTransform, SNAPSHOTS_DIR } from "./generate";
 import { readPinnedSnapshots } from "../extensions/registry";
 import {
   createSecretFileBoundary,
-  extensionSecretFileName,
   PROXY_SECRETS_MOUNT_PATH,
 } from "../extensions/boundary";
 import type { ExtensionCredential } from "../store/db";
@@ -326,9 +325,9 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
 
       // The REAL generated dev config, with the committed extension entries
       // (issue #53 injection rules) — the same file dev.sh mounts.
-      const extensionEntries = readPinnedSnapshots(SNAPSHOTS_DIR).map((s) => ({
-        extensionId: s.manifest.id,
-        domains: s.manifest.domains,
+      const extensionEntries = readPinnedSnapshots(SNAPSHOTS_DIR).map((snapshot) => ({
+        extensionId: snapshot.manifest.id,
+        credentialTargets: snapshot.manifest.credentialTargets,
       }));
       const devConfig = renderDevEgressConfig(extensionEntries);
       const devParsed = EgressConfigSchema.safeParse(parseYamlSubset(devConfig));
@@ -348,7 +347,6 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
       // Host that is NOT on the strict allowlist at all — must still pass
       // under the dev allow-all config (the strict config 403s it).
       const PERMISSIVE_HOST = "bottega-permissive.test";
-      const SECRET_VALUE = "leg-secret-token";
 
       // Local target: reached through the proxy via --add-host
       // (host-gateway), never directly. Records the Authorization header it
@@ -383,9 +381,6 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
           skip(`CA generation failed (${genCa.stderr.toString().trim().slice(0, 120)}). Manual checklist: run 'docker run --rm -v $PWD/certs:/certs ${PROXY_IMAGE} generate-ca -outdir /certs'.`);
           return;
         }
-        // The boundary's secret file for the github extension (what the
-        // runtime writes on the shared data volume in real dev).
-        writeFileSync(join(secretsDir, extensionSecretFileName("github")), SECRET_VALUE);
         writeFileSync(cfgPath, devConfig);
 
         const name = `bottega-ironproxy-dev-${process.pid}`;
@@ -455,12 +450,15 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
           // No injection rule matches PERMISSIVE_HOST → no Authorization.
           expect(seenAuth.at(-1)).toBe("");
 
-          // Extension host: 200 through the dev proxy AND the secrets
-          // transform injected the boundary's secret file as Bearer auth.
-          const injected = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
-          expect(injected.status).toBe(200);
-          expect(await injected.text()).toBe("target-ok");
-          expect(seenAuth.at(-1)).toBe(`Bearer ${SECRET_VALUE}`);
+          // Extension host stays reachable, but no provider-wide secret is
+          // installed. Credential authority exists only inside a live
+          // runWithAuthorization call (covered by the strict leg below).
+          const ordinaryExtension = await fetch(`http://${INJECT_HOST}:${targetPort}/`, {
+            proxy: proxyUrl,
+          });
+          expect(ordinaryExtension.status).toBe(200);
+          expect(await ordinaryExtension.text()).toBe("target-ok");
+          expect(seenAuth.at(-1)).toBe("");
         } finally {
           Bun.spawnSync(["docker", "rm", "-f", name], { timeout: 30_000 });
         }
@@ -518,7 +516,6 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
       const LEG_TARGET = "bottega-leg-target.test";
       const DENIED_HOST = "bottega-blocked.test";
       const MGMT_TOKEN = "leg-mgmt-token";
-      const SECRET_V1 = "leg-secret-v1";
       const SECRET_V2 = "leg-secret-v2";
 
       // 1. Allowlist domains from the deployment contract. The leg depends
@@ -553,12 +550,20 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
 
       // 3. Local upstream: records {host, Authorization} per request so the
       //    leg can prove who got the injected header — and who never did.
-      const seen: Array<{ host: string; auth: string }> = [];
+      const seen: Array<{ host: string; path: string; auth: string }> = [];
       const target = Bun.serve({
         hostname: "0.0.0.0",
         port: 0,
         fetch: (req) => {
-          seen.push({ host: new URL(req.url).hostname, auth: req.headers.get("authorization") ?? "" });
+          const url = new URL(req.url);
+          seen.push({
+            host: url.hostname,
+            path: url.pathname,
+            auth: req.headers.get("authorization") ?? "",
+          });
+          if (url.pathname === "/mcp/redirect") {
+            return Response.redirect(`http://${LEG_TARGET}:${target.port}/public`, 302);
+          }
           return new Response("target-ok");
         },
       });
@@ -583,14 +588,6 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
           return;
         }
 
-        // 5. The boundary's secret file for attio (the extension with an
-        //    injection rule), written per the #53 contract BEFORE boot
-        //    (mode 0600, write-temp + rename). Rotation via the REAL
-        //    boundary below proves the reload path on a running proxy.
-        const secretName = extensionSecretFileName("attio");
-        const secretPath = join(secretsDir, secretName);
-        writeFileSync(`${secretPath}.tmp`, SECRET_V1, { mode: 0o600 });
-        renameSync(`${secretPath}.tmp`, secretPath);
 
         // 6. Test-rendered strict config: real allowlist + leg target, the
         //    REAL generated secrets transform, management (token-gated).
@@ -604,8 +601,8 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
             '  http_listen: ":80"',
             "tls:",
             '  mode: "mitm"',
-            '  ca_cert: "/etc/iron-proxy/certs/ca.crt"',
-            '  ca_key: "/etc/iron-proxy/certs/ca.key"',
+            '  ca_cert: "/leg/certs/ca.crt"',
+            '  ca_key: "/leg/certs/ca.key"',
             "management:",
             '  listen: ":9092"',
             '  api_key_env: "IRON_MANAGEMENT_API_KEY"',
@@ -615,7 +612,12 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
             "      domains:",
             ...domains.map((d) => `        - "${d}"`),
             "",
-            renderSecretsTransform([{ extensionId: "attio", domains: [INJECT_HOST] }]).trimEnd(),
+            renderSecretsTransform([
+              {
+                extensionId: "attio",
+                credentialTargets: [{ host: INJECT_HOST, pathPrefix: "/mcp" }],
+              },
+            ]).trimEnd(),
             "log:",
             '  level: "error"',
             "",
@@ -631,11 +633,10 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
             "-p", "127.0.0.1::80",
             "-p", "127.0.0.1::9092",
             "-e", `IRON_MANAGEMENT_API_KEY=${MGMT_TOKEN}`,
-            "-v", `${cfgPath}:/etc/iron-proxy/egress.yml:ro`,
-            "-v", `${certsDir}:/etc/iron-proxy/certs:ro`,
-            "-v", `${secretsDir}:${PROXY_SECRETS_MOUNT_PATH}:ro`,
+            "-v", `${dir}:/leg`,
+            "-v", `${secretsDir}:${PROXY_SECRETS_MOUNT_PATH}`,
             PROXY_IMAGE,
-            "-config", "/etc/iron-proxy/egress.yml",
+            "-config", "/leg/egress-secrets-leg.yml",
           ],
           { timeout: 30_000 },
         );
@@ -689,57 +690,84 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
           expect(seen.at(-1)?.host).toBe(LEG_TARGET);
           expect(seen.at(-1)?.auth).toBe("");
 
-          // 10. Allowlisted host WITH the rule: the boot-time secret file is
-          //     injected as Bearer auth.
-          const bootInjected = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
-          expect(bootInjected.status).toBe(200);
-          expect(seen.at(-1)?.host).toBe(INJECT_HOST);
-          expect(seen.at(-1)?.auth).toBe(`Bearer ${SECRET_V1}`);
-
-          // 11. Management is token-gated: a reload without the token 401s.
-          const noToken = await fetch(`http://127.0.0.1:${mgmtPort}/v1/reload`, { method: "POST" });
-          expect(noToken.status).toBe(401);
-
-          // 12. The #53 chain against the REAL binary: the boundary writes
-          //     the rotated secret (mode 0600, write-temp + rename) and
-          //     POSTs /v1/reload with the management token; the RUNNING
-          //     proxy must now inject the new value without a restart.
+          // 10. A reviewed /mcp target receives the selected secret only
+          // while its call-scoped placeholder is active. The broader
+          // allowlist still permits /public and /mcp-evil, but neither gets
+          // credential authority. Query strings do not change path matching,
+          // and redirects are re-evaluated at the destination.
           const boundary = createSecretFileBoundary({
             resolveSecret: async () => SECRET_V2,
             secretsDir,
+            proxyConfigPath: cfgPath,
             proxyControlUrl: `http://127.0.0.1:${mgmtPort}`,
             proxyControlToken: MGMT_TOKEN,
           });
-          await boundary.authorize({
-            id: "leg-attio",
-            provider: "attio",
-            vault_provider: "attio",
-            identity_key: "leg",
-            owner: null,
-            scope: "org",
-            broker_credential_id: 1,
-            pending_vault_provider: null,
-            pending_broker_credential_id: null,
-            pending_identity_key: null,
-            retiring_broker_credential_id: null,
-            status: "active",
-            revision: 1,
-            created_at: Date.now(),
-            updated_at: Date.now(),
-          } satisfies ExtensionCredential);
-          expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+          let revokedPlaceholder = "";
+          await boundary.runWithAuthorization(
+            {
+              credential: {
+                id: "leg-attio",
+                provider: "attio",
+                vault_provider: "attio",
+                identity_key: "leg",
+                owner: null,
+                scope: "org",
+                broker_credential_id: 1,
+                pending_vault_provider: null,
+                pending_broker_credential_id: null,
+                pending_identity_key: null,
+                retiring_broker_credential_id: null,
+                status: "active",
+                revision: 1,
+                created_at: Date.now(),
+                updated_at: Date.now(),
+              } satisfies ExtensionCredential,
+              targets: [{ host: INJECT_HOST, pathPrefix: "/mcp" }],
+              callId: "iron-proxy-leg",
+            },
+            async (authorization) => {
+              revokedPlaceholder = authorization.placeholder;
+              const headers = {
+                Authorization: `Bearer ${authorization.placeholder}`,
+              };
+              const authorized = await fetch(
+                `http://${INJECT_HOST}:${targetPort}/mcp?tenant=alice`,
+                { proxy: proxyUrl, headers },
+              );
+              expect(authorized.status).toBe(200);
+              expect(seen.at(-1)).toEqual({
+                host: INJECT_HOST,
+                path: "/mcp",
+                auth: `Bearer ${SECRET_V2}`,
+              });
 
-          const reloadDeadline = Date.now() + 20_000;
-          let rotated: string | null = null;
-          while (Date.now() < reloadDeadline) {
-            const res = await fetch(`http://${INJECT_HOST}:${targetPort}/`, { proxy: proxyUrl });
-            if (res.status === 200 && seen.at(-1)?.auth === `Bearer ${SECRET_V2}`) {
-              rotated = seen.at(-1)?.auth ?? null;
-              break;
-            }
-            await Bun.sleep(500);
-          }
-          expect(rotated).toBe(`Bearer ${SECRET_V2}`);
+              for (const path of ["/public", "/mcp-evil"]) {
+                const ordinary = await fetch(
+                  `http://${INJECT_HOST}:${targetPort}${path}`,
+                  { proxy: proxyUrl, headers },
+                );
+                expect(ordinary.status).toBe(200);
+                expect(seen.at(-1)?.auth).not.toBe(`Bearer ${SECRET_V2}`);
+              }
+
+              const redirected = await fetch(
+                `http://${INJECT_HOST}:${targetPort}/mcp/redirect`,
+                { proxy: proxyUrl, headers, redirect: "follow" },
+              );
+              expect(redirected.status).toBe(200);
+              expect(seen.at(-1)?.host).toBe(LEG_TARGET);
+              expect(seen.at(-1)?.auth).not.toBe(`Bearer ${SECRET_V2}`);
+              return undefined;
+            },
+          );
+
+          const replay = await fetch(`http://${INJECT_HOST}:${targetPort}/mcp`, {
+            proxy: proxyUrl,
+            headers: { Authorization: `Bearer ${revokedPlaceholder}` },
+          });
+          expect(replay.status).toBe(200);
+          expect(seen.at(-1)?.auth).not.toBe(`Bearer ${SECRET_V2}`);
+          expect(readdirSync(join(secretsDir, "scoped"))).toEqual([]);
 
           // 13. DNS sinkhole: every name answers with the configured proxy
           //     IP (queried from a helper container on the same bridge).

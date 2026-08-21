@@ -136,6 +136,7 @@ function pinnedEntry(id: string, label: string, domain: string, reviewed = true)
     mcp: { serverUrl: `https://mcp.${domain}/mcp`, transport: "streamable-http" as const },
     credentialSchema: { type: "oauth" as const, scopes: [] },
     domains: [domain],
+    credentialTargets: [{ host: domain, pathPrefix: "/mcp" }],
     tools: [],
   };
   // SAFETY: the fixture carries every required field of the mcp manifest
@@ -256,6 +257,7 @@ function writeCompletedDraft(draftsDir: string, overrides: Record<string, JsonVa
       mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
       credentialSchema: { type: "oauth", scopes: ["read", "write"] },
       domains: ["linear.app"],
+      credentialTargets: [{ host: "linear.app", pathPrefix: "/mcp" }],
     },
     ...overrides,
   };
@@ -277,6 +279,7 @@ interface GmailDraftShape {
     mcp: { serverUrl: string; transport: string };
     credentialSchema: { type: string; scopes?: string[] };
     domains: string[];
+    credentialTargets: Array<{ host: string; pathPrefix?: string }>;
   };
 }
 
@@ -299,7 +302,8 @@ function gmailDraft(overrides: Record<string, JsonValue> = {}): GmailDraftShape 
       kind: "mcp",
       mcp: { serverUrl: "https://gmailmcp.googleapis.com/mcp/v1", transport: "streamable-http" },
       credentialSchema: { type: "oauth", scopes: ["https://www.googleapis.com/auth/gmail.readonly"] },
-      domains: ["gmail.googleapis.com"],
+      domains: ["gmail.googleapis.com", "gmailmcp.googleapis.com"],
+      credentialTargets: [{ host: "gmailmcp.googleapis.com", pathPrefix: "/mcp/v1" }],
     },
     ...overrides,
   };
@@ -735,6 +739,7 @@ describe("catalog_browser pin (issue #195)", () => {
           mcp: { command: "linear-mcp", transport: "stdio" },
           credentialSchema: { type: "api_key" },
           domains: ["linear.app"],
+          credentialTargets: [{ host: "linear.app" }],
         },
       });
       const tools = loadTools(store, {
@@ -1044,6 +1049,7 @@ describe("catalog_browser pin (issue #195)", () => {
           mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
           credentialSchema: { type: "oauth", scopes: ["read", "write"] },
           domains: ["linear.app"],
+          credentialTargets: [{ host: "linear.app", pathPrefix: "/mcp" }],
           tools: [{ name: "linear_search", tier: "read", description: "Search Linear" }],
         },
       });

@@ -21,6 +21,7 @@
       "type": "oauth",
       "scopes": ["read", "write"]
     },
-    "domains": ["mcp.linear.app"]
+    "domains": ["mcp.linear.app"],
+    "credentialTargets": [{ "host": "mcp.linear.app", "pathPrefix": "/mcp" }]
   }
 }

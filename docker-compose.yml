@@ -16,15 +16,33 @@
 # live in the vault; channel tokens live in the project .env only — the
 # executor env carries no keys, no tokens, no PAT.
 services:
+  egress-config-init:
+    # Copies the reviewed generated policy into the shared mutable location.
+    # The credential boundary rewrites only its marked call-scoped region;
+    # every stack start removes stale/replayed authority from a prior process.
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - cp /seed/egress.yml /data/egress.yml && chmod 600 /data/egress.yml
+    volumes:
+      - ./config/egress.yml:/seed/egress.yml:ro
+      - data:/data
+    networks:
+      - egress
+
   iron-proxy:
     # Pinned stable release; published to Docker Hub only (ghcr.io does not
     # exist — see .goreleaser.yml in ironsh/iron-proxy). v0.49.0 is the
     # latest stable tag at implementation time.
     image: ironsh/iron-proxy:0.49.0
     restart: on-failure
+    depends_on:
+      egress-config-init:
+        condition: service_completed_successfully
     command:
       - "-config"
-      - "/etc/iron-proxy/egress.yml"
+      - "/data/egress.yml"
     environment:
       # LLM judge key (config/egress.yml -> judge.provider.api_key_env):
       # the judge gates allowlisted traffic, so without a key every
@@ -39,7 +57,7 @@ services:
       # write-only boundary (the management endpoint 401s anyway).
       IRON_MANAGEMENT_API_KEY: ${IRON_MANAGEMENT_API_KEY:-}
     volumes:
-      - ./config/egress.yml:/etc/iron-proxy/egress.yml:ro
+      - ./config/egress.yml:/seed/egress.yml:ro
       # MITM CA, generated once per deployment (gitignored):
       #   docker run --rm -v $PWD/certs:/certs ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs
       - ./certs:/etc/iron-proxy/certs:ro
@@ -166,6 +184,7 @@ services:
       # write-only boundary, no reload).
       BOTTEGA_PROXY_CONTROL_URL: http://iron-proxy:9092
       BOTTEGA_PROXY_CONTROL_TOKEN: ${IRON_MANAGEMENT_API_KEY:-}
+      BOTTEGA_PROXY_CONFIG_PATH: /app/data/egress.yml
       # Credential boundary (issue #9): model keys resolve through the
       # broker, not from env. OMP_AUTH_BROKER_TOKEN is copied into .env
       # from the broker's first-boot token on the data volume

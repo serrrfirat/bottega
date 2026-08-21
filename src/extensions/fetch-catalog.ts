@@ -11,7 +11,7 @@
  * marked source.reviewed / source.vendorOfficial. Manifest tools are
  * OPTIONAL (issue #158): absent → the runtime discovers the provider's
  * tools/list surface at boot with conservative tiers; present → the
- * pinned-reviewed surface wins.
+ * reviewed pinned surface wins.
  *
  * The catalog record never carries an MCP/CLI binding, so the agent draft
  * flow (catalog_browser) instructs web-searching the vendor's OFFICIAL MCP
@@ -55,6 +55,7 @@ import {
   validateManifest,
   type CliBinding,
   type CredentialSchema,
+  type CredentialTarget,
   type ExtensionKind,
   type ExtensionTool,
   type JsonObject,
@@ -130,6 +131,7 @@ export interface SnapshotDraft {
     mcp?: McpBinding;
     cli?: CliBinding;
     credentialSchema?: CredentialSchema;
+    credentialTargets?: CredentialTarget[];
     tools?: ExtensionTool[];
   };
 }
@@ -332,18 +334,18 @@ export function buildSnapshotDraft(entry: CatalogEntry, pinnedAt: string = new D
 }
 
 function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
-  // The binding and credentialSchema are the NOT-discoverable facts
-  // (issue #158): a draft without them cannot pin. Tools are OPTIONAL —
-  // absent tools discover at runtime from the provider's tools/list.
+  // Binding, credential schema, and credential authority are reviewed facts.
   const needsBinding =
     draft.manifest.kind === "mcp" ? draft.manifest.mcp === undefined : draft.manifest.cli === undefined;
-  if (needsBinding || draft.manifest.credentialSchema === undefined) {
+  if (
+    needsBinding ||
+    draft.manifest.credentialSchema === undefined ||
+    draft.manifest.credentialTargets === undefined
+  ) {
     throw new ExtensionValidationError(
-      `draft for "${draft.extensionId}" is incomplete: add the ${draft.manifest.kind} binding and ` +
-        "credentialSchema from the vendor docs (see the catalog entry url) before pinning; manifest " +
-        "tools are OPTIONAL — a tools-less manifest discovers its surface at runtime from the " +
-        "provider's tools/list with conservative tiers (issue #158), or pin tools explicitly via " +
-        "fetch-catalog --generate-tools (issue #157)",
+      `draft for "${draft.extensionId}" is incomplete: add the ${draft.manifest.kind} binding, ` +
+        "credentialSchema, and explicit credentialTargets from the vendor docs before pinning; " +
+        "reachable domains do not grant credential authority",
     );
   }
   return validateManifest(JSON.parse(JSON.stringify(draft.manifest)));

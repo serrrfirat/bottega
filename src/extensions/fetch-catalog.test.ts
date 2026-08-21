@@ -75,6 +75,7 @@ function completedDraft(overrides: Partial<SnapshotDraft> = {}): SnapshotDraft {
         },
       ],
       domains: ["mcp.linear.app"],
+      credentialTargets: [{ host: "mcp.linear.app", pathPrefix: "/mcp" }],
     },
     ...overrides,
   };
@@ -254,6 +255,7 @@ describe("fetch-catalog helper (issue #54)", () => {
           mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
           credentialSchema: { type: "oauth", scopes: ["read", "write"] },
           domains: ["mcp.linear.app"],
+          credentialTargets: [{ host: "mcp.linear.app", pathPrefix: "/mcp" }],
           // no tools — the pin must NOT fabricate a surface; the runtime
           // discovers it from the provider's tools/list (issue #158)
         },
@@ -287,6 +289,7 @@ describe("fetch-catalog helper (issue #54)", () => {
           mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
           credentialSchema: { type: "api_key" },
           domains: ["mcp.linear.app"],
+          credentialTargets: [{ host: "mcp.linear.app", pathPrefix: "/mcp" }],
         },
       });
       // The pin still refuses: unreviewed community drafts never register —
@@ -435,6 +438,7 @@ describe("listCatalogEntries resilience (issue #117, #118)", () => {
           mcp: { serverUrl: "https://mcp.b12.io/mcp", transport: "streamable-http" },
           credentialSchema: { type: "api_key" },
           domains: ["b12.io"],
+          credentialTargets: [{ host: "b12.io", pathPrefix: "/mcp" }],
         },
       });
       // The provenance re-fetch resolves the url-less record; the completed

@@ -20,6 +20,7 @@
     "credentialSchema": {
       "type": "oauth"
     },
-    "domains": ["mcp.attio.com"]
+    "domains": ["mcp.attio.com"],
+    "credentialTargets": [{ "host": "mcp.attio.com", "pathPrefix": "/mcp" }]
   }
 }

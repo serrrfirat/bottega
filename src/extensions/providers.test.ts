@@ -182,7 +182,15 @@ function makeRuntime(
     // tiers; the tools map allows everything not explicitly denied.
     orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
     router: DenyRouter,
-    boundary: { async authorize() {} },
+    boundary: {
+      async runWithAuthorization(request, invoke) {
+        return invoke({
+          callId: request.callId,
+          placeholder: "test-placeholder",
+          signal: new AbortController().signal,
+        });
+      },
+    },
     ...(mcpTransport !== undefined ? { mcpTransport } : undefined),
     ...(surfaces !== undefined ? { surfaces } : undefined),
   });
@@ -599,6 +607,7 @@ describe("github hosted MCP live leg (skip-gated, issue #158 — tools-less disc
           mcp: { serverUrl: "https://api.githubcopilot.com/mcp/", transport: "streamable-http" },
           credentialSchema: { type: "api_key" },
           domains: ["api.githubcopilot.com"],
+          credentialTargets: [{ host: "api.githubcopilot.com", pathPrefix: "/mcp" }],
         }),
       );
 

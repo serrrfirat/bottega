@@ -13,7 +13,7 @@ import {
   renderEgressConfig,
   SNAPSHOTS_DIR,
   renderSecretsTransform,
-  apiKeyExtensionEntries,
+  credentialTargetEntries,
 } from "./generate";
 import { readPinnedSnapshots, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "../extensions/registry";
 import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID } from "../extensions/fixture";
@@ -26,10 +26,8 @@ const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egr
 const SNAPSHOTS = readPinnedSnapshots(SNAPSHOTS_DIR);
 const EXTENSION_DOMAINS = SNAPSHOTS.flatMap((s) => s.manifest.domains);
 
-/** File-injection entries for the committed api_key snapshots (issue #208;
- * since #284 the OAuth snapshots get no egress entry of any kind — the SDK
- * owns their OAuth, the proxy is transport/allowlist only). */
-const EXTENSION_ENTRIES = apiKeyExtensionEntries(SNAPSHOTS);
+/** Reviewed credential-target summaries stay separate from reachability. */
+const EXTENSION_ENTRIES = credentialTargetEntries(SNAPSHOTS);
 
 function allowlistDomains(yaml: string): string[] {
   const cfg = parseYamlSubset(yaml);
@@ -161,23 +159,22 @@ describe("egress config generation", () => {
     expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
   });
 
-  test("renderSecretsTransform emits the gateway keys plus one inject entry per extension", () => {
+  test("renderSecretsTransform reserves only the scoped region plus gateway keys", () => {
     const yaml = renderSecretsTransform([
-      { extensionId: FIXTURE_EXTENSION_ID, domains: [FIXTURE_EXTENSION_DOMAIN, "api.example.com"] },
+      {
+        extensionId: FIXTURE_EXTENSION_ID,
+        credentialTargets: [
+          { host: FIXTURE_EXTENSION_DOMAIN, pathPrefix: "/mcp" },
+          { host: "api.example.com" },
+        ],
+      },
     ]);
     const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
-    // 6 model-gateway keys (issue #208 + #230, incl. openai-codex + tavily) + the fixture extension.
-    expect(entries).toHaveLength(7);
-    // SAFETY: every rendered secrets entry's `source` is a block mapping
-    // carrying a `path` scalar (renderSecretsTransform emits it).
-    const fixture = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(FIXTURE_EXTENSION_ID));
-    expect(fixture).toMatchObject({
-      source: { type: "file", path: `/data/proxy-secrets/${FIXTURE_EXTENSION_ID}.secret` },
-      inject: { header: "Authorization", formatter: "Bearer {{ .Value }}" },
-    });
-    // SAFETY: renderSecretsTransform emits each entry's `rules` as a sequence of host-rule mappings.
-    const rules = fixture!["rules"] as Record<string, YamlNode>[];
-    expect(rules.map((r) => r["host"])).toEqual([FIXTURE_EXTENSION_DOMAIN, "api.example.com"]);
+    expect(entries).toHaveLength(6);
+    expect(yaml).toContain("bottega:scoped-authorizations begin");
+    expect(yaml).toContain("bottega:scoped-authorizations end");
+    expect(yaml).not.toContain(`${FIXTURE_EXTENSION_ID}.secret`);
+    expect(yaml).not.toContain('host: "api.example.com"');
     // The gateway entries are REQUIRED (fail closed — issue #208).
     for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex", "tavily"]) {
       // SAFETY: each gateway entry's `source` is a block mapping with a `path` scalar.
@@ -253,6 +250,7 @@ describe("egress config generation", () => {
               },
             ],
             domains: [FIXTURE_EXTENSION_DOMAIN],
+            credentialTargets: [{ host: FIXTURE_EXTENSION_DOMAIN, pathPrefix: "/mcp" }],
           },
         }),
       );
@@ -370,6 +368,7 @@ describe("runtime registry merge (issue #233)", () => {
         mcp: { serverUrl: `https://mcp.${extensionId}.example.com/mcp`, transport: "streamable-http" },
         credentialSchema: { type: credentialType },
         domains,
+        credentialTargets: [{ host: domains.at(-1)!, pathPrefix: "/mcp" }],
       },
     };
   }
@@ -394,8 +393,8 @@ describe("runtime registry merge (issue #233)", () => {
       expect(yaml).not.toContain("- name: oauth_token");
       expect(yaml).not.toContain("-oauth.json");
       expect(yaml).not.toContain("token_endpoint:");
-      // …the api_key runtime extension still gets a secrets file entry.
-      expect(yaml).toContain('path: "/data/proxy-secrets/runtime-key.secret"');
+      // Runtime credentials are never installed provider-wide.
+      expect(yaml).not.toContain('path: "/data/proxy-secrets/runtime-key.secret"');
       // The base config stays intact around the merge.
       expect(yaml).toContain('fallback: "deny"');
     } finally {
@@ -410,7 +409,7 @@ describe("runtime registry merge (issue #233)", () => {
       const runtime = [runtimeSnapshot("runtime-key", ["runtime-key.example.com"], "api_key")];
       const yaml = regenerateDevEgressConfig(join(dir, "missing-snapshots"), outPath, runtime);
       expect(readFileSync(outPath, "utf8")).toBe(yaml);
-      expect(yaml).toContain('path: "/data/proxy-secrets/runtime-key.secret"');
+      expect(yaml).not.toContain('path: "/data/proxy-secrets/runtime-key.secret"');
       expect(allowlistDomains(yaml)).toEqual(["*"]); // dev stays allow-all
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -426,7 +425,7 @@ describe("runtime registry merge (issue #233)", () => {
     const committedDev = readFileSync(resolve(import.meta.dir, `../../${DEV_EGRESS_CONFIG_PATH}`), "utf8");
     const seed = readPinnedSnapshots(SNAPSHOTS_DIR);
     const seedDomains = seed.flatMap((s) => s.manifest.domains);
-    const seedEntries = apiKeyExtensionEntries(seed);
+    const seedEntries = credentialTargetEntries(seed);
     expect(renderEgressConfig(mergedEgressDomains(seedDomains), seedEntries)).toBe(COMMITTED_EGRESS);
     expect(renderDevEgressConfig(seedEntries)).toBe(committedDev);
   });
@@ -450,6 +449,7 @@ describe("OAuth extension egress contract (issue #284)", () => {
         mcp: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
         credentialSchema: { type: "oauth" },
         domains: ["notion.com", "mcp.notion.com"],
+        credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
       },
     };
   }
@@ -465,7 +465,7 @@ describe("OAuth extension egress contract (issue #284)", () => {
     // <provider>-oauth.json blob seed, no token_endpoint.
     const yaml = renderEgressConfig(
       mergedEgressDomains(MERGED_SNAPSHOTS.flatMap((s) => s.manifest.domains)),
-      apiKeyExtensionEntries(MERGED_SNAPSHOTS),
+      credentialTargetEntries(MERGED_SNAPSHOTS),
     );
     const domains = allowlistDomains(yaml);
     for (const host of ["mcp.notion.com", "notion.com", "mcp.linear.app", "mcp.attio.com"]) {
@@ -478,7 +478,7 @@ describe("OAuth extension egress contract (issue #284)", () => {
     // The OAuth extensions get NO secrets-file entry either (nothing for
     // the proxy to inject) — only the api_key extension (github) + the six
     // model-gateway keys appear.
-    expect(secretsEntries(yaml)?.length).toBe(7);
+    expect(secretsEntries(yaml)?.length).toBe(6);
     // A runtime regen of the same set emits the same contract.
     const dir = mkdtempSync(join(tmpdir(), "egress-oauth-allowlist-"));
     try {
@@ -509,7 +509,7 @@ describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
     const entries = secretsEntries(COMMITTED_EGRESS);
     expect(entries).not.toBeNull();
     // github (api_key) + the six model-gateway keys — gmail adds nothing.
-    expect(entries!.length).toBe(7);
+    expect(entries!.length).toBe(6);
     for (const entry of entries!) {
       const source = entry["source"] as Record<string, YamlNode>;
       expect(String(source["path"])).not.toContain("gmail");
@@ -533,11 +533,12 @@ describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
         mcp: { serverUrl: "https://gmailmcp.googleapis.com/mcp/v1", transport: "streamable-http" },
         credentialSchema: { type: "oauth", scopes: ["https://www.googleapis.com/auth/gmail.readonly"] },
         domains: ["gmail.googleapis.com", "gmailmcp.googleapis.com"],
+        credentialTargets: [{ host: "gmailmcp.googleapis.com", pathPrefix: "/mcp/v1" }],
       },
     };
     const yaml = renderEgressConfig(
       mergedEgressDomains(gmailSnapshot.manifest.domains),
-      apiKeyExtensionEntries([gmailSnapshot]),
+      credentialTargetEntries([gmailSnapshot]),
     );
     const domains = allowlistDomains(yaml);
     expect(domains).toContain("gmail.googleapis.com");

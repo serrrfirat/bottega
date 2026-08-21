@@ -77,8 +77,13 @@ function makeRuntime(
     orgPolicy: opts.policy ?? parseOrgConfigYaml("tools:\n  unknown: allow\n"),
     router: DenyRouter,
     boundary: {
-      async authorize(credential: ExtensionCredential) {
-        boundaryCalls.push(credential);
+      async runWithAuthorization(request, invoke) {
+        boundaryCalls.push(request.credential);
+        return invoke({
+          callId: request.callId,
+          placeholder: "test-placeholder",
+          signal: new AbortController().signal,
+        });
       },
     },
     mcpTransport: opts.mcpTransport,
@@ -123,6 +128,7 @@ describe("extension tool bridge", () => {
         },
       ],
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     const { runtime, boundaryCalls } = makeRuntime([cli]);
     const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
@@ -143,6 +149,7 @@ describe("extension tool bridge", () => {
       credentialSchema: { type: "api_key" },
       tools: [{ name: "example.fail", tier: "read", description: "Always fails", params: [] }],
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     const { runtime } = makeRuntime([cli]);
     const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
@@ -196,6 +203,7 @@ describe("extension tool bridge", () => {
           },
         ],
         domains: ["api.example.com"],
+        credentialTargets: [{ host: "api.example.com" }],
       });
       const { runtime } = makeRuntime([cli]);
       const [definition] = extensionToolDefinitions([{ manifest: cli }], { runtime });
@@ -233,6 +241,7 @@ describe("extension tool bridge", () => {
         credentialSchema: { type: "api_key" },
         tools: [{ name: "sneaky.list", tier: "read", description: "Lists", params: [] }],
         domains: ["api.github.com"],
+        credentialTargets: [{ host: "api.github.com" }],
       }),
     ).toThrow(/looks like a credential/);
   });
@@ -254,6 +263,7 @@ describe("extension tool bridge", () => {
         },
       ],
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     const mcpTransport = (_binding: McpBinding): Transport => {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -288,6 +298,7 @@ describe("extension tool bridge", () => {
         },
       ],
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     // The stub records the tool name the RUNTIME forwards to the provider.
     const seen: string[] = [];
@@ -368,6 +379,7 @@ describe("extension tool bridge", () => {
       credentialSchema: { type: "api_key" },
       tools: [],
       domains: ["api.example.com"],
+      credentialTargets: [{ host: "api.example.com" }],
     });
     expect(extensionToolDefinitions([{ manifest: cli }], { runtime: stubRuntime })).toEqual([]);
   });
@@ -483,6 +495,7 @@ describe("extension tool bridge: tools-less manifests (issue #158)", () => {
       mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
       credentialSchema: { type: "api_key" },
       domains: ["discover.me.test"],
+      credentialTargets: [{ host: "discover.me.test", pathPrefix: "/mcp" }],
     });
   }
 
@@ -515,8 +528,13 @@ describe("extension tool bridge: tools-less manifests (issue #158)", () => {
       mcpTransport: discoverableTransport(seen),
       surfaces,
       boundary: {
-        async authorize(credential: ExtensionCredential) {
-          boundaryCalls.push(credential);
+        async runWithAuthorization(request, invoke) {
+          boundaryCalls.push(request.credential);
+          return invoke({
+            callId: request.callId,
+            placeholder: "test-placeholder",
+            signal: new AbortController().signal,
+          });
         },
       },
     });

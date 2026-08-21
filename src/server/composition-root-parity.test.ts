@@ -285,7 +285,17 @@ describe("composition-root parity (issue #172)", () => {
       // The resolver's OWN fail-closed error proves the resolver is wired:
       // an unwired boundary fails with the default "no broker secret
       // resolver wired" message instead (UNWIRED_ERROR must never match).
-      await expect(rt.boundary.authorize(credential), `${name} boundary`).rejects.toThrow(RESOLVER_ERROR);
+      await expect(
+        rt.boundary.runWithAuthorization(
+          {
+            credential,
+            targets: [{ host: "api.githubcopilot.com", pathPrefix: "/mcp" }],
+            callId: `parity-${name}`,
+          },
+          async () => undefined,
+        ),
+        `${name} boundary`,
+      ).rejects.toThrow(RESOLVER_ERROR);
     }
   });
 
@@ -314,11 +324,25 @@ describe("composition-root parity (issue #172)", () => {
           mapping: { "github:ik": { vault: "v", item: "i", field: "f" } },
         },
       });
-      // authorize() resolves from the stub and writes the secret file —
-      // proving the configured backend (not the broker default) was wired.
-      await server.boundary.authorize(credential);
-      await executor.runtime.boundary.authorize(credential);
-      await mcp.runtime.boundary.authorize(credential);
+      // Resolution happens before proxy activation. These parity roots do
+      // not boot a live proxy, so each call then fails closed on the missing
+      // mutable proxy config after proving the configured resolver ran.
+      for (const [name, runtime] of [
+        ["server", server],
+        ["executor", executor.runtime],
+        ["mcp", mcp.runtime],
+      ] as const) {
+        await expect(
+          runtime.boundary.runWithAuthorization(
+            {
+              credential,
+              targets: [{ host: "api.githubcopilot.com", pathPrefix: "/mcp" }],
+              callId: `parity-${name}`,
+            },
+            async () => undefined,
+          ),
+        ).rejects.toThrow(/BOTTEGA_PROXY_CONFIG_PATH/);
+      }
       expect(seen).toHaveLength(3);
       for (const request of seen) {
         expect(request.path).toBe("/v1/vaults/v/items/i");

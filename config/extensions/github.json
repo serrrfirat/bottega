@@ -20,6 +20,7 @@
     "credentialSchema": {
       "type": "api_key"
     },
-    "domains": ["api.githubcopilot.com"]
+    "domains": ["api.githubcopilot.com"],
+    "credentialTargets": [{ "host": "api.githubcopilot.com", "pathPrefix": "/mcp" }]
   }
 }

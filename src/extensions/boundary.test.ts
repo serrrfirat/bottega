@@ -6,10 +6,21 @@
  * hermetic fallback). Pure env mapping, tested hermetically.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { brokerSecretResolverFromEnv, createSecretFileBoundary, extensionSecretFileName, onePasswordConnectResolver, proxyBoundaryControlFromEnv, secretResolverFromSettings, type SecretResolverRef } from "./boundary";
+import {
+  brokerSecretResolverFromEnv,
+  createSecretFileBoundary,
+  onePasswordConnectResolver,
+  proxyBoundaryControlFromEnv,
+  renderScopedAuthorizationEntries,
+  SCOPED_AUTHORIZATIONS_BEGIN,
+  SCOPED_AUTHORIZATIONS_END,
+  secretResolverFromSettings,
+  type AuthorizationContext,
+  type SecretResolverRef,
+} from "./boundary";
 import type { ExtensionCredential } from "../store/db";
 import type { OrgSecretsBackendSettings, OrgSettings } from "../store/org-settings";
 
@@ -63,15 +74,14 @@ describe("proxyBoundaryControlFromEnv (issue #123)", () => {
   });
 });
 
-describe("createSecretFileBoundary reload half (issue #123, dev token contract)", () => {
-  /** Minimal credential: authorize only reads `provider` (the secret file name). */
-  const CREDENTIAL = {
-    id: "1",
+describe("request-scoped credential boundary (issues #317 and #307)", () => {
+  const ALICE = {
+    id: "alice",
     provider: "github",
     vault_provider: "github",
-    identity_key: "dev",
-    owner: null,
-    scope: "org",
+    identity_key: "alice",
+    owner: "alice",
+    scope: "personal",
     broker_credential_id: 1,
     pending_vault_provider: null,
     pending_broker_credential_id: null,
@@ -82,87 +92,238 @@ describe("createSecretFileBoundary reload half (issue #123, dev token contract)"
     created_at: 0,
     updated_at: 0,
   } satisfies ExtensionCredential;
+  const BOB = {
+    ...ALICE,
+    id: "bob",
+    identity_key: "bob",
+    owner: "bob",
+    broker_credential_id: 2,
+  } satisfies ExtensionCredential;
+  const TARGETS = [{ host: "api.example.com", pathPrefix: "/mcp" }] as const;
 
-  test("authorize writes the secret file and reloads the management API with the dev token", async () => {
-    // Stubbed management API: records the request, answers 200 like the
-    // real iron-proxy does for a valid token (dev.sh exports the same token
-    // to the container as IRON_MANAGEMENT_API_KEY and to the server as
-    // BOTTEGA_PROXY_CONTROL_TOKEN — both come from data/proxy-mgmt-token).
-    const seen: Array<{ path: string; auth: string | null }> = [];
-    const mgmt = Bun.serve({
+  function proxyConfig(): string {
+    return `transforms:
+  - name: secrets
+    config:
+      secrets:
+${SCOPED_AUTHORIZATIONS_BEGIN}
+${SCOPED_AUTHORIZATIONS_END}
+`;
+  }
+
+  test("two overlapping principals keep distinct authority and revoke in completion order", async () => {
+    const root = mkdtempSync(join(tmpdir(), "scoped-boundary-"));
+    const configPath = join(root, "egress.yml");
+    writeFileSync(configPath, proxyConfig());
+    const reloads: string[] = [];
+    const management = Bun.serve({
       port: 0,
-      fetch: async (req) => {
-        seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
+      fetch: () => {
+        reloads.push(readFileSync(configPath, "utf8"));
         return new Response("ok");
       },
     });
-    const dir = mkdtempSync(join(tmpdir(), "boundary-reload-"));
-    try {
-      const boundary = createSecretFileBoundary({
-        secretsDir: dir,
-        resolveSecret: async () => "dev-secret-value",
-        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
-        proxyControlToken: "dev-mgmt-token",
-      });
-      await boundary.authorize(CREDENTIAL);
-      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("dev-secret-value");
-      expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
-    } finally {
-      mgmt.stop(true);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("a 401 from the management API fails the extension call closed (token mismatch)", async () => {
-    // The fail-closed symptom: a running container whose
-    // IRON_MANAGEMENT_API_KEY differs from data/proxy-mgmt-token answers
-    // the reload with 401, and the boundary must NOT silently continue
-    // without injection — the extension call errors instead.
-    const mgmt = Bun.serve({
-      port: 0,
-      fetch: async () => new Response("unauthorized", { status: 401 }),
+    const boundary = createSecretFileBoundary({
+      secretsDir: join(root, "secrets"),
+      proxyConfigPath: configPath,
+      proxyControlUrl: `http://127.0.0.1:${management.port}`,
+      proxyControlToken: "management-token",
+      resolveSecret: async (credential) => `secret-${credential.owner}`,
     });
-    const dir = mkdtempSync(join(tmpdir(), "boundary-reload-"));
+    const aliceGate = Promise.withResolvers<void>();
+    const bobGate = Promise.withResolvers<void>();
+    const aliceReady = Promise.withResolvers<void>();
+    const bobReady = Promise.withResolvers<void>();
+    let aliceContext!: AuthorizationContext;
+    let bobContext!: AuthorizationContext;
     try {
-      const boundary = createSecretFileBoundary({
-        secretsDir: dir,
-        resolveSecret: async () => "dev-secret-value",
-        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
-        proxyControlToken: "wrong-token",
-      });
-      await expect(boundary.authorize(CREDENTIAL)).rejects.toThrow(/proxy reload failed \(401\)/);
+      const alice = boundary.runWithAuthorization(
+        { credential: ALICE, targets: TARGETS, callId: "call-alice" },
+        async (context) => {
+          aliceContext = context;
+          aliceReady.resolve();
+          await aliceGate.promise;
+          return "alice";
+        },
+      );
+      const bob = boundary.runWithAuthorization(
+        { credential: BOB, targets: TARGETS, callId: "call-bob" },
+        async (context) => {
+          bobContext = context;
+          bobReady.resolve();
+          await bobGate.promise;
+          return "bob";
+        },
+      );
+      await Promise.all([aliceReady.promise, bobReady.promise]);
+      const active = readFileSync(configPath, "utf8");
+      expect(active).toContain(aliceContext.placeholder);
+      expect(active).toContain(bobContext.placeholder);
+      expect(aliceContext.placeholder).not.toBe(bobContext.placeholder);
+      const files = readdirSync(join(root, "secrets", "scoped")).sort();
+      expect(files).toHaveLength(2);
+      expect(
+        files.map((file) => readFileSync(join(root, "secrets", "scoped", file), "utf8")).sort(),
+      ).toEqual(["secret-alice", "secret-bob"]);
+      for (const file of files) {
+        expect(statSync(join(root, "secrets", "scoped", file)).mode & 0o777).toBe(0o600);
+      }
+
+      bobGate.resolve();
+      await expect(bob).resolves.toBe("bob");
+      expect(readFileSync(configPath, "utf8")).not.toContain(bobContext.placeholder);
+      expect(readFileSync(configPath, "utf8")).toContain(aliceContext.placeholder);
+
+      aliceGate.resolve();
+      await expect(alice).resolves.toBe("alice");
+      const revoked = readFileSync(configPath, "utf8");
+      expect(revoked).not.toContain(aliceContext.placeholder);
+      expect(revoked).not.toContain(bobContext.placeholder);
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
+      expect(reloads.length).toBeGreaterThanOrEqual(5);
     } finally {
-      mgmt.stop(true);
-      rmSync(dir, { recursive: true, force: true });
+      bobGate.resolve();
+      aliceGate.resolve();
+      management.stop(true);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("write-only boundary (no control URL) still writes the secret file, no reload", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "boundary-reload-"));
+  test("exception, timeout, and caller abort revoke before returning", async () => {
+    const root = mkdtempSync(join(tmpdir(), "scoped-boundary-revoke-"));
+    const configPath = join(root, "egress.yml");
+    writeFileSync(configPath, proxyConfig());
+    const management = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    let expire!: () => void;
+    const boundary = createSecretFileBoundary({
+      secretsDir: join(root, "secrets"),
+      proxyConfigPath: configPath,
+      proxyControlUrl: `http://127.0.0.1:${management.port}`,
+      proxyControlToken: "management-token",
+      resolveSecret: async () => "secret",
+      scheduleExpiry: (callback) => {
+        expire = callback;
+        return () => {};
+      },
+    });
     try {
-      const boundary = createSecretFileBoundary({ secretsDir: dir, resolveSecret: async () => "s" });
-      await boundary.authorize(CREDENTIAL);
-      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("s");
+      await expect(
+        boundary.runWithAuthorization(
+          { credential: ALICE, targets: TARGETS, callId: "exception" },
+          async () => {
+            throw new Error("provider failed");
+          },
+        ),
+      ).rejects.toThrow("provider failed");
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
+
+      const timeoutReady = Promise.withResolvers<void>();
+      const timeoutPending = Promise.withResolvers<never>();
+      const timedOut = boundary.runWithAuthorization(
+        { credential: ALICE, targets: TARGETS, callId: "timeout", timeoutMs: 5 },
+        async () => {
+          timeoutReady.resolve();
+          return timeoutPending.promise;
+        },
+      );
+      await timeoutReady.promise;
+      expire();
+      await expect(timedOut).rejects.toThrow(/expired/);
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
+
+      const controller = new AbortController();
+      const abortReady = Promise.withResolvers<void>();
+      const abortPending = Promise.withResolvers<never>();
+      const aborted = boundary.runWithAuthorization(
+        { credential: ALICE, targets: TARGETS, callId: "abort", signal: controller.signal },
+        async () => {
+          abortReady.resolve();
+          return abortPending.promise;
+        },
+      );
+      await abortReady.promise;
+      controller.abort(new Error("caller cancelled"));
+      await expect(aborted).rejects.toThrow("caller cancelled");
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      management.stop(true);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("the live default secrets dir is refused under the test runner (issue #191)", async () => {
-    // The boundary's default PROXY_SECRETS_DIR is the LIVE production dir.
-    // The parity suite (#172/#190) clobbered data/proxy-secrets/github.secret
-    // by authorizing without an explicit temp secretsDir; the guard must
-    // fail the test loudly BEFORE any file system write. The default
-    // resolves to the live path from this file's cwd (the repo root).
-    const before = process.env.BOTTEGA_PROXY_SECRETS_DIR;
-    delete process.env.BOTTEGA_PROXY_SECRETS_DIR;
+  test("reload failure and process restart leave every old context denied", async () => {
+    const root = mkdtempSync(join(tmpdir(), "scoped-boundary-reload-"));
+    const configPath = join(root, "egress.yml");
+    writeFileSync(configPath, proxyConfig());
+    const failing = Bun.serve({ port: 0, fetch: () => new Response("bad", { status: 500 }) });
+    const denied = createSecretFileBoundary({
+      secretsDir: join(root, "secrets"),
+      proxyConfigPath: configPath,
+      proxyControlUrl: `http://127.0.0.1:${failing.port}`,
+      proxyControlToken: "management-token",
+      resolveSecret: async () => "secret",
+    });
     try {
-      const boundary = createSecretFileBoundary({ resolveSecret: async () => "s" });
-      await expect(boundary.authorize(CREDENTIAL)).rejects.toThrow(/refusing the live default secrets dir/);
+      await expect(
+        denied.runWithAuthorization(
+          { credential: ALICE, targets: TARGETS, callId: "reload" },
+          async () => "unreachable",
+        ),
+      ).rejects.toThrow(/proxy reload failed \(500\)/);
+      expect(readFileSync(configPath, "utf8")).not.toContain("bottega-call-");
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
     } finally {
-      if (before === undefined) delete process.env.BOTTEGA_PROXY_SECRETS_DIR;
-      else process.env.BOTTEGA_PROXY_SECRETS_DIR = before;
+      failing.stop(true);
     }
+
+    writeFileSync(
+      configPath,
+      proxyConfig().replace(
+        SCOPED_AUTHORIZATIONS_END,
+        `        - stale-call-entry\n${SCOPED_AUTHORIZATIONS_END}`,
+      ),
+    );
+    mkdirSync(join(root, "secrets", "scoped"), { recursive: true });
+    writeFileSync(join(root, "secrets", "scoped", "stale.secret"), "old-secret");
+    const management = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    const restarted = createSecretFileBoundary({
+      secretsDir: join(root, "secrets"),
+      proxyConfigPath: configPath,
+      proxyControlUrl: `http://127.0.0.1:${management.port}`,
+      proxyControlToken: "management-token",
+      resolveSecret: async () => "new-secret",
+    });
+    try {
+      await restarted.runWithAuthorization(
+        { credential: ALICE, targets: TARGETS, callId: "after-restart" },
+        async () => "ok",
+      );
+      expect(readFileSync(configPath, "utf8")).not.toContain("stale-call-entry");
+      expect(readdirSync(join(root, "secrets", "scoped"))).toEqual([]);
+    } finally {
+      management.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rendered targets use segment-boundary paths and never scan query/path/body for secrets", () => {
+    const rendered = renderScopedAuthorizationEntries([
+      {
+        fileId: "call",
+        placeholder: "opaque",
+        targets: [
+          { host: "api.example.com", pathPrefix: "/mcp" },
+          { host: "*.reviewed.example.com" },
+        ],
+      },
+    ]);
+    expect(rendered).toContain('host: "api.example.com"');
+    expect(rendered).toContain('paths: ["/mcp", "/mcp/*"]');
+    expect(rendered).not.toContain("/mcp-evil");
+    expect(rendered).toContain('host: "*.reviewed.example.com"');
+    expect(rendered).toContain("match_query: false");
+    expect(rendered).toContain("match_path: false");
+    expect(rendered).toContain("match_body: false");
   });
 });
 
@@ -313,38 +474,6 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
     }
   });
 
-  test("the resolved secret feeds the boundary end to end (secret file + reload)", async () => {
-    const broker = fakeBroker([
-      { id: 42, provider: "github", credential: { type: "api_key", key: "github_pat_test" }, identityKey: "api-key:dev", rotatesInMs: null },
-    ]);
-    const seen: Array<{ path: string; auth: string | null }> = [];
-    const mgmt = Bun.serve({
-      port: 0,
-      fetch: async (req) => {
-        seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
-        return new Response("ok");
-      },
-    });
-    const dir = mkdtempSync(join(tmpdir(), "boundary-resolver-"));
-    try {
-      const boundary = createSecretFileBoundary({
-        secretsDir: dir,
-        resolveSecret: brokerSecretResolverFromEnv({
-          OMP_AUTH_BROKER_URL: broker.url,
-          OMP_AUTH_BROKER_TOKEN: "broker-token",
-        }),
-        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
-        proxyControlToken: "dev-mgmt-token",
-      });
-      await boundary.authorize(BROKER_CREDENTIAL);
-      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("github_pat_test");
-      expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
-    } finally {
-      broker.stop();
-      mgmt.stop(true);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
 describe("secretResolverFromSettings (issue #190 backend selection)", () => {
@@ -578,48 +707,5 @@ describe("onePasswordConnectResolver (issue #190)", () => {
     }
   });
 
-  test("the Connect resolver feeds the boundary end to end (secret file + reload)", async () => {
-    const connect = stubConnect(() => itemResponse([{ id: "credential", label: "credential", value: "github_pat_123" }]));
-    const seen: Array<{ path: string; auth: string | null }> = [];
-    const mgmt = Bun.serve({
-      port: 0,
-      fetch: async (req) => {
-        seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
-        return new Response("ok");
-      },
-    });
-    const dir = mkdtempSync(join(tmpdir(), "boundary-connect-"));
-    const credential = {
-      id: "ec_connect",
-      provider: "github",
-      vault_provider: "github",
-      identity_key: "api-key:dev",
-      owner: null,
-      scope: "org",
-      broker_credential_id: 1,
-      pending_vault_provider: null,
-      pending_broker_credential_id: null,
-      pending_identity_key: null,
-      retiring_broker_credential_id: null,
-      status: "active",
-      revision: 1,
-      created_at: 0,
-      updated_at: 0,
-    } satisfies ExtensionCredential;
-    try {
-      const boundary = createSecretFileBoundary({
-        secretsDir: dir,
-        resolver: onePasswordConnectResolver(backend(connect.url, MAPPING), { OP_CONNECT_TOKEN: "connect-token" }),
-        proxyControlUrl: `http://127.0.0.1:${mgmt.port}`,
-        proxyControlToken: "dev-mgmt-token",
-      });
-      await boundary.authorize(credential);
-      expect(readFileSync(join(dir, extensionSecretFileName("github")), "utf8")).toBe("github_pat_123");
-      expect(seen).toEqual([{ path: "/v1/reload", auth: "Bearer dev-mgmt-token" }]);
-    } finally {
-      connect.stop();
-      mgmt.stop(true);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+
 });

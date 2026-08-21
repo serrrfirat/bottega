@@ -22,6 +22,7 @@ function cliManifest(): ExtensionManifest {
     credentialSchema: { type: "api_key" },
     tools: [{ name: "example.query", tier: "read", description: "Queries the example CLI", params: [] }],
     domains: ["api.example.com"],
+    credentialTargets: [{ host: "api.example.com" }],
   });
 }
 

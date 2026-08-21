@@ -22,13 +22,21 @@
  * `${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(id)}` (the same
  * volume at /data on the proxy side).
  */
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 // The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
 // transitive auth package, same 17.x release train) — no new dependency.
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import type { CredentialScope, ExtensionCredential } from "../store/db";
-import type { CredentialType } from "./manifest";
+import type { CredentialTarget, CredentialType } from "./manifest";
 import type { OrgSecretsBackendSettings, OrgSettings } from "../store/org-settings";
 import { errorMessage } from "../tools/helpers";
 
@@ -309,11 +317,20 @@ export interface CredentialReplacementPreparation {
 }
 
 /**
- * Runtime authorization plus strict lifecycle cleanup. Cleanup methods are
- * deliberately not best-effort: callers persist the failed phase and retry.
+ * Marker pair emitted inside the generated secrets list. The boundary only
+ * rewrites this bounded region; the reviewed egress policy stays immutable.
  */
-export interface CredentialBoundary {
-  authorize(credential: ExtensionCredential): Promise<void>;
+export const SCOPED_AUTHORIZATIONS_BEGIN = "        # bottega:scoped-authorizations begin";
+export const SCOPED_AUTHORIZATIONS_END = "        # bottega:scoped-authorizations end";
+
+/** Default maximum lifetime for one extension authorization. */
+export const DEFAULT_AUTHORIZATION_TTL_MS = 120_000;
+
+/** Opaque authority passed to a provider transport. It contains no secret. */
+export interface AuthorizationContext {
+  readonly callId: string;
+  readonly placeholder: string;
+  readonly signal: AbortSignal;
 }
 
 export interface ConnectionBoundary {
@@ -324,47 +341,130 @@ export interface ConnectionBoundary {
   disconnect(credential: ExtensionCredential): Promise<void>;
 }
 
-export interface SecretFileBoundaryOpts {
-  /**
-   * Pluggable secret resolver (issue #190): resolves the credential's
-   * secret payload from the deployment's configured backend (omp-broker
-   * default, 1password-connect). Preferred over `resolveSecret` when both
-   * are given — this is the canonical form the composition root wires.
-   */
-  resolver?: SecretResolver;
-  /**
-   * Fetches the secret payload for the resolved credential from the auth
-   * broker (account-pool-scoped, issue #51). The broker client lands with
-   * issue #54; until then, missing resolvers fail closed with a clear
-   * error instead of running calls without a credential.
-   */
-  resolveSecret?: (credential: ExtensionCredential) => Promise<string>;
-  /** Directory for secret files; defaults to PROXY_SECRETS_DIR (env-overridable). */
-  secretsDir?: string;
-  /** iron-proxy management API base (e.g. http://iron-proxy:9092); unset → write-only, no reload. */
-  proxyControlUrl?: string;
-  /** Bearer token for the management API (the config's api_key_env value). */
-  proxyControlToken?: string;
+export interface AuthorizationRequest {
+  credential: ExtensionCredential;
+  targets: readonly CredentialTarget[];
+  /** Redacted correlation id recorded by the runtime audit. */
+  callId: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 /**
- * The real boundary: writes the resolved secret to the extension's file
- * (mode 0600, atomic write-temp + rename) and best-effort reloads the
- * proxy when a control URL is set.
+ * The boundary owns the whole authorization lifetime. The callback cannot
+ * outlive its proxy mapping: success, failure, timeout, and abort all revoke
+ * in `finally`.
+ */
+export interface CredentialBoundary {
+  runWithAuthorization<T>(
+    request: AuthorizationRequest,
+    invoke: (context: AuthorizationContext) => Promise<T>,
+  ): Promise<T>;
+}
+
+interface ActiveAuthorization {
+  fileId: string;
+  placeholder: string;
+  targets: readonly CredentialTarget[];
+}
+
+export interface SecretFileBoundaryOpts {
+  resolver?: SecretResolver;
+  resolveSecret?: (credential: ExtensionCredential) => Promise<string>;
+  /** Host-side directory shared with iron-proxy at PROXY_SECRETS_MOUNT_PATH. */
+  secretsDir?: string;
+  /** Mutable config file the running proxy reloads. */
+  proxyConfigPath?: string;
+  proxyControlUrl?: string;
+  proxyControlToken?: string;
+  /** Test seam; defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Deterministic expiry seam; returns a cancellation function. */
+  scheduleExpiry?: (expire: () => void, timeoutMs: number) => () => void;
+}
+
+function yamlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+/** Renders active call mappings in iron-proxy's token-replacement mode. */
+export function renderScopedAuthorizationEntries(
+  authorizations: readonly {
+    fileId: string;
+    placeholder: string;
+    targets: readonly CredentialTarget[];
+  }[],
+): string {
+  return authorizations
+    .map((authorization) => {
+      const rules = authorization.targets
+        .map((target) => {
+          const paths =
+            target.pathPrefix === undefined
+              ? ""
+              : target.pathPrefix === "/"
+                ? "\n              paths: [\"/*\"]"
+                : `\n              paths: [${yamlString(target.pathPrefix)}, ${yamlString(`${target.pathPrefix}/*`)}]`;
+          return `            - host: ${yamlString(target.host)}${paths}`;
+        })
+        .join("\n");
+      return `        - source:
+            type: file
+            path: ${yamlString(`${PROXY_SECRETS_MOUNT_PATH}/scoped/${authorization.fileId}.secret`)}
+            ttl: "0s"
+          replace:
+            proxy_value: ${yamlString(authorization.placeholder)}
+            match_headers: ["Authorization"]
+            match_body: false
+            match_query: false
+            match_path: false
+          rules:
+${rules}`;
+    })
+    .join("\n");
+}
+
+function replaceScopedAuthorizationBlock(config: string, entries: string): string {
+  const begin = config.indexOf(SCOPED_AUTHORIZATIONS_BEGIN);
+  const end = config.indexOf(SCOPED_AUTHORIZATIONS_END);
+  if (begin === -1 || end === -1 || end < begin) {
+    throw new Error(
+      "extension credential boundary: proxy config has no scoped-authorization markers — regenerate egress config",
+    );
+  }
+  const afterBegin = begin + SCOPED_AUTHORIZATIONS_BEGIN.length;
+  const body = entries === "" ? "\n" : `\n${entries}\n`;
+  return `${config.slice(0, afterBegin)}${body}${config.slice(end)}`;
+}
+
+function abortError(reason: unknown): Error {
+  return reason instanceof Error ? reason : new Error(typeof reason === "string" ? reason : "authorization aborted");
+}
+
+/**
+ * File-backed call-scoped proxy boundary. Each live call gets a random proxy
+ * token and a distinct mode-0600 secret file. Config updates are serialized,
+ * but provider callbacks overlap; the applied config contains every live
+ * mapping, so one caller can never overwrite another caller's authority.
  */
 export function createSecretFileBoundary(
   opts: SecretFileBoundaryOpts = {},
 ): CredentialBoundary & ConnectionBoundary {
   const secretsDir = opts.secretsDir ?? process.env.BOTTEGA_PROXY_SECRETS_DIR ?? PROXY_SECRETS_DIR;
+  const proxyConfigPath = opts.proxyConfigPath ?? process.env.BOTTEGA_PROXY_CONFIG_PATH;
+  const fetchImpl = opts.fetchImpl ?? fetch;
   const resolveSecret = opts.resolver
     ? async (credential: ExtensionCredential): Promise<string> =>
         (await opts.resolver!.resolve(toSecretResolverRef(credential))).secret
     : opts.resolveSecret ??
       (() => {
         throw new Error(
-          "extension credential boundary: no broker secret resolver wired (issue #54) — the call would run unauthenticated, failing closed",
+          "extension credential boundary: no broker secret resolver wired — refusing an unauthenticated call",
         );
       });
+  const active = new Map<string, ActiveAuthorization>();
+  let queue: Promise<void> = Promise.resolve();
+  let initialized = false;
 
   function assertSafeTestDirectory(): void {
     if (process.env.NODE_ENV === "test" && resolve(secretsDir) === resolve(PROXY_SECRETS_DIR)) {
@@ -374,11 +474,35 @@ export function createSecretFileBoundary(
     }
   }
 
-  async function reloadProxy(): Promise<void> {
-    if (!opts.proxyControlUrl) return;
+  const locked = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = queue;
+    const next = Promise.withResolvers<void>();
+    queue = next.promise;
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      next.resolve();
+    }
+  };
+
+  const reload = async (required: boolean): Promise<void> => {
+    if (!opts.proxyControlUrl) {
+      if (required) {
+        throw new Error(
+          "extension credential boundary: scoped authorization requires BOTTEGA_PROXY_CONTROL_URL and BOTTEGA_PROXY_CONTROL_TOKEN",
+        );
+      }
+      return;
+    }
+    if (required && !opts.proxyControlToken) {
+      throw new Error(
+        "extension credential boundary: scoped authorization requires BOTTEGA_PROXY_CONTROL_URL and BOTTEGA_PROXY_CONTROL_TOKEN",
+      );
+    }
     let response: Response;
     try {
-      response = await fetch(`${opts.proxyControlUrl}/v1/reload`, {
+      response = await fetchImpl(`${opts.proxyControlUrl}/v1/reload`, {
         method: "POST",
         headers: opts.proxyControlToken
           ? { Authorization: `Bearer ${opts.proxyControlToken}` }
@@ -390,19 +514,110 @@ export function createSecretFileBoundary(
     if (!response.ok) {
       throw new Error(`extension credential boundary: proxy reload failed (${response.status})`);
     }
-  }
+  };
+
+  const apply = async (): Promise<void> => {
+    if (!proxyConfigPath) {
+      throw new Error(
+        "extension credential boundary: BOTTEGA_PROXY_CONFIG_PATH is required for request-scoped authorization",
+      );
+    }
+    const current = readFileSync(proxyConfigPath, "utf8");
+    const entries = renderScopedAuthorizationEntries([...active.values()]);
+    const next = replaceScopedAuthorizationBlock(current, entries);
+    const tmp = `${proxyConfigPath}.tmp`;
+    writeFileSync(tmp, next, { mode: 0o600 });
+    renameSync(tmp, proxyConfigPath);
+    await reload(true);
+  };
+
+  const initialize = async (): Promise<void> => {
+    if (initialized) return;
+    active.clear();
+    rmSync(join(secretsDir, "scoped"), { recursive: true, force: true });
+    mkdirSync(join(secretsDir, "scoped"), { recursive: true });
+    await apply();
+    initialized = true;
+  };
+
+  const revoke = async (fileId: string): Promise<void> => {
+    await locked(async () => {
+      if (!active.delete(fileId)) return;
+      // Delete the secret first. Even if config cleanup/reload fails, the
+      // currently applied mapping can no longer resolve any authority.
+      rmSync(join(secretsDir, "scoped", `${fileId}.secret`), { force: true });
+      await apply();
+    });
+  };
 
   return {
-    async authorize(credential) {
+    async runWithAuthorization(request, invoke) {
+      if (request.targets.length === 0) {
+        throw new Error("extension credential boundary: reviewed credential targets are required");
+      }
       assertSafeTestDirectory();
-      const secret = await resolveSecret(credential);
-      const fileName = extensionSecretFileName(credential.provider);
-      mkdirSync(secretsDir, { recursive: true });
-      const tmpPath = join(secretsDir, `${fileName}.tmp`);
-      const finalPath = join(secretsDir, fileName);
-      writeFileSync(tmpPath, secret, { mode: 0o600 });
-      renameSync(tmpPath, finalPath);
-      await reloadProxy();
+      if (request.signal?.aborted) throw abortError(request.signal.reason);
+
+      const secret = await resolveSecret(request.credential);
+      const fileId = randomUUID();
+      const placeholder = `bottega-call-${randomUUID()}`;
+      const controller = new AbortController();
+      const timeoutMs = request.timeoutMs ?? DEFAULT_AUTHORIZATION_TTL_MS;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+        throw new Error("extension credential boundary: timeoutMs must be a positive integer");
+      }
+      const onCallerAbort = (): void => controller.abort(request.signal?.reason);
+      request.signal?.addEventListener("abort", onCallerAbort, { once: true });
+      const expire = (): void =>
+        controller.abort(new Error(`extension authorization expired after ${timeoutMs}ms`));
+      const cancelExpiry =
+        opts.scheduleExpiry?.(expire, timeoutMs) ??
+        (() => {
+          const timer = setTimeout(expire, timeoutMs);
+          return () => clearTimeout(timer);
+        })();
+
+      try {
+        await locked(async () => {
+          await initialize();
+          const scopedDir = join(secretsDir, "scoped");
+          mkdirSync(scopedDir, { recursive: true });
+          const tmp = join(scopedDir, `${fileId}.secret.tmp`);
+          const final = join(scopedDir, `${fileId}.secret`);
+          writeFileSync(tmp, secret, { mode: 0o600 });
+          renameSync(tmp, final);
+          active.set(fileId, { fileId, placeholder, targets: request.targets });
+          try {
+            await apply();
+          } catch (err) {
+            active.delete(fileId);
+            rmSync(final, { force: true });
+            try {
+              await apply();
+            } catch {
+              // Secret deletion is the fail-closed cleanup. Preserve the
+              // original activation error; no credential remains usable.
+            }
+            throw err;
+          }
+        });
+
+        const abortRace = Promise.withResolvers<never>();
+        controller.signal.addEventListener(
+          "abort",
+          () => abortRace.reject(abortError(controller.signal.reason)),
+          { once: true },
+        );
+        return await Promise.race([
+          invoke({ callId: request.callId, placeholder, signal: controller.signal }),
+          abortRace.promise,
+        ]);
+      } finally {
+        cancelExpiry();
+        request.signal?.removeEventListener("abort", onCallerAbort);
+        controller.abort(new Error("extension authorization revoked"));
+        await revoke(fileId);
+      }
     },
 
     async prepareReplacement(current, replacement) {
@@ -425,12 +640,12 @@ export function createSecretFileBoundary(
           if (hadCurrent) renameSync(finalPath, backupPath);
           renameSync(stagedPath, finalPath);
           try {
-            await reloadProxy();
+            await reload(false);
           } catch (activationError) {
             rmSync(finalPath, { force: true });
             if (hadCurrent && existsSync(backupPath)) renameSync(backupPath, finalPath);
             try {
-              await reloadProxy();
+              await reload(false);
             } catch (rollbackError) {
               throw new Error(
                 `extension credential boundary: replacement activation failed and rollback reload failed: ${errorMessage(
@@ -453,7 +668,7 @@ export function createSecretFileBoundary(
       assertSafeTestDirectory();
       const finalPath = join(secretsDir, extensionSecretFileName(credential.provider));
       rmSync(finalPath, { force: true });
-      await reloadProxy();
+      await reload(false);
     },
   };
 }

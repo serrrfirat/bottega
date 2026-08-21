@@ -27,6 +27,7 @@ function cliManifest(): ExtensionManifest {
       },
     ],
     domains: ["api.example.com"],
+    credentialTargets: [{ host: "api.example.com", pathPrefix: "/v1" }],
   };
 }
 
@@ -288,15 +289,80 @@ describe("extension manifest validation (fail closed)", () => {
     expectInvalid(mutate(fixtureManifest(), ["domains"], ["bad domain"]), "domain");
     expectInvalid(mutate(fixtureManifest(), ["domains"], "not-an-array"), "domains must be an array");
   });
-
-  test("an empty domains array is accepted (no egress allowance)", () => {
-    const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), domains: [] }));
-    expect(manifest.domains).toEqual([]);
+  test("an empty domains array cannot carry an authenticated target", () => {
+    expectInvalid(
+      asJsonDoc({ ...fixtureManifest(), domains: [] }),
+      "credential target host",
+    );
   });
 
   test("wildcard domains with a leading *. are accepted", () => {
     const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), domains: ["*.fixture.weather.test"] }));
     expect(manifest.domains).toEqual(["*.fixture.weather.test"]);
+  });
+
+  test("credential targets are required and stay separate from reachable domains (issue #307)", () => {
+    expectInvalid(mutate(fixtureManifest(), ["credentialTargets"], undefined), "credentialTargets");
+    expectInvalid(mutate(fixtureManifest(), ["credentialTargets"], []), "credentialTargets must not be empty");
+    expectInvalid(
+      mutate(fixtureManifest(), ["credentialTargets"], [{ host: "private.example.com" }]),
+      "must be covered by domains",
+    );
+    const manifest = validateManifest(
+      mutate(fixtureManifest(), ["credentialTargets"], [
+        { host: "fixture.weather.test", pathPrefix: "/mcp" },
+      ]),
+    );
+    expect(manifest.credentialTargets).toEqual([
+      { host: "fixture.weather.test", pathPrefix: "/mcp" },
+    ]);
+    expect(manifest.domains).toEqual(["fixture.weather.test"]);
+  });
+
+  test("credential target host/path boundaries reject broad or ambiguous authority (issue #307)", () => {
+    for (const host of ["*", "https://api.example.com", "user@api.example.com", "api.example.com.", "bad host"]) {
+      expectInvalid(
+        mutate(fixtureManifest(), ["credentialTargets"], [{ host }]),
+        "credential target",
+      );
+    }
+    for (const pathPrefix of ["mcp", "/mcp/", "/mcp?admin=1", "/mcp#fragment", "/mcp//nested", "/mcp/../admin", "/%2e%2e/admin", "/mcp%2fadmin"]) {
+      expectInvalid(
+        mutate(fixtureManifest(), ["credentialTargets"], [
+          { host: "fixture.weather.test", pathPrefix },
+        ]),
+        "pathPrefix",
+      );
+    }
+  });
+
+  test("reviewed wildcard targets must be explicitly bound by the egress allowlist (issue #307)", () => {
+    const wildcard = validateManifest(
+      asJsonDoc({
+        ...fixtureManifest(),
+        domains: ["*.fixture.weather.test"],
+        credentialTargets: [{ host: "*.fixture.weather.test", pathPrefix: "/mcp" }],
+      }),
+    );
+    expect(wildcard.credentialTargets).toEqual([
+      { host: "*.fixture.weather.test", pathPrefix: "/mcp" },
+    ]);
+    expectInvalid(
+      asJsonDoc({
+        ...fixtureManifest(),
+        domains: ["*.fixture.weather.test"],
+        credentialTargets: [{ host: "*.weather.test", pathPrefix: "/mcp" }],
+      }),
+      "must be covered by domains",
+    );
+    expectInvalid(
+      asJsonDoc({
+        ...fixtureManifest(),
+        domains: ["fixture.weather.test"],
+        credentialTargets: [{ host: "*.fixture.weather.test", pathPrefix: "/mcp" }],
+      }),
+      "wildcard credential target",
+    );
   });
 
   test("an empty tools array is allowed (egress-only extension)", () => {

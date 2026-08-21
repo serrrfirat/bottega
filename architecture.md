@@ -149,10 +149,10 @@ rules denied the server's own model calls (a context-free LLM denies bare
 model/API requests) and Slack domains weren't allowlisted at all, which
 broke the bot under the dev proxy. Instead of loosening the deployment
 contract, local dev now loads the generated **dev-permissive config**
-(`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge; static-secret,
-OAuth-token, and management paths retained; mounted only by
-`docker-compose.dev.yml`) — so ALL dev traffic passes the proxy while the
-credential boundary stays identical.
+(`config/egress.dev.yml`: allow-all allowlist `"*"` + no judge; model-gateway
+secrets, request-scoped extension authorization markers, and management paths
+retained; mounted only by `docker-compose.dev.yml`) — so ALL dev traffic passes
+the proxy while the credential boundary stays identical.
 temporary #126 `NO_PROXY` bypass in `scripts/dev.sh` is reverted (the dev
 proxy passes everything; routing through it is harmless). `NEARAI_JUDGE_API_KEY`
 is a deployment concern only. The compose topology above still routes
@@ -453,10 +453,14 @@ user-facing view is in
 [features.md](features.md#extensions--the-registry).
 
 1. **Manifest and snapshot** — `manifest.ts` validates ids, bindings,
-   `credentialSchema`, domains, and optional tools. A top-level
-   `config/extensions/<id>.json` snapshot must carry reviewed provenance;
-   drafts live under `config/extensions/drafts/`, outside the registry scan.
-   Invalid or unreviewed snapshots never partially register.
+   `credentialSchema`, reachability `domains`, reviewed `credentialTargets`,
+   and optional tools. A target names the exact host and an optional
+   segment-boundary path prefix that may receive a credential; a broader
+   egress domain grants reachability only. Missing, malformed, or unbound
+   targets fail closed. A top-level `config/extensions/<id>.json` snapshot
+   must carry reviewed provenance; drafts live under
+   `config/extensions/drafts/`, outside the registry scan. Invalid or
+   unreviewed snapshots never partially register.
 2. **Chat-native draft/review/pin** — `catalog_browser` in
    `src/tools/admin.ts` creates the unreviewed catalog draft, instructs the
    agent to use `web_search` for the vendor-official binding (#146), and
@@ -572,18 +576,24 @@ sequenceDiagram
             R->>R: provider:identityKey → vault/item/field
         end
         R-->>B: secret payload
-        B->>X: atomic mode-0600 file + POST /v1/reload
-        T->>X: credential-free streamable-HTTP request
-        X->>X: allowlist → judge → inject Authorization
+        B->>X: random per-call placeholder + distinct mode-0600 file
+        B->>X: exact reviewed host/path rules + POST /v1/reload
+        T->>X: placeholder-bearing streamable-HTTP request
+        X->>X: allowlist → judge → target-bound placeholder replacement
         X->>H: credentialed tools/call<br/>providerName wire value
         H-->>T: one result (isError preserved)
-        T->>A: extension.call {tool, actor, credential_id, decision}
+        B->>X: delete file + remove rule + POST /v1/reload
+        T->>A: extension.call {tool, actor, credential_id, decision, call_id}
     end
 ```
 
-Missing backend configuration, credential row/mapping, supported secret
-shape, or proxy reload stops the request before it can run unauthenticated.
-The agent environment, transcript, and audit never receive the secret.
+Missing backend configuration, credential row/mapping, reviewed target,
+supported secret shape, config marker, or proxy reload stops the request
+before it can run unauthenticated. Completion, error, timeout, and cancellation
+delete the call's secret before removing its rule. A cleanup reload failure
+therefore leaves the old rule unable to resolve authority. Startup clears the
+scoped region and stale files before admitting a new call. The agent
+environment, transcript, approval payload, and audit never receive the secret.
 
 ```mermaid
 flowchart LR

@@ -30,6 +30,7 @@ export function fixtureManifest(): ExtensionManifest {
       },
     ],
     domains: [FIXTURE_EXTENSION_DOMAIN],
+    credentialTargets: [{ host: FIXTURE_EXTENSION_DOMAIN, pathPrefix: "/mcp" }],
   };
 }
 

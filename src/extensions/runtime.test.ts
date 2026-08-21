@@ -10,13 +10,12 @@
  * MCP transport receives nothing but the binding.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createAudit, type AuditModule } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
@@ -27,12 +26,11 @@ import {
   EXTENSION_CREDENTIAL_RESOLVED_EVENT,
   POLICY_DECISION_EVENT,
 } from "../store/audit-events";
-import { createSecretFileBoundary, extensionSecretFileName, PROXY_SECRETS_DIR, type CredentialBoundary } from "./boundary";
+import type { CredentialBoundary } from "./boundary";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL, fixtureManifest } from "./fixture";
 import { validateManifest, type ExtensionManifest, type JsonObject, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
-import { createExtensionRuntime, defaultMcpTransport, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
-import type { McpOAuthTokenStore } from "./mcp-oauth";
+import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
 import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-runtime-"));
@@ -75,8 +73,13 @@ function makeBoundary(): CredentialBoundary & { calls: ExtensionCredential[] } {
   const calls: ExtensionCredential[] = [];
   return {
     calls,
-    async authorize(credential: ExtensionCredential) {
-      calls.push(credential);
+    async runWithAuthorization(request, invoke) {
+      calls.push(request.credential);
+      return invoke({
+        callId: request.callId,
+        placeholder: `placeholder-${request.credential.id}`,
+        signal: new AbortController().signal,
+      });
     },
   };
 }
@@ -85,10 +88,9 @@ function makeHarness(opts: {
   policy?: PolicyConfig;
   manifests?: ExtensionManifest[];
   boundary?: CredentialBoundary;
-  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
   onToolStep?: ExtensionRuntimeDeps["onToolStep"];
   router?: ExtensionRuntimeDeps["router"];
-  mcpOAuthTokenStore?: McpOAuthTokenStore;
+  mcpTransport?: ExtensionRuntimeDeps["mcpTransport"];
 } = {}): RuntimeHarness {
   const registry = createFixtureRegistry();
   for (const manifest of opts.manifests ?? []) registry.register(manifest);
@@ -121,7 +123,7 @@ function makeHarness(opts: {
     mcpTransport,
   };
   if (opts.onToolStep !== undefined) deps.onToolStep = opts.onToolStep;
-  if (opts.mcpOAuthTokenStore !== undefined) deps.mcpOAuthTokenStore = opts.mcpOAuthTokenStore;
+
   return { runtime: createExtensionRuntime(deps), store, boundary, transports, mcpTransport };
 }
 
@@ -496,7 +498,7 @@ describe("extension runtime: ladder (org / me / auto) and boundary", () => {
 
   test("a boundary failure fails closed as a tool error (allow already audited)", async () => {
     const failingBoundary: CredentialBoundary = {
-      async authorize() {
+      async runWithAuthorization() {
         throw new Error("proxy reload failed (500)");
       },
     };
@@ -562,74 +564,87 @@ describe("extension runtime: ladder (org / me / auto) and boundary", () => {
     expect(result.ok).toBe(true);
     expect(seen).toEqual([{ name: FIXTURE_EXTENSION_TOOL, args: { city: "Porto", units: "metric" } }]);
   });
-});
 
-describe("extension runtime: secret-file boundary (issue #53 injection wiring)", () => {
-  test("writes the resolved secret to the extension's file with mode 0600 and reloads the proxy", async () => {
-    const secretsDir = join(dir, "boundary-secrets");
-    const reloads: Array<{ url: string; auth: string | null }> = [];
-    const server = Bun.serve({
-      port: 0,
-      fetch: (req) => {
-        reloads.push({
-          url: req.url,
-          auth: req.headers.get("authorization"),
-        });
-        return new Response("ok");
-      },
-    });
-    try {
-      const boundary = createSecretFileBoundary({
-        resolveSecret: async () => "sk-real-secret-123",
-        secretsDir,
-        proxyControlUrl: `http://127.0.0.1:${server.port}`,
-        proxyControlToken: "mgmt-token",
+  test("two gated concurrent personal calls keep Alice and Bob authority isolated (issue #317)", async () => {
+    const aliceGate = Promise.withResolvers<void>();
+    const bobGate = Promise.withResolvers<void>();
+    const aliceReady = Promise.withResolvers<void>();
+    const bobReady = Promise.withResolvers<void>();
+    const seen: Array<{ city: string; placeholder: string }> = [];
+    const mcpTransport: NonNullable<ExtensionRuntimeDeps["mcpTransport"]> = (
+      _binding,
+      _authProvider,
+      authorization,
+    ) => {
+      if (authorization === undefined) throw new Error("missing call-scoped authorization");
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const server = new Server(
+        { name: "concurrent-mcp", version: "1.0.0" },
+        { capabilities: { tools: {} } },
+      );
+      server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const city = String(request.params.arguments?.["city"] ?? "");
+        seen.push({ city, placeholder: authorization.placeholder });
+        if (city === "Alice") {
+          aliceReady.resolve();
+          await aliceGate.promise;
+        } else {
+          bobReady.resolve();
+          await bobGate.promise;
+        }
+        return { content: [{ type: "text", text: city }] };
       });
-      const store = createStore(":memory:");
-      stores.push(store);
-      const credential = await seedOrgCredential(store);
-      await boundary.authorize(credential);
-
-      const filePath = join(secretsDir, extensionSecretFileName(FIXTURE_EXTENSION_ID));
-      expect(readFileSync(filePath, "utf8")).toBe("sk-real-secret-123");
-      expect(statSync(filePath).mode & 0o777).toBe(0o600);
-      // The reload hit the management API with the bearer token.
-      expect(reloads).toEqual([
-        { url: `http://127.0.0.1:${server.port}/v1/reload`, auth: "Bearer mgmt-token" },
-      ]);
-    } finally {
-      server.stop();
-    }
-  });
-
-  test("no broker resolver → fails closed with a clear error, nothing written", async () => {
-    const secretsDir = join(dir, "boundary-empty");
-    const boundary = createSecretFileBoundary({ secretsDir });
-    const store = createStore(":memory:");
-    stores.push(store);
-    const credential = await seedOrgCredential(store);
-    await expect(boundary.authorize(credential)).rejects.toThrow(/issue #54/);
-    expect(() => statSync(join(secretsDir, extensionSecretFileName(FIXTURE_EXTENSION_ID)))).toThrow();
-  });
-
-  test("a failed proxy reload fails the authorization closed", async () => {
-    const boundary = createSecretFileBoundary({
-      resolveSecret: async () => "sk-secret",
-      secretsDir: join(dir, "boundary-reload-fail"),
-      proxyControlUrl: "http://127.0.0.1:9",
+      void server.connect(serverTransport);
+      return clientTransport;
+    };
+    const h = makeHarness({
+      policy: parseOrgConfigYaml(
+        "tools:\n  unknown: allow\nextensions:\n  org_credentials: deny\n",
+      ),
+      mcpTransport,
     });
-    const store = createStore(":memory:");
-    stores.push(store);
-    const credential = await seedOrgCredential(store);
-    await expect(boundary.authorize(credential)).rejects.toThrow(/proxy reload failed/);
-  });
+    const aliceCredential = await seedPersonalCredential(
+      h.store,
+      FIXTURE_EXTENSION_ID,
+      "alice",
+    );
+    const bobCredential = await seedPersonalCredential(
+      h.store,
+      FIXTURE_EXTENSION_ID,
+      "bob",
+    );
 
-  test("the proxy-side file path matches the generated egress config", () => {
-    // The runtime writes PROXY_SECRETS_DIR/...; the generated config reads
-    // /data/proxy-secrets/... (same volume). Both use the same filename.
-    expect(PROXY_SECRETS_DIR.endsWith("proxy-secrets")).toBe(true);
+    const alice = h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Alice" },
+      caller: "alice",
+    });
+    const bob = h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Bob" },
+      caller: "bob",
+    });
+    await Promise.all([aliceReady.promise, bobReady.promise]);
+    bobGate.resolve();
+    await expect(bob).resolves.toEqual({
+      ok: true,
+      content: [{ type: "text", text: "Bob" }],
+    });
+    aliceGate.resolve();
+    await expect(alice).resolves.toEqual({
+      ok: true,
+      content: [{ type: "text", text: "Alice" }],
+    });
+    expect(seen.sort((left, right) => left.city.localeCompare(right.city))).toEqual([
+      { city: "Alice", placeholder: `placeholder-${aliceCredential.id}` },
+      { city: "Bob", placeholder: `placeholder-${bobCredential.id}` },
+    ]);
+    expect(h.boundary.calls).toEqual([aliceCredential, bobCredential]);
   });
 });
+
 
 describe("extension runtime: tools-less manifests discover their surface (issue #158)", () => {
   const DISCOVER_ID = "discover.me";
@@ -655,6 +670,7 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
       mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
       credentialSchema: { type: "api_key" },
       domains: ["discover.me.test"],
+      credentialTargets: [{ host: "discover.me.test", pathPrefix: "/mcp" }],
     });
   }
 
@@ -806,6 +822,7 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
       credentialSchema: { type: "api_key" },
       tools: [{ name: "pinned.provider.get", tier: "read", description: "Pinned surface", params: [] }],
       domains: ["pinned.test"],
+      credentialTargets: [{ host: "pinned.test", pathPrefix: "/mcp" }],
     });
     const h = makeHarness({
       policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),
@@ -930,7 +947,13 @@ describe("extension runtime: tools-less manifests discover their surface (issue 
 /** A recording boundary for ad-hoc runtime constructions. */
 function hBoundary(): CredentialBoundary {
   return {
-    async authorize() {},
+    async runWithAuthorization(request, invoke) {
+      return invoke({
+        callId: request.callId,
+        placeholder: "test-placeholder",
+        signal: new AbortController().signal,
+      });
+    },
   };
 }
 
@@ -941,224 +964,6 @@ function createExtensionRegistryFor(manifests: ExtensionManifest[]) {
   return registry;
 }
 
-describe("extension runtime: generic MCP OAuth (issue #198)", () => {
-  const OAUTH_ID = "fixture.oauth";
-  const OAUTH_TOOL = "oauth.current";
-
-  /** A hosted OAuth MCP manifest (streamable-http + oauth credential). */
-  function oauthManifest(): ExtensionManifest {
-    const base = fixtureManifest();
-    return {
-      ...base,
-      id: OAUTH_ID,
-      label: "Fixture OAuth",
-      credentialSchema: { type: "oauth", scopes: ["read"] },
-      tools: [{ ...base.tools![0]!, name: OAUTH_TOOL }],
-    };
-  }
-
-  /** A scripted vault token store: records loads, serves tokens (or null). */
-  function tokenStore(loadResult: { access: string; refresh: string; expires: number } | null): McpOAuthTokenStore & { loads: string[]; saves: unknown[] } {
-    const loads: string[] = [];
-    const saves: unknown[] = [];
-    return {
-      loads,
-      saves,
-      async load(provider, brokerCredentialId) {
-        loads.push(`${provider}:${brokerCredentialId}`);
-        if (loadResult === null) return null;
-        return { type: "oauth" as const, ...loadResult };
-      },
-      async save(provider, credential) {
-        saves.push({ provider, credential });
-        return { brokerCredentialId: 77 };
-      },
-    };
-  }
-
-  test("OAuth MCP bindings receive the vault-backed runtime OAuth provider; api_key bindings receive none", async () => {
-    const store = tokenStore({ access: "access-1", refresh: "refresh-1", expires: Date.now() + 60_000 });
-    const captured: Array<{ binding: McpBinding; authProvider?: OAuthClientProvider }> = [];
-    const h = makeHarness({
-      manifests: [oauthManifest()],
-      mcpOAuthTokenStore: store,
-      mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => {
-        captured.push({ binding, authProvider });
-        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-        const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-        server.setRequestHandler(CallToolRequestSchema, async (request) => {
-          return { content: [{ type: "text", text: `sunny in ${String(request.params.arguments?.["city"] ?? "")}` }] };
-        });
-        void server.connect(serverTransport);
-        return clientTransport;
-      },
-    });
-    await seedOrgCredential(h.store, OAUTH_ID);
-
-    const result = await h.runtime.execute({
-      extensionId: OAUTH_ID,
-      toolName: OAUTH_TOOL,
-      args: { city: "Lisbon" },
-      caller: "UADA",
-    });
-
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    // The OAuth binding carried the runtime OAuth provider; the credential
-    // still crossed the boundary (the proxy injects the same access token).
-    expect(captured).toHaveLength(1);
-    expect(captured[0]!.authProvider).toBeDefined();
-    expect(h.boundary.calls).toHaveLength(1);
-    // The provider is vault-backed: load 1 = identity restoration
-    // (saveClientInformation), load 2 = provider.tokens(); tokens()
-    // reloads the registry row's vault credential (the seam's scripted
-    // row) and exposes it to the SDK.
-    const provider = captured[0]!.authProvider!;
-    await expect(provider.tokens()).resolves.toMatchObject({ access_token: "access-1", refresh_token: "refresh-1" });
-    expect(store.loads).toEqual([`${OAUTH_ID}:7`, `${OAUTH_ID}:7`]);
-    expect(store.saves).toHaveLength(0);
-  });
-
-  test("api_key bindings attach no OAuth provider (auth stays at the iron-proxy boundary)", async () => {
-    const captured: Array<{ binding: McpBinding; authProvider?: OAuthClientProvider }> = [];
-    const h = makeHarness({
-      mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => {
-        captured.push({ binding, authProvider });
-        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-        const server = new Server({ name: "fixture-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-        server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: "text", text: "ok" }] }));
-        void server.connect(serverTransport);
-        return clientTransport;
-      },
-    });
-    await seedOrgCredential(h.store);
-
-    const result = await h.runtime.execute({
-      extensionId: FIXTURE_EXTENSION_ID,
-      toolName: FIXTURE_EXTENSION_TOOL,
-      args: { city: "Lisbon" },
-      caller: "UADA",
-    });
-
-    expect(result.ok).toBe(true);
-    expect(captured).toHaveLength(1);
-    expect(captured[0]!.authProvider).toBeUndefined();
-  });
-
-  test("a missing vault row still calls (the transport's SDK client surfaces the re-auth prompt)", async () => {
-    // The runtime constructs the provider regardless; the transport's SDK
-    // OAuth client consults tokens() and, with no row, the provider's
-    // redirectToAuthorization throws the re-auth prompt (fail closed —
-    // covered hermetically in mcp-oauth.test.ts). Here we assert the
-    // provider is built and reads the vault (null → no tokens to send).
-    const store = tokenStore(null);
-    const captured: Array<{ authProvider?: OAuthClientProvider }> = [];
-    const h = makeHarness({
-      manifests: [oauthManifest()],
-      mcpOAuthTokenStore: store,
-      mcpTransport: (_binding: McpBinding, authProvider?: OAuthClientProvider) => {
-        captured.push({ authProvider });
-        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-        const server = new Server({ name: "oauth-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-        server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: "text", text: "ok" }] }));
-        void server.connect(serverTransport);
-        return clientTransport;
-      },
-    });
-    await seedOrgCredential(h.store, OAUTH_ID);
-
-    const result = await h.runtime.execute({
-      extensionId: OAUTH_ID,
-      toolName: OAUTH_TOOL,
-      args: { city: "Lisbon" },
-      caller: "UADA",
-    });
-
-    expect(result.ok).toBe(true); // the transport seam is a fake — auth is the SDK's job
-    const provider = captured[0]!.authProvider!;
-    await expect(provider.tokens()).resolves.toBeUndefined();
-  });
-
-  test("a runtime OAuth tool call authenticates through the REAL SDK transport against an authenticated fake MCP server — no proxy minting (issue #284)", async () => {
-    // The full wire proof: the runtime builds the vault-backed provider,
-    // hands it to the PRODUCTION defaultMcpTransport (StreamableHTTPClient
-    // with the SDK OAuth client), and the SDK attaches the vault bearer —
-    // the fake MCP server 401s any token-less request, so a successful
-    // call PROVES the SDK sent the credential. The proxy plane is not
-    // involved at all (no oauth_token transform, no blob — the egress
-    // generator tests pin that contract).
-    const seenAuth: string[] = [];
-    const stub = Bun.serve({
-      port: 0,
-      fetch: async (req) => {
-        if (req.method !== "POST" || !new URL(req.url).pathname.startsWith("/mcp")) {
-          return new Response("", { status: 404 });
-        }
-        const authorization = req.headers.get("authorization") ?? "";
-        if (authorization === "") {
-          return new Response("", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-        }
-        seenAuth.push(authorization);
-        const body = (await req.json()) as { jsonrpc: string; id: number; method: string; params?: unknown };
-        if (body.method === "initialize") {
-          return Response.json({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: {
-              protocolVersion: "2024-11-05",
-              capabilities: { tools: {} },
-              serverInfo: { name: "oauth-exec-stub", version: "1.0.0" },
-            },
-          });
-        }
-        if (body.method === "tools/call") {
-          const params = body.params as { name?: string; arguments?: { city?: string } };
-          return Response.json({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: {
-              content: [{ type: "text", text: `sunny in ${String(params.arguments?.city ?? "")}` }],
-              isError: false,
-            },
-          });
-        }
-        return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "unknown method" } });
-      },
-    });
-    const manifest = oauthManifest();
-    manifest.mcp = { serverUrl: `http://127.0.0.1:${stub.port}/mcp`, transport: "streamable-http" };
-    const store = tokenStore({ access: "access-1", refresh: "refresh-1", expires: Date.now() + 60_000 });
-    const h = makeHarness({
-      manifests: [manifest],
-      mcpOAuthTokenStore: store,
-      // The PRODUCTION transport: the SDK's streamable-http client with the
-      // runtime's OAuthClientProvider attaches the vault bearer on the wire.
-      mcpTransport: defaultMcpTransport,
-    });
-    try {
-      await seedOrgCredential(h.store, OAUTH_ID);
-
-      const result = await h.runtime.execute({
-        extensionId: OAUTH_ID,
-        toolName: OAUTH_TOOL,
-        args: { city: "Lisbon" },
-        caller: "UADA",
-      });
-
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-      const text = result.content.map((block) => ("text" in block ? block.text : "")).join(" ");
-      expect(text).toContain("sunny in Lisbon");
-      // The authenticated wire calls carried the vault bearer — the SDK
-      // OAuth client, NOT any proxy mint, authenticated this call.
-      expect(seenAuth.length).toBeGreaterThan(0);
-      expect(seenAuth[0]).toBe("Bearer access-1");
-      expect(h.boundary.calls).toHaveLength(1);
-    } finally {
-      stub.stop(true);
-    }
-  });
-});
 
 describe("extension runtime: array/object MCP params restore native JSON before the wire call (issue #248)", () => {
   const ARRAY_ID = "arraybug.me";
@@ -1200,6 +1005,7 @@ describe("extension runtime: array/object MCP params restore native JSON before 
       mcp: { serverUrl: "http://127.0.0.1:9/mcp", transport: "streamable-http" },
       credentialSchema: { type: "api_key" },
       domains: ["arraybug.me.test"],
+      credentialTargets: [{ host: "arraybug.me.test", pathPrefix: "/mcp" }],
     });
   }
 
@@ -1278,6 +1084,7 @@ describe("extension runtime: array/object MCP params restore native JSON before 
         },
       ],
       domains: ["pinso.test"],
+      credentialTargets: [{ host: "pinso.test", pathPrefix: "/mcp" }],
     });
     const h = makeHarness({
       policy: parseOrgConfigYaml("tools:\n  unknown: allow\n"),

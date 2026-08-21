@@ -74,6 +74,7 @@ function oauthMcpManifest(serverUrl: string): ExtensionManifest {
     credentialSchema: { type: "oauth", scopes: ["default"] },
     tools: [{ name: "oauth.ping", tier: "read", description: "Stub ping", params: [] }],
     domains: ["127.0.0.1"],
+    credentialTargets: [{ host: "127.0.0.1", pathPrefix: "/mcp" }],
   };
 }
 
@@ -571,6 +572,7 @@ describe("startMcpOAuthFlow — discovery + DCR + PKCE (issue #198)", () => {
       credentialSchema: { type: "api_key" },
       tools: [{ name: "apikey.ping", tier: "read", description: "ping", params: [] }],
       domains: ["127.0.0.1"],
+      credentialTargets: [{ host: "127.0.0.1", pathPrefix: "/mcp" }],
     });
     const deps = flowDeps(store, registry, new FakeVaultStore(), "http://127.0.0.1:9");
 

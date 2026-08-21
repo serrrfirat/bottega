@@ -53,7 +53,11 @@ import {
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "./fetch-catalog";
-import { validateManifest, type CredentialSchema } from "./manifest";
+import {
+  validateManifest,
+  type CredentialSchema,
+  type CredentialTarget,
+} from "./manifest";
 import { probeMcpEndpoint } from "./mcp-endpoint-probe";
 import type { ExtensionRegistry, PinnedSnapshot } from "./registry";
 import {
@@ -271,6 +275,8 @@ export interface CatalogDraftFacts {
   kind: string;
   /** The egress allowlist domains the registration would add. */
   domains: string[];
+  /** Reviewed destinations that may receive credentials. */
+  credentialTargets: CredentialTarget[];
   /** The discovered official hosted MCP endpoint. */
   mcpEndpoint: string;
   credentialSchema: CredentialSchema;
@@ -350,6 +356,15 @@ export async function lookupCatalogExtension(
     // Egress allowlist: the vendor host + the official MCP host (notion →
     // ["notion.com", "mcp.notion.com"]).
     domains: [...new Set<string>([...scaffold.manifest.domains, discovered.host])],
+    credentialTargets: [
+      {
+        host: discovered.host,
+        pathPrefix: (() => {
+          const path = new URL(discovered.serverUrl).pathname;
+          return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+        })(),
+      },
+    ],
   };
   const completed: SnapshotDraft = { ...scaffold, manifest };
   let manifestValidated: ReturnType<typeof validateManifest>;
@@ -381,6 +396,7 @@ export async function lookupCatalogExtension(
       label: entry.name,
       kind: entry.kind,
       domains: manifest.domains,
+      credentialTargets: manifest.credentialTargets,
       mcpEndpoint: discovered.serverUrl,
       credentialSchema: discovered.credentialSchema,
       oauthGated: discovered.oauthGated,

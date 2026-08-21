@@ -107,37 +107,17 @@ transforms:
         carry no secrets or sensitive data. When in doubt, deny. Reply with
         exactly one word: ALLOW or DENY.
 
-  # 3. Secrets: boundary credential injection (issue #53 + #208). Extension
-  #    calls carry no credential — the runtime resolves the caller's
-  #    credential at call time and writes it to the extension's secret file
-  #    on the shared data volume (mode 0600, write-temp + rename); this
-  #    transform INJECTS it as the Authorization header for the extension's
-  #    allowlisted domains before egress. The MODEL GATEWAY entries below
-  #    do the same for the providers config/omp/models.yml declares: the
-  #    SDK sends the placeholder bearer (bottega-proxy-placeholder), the
-  #    proxy swaps the real key from data/proxy-secrets/<provider>.secret
-  #    (seeded at boot by src/extensions/proxy-seed). The openai-codex
-  #    provider is one of these entries (issue #230): the seed owns the
-  #    codex refresh and writes the minted access token to
-  #    openai-codex.secret — the proxy injects it for chatgpt.com and never
-  #    touches auth.openai.com. require: true — a missing key rejects the
-  #    request (502) instead of letting the placeholder reach the gateway.
-  #    File sources re-read on config reload and on ttl expiry, so
-  #    credentials rotate on a running proxy. Judge runs BEFORE secrets so
-  #    the LLM judge never sees real credentials (iron-proxy README's
-  #    recommended ordering).
+  # 3. Secrets: request-scoped extension authorization plus static
+  #    model-gateway keys. Extension calls carry a random per-call proxy
+  #    token. The credential boundary installs its token-to-secret mapping
+  #    only for the call lifetime and only for reviewed credential targets,
+  #    then revokes it in finally. Egress domains remain reachability policy
+  #    and never grant credential authority.
   - name: secrets
     config:
       secrets:
-        - source:
-            type: file
-            path: "/data/proxy-secrets/github.secret"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-          rules:
-            - host: "api.githubcopilot.com"
+        # bottega:scoped-authorizations begin
+        # bottega:scoped-authorizations end
         - source:
             type: file
             path: "/data/proxy-secrets/near.secret"

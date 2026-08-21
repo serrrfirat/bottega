@@ -1721,8 +1721,13 @@ describe("OmpSessionDriver per-turn principal (issue #152/#178)", () => {
       orgPolicy: parseOrgConfigYaml("tools:\n  unknown: allow\nextensions:\n  org_credentials: deny\n"),
       router: DenyRouter,
       boundary: {
-        async authorize(credential: ExtensionCredential) {
-          boundaryCalls.push(credential);
+        async runWithAuthorization(request, invoke) {
+          boundaryCalls.push(request.credential);
+          return invoke({
+            callId: request.callId,
+            placeholder: "test-placeholder",
+            signal: new AbortController().signal,
+          });
         },
       },
       mcpTransport,

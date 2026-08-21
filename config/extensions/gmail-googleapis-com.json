@@ -21,6 +21,7 @@
       "type": "oauth",
       "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
     },
-    "domains": ["gmail.googleapis.com", "gmailmcp.googleapis.com"]
+    "domains": ["gmail.googleapis.com", "gmailmcp.googleapis.com"],
+    "credentialTargets": [{ "host": "gmailmcp.googleapis.com", "pathPrefix": "/mcp/v1" }]
   }
 }

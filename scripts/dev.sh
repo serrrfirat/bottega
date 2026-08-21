@@ -9,6 +9,11 @@ cd "$(dirname "$0")/.."
 export BOTTEGA_PUBLIC_BASE_URL_FILE="$(shared_data_dir)/public-base-url"
 export BOTTEGA_DEV_DATA_DIR="$(shared_data_dir)"
 export BOTTEGA_PROXY_SECRETS_DIR="$(shared_data_dir)/proxy-secrets"
+export BOTTEGA_PROXY_CONFIG_PATH="$(shared_data_dir)/egress.yml"
+# The shared MITM CA dir (issue #301): the single certs/ the shared proxy
+# terminates with. Every worktree's dev server trusts the SAME ca.crt
+# (NODE_EXTRA_CA_CERTS via scripts/canary-egress.ts), so a second worktree
+# boot NEVER generates/MITMs with a different CA than the shared proxy's.
 export BOTTEGA_DEV_CERTS_DIR="$(shared_certs_dir)"
 
 if [[ "${1:-}" == "--setup" ]]; then

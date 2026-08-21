@@ -57,6 +57,7 @@ function notionSnapshot(): PinnedSnapshot {
       mcp: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
       credentialSchema: { type: "oauth" },
       domains: ["notion.com", "mcp.notion.com"],
+      credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
     },
   };
 }
@@ -153,6 +154,7 @@ describe("store-backed runtime extension registry (issue #233)", () => {
         } as unknown as McpBinding,
         credentialSchema: { type: "oauth" },
         domains: ["notion.com", "mcp.notion.com"],
+        credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
       },
     };
     await store.upsertRuntimeExtension({

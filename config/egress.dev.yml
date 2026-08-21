@@ -58,26 +58,17 @@ transforms:
       domains:
         - "*"
 
-  # 2. Secrets: boundary credential injection (issue #53 + #208) — KEPT in
-  #    the dev config (the core requirement): extension calls carry no
-  #    credential, and this transform INJECTS it as the Authorization
-  #    header for the extension's allowlisted domains before egress; the
-  #    model-gateway entries swap the providers' placeholder bearer for the
-  #    real key (require: true — a missing key rejects the request). File
-  #    sources re-read on config reload and on ttl expiry, so credentials
-  #    rotate on a running proxy.
+  # 2. Secrets: request-scoped extension authorization plus static
+  #    model-gateway keys. Extension calls carry a random per-call proxy
+  #    token. The credential boundary installs its token-to-secret mapping
+  #    only for the call lifetime and only for reviewed credential targets,
+  #    then revokes it in finally. Egress domains remain reachability policy
+  #    and never grant credential authority.
   - name: secrets
     config:
       secrets:
-        - source:
-            type: file
-            path: "/data/proxy-secrets/github.secret"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-          rules:
-            - host: "api.githubcopilot.com"
+        # bottega:scoped-authorizations begin
+        # bottega:scoped-authorizations end
         - source:
             type: file
             path: "/data/proxy-secrets/near.secret"

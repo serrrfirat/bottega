@@ -446,6 +446,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
               mcp: { serverUrl: "http://127.0.0.1:0/mcp", transport: "streamable-http" },
               credentialSchema: { type: "oauth", scopes: ["read"] },
               domains: ["mcp.oauthboot.example.com"],
+              credentialTargets: [{ host: "mcp.oauthboot.example.com", pathPrefix: "/mcp" }],
             },
           },
           null,

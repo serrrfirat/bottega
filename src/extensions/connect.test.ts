@@ -76,6 +76,7 @@ function stdioOAuthManifest(): ExtensionManifest {
     credentialSchema: { type: "oauth", scopes: ["read"] },
     tools: [{ name: "stdio-oauth.current", tier: "read", description: "Stdio OAuth tool", params: [] }],
     domains: ["127.0.0.1"],
+    credentialTargets: [{ host: "127.0.0.1" }],
   };
 }
 
@@ -820,6 +821,7 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
       registering_from_catalog: true,
       vendor: "Notion",
       domains: ["notion.com", "mcp.notion.com"],
+      credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
       mcpEndpoint: "https://mcp.notion.com/mcp",
     });
     expect(h.runtimeRegistry.rows).toHaveLength(1);

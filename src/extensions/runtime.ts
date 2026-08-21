@@ -68,8 +68,11 @@ import {
 } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import { recordCredentialResolution, resolveCredential, type CallScope } from "./credentials";
-import { createSecretFileBoundary, type CredentialBoundary } from "./boundary";
-import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "./mcp-oauth";
+import {
+  createSecretFileBoundary,
+  type AuthorizationContext,
+  type CredentialBoundary,
+} from "./boundary";
 import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
 import { humanizeToolName } from "../server/adapters/approval-router";
 import {
@@ -134,13 +137,11 @@ export interface ExtensionRuntimeDeps {
    * "oauth") attach it to the streamable-http transport so the MCP SDK's
    * OAuth client drives discovery/refresh with the vault-backed tokens.
    */
-  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
-  /**
-   * Vault token store for the runtime's OAuth provider (issue #198 test
-   * seam): defaults to the production vault-backed store (broker upload /
-   * local AuthStorage).
-   */
-  mcpOAuthTokenStore?: McpOAuthTokenStore;
+  mcpTransport?: (
+    binding: McpBinding,
+    authProvider?: OAuthClientProvider,
+    authorization?: AuthorizationContext,
+  ) => Transport;
   /**
    * Pre-resolved effective tool surfaces (issue #158): extensionId →
    * pinned manifest tools or the discovered tools/list surface, resolved
@@ -176,6 +177,7 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
     spaceId?: string;
     credentialId: string | null;
     decision: ExtensionCallDecision;
+    callId?: string;
   }): Promise<number | null> => {
     try {
       return await deps.audit.appendAudit({
@@ -188,6 +190,7 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           actor: input.actor,
           credential_id: input.credentialId,
           decision: input.decision,
+          call_id: input.callId ?? null,
         },
       });
     } catch (err) {
@@ -373,54 +376,58 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         return { ok: false, error: resolution.kind === "ask" ? resolution.reason : resolution.message };
       }
       const credential = resolution.credential;
+      const callId = `${extensionId}:${taskId}`;
       await recordCredentialResolution(deps.store, { actor: caller, spaceId, credential });
-      await auditCall({ extensionId, toolName: tool.name, actor: caller, spaceId, credentialId: credential.id, decision: "allow" });
+      await auditCall({
+        extensionId,
+        toolName: tool.name,
+        actor: caller,
+        spaceId,
+        credentialId: credential.id,
+        decision: "allow",
+        callId,
+      });
 
-      // 3. Boundary injection + provider call. The credential stays at the
-      // boundary; the call carries no auth (iron-proxy attaches it for the
-      // extension's allowlisted domains). Failures (boundary write, proxy
-      // reload, transport, provider) are tool errors, never silent no-ops —
-      // the allow decision is already on the trail. The provider sees the
-      // WIRE name (providerName ?? manifest name, issue #148). The step
-      // checks off either way — the card documents the attempt, so the
-      // thinking panel never shows a stuck spinner.
+      // 3. Request-scoped boundary + provider call. The transport receives
+      // only a random proxy placeholder. iron-proxy replaces it with this
+      // caller's selected credential while the reviewed target and call
+      // authority are active, then the boundary revokes it in finally.
       const wireName = tool.providerName ?? tool.name;
-      // Issue #198: hosted OAuth MCPs carry their auth IN the transport —
-      // the MCP SDK's OAuth client (vault-backed tokens, refresh on 401,
-      // fail-closed re-auth prompt). The boundary's secret file still gets
-      // the current access token (the proxy injects the same value for the
-      // extension's allowlisted domains — consistent with the SDK's header).
-      const mcpAuth =
-        manifest.kind === "mcp" &&
-        manifest.mcp.transport === "streamable-http" &&
-        manifest.credentialSchema.type === "oauth"
-          ? await createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore })
-          : undefined;
       try {
-        await boundary.authorize(credential);
-        // Issue #248: array/object manifest params travel the model-facing
-        // surface as JSON-serialized strings; restore the NATIVE type the
-        // provider's inputSchema declares before the wire call. CLI calls
-        // keep the raw args — their flags are strings (jsonType never
-        // applies there, and String(value) on a restored object would
-        // mangle it).
-        const providerArgs = manifest.kind === "mcp" ? restoreNativeJsonArgs(args, tool.params) : args;
-        const result =
-          manifest.kind === "mcp"
-            ? await callMcpTool(makeTransport, manifest.mcp, wireName, providerArgs, mcpAuth)
-            : await callCliTool(manifest.cli, wireName, args);
-        if (outcome.decision !== "ask-human") {
-          emitToolStep(sink, {
-            spaceId,
-            taskId,
-            label,
-            title: toolStepTitle(tool.name, `allowed (${tier})`),
-            status: "complete",
-            outcome: "succeeded",
-            output: stepArgs,
-          });
-        }
-        return result;
+        return await boundary.runWithAuthorization(
+          {
+            credential,
+            targets: manifest.credentialTargets,
+            callId,
+            timeoutMs: deps.timeoutMs,
+          },
+          async (authorization) => {
+            // Issue #248: restore structured arguments before the wire call.
+            const providerArgs = manifest.kind === "mcp" ? restoreNativeJsonArgs(args, tool.params) : args;
+            const result =
+              manifest.kind === "mcp"
+                ? await callMcpTool(
+                    makeTransport,
+                    manifest.mcp,
+                    wireName,
+                    providerArgs,
+                    authorization,
+                  )
+                : await callCliTool(manifest.cli, wireName, args, authorization);
+            if (outcome.decision !== "ask-human") {
+              emitToolStep(sink, {
+                spaceId,
+                taskId,
+                label,
+                title: toolStepTitle(tool.name, `allowed (${tier})`),
+                status: "complete",
+                outcome: "succeeded",
+                output: stepArgs,
+              });
+            }
+            return result;
+          },
+        );
       } catch (err) {
         // A human-confirmed write that then FAILED (issue #277): posted
         // back into the thread and remembered per (space, tool) — bounded —
@@ -462,12 +469,26 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
  * injects the Authorization header for the extension's allowlisted
  * domains, issue #53).
  */
-export function defaultMcpTransport(binding: McpBinding, authProvider?: OAuthClientProvider): Transport {
+export function defaultMcpTransport(
+  binding: McpBinding,
+  authProvider?: OAuthClientProvider,
+  authorization?: AuthorizationContext,
+): Transport {
   if (binding.transport === "streamable-http") {
-    return new StreamableHTTPClientTransport(
-      new URL(binding.serverUrl),
-      authProvider !== undefined ? { authProvider } : undefined,
-    );
+    const headers =
+      authorization === undefined
+        ? undefined
+        : { Authorization: `Bearer ${authorization.placeholder}` };
+    return new StreamableHTTPClientTransport(new URL(binding.serverUrl), {
+      ...(authProvider !== undefined ? { authProvider } : undefined),
+      ...(headers !== undefined ? { requestInit: { headers } } : undefined),
+      ...(authorization !== undefined
+        ? {
+            fetch: (input, init) =>
+              fetch(input, { ...init, signal: authorization.signal }),
+          }
+        : undefined),
+    });
   }
   // stderr: "pipe" (issue #205): the discovery/call paths drain a bounded
   // prefix, so a misbehaving stdio server's exec noise (e.g. a shell
@@ -510,15 +531,19 @@ function restoreNativeJsonArgs(args: JsonObject, params: readonly ExtensionToolP
  * the agent tool result shape.
  */
 async function callMcpTool(
-  makeTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
+  makeTransport: (
+    binding: McpBinding,
+    authProvider?: OAuthClientProvider,
+    authorization?: AuthorizationContext,
+  ) => Transport,
   binding: McpBinding,
   toolName: string,
   params: JsonObject,
-  authProvider?: OAuthClientProvider,
+  authorization: AuthorizationContext,
 ): Promise<ExtensionRuntimeResult> {
   const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
   try {
-    await client.connect(makeTransport(binding, authProvider));
+    await client.connect(makeTransport(binding, undefined, authorization));
     // The SDK's declared return is a union with an experimental task-based
     // branch; passing CallToolResultSchema pins the runtime shape, so the
     // cast is the documented contract (guarded below).
@@ -574,6 +599,7 @@ async function callCliTool(
   binding: CliBinding,
   toolName: string,
   params: JsonObject,
+  authorization: AuthorizationContext,
 ): Promise<ExtensionRuntimeResult> {
   const flagArgs: string[] = [];
   for (const [name, value] of Object.entries(params)) {
@@ -585,7 +611,13 @@ async function callCliTool(
   }
   const proc = Bun.spawnSync({
     cmd: [binding.command, ...(binding.args ?? []), ...flagArgs],
-    env: { ...credentialSafeEnv(), ...binding.env },
+    env: {
+      ...credentialSafeEnv(),
+      ...binding.env,
+      ...(binding.credentialEnv !== undefined
+        ? { [binding.credentialEnv]: authorization.placeholder }
+        : undefined),
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
