@@ -232,6 +232,8 @@ A deployment that removes `config.yml` (back to deny-all) prints
 2. **Install to Workspace** and copy the **Bot User OAuth Token** (`xoxb-...`) — that is `SLACK_BOT_TOKEN`.
 3. **App-Level Tokens** → **Generate Token** with the `connections:write` scope and copy it (`xapp-...`) — that is `SLACK_APP_TOKEN`. Socket Mode needs it; no request URL is required.
 
+**Required bot scopes.** The manifest installs the bot scopes the app actually calls. Beyond the ones Slack lists on the app page, three `…:history` scopes matter: `channels:history` (public channels), `groups:history` (private channels), and `im:history` (DMs). Receiving a thread REPLY via Socket Mode delivers only the reply's own text; the bot uses `conversations.replies` to hydrate the missing conversation root + prior replies into the turn (issue #305), and that method requires the matching history scope for the channel type the thread is in. If any of the three is missing, a thread reply still turns, but with a `[thread context unavailable]` diagnostic instead of the surrounding conversation — no crash, just no prior-thread context. Re-install the app after changing scopes so the workspace token picks them up.
+
 ### 2. Set up `.env`
 
 Copy `.env.example` to `.env` and fill in:

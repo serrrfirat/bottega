@@ -12,6 +12,7 @@ import {
   buildPostMessageArgs,
   buildStartStreamArgs,
   buildStopStreamArgs,
+  buildThreadContextNotes,
   buildUpdateMessageArgs,
   channelFromSpaceId,
   createSlackAdapter,
@@ -33,9 +34,14 @@ import {
   STREAM_RETRY_CONFIG,
   STREAM_TASK_OUTPUT_MAX,
   taskUpdateChunk,
+  THREAD_CONTEXT_MAX_CHARS,
+  THREAD_CONTEXT_MAX_MESSAGES,
+  THREAD_CONTEXT_TIMEOUT_MS,
   type SlackAction,
   type MessageHandlerOptions,
   type SlackMessage,
+  type ThreadContextClient,
+  type ThreadReply,
 } from "./slack";
 
 /** Arbitrary JSON values (Slack event bodies are parsed JSON of unknown shape). */
@@ -1170,5 +1176,170 @@ describe("inbound Socket Mode routing through the real Bolt router (issue #29)",
     await deliver({ type: "message", channel: "C123", user: "U1", text: "plain chatter", ts: "2.4" });
 
     expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "plain chatter", ts: "2.4" }]);
+  });
+
+  describe("thread-context hydration (issue #305)", () => {
+    // A thread root at ts 9.9 whose reply at 9.11 is the triggering message.
+    const threadMsgs: ThreadReply[] = [
+      { user: "U0", text: "i need the deploy green by eod", ts: "9.9", thread_ts: "9.9" },
+      { user: "U1", text: "on it — checking the canary", ts: "9.10", thread_ts: "9.9" },
+      { user: "U2", text: "blocked on github auth", ts: "9.11", thread_ts: "9.9" },
+    ];
+    const fakeReplies = (messages: ThreadReply[] = threadMsgs): ThreadContextClient => ({
+      conversationsReplies: async () => ({ messages }),
+    });
+
+    test("hydrates a thread reply: root + prior replies, newest-last, excluding the triggering reply", async () => {
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: fakeReplies(),
+      });
+
+      // The trigger is U2's own reply (ts 9.11) — it must NOT be re-included.
+      await deliver({ type: "message", channel: "C123", user: "U2", text: "blocked on github auth", ts: "9.11", thread_ts: "9.9" });
+
+      expect(received).toHaveLength(1);
+      const m = received[0]!;
+      expect(m.threadTs).toBe("9.9");
+      // Triggering reply stays the leading user text (not duplicated as context)…
+      expect(m.text.startsWith("blocked on github auth")).toBe(true);
+      // …and the root + other reply surface newest-last, provenance-labeled.
+      expect(m.text).toContain("[thread root from U0: i need the deploy green by eod]");
+      expect(m.text).toContain("[thread reply from U1: on it — checking the canary]");
+      // The triggering reply (U2, ts 9.11) is NOT double-included as a context note.
+      expect(m.text).not.toContain("[thread reply from U2:");
+    });
+
+    test("non-thread messages are unchanged and never call the client", async () => {
+      const received: SlackMessage[] = [];
+      let calls = 0;
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: { conversationsReplies: async () => { calls += 1; return { messages: threadMsgs }; } },
+      });
+
+      await deliver({ type: "message", channel: "C123", user: "U1", text: "top-level ping", ts: "5.5" });
+
+      expect(received).toEqual([{ spaceId: "slack:C123", principal: "U1", text: "top-level ping", ts: "5.5" }]);
+      expect(calls).toBe(0);
+    });
+
+    test("thread reply without an injected client flows through unchanged (no dehydration)", async () => {
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); });
+
+      await deliver({ type: "message", channel: "C123", user: "U2", text: "blocked on github auth", ts: "9.11", thread_ts: "9.9" });
+
+      expect(received).toEqual([{ spaceId: "slack:C123", principal: "U2", text: "blocked on github auth", ts: "9.11", threadTs: "9.9" }]);
+    });
+
+    test("context is bounded to root + N recent replies and the total char cap", async () => {
+      const big = (n: number): ThreadReply[] =>
+        [{ user: "U0", text: "a".repeat(400), ts: "9.9", thread_ts: "9.9" }].concat(
+          Array.from({ length: n }, (_, i) => ({ user: `U${i + 1}`, text: `reply ${i} ` + "b".repeat(300), ts: `9.${10 + i}`, thread_ts: "9.9" })),
+        );
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: fakeReplies(big(20)),
+      });
+
+      await deliver({ type: "message", channel: "C123", user: "U99", text: "go", ts: "9.99", thread_ts: "9.9" });
+
+      const hydrated = received[0]!.text;
+      const ctx = hydrated.slice(hydrated.indexOf("[thread root"));
+      expect(ctx).toContain("[thread root from U0:");
+      // Bounded by the char cap (labels included).
+      expect(ctx.length).toBeLessThanOrEqual(THREAD_CONTEXT_MAX_CHARS);
+      // Bounded by the message cap: at most THREAD_CONTEXT_MAX_MESSAGES messages.
+      const noteCount = (ctx.match(/\[thread (root|reply) from/g) ?? []).length;
+      expect(noteCount).toBeLessThanOrEqual(THREAD_CONTEXT_MAX_MESSAGES);
+    });
+
+    test("scope-denied (ok:false, no messages) degrades with a diagnostic and still delivers", async () => {
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: { conversationsReplies: async () => ({}) },
+      });
+
+      await expect(
+        deliver({ type: "message", channel: "C123", user: "U2", text: "blocked", ts: "9.11", thread_ts: "9.9" }),
+      ).resolves.toBeUndefined();
+
+      expect(received).toHaveLength(1);
+      expect(received[0]!.text).toContain("[thread context unavailable");
+    });
+
+    test("a fetch failure degrades with a diagnostic instead of crashing the turn", async () => {
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: { conversationsReplies: async () => { throw new Error("boom"); } },
+      });
+
+      await expect(
+        deliver({ type: "message", channel: "C123", user: "U2", text: "blocked", ts: "9.11", thread_ts: "9.9" }),
+      ).resolves.toBeUndefined();
+
+      expect(received).toHaveLength(1);
+      expect(received[0]!.text).toContain("[thread context unavailable: boom]");
+    });
+
+    test("a hung client never blocks the turn (short timeout degrades with a diagnostic)", async () => {
+      const received: SlackMessage[] = [];
+      const { deliver } = bootApp(async (m) => { received.push(m); }, {
+        threadContextClient: { conversationsReplies: () => new Promise(() => {}) }, // never settles
+      });
+
+      const start = Date.now();
+      await deliver({ type: "message", channel: "C123", user: "U2", text: "blocked", ts: "9.11", thread_ts: "9.9" });
+      const elapsed = Date.now() - start;
+
+      expect(received).toHaveLength(1);
+      expect(received[0]!.text).toContain("[thread context unavailable:");
+      // The race timer bounds the wait — never the full turn hostage.
+      expect(elapsed).toBeLessThan(THREAD_CONTEXT_TIMEOUT_MS + 500);
+    });
+  });
+});
+
+describe("buildThreadContextNotes (issue #305)", () => {
+  const root: ThreadReply = { user: "U0", text: "root text", ts: "1.0", thread_ts: "1.0" };
+  const replyA: ThreadReply = { user: "U1", text: "first reply", ts: "1.1", thread_ts: "1.0" };
+  const replyB: ThreadReply = { user: "U2", text: "second reply", ts: "1.2", thread_ts: "1.0" };
+
+  test("keeps root + replies newest-last, excluding the triggering reply and empty text", () => {
+    const notes = buildThreadContextNotes(
+      [root, replyA, replyB, { user: "U3", ts: "1.3", thread_ts: "1.0" }], // no text → skipped
+      "1.2", // the triggering reply (U2) must not be re-included
+    );
+    expect(notes).toBe("[thread root from U0: root text]\n[thread reply from U1: first reply]");
+    expect(notes).not.toContain("second reply");
+  });
+
+  test("returns empty when only the triggering reply is present", () => {
+    expect(buildThreadContextNotes([root], "1.0")).toBe("");
+  });
+
+  test("caps the message count to the most recent replies", () => {
+    const flood: ThreadReply[] = [
+      root,
+      ...Array.from({ length: 10 }, (_, i) => ({ user: `U${i}`, text: `r${i}`, ts: `1.${i + 1}`, thread_ts: "1.0" })),
+    ];
+    const notes = buildThreadContextNotes(flood, "1.99", 4, 10_000);
+    // Root + the 3 newest replies; oldest flooded replies are dropped.
+    expect(notes).toContain("[thread root from U0: root text]");
+    expect(notes).toContain("[thread reply from U9: r9]");
+    expect(notes).not.toContain("r1");
+    expect((notes.match(/\[thread /g) ?? []).length).toBe(4);
+  });
+
+  test("caps total context to the character budget", () => {
+    const longRoot: ThreadReply = { user: "U0", text: "x".repeat(10_000), ts: "1.0", thread_ts: "1.0" };
+    const notes = buildThreadContextNotes([longRoot, replyA], "1.2", 5, 120);
+    expect(notes.length).toBeLessThanOrEqual(120);
+  });
+
+  test("a reply whose text only appears in the parent alongside a trigger is handled without crashing", () => {
+    // Only the root is context; the trigger is the only reply — nothing to add.
+    const notes = buildThreadContextNotes([root, replyA], "1.1");
+    expect(notes).toBe("[thread root from U0: root text]");
   });
 });

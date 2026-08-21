@@ -725,6 +725,154 @@ export async function probeStreamingSupport(client: WebClient, teamId: string | 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Thread-context hydration (issue #305)
+//
+// Socket Mode delivers a thread REPLY with only the reply's own text — the
+// conversation root and the bot's routine posts / prior thread content are
+// invisible to the turn. When an inbound message carries a `thread_ts`, the
+// adapter fetches the parent + recent replies via `conversations.replies`
+// through an injected client seam and surfaces them to the turn as bounded,
+// provenance-labeled context (newest-last), mirroring how attachment ingest
+// notes are appended to a turn (size-capped, one provenance-labeled note per
+// included message). Degrades safely: a missing scope or failed fetch appends
+// one diagnostic line and proceeds — never crashes the turn, never blocks on
+// Slack latency (the fetch races a short timer).
+// ---------------------------------------------------------------------------
+
+/** One `conversations.replies` message: the parent or a reply the adapter may surface as context. */
+export interface ThreadReply {
+  user?: string;
+  text?: string;
+  ts?: string;
+  bot_id?: string;
+  thread_ts?: string;
+}
+
+/**
+ * The injected Web-API seam for thread-context hydration. A @slack/web-api
+ * `WebClient` satisfies this structurally (`conversations.replies` returns a
+ * `ConversationsRepliesResponse` whose `messages` are structurally
+ * compatible), so the real adapter wires `app.client.conversations.replies`;
+ * tests inject a fake (or a Bun.serve-backed emulator client).
+ */
+export interface ThreadContextClient {
+  conversationsReplies(args: {
+    channel: string;
+    ts: string;
+    limit?: number;
+    inclusive?: boolean;
+  }): Promise<{ messages?: ThreadReply[] }>;
+}
+
+/** How many thread messages to keep: the conversation root plus up to this many recent replies. */
+export const THREAD_CONTEXT_MAX_MESSAGES = 5;
+/** Total character budget (labels included) for the appended thread context. */
+export const THREAD_CONTEXT_MAX_CHARS = 2_000;
+/** A thread-context fetch never waits longer than this — a hung client must not block a turn. */
+export const THREAD_CONTEXT_TIMEOUT_MS = 3_000;
+
+/**
+ * Builds bounded, provenance-labeled thread-context notes from a
+ * `conversations.replies` result. The triggering reply (`replyTs`) is the
+ * user's OWN message — already the turn text — so it is excluded to avoid
+ * double-including it as context. The conversation root plus the most recent
+ * replies (newest-last) are kept, each bounded by {@link
+ * THREAD_CONTEXT_MAX_CHARS} total and {@link THREAD_CONTEXT_MAX_MESSAGES}
+ * count. Returns "" when nothing qualifies (no text-bearing messages, or
+ * only the triggering reply).
+ *
+ * Pure, so the bounded-context contract is unit-testable without a client.
+ */
+export function buildThreadContextNotes(
+  messages: ThreadReply[],
+  replyTs: string,
+  maxMessages = THREAD_CONTEXT_MAX_MESSAGES,
+  maxChars = THREAD_CONTEXT_MAX_CHARS,
+): string {
+  const candidates = messages.filter(
+    (m): m is ThreadReply & { text: string } => typeof m.text === "string" && m.text.length > 0 && m.ts !== replyTs,
+  );
+  const rootIdx = candidates.findIndex((m) => m.ts !== undefined && m.ts === m.thread_ts);
+  const root = rootIdx >= 0 ? candidates[rootIdx] : undefined;
+  const others =
+    root === undefined ? candidates : [...candidates.slice(0, rootIdx), ...candidates.slice(rootIdx + 1)];
+  // Newest-last: the root first, then the most recent replies ascending.
+  const replyBudget = Math.max(0, maxMessages - (root === undefined ? 0 : 1));
+  const newestReplies = replyBudget === 0 ? [] : others.slice(-replyBudget);
+  const keep = root === undefined ? newestReplies : [root, ...newestReplies];
+  const notes: string[] = [];
+  let budget = maxChars;
+  for (const m of keep) {
+    const isRoot = m.ts !== undefined && m.ts === m.thread_ts;
+    const label = isRoot ? "thread root" : "thread reply";
+    const author = m.user ?? "(unknown)";
+    const prefix = `[${label} from ${author}: `;
+    const suffix = budget - prefix.length - 1; // trailing "]"
+    if (suffix <= 0) break;
+    const text = m.text.length <= suffix ? m.text : `${m.text.slice(0, Math.max(0, suffix - 3))}...`;
+    const note = `${prefix}${text}]`;
+    notes.push(note);
+    budget -= note.length;
+  }
+  return notes.join("\n");
+}
+
+/**
+ * Hydrates a thread reply's prior conversation context (issue #305): fetches
+ * the conversation root + recent replies via `conversations.replies` through
+ * the injected {@link ThreadContextClient} and returns the message's turn
+ * text augmented with bounded, provenance-labeled context (newest-last),
+ * excluding the triggering reply itself.
+ *
+ * Degrades safely: a missing scope, a failed fetch, or a client that never
+ * answers within {@link THREAD_CONTEXT_TIMEOUT_MS} appends one diagnostic
+ * line (logged AND surfaced to the turn text) and proceeds — it never
+ * crashes the turn and never blocks on Slack latency (the fetch races a
+ * short timer). Without a `thread_ts` or without a client, the message text
+ * is returned unchanged.
+ */
+export async function hydrateThreadContext(
+  message: SlackMessage,
+  client: ThreadContextClient | undefined,
+  log: (line: string) => void,
+  timeoutMs = THREAD_CONTEXT_TIMEOUT_MS,
+): Promise<string> {
+  if (message.threadTs === undefined || client === undefined) return message.text;
+  const append = (note: string): string => (message.text ? `${message.text}\n${note}` : note);
+  const call = client.conversationsReplies({
+    channel: channelFromSpaceId(message.spaceId),
+    ts: message.threadTs,
+    inclusive: true,
+    limit: 100,
+  });
+  let result: { messages?: ThreadReply[] } | undefined;
+  try {
+    result = await Promise.race([
+      call,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), timeoutMs),
+      ),
+    ]);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    log(`slack: thread context fetch failed (${detail}) — proceeding without thread context`);
+    return append(`[thread context unavailable: ${detail}]`);
+  }
+  const notes = buildThreadContextNotes(result?.messages ?? [], message.ts);
+  if (notes.length === 0) {
+    // Missing_scope / not_in_channel returns ok:false with no messages. One
+    // clear diagnostic line so the missing scope is attributable from the turn.
+    if (result && result.messages === undefined) {
+      const diag = "[thread context unavailable]";
+      log(`slack: thread context unavailable for ${message.spaceId} — check channels:history/groups:history/im:history scopes`);
+      return append(diag);
+    }
+    return message.text;
+  }
+  return append(notes);
+}
+
 export interface MessageHandlerOptions {
   /**
    * Per-space response mode (issue #55); defaults to `always` (today's
@@ -735,6 +883,17 @@ export interface MessageHandlerOptions {
   responseModeFor?: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   /** Current bot user id; undefined until the adapter resolves it at start(). */
   botUserId?: () => string | undefined;
+  /**
+   * Thread-context client seam (issue #305): when an inbound message
+   * carries a `thread_ts`, the handler fetches the conversation root +
+   * recent replies via `conversations.replies` through this injected
+   * client and surfaces them to the turn as bounded, provenance-labeled
+   * context (newest-last, excluding the triggering reply). Absent → no
+   * hydration (thread replies flow through as today). The real adapter
+   * wires a short-timeout WebClient-backed implementation; tests inject a
+   * fake (or a Bun.serve-backed emulator client).
+   */
+  threadContextClient?: ThreadContextClient;
 }
 
 /**
@@ -770,6 +929,13 @@ export function registerMessageHandler(
     ) {
       logger.info("slack: dropping unmentioned channel message (response_mode=mention)");
       return;
+    }
+    // Issue #305: hydrate a thread reply's prior conversation context so the
+    // turn sees the root + recent replies (bounded, newest-last, excluding
+    // this reply). Best-effort: a missing scope or failed fetch appends a
+    // diagnostic line and proceeds — never blocks the turn on Slack latency.
+    if (message.threadTs !== undefined && opts.threadContextClient !== undefined) {
+      message.text = await hydrateThreadContext(message, opts.threadContextClient, (line) => logger.info(line));
     }
     logger.info(`slack: inbound ${message.spaceId} ${message.ts} text=${message.text.slice(0, 60)}`);
     await onMessage(message);
@@ -1064,9 +1230,17 @@ export function createSlackAdapter(opts: {
    */
   let streamingCapable = true;
 
+  // Issue #305: the thread-context client seam uses the app's Web API client
+  // (bounded by hydrateThreadContext's short race timer, so the SDK's default
+  // retry policy can never block a turn on Slack latency). The client is
+  // injectable via MessageHandlerOptions for hermetic tests, but production
+  // callers always get the real conversations.replies-backed one.
   registerMessageHandler(app, opts.onMessage, {
     responseModeFor: opts.responseModeFor,
     botUserId: () => botUserId,
+    threadContextClient: {
+      conversationsReplies: (args) => app.client.conversations.replies(args),
+    },
   });
   if (opts.onAction !== undefined) {
     registerActionHandler(app, opts.onAction);

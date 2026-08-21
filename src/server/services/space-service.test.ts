@@ -641,6 +641,29 @@ describe("SpaceService session lifecycle", () => {
     expect(driver.last().prompts).toEqual([{ text: "hello", opts: { principal: "U1" } }]);
   });
 
+  test("a thread reply with hydrated context flows the root + prior replies into the turn prompt (issue #305)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // The adapter appends the bounded, provenance-labeled thread context to
+    // the reply's text before the service sees it; the turn must surface the
+    // whole thing (reply + root + prior reply) to the agent.
+    await service.handleInboundMessage(
+      msg({
+        text: "blocked on github auth\n[thread root from U0: i need the deploy green by eod]\n[thread reply from U1: on it — checking the canary]",
+        threadTs: "9.9",
+        ts: "9.11",
+        principal: "U2",
+      }),
+    );
+
+    expect(driver.last().prompts[0]!.text).toBe(
+      "blocked on github auth\n[thread root from U0: i need the deploy green by eod]\n[thread reply from U1: on it — checking the canary]",
+    );
+  });
+
   test("a space's authored skills are injected at cold start (issues #234/#235)", async () => {
     const skillsRoot = mkdtempSync(join(tmpdir(), "bottega-space-skills-inject-"));
     const prev = process.env.BOTTEGA_SKILLS_DIR;
