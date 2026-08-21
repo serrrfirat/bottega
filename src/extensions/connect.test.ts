@@ -10,15 +10,19 @@ import {
   APPROVAL_RESOLVED_EVENT,
   EXTENSION_CONNECTED_EVENT,
   POLICY_DECISION_EVENT,
+  SECRET_PROVISIONED_EVENT,
 } from "../store/audit-events";
 import { createStore, type Store } from "../store/db";
+import { bootSecretForProvider } from "../server/boot-secrets";
 import {
   apiKeyIdentityKey,
   connectExtension,
+  connectViaAuthBroker,
   CONNECT_EXTENSION_TOOL,
   connectExtensionToolDefinition,
   pickNewestBrokerEntry,
   SECRET_PASTE_REDIRECT,
+  storeBootSecret,
   type BrokerConnectResult,
   type ConnectExtensionDeps,
   type ConnectScope,
@@ -1006,5 +1010,127 @@ describe("connectExtension api_key no-key redirect (issue #247)", () => {
     expect(text).toContain("connect_upload_link");
     expect(text).not.toContain("needs its API key");
     expect(h.broker.calls).toHaveLength(0);
+  });
+});
+
+describe("storeBootSecret (issue #201)", () => {
+  const slackApp = bootSecretForProvider("slack-app")!;
+  const depsFor = (h: Harness) => ({
+    broker: h.deps.broker,
+    audit: h.deps.audit,
+    gate: h.deps.gate,
+  });
+
+  test("org-scope stores cross the policy gate; a deny blocks with nothing stored", async () => {
+    // deny-by-default policy → the exec-tier gate blocks before any broker write.
+    const h = makeDeps();
+    const outcome = await storeBootSecret(
+      { secret: slackApp, value: "xapp-secret", scope: "org", actor: "UADA", spaceId: "slack:C1" },
+      depsFor(h),
+    );
+    expect(outcome.ok).toBe(false);
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT })).toHaveLength(0);
+  });
+
+  test("an approved org store writes the value through the broker and audits metadata only", async () => {
+    const router = new RecordingRouter({ approved: true });
+    const broker = new RecordingBroker({ identityKey: null, brokerCredentialId: 12 });
+    const h = makeDeps({ policy: allowedPolicy(), router, broker });
+    const outcome = await storeBootSecret(
+      { secret: slackApp, value: "xapp-secret", scope: "org", actor: "UADA", spaceId: "slack:C1" },
+      depsFor(h),
+    );
+    expect(outcome).toMatchObject({ ok: true });
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.broker.calls).toEqual([{ provider: "slack-app", credentialType: "api_key", apiKey: "xapp-secret" }]);
+    const rows = await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toEqual({
+      secret: "slack-app",
+      scope: "org",
+      owner: null,
+    });
+  });
+
+  test("a broker failure fails the store closed with nothing audited", async () => {
+    const router = new RecordingRouter({ approved: true });
+    const failing = { connect: async () => Promise.reject(new Error("vault unreachable")) };
+    // SAFETY: only the broker connect slot is exercised; the rejecting double covers that one path.
+    const h = makeDeps({ policy: allowedPolicy(), router, broker: failing as never });
+    const outcome = await storeBootSecret(
+      { secret: slackApp, value: "xapp-secret", scope: "org", actor: "UADA" },
+      depsFor(h),
+    );
+    expect(outcome).toMatchObject({ ok: false });
+    expect(outcome.ok === false ? outcome.message : "").toContain("vault unreachable");
+    expect(await h.store.listAudit({ event_type: SECRET_PROVISIONED_EVENT })).toHaveLength(0);
+  });
+});
+
+describe("connectViaAuthBroker fail-closed guards (issue #52/#247)", () => {
+  test("an api_key connect without a key refuses to run — never an empty upload", async () => {
+    await expect(
+      connectViaAuthBroker({ provider: "fixture.weather", credentialType: "api_key" }),
+    ).rejects.toThrow(/needs its API key/);
+    await expect(
+      connectViaAuthBroker({ provider: "fixture.weather", credentialType: "api_key", apiKey: "   " }),
+    ).rejects.toThrow(/needs its API key/);
+  });
+});
+
+describe("connectExtension fail-closed deny branches (issue #198/#247)", () => {
+  test("a THROWING callback-base probe fails the hosted OAuth connect closed, naming the cause", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    h.deps.mcpOAuth!.probeCallbackBase = async () => {
+      throw new Error("tunnel connection refused");
+    };
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false ? outcome.message : "").toContain("tunnel connection refused");
+    // Nothing minted, nothing brokered.
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
+  });
+
+  test("a credential-upsert failure after a successful broker connect fails closed with no audit", async () => {
+    // A broker that succeeds, but a store whose upsert throws (e.g. a DB
+    // write error): the connect must surface a fail-closed message and
+    // never record an extension.connected audit.
+    const h = makeDeps({
+      policy: allowedPolicy(),
+      broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }),
+    });
+    // SAFETY: the deps store slot only needs the three connect methods; the
+    // wrapper delegates everything and throws only on the credential write.
+    const original = h.deps.store as Pick<typeof h.store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
+    h.deps.store = {
+      upsertExtensionCredential: async () => {
+        throw new Error("db write failed");
+      },
+      listExtensionCredentials: original.listExtensionCredentials.bind(original),
+      listRuntimeExtensions: original.listRuntimeExtensions.bind(original),
+    } as typeof h.deps.store;
+
+    const outcome = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false ? outcome.message : "").toContain("db write failed");
+    expect(await h.store.listAudit({ event_type: EXTENSION_CONNECTED_EVENT })).toHaveLength(0);
+  });
+});
+
+describe("connectExtension hosted-OAuth start fail-closed (issue #198)", () => {
+  test("a throwing mcpOAuth.start fails the connect closed after a healthy probe", async () => {
+    const h = makeDeps({ policy: allowedPolicy() });
+    h.deps.reconcileEgress = async () => ({ warnings: [] });
+    h.deps.mcpOAuth!.start = async () => {
+      throw new Error("authorize exchange failed");
+    };
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false ? outcome.message : "").toContain("authorize exchange failed");
+    expect(h.broker.calls).toHaveLength(0);
+    expect(await rowsFor(h.store, "com.example.oauth")).toHaveLength(0);
   });
 });
