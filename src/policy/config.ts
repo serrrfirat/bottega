@@ -248,6 +248,10 @@ const TIER_BY_TOOL: ToolTiers = {
   deploy_info: "read",
   first_run_wizard: "write",
   list_scheduler_jobs: "read",
+  // Operator visibility (#161/#320): both are read-only. Explanation calls
+  // the same pure decision table and never creates an approval.
+  audit_search: "read",
+  explain_policy: "read",
   // Proactive-layer tools (issues #86, #91): scheduler mutations stay
   // exec-tier, listing is read-only, and KB ingestion is a durable write.
   create_scheduler_job: "exec",

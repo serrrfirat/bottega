@@ -85,14 +85,14 @@ schedules. Create a weekday standup at 09:00 UTC with the
 }
 ```
 
-Standups and reflections are per-space opt-ins. Set the space's
-`spaces.policy_json` value to include:
+Standups, reflections, and the governance digest are per-space opt-ins. Set
+the destination space's `spaces.policy_json` value to include:
 
 ```json
-{"proactive":{"standup":true,"reflection":true}}
+{"proactive":{"standup":true,"reflection":true,"governance":true}}
 ```
 
-Both flags default to `false`. A proactive action posts only when the
+All flags default to `false`. A proactive action posts only when the
 space's effective `response_mode` is `always`; mention and request-only
 spaces never receive unsolicited posts. On restart, the scheduler skips
 overdue occurrences instead of catching up, advances each job to its next
@@ -112,6 +112,20 @@ The `org_pulse` action is a weekly, read-only summary of recent digest and
 reflection memories. Create it with no job-level space and set
 `params` to `{"pulse_space":"slack:C123"}` so the summary posts to that
 Slack space.
+
+Create the deterministic weekly governance digest with:
+
+```json
+{
+  "action": "governance_digest",
+  "cron": "0 9 * * 1",
+  "params": {"space": "slack:C123"}
+}
+```
+
+It reports only aggregate approvals, denials, timeouts, credential scopes,
+and org-settings changes from the prior seven days. It never uses a model or
+posts raw audit payloads.
 
 Knowledge-base sources live in `config/kb.yml`. After adding a source, run
 the `kb_ingest` tool with `{"source":"source-id"}`, or omit `source` to

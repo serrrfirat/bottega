@@ -209,7 +209,12 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       expect(resumeJob).toBeDefined();
       expect(runNow).toBeDefined();
 
-      const actions = ["standup_digest", "reflection", "org_pulse"] as const;
+      // Operator read wiring (#161/#320): the real boot toolset exposes both
+      // read-only surfaces, rather than only their helper definitions.
+      expect(tools.find((tool) => tool.name === "audit_search")?.approval).toBe("read");
+      expect(tools.find((tool) => tool.name === "explain_policy")?.approval).toBe("read");
+
+      const actions = ["standup_digest", "reflection", "org_pulse", "governance_digest"] as const;
       const created: Array<{ action: string; cron: string }> = [];
       for (const action of actions) {
         // Issue #220: space-scoped actions (standup_digest, reflection)

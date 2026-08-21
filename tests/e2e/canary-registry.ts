@@ -188,6 +188,16 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     durableProof: "model.pin_applied + model switched audit rows scoped per session/space",
     fixtures: ["emulator:requester", "emulator:member"],
   },
+  {
+    id: "operator.read-surfaces",
+    layer: "hermetic",
+    actors: ["requester", "member"],
+    covers: ["audit_search", "explain_policy"],
+    visibleProof: "cursor-paged audit rows and allow/deny/ask explanations are viewer-scoped and redacted",
+    durableProof: "audit.read + policy.explained rows; no approval.requested row from explanation",
+    fixtures: ["sqlite:seeded-audit", "policy:deny-ask-allow", "slack:admin-authority-double"],
+  },
+
 
   // ====================== Layer: live-api ================================
   {

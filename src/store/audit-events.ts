@@ -240,3 +240,13 @@ export const OUTBOX_POSTED_EVENT = "outbox.posted";
  * seam's external post fails.
  */
 export const OUTBOX_FAILED_EVENT = "outbox.failed";
+/** Filtered operator audit read (payload is the allowlisted filter, never results/cursor). */
+export const AUDIT_READ_EVENT = "audit.read";
+/** Side-effect-free policy/credential explanation (payload {tool, space, decision, tier}). */
+export const POLICY_EXPLAINED_EVENT = "policy.explained";
+/** Successfully published operator Home read (payload {revision}; no rendered rows). */
+export const OPERATOR_HOME_READ_EVENT = "operator.home_read";
+/** Weekly governance digest delivered (payload contains aggregate counts only). */
+export const GOVERNANCE_DIGEST_POSTED_EVENT = "governance_digest.posted";
+/** Weekly governance digest could not be delivered (payload {reason}; audit redaction still applies). */
+export const GOVERNANCE_DIGEST_FAILED_EVENT = "governance_digest.failed";

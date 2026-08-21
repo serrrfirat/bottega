@@ -509,6 +509,9 @@ export const SPACE_AGENT_TOOLS = [
   "resume_scheduler_job",
   "run_scheduler_job_now",
   "delete_scheduler_job",
+  // Read-only operator visibility (#161/#320).
+  "audit_search",
+  "explain_policy",
 ] as const;
 
 /**

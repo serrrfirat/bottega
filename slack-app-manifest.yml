@@ -15,7 +15,7 @@ display_information:
   background_color: "#1a1d21"
 features:
   app_home:
-    home_tab_enabled: false
+    home_tab_enabled: true
     messages_tab_enabled: true
   # Agents feature (issue #168) — DISABLED (#184): agent_view swallows DM
   # visibility — replies render in the app's agent surface (the Messages
@@ -86,5 +86,6 @@ settings:
       - message.groups
       - message.im
       - app_mention
+      - app_home_opened
   socket_mode_enabled: true
   token_rotation_enabled: false

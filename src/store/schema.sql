@@ -210,6 +210,9 @@ CREATE TABLE IF NOT EXISTS audit (
   payload    TEXT NOT NULL               -- JSON, secrets redacted before write
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit(event_type, ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_space_ts ON audit(space_id, ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit(actor, ts DESC, id DESC);
 
 -- Audit is append-only: the store exposes no update/delete helpers, and
 -- these triggers make direct UPDATE/DELETE fail on any connection.

@@ -50,7 +50,13 @@
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { recoverStaleWorkItems, type Store, type SpaceModelSettings, type WorkItem } from "./store/db";
+import {
+  recoverStaleWorkItems,
+  type AuditCursor,
+  type Store,
+  type SpaceModelSettings,
+  type WorkItem,
+} from "./store/db";
 import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
@@ -1181,14 +1187,14 @@ function parseDeliveryResolution(raw: string): DeliveryResolutionPayload | null 
  * `delivery.resolved` ({id, approved, approver}); this wait polls for that
  * row and resolves with the recorded decision — approved → {approver},
  * denied → null (the executor then blocks the item with evidence). The
- * FIRST recorded decision wins (listAudit returns rows in ts order).
+ * FIRST recorded decision wins (the indexed cursor walk preserves chronological precedence).
  *
  * Headless/executor-only runs (no server to resolve) fail closed on the
  * timeout: null → the item lands in `blocked`, never a silent hang at
  * `working`.
  */
 export async function waitForDeliveryApproval(
-  store: Pick<Store, "listAudit">,
+  store: Pick<Store, "queryAudit">,
   item: WorkItem,
   delivery: DeliveryInfo,
   opts: DeliveryWaitOpts = {},
@@ -1199,14 +1205,26 @@ export async function waitForDeliveryApproval(
   const deadline = Date.now() + timeoutMs;
   log(`[${item.id}] delivery approval pending for ${delivery.prUrl} — waiting for the space's decision`);
   for (;;) {
-    const rows = await store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT });
-    for (const row of rows) {
-      const payload = parseDeliveryResolution(row.payload);
-      if (payload === null || payload.id !== item.id) continue;
-      // First recorded decision wins.
-      if (payload.approved === true && payload.approver !== undefined) {
-        log(`[${item.id}] delivery approved by <@${payload.approver}>`);
-        return { approver: payload.approver };
+    let cursor: AuditCursor | null = null;
+    let resolution: DeliveryResolutionPayload | null = null;
+    do {
+      const page = await store.queryAudit({
+        event_type: DELIVERY_RESOLVED_EVENT,
+        since: item.created_at,
+        cursor,
+        limit: 100,
+      });
+      for (const row of page.rows) {
+        const candidate = parseDeliveryResolution(row.payload);
+        if (candidate !== null && candidate.id === item.id) resolution = candidate;
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    if (resolution !== null) {
+      if (resolution.approved === true && resolution.approver !== undefined) {
+        log(`[${item.id}] delivery approved by <@${resolution.approver}>`);
+        return { approver: resolution.approver };
       }
       log(`[${item.id}] delivery denied — blocking`);
       return null;

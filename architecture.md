@@ -732,7 +732,7 @@ standup digest producers check pruning capability before side effects.
 
 `src/scheduler/` implements a durable, UTC-only scheduler with policy-gated
 lifecycle tools (issues #86 and #308) and typed built-in actions for
-standups, reflection, org pulse, recurring work, messages, and ingestion.
+standups, reflection, org pulse, governance digest, recurring work, messages, and ingestion.
 
 ```mermaid
 flowchart LR
@@ -744,7 +744,7 @@ flowchart LR
     INV --> RUN["durable claim/fire runner — every 5 s"]
     RUN --> CRON["nextCronFire — five-field UTC cron<br/>(no DST; OR semantics; ? allowed once)"]
     RUN -- "first pass after boot: occurrences<br/>before now" --> MISS["audit 'missed', skip — no replay of backlog"]
-    RUN --> ACT["typed action registry"]
+    RUN -- "job due" --> ACT["typed action registry<br/>standup | reflection | pulse | governance | recurring work | ingestion"]
     ACT --> POST["postMessage → Slack space"]
     ACT --> MEM["memory provider — org memories<br/>append-only save; capability-gated maintenance"]
     ACT --> WI["work_items — recurring extension work"]
@@ -769,6 +769,11 @@ flowchart LR
   `spaces.policy_json` with `proactive: { standup: true, reflection: true }`;
   invalid policy data fails closed (disabled). The org pulse targets a
   configured Slack space.
+
+The weekly `governance_digest` is model-free and opt-in at its destination
+space. It reads cursor-paged audit summaries through the canonical allowlist,
+groups approvals/denials/timeouts/credential scopes/settings changes, and
+posts once. Delivery failure is redacted and audited inside the action.
 
 ## Knowledge-base ingestion (#91)
 
@@ -844,6 +849,12 @@ and the presenter falls back to the plain path (#181). The hermetic e2e
 harness uses the explicit `streamingSupported: () => false` seam to exercise
 that fallback (#179). `agent_view` and `assistant:write` remain absent from
 the Slack manifest because they hid DM messages (#184).
+
+The admin-only App Home handler publishes a deterministic, revision-hashed
+Block Kit view from canonical read models. Workspace admin status comes from
+Slack `users.info`; unknown or non-admin viewers fail closed. Each section
+has its own error boundary, personal connections are owner-filtered, and
+repeated unchanged events do not republish or repeat the read audit.
 
 On the plain path, progress prefers the current gated tool step, then the
 latest model thinking snippet, then `Thinking… Ns` (#193). Reply/progress
@@ -971,9 +982,11 @@ before exposing the store, and a retry resumes from the last committed ID.
 - `upload_tokens` — opaque, expiring, single-use #196 browser-upload
   grants. The MCP child and server endpoint share the table; atomic delete
   makes only the first valid POST consumable.
-- `audit` — append-only; triggers reject UPDATE/DELETE. Policy decisions,
-  approvals, tool calls, delivery decisions, model-pin application, and
-  work-item transitions are rows. Payloads are redacted and capped at 4 KiB.
+- `audit` — append-only; triggers reject UPDATE/DELETE. Composite
+  event/space/actor + time indexes support capped newest-first cursor reads.
+  Operator DTOs expose only allowlisted fields; policy decisions, approvals,
+  tool calls, delivery decisions, model-pin application, and work-item
+  transitions remain durable rows with payloads redacted and capped at 4 KiB.
 
 ```mermaid
 stateDiagram-v2
