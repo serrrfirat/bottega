@@ -1174,7 +1174,7 @@ export async function waitForDeliveryApproval(
       const page = await store.queryAudit({
         event_type: DELIVERY_RESOLVED_EVENT,
         since: item.created_at,
-        cursor,
+        cursor: cursor ?? undefined,
         limit: 100,
       });
       for (const row of page.rows) {

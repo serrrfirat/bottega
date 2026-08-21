@@ -1295,6 +1295,7 @@ describe("delivery routing (issue #129)", () => {
         actor: "executor",
         credential_id: null,
         decision: "error",
+        call_id: null,
       });
     } finally {
       fx.cleanup();
@@ -1334,6 +1335,7 @@ describe("delivery routing (issue #129)", () => {
         actor: "executor",
         credential_id: null,
         decision: "deny",
+        call_id: null,
       });
     } finally {
       fx.cleanup();
@@ -2008,12 +2010,11 @@ describe("worker job envelope (epic #170)", () => {
         expect.objectContaining({
           id: "kb_job_1",
           kind: "kb",
-          attempts: 1,
           error: expect.stringContaining("kb job refused: host example.com is not in the declared KB source hosts"),
         }),
       );
       expect(payloads).toContainEqual(
-        expect.objectContaining({ id: "sched_job_1", kind: "scheduled", attempts: 1 }),
+        expect.objectContaining({ id: "sched_job_1", kind: "scheduled" }),
       );
       // Fail-closed: nothing ran, no completion signal, no work items.
       expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
@@ -2157,7 +2158,6 @@ describe("worker job envelope (epic #170)", () => {
         expect(JSON.parse(failed[0].payload)).toMatchObject({
           id: "kb_malformed",
           kind: "kb",
-          attempts: 1,
           error: expect.stringContaining("payload must be { url }"),
         });
         expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
@@ -2195,7 +2195,6 @@ describe("worker job envelope (epic #170)", () => {
           expect(JSON.parse(failed[0].payload)).toMatchObject({
             id: "kb_evil",
             kind: "kb",
-            attempts: 1,
             error: expect.stringContaining("kb job refused: host evil.example.com is not in the declared KB source hosts"),
           });
           // No fetch happened: nothing was parsed or stored.
@@ -2209,7 +2208,7 @@ describe("worker job envelope (epic #170)", () => {
     });
   });
 
-  test("a failing job requeues with bounded backoff and fails closed at max attempts", async () => {
+  test("a sandbox-owned semantic failure fails closed on its first attempt without replay", async () => {
     const fx = makeFixture();
     try {
       await fx.store.enqueueJob({ id: "kb_retry", kind: "kb", payload: { url: "https://example.com/retry" } });
@@ -2226,20 +2225,23 @@ describe("worker job envelope (epic #170)", () => {
         await run;
       }
 
-      // Three claims (attempts 1..3), the first two requeued, the last terminal.
+      // Issue #101 moved every job body into the sandbox. A handled
+      // semantic failure owns its terminal lifecycle there and must not be
+      // replayed by the parent as though the child had crashed.
       const claimed = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
-      const claimPayloads = claimed.map((row) => JSON.parse(row.payload));
-      expect(claimPayloads).toHaveLength(3);
-      expect(claimPayloads.map((p) => p.attempts)).toEqual([1, 2, 3]);
+      expect(claimed.map((row) => JSON.parse(row.payload).attempts)).toEqual([1]);
 
       const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
-      const failPayloads = failed.map((row) => JSON.parse(row.payload));
-      expect(failPayloads.filter((p) => p.requeued === true)).toHaveLength(2);
-      expect(failPayloads[2]).toMatchObject({ id: "kb_retry", kind: "kb", attempts: 3 });
-      expect(failPayloads[2].requeued).toBeUndefined();
-      // Backoff grew between attempts.
-      expect(failPayloads[0].backoff_ms).toBe(5);
-      expect(failPayloads[1].backoff_ms).toBe(10);
+      expect(failed).toHaveLength(1);
+      const failure = JSON.parse(failed[0].payload);
+      expect(failure).toMatchObject({
+        id: "kb_retry",
+        kind: "kb",
+        error: expect.stringContaining("kb job refused"),
+      });
+      expect(failure.requeued).toBeUndefined();
+      expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+      expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
     } finally {
       fx.cleanup();
     }
@@ -2278,8 +2280,27 @@ describe("worker job envelope (epic #170)", () => {
       expect(fx.driver.sessions).toHaveLength(0);
       expect(await fx.store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
       expect(consumeOutboxWatermarked(fx.store).rows).toHaveLength(0);
-      const failed = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
-      expect(JSON.parse(failed[0].payload)).toMatchObject({ id: item.id, kind: "git", error: expect.stringContaining("another worker owns it") });
+      const claims = await fx.store.listAudit({ event_type: JOB_CLAIMED_EVENT });
+      expect(claims.map((row) => JSON.parse(row.payload).attempts)).toEqual([1, 2]);
+      const failed = (await fx.store.listAudit({ event_type: JOB_FAILED_EVENT })).map((row) =>
+        JSON.parse(row.payload),
+      );
+      expect(failed).toHaveLength(2);
+      expect(failed[0]).toMatchObject({
+        id: item.id,
+        kind: "git",
+        attempts: 1,
+        requeued: true,
+        backoff_ms: 5,
+        error: expect.stringContaining("sandbox requested requeue"),
+      });
+      expect(failed[1]).toMatchObject({
+        id: item.id,
+        kind: "git",
+        attempts: 2,
+        error: expect.stringContaining("sandbox requested requeue"),
+      });
+      expect(failed[1].requeued).toBeUndefined();
     } finally {
       fx.cleanup();
     }
