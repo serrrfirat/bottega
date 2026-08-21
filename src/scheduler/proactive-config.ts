@@ -6,6 +6,7 @@ const ProactivePolicySchema = z.object({
     .object({
       standup: z.boolean().optional(),
       reflection: z.boolean().optional(),
+      governance: z.boolean().optional(),
     })
     .optional(),
 });
@@ -20,7 +21,7 @@ const ProactivePolicySchema = z.object({
  * Only the exact boolean `true` enables a feature. Malformed JSON, absent
  * keys, and non-boolean shapes fail closed (feature disabled).
  */
-export function proactiveEnabled(policyJson: string, feature: "standup" | "reflection"): boolean {
+export function proactiveEnabled(policyJson: string, feature: "standup" | "reflection" | "governance"): boolean {
   try {
     const policy = ProactivePolicySchema.parse(JSON.parse(policyJson));
     return policy.proactive?.[feature] === true;

@@ -269,9 +269,12 @@ describe("omp sdk agent driver", () => {
         "create_work_item",
         "work_item_cancel",
         "list_work_items",
-        // Skills-tier tooling (issues #234/#235): the policy-gated writer
-        // for the space's skill store, aligned with SPACE_AGENT_TOOLS.
-        "write_space_skill",
+        // Complete skill lifecycle, aligned with SPACE_AGENT_TOOLS.
+        "list_space_skills",
+        "get_space_skill",
+        "create_space_skill",
+        "update_space_skill",
+        "delete_space_skill",
         "connect_extension",
         "memory.save",
         "memory.search",

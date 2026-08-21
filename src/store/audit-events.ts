@@ -10,13 +10,16 @@
  */
 /** Work item created (payload {id, requester, assignee}). */
 export const WORK_ITEM_CREATED_EVENT = "work_item.created";
-/**
- * A space skill was written (issues #234/#235): payload {name, path}; the
- * space_id rides the top-level field. Written by the `write_space_skill`
- * tool after a successful policy-gated write lands on disk (fail-closed: no
- * event without a file).
- */
-export const SPACE_SKILL_WRITTEN_EVENT = "space_skill.written";
+/** Space skill summaries listed (payload {skills:[{name,source_tier,revision}]}). */
+export const SPACE_SKILL_LISTED_EVENT = "space_skill.listed";
+/** Effective space skill read (payload {name,source_tier,revision,companion_files}); never bodies. */
+export const SPACE_SKILL_READ_EVENT = "space_skill.read";
+/** Space-tier skill created (payload {name,revision,companion_files}); never bodies. */
+export const SPACE_SKILL_CREATED_EVENT = "space_skill.created";
+/** Space-tier skill replaced (payload {name,previous_revision,revision,companion_files}); never bodies. */
+export const SPACE_SKILL_UPDATED_EVENT = "space_skill.updated";
+/** Space-tier skill deleted (payload {name,revision,revealed?}); never bodies. */
+export const SPACE_SKILL_DELETED_EVENT = "space_skill.deleted";
 /** Work item state transition (payload {from, to, by}). */
 export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
 /** Queue read (payload {state?, count}; space_id top-level). */
@@ -237,3 +240,13 @@ export const OUTBOX_POSTED_EVENT = "outbox.posted";
  * seam's external post fails.
  */
 export const OUTBOX_FAILED_EVENT = "outbox.failed";
+/** Filtered operator audit read (payload is the allowlisted filter, never results/cursor). */
+export const AUDIT_READ_EVENT = "audit.read";
+/** Side-effect-free policy/credential explanation (payload {tool, space, decision, tier}). */
+export const POLICY_EXPLAINED_EVENT = "policy.explained";
+/** Successfully published operator Home read (payload {revision}; no rendered rows). */
+export const OPERATOR_HOME_READ_EVENT = "operator.home_read";
+/** Weekly governance digest delivered (payload contains aggregate counts only). */
+export const GOVERNANCE_DIGEST_POSTED_EVENT = "governance_digest.posted";
+/** Weekly governance digest could not be delivered (payload {reason}; audit redaction still applies). */
+export const GOVERNANCE_DIGEST_FAILED_EVENT = "governance_digest.failed";

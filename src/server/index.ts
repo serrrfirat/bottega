@@ -9,8 +9,9 @@ import { evaluatePolicyGate } from "../policy/gate";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
+import { listConnectionReadModel } from "../extensions/lifecycle";
 import { workItemToolDefinitions } from "../tools/work-items";
-import { writeSpaceSkillToolDefinition } from "../tools/space-skills";
+import { spaceSkillToolDefinitions } from "../tools/space-skills";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
 import { modelToolsDefinitions } from "../tools/model-settings";
@@ -20,6 +21,7 @@ import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
 import { chartToolDefinition } from "../tools/render-chart";
 import { searchWebToolDefinition } from "../tools/search-web";
+import { operatorReadToolDefinitions } from "../tools/operator-read";
 import { loadKbConfig } from "../kb/config";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
@@ -30,6 +32,7 @@ import { orgPulseAction } from "../scheduler/observer";
 import { recurringWorkAction } from "../scheduler/recurring-work";
 import { sendMessageAction } from "../scheduler/send-message";
 import { kbIngestAction } from "../scheduler/kb-ingest";
+import { governanceDigestAction } from "../scheduler/governance-digest";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -76,6 +79,7 @@ import {
 } from "./adapters/slack";
 import { SpaceService } from "./services/space-service";
 import type { ToolStepSink } from "./services/slack-turn-presenter";
+import { createOperatorHomeService } from "./operator-home";
 import { createLearningService } from "./services/learning";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -277,6 +281,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // Ingest polling leg (issue #57): scheduled with a durable
     // "ingest_poll" job (create_scheduler_job, params.space = target).
     createIngestPollAction(),
+    governanceDigestAction,
   ]);
   const kbDeps: KbToolDependencies = {
     store,
@@ -327,6 +332,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     const policy = await loadSpacePolicy(orgPolicy, store, spaceId);
     return policy.responseMode;
   };
+  const operatorHome = createOperatorHomeService({
+    store,
+    audit,
+    orgPolicy,
+    setupChecks: () => runWizardChecks(store),
+    listConnections: (actor) => listConnectionReadModel({ actor }, { store, registry: extensionRegistry }),
+    pendingApprovals: () => [...(approvalRouter.pendingPrompts?.() ?? [])],
+    memoryStatus: async () => ({
+      provider: orgSettings?.memoryBackend?.baseUrl ? "mem0" : "sqlite",
+      available: true,
+    }),
+  });
   let spaceService: SpaceService;
   const adapter = createSlackAdapter({
     appToken,
@@ -348,6 +365,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       return approvalRouter.handleAction(a);
     },
     responseModeFor,
+    onHomeOpened: (viewer) => operatorHome.render(viewer),
+    onHomePublished: (viewer, revision) => operatorHome.recordRead(viewer, revision),
   });
   // Boot-time onboarding guide (issue #116): proactive Slack-side setup.
   // When any first-run check fails AND an onboarding space is configured
@@ -573,12 +592,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // onSessionToolset seam can expose the wiring to caller-level boot tests.
   const sessionToolset = [
     ...workItemToolDefinitions(store, { orgPolicy, agentDir }),
-    // Space-skill governance (issues #234/#235, Tier 1): the policy-gated
-    // write_space_skill rides the same custom-tools bridge as the work-item
-    // tools — the driver's gate wraps it identically (exec tier → ask-human
-    // by default), every write is audited, and the space's cached skills are
-    // busted so the NEXT session claims the skill.
-    writeSpaceSkillToolDefinition(store, { audit }),
+    // Complete skill lifecycle uses the same policy-gated definitions on
+    // both the SDK-session and MCP channels. Reads are read-tier; code
+    // injection/removal is exec-tier and refreshes only the next session.
+    ...spaceSkillToolDefinitions(store, { audit }),
     // Memory tools (issue #137): recall/save scopes derive from the
     // authenticated invocation context — space id (from the session file),
     // the TURN principal (getTurnPrincipal, the same seam the connect tool
@@ -646,6 +663,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       },
     }),
     ...kbToolDefinitions(kbDeps),
+    ...operatorReadToolDefinitions(store, {
+      audit,
+      orgPolicy,
+      actorForSpace: (spaceId) => spaceService.getTurnPrincipal(spaceId),
+      canReadSpace: async (actor) => (await adapter.isWorkspaceAdmin?.(actor)) ?? false,
+      knownExtensionIds: extensionRegistry.list().map((entry) => entry.manifest.id),
+      toolTier: extensionToolTier,
+    }),
     // Todo snapshot (issue #228): read-tier assembly of the space's live
     // state — work items (same query as list_work_items), pending
     // approvals (the router's outstanding prompts), scheduled jobs (same

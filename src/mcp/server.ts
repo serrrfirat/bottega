@@ -90,7 +90,7 @@ import {
   type PolicyConfig,
   type Tier,
 } from "../policy/config";
-import { summarizeArgs } from "../policy/gate";
+import { summarizeToolArgs } from "../policy/gate";
 import { MEMORY_WRITE_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { memorySaveArgsSchema, memorySearchArgsSchema, sha256Hex } from "../tools/memory";
@@ -147,7 +147,7 @@ import type { Store } from "../store/db";
 import { kbToolDefinitions } from "../tools/kb-tools";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { workItemToolDefinitions } from "../tools/work-items";
-import { writeSpaceSkillToolDefinition } from "../tools/space-skills";
+import { spaceSkillToolDefinitions } from "../tools/space-skills";
 import type { ModelCatalogEntry } from "../models/model-pin";
 
 export interface MemoryMcpServerOptions {
@@ -258,6 +258,9 @@ export interface McpInternalToolsOptions {
   schedulerNow?: () => number;
   /** KB config for kb_ingest (issue #91); absent → kb_ingest is not advertised. */
   kb?: KbConfig;
+  /** Per-space and built-in skill roots; production defaults to the documented env paths. */
+  skillsRoot?: string;
+  builtinSkillsDir?: string;
 }
 
 /**
@@ -500,7 +503,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       space_id: opts.spaceId ?? null,
       actor,
       event_type: POLICY_DECISION_EVENT,
-      payload: { tool, tier, decision, reason, args: summarizeArgs(args) },
+      payload: { tool, tier, decision, reason, args: summarizeToolArgs(tool, args) },
     });
 
   /** Gate + audit first, then validate, then execute. Returns the MCP result. */
@@ -673,13 +676,14 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           agentDir: opts.internal.agentDir,
           listModels: opts.internal.listModels,
         }),
-        // Space-skill governance (issues #234/#235, Tier 1): same
-        // write_space_skill surface on the MCP path — gated by
-        // bindInternalTool (gate → audit → validate → execute). Skill
-        // injection is SDK-session-only; the server-side skill store
-        // remains fully manageable over MCP.
+        // The MCP channel exposes the exact same complete lifecycle
+        // definitions as the in-session space agent.
         ...(opts.audit !== undefined
-          ? [writeSpaceSkillToolDefinition(opts.internal.store, { audit: opts.audit })]
+          ? spaceSkillToolDefinitions(opts.internal.store, {
+              audit: opts.audit,
+              skillsRoot: opts.internal.skillsRoot,
+              builtinSkillsDir: opts.internal.builtinSkillsDir,
+            })
           : []),
         ...modelToolsDefinitions(opts.internal.store, {
           audit: opts.audit,

@@ -176,11 +176,13 @@ const TIER_BY_TOOL: ToolTiers = {
   task: "exec",
   create_work_item: "exec",
   work_item_cancel: "exec",
-  // Skill governance (issues #234/#235, Tier 1): writing a skill into a
-  // space's skill store injects procedures into the space agent's future
-  // sessions, so it is exec-tier (ask-human) like the other privileged
-  // mutations — an operator can auto-approve it via approvals.always_approve.
-  write_space_skill: "exec",
+  // Space skill reads expose only the selected space plus read-only lower
+  // tiers. Mutations inject future procedure code and remain exec-tier.
+  list_space_skills: "read",
+  get_space_skill: "read",
+  create_space_skill: "exec",
+  update_space_skill: "exec",
+  delete_space_skill: "exec",
   complete_work_item: "write",
   list_work_items: "read",
   // Todo snapshot (issue #228): read-only assembly of the space's live
@@ -246,6 +248,10 @@ const TIER_BY_TOOL: ToolTiers = {
   deploy_info: "read",
   first_run_wizard: "write",
   list_scheduler_jobs: "read",
+  // Operator visibility (#161/#320): both are read-only. Explanation calls
+  // the same pure decision table and never creates an approval.
+  audit_search: "read",
+  explain_policy: "read",
   // Proactive-layer tools (issues #86, #91): scheduler mutations stay
   // exec-tier, listing is read-only, and KB ingestion is a durable write.
   create_scheduler_job: "exec",

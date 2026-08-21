@@ -50,13 +50,22 @@ export const updateSchedulerJobArgsSchema = z
   .refine((value) => value.action !== undefined || value.cron !== undefined || value.params !== undefined, {
     message: "update requires at least one supplied field",
   });
-export const pauseSchedulerJobArgsSchema = z.object({
+const schedulerJobRevisionArgs = {
   id: z.string().min(1),
   expected_revision: z.number().int().positive(),
-});
+};
+export const pauseSchedulerJobArgsSchema = z.object(schedulerJobRevisionArgs);
 export const resumeSchedulerJobArgsSchema = pauseSchedulerJobArgsSchema;
-export const runSchedulerJobNowArgsSchema = pauseSchedulerJobArgsSchema.extend({
-  invocation_id: z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_.:-]+$/).optional(),
+export const runSchedulerJobNowArgsSchema = z.object({
+  ...schedulerJobRevisionArgs,
+  invocation_id: z
+    .string()
+    .transform((value) => value.trim())
+    .refine(
+      (value) => value.length >= 1 && value.length <= 200 && /^[A-Za-z0-9_.:-]+$/.test(value),
+      "invocation_id must be 1-200 letters, numbers, dots, colons, underscores, or dashes",
+    )
+    .optional(),
 });
 export const deleteSchedulerJobArgsSchema = z.object({ id: z.string().min(1) });
 
@@ -205,6 +214,7 @@ export function schedulerToolDefinitions(
           params: jobParams,
           spaceId,
           createdBy: actor,
+          createdAt: now(),
         });
         await audit.appendAudit({
           space_id: job.spaceId,

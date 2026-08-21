@@ -245,6 +245,30 @@ export type ListAuditOpts = {
   limit?: number;
 };
 
+export interface AuditCursor {
+  ts: number;
+  id: number;
+}
+
+/** Indexed, newest-first audit query. Payload filters only inspect valid JSON rows. */
+export interface AuditQueryOpts {
+  space_id?: string;
+  actor?: string;
+  event_type?: string;
+  since?: number;
+  until?: number;
+  tool?: string;
+  extension?: string;
+  cursor?: AuditCursor;
+  /** Clamped to 1..100 at the store boundary. */
+  limit?: number;
+}
+
+export interface AuditPage {
+  rows: AuditRow[];
+  nextCursor: AuditCursor | null;
+}
+
 export interface Store {
   /**
    * Idempotent upsert on first contact (issue #188): creates the row with
@@ -480,6 +504,7 @@ export interface Store {
     params?: Record<string, string>;
     spaceId?: string | null;
     createdBy: string;
+    createdAt?: number;
   }): Promise<SchedulerJob>;
   getSchedulerJob(id: string): Promise<SchedulerJob | null>;
   listSchedulerJobs(): Promise<SchedulerJob[]>;
@@ -517,6 +542,8 @@ export interface Store {
   listSchedulerInvocations(filter?: { jobId?: string }): Promise<SchedulerInvocation[]>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
+  /** Indexed, cursor-backed audit search; always capped and newest-first. */
+  queryAudit(opts?: AuditQueryOpts): Promise<AuditPage>;
   /** The durable ingest poll cursor for a provider (issue #101); null when never persisted. */
   getIngestWatermark(provider: string): Promise<string | null>;
   /** Persists the ingest poll boundary for a provider (issue #101). */
@@ -1485,13 +1512,15 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     params?: Record<string, string>;
     spaceId?: string | null;
     createdBy: string;
+    createdAt?: number;
   }): Promise<SchedulerJob> {
     if (!isKnownSchedulerAction(input.action)) {
       throw new Error(`unknown scheduler action: ${input.action}`);
     }
     const params = input.params ?? {};
     const id = `sj_${randomUUID()}`;
-    const createdAt = Date.now();
+    const createdAt = input.createdAt ?? Date.now();
+    if (!Number.isSafeInteger(createdAt)) throw new Error("scheduler creation time must be a safe integer");
     const nextFireAt = nextCronFire(input.cron, createdAt);
     // SAFETY: INSERT ... RETURNING * always returns the freshly inserted scheduler_jobs row.
     const row = db
@@ -1918,6 +1947,70 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return db.query(sql).all(...params) as AuditRow[];
   }
 
+  async function queryAudit(opts: AuditQueryOpts = {}): Promise<AuditPage> {
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.event_type !== undefined) {
+      clauses.push("event_type = ?");
+      params.push(opts.event_type);
+    }
+    if (opts.space_id !== undefined) {
+      clauses.push("space_id = ?");
+      params.push(opts.space_id);
+    }
+    if (opts.actor !== undefined) {
+      clauses.push("actor = ?");
+      params.push(opts.actor);
+    }
+    if (opts.since !== undefined) {
+      clauses.push("ts >= ?");
+      params.push(opts.since);
+    }
+    if (opts.until !== undefined) {
+      clauses.push("ts <= ?");
+      params.push(opts.until);
+    }
+    if (opts.tool !== undefined) {
+      clauses.push("json_valid(payload) AND json_extract(payload, '$.tool') = ?");
+      params.push(opts.tool);
+    }
+    if (opts.extension !== undefined) {
+      clauses.push(
+        "json_valid(payload) AND COALESCE(json_extract(payload, '$.extension'), json_extract(payload, '$.provider')) = ?",
+      );
+      params.push(opts.extension);
+    }
+    if (opts.cursor !== undefined) {
+      if (
+        !Number.isSafeInteger(opts.cursor.ts) ||
+        !Number.isSafeInteger(opts.cursor.id) ||
+        opts.cursor.ts < 0 ||
+        opts.cursor.id < 1
+      ) {
+        throw new Error("invalid audit cursor");
+      }
+      clauses.push("(ts < ? OR (ts = ? AND id < ?))");
+      params.push(opts.cursor.ts, opts.cursor.ts, opts.cursor.id);
+    }
+    const requestedLimit = opts.limit ?? 50;
+    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const sql =
+      "SELECT id, ts, space_id, actor, event_type, payload FROM audit" +
+      where +
+      " ORDER BY ts DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    // SAFETY: the SELECT projects exactly AuditRow's six columns.
+    const matches = db.query(sql).all(...params) as AuditRow[];
+    const hasMore = matches.length > limit;
+    const rows = hasMore ? matches.slice(0, limit) : matches;
+    const last = rows.at(-1);
+    return {
+      rows,
+      nextCursor: hasMore && last !== undefined ? { ts: last.ts, id: last.id } : null,
+    };
+  }
+
   /**
    * The visible queue (issue #159): work items of a space (or every space
    * when no space filter), newest first, optionally narrowed by state.
@@ -2000,6 +2093,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     claimNextSchedulerInvocation,
     completeSchedulerInvocation,
     listSchedulerInvocations,
+    queryAudit,
     appendAudit,
     listAudit,
     getIngestWatermark,

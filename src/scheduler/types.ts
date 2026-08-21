@@ -30,7 +30,8 @@ export type SchedulerActionName =
   | "ingest_poll"
   | "kb_ingest"
   | "send_message"
-  | "memory_consolidation";
+  | "memory_consolidation"
+  | "governance_digest";
 
 /**
  * A durable scheduler job (issue #86). Stored in the `scheduler_jobs`

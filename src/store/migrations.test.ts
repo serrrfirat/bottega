@@ -20,6 +20,7 @@ const EXPECTED_MIGRATION_IDS = [
   "010_add_spaces_settings",
   "011_add_scheduler_lifecycle",
   "012_add_connection_lifecycle",
+  "013_add_audit_search_indexes",
 ] as const;
 
 function tempDb(name: string): string {
@@ -164,6 +165,32 @@ describe("ordered SQLite migrations", () => {
     ).toEqual(firstLedger);
     expect(await reopened.getWorkItem("wi_legacy")).toMatchObject({ requester: "U1", assignee: "U1" });
     reopened.close();
+  });
+
+  test("an existing migration ledger receives the audit search indexes", () => {
+    const path = tempDb("pre-audit-indexes.db");
+    const store = createStore(path);
+    const db = store.getDb();
+    db.exec(`
+      DROP INDEX idx_audit_event_ts;
+      DROP INDEX idx_audit_space_ts;
+      DROP INDEX idx_audit_actor_ts;
+      DELETE FROM schema_migrations WHERE id = '013_add_audit_search_indexes';
+    `);
+    store.close();
+
+    const upgraded = createStore(path);
+    const indexes = upgraded
+      .getDb()
+      .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_audit_%_ts' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    expect(indexes.map(({ name }) => name)).toEqual([
+      "idx_audit_actor_ts",
+      "idx_audit_event_ts",
+      "idx_audit_space_ts",
+    ]);
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("013_add_audit_search_indexes");
+    upgraded.close();
   });
 
   test("a failed migration rolls back its schema, data, and version row, then retries safely", () => {

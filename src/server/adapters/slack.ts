@@ -1,6 +1,7 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type FilesInfoResponse } from "@slack/web-api";
+import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type FilesInfoResponse, type ViewsPublishArguments } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
+import type { OperatorViewer, SlackHomeRender } from "../operator-home";
 import { z } from "zod";
 // Bun's undici shim lacks the `ping` export that @slack/socket-mode calls for
 // WebSocket keepalive (`undici_1.ping(this.websocket, ...)` via CJS require —
@@ -174,6 +175,8 @@ export interface SlackAdapter {
    * than once.
    */
   streamingSupported(): boolean;
+  /** Workspace-admin check used by cross-space read-only operator tools. */
+  isWorkspaceAdmin?(principal: string): Promise<boolean>;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -814,6 +817,63 @@ export function registerActionHandler(
   );
 }
 
+const appHomeOpenedEventSchema = z.object({
+  type: z.literal("app_home_opened"),
+  user: z.string().min(1),
+  tab: z.literal("home"),
+});
+
+export interface AppHomeHandlerDeps {
+  resolveViewer: (user: string) => Promise<OperatorViewer | null>;
+  render: (viewer: OperatorViewer) => Promise<SlackHomeRender>;
+  publish: (input: { user_id: string; view: SlackHomeRender["view"] }) => Promise<void>;
+  onPublished?: (viewer: OperatorViewer, revision: string) => Promise<void> | void;
+  log?: (line: string) => void;
+}
+
+/**
+ * Routes the real Slack `app_home_opened` event to one revision-aware
+ * `views.publish` call. Reads may repeat; an unchanged revision never posts
+ * or audits twice. Failures stay bounded and reveal no Slack/API error text.
+ */
+export function registerAppHomeHandler(app: Pick<App, "event">, deps: AppHomeHandlerDeps): void {
+  const revisionByUser = new Map<string, string>();
+  const activeByUser = new Map<string, Promise<void>>();
+  app.event("app_home_opened", async ({ event }) => {
+    const parsed = appHomeOpenedEventSchema.safeParse(event);
+    if (!parsed.success) return;
+    const user = parsed.data.user;
+    const active = activeByUser.get(user);
+    if (active !== undefined) {
+      await active;
+      return;
+    }
+    const refresh = (async () => {
+      try {
+        const resolved = await deps.resolveViewer(user);
+        const viewer = resolved ?? { id: user, isAdmin: false };
+        const rendered = await deps.render(viewer);
+        if (revisionByUser.get(user) === rendered.revision) return;
+        await deps.publish({ user_id: user, view: rendered.view });
+        revisionByUser.set(user, rendered.revision);
+        try {
+          await deps.onPublished?.(viewer, rendered.revision);
+        } catch {
+          (deps.log ?? console.error)("slack: operator Home read audit failed");
+        }
+      } catch {
+        (deps.log ?? console.error)("slack: operator Home publish failed");
+      }
+    })();
+    activeByUser.set(user, refresh);
+    try {
+      await refresh;
+    } finally {
+      activeByUser.delete(user);
+    }
+  });
+}
+
 /**
  * Socket-mode connection watchdog (issue #237).
  *
@@ -963,6 +1023,10 @@ export function createSlackAdapter(opts: {
   onMessage: (m: SlackMessage) => Promise<void>;
   /** Interactive-component handler (approval buttons, issue #44); optional so headless callers omit it. */
   onAction?: (a: SlackAction) => Promise<void>;
+  /** Admin-only App Home renderer; omitted by tests/headless callers that do not expose Home. */
+  onHomeOpened?: (viewer: OperatorViewer) => Promise<SlackHomeRender>;
+  /** Records a successfully published Home read without coupling the adapter to persistence. */
+  onHomePublished?: (viewer: OperatorViewer, revision: string) => Promise<void> | void;
   /**
    * WebClient options passthrough. Tests point the Web API at an emulator
    * (e.g. @emulators/slack) via `clientOptions.slackApiUrl`; production
@@ -1076,6 +1140,17 @@ export function createSlackAdapter(opts: {
    * the workspace's, so a later valid request can still open a panel.
    */
   let streamingCapable = true;
+  const resolveWorkspaceViewer = async (user: string): Promise<OperatorViewer | null> => {
+    const info = await app.client.users.info({ user });
+    if (!info.ok || info.user?.id !== user) return null;
+    return {
+      id: user,
+      isAdmin:
+        info.user.is_admin === true ||
+        info.user.is_owner === true ||
+        info.user.is_primary_owner === true,
+    };
+  };
 
   registerMessageHandler(app, opts.onMessage, {
     responseModeFor: opts.responseModeFor,
@@ -1083,6 +1158,20 @@ export function createSlackAdapter(opts: {
   });
   if (opts.onAction !== undefined) {
     registerActionHandler(app, opts.onAction);
+  }
+  if (opts.onHomeOpened !== undefined) {
+    registerAppHomeHandler(app, {
+      resolveViewer: resolveWorkspaceViewer,
+      render: opts.onHomeOpened,
+      publish: async (input) => {
+        // SAFETY: the Home renderer emits a `type: home` view with Block Kit
+        // JSON. Slack owns the full union; the adapter intentionally keeps
+        // that SDK type out of the canonical read model.
+        const view = input.view as ViewsPublishArguments["view"];
+        await app.client.views.publish({ user_id: input.user_id, view });
+      },
+      onPublished: opts.onHomePublished,
+    });
   }
 
   return {
@@ -1274,6 +1363,7 @@ export function createSlackAdapter(opts: {
       }
     },
     streamingSupported: () => (opts.streamingSupported !== undefined ? opts.streamingSupported() : streamingCapable),
+    isWorkspaceAdmin: async (principal) => (await resolveWorkspaceViewer(principal))?.isAdmin ?? false,
     start: async () => {
       // The bot's user id (issue #55) and team id (issue #168): auth.test
       // needs only the bot token and is always allowed. A failed lookup

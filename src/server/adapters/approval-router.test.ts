@@ -147,6 +147,35 @@ describe("SlackApprovalRouter request", () => {
     expect(rendered).toContain("ls");
   });
 
+  test("space-skill mutation approvals show hash-and-size diffs without document or file bodies", async () => {
+    const { adapter, posted } = fakeAdapter();
+    const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
+    const document = "---\nname: review\ndescription: Private.\n---\nNever put this procedure in Slack.\n";
+
+    void router.request({
+      ...REQUEST,
+      tool: "update_space_skill",
+      args: {
+        name: "review",
+        expected_revision: "a".repeat(64),
+        document,
+        companion_files: { "scripts/run.sh": { encoding: "text", content: "never put this script in Slack" } },
+      },
+    });
+    const rendered = actionBlocks(posted)
+      .filter((block) => block.type === "section")
+      .map((block) => block.text?.text ?? "")
+      .join("\n");
+    expect(rendered).not.toContain("Never put this procedure");
+    expect(rendered).not.toContain("never put this script");
+    expect(rendered).toContain("SKILL.md");
+    expect(rendered).toContain("Companion scripts/run.sh");
+    expect(rendered).toContain("replace");
+    expect(rendered).toContain("omitted old files are deleted");
+    expect(rendered).toContain("sha256");
+    expect(rendered).toContain("a".repeat(64));
+  });
+
   test("an oversized arg value is elided at the per-row cap with an ellipsis (issue #277)", async () => {
     const { adapter, posted } = fakeAdapter();
     const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });

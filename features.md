@@ -251,6 +251,37 @@ reactions and records reply and phrase latency.
   turn's older line — so the steer's author sees their own progress and
   any poller watching the steer's message sees the reply.
 
+## Operator Home and governance visibility (issues #161, #320)
+
+Slack workspace administrators can open the app's **Home** tab for a
+read-only operator summary. It shows setup health, running or blocked work,
+pending approvals, schedules, connection status, memory availability, and
+recent audit outcomes. Reopening Home refreshes changed data; an unchanged
+revision does not publish or audit a duplicate view. Non-admin users see no
+operator rows. Org connections are visible to administrators, while a
+personal connection appears only to its owner.
+
+Two read-tier tools use the same deterministic enforcement paths as runtime:
+
+- **`audit_search`** filters the current space's append-only audit by event,
+  actor, tool, extension, and time. Results are newest-first, cursor-paged,
+  and built from an allowlist of compact fields. Raw payloads, prompts,
+  message bodies, query strings, credential identities, and secrets never
+  enter the result. A foreign-space read requires Slack workspace-admin
+  authority; every successful search records one redacted `audit.read` row.
+- **`explain_policy`** reports the effective allow, deny, or ask-human
+  decision, rule source, tool tier, and approval requirement without running
+  the tool or creating an approval. Optional provider/scope input uses the
+  live credential ladder but reports only availability and selected
+  org/personal scope.
+
+The opt-in **`governance_digest`** scheduler action posts one deterministic
+weekly summary of human and automatic approvals, denials by safe reason code,
+approval timeouts, credential use by org/personal scope, and org-settings
+changes. It never uses a model or includes raw audit payloads. Enable it only
+in the destination space with
+`{\"proactive\":{\"governance\":true}}`.
+
 ## Policy & approvals (user-facing)
 
 Every agent action is policy-gated; here is what that looks like from the
@@ -737,6 +768,28 @@ as a workflow artifact.
 - Run locally on the runner:
   `BROWSER_PROFILE_DIR=… SLACK_WORKSPACE_URL=… bun run canary:browser`
   (the `canary:browser` script; `--journey` / `--role` focus a run).
+
+### Real Slack Operator Home verification checklist (#320)
+
+After importing the updated manifest and reinstalling the app:
+
+1. Open **Home** as a workspace administrator at desktop and narrow widths.
+   Capture the loading/current view and confirm every section remains legible.
+2. Reopen Home without changing data. Confirm the view does not flicker or
+   duplicate side effects. Change one schedule or work state, reopen, and
+   confirm exactly one refreshed view appears.
+3. Verify populated, empty, and unavailable setup, work, approvals,
+   schedules, connections, memory, and recent-outcomes sections. A malformed
+   seeded row must affect only its bounded section.
+4. Open Home as two administrators with different personal connections.
+   Each sees org connections plus only their own personal connection. Open as
+   a non-admin and confirm no protected row or space identifier appears.
+5. Invoke `explain_policy` for one allow, deny, and ask-human tool. Compare
+   the result with a real gated call. Confirm explanation creates no approval
+   card and exposes no credential identity, prompt, message, query, or secret.
+6. Save screenshots for desktop/narrow, empty/error, and two-viewer states.
+   Keep the matching `operator.home_read` / `policy.explained` row ids as
+   durable evidence; never copy raw payloads into the evidence.
 
 ### QA user + tokens
 

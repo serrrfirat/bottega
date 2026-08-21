@@ -14,6 +14,7 @@ export const KNOWN_ACTIONS = [
   "ingest_poll",
   "kb_ingest",
   "send_message",
+  "governance_digest",
 ] as const satisfies readonly SchedulerActionName[];
 
 /** Builds a name-to-handler registry and rejects ambiguous duplicate registrations. */

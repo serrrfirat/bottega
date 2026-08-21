@@ -222,6 +222,16 @@ export const MIGRATIONS: readonly Migration[] = [
       }
     },
   },
+  {
+    id: "013_add_audit_search_indexes",
+    up(db) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit(event_type, ts DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_space_ts ON audit(space_id, ts DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit(actor, ts DESC, id DESC);
+      `);
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {

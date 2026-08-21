@@ -188,6 +188,16 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     durableProof: "model.pin_applied + model switched audit rows scoped per session/space",
     fixtures: ["emulator:requester", "emulator:member"],
   },
+  {
+    id: "operator.read-surfaces",
+    layer: "hermetic",
+    actors: ["requester", "member"],
+    covers: ["audit_search", "explain_policy"],
+    visibleProof: "cursor-paged audit rows and allow/deny/ask explanations are viewer-scoped and redacted",
+    durableProof: "audit.read + policy.explained rows; no approval.requested row from explanation",
+    fixtures: ["sqlite:seeded-audit", "policy:deny-ask-allow", "slack:admin-authority-double"],
+  },
+
 
   // ====================== Layer: live-api ================================
   {
@@ -230,7 +240,21 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     id: "live.roles.simultaneous-dm-channel",
     layer: "live-api",
     actors: ["requester", "member"],
-    covers: ["list_todos", "settings", "catalog_browser", "stack_health", "deploy_info", "first_run_wizard", "write_space_skill", "session_search", "todo"],
+    covers: [
+      "list_todos",
+      "settings",
+      "catalog_browser",
+      "stack_health",
+      "deploy_info",
+      "first_run_wizard",
+      "list_space_skills",
+      "get_space_skill",
+      "create_space_skill",
+      "update_space_skill",
+      "delete_space_skill",
+      "session_search",
+      "todo",
+    ],
     visibleProof: "a DM turn and a channel turn both complete; replies stay in their own conversation",
     durableProof: "per-space transcripts + permalinks for both replies",
     fixtures: ["live:SLACK_QA_REQUESTER_TOKEN", "live:SLACK_QA_MEMBER_TOKEN"],

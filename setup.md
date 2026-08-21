@@ -85,14 +85,14 @@ schedules. Create a weekday standup at 09:00 UTC with the
 }
 ```
 
-Standups and reflections are per-space opt-ins. Set the space's
-`spaces.policy_json` value to include:
+Standups, reflections, and the governance digest are per-space opt-ins. Set
+the destination space's `spaces.policy_json` value to include:
 
 ```json
-{"proactive":{"standup":true,"reflection":true}}
+{"proactive":{"standup":true,"reflection":true,"governance":true}}
 ```
 
-Both flags default to `false`. A proactive action posts only when the
+All flags default to `false`. A proactive action posts only when the
 space's effective `response_mode` is `always`; mention and request-only
 spaces never receive unsolicited posts. On restart, the scheduler skips
 overdue occurrences instead of catching up, advances each job to its next
@@ -112,6 +112,20 @@ The `org_pulse` action is a weekly, read-only summary of recent digest and
 reflection memories. Create it with no job-level space and set
 `params` to `{"pulse_space":"slack:C123"}` so the summary posts to that
 Slack space.
+
+Create the deterministic weekly governance digest with:
+
+```json
+{
+  "action": "governance_digest",
+  "cron": "0 9 * * 1",
+  "params": {"space": "slack:C123"}
+}
+```
+
+It reports only aggregate approvals, denials, timeouts, credential scopes,
+and org-settings changes from the prior seven days. It never uses a model or
+posts raw audit payloads.
 
 Knowledge-base sources live in `config/kb.yml`. After adding a source, run
 the `kb_ingest` tool with `{"source":"source-id"}`, or omit `source` to
@@ -200,51 +214,57 @@ deployment. The shipped Attio, Linear, and GitHub extension hosts are already
 allowlisted. Add a host to the static allowlist when adding an extension;
 connected credentials never bypass the proxy or its judge.
 
-## Skills (per-space authored procedures, issues #234/#235)
+## Skills (per-space authored procedures, issues #234/#235/#314)
 
-Skills are durable, space-specific procedures the space agent can learn and
-reference mid-session with `skill://<name>`. The agent claims skills by
-name; the store is two-tier:
+Skills are durable procedures resolved through `skill://<name>`. Built-ins
+ship read-only at `skills/` (`BOTTEGA_BUILTIN_SKILLS_DIR` overrides).
+Per-space skills live at `data/skills/<spaceId>/<name>/`
+(`BOTTEGA_SKILLS_DIR` overrides) and shadow a same-named built-in.
 
-- **Built-ins** ship with the repo at `skills/` (override with
-  `BOTTEGA_BUILTIN_SKILLS_DIR`) and load once per boot. The shipped
-  `pr_review` built-in is injected into every git work-item session.
-- **Per-space skills** are authored at runtime into
-  `data/skills/<spaceId>/<name>/SKILL.md` (override the root with
-  `BOTTEGA_SKILLS_DIR`). A space skill with the same name as a built-in
-  shadows it for that space.
+Use the lifecycle tools instead of editing that directory:
 
-Writing a skill is a privileged mutation (`write_space_skill`, exec tier):
-it injects procedures into the space agent's *future* sessions, so an
-unconfigured or unauthorized write denies fail-closed. To auto-approve
-skill writes without the ask-human prompt, list the tool under `tools:`
-with action `allow` **and** under `approvals.always_approve`:
+- `list_space_skills` lists effective names, descriptions, source tiers,
+  revisions, companion names, and shadowing.
+- `get_space_skill` returns one effective `SKILL.md` and its companions.
+- `create_space_skill` creates a new space-tier skill. It never replaces.
+- `update_space_skill` requires `expected_revision` and atomically replaces
+  the document plus the complete `companion_files` map. Omitted old files
+  are removed.
+- `delete_space_skill` requires `expected_revision`, removes only the space
+  tier, and reveals a shadowed built-in if one exists.
+
+Create/update accept `name`, the complete `document` string, and
+`companion_files`. Each map value is
+`{encoding: "text", content: "..."}` or
+`{encoding: "base64", content: "..."}`. Paths use relative POSIX syntax
+`scripts/run.sh`; absolute, backslash, dot/hidden/traversal, reserved, and
+symlink paths are rejected. Limits are 64 KiB for `SKILL.md`, 256 KiB per
+companion, 32 companions, and 1 MiB total.
+
+A list/get is read-tier. Create/update/delete are exec-tier because they
+change code loaded by future sessions. To auto-approve all mutations:
 
 ```yaml
 tools:
-  write_space_skill: allow
+  create_space_skill: allow
+  update_space_skill: allow
+  delete_space_skill: allow
 approvals:
   always_approve:
-    - write_space_skill
+    - create_space_skill
+    - update_space_skill
+    - delete_space_skill
 ```
 
-`always_approve` only skips the prompt for tools whose action is already
-`allow` — an unlisted tool (or a `deny`) still fails closed, and an unknown
-name in `always_approve` fails the policy closed. The dev floor in
-`config.yml` (`tools: unknown: allow`) already gives the tool action
-`allow`, so adding the `approvals` entry is all that is needed to
-auto-approve locally. Verify with the loader, not by eye:
+An allow entry without `always_approve` still asks a human. An unlisted or
+denied mutation fails before filesystem access. Approval cards and audit
+rows show file names, sizes, revisions, and SHA-256 hashes, never skill or
+companion bodies.
 
-```bash
-bun -e 'import {loadOrgConfig,decidePolicyCall} from "./src/policy/config.ts"; const p=loadOrgConfig(); console.log(decidePolicyCall(p,"write_space_skill"))'
-```
-
-With the dev floor but no `approvals` entry this prints
-`{decision:"ask-human",reason:"exec-tier tool requires human approval",autoApproved:false}`;
-after adding `write_space_skill` to `approvals.always_approve` it prints
-`{decision:"allow",reason:"auto-approved by policy (approvals.always_approve)",autoApproved:true}`.
-A deployment that removes `config.yml` (back to deny-all) prints
-`{decision:"deny",reason:"policy denies the tool",autoApproved:false}`.
+Successful mutations invalidate the space loader cache. They do not change
+the immutable skill snapshot of a running session. Start a new space or
+work-item session to activate the new version. After delete, that next cold
+session resolves the lower built-in version.
 
 ## Deployment
 
