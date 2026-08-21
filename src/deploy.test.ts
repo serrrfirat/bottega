@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { service, serviceEnv, services } from "./compose-test-utils";
+import { service, serviceEnv } from "./compose-test-utils";
 import { parseYamlSubset } from "./yaml-subset";
 import type { YamlNode } from "./yaml-subset";
 
