@@ -1565,6 +1565,18 @@ describe("credential hygiene", () => {
   });
 });
 
+describe("per-job isolation guard (issues #101/#335)", () => {
+  test("prepareExecutor refuses to boot without a sandbox runner", async () => {
+    const fx = makeFixture();
+    try {
+      const { sandboxRunner: _omitted, ...deps } = makeDeps(fx);
+      await expect(prepareExecutor(deps)).rejects.toThrow(/refuses to start without per-job isolation/);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
 describe("delivery approval round trip (issue #149)", () => {
   /** Server-side fakes: the poller's message surface + the resolver's rewrite surface. */
   function serverFakes() {
