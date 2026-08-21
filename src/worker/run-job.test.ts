@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runExecutor, type ExecutorDeps } from "../executor";
+import { runExecutor, type ExecutorConfig, type ExecutorDeps } from "../executor";
 import { jobEgressDomains, hostFromBaseUrl, BASE_EGRESS_DOMAINS } from "../egress/generate";
 import type { IngestEvent, Poller } from "../ingest/types";
 import { createAudit } from "../policy/audit";
@@ -14,6 +14,18 @@ import type { OutboxRow } from "../store/outbox";
 import { resolveKindCaps } from "./caps";
 import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } from "./scoped-store";
 import type { WorkerJob } from "./envelope";
+import type { SchedulerAction, SchedulerActionName, SchedulerActionRegistry } from "../scheduler/types";
+import {
+  runJobInSandbox,
+  runJobSandboxBody,
+  runScheduledJobBody,
+  unstickWorkItem,
+  SANDBOX_EXIT_COMPLETED,
+  SANDBOX_EXIT_FAILED,
+  SANDBOX_EXIT_REQUEUE,
+  type SandboxRunner,
+} from "./run-job";
+import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
 
 const stores: Store[] = [];
 const dirs: string[] = [];
@@ -255,3 +267,457 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): P
     await Bun.sleep(25);
   }
 }
+
+// --- issue #302: boss-loop supervisor (runJobInSandbox) and the sandbox's
+// own fail-closed legs, at the module boundary with a real temp store. ---
+
+/** Minimal deps: only the store matters to the supervisor + fail-closed legs under test. */
+function minDeps(store: Store): ExecutorDeps {
+  return { store, memoryProvider: undefined as never, driver: undefined as never };
+}
+
+/** A job-claim loop config: only jobLeaseMs is consulted by runJobInSandbox. */
+function supervisorCfg(): ExecutorConfig {
+  return { jobLeaseMs: 60_000 } as ExecutorConfig;
+}
+
+/** Creates a git work item, claims its job row (→ running), and moves the item to working — the mid-flight state the supervisor recoveries assume. */
+async function claimedRunningJob(store: Store): Promise<{ job: WorkerJob; itemId: string }> {
+  const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_CLAIM" });
+  const item = await store.createWorkItem({
+    space_id: space.id,
+    requester: "U1",
+    description: "mid-flight",
+    delivery: "git",
+    repo: "acme/sandbox",
+  });
+  const job = await store.claimNextJob(60_000);
+  if (!job) throw new Error("expected a claimable job");
+  await store.claimWorkItemById(item.id); // open -> claimed
+  await store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
+  return { job, itemId: item.id };
+}
+
+/** Reads the job.failed audit rows as parsed payloads (the durable evidence). */
+async function failedAuditPayloads(store: Store): Promise<Array<Record<string, unknown>>> {
+  const rows = await store.listAudit({ event_type: JOB_FAILED_EVENT });
+  return rows.map((row) => JSON.parse(row.payload));
+}
+
+describe("boss-loop supervisor exit-code contract (issue #302)", () => {
+  test("a TIMEOUT tears the run down: job failed loudly, item unstuck, audit names the timeout", async () => {
+    const store = freshStore();
+    const { job, itemId } = await claimedRunningJob(store);
+    const timeoutRunner: SandboxRunner = async () => ({ exitCode: null, signal: null, timedOut: true });
+
+    const outcome = await runJobInSandbox(minDeps(store), supervisorCfg(), job, timeoutRunner);
+
+    // The supervisor maps a timed-out run to a loud failure the sandbox did
+    // not write itself — selfReported so the outer loop never doubles it.
+    expect(outcome).toEqual({ state: "blocked", result: null, selfReported: true });
+
+    // Durable evidence: the job landed failed, not silently dropped.
+    expect(await jobStatus(store, job.id)).toBe("failed");
+
+    // The audit names the timeout explicitly and flags the crash — the
+    // operator can tell a timed-out run from a crashed one (issue #149).
+    expect((await failedAuditPayloads(store))[0]).toMatchObject({
+      id: job.id,
+      kind: "git",
+      error: "sandbox timeout",
+      sandbox_crash: true,
+    });
+
+    // The work item never hangs at working: it is unstuck to blocked.
+    expect((await store.getWorkItem(itemId))?.state).toBe("blocked");
+  });
+
+  test("a signal-killed run fails loudly with the signal named and the item unstuck", async () => {
+    const store = freshStore();
+    const { job, itemId } = await claimedRunningJob(store);
+    const killedRunner: SandboxRunner = async () => ({ exitCode: null, signal: "SIGKILL", timedOut: false });
+
+    const outcome = await runJobInSandbox(minDeps(store), supervisorCfg(), job, killedRunner);
+
+    expect(outcome.state).toBe("blocked");
+    expect(await jobStatus(store, job.id)).toBe("failed");
+    expect((await failedAuditPayloads(store))[0]).toMatchObject({
+      id: job.id,
+      error: "sandbox crashed (exit signal SIGKILL)",
+      sandbox_crash: true,
+    });
+    expect((await store.getWorkItem(itemId))?.state).toBe("blocked");
+  });
+
+  test("exit 0 and exit 2 map to selfReported done/blocked with NO parent write (the sandbox owns its lifecycle)", async () => {
+    // exit 0 → completed; exit 2 → self-failed. In both cases the supervisor
+    // must NOT write a second completion/failure — selfReported keeps the
+    // outer loop from duplicating the outbox row + audit (issue #101).
+    const doneStore = freshStore();
+    await doneStore.enqueueJob({ id: "job_done", kind: "git", payload: { workItemId: "wi_done" }, spaceId: "s" });
+    const doneJob = await doneStore.claimNextJob(60_000);
+    const out0 = await runJobInSandbox(
+      minDeps(doneStore),
+      supervisorCfg(),
+      doneJob!,
+      async () => ({ exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false }),
+    );
+    expect(out0).toEqual({ state: "done", result: null, selfReported: true });
+    // The supervisor wrote nothing itself: job row untouched, no audit.
+    expect((await doneStore.getJob(doneJob!.id))?.status).toBe("running");
+    expect(await doneStore.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+    expect(await doneStore.listAudit({ event_type: JOB_FAILED_EVENT })).toHaveLength(0);
+
+    const failedStore = freshStore();
+    await failedStore.enqueueJob({ id: "job_selffailed", kind: "git", payload: { workItemId: "wi_self" }, spaceId: "s" });
+    const failedJob = await failedStore.claimNextJob(60_000);
+    const out2 = await runJobInSandbox(
+      minDeps(failedStore),
+      supervisorCfg(),
+      failedJob!,
+      async () => ({ exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false }),
+    );
+    expect(out2).toEqual({ state: "blocked", result: null, selfReported: true });
+    expect(await failedStore.listAudit({ event_type: JOB_FAILED_EVENT })).toHaveLength(0);
+  });
+
+  test("exit 3 (lease-reclaim race) surfaces as a requeue, never a completion — concurrent-claim safety", async () => {
+    const store = freshStore();
+    const { job } = await claimedRunningJob(store);
+    const requeueRunner: SandboxRunner = async () => ({ exitCode: SANDBOX_EXIT_REQUEUE, signal: null, timedOut: false });
+
+    // The supervisor rejects the run so the claim loop requeues with backoff
+    // — the item must never be double-executed and never complete here.
+    await expect(runJobInSandbox(minDeps(store), supervisorCfg(), job, requeueRunner)).rejects.toThrow(
+      /sandbox requested requeue/,
+    );
+    // No completion signal, no failed audit: the run is purely deferred.
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+    expect(await store.listAudit({ event_type: JOB_FAILED_EVENT })).toHaveLength(0);
+  });
+});
+
+describe("runJobSandboxBody fail-closed legs (issue #302)", () => {
+  test("a malformed git envelope fails closed before any work — no claim, no release", async () => {
+    const store = freshStore();
+    const job: WorkerJob = {
+      id: "job_malformed",
+      kind: "git",
+      payload: { notAnId: 42 },
+      attempts: 0,
+      leaseUntil: 0,
+      status: "queued",
+    };
+    await expect(runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job)).rejects.toThrow(
+      /payload must be \{ workItemId \}/,
+    );
+    // Fail-closed: nothing was claimed, completed, or released.
+    expect(await jobStatus(store, job.id)).toBeNull();
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+  });
+
+  test("a work item already settled elsewhere completes as a no-op with its OWN outbox row (never double-runs)", async () => {
+    const store = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_SETTLED" });
+    const item = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "already done",
+      delivery: "git",
+      repo: "acme/sandbox",
+    });
+    // Settle the item to blocked OUTSIDE the sandbox (another worker failed it).
+    await store.claimWorkItemById(item.id);
+    await store.transitionWorkItem(item.id, "claimed", "working", { by: "executor:other" });
+    await store.transitionWorkItem(item.id, "working", "blocked", { by: "executor:other", evidence: "failed elsewhere" });
+
+    const job: WorkerJob = {
+      id: "job_late",
+      kind: "git",
+      payload: { workItemId: item.id },
+      attempts: 0,
+      leaseUntil: 0,
+      status: "queued",
+    };
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+
+    // The late sandbox observes the settlement and completes as a no-op so
+    // the server still sees the completion via its own outbox row.
+    expect(result).toEqual({ exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false });
+    expect((await store.getWorkItem(item.id))?.state).toBe("blocked");
+    const { rows } = consumeOutboxWatermarked(store);
+    const completion = rows.find((r) => r.id === job.id && r.kind === "git");
+    expect(completion).toBeTruthy();
+    expect(JSON.parse(completion!.payload)).toMatchObject({ state: "blocked", result: null });
+    // The settled item is never re-executed: no session ever ran it.
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(1);
+  });
+
+  test("a lease-reclaim race (item mid-flight under a live owner) requeues instead of running twice", async () => {
+    const store = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_RACE" });
+    const item = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "claimed elsewhere",
+      delivery: "git",
+      repo: "acme/sandbox",
+    });
+    // A live owner holds the item mid-flight (claimed/working under another
+    // worker) — the sandbox must NOT double-execute it.
+    await store.claimWorkItemById(item.id, "executor:other");
+    await store.transitionWorkItem(item.id, "claimed", "working", { by: "executor:other" });
+
+    const job: WorkerJob = {
+      id: "job_race",
+      kind: "git",
+      payload: { workItemId: item.id },
+      attempts: 0,
+      leaseUntil: 0,
+      status: "queued",
+    };
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+
+    expect(result).toEqual({ exitCode: SANDBOX_EXIT_REQUEUE, signal: null, timedOut: false });
+    expect((await store.getWorkItem(item.id))?.state).toBe("working");
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+    expect(consumeOutboxWatermarked(store).rows).toHaveLength(0);
+  });
+
+  test("a missing work item fails the job loudly through failSelf (blocked item, failed job)", async () => {
+    const store = freshStore();
+    await store.enqueueJob({ id: "job_missing", kind: "git", payload: { workItemId: "item_does_not_exist" }, spaceId: "s" });
+    const job: WorkerJob = {
+      id: "job_missing",
+      kind: "git",
+      payload: { workItemId: "item_does_not_exist" },
+      attempts: 0,
+      leaseUntil: 0,
+      status: "queued",
+    };
+    const result = await runJobSandboxBody(minDeps(store), supervisorCfg(), {} as never, job);
+
+    expect(result).toEqual({ exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false });
+    expect(await jobStatus(store, job.id)).toBe("failed");
+    // The audit names the missing item — durable evidence, never a silent drop.
+    expect((await failedAuditPayloads(store))[0]).toMatchObject({ id: job.id, error: expect.stringContaining("not found") });
+    // No completion signal: the job failed, nothing completed.
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+  });
+});
+
+describe("unstickWorkItem (issue #302)", () => {
+  test("a claimed item is unstuck via claimed->working->blocked; a working item goes straight to blocked", async () => {
+    const store = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_UNSTICK" });
+    const claimedItem = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "stuck claimed",
+      delivery: "git",
+      repo: "acme/sandbox",
+    });
+    await store.claimWorkItemById(claimedItem.id);
+
+    await unstickWorkItem(store, claimedItem.id, "sandbox timeout");
+    expect((await store.getWorkItem(claimedItem.id))?.state).toBe("blocked");
+
+    const workingItem = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "stuck working",
+      delivery: "git",
+      repo: "acme/sandbox",
+    });
+    await store.claimWorkItemById(workingItem.id);
+    await store.transitionWorkItem(workingItem.id, "claimed", "working", { by: "executor" });
+    await unstickWorkItem(store, workingItem.id, "sandbox crashed (exit 1)");
+    expect((await store.getWorkItem(workingItem.id))?.state).toBe("blocked");
+  });
+
+  test("already-terminal items and missing items are left untouched (unstick is a no-op)", async () => {
+    const store = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_NOOP" });
+    const doneItem = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "already blocked",
+      delivery: "git",
+      repo: "acme/sandbox",
+    });
+    await store.claimWorkItemById(doneItem.id);
+    await store.transitionWorkItem(doneItem.id, "claimed", "working", { by: "executor" });
+    // Working -> blocked is the executor's failure landing; terminal items
+    // must be left untouched by unstick.
+    await store.transitionWorkItem(doneItem.id, "working", "blocked", { by: "executor", evidence: "done before" });
+    await unstickWorkItem(store, doneItem.id, "timeout");
+    expect((await store.getWorkItem(doneItem.id))?.state).toBe("blocked");
+
+    // A missing item must not throw — the job already failed loudly and the
+    // unstick guard is best-effort.
+    await expect(unstickWorkItem(store, "missing_item", "timeout")).resolves.toBeUndefined();
+  });
+});
+
+describe("runScheduledJobBody (issue #302)", () => {
+  function actionDeps(store: Store, actions: SchedulerActionRegistry): ExecutorDeps {
+    return { ...minDeps(store), scheduledActions: actions } as ExecutorDeps;
+  }
+
+  function scheduledJob(action: string, params: Record<string, string> | undefined = undefined): WorkerJob {
+    return {
+      id: "job_sched",
+      kind: "scheduled",
+      payload: params === undefined ? { action } : { action, params },
+      attempts: 0,
+      leaseUntil: 0,
+      status: "queued",
+    };
+  }
+
+  test("a successful scheduled action completes through the sandbox: job.completed audit + own outbox row", async () => {
+    const store = freshStore();
+    const ran: string[] = [];
+    const action: SchedulerAction = {
+      name: "memory_consolidation",
+      run: async (_params, ctx) => {
+        ran.push("run");
+        await ctx.store.appendAudit({ actor: "sched", event_type: "scheduler.fire", payload: "fired" });
+        return { consolidated: 3 };
+      },
+    };
+    const registry = new Map<SchedulerActionName, SchedulerAction>();
+    registry.set(action.name, action);
+
+    const result = await runScheduledJobBody(
+      actionDeps(store, registry),
+      supervisorCfg(),
+      {} as never,
+      scheduledJob("memory_consolidation", { spaceId: "s" }),
+    );
+
+    expect(result).toEqual({ exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false });
+    expect(ran).toEqual(["run"]);
+    const completed = await store.listAudit({ event_type: JOB_COMPLETED_EVENT });
+    expect(JSON.parse(completed[0].payload)).toMatchObject({ id: "job_sched", kind: "scheduled", state: "completed", result: { consolidated: 3 } });
+    const { rows } = consumeOutboxWatermarked(store);
+    const completion = rows.find((r) => r.id === "job_sched" && r.kind === "scheduled");
+    expect(JSON.parse(completion!.payload)).toMatchObject({ state: "completed", result: { consolidated: 3 } });
+  });
+
+  test("an unknown action fails LOUDLY naming it — never a silent no-op (issue #272)", async () => {
+    const store = freshStore();
+    const registry: SchedulerActionRegistry = new Map();
+    // The unknown-action check sits BEFORE the body's try/catch: it throws
+    // clean out of the sandbox body so the supervisor crashes the job loudly
+    // (job.failed via the boss loop) — never a silent no-op, never a fake
+    // completion.
+    await expect(
+      runScheduledJobBody(actionDeps(store, registry), supervisorCfg(), {} as never, scheduledJob("standup_digest")),
+    ).rejects.toThrow(/unknown action "standup_digest"/);
+    // Fail-closed: no completion signal, nothing ran.
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+    expect(consumeOutboxWatermarked(store).rows).toHaveLength(0);
+  });
+
+  test("a scheduled action that posts to Slack or loads a policy fails the job loudly (no tokens, no policy context)", async () => {
+    const store = freshStore();
+    const action: SchedulerAction = {
+      name: "memory_consolidation",
+      run: async (_params, ctx) => {
+        // The ctx seams are hard guards: the worker holds no Slack tokens
+        // and no policy context, so these THROW — the action cannot silently
+        // reach the outside world.
+        ctx.postMessage("C1", "hi");
+        return null;
+      },
+    };
+    const registry = new Map<SchedulerActionName, SchedulerAction>();
+    registry.set(action.name, action);
+    const result = await runScheduledJobBody(
+      actionDeps(store, registry),
+      supervisorCfg(),
+      {} as never,
+      scheduledJob("memory_consolidation"),
+    );
+    expect(result.exitCode).toBe(SANDBOX_EXIT_FAILED);
+    expect((await failedAuditPayloads(store))[0]).toMatchObject({
+      id: "job_sched",
+      kind: "scheduled",
+      error: expect.stringContaining("no tokens"),
+    });
+    // The loadPolicy seam is equally locked down.
+    const policyAction: SchedulerAction = {
+      name: "memory_consolidation",
+      run: async (_params, ctx) => {
+        // loadPolicy is an async seam → must be awaited for the guard to
+        // propagate; an un-awaited rejection would silently complete.
+        await ctx.loadPolicy("space_x");
+        return null;
+      },
+    };
+    const policyRegistry = new Map<SchedulerActionName, SchedulerAction>();
+    policyRegistry.set(policyAction.name, policyAction);
+    const policyStore = freshStore();
+    const policyResult = await runScheduledJobBody(
+      actionDeps(policyStore, policyRegistry),
+      supervisorCfg(),
+      {} as never,
+      scheduledJob("memory_consolidation"),
+    );
+    expect(policyResult.exitCode).toBe(SANDBOX_EXIT_FAILED);
+    expect((await failedAuditPayloads(policyStore))[0]).toMatchObject({
+      error: expect.stringContaining("no policy context"),
+    });
+  });
+});
+
+describe("issue #302: malformed git envelope fails closed through the real claim loop, with audit evidence", () => {
+  test("a git job with a malformed payload lands failed via job.failed naming the envelope requirement", async () => {
+    const store = freshStore();
+    const dir = mkdtempSync(join(tmpdir(), "bottega-malformed-"));
+    dirs.push(dir);
+    mkdirSync(join(dir, "config"), { recursive: true });
+    mkdirSync(join(dir, "transcripts"), { recursive: true });
+    Bun.write(join(dir, "config", "org.yml"), 'git_base_url: "https://github.com"\nrepos:\n  - "acme/sandbox"\n');
+    const patFile = join(dir, "secrets", "github-pat");
+    mkdirSync(dirname(patFile), { recursive: true });
+    writeFileSync(patFile, "ghp_local_test_pat", { mode: 0o600 });
+
+    await store.enqueueJob({ id: "j_malformed", kind: "git", payload: { notAnId: 42 }, spaceId: "s" });
+
+    const deps: ExecutorDeps = {
+      store,
+      memoryProvider: undefined as never,
+      driver: undefined as never,
+      orgConfigDir: join(dir, "config"),
+      transcriptDir: join(dir, "transcripts"),
+      pollIntervalMs: 10,
+      maxJobAttempts: 1,
+      jobBackoffMs: 5,
+      jobBackoffMaxMs: 10,
+    };
+    const prevTokenEnv = process.env.EXECUTOR_GIT_TOKEN_FILE;
+    process.env.EXECUTOR_GIT_TOKEN_FILE = patFile;
+    const ac = new AbortController();
+    const run = runExecutor(deps, ac.signal);
+    try {
+      await waitFor(() => jobStatus(store, "j_malformed").then((s) => s === "failed"));
+    } finally {
+      if (prevTokenEnv === undefined) delete process.env.EXECUTOR_GIT_TOKEN_FILE;
+      else process.env.EXECUTOR_GIT_TOKEN_FILE = prevTokenEnv;
+      ac.abort();
+      await run.catch(() => {});
+    }
+
+    // Fail-closed: the job failed with the envelope requirement named, and
+    // nothing completed or released (no double-execute, no false success).
+    expect((await failedAuditPayloads(store))[0]).toMatchObject({
+      id: "j_malformed",
+      kind: "git",
+      error: expect.stringContaining("payload must be { workItemId }"),
+    });
+    expect(await store.listAudit({ event_type: JOB_COMPLETED_EVENT })).toHaveLength(0);
+    expect(consumeOutboxWatermarked(store).rows).toHaveLength(0);
+  });
+});
