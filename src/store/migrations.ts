@@ -179,6 +179,49 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    id: "012_add_connection_lifecycle",
+    up(db) {
+      const connectionColumns = columnNames(db, "extension_credentials");
+      if (!connectionColumns.includes("vault_provider")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN vault_provider TEXT NOT NULL DEFAULT ''");
+        db.exec("UPDATE extension_credentials SET vault_provider = provider WHERE vault_provider = ''");
+      }
+      if (!connectionColumns.includes("pending_vault_provider")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN pending_vault_provider TEXT");
+      }
+      if (!connectionColumns.includes("pending_broker_credential_id")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN pending_broker_credential_id INTEGER");
+      }
+      if (!connectionColumns.includes("pending_identity_key")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN pending_identity_key TEXT");
+      }
+      if (!connectionColumns.includes("retiring_broker_credential_id")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN retiring_broker_credential_id INTEGER");
+      }
+      if (!connectionColumns.includes("status")) {
+        db.exec(
+          "ALTER TABLE extension_credentials ADD COLUMN status TEXT NOT NULL DEFAULT 'active' " +
+            "CHECK (status IN ('active','replacing','replace_cleanup_pending','disconnecting_boundary','disconnecting_authority','disconnected'))",
+        );
+      }
+      if (!connectionColumns.includes("revision")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+      }
+      if (!connectionColumns.includes("updated_at")) {
+        db.exec("ALTER TABLE extension_credentials ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0");
+        db.exec("UPDATE extension_credentials SET updated_at = created_at WHERE updated_at = 0");
+      }
+
+      const uploadTokenColumns = columnNames(db, "upload_tokens");
+      if (!uploadTokenColumns.includes("connection_id")) {
+        db.exec("ALTER TABLE upload_tokens ADD COLUMN connection_id TEXT");
+      }
+      if (!uploadTokenColumns.includes("expected_revision")) {
+        db.exec("ALTER TABLE upload_tokens ADD COLUMN expected_revision INTEGER");
+      }
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {

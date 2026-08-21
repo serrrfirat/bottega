@@ -44,6 +44,12 @@ import { bootSecretForProvider } from "../server/boot-secrets";
 import { callbackPort } from "./oauth-callback";
 import { resolveMcpOAuthRegistrationCapability } from "./mcp-oauth";
 import {
+  createConnectionAuthority,
+  replaceConnection,
+  type ConnectionLifecycleDeps,
+} from "./lifecycle";
+import type { ConnectionBoundary } from "./boundary";
+import {
   createStaticOAuthClientStore,
   provisionStaticOAuthClient,
   type StaticOAuthClientStore,
@@ -221,6 +227,8 @@ export class UploadLinkStore {
     actor: string;
     spaceId?: string | null;
     label: string;
+    connectionId?: string;
+    expectedRevision?: number;
     ttlMs?: number;
     /** Absolute ms override — tests pin expiry without waiting. */
     expiresAt?: number;
@@ -238,6 +246,8 @@ export class UploadLinkStore {
       actor: input.actor,
       spaceId: input.spaceId,
       label: input.label,
+      connectionId: input.connectionId,
+      expectedRevision: input.expectedRevision,
       expiresAt,
     });
     return { ok: true, token: row.token, expiresAt: row.expires_at };
@@ -319,7 +329,14 @@ function isHostedOAuthMcp(manifest: ExtensionManifest): boolean {
  * closed, exactly like every other non-org provisioning posture.
  */
 export async function mintUploadLink(
-  input: { extension: string; scope: ConnectScope; actor: string; spaceId?: string },
+  input: {
+    extension: string;
+    scope: ConnectScope;
+    actor: string;
+    spaceId?: string;
+    connectionId?: string;
+    expectedRevision?: number;
+  },
   deps: MintUploadLinkDeps,
 ): Promise<MintUploadLinkOutcome> {
   const resolved = deps.registry.resolve(input.extension);
@@ -393,6 +410,8 @@ export async function mintUploadLink(
     actor: input.actor,
     spaceId: input.spaceId,
     label,
+    connectionId: input.connectionId,
+    expectedRevision: input.expectedRevision,
     ttlMs: deps.ttlMs,
   });
   if (!minted.ok) return { ok: false, message: minted.reason };
@@ -441,10 +460,16 @@ export function uploadLinkReplyText(outcome: { url: string; warning?: string; mo
 export const UPLOAD_LINK_RELAY_GUIDANCE =
   "The returned link is final: relay it to the user exactly as returned — never reconstruct, reformat, or substitute it.";
 
-const MINT_UPLOAD_LINK_PARAMS_SCHEMA = z.object({
-  extension: z.string().describe("Extension id from the registry (e.g. the provider id)"),
-  scope: z.enum(["org", "personal"]).describe("org = shared org account; personal = your own account"),
-});
+const MINT_UPLOAD_LINK_PARAMS_SCHEMA = z
+  .object({
+    extension: z.string().describe("Extension id from the registry (e.g. the provider id)"),
+    scope: z.enum(["org", "personal"]).describe("org = shared org account; personal = your own account"),
+    connection_id: z.string().min(1).optional().describe("Stable replace target from list_connections"),
+    expected_revision: z.number().int().positive().optional().describe("Replace target revision"),
+  })
+  .refine((value) => (value.connection_id === undefined) === (value.expected_revision === undefined), {
+    message: "connection_id and expected_revision must be supplied together",
+  });
 
 export interface MintUploadLinkToolDeps extends MintUploadLinkDeps {
   /** The principal who requested the link (space-service seam). */
@@ -485,7 +510,14 @@ export function mintUploadLinkToolDefinition(deps: MintUploadLinkToolDeps): Tool
       const spaceId = spaceIdFromFile(ctx.sessionManager.getSessionFile());
       const actor = deps.getPrincipal?.() ?? deps.defaultActor ?? "agent";
       const outcome = await mintUploadLink(
-        { extension: params.extension, scope: params.scope, actor, spaceId },
+        {
+          extension: params.extension,
+          scope: params.scope,
+          actor,
+          spaceId,
+          connectionId: params.connection_id,
+          expectedRevision: params.expected_revision,
+        },
         deps,
       );
       if (!outcome.ok) return toolError(outcome.message);
@@ -552,21 +584,30 @@ export interface UploadLinkServerHandle {
 /** The connect deps the endpoint needs, with a store that can mint/consume
  * tokens AND record the resulting credential (the full {@link Store} satisfies it). */
 export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
-  // `listRuntimeExtensions` (issue #250): the connect-time egress reconcile
-  // default derives the runtime half of the egress superset from the store.
-  store: UploadLinkStoreSlice & Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
+  // The browser POST shares the full credential lifecycle store. A
+  // replacement token resumes through the same durable state machine.
+  store: UploadLinkStoreSlice &
+    Pick<
+      Store,
+      | "upsertExtensionCredential"
+      | "listExtensionCredentials"
+      | "listRuntimeExtensions"
+      | "listExtensionConnections"
+      | "getExtensionConnection"
+      | "beginExtensionConnectionReplacement"
+      | "commitExtensionConnectionReplacement"
+      | "rollbackExtensionConnectionReplacement"
+      | "beginExtensionConnectionDisconnect"
+      | "transitionExtensionConnection"
+    >;
+  connectionBoundary?: ConnectionBoundary;
   /**
    * The static-client vault seam (issue #288): the POST of an org-scoped
-   * hosted-OAuth link stores the pre-registered client here — an opaque
-   * api_key row under the extension's synthetic provider key. Defaults to
-   * the production store (broker-or-local, exactly like the api_key path).
+   * hosted-OAuth link stores the pre-registered client here.
    */
   staticOAuthClientStore?: StaticOAuthClientStore;
 };
-
-/** The upload-link surface's route handler + store, without a listener —
- * so the boot can mount it onto the SHARED inbound surface (the OAuth
- * callback server), keeping ONE stable port for every browser leg. */
+/** The route handler and token store mounted on the shared callback server. */
 export interface UploadLinkMount {
   store: UploadLinkStore;
   fetch(req: Request): Response | Promise<Response>;
@@ -705,21 +746,35 @@ async function handleUpload(
           },
           deps,
         )
-      : await connectExtension(
-          {
-            extension: consumed.row.extension,
-            scope: consumed.row.scope,
-            actor: consumed.row.actor,
-            spaceId: consumed.row.space_id ?? undefined,
-            apiKey: secret,
-            // Issue #222: this is the one-time-upload seam — the secret
-            // came from the user's browser (never chat), and the consumed
-            // token IS the authorization. The connect paste guard stays
-            // on for every chat/MCP/intent caller; only this POST opts out.
-            fromUpload: true,
-          },
-          deps,
-        );
+      : consumed.row.connection_id !== null && consumed.row.expected_revision !== null
+        ? await replaceConnection(
+            {
+              connectionId: consumed.row.connection_id,
+              expectedRevision: consumed.row.expected_revision,
+              actor: consumed.row.actor,
+              spaceId: consumed.row.space_id ?? undefined,
+              replacementApiKey: secret,
+            },
+            {
+              registry: deps.registry,
+              store: deps.store,
+              audit: deps.audit,
+              gate: deps.gate,
+              authority: createConnectionAuthority(deps.broker),
+              boundary: deps.connectionBoundary,
+            } satisfies ConnectionLifecycleDeps,
+          )
+        : await connectExtension(
+            {
+              extension: consumed.row.extension,
+              scope: consumed.row.scope,
+              actor: consumed.row.actor,
+              spaceId: consumed.row.space_id ?? undefined,
+              apiKey: secret,
+              fromUpload: true,
+            },
+            deps,
+          );
     if (!outcome.ok) return new Response(outcome.message, { status: 400 });
   } catch (err) {
     return new Response(`saving the secret failed: ${errorMessage(err)}`, { status: 500 });

@@ -50,11 +50,19 @@ const closedTransport = (_binding: McpBinding): Transport => {
 const credential: ExtensionCredential = {
   id: "c1",
   provider: "github",
+  vault_provider: "github",
   identity_key: "ik",
   owner: null,
   scope: "org",
   broker_credential_id: 1,
+  pending_vault_provider: null,
+  pending_broker_credential_id: null,
+  pending_identity_key: null,
+  retiring_broker_credential_id: null,
+  status: "active",
+  revision: 1,
   created_at: 1_700_000_000_000,
+  updated_at: 1_700_000_000_000,
 };
 
 /** The broker resolver's fail-closed error (OMP_AUTH_BROKER_URL/TOKEN unset). */

@@ -416,6 +416,14 @@ clients.
   `connect_extension` plus the effective extension surface to any MCP
   client or future agent. Calls execute server-side through the same policy
   gate, credential ladder, egress boundary, and audit (#61/#172).
+- **Connection lifecycle controls** (#318) — `list_connections` and
+  `inspect_connection` return caller-visible, redacted metadata for stable
+  connection IDs. `replace_connection` uses an expected revision and stages
+  the new authority before switching. `disconnect_connection` denies runtime
+  use first, then durably resumes boundary and vault cleanup after failures.
+  Personal rows are owner-isolated. Organization changes use the existing
+  policy and human-approval gate. API-key replacement secrets use a
+  connection-bound one-time upload link; they never enter tool output.
 - **Curated CLI set** (issues #58, #62, #63) — `kind: "cli"` extensions run
   curated, preinstalled CLIs from the tools image (zero client code, no
   SDK): GitHub/ops `gh`, `jq`, `curl`, `git`, `glab`, `yq` (v4),

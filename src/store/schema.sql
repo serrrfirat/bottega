@@ -58,15 +58,31 @@ CREATE INDEX IF NOT EXISTS idx_work_items_queue ON work_items(space_id, state);
 -- broker_credential_id is the broker snapshot entry id ({provider, identityKey}
 -- identify the row; the id is the opaque row key).
 CREATE TABLE IF NOT EXISTS extension_credentials (
-  id                   TEXT PRIMARY KEY, -- "ec_<uuid>"
-  provider             TEXT NOT NULL,    -- extension provider id, e.g. 'github'
-  identity_key         TEXT NOT NULL,    -- broker snapshot identityKey (email/accountId/projectId)
-  owner                TEXT,             -- principal for scope='personal'; NULL for scope='org'
-  scope                TEXT NOT NULL CHECK (scope IN ('org','personal')),
-  broker_credential_id INTEGER NOT NULL, -- auth-broker credential row id (SnapshotEntry.id)
-  created_at           INTEGER NOT NULL
+  id                              TEXT PRIMARY KEY, -- stable "ec_<uuid>" connection id
+  provider                        TEXT NOT NULL,    -- extension manifest id, e.g. 'github'
+  vault_provider                  TEXT NOT NULL,    -- credential-store namespace owned by this connection
+  identity_key                    TEXT NOT NULL,    -- redacted broker identity label source
+  owner                           TEXT,             -- principal for scope='personal'; NULL for scope='org'
+  scope                           TEXT NOT NULL CHECK (scope IN ('org','personal')),
+  broker_credential_id            INTEGER NOT NULL, -- auth-broker credential row id (SnapshotEntry.id)
+  pending_vault_provider          TEXT,             -- staged replacement vault namespace
+  pending_broker_credential_id    INTEGER,          -- staged replacement authority
+  pending_identity_key            TEXT,             -- staged replacement identity metadata
+  retiring_broker_credential_id   INTEGER,          -- old authority awaiting replacement cleanup
+  status                          TEXT NOT NULL DEFAULT 'active'
+                                  CHECK (status IN (
+                                    'active',
+                                    'replacing',
+                                    'replace_cleanup_pending',
+                                    'disconnecting_boundary',
+                                    'disconnecting_authority',
+                                    'disconnected'
+                                  )),
+  revision                        INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+  created_at                      INTEGER NOT NULL,
+  updated_at                      INTEGER NOT NULL
 );
--- One org-scoped credential per provider; one personal credential per (provider, owner).
+-- One durable connection per org/provider and per personal provider/owner.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
 
@@ -79,35 +95,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credential
 -- (schema/extensionId/pinnedAt/source/manifest — the registry's fail-closed
 -- parse validates it on read).
 CREATE TABLE IF NOT EXISTS extension_registry (
-  id            TEXT PRIMARY KEY,      -- extension id (the manifest id)
-  snapshot      TEXT NOT NULL,         -- JSON: the PinnedSnapshot document
-  registered_by TEXT NOT NULL,         -- the connect principal who registered it
-  space_id      TEXT,                  -- space the connect ran in (nullable: MCP/headless)
+  id            TEXT PRIMARY KEY,
+  snapshot      TEXT NOT NULL,
+  registered_by TEXT NOT NULL,
+  space_id      TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
--- One org-scoped credential per provider; one personal credential per (provider, owner).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_org ON extension_credentials(provider) WHERE scope = 'org';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_creds_personal ON extension_credentials(provider, owner) WHERE scope = 'personal';
 
--- One-time upload tokens (issue #196): the no-secrets-in-chat path for
--- api_key-type extensions. The agent mints a single-use, short-TTL link;
--- the user opens it in a browser and pastes the secret, and the upload
--- endpoint consumes THIS row (atomic DELETE) and stores the value directly
--- into the vault via the same connect path. The token never carries the
--- secret; expired/used tokens are simply gone (fail closed). Shared via the
--- SQLite file so both the server process (endpoint) and per-session MCP
--- child processes (mint tool) agree on the same links.
+-- One-time upload links carry no secret. Optional replacement columns bind
+-- a browser upload to one stable connection revision.
 CREATE TABLE IF NOT EXISTS upload_tokens (
-  id         TEXT PRIMARY KEY,      -- "ut_<uuid>"
-  token      TEXT NOT NULL UNIQUE,  -- opaque 128-bit random, single-use
-  extension  TEXT NOT NULL,         -- provider id, e.g. 'github'
-  scope      TEXT NOT NULL CHECK (scope IN ('org','personal')),
-  actor      TEXT NOT NULL,         -- principal the connect will run for
-  space_id   TEXT,
-  label      TEXT NOT NULL,         -- provider label, rendered in the form
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL       -- created + short TTL (issue #196)
+  id                TEXT PRIMARY KEY,
+  token             TEXT NOT NULL UNIQUE,
+  extension         TEXT NOT NULL,
+  scope             TEXT NOT NULL CHECK (scope IN ('org','personal')),
+  actor             TEXT NOT NULL,
+  space_id          TEXT,
+  label             TEXT NOT NULL,
+  connection_id     TEXT,
+  expected_revision INTEGER,
+  created_at        INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  CHECK ((connection_id IS NULL) = (expected_revision IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_upload_tokens_actor ON upload_tokens(actor);
 
@@ -188,7 +198,6 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_claim
   ON scheduler_invocations(status, requested_at, id);
 CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_job
   ON scheduler_invocations(job_id, requested_at, id);
-);
 
 CREATE TABLE IF NOT EXISTS audit (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,

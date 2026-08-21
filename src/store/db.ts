@@ -116,21 +116,35 @@ export type AuditRow = {
 };
 
 export type CredentialScope = "org" | "personal";
+export type ConnectionStatus =
+  | "active"
+  | "replacing"
+  | "replace_cleanup_pending"
+  | "disconnecting_boundary"
+  | "disconnecting_authority"
+  | "disconnected";
 
 /**
- * Registry row for an extension credential (issue #51). Metadata only — the
- * secret payload lives in the OMP auth broker; `broker_credential_id` is the
- * broker snapshot entry id and `identity_key` the broker's identity key.
- * Field names mirror the table columns (see Space / WorkItem).
+ * Durable extension connection (issues #51/#318). Metadata only: secret
+ * payloads remain inside the credential boundary. `id` is the stable
+ * operator target; revision and status provide fail-closed lifecycle CAS.
  */
 export type ExtensionCredential = {
   id: string;
   provider: string;
+  vault_provider: string;
   identity_key: string;
   owner: string | null;
   scope: CredentialScope;
   broker_credential_id: number;
+  pending_broker_credential_id: number | null;
+  pending_vault_provider: string | null;
+  pending_identity_key: string | null;
+  retiring_broker_credential_id: number | null;
+  status: ConnectionStatus;
+  revision: number;
   created_at: number;
+  updated_at: number;
 };
 
 /**
@@ -163,6 +177,8 @@ export type UploadToken = {
   actor: string;
   space_id: string | null;
   label: string;
+  connection_id: string | null;
+  expected_revision: number | null;
   created_at: number;
   expires_at: number;
 };
@@ -334,19 +350,41 @@ export interface Store {
    */
   markUnclaimedJobs(ttlMs: number): Promise<WorkerJob[]>;
   /**
-   * Registers or re-binds an extension credential (issue #51). One org row per
-   * provider, one personal row per (provider, owner): re-running connect with
-   * a refreshed broker credential updates identity_key + broker_credential_id.
+   * Creates or reactivates the one connection for an org/provider or
+   * personal provider/owner. Existing rows retain their stable id and
+   * advance their revision.
    */
   upsertExtensionCredential(input: {
     provider: string;
+    /** Credential-store namespace; defaults to provider for legacy/OAuth rows. */
+    vaultProvider?: string;
     identityKey: string;
     /** Required for scope='personal'; must be null for scope='org'. */
     owner: string | null;
     scope: CredentialScope;
     brokerCredentialId: number;
   }): Promise<ExtensionCredential>;
+  /** Active rows only: this is the runtime credential-resolution view. */
   listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
+  /** Deterministic operator read model, including disconnected rows. */
+  listExtensionConnections(): Promise<ExtensionCredential[]>;
+  getExtensionConnection(id: string): Promise<ExtensionCredential | null>;
+  beginExtensionConnectionReplacement(input: {
+    id: string;
+    vaultProvider: string;
+    expectedRevision: number;
+    identityKey: string;
+    brokerCredentialId: number;
+  }): Promise<ExtensionCredential>;
+  commitExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential>;
+  rollbackExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential>;
+  beginExtensionConnectionDisconnect(id: string, expectedRevision: number): Promise<ExtensionCredential>;
+  transitionExtensionConnection(input: {
+    id: string;
+    from: ConnectionStatus;
+    to: ConnectionStatus;
+    clearRetiringAuthority?: boolean;
+  }): Promise<ExtensionCredential>;
   /**
    * Runtime extension registry (issue #233): persists one runtime-registered
    * extension's PinnedSnapshot document (machine state — never a repo file).
@@ -373,6 +411,8 @@ export interface Store {
     actor: string;
     spaceId?: string | null;
     label: string;
+    connectionId?: string;
+    expectedRevision?: number;
     /** Absolute ms; created_at + the caller's TTL. */
     expiresAt: number;
   }): UploadToken;
@@ -1066,15 +1106,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
 
   async function upsertExtensionCredential(input: {
     provider: string;
+    vaultProvider?: string;
     identityKey: string;
     owner: string | null;
     scope: CredentialScope;
     brokerCredentialId: number;
   }): Promise<ExtensionCredential> {
     const provider = input.provider.trim();
+    const vaultProvider = input.vaultProvider?.trim() || provider;
     const identityKey = input.identityKey.trim();
     const owner = input.owner?.trim() ?? "";
-    if (!provider || !identityKey) throw new Error("extension credential needs a provider and an identity key");
+    if (!provider || !vaultProvider || !identityKey) {
+      throw new Error("extension credential needs a provider, vault provider, and identity key");
+    }
     if (input.scope === "personal" && !owner) {
       throw new Error("personal extension credentials need an owner");
     }
@@ -1082,28 +1126,172 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       throw new Error("org extension credentials cannot have an owner");
     }
     const id = `ec_${randomUUID()}`;
-    const t = Date.now();
-    // Conflict targets match the partial unique indexes in schema.sql.
+    const now = Date.now();
     const conflictTarget = input.scope === "org" ? "(provider) WHERE scope = 'org'" : "(provider, owner) WHERE scope = 'personal'";
-    // SAFETY: INSERT ... ON CONFLICT ... RETURNING * always returns the inserted or updated credential row.
+    // SAFETY: INSERT ... ON CONFLICT ... RETURNING returns exactly one typed metadata row.
     return db
       .query(
-        `INSERT INTO extension_credentials (id, provider, identity_key, owner, scope, broker_credential_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO extension_credentials
+           (id, provider, vault_provider, identity_key, owner, scope, broker_credential_id,
+            pending_vault_provider, pending_broker_credential_id, pending_identity_key,
+            retiring_broker_credential_id, status, revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'active', 1, ?, ?)
          ON CONFLICT${conflictTarget}
-         DO UPDATE SET identity_key = excluded.identity_key,
+         DO UPDATE SET vault_provider = excluded.vault_provider,
+                       identity_key = excluded.identity_key,
                        broker_credential_id = excluded.broker_credential_id,
-                       created_at = excluded.created_at
+                       pending_vault_provider = NULL,
+                       pending_broker_credential_id = NULL,
+                       pending_identity_key = NULL,
+                       retiring_broker_credential_id = NULL,
+                       status = 'active',
+                       revision = extension_credentials.revision + 1,
+                       updated_at = excluded.updated_at
          RETURNING *`,
       )
-      .get(id, provider, identityKey, input.scope === "personal" ? owner : null, input.scope, input.brokerCredentialId, t) as ExtensionCredential;
+      .get(
+        id,
+        provider,
+        vaultProvider,
+        identityKey,
+        input.scope === "personal" ? owner : null,
+        input.scope,
+        input.brokerCredentialId,
+        now,
+        now,
+      ) as ExtensionCredential;
   }
 
   async function listExtensionCredentials(provider: string): Promise<ExtensionCredential[]> {
-    // SAFETY: SELECT * returns one row per extension_credentials match, each with ExtensionCredential's column shape.
+    // The runtime view excludes every non-active lifecycle state.
+    // SAFETY: SELECT * returns ExtensionCredential's column shape.
     return db
-      .query("SELECT * FROM extension_credentials WHERE provider = ? ORDER BY scope, created_at")
+      .query(
+        "SELECT * FROM extension_credentials WHERE provider = ? AND status = 'active' " +
+          "ORDER BY scope, COALESCE(owner, ''), created_at, id",
+      )
       .all(provider) as ExtensionCredential[];
+  }
+
+  async function listExtensionConnections(): Promise<ExtensionCredential[]> {
+    // SAFETY: SELECT * returns ExtensionCredential's column shape.
+    return db
+      .query("SELECT * FROM extension_credentials ORDER BY provider, scope, COALESCE(owner, ''), created_at, id")
+      .all() as ExtensionCredential[];
+  }
+
+  async function getExtensionConnection(id: string): Promise<ExtensionCredential | null> {
+    // SAFETY: get() returns one ExtensionCredential-shaped row or null.
+    return (db.query("SELECT * FROM extension_credentials WHERE id = ?").get(id) as ExtensionCredential | null) ?? null;
+  }
+
+  function connectionMutationResult(
+    row: ExtensionCredential | null,
+    id: string,
+    expectedRevision?: number,
+  ): ExtensionCredential {
+    if (row) return row;
+    const current = db.query("SELECT * FROM extension_credentials WHERE id = ?").get(id) as ExtensionCredential | null;
+    if (!current) throw new Error(`connection "${id}" not found`);
+    if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+      throw new Error(`stale revision for connection "${id}": expected ${expectedRevision}, current ${current.revision}`);
+    }
+    throw new Error(`connection "${id}" cannot transition from status ${current.status}`);
+  }
+
+  async function beginExtensionConnectionReplacement(input: {
+    id: string;
+    vaultProvider: string;
+    expectedRevision: number;
+    identityKey: string;
+    brokerCredentialId: number;
+  }): Promise<ExtensionCredential> {
+    const vaultProvider = input.vaultProvider.trim();
+    const identityKey = input.identityKey.trim();
+    if (!vaultProvider || !identityKey) {
+      throw new Error("replacement connection needs a vault provider and identity key");
+    }
+    const row = db
+      .query(
+        `UPDATE extension_credentials
+         SET status = 'replacing',
+             pending_vault_provider = ?,
+             pending_broker_credential_id = ?,
+             pending_identity_key = ?,
+             updated_at = ?
+         WHERE id = ? AND revision = ? AND status = 'active'
+         RETURNING *`,
+      )
+      .get(vaultProvider, input.brokerCredentialId, identityKey, Date.now(), input.id, input.expectedRevision) as ExtensionCredential | null;
+    return connectionMutationResult(row, input.id, input.expectedRevision);
+  }
+
+  async function commitExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    const row = db
+      .query(
+        `UPDATE extension_credentials
+         SET vault_provider = pending_vault_provider,
+             identity_key = pending_identity_key,
+             retiring_broker_credential_id = broker_credential_id,
+             broker_credential_id = pending_broker_credential_id,
+             pending_vault_provider = NULL,
+             pending_broker_credential_id = NULL,
+             pending_identity_key = NULL,
+             status = 'replace_cleanup_pending',
+             revision = revision + 1,
+             updated_at = ?
+         WHERE id = ? AND revision = ? AND status = 'replacing'
+           AND pending_vault_provider IS NOT NULL
+           AND pending_broker_credential_id IS NOT NULL
+           AND pending_identity_key IS NOT NULL
+         RETURNING *`,
+      )
+      .get(Date.now(), id, expectedRevision) as ExtensionCredential | null;
+    return connectionMutationResult(row, id, expectedRevision);
+  }
+
+  async function rollbackExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    const row = db
+      .query(
+        `UPDATE extension_credentials
+         SET status = 'active',
+             pending_vault_provider = NULL,
+             pending_broker_credential_id = NULL,
+             pending_identity_key = NULL,
+             updated_at = ?
+         WHERE id = ? AND revision = ? AND status = 'replacing'
+         RETURNING *`,
+      )
+      .get(Date.now(), id, expectedRevision) as ExtensionCredential | null;
+    return connectionMutationResult(row, id, expectedRevision);
+  }
+
+  async function beginExtensionConnectionDisconnect(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    const row = db
+      .query(
+        `UPDATE extension_credentials
+         SET status = 'disconnecting_boundary', revision = revision + 1, updated_at = ?
+         WHERE id = ? AND revision = ? AND status = 'active'
+         RETURNING *`,
+      )
+      .get(Date.now(), id, expectedRevision) as ExtensionCredential | null;
+    return connectionMutationResult(row, id, expectedRevision);
+  }
+
+  async function transitionExtensionConnection(input: {
+    id: string;
+    from: ConnectionStatus;
+    to: ConnectionStatus;
+    clearRetiringAuthority?: boolean;
+  }): Promise<ExtensionCredential> {
+    const retirementUpdate = input.clearRetiringAuthority ? ", retiring_broker_credential_id = NULL" : "";
+    const row = db
+      .query(
+        `UPDATE extension_credentials SET status = ?, updated_at = ?${retirementUpdate} ` +
+          "WHERE id = ? AND status = ? RETURNING *",
+      )
+      .get(input.to, Date.now(), input.id, input.from) as ExtensionCredential | null;
+    return connectionMutationResult(row, input.id);
   }
 
   async function upsertRuntimeExtension(input: {
@@ -1146,6 +1334,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     actor: string;
     spaceId?: string | null;
     label: string;
+    connectionId?: string;
+    expectedRevision?: number;
     expiresAt: number;
   }): UploadToken {
     const extension = input.extension.trim();
@@ -1153,14 +1343,22 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     if (!extension || !label) throw new Error("upload token needs an extension and a label");
     if (input.scope !== "org" && input.scope !== "personal") throw new Error("upload token scope must be org or personal");
     if (!Number.isSafeInteger(input.expiresAt)) throw new Error("upload token expiresAt must be a safe integer");
+    const hasConnection = input.connectionId !== undefined;
+    if (hasConnection !== (input.expectedRevision !== undefined)) {
+      throw new Error("replacement upload token needs both connectionId and expectedRevision");
+    }
+    if (input.expectedRevision !== undefined && !Number.isSafeInteger(input.expectedRevision)) {
+      throw new Error("replacement upload token expectedRevision must be a safe integer");
+    }
     // Sweep expired rows lazily so the table stays bounded by live links.
     db.query("DELETE FROM upload_tokens WHERE expires_at <= ?").run(Date.now());
     const token = randomBytes(18).toString("base64url"); // 144 bits, unguessable
     // SAFETY: INSERT ... RETURNING * always returns the freshly inserted upload token row.
     return db
       .query(
-        `INSERT INTO upload_tokens (id, token, extension, scope, actor, space_id, label, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO upload_tokens
+           (id, token, extension, scope, actor, space_id, label, connection_id, expected_revision, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING *`,
       )
       .get(
@@ -1171,6 +1369,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         input.actor,
         input.spaceId ?? null,
         label,
+        input.connectionId ?? null,
+        input.expectedRevision ?? null,
         Date.now(),
         input.expiresAt,
       ) as UploadToken;
@@ -1765,6 +1965,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     markUnclaimedJobs,
     upsertExtensionCredential,
     listExtensionCredentials,
+    listExtensionConnections,
+    getExtensionConnection,
+    beginExtensionConnectionReplacement,
+    commitExtensionConnectionReplacement,
+    rollbackExtensionConnectionReplacement,
+    beginExtensionConnectionDisconnect,
+    transitionExtensionConnection,
     upsertRuntimeExtension,
     listRuntimeExtensions,
     createUploadToken,

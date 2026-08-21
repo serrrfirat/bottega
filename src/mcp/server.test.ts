@@ -357,12 +357,16 @@ describe("MCP server conformance (spawned entrypoint)", () => {
         "create_scheduler_job",
         "create_work_item",
         "delete_scheduler_job",
+        "disconnect_connection",
+        "inspect_connection",
+        "list_connections",
         "list_scheduler_jobs",
         "list_work_items",
         "memory.save",
         "memory.search",
         "model_settings",
         "pause_scheduler_job",
+        "replace_connection",
         "resume_scheduler_job",
         "run_scheduler_job_now",
         "session_search",
@@ -379,6 +383,9 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       expect(connectProps.scope?.enum).toEqual(["org", "personal"]);
       expect(connectProps.extension?.type).toBe("string");
       expect(connect.inputSchema.required).toContain("extension");
+      const replace = tools.find((t) => t.name === "replace_connection")!;
+      expect(Object.keys(replace.inputSchema.properties ?? {}).sort()).toEqual(["connection_id", "expected_revision"]);
+      expect(replace.inputSchema.required).toEqual(["connection_id", "expected_revision"]);
       expect(connect.inputSchema.required).toContain("scope");
 
       const save = tools.find((t) => t.name === "memory.save")!;
@@ -711,12 +718,16 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "create_scheduler_job",
         "create_work_item",
         "delete_scheduler_job",
+        "disconnect_connection",
+        "inspect_connection",
+        "list_connections",
         "list_scheduler_jobs",
         "list_work_items",
         "memory.save",
         "memory.search",
         "model_settings",
         "pause_scheduler_job",
+        "replace_connection",
         "resume_scheduler_job",
         "run_scheduler_job_now",
         "session_search",
@@ -940,7 +951,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       expect(res.content[0]?.text ?? "").toBe("Fixture Weather connected as @U123");
 
       expect(h.brokerCalls).toEqual([
-        { provider: FIXTURE_EXTENSION_ID, credentialType: "api_key", apiKey: "attio-secret-key" },
+        expect.objectContaining({ provider: FIXTURE_EXTENSION_ID, credentialType: "api_key", apiKey: "attio-secret-key" }),
       ]);
       const rows = await h.store.listExtensionCredentials(FIXTURE_EXTENSION_ID);
       expect(rows).toHaveLength(1);

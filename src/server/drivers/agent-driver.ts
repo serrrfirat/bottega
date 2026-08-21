@@ -31,10 +31,17 @@ import {
   connectExtensionToolDefinition,
   connectViaAuthBroker,
   type BrokerConnector,
+  type ConnectExtensionDeps,
 } from "../../extensions/connect";
 import type { McpOAuthConnector } from "../../extensions/mcp-oauth";
 import type { CatalogRegisterDeps } from "../../extensions/catalog-register";
 import { mintUploadLinkToolDefinition, type UploadLinkStore } from "../../extensions/upload-link";
+import {
+  connectionLifecycleToolDefinitions,
+  createConnectionAuthority,
+  type ConnectionAuthority,
+} from "../../extensions/lifecycle";
+import type { ConnectionBoundary } from "../../extensions/boundary";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
 import { redact } from "../../policy/audit";
@@ -70,9 +77,9 @@ export interface MemoryContextDriverOpts {
  */
 export interface ConnectExtensionDriverOpts {
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  // `listRuntimeExtensions` (issue #250): the connect-time egress reconcile
-  // default derives the runtime half of the egress superset from the store.
-  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
+  // Full connection lifecycle store: runtime reads active rows while
+  // list/inspect/replace/disconnect address the durable stable id.
+  store: ConnectExtensionDeps["store"];
   audit: AuditModule;
   loadPolicy: (spaceId: string | undefined) => Promise<PolicyConfig>;
   router: ApprovalRouter;
@@ -103,6 +110,8 @@ export interface ConnectExtensionDriverOpts {
    * endpoint, never through chat or a CLI.
    */
   uploadLink?: { store: UploadLinkStore; baseUrl: () => string };
+  connectionAuthority?: ConnectionAuthority;
+  connectionBoundary?: ConnectionBoundary;
 }
 
 /**
@@ -1249,6 +1258,22 @@ export function createOmpSdkDriver(
               ...(opts.connectExtension.mcpOAuth !== undefined
                 ? { mcpOAuth: opts.connectExtension.mcpOAuth }
                 : undefined),
+              gate: {
+                loadPolicy: opts.connectExtension.loadPolicy,
+                router: opts.connectExtension.router,
+                timeoutMs: opts.connectExtension.timeoutMs,
+              },
+              getPrincipal,
+              spaceIdFromFile: sessionIdFromFilePath,
+            }),
+            ...connectionLifecycleToolDefinitions({
+              registry: opts.connectExtension.registry,
+              store: opts.connectExtension.store,
+              audit: opts.connectExtension.audit,
+              authority:
+                opts.connectExtension.connectionAuthority ??
+                createConnectionAuthority(opts.connectExtension.broker ?? connectViaAuthBroker),
+              boundary: opts.connectExtension.connectionBoundary,
               gate: {
                 loadPolicy: opts.connectExtension.loadPolicy,
                 router: opts.connectExtension.router,

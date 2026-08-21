@@ -1178,7 +1178,7 @@ describe("extension credentials", () => {
     ).rejects.toThrow(/personal extension credentials need an owner/);
     await expect(
       s.upsertExtensionCredential({ provider: "", identityKey: "k", owner: null, scope: "org", brokerCredentialId: 1 }),
-    ).rejects.toThrow(/provider and an identity key/);
+    ).rejects.toThrow(/provider, vault provider, and identity key/);
   });
 
   test("listExtensionCredentials filters by provider and orders org before personal", async () => {
@@ -1194,7 +1194,11 @@ describe("extension credentials", () => {
   test("schema CHECK rejects an unknown scope through the raw handle", () => {
     const s = freshStore();
     expect(() =>
-      s.getDb().query("INSERT INTO extension_credentials (id, provider, identity_key, owner, scope, broker_credential_id, created_at) VALUES (?, ?, ?, NULL, 'team', ?, ?)").run("ec_x", "github", "k", 1, 1),
+      s.getDb().query(
+        "INSERT INTO extension_credentials " +
+          "(id, provider, vault_provider, identity_key, owner, scope, broker_credential_id, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, NULL, 'team', ?, ?, ?)",
+      ).run("ec_x", "github", "github", "k", 1, 1, 1),
     ).toThrow(/CHECK/);
   });
 });

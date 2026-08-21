@@ -109,6 +109,18 @@ import {
   UPLOAD_LINK_RELAY_GUIDANCE,
   type PublicBaseResolution,
 } from "../extensions/upload-link";
+import {
+  DISCONNECT_CONNECTION_TOOL,
+  INSPECT_CONNECTION_TOOL,
+  LIST_CONNECTIONS_TOOL,
+  REPLACE_CONNECTION_TOOL,
+  disconnectConnection,
+  inspectConnection,
+  listConnections,
+  replaceConnection,
+  type ConnectionAuthority,
+} from "../extensions/lifecycle";
+import type { ConnectionBoundary } from "../extensions/boundary";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
 import type { ExtensionRegistry } from "../extensions/registry";
 import type { ExtensionRuntime } from "../extensions/runtime";
@@ -213,6 +225,8 @@ export interface McpExtensionsOptions {
     baseUrl: () => string;
     resolvePublicBase?: () => Promise<PublicBaseResolution>;
   };
+  connectionAuthority?: ConnectionAuthority;
+  connectionBoundary?: ConnectionBoundary;
 }
 
 /**
@@ -355,18 +369,33 @@ const connectJsonSchema = {
   additionalProperties: false,
 } as const;
 
-/** JSON Schema for `connect_upload_link` (mirrors the mint tool's params, issue #196). */
+/** JSON Schema for `connect_upload_link` and optional stable replacement target. */
 const mintUploadLinkJsonSchema = {
   type: "object",
   properties: {
-    extension: { type: "string", description: "Extension id from the registry (e.g. the provider id)" },
-    scope: {
-      type: "string",
-      enum: ["org", "personal"],
-      description: "org = shared org account; personal = your own account",
-    },
+    extension: { type: "string", description: "Extension id from the registry" },
+    scope: { type: "string", enum: ["org", "personal"] },
+    connection_id: { type: "string", minLength: 1 },
+    expected_revision: { type: "integer", minimum: 1 },
   },
   required: ["extension", "scope"],
+  additionalProperties: false,
+} as const;
+
+const inspectConnectionJsonSchema = {
+  type: "object",
+  properties: { connection_id: { type: "string", minLength: 1 } },
+  required: ["connection_id"],
+  additionalProperties: false,
+} as const;
+
+const mutateConnectionJsonSchema = {
+  type: "object",
+  properties: {
+    connection_id: { type: "string", minLength: 1 },
+    expected_revision: { type: "integer", minimum: 1 },
+  },
+  required: ["connection_id", "expected_revision"],
   additionalProperties: false,
 } as const;
 
@@ -391,12 +420,23 @@ const connectArgsSchema = z.object({
   api_key: z.string().optional(),
 });
 
-/** connect_upload_link args (mirrors the mint tool's params). */
-const mintUploadLinkArgsSchema = z.object({
-  extension: z.string().refine((value) => value.trim() !== "", { message: "extension must be a non-empty string" }),
-  scope: z.enum(["org", "personal"]),
-});
+/** connect_upload_link args, optionally bound to one replacement revision. */
+const mintUploadLinkArgsSchema = z
+  .object({
+    extension: z.string().refine((value) => value.trim() !== "", { message: "extension must be a non-empty string" }),
+    scope: z.enum(["org", "personal"]),
+    connection_id: z.string().min(1).optional(),
+    expected_revision: z.number().int().positive().optional(),
+  })
+  .refine((value) => (value.connection_id === undefined) === (value.expected_revision === undefined), {
+    message: "connection_id and expected_revision must be supplied together",
+  });
 
+const inspectConnectionArgsSchema = z.object({ connection_id: z.string().min(1) });
+const mutateConnectionArgsSchema = z.object({
+  connection_id: z.string().min(1),
+  expected_revision: z.number().int().positive(),
+});
 /** Validation of connect args at the MCP boundary (mirrors the tool's zod schema). */
 function parseConnectArgs(
   input: CallToolRequest["params"]["arguments"],
@@ -411,12 +451,26 @@ function parseConnectArgs(
 /** Validation of mint args at the MCP boundary (mirrors the tool's zod schema). */
 function parseMintUploadLinkArgs(
   input: CallToolRequest["params"]["arguments"],
-): { ok: true; extension: string; scope: "org" | "personal" } | { ok: false; error: string } {
+):
+  | {
+      ok: true;
+      extension: string;
+      scope: "org" | "personal";
+      connectionId?: string;
+      expectedRevision?: number;
+    }
+  | { ok: false; error: string } {
   const parsed = mintUploadLinkArgsSchema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, error: zodIssues(parsed.error) };
   }
-  return { ok: true, extension: parsed.data.extension, scope: parsed.data.scope };
+  return {
+    ok: true,
+    extension: parsed.data.extension,
+    scope: parsed.data.scope,
+    connectionId: parsed.data.connection_id,
+    expectedRevision: parsed.data.expected_revision,
+  };
 }
 
 export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
@@ -689,7 +743,14 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       throw new McpError(ErrorCode.InvalidParams, `${MINT_UPLOAD_LINK_TOOL}: invalid arguments: ${parsed.error}`);
     }
     const outcome = await mintUploadLink(
-      { extension: parsed.extension, scope: parsed.scope, actor: opts.defaultPrincipal ?? "agent", spaceId: opts.spaceId ?? undefined },
+      {
+        extension: parsed.extension,
+        scope: parsed.scope,
+        actor: opts.defaultPrincipal ?? "agent",
+        spaceId: opts.spaceId ?? undefined,
+        connectionId: parsed.connectionId,
+        expectedRevision: parsed.expectedRevision,
+      },
       {
         registry: extensions.connect.registry,
         store: extensions.uploadLink.store,
@@ -703,6 +764,61 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     // reconstruct from context. Issue #211: a stale public base prepends
     // its warning so the reply explains a loopback-only link.
     return { content: [{ type: "text", text: uploadLinkReplyText(outcome) }] };
+  };
+
+  const connectionLifecycleDeps = () => {
+    if (!extensions) throw new McpError(ErrorCode.InvalidParams, "connection lifecycle is unavailable");
+    return {
+      registry: extensions.connect.registry,
+      store: extensions.connect.store,
+      audit: extensions.connect.audit,
+      gate: extensions.connect.gate,
+      authority: extensions.connectionAuthority,
+      boundary: extensions.connectionBoundary,
+    };
+  };
+
+  const callListConnections = async (callArgs: CallToolRequest["params"]["arguments"]) => {
+    const parsed = z.object({}).strict().safeParse(callArgs ?? {});
+    if (!parsed.success) throw new McpError(ErrorCode.InvalidParams, `${LIST_CONNECTIONS_TOOL}: invalid arguments`);
+    const outcome = await listConnections(
+      { actor: opts.defaultPrincipal ?? "agent", spaceId: opts.spaceId ?? undefined },
+      connectionLifecycleDeps(),
+    );
+    return { content: [{ type: "text", text: outcome.message }] };
+  };
+
+  const callInspectConnection = async (callArgs: CallToolRequest["params"]["arguments"]) => {
+    const parsed = inspectConnectionArgsSchema.safeParse(callArgs);
+    if (!parsed.success) throw new McpError(ErrorCode.InvalidParams, `${INSPECT_CONNECTION_TOOL}: invalid arguments`);
+    const outcome = await inspectConnection(
+      {
+        connectionId: parsed.data.connection_id,
+        actor: opts.defaultPrincipal ?? "agent",
+        spaceId: opts.spaceId ?? undefined,
+      },
+      connectionLifecycleDeps(),
+    );
+    return { content: [{ type: "text", text: outcome.message }], ...(outcome.ok ? undefined : { isError: true }) };
+  };
+
+  const callMutateConnection = async (
+    name: typeof REPLACE_CONNECTION_TOOL | typeof DISCONNECT_CONNECTION_TOOL,
+    callArgs: CallToolRequest["params"]["arguments"],
+  ) => {
+    const parsed = mutateConnectionArgsSchema.safeParse(callArgs);
+    if (!parsed.success) throw new McpError(ErrorCode.InvalidParams, `${name}: invalid arguments`);
+    const input = {
+      connectionId: parsed.data.connection_id,
+      expectedRevision: parsed.data.expected_revision,
+      actor: opts.defaultPrincipal ?? "agent",
+      spaceId: opts.spaceId ?? undefined,
+    };
+    const outcome =
+      name === REPLACE_CONNECTION_TOOL
+        ? await replaceConnection(input, connectionLifecycleDeps())
+        : await disconnectConnection(input, connectionLifecycleDeps());
+    return { content: [{ type: "text", text: outcome.message }], ...(outcome.ok ? undefined : { isError: true }) };
   };
 
   /**
@@ -819,6 +935,26 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
                 `Never paste a live token here — use connect_upload_link instead.`,
               inputSchema: connectJsonSchema,
             },
+            {
+              name: LIST_CONNECTIONS_TOOL,
+              description: "Lists caller-visible extension connections with redacted metadata only.",
+              inputSchema: { type: "object", properties: {}, additionalProperties: false } as const,
+            },
+            {
+              name: INSPECT_CONNECTION_TOOL,
+              description: "Inspects one caller-visible stable connection id without returning credential material.",
+              inputSchema: inspectConnectionJsonSchema,
+            },
+            {
+              name: REPLACE_CONNECTION_TOOL,
+              description: "Replaces one stable connection using its expected revision. Organization changes require approval.",
+              inputSchema: mutateConnectionJsonSchema,
+            },
+            {
+              name: DISCONNECT_CONNECTION_TOOL,
+              description: "Immediately denies and durably disconnects one stable connection. Safe to retry.",
+              inputSchema: mutateConnectionJsonSchema,
+            },
             ...(extensions.uploadLink
               ? [
                   {
@@ -851,6 +987,11 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     if (extensions) {
       if (name === CONNECT_EXTENSION_TOOL) return callConnect(args);
       if (name === MINT_UPLOAD_LINK_TOOL) return callMintUploadLink(args);
+      if (name === LIST_CONNECTIONS_TOOL) return callListConnections(args);
+      if (name === INSPECT_CONNECTION_TOOL) return callInspectConnection(args);
+      if (name === REPLACE_CONNECTION_TOOL || name === DISCONNECT_CONNECTION_TOOL) {
+        return callMutateConnection(name, args);
+      }
       // Issue #158: resolve the owner across the EFFECTIVE surface (pinned
       // tools first, then discovered tools for tools-less manifests).
       const extensionId = await toolOwnerExtensionId(

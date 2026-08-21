@@ -39,11 +39,10 @@
  * never the driver, so a stalled agent cannot block a catalog connect.
  *
  * The broker seam: callers inject a {@link BrokerConnector};
- * {@link connectViaAuthBroker} is the production implementation (the
- * server's default). Known limitation: the broker's vault keeps ONE api_key
- * row per provider (API keys have no identity), so a personal api_key
- * re-connect replaces the vault row another owner's row still references —
- * the #53 runtime resolves credentials against the current vault state.
+ * {@link connectViaAuthBroker} is the production implementation. API-key
+ * connections use an owner-safe vault namespace so two personal rows for
+ * one provider never share authority. A second connect cannot overwrite an
+ * active row; it names the stable `replace_connection` target instead.
  */
 import { z, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { runAuthBrokerCommand } from "@oh-my-pi/pi-coding-agent/cli/auth-broker-cli";
@@ -97,10 +96,22 @@ export interface BrokerConnectResult {
  */
 export type BrokerConnector = (input: {
   provider: string;
+  /** Credential-store namespace. API-key connections use an owner-safe target. */
+  vaultProvider?: string;
   credentialType: CredentialType;
   /** Required by api_key credential types (the user's key, imported into the vault). */
   apiKey?: string;
 }) => Promise<BrokerConnectResult>;
+
+/** Stable per-scope vault namespace prevents API-key rows from colliding across owners. */
+export function extensionCredentialVaultProvider(
+  provider: string,
+  scope: ConnectScope,
+  owner: string | null,
+): string {
+  const target = scope === "org" ? "org" : Buffer.from(owner ?? "unknown", "utf8").toString("base64url");
+  return `bottega-extension:${provider}:${scope}:${target}`;
+}
 
 export interface ConnectExtensionDeps {
   /**
@@ -110,7 +121,19 @@ export interface ConnectExtensionDeps {
    * same turn.
    */
   registry: Pick<ExtensionRegistry, "resolve" | "register">;
-  store: Pick<Store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
+  store: Pick<
+    Store,
+    | "upsertExtensionCredential"
+    | "listExtensionCredentials"
+    | "listRuntimeExtensions"
+    | "listExtensionConnections"
+    | "getExtensionConnection"
+    | "beginExtensionConnectionReplacement"
+    | "commitExtensionConnectionReplacement"
+    | "rollbackExtensionConnectionReplacement"
+    | "beginExtensionConnectionDisconnect"
+    | "transitionExtensionConnection"
+  >;
   /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
   broker: BrokerConnector;
@@ -335,40 +358,38 @@ export async function connectExtension(
   // connect reconciles the proxy plane with zero composition-root wiring.
   const reconcileEgress = deps.reconcileEgress ?? createReconcileEgress({ store: deps.store });
 
-  // Issue #247: a chat api_key connect carries no key (the intent regex is
-  // gone since #273 — every connect arrives through the agent tool, which
-  // captures no key — and the paste guard above refuses pasted keys), so
-  // BEFORE the broker — whose only answer is the bare "needs its API key"
-  // throw with no way forward — resolve what the user actually can do.
-  // The org-scope policy gate above already ran (a denied org connect
-  // never reaches here); OAuth/upload connects skip this block by
-  // construction. An existing personal/org credential row means the
-  // provider is ALREADY connected — the honest reply names the replace
-  // path — and otherwise the #196 one-time upload link is the next step.
+  let existing: ExtensionCredential[];
+  try {
+    existing = await deps.store.listExtensionCredentials(provider);
+  } catch (err) {
+    return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
+  }
+  const target = existing.find((row) =>
+    input.scope === "personal"
+      ? row.scope === "personal" && row.owner === input.actor
+      : row.scope === "org",
+  );
+  if (target) {
+    return {
+      ok: false,
+      message:
+        `${label} is already connected ${input.scope === "org" ? "as an organization" : `for @${input.actor}`} ` +
+        `as ${target.id} revision ${target.revision} — use replace_connection with that stable id and expected revision.`,
+    };
+  }
+
+  // An api_key chat connect carries no key. Point to the boundary-safe
+  // upload flow before invoking the broker.
   if (
     manifest.credentialSchema.type === "api_key" &&
     input.apiKey === undefined &&
     !input.fromUpload
   ) {
-    let existing: ExtensionCredential[];
-    try {
-      existing = await deps.store.listExtensionCredentials(provider);
-    } catch (err) {
-      return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
-    }
-    const target = existing.find((row) =>
-      input.scope === "personal"
-        ? row.scope === "personal" && row.owner === input.actor
-        : row.scope === "org",
-    );
-    const who = input.scope === "org" ? "as an organization" : `for @${input.actor}`;
-    const replacePath =
-      "use connect_upload_link for a one-time browser upload, or re-run connect with the key — never paste a live key in chat";
     return {
       ok: false,
-      message: target
-        ? `${label} is already connected ${who} — to replace the key, ${replacePath}.`
-        : `connect ${label} now: ${replacePath}.`,
+      message:
+        `connect ${label} now: use connect_upload_link for a one-time browser upload, or re-run connect with the key — ` +
+        "never paste a live key in chat.",
     };
   }
 
@@ -449,19 +470,29 @@ export async function connectExtension(
     return { ok: true, credential: null, message: oauthStart.message };
   }
 
+  const owner = input.scope === "personal" ? input.actor : null;
+  const vaultProvider =
+    manifest.credentialSchema.type === "api_key"
+      ? extensionCredentialVaultProvider(provider, input.scope, owner)
+      : provider;
   let brokerResult: BrokerConnectResult;
   try {
-    brokerResult = await deps.broker({ provider, credentialType: manifest.credentialSchema.type, apiKey: input.apiKey });
+    brokerResult = await deps.broker({
+      provider,
+      vaultProvider,
+      credentialType: manifest.credentialSchema.type,
+      apiKey: input.apiKey,
+    });
   } catch (err) {
     return { ok: false, message: `connect ${label} failed: ${errorMessage(err)}` };
   }
 
-  const owner = input.scope === "personal" ? input.actor : null;
   const identityKey = brokerResult.identityKey ?? apiKeyIdentityKey(provider, input.scope, owner);
   let credential: ExtensionCredential;
   try {
     credential = await deps.store.upsertExtensionCredential({
       provider,
+      vaultProvider,
       identityKey,
       owner,
       scope: input.scope,
@@ -611,6 +642,7 @@ export function pickNewestBrokerEntry<T extends { id: number }>(entries: readonl
  */
 export async function connectViaAuthBroker(input: {
   provider: string;
+  vaultProvider?: string;
   credentialType: CredentialType;
   apiKey?: string;
 }): Promise<BrokerConnectResult> {
@@ -636,17 +668,18 @@ export async function connectViaAuthBroker(input: {
   if (!apiKey) {
     throw new Error(`connect ${input.provider} needs its API key (api_key extensions require the key)`);
   }
+  const vaultProvider = input.vaultProvider ?? input.provider;
   const brokerConfig = await resolveAuthBrokerConfig();
   if (brokerConfig) {
     const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
-    const res = await client.uploadCredential(input.provider, { type: "api_key", key: apiKey });
+    const res = await client.uploadCredential(vaultProvider, { type: "api_key", key: apiKey });
     const newest = pickNewestBrokerEntry(res.entries);
     if (!newest) throw new Error(`the broker did not record the "${input.provider}" API key`);
     return { identityKey: null, brokerCredentialId: newest.id };
   }
   const storage = await discoverAuthStorage();
   try {
-    const entries = storage.upsertCredential(input.provider, { type: "api_key", key: apiKey });
+    const entries = storage.upsertCredential(vaultProvider, { type: "api_key", key: apiKey });
     const newest = pickNewestBrokerEntry(entries);
     if (!newest) throw new Error(`the vault did not record the "${input.provider}" API key`);
     return { identityKey: null, brokerCredentialId: newest.id };

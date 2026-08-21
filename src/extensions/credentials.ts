@@ -51,21 +51,25 @@ export function resolveCredential(input: ResolveCredentialInput): CredentialReso
   const { callScope, caller, provider, spacePolicy, findCredential } = input;
   if (callScope === "org") {
     const credential = findCredential("org", null);
-    if (!credential) return { kind: "error", message: `connect ${provider} as an organization` };
+    if (!credential || credential.status !== "active") {
+      return { kind: "error", message: `connect ${provider} as an organization` };
+    }
     return { kind: "credential", credential };
   }
   if (callScope === "me") {
     const credential = findCredential("personal", caller);
-    if (!credential) return { kind: "error", message: `connect your ${provider} account` };
+    if (!credential || credential.status !== "active") {
+      return { kind: "error", message: `connect your ${provider} account` };
+    }
     return { kind: "credential", credential };
   }
   // auto
   if (spacePolicy.orgUsageAllowed) {
     const org = findCredential("org", null);
-    if (org) return { kind: "credential", credential: org };
+    if (org?.status === "active") return { kind: "credential", credential: org };
   }
   const personal = findCredential("personal", caller);
-  if (personal) return { kind: "credential", credential: personal };
+  if (personal?.status === "active") return { kind: "credential", credential: personal };
   const orgHint = spacePolicy.orgUsageAllowed
     ? `org usage is allowed by this space's policy but no ${provider} credential is connected as an organization`
     : `org usage is not allowed by this space's policy`;

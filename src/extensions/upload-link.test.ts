@@ -249,7 +249,7 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
       // the value and the vault row landed (personal, owner = the minting
       // principal).
       expect(h.broker.calls).toEqual([
-        { provider: "fixture.weather", credentialType: "api_key", apiKey: secret },
+        expect.objectContaining({ provider: "fixture.weather", credentialType: "api_key", apiKey: secret }),
       ]);
       const rows = await rowsFor(h.store, "fixture.weather");
       expect(rows).toHaveLength(1);
@@ -297,7 +297,7 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
       // The broker saw the real value and the vault row landed — the same
       // connect path as any other upload, minus the chat paste guard.
       expect(h.broker.calls).toEqual([
-        { provider: "fixture.weather", credentialType: "api_key", apiKey: secret },
+        expect.objectContaining({ provider: "fixture.weather", credentialType: "api_key", apiKey: secret }),
       ]);
       const rows = await rowsFor(h.store, "fixture.weather");
       expect(rows).toHaveLength(1);

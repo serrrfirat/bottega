@@ -197,6 +197,13 @@ const TIER_BY_TOOL: ToolTiers = {
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.
   connect_extension: "exec",
+  // Stable, redacted connection reads are read-tier. Authority-changing
+  // lifecycle operations are exec-tier so org mutations cross approval;
+  // personal ownership is enforced again by the lifecycle handler.
+  list_connections: "read",
+  inspect_connection: "read",
+  replace_connection: "exec",
+  disconnect_connection: "exec",
   // Catalog registration policy surface (issue #232/#233): the catalog
   // connect path no longer GATES on this name — the connect's own
   // approval (connect_extension, org scope) covers the runtime

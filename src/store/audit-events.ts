@@ -101,6 +101,10 @@ export const SETTINGS_CHANGED_EVENT = "settings.changed";
 export const EXTENSION_CREDENTIAL_RESOLVED_EVENT = "extension.credential_resolved";
 /** Extension connected through the connect capability (payload {extension, scope, owner}). */
 export const EXTENSION_CONNECTED_EVENT = "extension.connected";
+/** Connection lifecycle phase (payload {connection_id, phase, revision, status}). */
+export const EXTENSION_CONNECTION_PHASE_EVENT = "extension.connection_phase";
+/** Redacted connection list/inspection (payload {action, count?, connection_id?}). */
+export const EXTENSION_CONNECTION_READ_EVENT = "extension.connection_read";
 /**
  * Deployment-level static OAuth client provisioned (issue #288): payload
  * {extension, scope, owner, status} — metadata ONLY, never client values

@@ -22,7 +22,7 @@
  * `${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(id)}` (the same
  * volume at /data on the proxy side).
  */
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 // The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
 // transitive auth package, same 17.x release train) — no new dependency.
@@ -70,6 +70,7 @@ export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env
  */
 export interface SecretResolverRef {
   provider: string;
+  vaultProvider?: string;
   identityKey: string;
   scope: CredentialScope;
   owner: string | null;
@@ -98,6 +99,7 @@ export interface SecretResolver {
 function toSecretResolverRef(credential: ExtensionCredential): SecretResolverRef {
   return {
     provider: credential.provider,
+    vaultProvider: credential.vault_provider,
     identityKey: credential.identity_key,
     scope: credential.scope,
     owner: credential.owner,
@@ -151,11 +153,11 @@ async function resolveBrokerSecret(env: NodeJS.ProcessEnv, ref: SecretResolverRe
     throw new Error(`extension credential boundary: broker snapshot fetch failed (status ${result.status})`);
   }
   const entry = result.snapshot.credentials.find(
-    (candidate) => candidate.id === ref.brokerCredentialId && candidate.provider === ref.provider,
+    (candidate) => candidate.id === ref.brokerCredentialId && candidate.provider === (ref.vaultProvider ?? ref.provider),
   );
   if (!entry) {
     throw new Error(
-      `extension credential boundary: the broker has no "${ref.provider}" vault row ${ref.brokerCredentialId} — re-run connect ${ref.provider} as me|org`,
+      `extension credential boundary: the broker has no vault row ${ref.brokerCredentialId} for connection provider "${ref.provider}" — reconnect the selected connection`,
     );
   }
   if (entry.credential.type === "api_key") return { type: "api_key", secret: entry.credential.key };
@@ -300,14 +302,26 @@ export function secretResolverFromSettings(
   throw new Error(`extension credential boundary: unknown secrets_backend type "${backend["type"]}"`);
 }
 
+/** Prepared replacement keeps the new secret staged until activation. */
+export interface CredentialReplacementPreparation {
+  activate(): Promise<void>;
+  rollback(): Promise<void>;
+}
+
 /**
- * The boundary contract. `authorize` makes the resolved credential
- * available to the proxy for the extension's allowlisted domains (writes
- * the secret file + best-effort reload). The credential payload itself is
- * never returned to the caller.
+ * Runtime authorization plus strict lifecycle cleanup. Cleanup methods are
+ * deliberately not best-effort: callers persist the failed phase and retry.
  */
 export interface CredentialBoundary {
   authorize(credential: ExtensionCredential): Promise<void>;
+}
+
+export interface ConnectionBoundary {
+  prepareReplacement(
+    current: ExtensionCredential,
+    replacement: ExtensionCredential,
+  ): Promise<CredentialReplacementPreparation>;
+  disconnect(credential: ExtensionCredential): Promise<void>;
 }
 
 export interface SecretFileBoundaryOpts {
@@ -338,7 +352,9 @@ export interface SecretFileBoundaryOpts {
  * (mode 0600, atomic write-temp + rename) and best-effort reloads the
  * proxy when a control URL is set.
  */
-export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): CredentialBoundary {
+export function createSecretFileBoundary(
+  opts: SecretFileBoundaryOpts = {},
+): CredentialBoundary & ConnectionBoundary {
   const secretsDir = opts.secretsDir ?? process.env.BOTTEGA_PROXY_SECRETS_DIR ?? PROXY_SECRETS_DIR;
   const resolveSecret = opts.resolver
     ? async (credential: ExtensionCredential): Promise<string> =>
@@ -349,20 +365,36 @@ export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): Cre
           "extension credential boundary: no broker secret resolver wired (issue #54) — the call would run unauthenticated, failing closed",
         );
       });
+
+  function assertSafeTestDirectory(): void {
+    if (process.env.NODE_ENV === "test" && resolve(secretsDir) === resolve(PROXY_SECRETS_DIR)) {
+      throw new Error(
+        "extension credential boundary: refusing the live default secrets dir under test — pass an explicit temp secretsDir (issue #191)",
+      );
+    }
+  }
+
+  async function reloadProxy(): Promise<void> {
+    if (!opts.proxyControlUrl) return;
+    let response: Response;
+    try {
+      response = await fetch(`${opts.proxyControlUrl}/v1/reload`, {
+        method: "POST",
+        headers: opts.proxyControlToken
+          ? { Authorization: `Bearer ${opts.proxyControlToken}` }
+          : undefined,
+      });
+    } catch (err) {
+      throw new Error(`extension credential boundary: proxy reload failed: ${errorMessage(err)}`);
+    }
+    if (!response.ok) {
+      throw new Error(`extension credential boundary: proxy reload failed (${response.status})`);
+    }
+  }
+
   return {
     async authorize(credential) {
-      // Test isolation (issue #191): the composition-root parity suite
-      // (#172/#190) clobbered the LIVE data/proxy-secrets/github.secret by
-      // authorizing with the relative default after its temp-dir boots
-      // restored the repo cwd — the write landed in the production dir.
-      // Under the test runner (bun test sets NODE_ENV=test) the boundary
-      // must never write the live default: fail the test loudly BEFORE any
-      // file system write instead of clobbering the real credential.
-      if (process.env.NODE_ENV === "test" && resolve(secretsDir) === resolve(PROXY_SECRETS_DIR)) {
-        throw new Error(
-          "extension credential boundary: refusing the live default secrets dir under test — pass an explicit temp secretsDir (issue #191)",
-        );
-      }
+      assertSafeTestDirectory();
       const secret = await resolveSecret(credential);
       const fileName = extensionSecretFileName(credential.provider);
       mkdirSync(secretsDir, { recursive: true });
@@ -370,22 +402,58 @@ export function createSecretFileBoundary(opts: SecretFileBoundaryOpts = {}): Cre
       const finalPath = join(secretsDir, fileName);
       writeFileSync(tmpPath, secret, { mode: 0o600 });
       renameSync(tmpPath, finalPath);
-      if (opts.proxyControlUrl) {
-        let res: Response;
-        try {
-          res = await fetch(`${opts.proxyControlUrl}/v1/reload`, {
-            method: "POST",
-            headers: opts.proxyControlToken
-              ? { Authorization: `Bearer ${opts.proxyControlToken}` }
-              : undefined,
-          });
-        } catch (err) {
-          throw new Error(`extension credential boundary: proxy reload failed: ${errorMessage(err)}`);
-        }
-        if (!res.ok) {
-          throw new Error(`extension credential boundary: proxy reload failed (${res.status})`);
-        }
+      await reloadProxy();
+    },
+
+    async prepareReplacement(current, replacement) {
+      assertSafeTestDirectory();
+      if (current.id !== replacement.id || current.provider !== replacement.provider) {
+        throw new Error("extension credential boundary: replacement target does not match the current connection");
       }
+      const secret = await resolveSecret(replacement);
+      mkdirSync(secretsDir, { recursive: true });
+      const fileName = extensionSecretFileName(current.provider);
+      const finalPath = join(secretsDir, fileName);
+      const stagedPath = join(secretsDir, `${fileName}.${current.id}.staged`);
+      const backupPath = join(secretsDir, `${fileName}.${current.id}.backup`);
+      writeFileSync(stagedPath, secret, { mode: 0o600 });
+      let activated = false;
+      return {
+        async activate() {
+          if (activated) return;
+          const hadCurrent = existsSync(finalPath);
+          if (hadCurrent) renameSync(finalPath, backupPath);
+          renameSync(stagedPath, finalPath);
+          try {
+            await reloadProxy();
+          } catch (activationError) {
+            rmSync(finalPath, { force: true });
+            if (hadCurrent && existsSync(backupPath)) renameSync(backupPath, finalPath);
+            try {
+              await reloadProxy();
+            } catch (rollbackError) {
+              throw new Error(
+                `extension credential boundary: replacement activation failed and rollback reload failed: ${errorMessage(
+                  activationError,
+                )}; ${errorMessage(rollbackError)}`,
+              );
+            }
+            throw activationError;
+          }
+          rmSync(backupPath, { force: true });
+          activated = true;
+        },
+        async rollback() {
+          if (!activated) rmSync(stagedPath, { force: true });
+        },
+      };
+    },
+
+    async disconnect(credential) {
+      assertSafeTestDirectory();
+      const finalPath = join(secretsDir, extensionSecretFileName(credential.provider));
+      rmSync(finalPath, { force: true });
+      await reloadProxy();
     },
   };
 }

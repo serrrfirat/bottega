@@ -19,6 +19,7 @@ const EXPECTED_MIGRATION_IDS = [
   "009_expand_worker_job_kinds",
   "010_add_spaces_settings",
   "011_add_scheduler_lifecycle",
+  "012_add_connection_lifecycle",
 ] as const;
 
 function tempDb(name: string): string {

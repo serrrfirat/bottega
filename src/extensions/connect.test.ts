@@ -98,12 +98,19 @@ class RecordingRouter implements ApprovalRouter {
 
 class RecordingBroker {
   readonly calls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
+  readonly vaultProviders: string[] = [];
   result: BrokerConnectResult;
   constructor(result: BrokerConnectResult = { identityKey: null, brokerCredentialId: 9 }) {
     this.result = result;
   }
-  async connect(input: { provider: string; credentialType: string; apiKey?: string }): Promise<BrokerConnectResult> {
-    this.calls.push(input);
+  async connect(input: {
+    provider: string;
+    vaultProvider?: string;
+    credentialType: string;
+    apiKey?: string;
+  }): Promise<BrokerConnectResult> {
+    this.calls.push({ provider: input.provider, credentialType: input.credentialType, apiKey: input.apiKey });
+    this.vaultProviders.push(input.vaultProvider ?? input.provider);
     return this.result;
   }
 }
@@ -398,34 +405,36 @@ describe("connectExtension broker seam", () => {
 });
 
 describe("connectExtension re-connect", () => {
-  test("re-connecting personal updates the existing row, never duplicates", async () => {
+  test("re-connecting personal names the stable replace target without touching the broker", async () => {
     const h = makeDeps();
-    h.broker.result = { identityKey: null, brokerCredentialId: 1 };
-    const a = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
-    h.broker.result = { identityKey: "email:ada@example.com", brokerCredentialId: 2 };
-    const b = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+    h.broker.result = { identityKey: "email:ada@example.com", brokerCredentialId: 1 };
+    const first = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+    const second = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
 
-    expect(a.ok && b.ok).toBe(true);
-    const rows = await rowsFor(h.store, "com.example.stdio-oauth");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.broker_credential_id).toBe(2);
-    expect(rows[0]!.identity_key).toBe("email:ada@example.com");
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      expect(second.message).toContain("replace_connection");
+      expect(second.message).toContain(first.ok && first.credential ? first.credential.id : "unreachable");
+      expect(second.message).toContain("revision 1");
+    }
+    expect(h.broker.calls).toHaveLength(1);
   });
 
-  test("re-connecting org updates the existing row, never duplicates", async () => {
+  test("re-connecting org names the approved stable replace target without overwriting it", async () => {
     const h = makeDeps({ policy: allowedPolicy() });
     h.broker.result = { identityKey: "org-a", brokerCredentialId: 1 };
-    const a = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
-    h.broker.result = { identityKey: "org-b", brokerCredentialId: 2 };
-    const b = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
+    const first = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
+    const second = await connect(h, "fixture.weather", "org", "UADA", { apiKey: "k" });
 
-    expect(a.ok && b.ok).toBe(true);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.message).toContain("replace_connection");
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.broker_credential_id).toBe(2);
-    expect(rows[0]!.identity_key).toBe("org-b");
+    expect(rows[0]!.broker_credential_id).toBe(1);
+    expect(h.broker.calls).toHaveLength(1);
   });
-
   test("one personal row per owner: two principals get two rows", async () => {
     const h = makeDeps();
     await connect(h, "fixture.weather", "personal", "UADA", { apiKey: "attio-secret-key" });
@@ -433,6 +442,8 @@ describe("connectExtension re-connect", () => {
     const rows = await rowsFor(h.store, "fixture.weather");
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.owner).sort()).toEqual(["UADA", "UBOB"]);
+    expect(new Set(rows.map((row) => row.vault_provider)).size).toBe(2);
+    expect(new Set(h.broker.vaultProviders).size).toBe(2);
   });
 });
 
@@ -942,12 +953,11 @@ describe("connectExtension api_key no-key redirect (issue #247)", () => {
 
     // The chat re-connect carries no key.
     const outcome = await connect(h, "fixture.weather", "personal", "UADA");
-
     expect(outcome.ok).toBe(false);
     if (outcome.ok === false) {
+      expect(outcome.message).toContain("replace_connection");
+      expect(outcome.message).toContain("expected revision");
       expect(outcome.message).not.toContain("needs its API key");
-      expect(outcome.message).toContain("already connected");
-      expect(outcome.message).toContain("connect_upload_link");
     }
     // The broker was NOT called again and no duplicate row was written.
     expect(h.broker.calls).toHaveLength(1);

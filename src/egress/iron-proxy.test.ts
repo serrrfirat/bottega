@@ -713,11 +713,19 @@ describe("iron-proxy strict secrets leg (skip-gated, issue #177)", () => {
           await boundary.authorize({
             id: "leg-attio",
             provider: "attio",
+            vault_provider: "attio",
             identity_key: "leg",
             owner: null,
             scope: "org",
             broker_credential_id: 1,
+            pending_vault_provider: null,
+            pending_broker_credential_id: null,
+            pending_identity_key: null,
+            retiring_broker_credential_id: null,
+            status: "active",
+            revision: 1,
             created_at: Date.now(),
+            updated_at: Date.now(),
           } satisfies ExtensionCredential);
           expect(statSync(secretPath).mode & 0o777).toBe(0o600);
 

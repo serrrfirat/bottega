@@ -517,6 +517,16 @@ user-facing view is in
    secret and are refused by the mint path. The connect path rejects
    recognized credential shapes before gate/broker/audit work; this is a
    narrow guard, not a general scanner for arbitrary Slack text.
+8. **Stable connection lifecycle** — `extension_credentials.id` is the
+   operator target. The runtime reads only `status=active` rows. Replace
+   uses revision compare-and-swap, a staged boundary activation, and
+   post-switch retirement of the old vault row. Disconnect advances through
+   `disconnecting_boundary` and `disconnecting_authority`; each phase is
+   audited and retryable, while every non-active phase stays denied. List
+   and inspect filter personal rows to the caller and expose no vault
+   namespace, row ID, identity key, or token material. Org mutations cross
+   `replace_connection` / `disconnect_connection` policy approval before
+   state changes.
 
 GitHub's production snapshot is the hosted streamable-HTTP endpoint
 `https://api.githubcopilot.com/mcp/`; no local GitHub MCP binary is installed

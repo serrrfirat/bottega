@@ -18,11 +18,19 @@ function row(overrides: Partial<ExtensionCredential>): ExtensionCredential {
   return {
     id: "ec_test",
     provider: "github",
+    vault_provider: "github",
     identity_key: "email:ada@example.com",
     owner: null,
     scope: "org",
     broker_credential_id: 7,
+    pending_vault_provider: null,
+    pending_broker_credential_id: null,
+    pending_identity_key: null,
+    retiring_broker_credential_id: null,
+    status: "active",
+    revision: 1,
     created_at: 1,
+    updated_at: 1,
     ...overrides,
   };
 }

@@ -68,11 +68,19 @@ describe("createSecretFileBoundary reload half (issue #123, dev token contract)"
   const CREDENTIAL = {
     id: "1",
     provider: "github",
+    vault_provider: "github",
     identity_key: "dev",
     owner: null,
     scope: "org",
     broker_credential_id: 1,
+    pending_vault_provider: null,
+    pending_broker_credential_id: null,
+    pending_identity_key: null,
+    retiring_broker_credential_id: null,
+    status: "active",
+    revision: 1,
     created_at: 0,
+    updated_at: 0,
   } satisfies ExtensionCredential;
 
   test("authorize writes the secret file and reloads the management API with the dev token", async () => {
@@ -162,11 +170,19 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
   const BROKER_CREDENTIAL = {
     id: "ec_test",
     provider: "github",
+    vault_provider: "github",
     identity_key: "api-key:dev",
     owner: "U0B9QUPCTJ5",
     scope: "personal",
     broker_credential_id: 42,
+    pending_vault_provider: null,
+    pending_broker_credential_id: null,
+    pending_identity_key: null,
+    retiring_broker_credential_id: null,
+    status: "active",
+    revision: 1,
     created_at: 0,
+    updated_at: 0,
   } satisfies ExtensionCredential;
 
   /** A schema-valid broker snapshot (GET /v1/snapshot, wire schemas are strict). */
@@ -260,7 +276,7 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
         OMP_AUTH_BROKER_URL: broker.url,
         OMP_AUTH_BROKER_TOKEN: "broker-token",
       });
-      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no "github" vault row 42/);
+      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no vault row 42 for connection provider "github"/);
     } finally {
       broker.stop();
     }
@@ -275,7 +291,7 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
         OMP_AUTH_BROKER_URL: broker.url,
         OMP_AUTH_BROKER_TOKEN: "broker-token",
       });
-      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no "github" vault row 42/);
+      await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/no vault row 42 for connection provider "github"/);
     } finally {
       broker.stop();
     }
@@ -576,11 +592,19 @@ describe("onePasswordConnectResolver (issue #190)", () => {
     const credential = {
       id: "ec_connect",
       provider: "github",
+      vault_provider: "github",
       identity_key: "api-key:dev",
       owner: null,
       scope: "org",
       broker_credential_id: 1,
+      pending_vault_provider: null,
+      pending_broker_credential_id: null,
+      pending_identity_key: null,
+      retiring_broker_credential_id: null,
+      status: "active",
+      revision: 1,
       created_at: 0,
+      updated_at: 0,
     } satisfies ExtensionCredential;
     try {
       const boundary = createSecretFileBoundary({
