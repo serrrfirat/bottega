@@ -53,7 +53,13 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     // pass; the strict config stays the deployment contract (base compose).
     expect(vols).not.toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
     expect(vols.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
-    expect(vols).toContain("./data:/data");
+    // The canonical data dir is interpolated by scripts/dev.sh (which exports
+    // BOTTEGA_DEV_DATA_DIR=shared_data_dir, issue #301/#293): every worktree's
+    // dev stack binds the SAME canonical data/ — required once worktrees share
+    // one Compose project (else the mount flips on every boot from a
+    // different worktree). The `${...:-./data}` fallback keeps the bare
+    // `docker compose` invocation from docs/troubleshooting on ./data.
+    expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
     // The dev proxy must NOT use the compose named volume: the host server
     // writes secret files to ./data/proxy-secrets (PROXY_SECRETS_DIR) and
     // the generated egress config reads them at /data/proxy-secrets
@@ -90,11 +96,11 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     // which scripts/dev.sh reads for OMP_AUTH_BROKER_TOKEN. Compose merges
     // volumes by container path, so ./data:/data REPLACES the base
     // `data:/data` (the same dedup the iron-proxy override relies on).
-    expect(vols).toContain("./data:/data");
+    expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
     expect(vols).not.toContain("data:/data");
     // The entrypoints mount (the token bootstrap) is inherited from the
     // base service untouched — the override lists only its deltas.
-    expect(vols).toEqual(["./data:/data"]);
+    expect(vols).toEqual(["${BOTTEGA_DEV_DATA_DIR:-./data}:/data"]);
     // SAFETY: the base auth-broker keeps the entrypoints mount (asserted below).
     expect(baseBroker["volumes"] as string[]).toContain("./config/entrypoints:/entrypoints:ro");
   });
@@ -133,5 +139,28 @@ describe("scripts/dev.sh broker wiring contract (issue #143)", () => {
     expect(devSh).toContain("auth-broker did not become ready");
     expect(devSh).toContain("docker pull oh-my-pi/pi:dev");
     expect(devSh).toContain("exit 1");
+  });
+});
+
+describe("scripts/dev.sh shared dev stack wiring (issue #301)", () => {
+  const devSh = readFileSync(resolve(import.meta.dir, "../../scripts/dev.sh"), "utf8");
+
+  test("pins ONE canonical Compose project so every worktree reuses the same egress network", () => {
+    // The fix: a worktree's `compose up` must target the CANONICAL checkout's
+    // project name (issue #301), not its own dir basename — otherwise each
+    // worktree creates a fresh <worktree>_egress network on the same explicit
+    // 172.30.0.0/24 subnet and Docker rejects the second with "invalid pool
+    // request: Pool overlaps with other one on this address space".
+    expect(devSh).toContain('export COMPOSE_PROJECT_NAME="$(dev_compose_project)"');
+  });
+
+  test("binds the CANONICAL data dir so the shared project's mounts do not flip between worktrees", () => {
+    // Sharing one project across worktrees REQUIRES a stable /data bind;
+    // dev.sh points it at the shared_data_dir (the same canonical store
+    // #293 already routes BOTTEGA_PUBLIC_BASE_URL_FILE through).
+    expect(devSh).toContain('export BOTTEGA_DEV_DATA_DIR="$(shared_data_dir)"');
+    // The two env exports must come from the shared helper (sourced once),
+    // reusing its canonical-checkout resolution rather than duplicating it.
+    expect(devSh).toContain('. "$(dirname "$0")/shared-data-dir.sh"');
   });
 });

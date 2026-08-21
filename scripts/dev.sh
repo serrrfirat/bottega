@@ -67,6 +67,26 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/shared-data-dir.sh"
 export BOTTEGA_PUBLIC_BASE_URL_FILE="$(shared_data_dir)/public-base-url"
 
+# Issue #301: the dev stack is SHARED across worktrees. The base
+# docker-compose.yml declares networks.egress with a fixed 172.30.0.0/24
+# subnet and scopes the network/containers by COMPOSE_PROJECT_NAME (default
+# = the current dir basename), so a worktree used to get its OWN
+# <worktree>_egress network on that same subnet — the SECOND worktree's
+# `compose up` failed with "invalid pool request: Pool overlaps with other
+# one on this address space". Pin the project to the CANONICAL checkout's
+# name (like e2e-smoke.sh pins its own project): every worktree now targets
+# the SAME project -> the SAME egress network (reuse, no overlap) and the
+# SAME running iron-proxy/auth-broker containers (idempotent reuse, no
+# duplicate port bind). The base compose file and the deploy path are
+# untouched — only dev boot shares.
+export COMPOSE_PROJECT_NAME="$(dev_compose_project)"
+# Sharing one project across worktrees REQUIRES a stable /data bind: pin it
+# to the canonical shared_data_dir (#293's store) so the shared project's
+# containers never flip mounts when a DIFFERENT worktree boots. The dev
+# override mounts ${BOTTEGA_DEV_DATA_DIR:-./data}:/data (docs/bare compose
+# still default to ./data).
+export BOTTEGA_DEV_DATA_DIR="$(shared_data_dir)"
+
 mkdir -p data/omp-agent
 bun run scripts/seed-agent-dir.ts data/omp-agent config/omp
 

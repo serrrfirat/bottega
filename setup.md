@@ -348,7 +348,13 @@ set: the launcher propagates the canonical checkout's store path to the
 server (issue #293), so a dev server restarted from ANY repository
 worktree — including `.worktrees/<name>` feature worktrees — reads the same
 `data/public-base-url` the tunnel writes (a worktree's own `data/` stays
-per-checkout state; the public-base store is shared).
+per-checkout state; the public-base store is shared). The ENTIRE local dev
+stack shares the same way (issue #301): `bun run dev` pins the Compose
+project to the canonical checkout's name, so every worktree reuses ONE
+iron-proxy egress network and ONE proxy/broker container set — instead of
+each worktree creating its own `<worktree>_egress` network on the fixed
+`172.30.0.0/24` subnet and failing the SECOND boot with `invalid pool
+request: Pool overlaps with other one on this address space`.
 
 ### Static OAuth clients for no-DCR servers (issue #288, Gmail)
 
