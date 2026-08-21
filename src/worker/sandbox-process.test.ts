@@ -604,7 +604,7 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
     // default, so passing it through ready() is provable by observation.
     const supervisorProvider: ResolvedMemoryProvider = {
       backend: "mem0",
-      capabilities: { consolidation: "auto", digestPruning: "auto" },
+      capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
       save: async () => {
         throw new Error("unused in this test");
       },
@@ -625,8 +625,8 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       // After ready(), the getter reflects the supervisor-reported values —
       // never a stale by-value snapshot.
       expect(session.memoryProvider.backend).toBe("mem0");
-      expect(session.memoryProvider.capabilities.consolidation).toBe("auto");
-      expect(session.memoryProvider.capabilities.digestPruning).toBe("auto");
+      expect(session.memoryProvider.capabilities.consolidation).toBe("on-save");
+      expect(session.memoryProvider.capabilities.digestPruning).toBe("unsupported");
       expect(session.memoryProvider.save).toBeTypeOf("function");
     } finally {
       session.close();
