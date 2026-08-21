@@ -27,9 +27,17 @@ export type EgressEnv = Record<(typeof EGRESS_KEYS)[number], string>;
 /** A reachability probe: true when the tunnel answers connections. */
 export type TunnelProbe = (tunnelUrl: string) => Promise<boolean>;
 
-/** The five proxy env vars, derived from the repo root (the CA cert path). */
+/**
+ * The five proxy env vars, derived from the repo root (the CA cert path).
+ * `cwd` is the repo root in the standalone case (canary.sh); scripts/dev.sh
+ * exports BOTTEGA_DEV_CERTS_DIR to the CANONICAL certs dir (issue #301) so
+ * every worktree trusts the SAME CA the shared proxy terminates with — a
+ * dev server booted from ANY worktree uses the shared CA, never a
+ * worktree-local cert the shared proxy is not terminating with.
+ */
 export function proxyEnv(cwd: string): EgressEnv {
-  const caCert = join(cwd, "certs", "ca.crt");
+  const certsDir = process.env.BOTTEGA_DEV_CERTS_DIR ?? join(cwd, "certs");
+  const caCert = join(certsDir, "ca.crt");
   return {
     HTTP_PROXY: PROXY_TUNNEL_URL,
     HTTPS_PROXY: PROXY_TUNNEL_URL,

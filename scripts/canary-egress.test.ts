@@ -20,25 +20,29 @@ function freshCwd(): { cwd: string; cleanup: () => void } {
   return { cwd, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
+/** The five proxy env vars the egress needs + the canonical certs-dir override (issue #301). */
+const AMBIENT_KEYS = [...EGRESS_KEYS, "BOTTEGA_DEV_CERTS_DIR"] as const;
+
 type EgressSnapshot = Record<string, string | undefined>;
 
 function snapshotEgressEnv(): EgressSnapshot {
   const snapshot: EgressSnapshot = {};
-  for (const key of EGRESS_KEYS) snapshot[key] = process.env[key];
+  for (const key of AMBIENT_KEYS) snapshot[key] = process.env[key];
   return snapshot;
 }
 
 function restoreEgressEnv(snapshot: EgressSnapshot): void {
-  for (const key of EGRESS_KEYS) {
+  for (const key of AMBIENT_KEYS) {
     const value = snapshot[key];
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
 }
 
-/** Runs `fn` with the ambient egress env restored afterwards (hermetic). */
+/** Runs `fn` with the ambient egress + canonical-certs env cleared (hermetic). */
 function withEnv(fn: () => unknown): unknown {
   const before = snapshotEgressEnv();
+  for (const key of AMBIENT_KEYS) delete process.env[key];
   try {
     return fn();
   } finally {
@@ -75,6 +79,30 @@ describe("live canary egress rides iron-proxy (issue #241)", () => {
       expect(env.NO_PROXY).toBe(NO_PROXY_LIST);
       expect(env.NO_PROXY).toContain("auth-broker");
       expect(env.NO_PROXY).toContain("mem0");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("honors the CANONICAL certs dir (BOTTEGA_DEV_CERTS_DIR, issue #301) for the CA path", () => {
+    // scripts/dev.sh exports BOTTEGA_DEV_CERTS_DIR=shared_certs_dir before
+    // evaling canary-egress, so a dev server booted from ANY worktree trusts
+    // the SAME CA the SHARED proxy terminates with — never a worktree-local
+    // certs/ca.crt the shared proxy is not terminating with.
+    const { cwd, cleanup } = freshCwd();
+    try {
+      const before = process.env.BOTTEGA_DEV_CERTS_DIR;
+      process.env.BOTTEGA_DEV_CERTS_DIR = "/canonical/dev/certs";
+      try {
+        const env = proxyEnv(cwd);
+        expect(env.NODE_EXTRA_CA_CERTS).toBe("/canonical/dev/certs/ca.crt");
+        expect(env.SSL_CERT_FILE).toBe("/canonical/dev/certs/ca.crt");
+        // …and NOT the worktree-local certs the cwd would otherwise imply.
+        expect(env.NODE_EXTRA_CA_CERTS).not.toContain(join(cwd, "certs"));
+      } finally {
+        if (before === undefined) delete process.env.BOTTEGA_DEV_CERTS_DIR;
+        else process.env.BOTTEGA_DEV_CERTS_DIR = before;
+      }
     } finally {
       cleanup();
     }

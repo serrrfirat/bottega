@@ -25,12 +25,13 @@
 #      the dev config mount) and waits for the management API to answer a
 #      reload — that proves the dev egress config (allowlist + secrets +
 #      management) parsed AND that the running container's
-#      IRON_MANAGEMENT_API_KEY matches data/proxy-mgmt-token (a stale
+#      IRON_MANAGEMENT_API_KEY matches the canonical proxy token (a stale
 #      container with a different token 401s the probe and fails loudly);
 #   5. starts the auth-broker vault (issue #143, docker-compose.dev.yml:
-#      127.0.0.1-bound 8765 + ./data bind) and waits for its readiness —
-#      the token file (data/.omp/auth-broker.token, 0600, bootstrapped by
-#      entrypoints/broker.sh) exists AND /v1/healthz answers — then exports
+#      127.0.0.1-bound 8765 + canonical data bind) and waits for its
+#      readiness — the token file (the canonical data dir's .omp/
+#      auth-broker.token, 0600, bootstrapped by entrypoints/broker.sh)
+#      exists AND /v1/healthz answers — then exports
 #      OMP_AUTH_BROKER_URL/TOKEN so the extension runtime's broker secret
 #      resolver (issue #54 wiring) can fetch vault credentials;
 #   6. exports the proxy env the server needs: HTTP(S)_PROXY, NO_PROXY (the
@@ -86,6 +87,19 @@ export COMPOSE_PROJECT_NAME="$(dev_compose_project)"
 # override mounts ${BOTTEGA_DEV_DATA_DIR:-./data}:/data (docs/bare compose
 # still default to ./data).
 export BOTTEGA_DEV_DATA_DIR="$(shared_data_dir)"
+# The credential boundary's secret-file dir (issue #301): the host server
+# writes extension secret files to THIS canonical dir (BOTTEGA_PROXY_SECRETS_DIR)
+# — the SAME dir the shared dev proxy reads at /data/proxy-secrets
+# (PROXY_SECRETS_MOUNT_PATH, mounted from BOTTEGA_DEV_DATA_DIR). Canonicalizing
+# it means a server booted from ANY worktree injects secrets into the SHARED
+# proxy's store — never into a worktree-local data/proxy-secrets the shared
+# proxy's mount cannot see (the #301 fresh-worktree bug).
+export BOTTEGA_PROXY_SECRETS_DIR="$(shared_data_dir)/proxy-secrets"
+# The shared MITM CA dir (issue #301): the single certs/ the shared proxy
+# terminates with. Every worktree's dev server trusts the SAME ca.crt
+# (NODE_EXTRA_CA_CERTS via scripts/canary-egress.ts), so a second worktree
+# boot NEVER generates/MITMs with a different CA than the shared proxy's.
+export BOTTEGA_DEV_CERTS_DIR="$(shared_certs_dir)"
 
 mkdir -p data/omp-agent
 bun run scripts/seed-agent-dir.ts data/omp-agent config/omp
@@ -127,43 +141,53 @@ fi
 
 # 2. MITM CA (config/egress.dev.yml -> tls): the proxy terminates HTTPS with
 #    it and the dev server must trust it (NODE_EXTRA_CA_CERTS below).
-#    Gitignored.
-if [[ ! -f certs/ca.crt ]]; then
-  echo "iron-proxy: generating MITM CA (certs/, gitignored)..."
-  mkdir -p certs
-  if ! docker run --rm -v "$PWD/certs:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null 2>&1; then
+#    Gitignored. Lives in the CANONICAL checkout's certs/ (shared_certs_dir,
+#    exported above as BOTTEGA_DEV_CERTS_DIR) so ALL worktrees of one repo
+#    trust the SAME CA the shared proxy terminates with — a second worktree
+#    boot reuses it instead of generating its own (which the shared proxy
+#    would not be terminating with).
+if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
+  echo "iron-proxy: generating MITM CA ($BOTTEGA_DEV_CERTS_DIR, gitignored)..."
+  mkdir -p "$BOTTEGA_DEV_CERTS_DIR"
+  if ! docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null 2>&1; then
     echo "bottega dev: iron-proxy CA generation failed (issue #123) — is the ironsh/iron-proxy:0.49.0 image pullable?" >&2
     echo "  docker pull ironsh/iron-proxy:0.49.0" >&2
     exit 1
   fi
-  echo "iron-proxy: MITM CA generated at certs/ca.crt"
+  echo "iron-proxy: MITM CA generated at $BOTTEGA_DEV_CERTS_DIR/ca.crt"
 fi
 
 # 3. Management API token for the boundary reload (issue #123). Persisted
-#    (0600, gitignored data/) so consecutive dev runs REUSE a running proxy
-#    instead of recreating it with a fresh token each boot. The dev config
+#    (0600, gitignored) in the CANONICAL data dir so consecutive dev runs —
+#    and boots from ANY worktree — REUSE a running proxy instead of
+#    recreating it with a fresh token each boot, and so the shared container's
+#    IRON_MANAGEMENT_API_KEY (interpolated below) always matches the token
+#    dev.sh reads. A worktree-local token would 401 the shared proxy's reload
+#    probe (the container holds a DIFFERENT canonical token). The dev config
 #    (config/egress.dev.yml) has NO judge, so NEARAI_JUDGE_API_KEY is not
 #    needed here — the strict config's judge key stays a deployment (.env /
 #    compose) concern.
-if [[ ! -f data/proxy-mgmt-token ]]; then
-  mkdir -p data
+mkdir -p "$BOTTEGA_DEV_DATA_DIR"
+TOKEN_FILE="$BOTTEGA_DEV_DATA_DIR/proxy-mgmt-token"
+if [[ ! -f "$TOKEN_FILE" ]]; then
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 16 | tr -d '\n' > data/proxy-mgmt-token
+    openssl rand -hex 16 | tr -d '\n' > "$TOKEN_FILE"
   else
-    printf 'dev-bottega-%s' "$(date +%s)" > data/proxy-mgmt-token
+    printf 'dev-bottega-%s' "$(date +%s)" > "$TOKEN_FILE"
   fi
-  chmod 600 data/proxy-mgmt-token
-  echo "iron-proxy: dev management token generated at data/proxy-mgmt-token (0600)"
+  chmod 600 "$TOKEN_FILE"
+  echo "iron-proxy: dev management token generated at $TOKEN_FILE (0600)"
 fi
-export IRON_MANAGEMENT_API_KEY="$(<data/proxy-mgmt-token)"
+export IRON_MANAGEMENT_API_KEY="$(<$TOKEN_FILE)"
 export BOTTEGA_PROXY_CONTROL_URL="http://127.0.0.1:9092"
 export BOTTEGA_PROXY_CONTROL_TOKEN="$IRON_MANAGEMENT_API_KEY"
 
 # 4. Start the proxy (detached, idempotent: a running container with the
 #    same config is reused) and wait for the management API — a successful
 #    POST /v1/reload proves the dev egress config parsed AND that the
-#    container's IRON_MANAGEMENT_API_KEY matches data/proxy-mgmt-token (the
-#    compose interpolation below exports the same token to the container).
+#    container's IRON_MANAGEMENT_API_KEY matches the canonical proxy token
+#    (the compose interpolation below exports the same token to the
+#    container).
 echo "iron-proxy: starting (${COMPOSE_DEV[*]} up -d iron-proxy)..."
 "${COMPOSE_DEV[@]}" up -d iron-proxy
 echo "iron-proxy: waiting for the management API (POST /v1/reload) on 127.0.0.1:9092..."
@@ -182,7 +206,7 @@ if [[ "$READY" != 1 ]]; then
   echo "  ${COMPOSE_DEV[*]} logs iron-proxy" >&2
   echo "  ${COMPOSE_DEV[*]} ps" >&2
   echo "If the probe 401s, the running container's IRON_MANAGEMENT_API_KEY differs from" >&2
-  echo "data/proxy-mgmt-token (e.g. a container started outside dev.sh) — recreate it:" >&2
+  echo "$TOKEN_FILE (e.g. a container started outside dev.sh) — recreate it:" >&2
   echo "  ${COMPOSE_DEV[*]} up -d --force-recreate iron-proxy" >&2
   exit 1
 fi
@@ -191,14 +215,17 @@ echo "iron-proxy: ready (dev egress config loaded, management API answering)"
 # 5. Auth-broker vault (issue #143): the extension credential boundary's
 #    secret FETCH half (issue #54 wiring) needs a running broker AND the
 #    vault token. The dev override publishes the broker on 127.0.0.1:8765
-#    with the host's ./data bind, so first boot bootstraps the bearer token
-#    to data/.omp/auth-broker.token (0600, entrypoints/broker.sh) — the
-#    same path the compose stack uses on the shared volume. Readiness = the
-#    token file exists AND the broker's unauthenticated /v1/healthz answers
-#    (the compose healthcheck's probe — healthy implies the token is ready
-#    for dependents). Missing image / unreadable token fail loudly below,
-#    never silently: the boundary must NOT run extension calls
-#    unauthenticated.
+#    with the host's canonical data bind (BOTTEGA_DEV_DATA_DIR), so first
+#    boot bootstraps the bearer token to the CANONICAL data dir's
+#    .omp/auth-broker.token (0600, entrypoints/broker.sh) — the same path
+#    the compose stack uses on the shared volume. A worktree boot reads the
+#    SAME canonical token, so the shared broker's dependents always match
+#    (a worktree-local token file would 401 every vault fetch / the shared
+#    broker never wrote it). Readiness = the token file exists AND the
+#    broker's unauthenticated /v1/healthz answers (the compose healthcheck's
+#    probe — healthy implies the token is ready for dependents). Missing
+#    image / unreadable token fail loudly below, never silently: the
+#    boundary must NOT run extension calls unauthenticated.
 # Run a command with a hard deadline (portable: macOS has no coreutils
 # `timeout`; same helper as scripts/e2e-smoke.sh). Returns 1 on any
 # non-zero exit or deadline kill — a compose-up hang must never block
@@ -234,19 +261,24 @@ else
   # PI_CONFIG_DIR as HOME-relative (path.join), so an absolute dir would
   # double-prefix and 401 every snapshot fetch.
   echo "auth-broker: docker image (oh-my-pi/pi:dev) unavailable — falling back to the local omp CLI" >&2
-  mkdir -p data/.omp
-  if [[ ! -f data/.omp/auth-broker.token ]]; then
-    openssl rand -hex 32 > data/.omp/auth-broker.token && chmod 600 data/.omp/auth-broker.token
+  mkdir -p "$BOTTEGA_DEV_DATA_DIR/.omp"
+  if [[ ! -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]]; then
+    openssl rand -hex 32 > "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" && chmod 600 "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token"
   fi
-  local_rel="${PWD#${HOME}/}/data/.omp"
-  PI_CONFIG_DIR="$local_rel" OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)" \
-    nohup omp auth-broker serve --bind=0.0.0.0:8765 >> data/auth-broker.log 2>&1 &
-  echo "auth-broker: local omp CLI broker starting (log: data/auth-broker.log)"
+  # The local broker's config dir must match the SHARED canonical data dir
+  # (every worktree's fallback broker serves/token-bootstraps into the SAME
+  # store, so a server restarted from any worktree resolves the SAME vault
+  # token). PI_CONFIG_DIR is HOME-relative (the CLI path.joins it), so use
+  # the canonical data dir's HOME-relative form, never the worktree's PWD.
+  local_rel="${BOTTEGA_DEV_DATA_DIR#${HOME}/}/.omp"
+  PI_CONFIG_DIR="$local_rel" OMP_AUTH_BROKER_TOKEN="$(<"$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token")" \
+    nohup omp auth-broker serve --bind=0.0.0.0:8765 >> "$BOTTEGA_DEV_DATA_DIR/auth-broker.log" 2>&1 &
+  echo "auth-broker: local omp CLI broker starting (log: $BOTTEGA_DEV_DATA_DIR/auth-broker.log)"
 fi
-echo "auth-broker: waiting for the vault token (data/.omp/auth-broker.token) + /v1/healthz on 127.0.0.1:8765..."
+echo "auth-broker: waiting for the vault token ($BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token) + /v1/healthz on 127.0.0.1:8765..."
 BROKER_READY=0
 for _ in $(seq 1 30); do
-  if [[ -f data/.omp/auth-broker.token ]] && curl -fsS -o /dev/null -m 3 http://127.0.0.1:8765/v1/healthz 2>/dev/null; then
+  if [[ -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]] && curl -fsS -o /dev/null -m 3 http://127.0.0.1:8765/v1/healthz 2>/dev/null; then
     BROKER_READY=1
     break
   fi
@@ -261,13 +293,13 @@ if [[ "$BROKER_READY" != 1 ]]; then
   echo "  bun run dev" >&2
   exit 1
 fi
-# The vault token (0600, broker.sh bootstrap on the ./data bind). Read it
-# every boot — the broker persists the token, so consecutive runs stay
-# stable. These two exports are the resolver's env contract
+# The vault token (0600, broker.sh bootstrap on the canonical data bind).
+# Read it every boot — the broker persists the token, so consecutive runs
+# stay stable. These two exports are the resolver's env contract
 # (src/extensions/boundary.ts -> brokerSecretResolverFromEnv).
 export OMP_AUTH_BROKER_URL="http://127.0.0.1:8765"
-export OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)"
-echo "auth-broker: ready (vault token at data/.omp/auth-broker.token, 0600)"
+export OMP_AUTH_BROKER_TOKEN="$(<"$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token")"
+echo "auth-broker: ready (vault token at $BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token, 0600)"
 
 # 6. Server proxy env (issue #123): same topology as compose — HTTP(S)_PROXY
 #    at the tunnel, NO_PROXY for internal names, the MITM CA for Bun/Node

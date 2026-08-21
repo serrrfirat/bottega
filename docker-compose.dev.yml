@@ -9,19 +9,22 @@
 # replaces the volume list for the dev proxy only.
 #
 # Issue #301 — the dev stack is SHARED across worktrees: scripts/dev.sh
-# exports COMPOSE_PROJECT_NAME=(canonical checkout basename) so every
-# worktree targets ONE project -> ONE egress network (reuse, no subnet
-# overlap) and ONE proxy/broker container set. That requires a stable
-# /data bind too, so dev.sh exports BOTTEGA_DEV_DATA_DIR=shared_data_dir
-# (the canonical store) and each bind below interpolates it; bare
-# `docker compose` use (docs/troubleshooting) falls back to ./data.
+# exports COMPOSE_PROJECT_NAME=(a stable hash of the canonical checkout's
+# realpath) so every worktree of ONE repo targets ONE project -> ONE egress
+# network (reuse, no subnet overlap) and ONE proxy/broker container set,
+# while unrelated same-basename clones diverge. That requires stable /data
+# AND cert binds too, so dev.sh exports BOTTEGA_DEV_DATA_DIR=shared_data_dir
+# and BOTTEGA_DEV_CERTS_DIR=shared_certs_dir and each bind below
+# interpolates them; bare `docker compose` use (docs/troubleshooting) falls
+# back to ./data and ./certs.
 #
 # The auth-broker vault (issue #143) is published for the dev server the
-# same way: its token bootstraps to the HOST's ./data/.omp/auth-broker.token
-# (0600, entrypoints/broker.sh) and it listens on 127.0.0.1:8765, so
-# scripts/dev.sh can export OMP_AUTH_BROKER_URL/TOKEN for the extension
-# runtime's broker secret resolver. The base service's image, entrypoint,
-# command, healthcheck, and environment all stay inherited.
+# same way: its token bootstraps to the HOST's canonical data/.omp/
+# auth-broker.token (0600, entrypoints/broker.sh, mounted from
+# BOTTEGA_DEV_DATA_DIR) and it listens on 127.0.0.1:8765, so scripts/dev.sh
+# can export OMP_AUTH_BROKER_URL/TOKEN for the extension runtime's broker
+# secret resolver. The base service's image, entrypoint, command,
+# healthcheck, and environment all stay inherited.
 #
 # Used only by scripts/dev.sh:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d iron-proxy auth-broker
@@ -37,10 +40,12 @@
 #     OMP_AUTH_BROKER_URL/TOKEN exported by dev.sh)
 # The override replaces the volume list: config + CA mounts match the base
 # service, and `data:/data` becomes the host's canonical data dir — the dev
-# server writes secret files to data/proxy-secrets (PROXY_SECRETS_DIR) and the
-# generated dev egress config reads them at /data/proxy-secrets
-# (PROXY_SECRETS_MOUNT_PATH), the same relative path; the broker token
-# lands at data/.omp/auth-broker.token (the same ./data bind).
+# server writes secret files to the canonical data/proxy-secrets
+# (BOTTEGA_PROXY_SECRETS_DIR) and the generated dev egress config reads them
+# at /data/proxy-secrets (PROXY_SECRETS_MOUNT_PATH), the same relative path;
+# the broker token lands at the canonical data/.omp/auth-broker.token (the
+# same BOTTEGA_DEV_DATA_DIR bind); the CA bind is the canonical certs dir
+# (BOTTEGA_DEV_CERTS_DIR).
 services:
   iron-proxy:
     ports:
@@ -48,7 +53,14 @@ services:
       - "127.0.0.1:9092:9092"
     volumes:
       - ./config/egress.dev.yml:/etc/iron-proxy/egress.yml:ro
-      - ./certs:/etc/iron-proxy/certs:ro
+      # The shared MITM CA: the CANONICAL certs dir (dev.sh exports
+      # BOTTEGA_DEV_CERTS_DIR=shared_certs_dir, issue #301) so every
+      # worktree's proxy terminates with the SAME CA — never a
+      # worktree-local cert. The `:-./certs` fallback keeps bare compose
+      # runs on the local certs dir. The generated dev egress config
+      # (config/egress.dev.yml -> tls) and the server's NODE_EXTRA_CA_CERTS
+      # point at the same CA.
+      - ${BOTTEGA_DEV_CERTS_DIR:-./certs}:/etc/iron-proxy/certs:ro
       - ${BOTTEGA_DEV_DATA_DIR:-./data}:/data
 
   auth-broker:

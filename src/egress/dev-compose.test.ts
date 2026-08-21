@@ -52,7 +52,13 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     // config (allow-all + no judge, issue #126) is what makes local testing
     // pass; the strict config stays the deployment contract (base compose).
     expect(vols).not.toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
-    expect(vols.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
+    // The MITM CA bind is the CANONICAL certs dir (dev.sh exports
+    // BOTTEGA_DEV_CERTS_DIR=shared_certs_dir, issue #301) so every worktree's
+    // dev proxy terminates with the SAME CA — never a worktree-local cert the
+    // shared stack's other containers are not terminating with. The `:-./certs`
+    // fallback keeps bare `docker compose` on the local certs dir.
+    expect(vols).toContain("${BOTTEGA_DEV_CERTS_DIR:-./certs}:/etc/iron-proxy/certs:ro");
+    expect(vols).not.toContain("./certs:/etc/iron-proxy/certs:ro");
     // The canonical data dir is interpolated by scripts/dev.sh (which exports
     // BOTTEGA_DEV_DATA_DIR=shared_data_dir, issue #301/#293): every worktree's
     // dev stack binds the SAME canonical data/ — required once worktrees share
@@ -61,9 +67,10 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
     // `docker compose` invocation from docs/troubleshooting on ./data.
     expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
     // The dev proxy must NOT use the compose named volume: the host server
-    // writes secret files to ./data/proxy-secrets (PROXY_SECRETS_DIR) and
-    // the generated egress config reads them at /data/proxy-secrets
-    // (PROXY_SECRETS_MOUNT_PATH) — one relative path, both topologies.
+    // writes secret files to the CANONICAL data/proxy-secrets
+    // (BOTTEGA_PROXY_SECRETS_DIR, issue #301) and the generated egress
+    // config reads them at /data/proxy-secrets (PROXY_SECRETS_MOUNT_PATH) —
+    // one relative path, both topologies.
     expect(vols).not.toContain("data:/data");
     expect(PROXY_SECRETS_MOUNT_PATH).toBe(`/data/${PROXY_SECRETS_DIR.split("/").pop()}`);
   });
@@ -126,13 +133,15 @@ describe("scripts/dev.sh broker wiring contract (issue #143)", () => {
   });
 
   test("waits for the token file AND the broker health probe before exporting env", () => {
-    expect(devSh).toContain("data/.omp/auth-broker.token");
+    // Readiness reads the token from the CANONICAL data dir (issue #301 —
+    // the shared broker bootstraps it there), plus the health probe.
+    expect(devSh).toContain('[[ -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]]');
     expect(devSh).toContain("http://127.0.0.1:8765/v1/healthz");
   });
 
   test("exports the resolver's env contract from the 0600 token file", () => {
     expect(devSh).toContain('export OMP_AUTH_BROKER_URL="http://127.0.0.1:8765"');
-    expect(devSh).toContain('export OMP_AUTH_BROKER_TOKEN="$(<data/.omp/auth-broker.token)"');
+    expect(devSh).toContain('export OMP_AUTH_BROKER_TOKEN="$(<"$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token")"');
   });
 
   test("fails loudly with the remedy when the broker cannot become ready (never silent)", () => {
@@ -162,5 +171,45 @@ describe("scripts/dev.sh shared dev stack wiring (issue #301)", () => {
     // The two env exports must come from the shared helper (sourced once),
     // reusing its canonical-checkout resolution rather than duplicating it.
     expect(devSh).toContain('. "$(dirname "$0")/shared-data-dir.sh"');
+  });
+
+  test("routes the credential boundary's secret files to the CANONICAL data dir (issue #301)", () => {
+    // The host server writes extension secret files to BOTTEGA_PROXY_SECRETS_DIR;
+    // that MUST be the canonical data dir's proxy-secrets (the same dir the
+    // shared dev proxy reads via PROXY_SECRETS_MOUNT_PATH from the
+    // BOTTEGA_DEV_DATA_DIR bind). A worktree-local dir would inject secrets
+    // the shared proxy's /data mount cannot see (the fresh-worktree bug).
+    expect(devSh).toContain('export BOTTEGA_PROXY_SECRETS_DIR="$(shared_data_dir)/proxy-secrets"');
+    // The proxy's persistence + management token must be canonical too.
+    expect(devSh).toContain('TOKEN_FILE="$BOTTEGA_DEV_DATA_DIR/proxy-mgmt-token"');
+    expect(devSh).toContain('export IRON_MANAGEMENT_API_KEY="$(<$TOKEN_FILE)"');
+  });
+
+  test("routes the management + broker tokens and the MITM CA to the CANONICAL store (issue #301)", () => {
+    // Broker readiness + token must read the CANONICAL data dir (.omp/
+    // auth-broker.token), never a worktree-local data/.omp the shared broker
+    // never wrote — a fresh secondary worktree boot must not wait on a local
+    // token or inject state the shared proxy/broker cannot see.
+    expect(devSh).toContain('[[ -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]]');
+
+    // The egress CA must be the canonical certs dir (dev.sh exports it),
+    // so canary-egress.ts / NODE_EXTRA_CA_CERTS / SSL_CERT_FILE trust the
+    // SAME CA the shared proxy terminates with, never a worktree-local cert.
+    expect(devSh).toContain('export BOTTEGA_DEV_CERTS_DIR="$(shared_certs_dir)"');
+    expect(devSh).toContain('mkdir -p "$BOTTEGA_DEV_CERTS_DIR"');
+    expect(devSh).toContain('docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs"');
+  });
+
+  test("renders CANONICAL host paths into the Compose override and the egress CA env", () => {
+    // The Compose override's /data and certs binds are interpolated from the
+    // canonical dirs dev.sh exports — so host and container share one path.
+    const vols = proxy["volumes"] as string[];
+    expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
+    expect(vols).toContain("${BOTTEGA_DEV_CERTS_DIR:-./certs}:/etc/iron-proxy/certs:ro");
+    // scripts/canary-egress.ts must derive the CA cert path from
+    // BOTTEGA_DEV_CERTS_DIR (the canonical certs dir) when dev.sh sets it —
+    // read the source, not the rendered dev env (no docker needed).
+    const egressSrc = readFileSync(resolve(import.meta.dir, "../../scripts/canary-egress.ts"), "utf8");
+    expect(egressSrc).toContain('process.env.BOTTEGA_DEV_CERTS_DIR ?? join(cwd, "certs")');
   });
 });
