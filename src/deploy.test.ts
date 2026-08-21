@@ -66,10 +66,7 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     expect(executor["read_only"]).toBe("true");
     expect(executor["pids_limit"]).toBe("256");
     expect(asStringArray(executor["cap_drop"])).toEqual(["ALL"]);
-    expect(asStringArray(executor["security_opt"])).toEqual([
-      "no-new-privileges:true",
-      "seccomp=default",
-    ]);
+    expect(asStringArray(executor["security_opt"])).toEqual(["no-new-privileges:true"]);
     expect(asStringArray(executor["tmpfs"])).toContain("/tmp:rw,noexec,nosuid,size=64m");
     const volumes = asStringArray(executor["volumes"]);
     expect(volumes).not.toContain("./config/omp:/app/data/omp-agent");

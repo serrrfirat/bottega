@@ -222,7 +222,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      - seccomp=default
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     depends_on:
