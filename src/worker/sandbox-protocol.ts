@@ -46,10 +46,20 @@ export const sandboxExecuteRequestSchema = z
   .object({
     version: z.literal(SANDBOX_PROTOCOL_VERSION),
     mode: z.literal("execute"),
-    dbPath: z.string().min(1).max(4_096),
+    // The child-process (test-fabric) lane opens the one allowlisted store
+    // file at `dbPath`. The PRODUCTION Docker lane OMITS it entirely: the job
+    // container never holds/opens a SQLite file and reaches the store only
+    // over the mounted RPC socket, so the request carries no dbPath and the
+    // job env/args never reveal one.
+    dbPath: z.string().min(1).max(4_096).optional(),
     job: workerJobSchema,
     config: sandboxConfigSchema,
     caps: capsSchema,
+    // The supervisor's parsed org settings blob (JSON-safe), injected so the
+    // child's shared composition chain (loadOrgPolicy, secret resolver, agent
+    // dir pin) never needs a synchronous store read over the async RPC socket.
+    // Present in the Docker lane (and any lane that boots over RPC).
+    orgSettings: z.unknown().optional(),
   })
   .strict();
 

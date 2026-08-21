@@ -15,9 +15,9 @@
  * unknown action instead of silently no-oping.
  */
 import { randomUUID } from "node:crypto";
-import { maintainMemory } from "../memory/consolidation";
+import { maintainMemory, type ConsolidationResult } from "../memory/consolidation";
 import type { Store } from "../store/db";
-import type { SchedulerAction } from "./types";
+import type { SchedulerAction, SchedulerActionContext } from "./types";
 
 const ACTION_NAME = "memory_consolidation" as const;
 
@@ -57,6 +57,12 @@ export function memoryConsolidationAction(): SchedulerAction {
           "memory_consolidation requires the executor's consolidation model call — " +
             "the server never runs this action in-process (issue #272)",
         );
+      }
+      if (ctx.runMemoryConsolidation !== undefined) {
+        // The disposable job container routes the DB leg of consolidation to
+        // the supervisor over RPC (it holds no SQLite handle); the LLM leg
+        // still runs in the worker via the model-call bridge.
+        return ctx.runMemoryConsolidation();
       }
       return maintainMemory(ctx.store.getDb(), modelCall);
     },

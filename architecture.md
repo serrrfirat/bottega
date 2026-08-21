@@ -936,39 +936,60 @@ flowchart LR
 ```
 
 Every durable worker kind crosses the same mandatory container boundary. The
-executor serializes one strict, bounded, non-secret job request into the
-job container's stdin; the container reopens only the configured SQLite
-file, derives the job scope from that envelope, and writes lifecycle,
-outbox, and audit rows through the scoped-store facade. There is no
-production in-process fallback. Missing launcher wiring, invalid IPC, an
-unavailable Docker/container runtime, a timeout, or lease loss fails
-closed. Timeout and lease loss deterministically remove the full container
-tree before the supervisor maps the exit contract.
+supervisor RETAINS the real Store and its SQLite-backed memory provider
+(single-writer on the data volume, #101) and exposes ONLY job-scoped
+store/memory operations to the container over a bounded unix-socket RPC
+(`src/worker/store-rpc.ts`): one newline-delimited JSON frame per message,
+hard frame caps in both directions, per-call timeouts, and an explicit
+method ALLOWLIST with a job-scoped-store firewall layered beneath it
+(`createJobScopedStore`). The job container never holds or opens the shared
+`bottega.db` bytes and never calls `getDb`/`close`. The executor serializes
+one strict, bounded, non-secret job request into the job container's stdin;
+the container consumes the injected RPC store/memory, derives the job scope
+from that envelope, and writes lifecycle, outbox, and audit rows through the
+scoped RPC facade. Cross-job rows, global writes (enqueue/claim/sweep),
+policy/credential/scheduler writes, unknown methods, and malformed or
+oversized frames all FAIL CLOSED. There is no production in-process
+fallback. Missing launcher wiring, invalid IPC, an unavailable
+Docker/container runtime, a timeout, or lease loss fails closed. Timeout and
+lease loss deterministically remove the full container tree before the
+supervisor maps the exit contract.
 
-The job-container environment is an allowlist. Slack and webhook secrets,
-provider keys, and proxy-management credentials are absent. The git PAT file
-is mounted (or, on the shared data volume, present) only for `git` jobs. The
-auth-broker token file is present only for `extension` jobs. Other kinds
-receive neither credential mount. HTTP(S) uses iron-proxy settings; the job
-container's egress has no direct route and must traverse the proxy.
+The job-container environment is an allowlist, and its mounts are exact per-job
+subpaths — never a shared root and never a SQLite file. Slack and webhook
+secrets, provider keys, and proxy-management credentials are absent. The
+shared `data` volume is mounted into a job container only as exact
+`--mount type=volume,src=data,…,volume-subpath=<subdir>` subpaths: the job's
+own workspace subdir, its own transcript/session subdir, the per-job RPC
+socket dir, and (for the kinds that authorize them) per-job credential
+subdirs prepared and cleaned up by the supervisor. The git PAT (askpass) is
+present only for `git` and `github` ingest_poll jobs; the auth-broker token
+only for `extension` jobs; other kinds receive neither. HTTP(S) uses
+iron-proxy settings; the job container's egress has no direct route and must
+traverse the proxy.
 
 The deployment applies the #105 controls at the executor-container boundary
 (read-only image root, writable durable data and disposable workspace
 mounts, all capabilities dropped, no-new-privileges, seccomp, bounded
-PIDs/memory, an init reaper) and the per-job container likewise runs
-read-only root with only the declared store/workspace/credential mounts,
-dropped capabilities, bounded memory/PIDs, and an allowlisted env. Timeout
-and lease loss deterministically remove the whole container (and its
+PIDs/memory, an init reaper). The executor itself (the supervisor) is the
+only process that mounts the whole `data` volume. The per-job container
+likewise runs read-only root with only its exact workspace/transcript/socket/
+credential subpath mounts, dropped capabilities, bounded memory/PIDs, and an
+allowlisted env; ls env names are hard-dropped, and job stdout is the
+single bounded result JSON (all `console.*` writes are redirected to stderr).
+Timeout and lease loss deterministically remove the whole container (and its
 process tree) via `docker kill`, so no job ever leaks a container.
 
 One deployment-gated leg remains for end-to-end network isolation: the
 per-job container joins the egress network with the proxy as DNS, which the
-CI Docker job exercises. Local non-Linux runs verify the request/result IPC,
-scope, and teardown boundary hermetically (injected docker/client seams) and
-skip the real-container lane only where no Docker socket is present; CI's
-Docker job is the required no-skip lane for read-only root, writable
-workspace, capabilities, bounded result IPC, container teardown, and
-mandatory-proxy egress.
+CI Docker job exercises with the real production image and `docker run` args
+(`BOTTEGA_RUN_INTEGRATION=1`; a printed SKIP is treated as a CI failure).
+Local non-Linux runs verify the request/result IPC, scope, RPC allowlist,
+mount scoping, and teardown boundary hermetically (injected docker/client
+seams + real RPC server/client over a temp socket) and skip the real-container
+lane only where no Docker socket is present; CI's Docker job is the required
+no-skip lane for read-only root, writable workspace, capabilities, bounded
+result IPC, container teardown, and mandatory-proxy egress.
 
 ## Persistence & audit
 
@@ -1031,7 +1052,7 @@ is never deleted: "cleanup" evicts caches, never rows.
 | Untrusted ingress | Adapters validate every event; only adapters mint messages |
 | Credential exposure | Per-turn principal selects the credential; omp-broker or 1Password Connect resolves it; mode-0600 files and iron-proxy inject it only at the allowlisted host. API-key onboarding can use a single-use browser upload (#196). Slack tokens stay server-only; the git PAT stays file-only |
 | Secret pasted into a typed connect/memory write | Recognized shapes are refused before broker/persistence/audit and redirected to OAuth, the configured vault, or `connect_upload_link`. This does not scrub arbitrary Slack text already received |
-| Malicious repo content | Every job runs in a dedicated disposable Docker container with its own writable workspace; the server never mounts repository paths. Root is read-only, capabilities are dropped, and the job container cannot touch host paths outside the declared store/workspace mounts |
+| Malicious repo content | Every job runs in a dedicated disposable Docker container with its own writable workspace subdir; the server never mounts repository paths. Root is read-only, capabilities are dropped, and the job container touches only its exact subpath mounts — never the shared data root and never the SQLite store (it reaches the store only over the bounded, allowlisted job-scoped RPC socket) |
 | Exfiltration / rogue egress | Job-container env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Egress has no direct route and traverses iron-proxy default-deny allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
 | Unauthorized side effects | Policy gate on every tool call; exec and org-settings writes ask humans; unknown → deny |
 | Cross-user credential confusion | The driver binds the fresh turn's principal; steers do not replace it (#152), and one tool call dispatches once (#178) |

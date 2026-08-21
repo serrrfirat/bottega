@@ -266,13 +266,23 @@ services:
       # Related only to extension jobs: the supervisor passes this FILE
       # mount to that child kind, never the bearer value or other jobs.
       OMP_AUTH_BROKER_TOKEN_FILE: /app/data/.omp/auth-broker.token
-      # Per-job container isolation (issue #101/#338): the supervisor mounts
-      # the host docker socket to launch one disposable container per claimed
-      # job. The job container is a host sibling, so the DB/workspaces mounts
-      # reference the shared `data` named volume (Docker-out-of-Docker
-      # path-free), egress traverses iron-proxy on the `egress` network with
-      # the proxy as DNS, and the egress MITM CA is bind-mounted read-only.
+      # Per-job container isolation (issue #101/#338): the supervisor retains
+      # the real Store (single-writer on the shared `data` volume) and exposes
+      # ONLY job-scoped store/memory ops to each disposable job container over
+      # a bounded unix-socket RPC. The supervisor mounts the host docker socket
+      # to launch one container per claimed job. Each job container mounts ONLY
+      # its own workspace subdir, its own transcript subdir, the RPC socket
+      # dir, the egress MITM CA, and the exact kind-authorized credential
+      # subdir — NEVER the whole shared `data` volume and NEVER a SQLite file.
+      # Egress traverses iron-proxy on the `egress` network with the proxy as
+      # DNS; the CA is bind-mounted read-only.
       BOTTEGA_SANDBOX_DATA_VOLUME: data
+      # The supervisor-visible paths where the shared `data` volume root is
+      # mounted for the workspaces axis (`/workspaces`) and the state axis
+      # (`/app/data`) — used to compute per-job `volume-subpath` mounts so a
+      # job container sees only its own subdirectories.
+      BOTTEGA_SANDBOX_WORKSPACES_VOLUME_ROOT: /workspaces
+      BOTTEGA_SANDBOX_STATE_VOLUME_ROOT: /app/data
       BOTTEGA_SANDBOX_NETWORK: ${BOTTEGA_SANDBOX_NETWORK:-bottega_egress}
       BOTTEGA_SANDBOX_DNS: 172.30.0.2
       BOTTEGA_SANDBOX_PROXY_URL: http://iron-proxy:8080
@@ -281,7 +291,8 @@ services:
       # job container can verify proxied TLS). Override for remote hosts.
       BOTTEGA_SANDBOX_CA_CERT_HOST: ${BOTTEGA_SANDBOX_CA_CERT_HOST:-${PWD}/certs/ca.crt}
       # The job container preserves only the allowlisted passthrough names;
-      # it never receives Slack tokens or the raw parent environment.
+      # it never receives Slack tokens or the raw parent environment — the
+      # RPC store surface (explicit allowlist) is its only data path.
       BOTTEGA_SANDBOX_DOCKER_SOCKET: /var/run/docker.sock
     volumes:
       - data:/app/data
@@ -296,7 +307,13 @@ services:
       - egress
 
 volumes:
+  # The shared `data` volume: single-writer SQLite store + secrets + transcripts
+  # + workspaces. Named `data` (not the compose-default `<project>_data`) so the
+  # executor's sibling per-job containers (Docker-out-of-Docker) can mount exact
+  # per-job SUBPATHS of it by name via `--mount type=volume,volume-subpath=…`
+  # (BOTTEGA_SANDBOX_DATA_VOLUME). The job containers never mount the whole root.
   data:
+    name: data
 
 networks:
   egress:

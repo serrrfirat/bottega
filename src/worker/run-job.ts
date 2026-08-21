@@ -33,17 +33,21 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
 import type { Store } from "../store/db";
+import type { OrgSettings } from "../store/org-settings";
+import type { ResolvedMemoryProvider } from "../server/memory-provider";
 import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
-import { postOutboxRow } from "../store/outbox";
+import { postOutboxRow, type OutboxWrite } from "../store/outbox";
 import { createAudit, type AuditModule } from "../policy/audit";
 import type { SchedulerActionName } from "../scheduler/types";
-import { scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
+import { ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import { resolveKindCaps, type JobResourceCaps } from "./caps";
+import { JobStoreRpcServer } from "./store-rpc";
 import {
   MAX_SANDBOX_REQUEST_BYTES,
   MAX_SANDBOX_RESPONSE_BYTES,
@@ -219,11 +223,16 @@ export async function probeChildProcessSandbox(options: {
 // ---------------------------------------------------------------------------
 
 /** Container-internal mount points (the app image WORKDIR is /app). */
-const CONTAINER_DATA_DIR = "/app/data";
-const CONTAINER_DB_PATH = "/app/data/bottega.db";
-const CONTAINER_WORKSPACES_DIR = "/workspaces";
-const CONTAINER_TRANSCRIPT_DIR = "/app/data/transcripts";
+/** No bottega.db is ever mounted: the child reaches the store only over RPC. */
+const CONTAINER_WORKSPACES_ROOT = "/workspaces";
+const CONTAINER_TRANSCRIPTS_ROOT = "/transcripts";
+const CONTAINER_RPC_DIR = "/rpc";
+const CONTAINER_RPC_SOCKET = "/rpc/store.sock";
+/** The git credential dir (PAT + askpass) mounted exactly for git-authorized jobs. */
+const CONTAINER_GIT_SECRETS_DIR = "/app/data/secrets";
 const CONTAINER_GIT_TOKEN_FILE = "/app/data/secrets/github-pat";
+/** The auth-broker credential dir mounted exactly for extension jobs. */
+const CONTAINER_BROKER_DIR = "/app/data/.omp";
 const CONTAINER_BROKER_TOKEN_FILE = "/app/data/.omp/auth-broker.token";
 const CONTAINER_CA_CERT_PATH = "/etc/iron-proxy/certs/ca.crt";
 const CONTAINER_ASKPASS_SCRIPT = "/app/data/secrets/git-askpass.sh";
@@ -235,19 +244,34 @@ const DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock";
 const CONTAINER_CHILD_ENTRYPOINT = "/app/src/worker/run-job-child.ts";
 
 export interface DockerSandboxOptions {
-  /** Host path to the single SQLite store file, mounted rw into the container. */
-  dbPath: string;
-  /** Host path to the workspaces root (org setting), mounted rw into the container. */
+  /** Host path to the job's own workspace dir (git/extension), mounted exactly. */
   workspacesDir: string;
-  /** Host path to the transcripts dir, mounted rw into the container. */
+  /** Host path to the transcripts dir; the job's own subdir is mounted exactly. */
   transcriptDir: string;
   /**
-   * When set (e.g. "data"), the runner mounts that Docker named volume at the
-   * container-internal paths instead of the host paths above. Used by the
-   * compose deployment where the executor and the job container are siblings
-   * sharing the `data` volume and the executor cannot see host paths.
+   * When set (e.g. "data"), the runner mounts the named volume via
+   * `--mount type=volume,volume-subpath=<exact subdir>` so the job container
+   * sees ONLY its own workspace/transcript/credential/socket subpaths — never
+   * the whole volume. Used by the compose deployment (Docker-out-of-Docker).
+   * Host paths below are the SUPERVISOR's view (the executor container).
    */
   volume?: string;
+  /**
+   * The supervisor-visible host path at which the named volume root is
+   * mounted for the workspaces axis (volume mode). In compose, `data` mounts
+   * at `/workspaces`, so this is `/workspaces` and a job workspace
+   * `<workspacesDir>/<itemId>` maps to volume-subpath `<itemId>`.
+   */
+  volumeWorkspacesRoot?: string;
+  /**
+   * The supervisor-visible host path at which the named volume root is
+   * mounted for the transcripts/state axis (volume mode). In compose, `data`
+   * mounts at `/app/data`, so this is `/app/data` and a transcript dir
+   * `/app/data/transcripts/<itemId>` maps to volume-subpath
+   * `transcripts/<itemId>`.
+   */
+  volumeStateRoot?: string;
+  /** The supervisor's job args/request must never reveal a DB path — this is never mounted. */
   /** Job container image (defaults to the app/tools-derived image). */
   image?: string;
   /** Docker network the job container joins (egress). "none" for hermetic. */
@@ -262,6 +286,22 @@ export interface DockerSandboxOptions {
   gitTokenFile?: string;
   /** Host path to the auth-broker token file (extension kind only). */
   brokerTokenFile?: string;
+  /** Host path to the askpass script (git kind). */
+  askpassScript?: string;
+  /**
+   * The supervisor's REAL store (issue #101). The RPC server the supervisor
+   * starts per job wraps THIS store in the job's scope; the job container
+   * never sees the raw handle. Required for the production lane.
+   */
+  hostStore?: Store;
+  /**
+   * The supervisor's REAL memory provider (issue #101). The RPC server
+   * forwards the job's memory calls to it (kb ingest saves org memories;
+   * scheduled consolidation runs supervisor-side). Required for production.
+   */
+  memoryProvider?: ResolvedMemoryProvider;
+  /** The supervisor's parsed org settings, serialized into the job request so the child boot needs no sync store read. */
+  orgSettings?: OrgSettings | null;
   /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
   docker?: DockerClient;
   /** Fail closed at boot when docker is unavailable (no in-process/child fallback). */
@@ -335,7 +375,6 @@ export function createDockerClient(socket: string): DockerClient {
 
 /** Boot-time proof that docker and the job container image are usable. */
 export async function probeDockerSandbox(options: {
-  dbPath: string;
   workspacesDir: string;
   transcriptDir: string;
   volume?: string;
@@ -348,7 +387,6 @@ export async function probeDockerSandbox(options: {
   const docker = options.requireDocker ? requireDockerClient() : optionalDockerClient();
   if (docker === null) throw new Error("sandbox unavailable: docker CLI or socket is not available (no container fallback)");
   const response = await launchDockerContainer(docker, { mode: "probe" }, {
-    dbPath: options.dbPath,
     workspacesDir: options.workspacesDir,
     transcriptDir: options.transcriptDir,
     volume: options.volume,
@@ -374,8 +412,9 @@ export async function probeDockerSandbox(options: {
  * a host child process or in-process execution.
  */
 export function createDockerSandboxRunner(options: DockerSandboxOptions): SandboxRunner {
-  if (options.dbPath.trim() === "") throw new Error("sandbox database path is required");
   if (options.workspacesDir.trim() === "") throw new Error("sandbox workspaces dir is required");
+  if (options.hostStore === undefined) throw new Error("sandbox store is required (the supervisor's real store)");
+  if (options.memoryProvider === undefined) throw new Error("sandbox memory provider is required (the supervisor's real provider)");
   const docker = options.docker ?? (options.requireDocker ? requireDockerClient() : optionalDockerClient());
   if (docker === null) {
     throw new Error("sandbox unavailable: docker CLI or socket is not available (no container fallback)");
@@ -387,25 +426,31 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
     const request: SandboxRequest = {
       version: SANDBOX_PROTOCOL_VERSION,
       mode: "execute",
-      dbPath: CONTAINER_DB_PATH,
+      // The job container NEVER opens or mounts a SQLite store file: dbPath is
+      // omitted. It reaches the store only over the mounted RPC socket.
       job,
       config: containerConfig(ctx.cfg, options),
       caps: ctx.caps,
+      orgSettings: options.orgSettings ?? undefined,
     };
     const containerName = `${namePrefix}-${sanitizeContainerName(job.id)}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const response = await launchDockerContainer(docker, request, {
-      dbPath: options.dbPath,
       workspacesDir: options.workspacesDir,
       transcriptDir: options.transcriptDir,
       volume: options.volume,
+      volumeWorkspacesRoot: options.volumeWorkspacesRoot,
+      volumeStateRoot: options.volumeStateRoot,
+      hostStore: options.hostStore,
+      memoryProvider: options.memoryProvider,
       askpassScript: ctx.cfg.askpassScript,
       image,
       network,
       dns: options.dns,
       proxyUrl: options.proxyUrl,
       caCertHostPath: options.caCertHostPath,
-      gitTokenFile: options.gitTokenFile,
+      gitTokenFile: options.gitTokenFile ?? ctx.cfg.tokenFile,
       brokerTokenFile: options.brokerTokenFile,
+      job: job,
       jobId: job.id,
       caps: ctx.caps,
       signal: ctx.signal,
@@ -423,8 +468,8 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
 function containerConfig(cfg: ExecutorConfig, _options: DockerSandboxOptions): ExecutorConfig {
   return {
     ...cfg,
-    workspacesDir: CONTAINER_WORKSPACES_DIR,
-    transcriptDir: CONTAINER_TRANSCRIPT_DIR,
+    workspacesDir: CONTAINER_WORKSPACES_ROOT,
+    transcriptDir: CONTAINER_TRANSCRIPTS_ROOT,
     tokenFile: CONTAINER_GIT_TOKEN_FILE,
     askpassScript: CONTAINER_ASKPASS_SCRIPT,
   };
@@ -450,10 +495,11 @@ type DockerLaunchResult =
   | { kind: "error"; protocolError: string };
 
 interface DockerLaunchOptions {
-  dbPath: string;
   workspacesDir: string;
   transcriptDir: string;
   volume?: string;
+  volumeWorkspacesRoot?: string;
+  volumeStateRoot?: string;
   askpassScript?: string;
   image: string;
   network: string;
@@ -462,6 +508,10 @@ interface DockerLaunchOptions {
   caCertHostPath?: string;
   gitTokenFile?: string;
   brokerTokenFile?: string;
+  /** The supervisor's real store, host-side (job-scoped RPC host). */
+  hostStore?: import("../store/db").Store;
+  memoryProvider?: ResolvedMemoryProvider;
+  job?: WorkerJob;
   jobId: string;
   caps: JobResourceCaps;
   signal: AbortSignal;
@@ -472,7 +522,10 @@ interface DockerLaunchOptions {
  * Launches one disposable job container, writes the bounded request DTO over
  * stdin, reads the single bounded result JSON from stdout (job logs stream
  * from stderr), and deterministically removes the container on timeout,
- * lease loss, IPC violation, or normal exit.
+ * lease loss, IPC violation, or normal exit. The supervisor starts a
+ * job-scoped {@link JobStoreRpcServer} over the shared volume/socket dir
+ * before launch and tears it down (with the per-job credential/socket
+ * subdirs) after the container exits — the container never sees the DB.
  */
 async function launchDockerContainer(
   docker: DockerClient,
@@ -483,11 +536,32 @@ async function launchDockerContainer(
   if (Buffer.byteLength(encoded) > MAX_SANDBOX_REQUEST_BYTES) {
     return { kind: "error", protocolError: "sandbox request exceeds IPC limit" };
   }
-  const args = dockerRunArgs(request, opts);
+  // Prepare the per-job RPC socket dir + credentials, then start the
+  // job-scoped store RPC host (execute lane only; the probe needs no store).
+  const prep = request.mode === "execute" ? prepareJobMounts(opts) : null;
+  let rpcServer: JobStoreRpcServer | null = null;
+  let rpcDirHost = "";
+  if (prep !== null) {
+    rpcDirHost = prep.rpcDirHost;
+    if (opts.hostStore !== undefined && opts.job !== undefined) {
+      rpcServer = JobStoreRpcServer.create(opts.hostStore, jobScopeFromEnvelope(opts.job), rpcDirHost, {
+        memoryProvider: opts.memoryProvider,
+      });
+      try {
+        await rpcServer.listen();
+      } catch (error) {
+        cleanupJobMounts(prep);
+        return { kind: "error", protocolError: `sandbox unavailable: store RPC socket bind failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+  }
+  const args = dockerRunArgs(request, opts, rpcDirHost);
   let proc: DockerProcess;
   try {
     proc = docker.launch(args);
   } catch (error) {
+    rpcServer?.close();
+    cleanupJobMounts(prep);
     return { kind: "error", protocolError: `sandbox unavailable: docker launch failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 
@@ -525,6 +599,8 @@ async function launchDockerContainer(
   // Guaranteed cleanup: never leak a container after the launcher returns
   // (--rm already removes it on exit; the net rm covers unexpected states).
   ensureContainerRemoved(docker, opts.containerName);
+  rpcServer?.close();
+  cleanupJobMounts(prep);
 
   if (timedOut || leaseLost) {
     const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
@@ -560,7 +636,7 @@ async function launchDockerContainer(
 }
 
 /** Builds the one `docker run --rm -i` invocation for a single job container. */
-function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions): string[] {
+function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDirHost: string): string[] {
   const args = [
     "run",
     "--rm",
@@ -580,38 +656,12 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions): stri
   if (opts.dns !== undefined && opts.dns.length > 0) {
     for (const dns of opts.dns) args.push("--dns", dns);
   }
-  // Explicit mounts only: the store file, the workspace root, transcripts,
-  // and (for the kinds that need them) the job-scoped credential files and
-  // the egress CA. Root stays read-only. In named-volume mode the executor
-  // and the job container are Docker-out-of-Docker siblings sharing a volume,
-  // so the same volume is mounted at the container-internal paths the child
-  // expects (the deploy mounts `data` at both /app/data and /workspaces).
-  if (opts.volume !== undefined && opts.volume !== "") {
-    args.push("-v", `${opts.volume}:${CONTAINER_DATA_DIR}:rw`);
-    args.push("-v", `${opts.volume}:${CONTAINER_WORKSPACES_DIR}:rw`);
-  } else {
-    args.push("-v", `${opts.dbPath}:${CONTAINER_DB_PATH}:rw`);
-    args.push("-v", `${opts.workspacesDir}:${CONTAINER_WORKSPACES_DIR}:rw`);
-    args.push("-v", `${opts.transcriptDir}:${CONTAINER_TRANSCRIPT_DIR}:rw`);
-  }
-  if (opts.caCertHostPath !== undefined && opts.caCertHostPath !== "") {
-    args.push("-v", `${opts.caCertHostPath}:${CONTAINER_CA_CERT_PATH}:ro`);
-  }
-  if (request.mode === "execute" && request.job.kind === "git" && (opts.volume === undefined || opts.volume === "") && opts.askpassScript !== undefined && opts.askpassScript !== "") {
-    // Host-path mode: the askpass script (host file) is mounted read-only at
-    // the container path; it cats the EXECUTOR_GIT_TOKEN_FILE env so the token
-    // file itself stays file-scoped. Volume mode covers it via the data volume.
-    args.push("-v", `${opts.askpassScript}:${CONTAINER_ASKPASS_SCRIPT}:ro`);
-  }
-  if (opts.volume === undefined || opts.volume === "") {
-    // Host-path mode: mount the job-scoped credential files explicitly.
-    if (opts.gitTokenFile !== undefined && opts.gitTokenFile !== "" && request.mode === "execute" && request.job.kind === "git") {
-      args.push("-v", `${opts.gitTokenFile}:${CONTAINER_GIT_TOKEN_FILE}:ro`);
-    }
-    if (opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "" && request.mode === "execute" && request.job.kind === "extension") {
-      args.push("-v", `${opts.brokerTokenFile}:${CONTAINER_BROKER_TOKEN_FILE}:ro`);
-    }
-  }
+  // Exact per-job mounts only — NEVER the whole shared volume and NEVER the
+  // SQLite store. The job container sees its own workspace subdir, its own
+  // transcript subdir, the RPC socket dir, the egress CA, and the exact
+  // kind-authorized credential files/subdirs. Root stays read-only.
+  appendContainerMounts(args, request, opts, rpcDirHost);
+
   // Allowlisted environment only: the child marker + Docker lane marker, the
   // job-scoped credential handles, and the allowlisted host passthroughs.
   const env: Record<string, string> = { BOTTEGA_SANDBOX_CHILD: "1", BOTTEGA_SANDBOX_DOCKER: "1" };
@@ -628,7 +678,8 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions): stri
     env.NODE_EXTRA_CA_CERTS = CONTAINER_CA_CERT_PATH;
   }
   if (request.mode === "execute") {
-    if (request.job.kind === "git" && opts.gitTokenFile !== undefined && opts.gitTokenFile !== "") {
+    const needsGitToken = jobNeedsGitToken(request.job);
+    if (opts.gitTokenFile !== undefined && opts.gitTokenFile !== "" && needsGitToken) {
       env.EXECUTOR_GIT_TOKEN_FILE = CONTAINER_GIT_TOKEN_FILE;
     }
     if (request.job.kind === "extension" && opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "") {
@@ -640,6 +691,168 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions): stri
   }
   args.push(opts.image, "bun", CONTAINER_CHILD_ENTRYPOINT);
   return args;
+}
+
+/** Appends the exact per-job mounts to the `docker run` arg list. */
+function appendContainerMounts(args: string[], request: SandboxRequest, opts: DockerLaunchOptions, rpcDirHost: string): void {
+  const volumeMode = opts.volume !== undefined && opts.volume !== "";
+  const itemId = request.mode === "execute" ? jobScopeFromEnvelope(request.job).workItemId : null;
+
+  // Per-job workspace subdir (git/extension only).
+  if (itemId !== null) {
+    const workspaceHost = join(opts.workspacesDir, itemId);
+    if (volumeMode) {
+      const sub = relativeSubpath(opts.volumeWorkspacesRoot ?? opts.workspacesDir, workspaceHost);
+      args.push("--mount", `type=volume,src=${opts.volume},dst=${join(CONTAINER_WORKSPACES_ROOT, itemId)},volume-subpath=${sub}`);
+    } else {
+      args.push("-v", `${workspaceHost}:${join(CONTAINER_WORKSPACES_ROOT, itemId)}:rw`);
+    }
+  }
+  // Per-job transcript/session subdir (git/extension only).
+  if (itemId !== null) {
+    const transcriptHost = join(opts.transcriptDir, itemId);
+    if (volumeMode) {
+      const sub = relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), transcriptHost);
+      args.push("--mount", `type=volume,src=${opts.volume},dst=${join(CONTAINER_TRANSCRIPTS_ROOT, itemId)},volume-subpath=${sub}`);
+    } else {
+      args.push("-v", `${transcriptHost}:${join(CONTAINER_TRANSCRIPTS_ROOT, itemId)}:rw`);
+    }
+  }
+  // Per-job RPC socket dir (execute lane only).
+  if (request.mode === "execute" && rpcDirHost !== "") {
+    if (volumeMode) {
+      const sub = relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), rpcDirHost);
+      args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_RPC_DIR},volume-subpath=${sub}`);
+    } else {
+      args.push("-v", `${rpcDirHost}:${CONTAINER_RPC_DIR}:rw`);
+    }
+  }
+  // Egress MITM CA (read-only).
+  if (opts.caCertHostPath !== undefined && opts.caCertHostPath !== "") {
+    args.push("-v", `${opts.caCertHostPath}:${CONTAINER_CA_CERT_PATH}:ro`);
+  }
+  // Exact kind-authorized credential material. In volume mode these come
+  // from the job-specific prepared credential subdirs (see prepareJobMounts).
+  if (request.mode === "execute") {
+    if (jobNeedsGitToken(request.job) && opts.gitTokenFile !== undefined && opts.gitTokenFile !== "") {
+      if (volumeMode) {
+        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_GIT_SECRETS_DIR},volume-subpath=${relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), gitCredDirHost(opts, request.job.id))}`);
+      } else {
+        args.push("-v", `${opts.gitTokenFile}:${CONTAINER_GIT_TOKEN_FILE}:ro`);
+        if (opts.askpassScript !== undefined && opts.askpassScript !== "") {
+          args.push("-v", `${opts.askpassScript}:${CONTAINER_ASKPASS_SCRIPT}:ro`);
+        }
+      }
+    }
+    if (request.job.kind === "extension" && opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "") {
+      if (volumeMode) {
+        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_BROKER_DIR},volume-subpath=${relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), extensionCredDirHost(opts, request.job.id))}`);
+      } else {
+        args.push("-v", `${opts.brokerTokenFile}:${CONTAINER_BROKER_TOKEN_FILE}:ro`);
+      }
+    }
+  }
+}
+
+/** True when a job kind legitimately authorizes the git PAT file (git delivery + github ingest_poll). */
+function jobNeedsGitToken(job: WorkerJob): boolean {
+  if (job.kind === "git") return true;
+  if (job.kind === "ingest_poll") {
+    const parsed = ingestPollJobPayloadSchema.safeParse(job.payload);
+    return parsed.success && parsed.data.provider === "github";
+  }
+  return false;
+}
+
+/** The host-space sandbox staging root under the shared volume (via the state axis). */
+function sandboxStagingRoot(opts: DockerLaunchOptions): string {
+  return join(dirname(opts.transcriptDir), ".omp", "sandbox");
+}
+/** Host path of the git credential subdir prepared for a job. */
+function gitCredDirHost(opts: DockerLaunchOptions, jobId: string): string {
+  return join(sandboxStagingRoot(opts), "creds", jobId, "git");
+}
+/** Host path of the extension credential subdir prepared for a job. */
+function extensionCredDirHost(opts: DockerLaunchOptions, jobId: string): string {
+  return join(sandboxStagingRoot(opts), "creds", jobId, "extension");
+}
+
+interface PreparedJobMounts {
+  rpcDirHost: string;
+  /** Host paths created; removed on teardown (never shared roots). */
+  createdDirs: string[];
+}
+
+/**
+ * Prepares the per-job writable subdirs the container will see: the RPC
+ * socket dir (and, in volume mode, the workspace/transcript/credential
+ * subdirs so `volume-subpath` exists). Only the exact subdirs are created —
+ * never a shared root. Returns the staging handle for teardown.
+ */
+function prepareJobMounts(opts: DockerLaunchOptions): PreparedJobMounts {
+  const staging = sandboxStagingRoot(opts);
+  const rpcDirHost = join(staging, "rpc", opts.jobId);
+  const createdDirs: string[] = [rpcDirHost];
+  mkdirSync(rpcDirHost, { recursive: true });
+  const itemId = opts.job !== undefined ? jobScopeFromEnvelope(opts.job).workItemId : null;
+  if (itemId !== null) {
+    const workspaceHost = join(opts.workspacesDir, itemId);
+    mkdirSync(workspaceHost, { recursive: true });
+    createdDirs.push(workspaceHost);
+    const transcriptHost = join(opts.transcriptDir, itemId);
+    mkdirSync(transcriptHost, { recursive: true });
+    createdDirs.push(transcriptHost);
+  }
+  // Copy the exact kind-authorized credential files into per-job credential
+  // dirs (volume mode mounts `volume-subpath` into the container). We copy
+  // rather than mount individual files because `--mount volume-subpath` can
+  // only address an existing subdir on the shared volume.
+  if (opts.job !== undefined) {
+    if (jobNeedsGitToken(opts.job) && opts.gitTokenFile !== undefined && opts.gitTokenFile !== "" && opts.askpassScript !== undefined && opts.askpassScript !== "") {
+      const gitDir = gitCredDirHost(opts, opts.jobId);
+      mkdirSync(gitDir, { recursive: true });
+      copyFileInto(opts.gitTokenFile, join(gitDir, "github-pat"), 0o600);
+      copyFileInto(opts.askpassScript, join(gitDir, "git-askpass.sh"), 0o700);
+      createdDirs.push(gitDir);
+    }
+    if (opts.job.kind === "extension" && opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "") {
+      const extDir = extensionCredDirHost(opts, opts.jobId);
+      mkdirSync(extDir, { recursive: true });
+      copyFileInto(opts.brokerTokenFile, join(extDir, "auth-broker.token"), 0o600);
+      createdDirs.push(extDir);
+    }
+  }
+  return { rpcDirHost, createdDirs };
+}
+
+/** Copies a secret file into the per-job credential dir with the exact mode. */
+function copyFileInto(src: string, dest: string, mode: number): void {
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, readFileSync(src), { mode });
+  chmodSync(dest, mode);
+}
+
+/** Best-effort per-job teardown: removes only the dirs this job created. */
+function cleanupJobMounts(prep: PreparedJobMounts | null): void {
+  if (prep === null) return;
+  for (const dir of prep.createdDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort; the container (--rm) is already gone and a leftover
+      // per-job dir is inert, not a shared-root leak.
+    }
+  }
+}
+
+/** The path of `full` relative to `root` (both absolute), with no leading slash. */
+function relativeSubpath(root: string, full: string): string {
+  const r = root.replace(/\/+$/, "");
+  const f = full.replace(/\/+$/, "");
+  if (!f.startsWith(r)) {
+    throw new Error(`path ${full} is not inside volume root ${root}`);
+  }
+  return f.slice(r.length).replace(/^\/+/, "");
 }
 
 /** Deterministic full-container teardown: SIGKILL the container's cgroup. */
@@ -1002,6 +1215,7 @@ export async function runScheduledJobBody(
       log: (line) => console.log(`[${job.id}] ${line}`),
       now: Date.now,
       consolidationModelCall: deps.consolidationModelCall,
+      ...(deps.runMemoryConsolidation !== undefined ? { runMemoryConsolidation: deps.runMemoryConsolidation } : undefined),
     });
     await completeSelf(store, audit, job, { state: "completed", result: result ?? null });
     return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
@@ -1124,15 +1338,32 @@ export async function unstickWorkItem(store: Store, workItemId: string, reason: 
   }
 }
 
+/**
+ * A store that may expose a job-scoped `postOutboxRow` (the container's RPC
+ * store, whose outbox write is routed supervisor-side so no SQL handle is
+ * needed in the container). The real / child-process / in-process stores
+ * lack it and write through the module {@link postOutboxRow} directly.
+ */
+export type SandboxStore = Store & { postOutboxRow?(input: OutboxWrite): Promise<void> };
+
+/** Writes one job-completion outbox row, routing through RPC when available. */
+async function writeOutboxRow(store: SandboxStore, input: OutboxWrite): Promise<void> {
+  if (store.postOutboxRow !== undefined) {
+    await store.postOutboxRow(input);
+  } else {
+    postOutboxRow(store, input);
+  }
+}
+
 /** The sandbox's own success bookkeeping: completeJob + one outbox row + audit. */
 async function completeSelf(
-  store: Store,
+  store: SandboxStore,
   audit: AuditModule,
   job: WorkerJob,
   outcome: { state: string; result: unknown },
 ): Promise<void> {
   await store.completeJob(job.id);
-  postOutboxRow(store, {
+  await writeOutboxRow(store, {
     id: job.id,
     kind: job.kind,
     payload: { state: outcome.state, result: outcome.result ?? null },
@@ -1149,7 +1380,7 @@ async function completeSelf(
 
 /** The sandbox's own failure bookkeeping: failJob + job.failed audit + item blocked. */
 async function failSelf(
-  store: Store,
+  store: SandboxStore,
   audit: AuditModule,
   job: WorkerJob,
   workItemId: string,
@@ -1160,7 +1391,7 @@ async function failSelf(
 }
 
 /** Failure bookkeeping for isolated kinds that do not own a work-item row. */
-async function failJobSelf(store: Store, audit: AuditModule, job: WorkerJob, message: string): Promise<void> {
+async function failJobSelf(store: SandboxStore, audit: AuditModule, job: WorkerJob, message: string): Promise<void> {
   await store.failJob(job.id);
   await audit.appendAudit({
     ts: Date.now(),

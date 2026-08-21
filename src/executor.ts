@@ -75,6 +75,7 @@ import {
   probeDockerSandbox,
   runJobInSandbox,
   type SandboxRunner,
+  type SandboxStore,
 } from "./worker/run-job";
 import type { Poller } from "./ingest/types";
 import { getWatermarkedPoller } from "./ingest/registry";
@@ -82,7 +83,7 @@ import { createAudit, redact } from "./policy/audit";
 import { loadKbConfig } from "./kb/config";
 import { ingestSource } from "./kb/ingest";
 import type { MemoryProvider } from "./memory/types";
-import type { ConsolidationModelCall } from "./memory/consolidation";
+import type { ConsolidationModelCall, ConsolidationResult } from "./memory/consolidation";
 import { buildRegistry } from "./scheduler/actions";
 import { memoryConsolidationAction } from "./scheduler/memory-consolidation";
 import type { SchedulerActionRegistry } from "./scheduler/types";
@@ -169,7 +170,7 @@ export interface ExtensionWorkerToolset {
 }
 
 export interface ExecutorDeps {
-  store: Store;
+  store: SandboxStore;
   /**
    * The org memory provider (the kb job kind's write target — shared
    * chain, same provider the server and extension sessions resolve,
@@ -274,6 +275,14 @@ export interface ExecutorDeps {
    * Tests stub it.
    */
   consolidationModelCall?: ConsolidationModelCall;
+  /**
+   * The disposable-job-container seam for SQLite memory consolidation
+   * (issue #101): wired by the RPC lane to route the DB leg of
+   * `maintainMemory` supervisor-side (the container holds no SQLite handle)
+   * with the LLM leg remoted back into the worker. Absent in the
+   * in-process/child-process lanes, which use `maintainMemory(getDb())`.
+   */
+  runMemoryConsolidation?: () => Promise<ConsolidationResult[]>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -333,6 +342,24 @@ export async function bootExecutorRuntime(opts: {
   agentDir?: string;
   /** Database opened by this composition root. Sandbox children pass the one allowlisted database mount. */
   dbPath?: string;
+  /**
+   * Sandbox-child isolation (#101/#338): when set, this root boots over the
+   * provided job-scoped store RPC client instead of opening `dbPath` — the
+   * job container never touches the shared bottega.db bytes. Mutually
+   * exclusive with `dbPath`.
+   */
+  store?: Store;
+  /** Injected scoped memory provider for the sandbox child (no shared-db handle). */
+  memoryProvider?: import("../server/memory-provider").ResolvedMemoryProvider;
+  /**
+   * Injected, already-scoped org settings for the sandbox child (issue
+   * #101): avoids synchronous store reads over the async RPC socket when
+   * `store` is an RPC client. The supervisor serializes its parsed
+   * settings into the job request.
+   */
+  orgSettings?: OrgSettings | null;
+  /** Skip the global extension-registry merge (denied by the sandbox store RPC allowlist). */
+  skipRuntimeRegistryMerge?: boolean;
   /** Secret env names a sandbox child must never seed into its process. */
   skipBootSecretEnvNames?: readonly string[];
   /** Sandbox children inherit no secret env and must not contact the boot vault. */
@@ -366,6 +393,10 @@ export async function bootExecutorRuntime(opts: {
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : undefined),
+    ...(opts.store !== undefined ? { store: opts.store } : undefined),
+    ...(opts.memoryProvider !== undefined ? { memoryProvider: opts.memoryProvider } : undefined),
+    ...(opts.orgSettings !== undefined ? { orgSettings: opts.orgSettings } : undefined),
+    ...(opts.skipRuntimeRegistryMerge === true ? { skipRuntimeRegistryMerge: true } : undefined),
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
@@ -380,7 +411,7 @@ export async function bootExecutorRuntime(opts: {
   // unless the org settings override the default (#125: the operator's own
   // agent-dir pin is then inert and must not be clobbered).
   const pinSync = ensureAgentDirModelPin(agentDir, OMP_CONFIG_TEMPLATE, {
-    orgDefault: runtime.store.getOrgSettings()?.models?.default,
+    orgDefault: opts.orgSettings !== undefined ? opts.orgSettings?.models?.default : runtime.store.getOrgSettings()?.models?.default,
   });
   if (pinSync === "created" || pinSync === "patched" || pinSync === "updated") {
     console.log(
@@ -1423,19 +1454,33 @@ if (import.meta.main) {
   const dbPath = process.env.BOTTEGA_DB_PATH ?? "data/bottega.db";
   const boot = await bootExecutorRuntime({ dbPath });
   const { store } = boot.runtime;
+  const memoryProvider = boot.runtime.memoryProvider;
   // Production isolation: one disposable Docker container per job. The
-  // supervisor mounts the store file, the workspaces root and transcripts,
-  // and the job-scoped credential files; prox/CA config comes from the
-  // deployment env. When the supervisor itself runs inside a container the
-  // job container is a sibling on the host, so the mount SOURCE paths must
-  // be the host-visible ones provided by the deployment (BOTTEGA_SANDBOX_*_HOST).
-  const sandboxHostDb = process.env.BOTTEGA_SANDBOX_DB_HOST ?? dbPath;
+  // supervisor RETAINS the real Store + memory provider (single-writer on
+  // the data volume, #101) and exposes ONLY job-scoped store/memory ops to
+  // the container over a bounded unix-socket RPC (no bottega.db bytes, no
+  // shared-root mounts). The job container mounts ONLY its own workspace
+  // subdir, its own transcript subdir, the RPC socket dir, the egress CA,
+  // and the exact kind-authorized credential material. The supervisor's
+  // mount SOURCE paths are the deployment-visible ones when it runs inside
+  // a container (BOTTEGA_SANDBOX_*_HOST / volume roots).
   const sandboxWorkspaces = process.env.BOTTEGA_SANDBOX_WORKSPACES_HOST ?? defaultWorkspaceRoot();
+  const sandboxTranscripts = process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts";
+  const sandboxVolume = process.env.BOTTEGA_SANDBOX_DATA_VOLUME;
   const sandboxRunner = createDockerSandboxRunner({
-    dbPath: sandboxHostDb,
     workspacesDir: sandboxWorkspaces,
-    transcriptDir: process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts",
-    volume: process.env.BOTTEGA_SANDBOX_DATA_VOLUME,
+    transcriptDir: sandboxTranscripts,
+    volume: sandboxVolume,
+    // Named-volume subpath roots: where the shared `data` volume is mounted
+    // in the supervisor for the workspaces and state axes. In compose both are
+    // the same volume, mounted at /workspaces and /app/data respectively, so a
+    // job workspace /workspaces/<itemId> maps to volume-subpath <itemId> and a
+    // transcript dir /app/data/transcripts/<itemId> maps to transcripts/<itemId>.
+    volumeWorkspacesRoot: process.env.BOTTEGA_SANDBOX_WORKSPACES_VOLUME_ROOT ?? sandboxWorkspaces,
+    volumeStateRoot: process.env.BOTTEGA_SANDBOX_STATE_VOLUME_ROOT ?? (sandboxVolume ? "/app/data" : undefined),
+    hostStore: store,
+    memoryProvider,
+    orgSettings: store.getOrgSettings(),
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
     network: process.env.BOTTEGA_SANDBOX_NETWORK,
@@ -1445,10 +1490,9 @@ if (import.meta.main) {
     requireDocker: true,
   });
   await probeDockerSandbox({
-    dbPath: sandboxHostDb,
     workspacesDir: sandboxWorkspaces,
-    transcriptDir: process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts",
-    volume: process.env.BOTTEGA_SANDBOX_DATA_VOLUME,
+    transcriptDir: sandboxTranscripts,
+    volume: sandboxVolume,
     requireDocker: true,
   });
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
@@ -1456,7 +1500,7 @@ if (import.meta.main) {
     store,
     dbPath,
     sandboxRunner,
-    memoryProvider: boot.runtime.memoryProvider,
+    memoryProvider,
     get driver(): AgentDriver | Promise<AgentDriver> {
       return (driver ??= boot.getDriver());
     },

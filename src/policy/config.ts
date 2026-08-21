@@ -1060,17 +1060,28 @@ export function applyOrgSettings(file: PolicyConfig, settings: OrgSettings): Pol
  * singleton when a row exists; the per-space overlay still applies on top
  * via loadSpacePolicy. A malformed settings blob fails the whole policy
  * closed (every decision denies) — never a silent fallback to file values.
- * Sync: bun:sqlite is synchronous and the boot loaders are sync.
+ * Sync: bun:sqlite is synchronous and the boot loaders are sync. When
+ * `injectedSettings` is non-null it is used INSTEAD of a store read — the
+ * sandbox-child composition root passes the supervisor's already-parsed
+ * org settings so it never needs a synchronous RPC round-trip.
  */
-export function loadOrgPolicy(store: Pick<Store, "getOrgSettings">, dir?: string): PolicyConfig {
+export function loadOrgPolicy(
+  store: Pick<Store, "getOrgSettings">,
+  dir?: string,
+  injectedSettings?: OrgSettings | null,
+): PolicyConfig {
   const policy = loadOrgConfig(dir);
   if (!policy.ok) return policy;
   let settings: OrgSettings | null;
-  try {
-    settings = store.getOrgSettings();
-  } catch (err) {
-    // SAFETY: store.getOrgSettings throws Error instances (bun:sqlite errors); the catch value has .message.
-    return structuralError(policy, `org_settings: ${(err as Error).message}`);
+  if (injectedSettings !== undefined) {
+    settings = injectedSettings;
+  } else {
+    try {
+      settings = store.getOrgSettings();
+    } catch (err) {
+      // SAFETY: store.getOrgSettings throws Error instances (bun:sqlite errors); the catch value has .message.
+      return structuralError(policy, `org_settings: ${(err as Error).message}`);
+    }
   }
   return settings ? applyOrgSettings(policy, settings) : policy;
 }

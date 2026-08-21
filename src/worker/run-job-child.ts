@@ -1,10 +1,13 @@
 import { readFileSync, readSync, statSync, writeSync } from "node:fs";
-import { bootExecutorRuntime, createDefaultConsolidationModelCall, type ExecutorDeps } from "../executor";
+import { bootExecutorRuntime, createDefaultConsolidationModelCall, type ExecutorBoot, type ExecutorDeps } from "../executor";
 import type { AgentDriver } from "../server/drivers/agent-driver";
+import type { OrgSettings } from "../store/org-settings";
 import { buildRegistry } from "../scheduler/actions";
 import { memoryConsolidationAction } from "../scheduler/memory-consolidation";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
-import { runIsolatedJobBody, type SandboxResult } from "./run-job";
+import type { Store } from "../store/db";
+import { runIsolatedJobBody, type SandboxResult, type SandboxStore } from "./run-job";
+import { connectStoreRpc } from "./store-rpc";
 import {
   MAX_SANDBOX_REQUEST_BYTES,
   SANDBOX_PROTOCOL_VERSION,
@@ -53,6 +56,19 @@ function forbiddenEnvironment(): string[] {
 }
 
 /**
+ * Narrowed shape check on the supervisor-serialized org settings relayed in
+ * the job request (trusted internal boundary; only the settings-read fields
+ * matter). Non-null objects that at least carry the parsed-blob markers are
+ * accepted; null/undefined/garbage are ignored (the child then falls back to
+ * no settings, which the boot chain tolerates).
+ */
+function isOrgSettingsLike(value: unknown): value is OrgSettings {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Partial<OrgSettings>;
+  return typeof candidate.ok === "boolean" && Array.isArray(candidate.errors);
+}
+
+/**
  * The Docker lane has no extra file descriptor like the child lane's fd 3:
  * the container's stdout is the single bounded protocol channel and every
  * job log is redirected to stderr, so stdout carries ONLY the response JSON.
@@ -75,6 +91,9 @@ async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): P
   const forbidden = forbiddenEnvironment();
   if (forbidden.length > 0) {
     throw new Error(`sandbox received forbidden credential environment: ${forbidden.join(", ")}`);
+  }
+  if (DOCKER_LANE) {
+    return await executeViaRpc(request);
   }
   if (request.job.kind === "extension") {
     const tokenFile = process.env.OMP_AUTH_BROKER_TOKEN_FILE;
@@ -120,12 +139,71 @@ async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): P
   }
 }
 
+/**
+ * The Docker lane boots the job-scoped runtime over the mounted store RPC
+ * socket (no bottega.db bytes reach the container) and runs the same
+ * isolated job body. The scoped store + memory cross the bounded socket; the
+ * supervisor enforces the job-scope allowlist and denies global/unknown ops.
+ */
+async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
+  const socketPath = process.env.BOTTEGA_SANDBOX_RPC_SOCKET;
+  if (socketPath === undefined || socketPath === "") {
+    throw new Error("Docker lane sandbox requires the mounted store RPC socket (BOTTEGA_SANDBOX_RPC_SOCKET)");
+  }
+  const rpc = connectStoreRpc(socketPath);
+  let boot: ExecutorBoot;
+  try {
+    await rpc.ready();
+    boot = await bootExecutorRuntime({
+      // RPC facade typed up to the full Store at the boot boundary (same
+      // explicit allowlist; non-allowlisted methods fail closed at the socket).
+      store: rpc.store as unknown as Store,
+      memoryProvider: rpc.memoryProvider,
+      orgSettings: isOrgSettingsLike(request.orgSettings) ? request.orgSettings : undefined,
+      skipRuntimeRegistryMerge: true,
+      skipBootSecretEnvNames: FORBIDDEN_ENV_NAMES,
+      skipBootSecretSeed: true,
+      skipProxyCredentialSync: true,
+    });
+    let driver: AgentDriver | Promise<AgentDriver> | undefined;
+    const consolidationModelCall = createDefaultConsolidationModelCall(boot.getDriver());
+    // The scheduled consolidation DB leg is routed supervisor-side; the LLM
+    // leg comes back into the worker over the RPC socket (issue #272).
+    rpc.setConsolidationModelCall(consolidationModelCall);
+    const deps: ExecutorDeps = {
+      // The RPC facade exposes only the job-relevant Store subset + the
+      // supervisor-routed postOutboxRow; typed up to the full SandboxStore at
+      // the session boundary (the job body / scoped-store layers never invoke
+      // non-allowlisted methods — those fail closed at the socket).
+      store: rpc.store as unknown as SandboxStore,
+      memoryProvider: rpc.memoryProvider,
+      get driver(): AgentDriver | Promise<AgentDriver> {
+        return (driver ??= boot.getDriver());
+      },
+      getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
+      orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
+      transcriptDir: request.config.transcriptDir,
+      scheduledActions: buildRegistry([memoryConsolidationAction()]),
+      consolidationModelCall,
+      runMemoryConsolidation: () => rpc.maintainMemory(),
+    };
+    return await runIsolatedJobBody(deps, request.config, request.caps, request.job);
+  } finally {
+    rpc.close();
+  }
+}
+
 async function main(): Promise<void> {
   process.env.BOTTEGA_SANDBOX_CHILD = "1";
   if (DOCKER_LANE) {
     // stdout is the reserved bounded protocol channel; every job log goes to
-    // stderr so it can never corrupt or exceed the result document.
+    // stderr so it can never corrupt or exceed the single result document.
+    // Redirect every stdout-writing console method (not just log).
     console.log = (...args: unknown[]) => console.error(...args);
+    console.info = (...args: unknown[]) => console.error(...args);
+    console.debug = (...args: unknown[]) => console.error(...args);
+    console.dir = (...args: unknown[]) => console.error(...args);
+    console.trace = (...args: unknown[]) => console.error(...args);
   }
   const request = readRequest();
   if (request.mode === "probe") {
