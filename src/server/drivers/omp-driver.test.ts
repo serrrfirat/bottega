@@ -628,7 +628,7 @@ describe("upload-link reply survives SDK secret obfuscation (issue #221)", () =>
       });
       const minted = await tool.execute(
         "call-1",
-        { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+        { extension: FIXTURE_EXTENSION_ID, scope: "personal", connection_id: undefined, expected_revision: undefined },
         undefined,
         undefined,
         // SAFETY: the mint tool reads only ctx.sessionManager.getSessionFile().

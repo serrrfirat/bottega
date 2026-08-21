@@ -43,6 +43,7 @@ import {
   vaultCredentialToTokens,
   type McpOAuthFlowDeps,
   type McpOAuthTokenStore,
+  type PersistedOAuthFlow,
   type VaultOAuthCredential,
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";

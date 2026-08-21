@@ -27,6 +27,7 @@
  * and is what the caller-surface tests pin.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { Readable } from "node:stream";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
@@ -187,7 +188,8 @@ export async function probeChildProcessSandbox(options: {
       requireLimits: options.requireOsResourceLimits ?? process.platform === "linux",
     },
   );
-  if (!("probe" in response)) throw new Error(response.protocolError ?? "sandbox probe failed");
+  if ("protocolError" in response) throw new Error(response.protocolError);
+  if (!("probe" in response)) throw new Error("sandbox probe failed");
   return response.probe;
 }
 
@@ -243,7 +245,7 @@ async function spawnSandboxChild(
     };
   }
   const responseStream = child.stdio[3];
-  if (responseStream === null || child.stdin === null) {
+  if (!(responseStream instanceof Readable) || child.stdin === null) {
     killProcessTree(child);
     return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox IPC pipes unavailable" };
   }

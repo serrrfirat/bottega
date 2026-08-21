@@ -96,7 +96,7 @@ export function schedulerInvocationFromRow(row: SchedulerInvocationRow): Schedul
   };
 }
 
-export interface SchedulerJobAuditMetadata {
+export type SchedulerJobAuditMetadata = {
   id: string;
   action: SchedulerActionName;
   cron: string;

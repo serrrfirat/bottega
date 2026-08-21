@@ -25,7 +25,13 @@
 import { z } from "zod";
 import { DELIVERY_REQUESTED_EVENT, DELIVERY_RESOLVED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
-import { DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
+import {
+  DELIVERY_APPROVE_ACTION_ID,
+  DELIVERY_DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+  type SlackBlockPayload,
+} from "./slack";
 
 /**
  * The `delivery.requested` payload as the poller writes it (all strings).
@@ -53,15 +59,16 @@ function parsePayload(raw: string): DeliveryRequestPayload | null {
  * Approve/Deny buttons carrying the WORK ITEM id (the value the resolver
  * keys on). Pure so the outbound rendering is testable without Slack.
  */
-export function buildDeliveryBlocks(prUrl: string, summary: string, id: string): unknown[] {
+export function buildDeliveryBlocks(prUrl: string, summary: string, id: string): SlackBlockPayload[] {
+  const summaryBlock: SlackBlockPayload[] = summary
+    ? [{ type: "section", text: { type: "mrkdwn", text: `*Summary:* ${summary}` } }]
+    : [];
   return [
     {
       type: "section",
       text: { type: "mrkdwn", text: `*Delivery approval required* — <${prUrl}|PR ready>` },
     },
-    ...(summary
-      ? [{ type: "section", text: { type: "mrkdwn", text: `*Summary:* ${summary}` } }]
-      : []),
+    ...summaryBlock,
     {
       type: "actions",
       block_id: "bottega_delivery",

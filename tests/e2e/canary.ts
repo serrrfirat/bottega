@@ -427,6 +427,7 @@ function canaryOAuthManifest(): ExtensionManifest {
     // serverUrl.
     tools: [],
     domains: ["oauth.fixture.test"],
+    credentialTargets: [{ host: "oauth.fixture.test", pathPrefix: "/mcp" }],
   };
 }
 
@@ -2009,7 +2010,7 @@ async function journeyUploadLink(h: Harness, channelId: string, uploadLink: Uplo
     });
     const minted = await mintTool.execute(
       "tc-mint",
-      { extension: FIXTURE_EXTENSION_ID, scope: "personal" },
+      { extension: FIXTURE_EXTENSION_ID, scope: "personal", connection_id: undefined, expected_revision: undefined },
       undefined,
       undefined,
       toolCtxFor(h, spaceId),

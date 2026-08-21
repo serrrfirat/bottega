@@ -17,7 +17,8 @@ import { z } from "zod";
 import { chartArgsSchema, chartToolDefinition, buildChartBlock } from "./render-chart";
 import { SlackTurnPresenter } from "../server/services/slack-turn-presenter";
 import type { SlackAdapter, SlackMessage } from "../server/adapters/slack";
-import type { Store } from "../store/db";
+import type { Store, AuditEntry } from "../store/db";
+import type { OrgSettings } from "../store/org-settings";
 import { createStore } from "../store/db";
 import { createAudit } from "../policy/audit";
 import { DenyRouter } from "../policy/approval-router";
@@ -310,7 +311,8 @@ function chartStore(): Store {
   // for a plain chart post, so a double exposing just that member satisfies
   // the executed surface (mirrors slack-turn-presenter.test.ts).
   return {
-    appendAudit: async () => 0,
+    appendAudit: async (_entry: AuditEntry) => 0,
+    getOrgSettings: (): OrgSettings | null => null,
   } as Store;
 }
 

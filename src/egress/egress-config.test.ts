@@ -177,7 +177,7 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(asString(inject["require"])).toBe("true");
 
       const rules = asRecordArray(entry["rules"]);
-      expect(rules.map((rule) => String(rule["host"]))).toEqual(expectedHosts!);
+      expect(rules.map((rule) => String(rule["host"]))).toEqual([...expectedHosts!]);
       for (const rule of rules) {
         expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
       }

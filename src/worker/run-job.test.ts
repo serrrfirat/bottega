@@ -88,7 +88,7 @@ describe("job-scoped store facade (issue #101)", () => {
     const sandbox = scoped as Pick<Store, "enqueueJob" | "claimNextJob" | "markStaleWorkItems">;
     expect(() => sandbox.enqueueJob({ id: "j", kind: "git", payload: {} })).toThrow(ScopedStoreAccessError);
     expect(() => sandbox.claimNextJob(60_000)).toThrow(ScopedStoreAccessError);
-    expect(() => sandbox.markStaleWorkItems()).toThrow(ScopedStoreAccessError);
+    expect(() => sandbox.markStaleWorkItems(20, "claimed")).toThrow(ScopedStoreAccessError);
   });
 
   test("two concurrent scopes cannot read or mutate each other's rows", async () => {
@@ -629,7 +629,7 @@ describe("runScheduledJobBody (issue #302)", () => {
       run: async (_params, ctx) => {
         ran.push("run");
         await ctx.store.appendAudit({ actor: "sched", event_type: "scheduler.fire", payload: "fired" });
-        return { consolidated: 3 };
+        return [{ pool: { scope: "org" }, newFacts: 3, actionsApplied: 0, compacted: false }];
       },
     };
     const registry = new Map<SchedulerActionName, SchedulerAction>();
@@ -645,10 +645,10 @@ describe("runScheduledJobBody (issue #302)", () => {
     expect(result).toEqual({ exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false });
     expect(ran).toEqual(["run"]);
     const completed = await store.listAudit({ event_type: JOB_COMPLETED_EVENT });
-    expect(JSON.parse(completed[0].payload)).toMatchObject({ id: "job_sched", kind: "scheduled", state: "completed", result: { consolidated: 3 } });
+    expect(JSON.parse(completed[0].payload)).toMatchObject({ id: "job_sched", kind: "scheduled", state: "completed", result: [{ pool: { scope: "org" }, newFacts: 3, compacted: false }] });
     const { rows } = consumeOutboxWatermarked(store);
     const completion = rows.find((r) => r.id === "job_sched" && r.kind === "scheduled");
-    expect(JSON.parse(completion!.payload)).toMatchObject({ state: "completed", result: { consolidated: 3 } });
+    expect(JSON.parse(completion!.payload)).toMatchObject({ state: "completed", result: [{ pool: { scope: "org" }, newFacts: 3, compacted: false }] });
   });
 
   test("an unknown action fails LOUDLY naming it — never a silent no-op (issue #272)", async () => {
@@ -675,7 +675,7 @@ describe("runScheduledJobBody (issue #302)", () => {
         // and no policy context, so these THROW — the action cannot silently
         // reach the outside world.
         ctx.postMessage("C1", "hi");
-        return null;
+        return;
       },
     };
     const registry = new Map<SchedulerActionName, SchedulerAction>();
@@ -699,7 +699,7 @@ describe("runScheduledJobBody (issue #302)", () => {
         // loadPolicy is an async seam → must be awaited for the guard to
         // propagate; an un-awaited rejection would silently complete.
         await ctx.loadPolicy("space_x");
-        return null;
+        return;
       },
     };
     const policyRegistry = new Map<SchedulerActionName, SchedulerAction>();

@@ -24,10 +24,14 @@ const dir = mkdtempSync(join(tmpdir(), "bottega-scheduler-lifecycle-"));
 const stores: Store[] = [];
 
 const memory: MemoryProvider = {
+  capabilities: { consolidation: "explicit", digestPruning: "explicit" },
   save: async () => {
     throw new Error("unused memory save");
   },
   search: async () => [],
+  pruneDigests: async () => {
+    throw new Error("unused memory prune");
+  },
 };
 
 afterAll(() => {

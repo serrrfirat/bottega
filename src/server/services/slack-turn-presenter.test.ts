@@ -1962,7 +1962,7 @@ describe("renderSearchResultBlocks (issue #278)", () => {
       expect(section.text?.text).toContain("https://example.com/");
     }
     const context = blocks.find((b) => b.type === "context");
-    expect(context.elements?.[0]?.text).toContain("1 more result");
+    expect(context?.elements?.[0]?.text).toContain("1 more result");
   });
 
   test("the citations used section lists every cited source URL", () => {
@@ -1988,7 +1988,7 @@ describe("renderSearchResultBlocks (issue #278)", () => {
     const sections = blocks.filter((b) => b.type === "section");
     expect(sections.length).toBe(3); // 2 rows + the sources-used footer
     const context = blocks.find((b) => b.type === "context");
-    expect(context.elements?.[0]?.text).toContain("5 more results");
+    expect(context?.elements?.[0]?.text).toContain("5 more results");
   });
 });
 

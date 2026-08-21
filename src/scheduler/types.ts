@@ -16,6 +16,7 @@ import type { AuditModule } from "../policy/audit";
 import type { MemoryProvider } from "../memory/types";
 import type { ConsolidationModelCall, ConsolidationResult } from "../memory/consolidation";
 import type { PolicyConfig } from "../policy/config";
+import type { SlackBlockPayload } from "../server/adapters/slack";
 
 /**
  * The typed action registry names (issue #86): no generic scripting, every
@@ -87,7 +88,7 @@ export interface SchedulerActionContext {
   audit: AuditModule;
   memoryProvider: MemoryProvider;
   /** SlackAdapter.postMessage-compatible (spaceId, text[, opts.blocks]) → message ts. */
-  postMessage: (spaceId: string, text: string, opts?: { blocks?: unknown[] }) => Promise<string | undefined>;
+  postMessage: (spaceId: string, text: string, opts?: { blocks?: SlackBlockPayload[] }) => Promise<string | undefined>;
   /** Effective (org floor + space overlay) policy for a space. */
   loadPolicy: (spaceId: string) => Promise<PolicyConfig>;
   log: (line: string) => void;

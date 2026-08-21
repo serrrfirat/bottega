@@ -91,16 +91,16 @@ type ChartArgs =
       axis_config: { categories: string[] };
     };
 
-export interface PieChartBlock {
+export type PieChartBlock = {
   type: "data_visualization";
   title: string;
   chart: {
     type: "pie";
     segments: Array<{ label: string; value: number }>;
   };
-}
+};
 
-export interface AxisChartBlock {
+export type AxisChartBlock = {
   type: "data_visualization";
   title: string;
   chart: {
@@ -111,7 +111,7 @@ export interface AxisChartBlock {
     }>;
     axis_config: { categories: string[] };
   };
-}
+};
 
 export type SlackChartBlock = PieChartBlock | AxisChartBlock;
 

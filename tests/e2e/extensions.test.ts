@@ -131,8 +131,13 @@ function makeRuntimeHarness(opts: {
   const store = freshStore();
   const boundary: CredentialBoundary & { calls: ExtensionCredential[] } = {
     calls: [],
-    async authorize(credential: ExtensionCredential) {
-      boundary.calls.push(credential);
+    async runWithAuthorization(request, invoke) {
+      boundary.calls.push(request.credential);
+      return invoke({
+        callId: request.callId,
+        placeholder: "test-placeholder",
+        signal: new AbortController().signal,
+      });
     },
   };
   // SAFETY: the stub transport records every binding the runtime requests;
