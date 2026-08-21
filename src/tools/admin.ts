@@ -21,10 +21,11 @@
  * are never installed or pinned by this tool; catalog entries carry no
  * MCP/CLI binding, so the draft result surfaces that and tells the agent to
  * web-search the vendor's OFFICIAL MCP server (issue #146) before
- * completing the binding facts. `pin` is the CHAT-NATIVE pin (issue #195):
- * the agent completes the draft IN-CHANNEL (binding/credentialSchema/tools
- * via params — the space agent has no write/bash tools, so the binding
- * facts come from the call, the provenance from the draft file), the tool
+ * completing the binding, credential schema, and credential targets.
+ * `pin` is the CHAT-NATIVE pin (issue #195): the agent completes the draft
+ * IN-CHANNEL (binding/credentialSchema/credentialTargets/tools via params —
+ * the space agent has no write/bash tools, so the reviewed facts come from
+ * the call and the provenance comes from the draft file), the tool
  * surfaces the draft summary and REQUIRES the human's in-channel
  * confirmation (confirm: true — the confirmation IS the review: the
  * snapshot records source.reviewed: true, and an unconfirmed/unreviewed
@@ -98,7 +99,14 @@ import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/bo
 import { OAUTH_CALLBACK_PATH, callbackPort } from "../extensions/oauth-callback";
 import { uploadLinkPublicBase } from "../extensions/upload-link";
 import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
-import type { CliBinding, CredentialSchema, ExtensionKind, ExtensionTool, McpBinding } from "../extensions/manifest";
+import type {
+  CliBinding,
+  CredentialSchema,
+  CredentialTarget,
+  ExtensionKind,
+  ExtensionTool,
+  McpBinding,
+} from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
 import { probeMcpEndpoint } from "../extensions/mcp-endpoint-probe";
 import type { ExtensionRegistry, PinnedSnapshot, ResolvedExtension } from "../extensions/registry";
@@ -222,6 +230,11 @@ export const catalogBrowserArgsSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe("The completed credentialSchema ({type: oauth|api_key, scopes?})"),
+  /** Pin: reviewed destinations that may receive credentials ({host, pathPrefix?}). */
+  credential_targets: z
+    .array(z.record(z.string(), z.unknown()))
+    .optional()
+    .describe("Reviewed credential destinations ({host, pathPrefix?}); required by the completed manifest"),
   /** Pin: the explicit tool surface (optional — absent → runtime discovery of the provider's tools/list, issue #158). */
   tools: z
     .array(z.record(z.string(), z.unknown()))
@@ -293,6 +306,7 @@ interface DraftSummary {
   kind: ExtensionKind;
   binding: McpBinding | CliBinding | undefined;
   credential_schema: CredentialSchema | undefined;
+  credential_targets: CredentialTarget[] | undefined;
   tools_count: number | null;
   domains: string[];
   vendor_official: boolean;
@@ -302,7 +316,7 @@ interface DraftSummary {
 /**
  * The review-gate summary for a completed draft: everything the human must
  * see before confirming a pin (id, label, kind, binding, credential schema,
- * tool count, domains, provenance). One source shared by the confirm-
+ * credential targets, tool count, domains, provenance). One source shared by
  * required refusal and the audit trail.
  */
 function draftSummary(draft: SnapshotDraft): DraftSummary {
@@ -313,6 +327,7 @@ function draftSummary(draft: SnapshotDraft): DraftSummary {
     kind: draft.manifest.kind,
     binding,
     credential_schema: draft.manifest.credentialSchema,
+    credential_targets: draft.manifest.credentialTargets,
     tools_count: draft.manifest.tools?.length ?? null,
     domains: draft.manifest.domains,
     vendor_official: draft.source.vendorOfficial,
@@ -815,10 +830,11 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
       "\"linear\") and writes an UNREVIEWED draft snapshot (source.reviewed: false) to " +
       "config/extensions/drafts/<id>.draft.json — it is NEVER installed or pinned by this action. Catalog " +
       "entries carry no MCP/CLI binding, so when drafting one, web-search the vendor's OFFICIAL MCP server " +
-      "(serverUrl + transport + credentialSchema from the vendor's published MCP spec; vendor-official URLs " +
-      "only — never guess or use community URLs). `pin` completes the draft IN-CHANNEL and REQUIRES the human's " +
-      "confirmation (the review gate): pass `spec` + the completed `binding` / `credential_schema` (+ optional " +
-      "`tools` / `domains` / `vendor_official`) and FIRST call WITHOUT confirm to surface the draft " +
+      "(serverUrl + transport + credentialSchema + reviewed credentialTargets from the vendor's published MCP " +
+      "spec; vendor-official URLs only — never guess or use community URLs). `pin` completes the draft " +
+      "IN-CHANNEL and REQUIRES the human's confirmation (the review gate): pass `spec` + the completed `binding` / " +
+      "`credential_schema` / `credential_targets` (+ optional `tools` / `domains` / `vendor_official`) and FIRST " +
+      "call WITHOUT confirm to surface the draft " +
       "summary, then " +
       "call WITH confirm=true after the human confirms in-channel — the confirmation IS the review, the snapshot " +
       "records source.reviewed: true, the pinned snapshot is written to config/extensions via the fetch-catalog " +
@@ -874,17 +890,17 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                       "official HOSTED streamable-http server with OAuth (policy #49/#195 — no binaries, " +
                       "the broker handles the OAuth flow); stdio/API-key only when no hosted variant " +
                       "exists. Complete the draft IN-CHANNEL: call catalog_browser action=pin spec=<id> " +
-                      "with the binding + credential_schema (+ optional tools) params, then ASK THE " +
-                      "HUMAN to confirm in-channel (confirm=true) — the confirmation is the review that " +
+                      "with the binding + credential_schema + credential_targets (+ optional tools) params, then " +
+                      "ASK THE HUMAN to confirm in-channel (confirm=true) — the confirmation is the review that " +
                       "pins — then connect_extension (\"connect as me\" opens the OAuth flow). Manifest " +
                       "tools are OPTIONAL (issue #158): omit them to pin a tools-less manifest whose " +
                       "surface is discovered at runtime from the provider's tools/list with " +
                       "conservative tiers (the agent then sees the provider's FULL surface), or run " +
                       "`bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json>` to pin " +
                       "tools explicitly."
-                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli, credentialSchema) " +
-                      "from the vendor docs IN-CHANNEL: call catalog_browser action=pin spec=<id> with the " +
-                      "binding + credential_schema (+ optional tools) params, then ASK THE HUMAN to confirm " +
+                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli), credentialSchema, and " +
+                      "credentialTargets from the vendor docs IN-CHANNEL: call catalog_browser action=pin spec=<id> with " +
+                      "the binding + credential_schema + credential_targets (+ optional tools) params, then ASK THE HUMAN to confirm " +
                       "in-channel (confirm=true) — the confirmation is the review that pins — then " +
                       "connect_extension (\"connect as me\" opens the OAuth flow for oauth extensions). " +
                       "PREFER the official HOSTED streamable-http + OAuth server (policy #49/#195); " +
@@ -941,6 +957,13 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             // credentialSchema before any write or registration.
             manifest.credentialSchema = JSON.parse(JSON.stringify(params.credential_schema)) as CredentialSchema;
           }
+          if (params.credential_targets !== undefined) {
+            // SAFETY: validateManifest below is the fail-closed authority on
+            // credentialTargets before any write or registration.
+            manifest.credentialTargets = JSON.parse(
+              JSON.stringify(params.credential_targets),
+            ) as CredentialTarget[];
+          }
           if (params.tools !== undefined) {
             // SAFETY: validateManifest below is the fail-closed authority on
             // the tool surface before any write or registration.
@@ -962,16 +985,20 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
             },
           };
           // Fail closed BEFORE the review gate: an incomplete draft (missing
-          // the binding or credentialSchema — the not-discoverable facts) or
+          // the binding, credentialSchema, or reviewed credentialTargets) or
           // a malformed manifest must never reach the human's confirmation.
           const needsBinding =
             completed.manifest.kind === "mcp"
               ? completed.manifest.mcp === undefined
               : completed.manifest.cli === undefined;
-          if (needsBinding || completed.manifest.credentialSchema === undefined) {
+          if (
+            needsBinding ||
+            completed.manifest.credentialSchema === undefined ||
+            completed.manifest.credentialTargets === undefined
+          ) {
             return toolError(
-              `draft for "${completed.extensionId}" is incomplete: add the ${completed.manifest.kind} binding and ` +
-                "credentialSchema from the vendor docs (web-search the vendor's OFFICIAL MCP spec per #146) " +
+              `draft for "${completed.extensionId}" is incomplete: add the ${completed.manifest.kind} binding, ` +
+                "credentialSchema, and credentialTargets from the vendor docs (web-search the vendor's OFFICIAL MCP spec per #146) " +
                 "before pinning; manifest tools are OPTIONAL (issue #158) — omit them to discover the surface at " +
                 "runtime from the provider's tools/list with conservative tiers, or pass them via the tools param.",
             );

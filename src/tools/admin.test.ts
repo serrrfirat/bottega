@@ -660,7 +660,12 @@ describe("catalog_browser pin (issue #195)", () => {
       const body = JSON.parse(res.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
-        summary: { id: string; binding: Record<string, JsonValue>; credential_schema: Record<string, JsonValue> };
+        summary: {
+          id: string;
+          binding: Record<string, JsonValue>;
+          credential_schema: Record<string, JsonValue>;
+          credential_targets: Array<Record<string, JsonValue>>;
+        };
         note: string;
       };
       expect(body.confirm_required).toBe(true);
@@ -668,6 +673,7 @@ describe("catalog_browser pin (issue #195)", () => {
       expect(body.summary.id).toBe("linear");
       expect(body.summary.binding).toEqual({ serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" });
       expect(body.summary.credential_schema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(body.summary.credential_targets).toEqual([{ host: "linear.app", pathPrefix: "/mcp" }]);
       expect(body.note).toContain("REVIEW REQUIRED");
       // fail closed: nothing was pinned, nothing regenerated
       expect(existsSync(join(snapshotsDir, "linear.json"))).toBe(false);
@@ -845,6 +851,7 @@ describe("catalog_browser pin (issue #195)", () => {
         spec: "notion",
         binding: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
         credential_schema: { type: "oauth", scopes: ["read", "write"] },
+        credential_targets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
         vendor_official: true,
       });
       expect(refused.isError).toBe(true);
@@ -852,13 +859,19 @@ describe("catalog_browser pin (issue #195)", () => {
       const refusedBody = JSON.parse(refused.text) as {
         confirm_required: boolean;
         hosted_variant: boolean;
-        summary: { id: string; binding: Record<string, JsonValue>; credential_schema: Record<string, JsonValue> };
+        summary: {
+          id: string;
+          binding: Record<string, JsonValue>;
+          credential_schema: Record<string, JsonValue>;
+          credential_targets: Array<Record<string, JsonValue>>;
+        };
       };
       expect(refusedBody.confirm_required).toBe(true);
       expect(refusedBody.hosted_variant).toBe(true);
       expect(refusedBody.summary.id).toBe("notion");
       expect(refusedBody.summary.binding).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
       expect(refusedBody.summary.credential_schema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(refusedBody.summary.credential_targets).toEqual([{ host: "mcp.notion.com", pathPrefix: "/mcp" }]);
       expect(existsSync(join(snapshotsDir, "notion.json"))).toBe(false);
 
       // 3. the human confirms in-channel → pin completes
@@ -868,6 +881,7 @@ describe("catalog_browser pin (issue #195)", () => {
         confirm: true,
         binding: { serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" },
         credential_schema: { type: "oauth", scopes: ["read", "write"] },
+        credential_targets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
         vendor_official: true,
       });
       expect(pinned.isError).toBe(false);
@@ -883,6 +897,7 @@ describe("catalog_browser pin (issue #195)", () => {
       expect(snapshot.source.vendorOfficial).toBe(true);
       expect(snapshot.manifest.mcp).toEqual({ serverUrl: "https://mcp.notion.com/mcp", transport: "streamable-http" });
       expect(snapshot.manifest.credentialSchema).toEqual({ type: "oauth", scopes: ["read", "write"] });
+      expect(snapshot.manifest.credentialTargets).toEqual([{ host: "mcp.notion.com", pathPrefix: "/mcp" }]);
       expect(snapshot.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
 
       // egress regenerated with the hosted MCP host allowlisted
