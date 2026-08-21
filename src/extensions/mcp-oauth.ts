@@ -32,15 +32,19 @@
 import { randomBytes } from "node:crypto";
 import { auth, discoverOAuthServerInfo, type AuthResult, type OAuthClientProvider, type OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
+  AuthorizationServerMetadata,
+  OAuthClientInformation,
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { resolveAuthBrokerConfig } from "@oh-my-pi/pi-coding-agent/session/auth-broker-config";
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
+import { z } from "zod";
 import type { AuditModule } from "../policy/audit";
 import type { ExtensionCredential, OAuthFlow, Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
@@ -54,6 +58,19 @@ import type { ReconcileEgress } from "./egress-reconcile";
 export const MCP_OAUTH_FLOW_TTL_MS = 15 * 60_000;
 /** Per-actor cap on live (unexpired) flows — the mint path's rate limit. */
 export const MCP_OAUTH_MAX_OUTSTANDING_PER_ACTOR = 5;
+
+/** The client identity fields bottega persists beyond the SDK's base registration result. */
+interface OAuthClientIdentity {
+  client_id?: string;
+  client_secret?: string;
+  token_endpoint_auth_method?: string;
+}
+
+/** A registered SDK client plus bottega's persisted token-endpoint auth method. */
+type PersistedClientInformation = OAuthClientInformation & OAuthClientIdentity;
+
+/** The SDK-parsed registration endpoint field from authorization-server metadata. */
+type RegistrationEndpoint = AuthorizationServerMetadata["registration_endpoint"];
 
 /**
  * A vault OAuth credential carrying the per-user registered client
@@ -167,9 +184,9 @@ export class OAuthFlowStore {
  */
 export interface McpOAuthTokenStore {
   /** Stores the token in the vault; returns the vault row id (the registry's brokerCredentialId). */
-  save(provider: string, credential: OAuthCredential): Promise<{ brokerCredentialId: number }>;
+  save(provider: string, credential: VaultOAuthCredential): Promise<{ brokerCredentialId: number }>;
   /** Loads the vault row RAW (real refresh token locally, sentinel remotely); null when missing. */
-  load(provider: string, brokerCredentialId: number): Promise<OAuthCredential | null>;
+  load(provider: string, brokerCredentialId: number): Promise<VaultOAuthCredential | null>;
 }
 
 /** Production vault token store (env-configured broker, else local storage). */
@@ -259,8 +276,8 @@ export function vaultCredentialToTokens(credential: OAuthCredential): OAuthToken
  */
 export function tokensToVaultCredential(
   tokens: OAuthTokens,
-  previous: OAuthCredential | null,
-  clientInformation?: { client_id?: string; client_secret?: string; token_endpoint_auth_method?: string },
+  previous: VaultOAuthCredential | null,
+  clientInformation?: OAuthClientIdentity,
 ): VaultOAuthCredential {
   // A genuine new refresh wins; otherwise the previous row's refresh is
   // carried forward (non-rotating servers). Neither present → the grant
@@ -282,10 +299,9 @@ export function tokensToVaultCredential(
       expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
       refreshable: false,
     };
-    const carried = previous as VaultOAuthCredential | null;
-    const clientId = clientInformation?.client_id ?? carried?.client_id;
-    const clientSecret = clientInformation?.client_secret ?? carried?.client_secret;
-    const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? carried?.token_endpoint_auth_method;
+    const clientId = clientInformation?.client_id ?? previous?.client_id;
+    const clientSecret = clientInformation?.client_secret ?? previous?.client_secret;
+    const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? previous?.token_endpoint_auth_method;
     if (clientId !== undefined && clientId !== "") credential.client_id = clientId;
     if (clientSecret !== undefined && clientSecret !== "") credential.client_secret = clientSecret;
     if (clientAuthMethod !== undefined && clientAuthMethod !== "") credential.token_endpoint_auth_method = clientAuthMethod;
@@ -298,14 +314,13 @@ export function tokensToVaultCredential(
     refreshable: true,
     expires: tokens.expires_in !== undefined && tokens.expires_in > 0 ? Date.now() + tokens.expires_in * 1000 : 0,
   };
-  const carried = previous as VaultOAuthCredential | null;
-  const clientId = clientInformation?.client_id ?? carried?.client_id;
-  const clientSecret = clientInformation?.client_secret ?? carried?.client_secret;
+  const clientId = clientInformation?.client_id ?? previous?.client_id;
+  const clientSecret = clientInformation?.client_secret ?? previous?.client_secret;
   // Issue #257: the negotiated auth method (client_secret_basic/post for
   // confidential AS, "none" for public) is per-user vault data — persisted
   // alongside the secret so the runtime mints with the SAME method, and
   // rotation write-backs never degrade it to a public client.
-  const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? carried?.token_endpoint_auth_method;
+  const clientAuthMethod = clientInformation?.token_endpoint_auth_method ?? previous?.token_endpoint_auth_method;
   if (clientId !== undefined && clientId !== "") credential.client_id = clientId;
   if (clientSecret !== undefined && clientSecret !== "") credential.client_secret = clientSecret;
   if (clientAuthMethod !== undefined && clientAuthMethod !== "") credential.token_endpoint_auth_method = clientAuthMethod;
@@ -315,7 +330,7 @@ export function tokensToVaultCredential(
 /** The persisted flow bookkeeping (the `oauth_flows.flow` JSON blob). */
 export interface PersistedOAuthFlow {
   codeVerifier?: string;
-  clientInformation?: OAuthClientInformationMixed;
+  clientInformation?: PersistedClientInformation;
   discoveryState?: OAuthDiscoveryState;
   /**
    * The connect-negotiated `token_endpoint_auth_method` (issue #257).
@@ -326,6 +341,29 @@ export interface PersistedOAuthFlow {
   tokenEndpointAuthMethod?: string;
   authorizationUrl?: string;
 }
+
+/** Boundary parser for the JSON flow row written by {@link startMcpOAuthFlow}. */
+const PERSISTED_OAUTH_FLOW_SCHEMA = z
+  .object({
+    codeVerifier: z.string().optional(),
+    clientInformation: z
+      .object({
+        client_id: z.string(),
+        client_secret: z.string().optional(),
+        token_endpoint_auth_method: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+    discoveryState: z
+      .object({
+        authorizationServerUrl: z.string(),
+      })
+      .passthrough()
+      .optional(),
+    tokenEndpointAuthMethod: z.string().optional(),
+    authorizationUrl: z.string().optional(),
+  })
+  .passthrough();
 
 export interface McpOAuthProviderOpts {
   /** The registered callback URL; the authorization server redirects the browser here. */
@@ -623,17 +661,14 @@ function maskTokenFields(body: string): string {
  * back untouched: the SDK conventionally consumes a Response body exactly
  * once, and capture must never disturb the real flow (or fail it).
  */
-export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
+export interface TokenExchangeDebugOptions {
+  fetchFn?: FetchLike;
+}
+
+export function debugTokenExchangeFetch(): TokenExchangeDebugOptions {
   if (process.env.DEBUG === undefined) return {};
-  // Cast: the ordinary arrow function below intentionally lacks Bun's
-  // augmented `preconnect` member; its call signature is `typeof fetch`.
-  const wrapped = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const urlText =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : input.url;
+  const wrapped: FetchLike = async (input, init): Promise<Response> => {
+    const urlText = input.toString();
     let response: Response;
     try {
       response = await fetch(input, init);
@@ -653,7 +688,7 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
       // Capture must never break the connect; the exchange response is untouched.
     }
     return response;
-  }) as unknown as typeof fetch;
+  };
   return { fetchFn: wrapped };
 }
 
@@ -666,8 +701,8 @@ export function debugTokenExchangeFetch(): { fetchFn?: typeof fetch } {
  * hermetic-test / local-dev posture, unchanged. Anything else is NOT
  * usable → the connect requires a provisioned static client.
  */
-function registrationEndpointUsable(registrationEndpoint: unknown): boolean {
-  if (typeof registrationEndpoint !== "string" || registrationEndpoint === "") return false;
+function registrationEndpointUsable(registrationEndpoint: RegistrationEndpoint): boolean {
+  if (registrationEndpoint === undefined || registrationEndpoint === "") return false;
   let url: URL;
   try {
     url = new URL(registrationEndpoint);
@@ -693,7 +728,7 @@ export type McpOAuthRegistrationCapability = "dcr" | "no-dcr" | "unknown";
  * is USABLE, `"no-dcr"` otherwise. The SINGLE seam both the connect's
  * negotiation and the upload-link mint use — never a provider flag.
  */
-export function registrationCapabilityFromMetadata(registrationEndpoint: unknown): "dcr" | "no-dcr" {
+export function registrationCapabilityFromMetadata(registrationEndpoint: RegistrationEndpoint): "dcr" | "no-dcr" {
   return registrationEndpointUsable(registrationEndpoint) ? "dcr" : "no-dcr";
 }
 
@@ -937,15 +972,16 @@ export async function startMcpOAuthFlow(
   }
   let result: AuthResult;
   try {
-    result = await auth(provider, {
+    const authOptions: Parameters<typeof auth>[1] = {
       serverUrl,
-      ...(negotiation.scope !== undefined ? { scope: negotiation.scope } : {}),
       // Issue #263: DEBUG-gated raw token-endpoint capture on the connect
       // leg (INTERACTIVE mint never hits /token — the wrapper only acts on
       // /token paths — but the SDK's discovery/register/authorize run
       // through the same fetchFn under DEBUG).
       ...debugTokenExchangeFetch(),
-    });
+    };
+    if (negotiation.scope !== undefined) authOptions.scope = negotiation.scope;
+    result = await auth(provider, authOptions);
   } catch (err) {
     return { ok: false, message: `connect ${manifest.label} failed: ${errorMessage(err)}` };
   }
@@ -1030,11 +1066,7 @@ export async function completeMcpOAuthFlow(
 ): Promise<{ brokerCredentialId: number; warnings: string[] }> {
   let persisted: PersistedOAuthFlow;
   try {
-    // SAFETY: the JSON round-trip degrades the SDK's URL-typed fields to strings;
-    // the exchange only reads client_id/client_secret + the separately
-    // restored codeVerifier/redirectUri, so this cast is the documented
-    // contract (JSON.parse of what JSON.stringify wrote in startMcpOAuthFlow).
-    persisted = JSON.parse(flowRow.flow) as PersistedOAuthFlow;
+    persisted = PERSISTED_OAUTH_FLOW_SCHEMA.parse(JSON.parse(flowRow.flow));
   } catch {
     throw new Error(`connect ${flowRow.label} failed: the pending flow is malformed — re-run connect`);
   }
@@ -1044,12 +1076,7 @@ export async function completeMcpOAuthFlow(
   // authoritative, and it is what makes the vault row's confidential
   // identity self-describing for the runtime.
   if (persisted.tokenEndpointAuthMethod !== undefined) {
-    // Cast: the SDK union arms don't all carry token_endpoint_auth_method,
-    // but a freshly JSON.parse'd object is safe to mutate and the runtime
-    // restores the method from the SAME union (issue #257).
-    const restoredClient = persisted.clientInformation as
-      | (OAuthClientInformationMixed & { token_endpoint_auth_method?: string })
-      | undefined;
+    const restoredClient = persisted.clientInformation;
     if (restoredClient !== undefined && restoredClient.token_endpoint_auth_method === undefined) {
       // Fresh object from JSON.parse — mutating it never touches the row.
       restoredClient.token_endpoint_auth_method = persisted.tokenEndpointAuthMethod;
@@ -1120,7 +1147,10 @@ export async function completeMcpOAuthFlow(
   // The probe's refresh may have rotated the vault row again; the registry
   // reference must point at the POST-probe row (the same identity-key vault
   // row in production).
-  const brokerCredentialId = provider.savedBrokerCredentialId as number;
+  const brokerCredentialId = provider.savedBrokerCredentialId;
+  if (brokerCredentialId === undefined) {
+    throw new Error(`connect ${flowRow.label} failed: the vault recorded no OAuth credential`);
+  }
   const owner = flowRow.scope === "personal" ? flowRow.actor : null;
   await deps.store.upsertExtensionCredential({
     provider: flowRow.provider,
@@ -1184,21 +1214,17 @@ export interface RuntimeMcpOAuthOpts {
  * from the vault row so the SDK treats the client as ALREADY registered
  * (no re-DCR per call) and sends confidential credentials per the persisted
  * method. Returns undefined for rows without a client_id (pre-#250 →
- * runtime DCR as today; public clients → "none", preserved). A cast is
- * used because the SDK union types are exact Zod-object shapes that never
- * admit the extra fields the runtime object carries.
+ * runtime DCR as today; public clients → "none", preserved).
  */
 function vaultCredentialClientInformation(credential: VaultOAuthCredential): OAuthClientInformationMixed | undefined {
   const { client_id, client_secret, token_endpoint_auth_method } = credential;
   if (client_id === undefined || client_id === "") return undefined;
-  const info: Record<string, string> = { client_id };
+  const info: PersistedClientInformation = { client_id };
   if (client_secret !== undefined && client_secret !== "") info.client_secret = client_secret;
   if (token_endpoint_auth_method !== undefined && token_endpoint_auth_method !== "") {
     info.token_endpoint_auth_method = token_endpoint_auth_method;
   }
-  // `unknown`: the SDK union arms are exact Zod-object shapes — the runtime
-  // object is a structural subset, never a full arm, so no arm overlaps.
-  return info as unknown as OAuthClientInformationMixed;
+  return info;
 }
 
 /**
@@ -1234,7 +1260,7 @@ export async function createRuntimeMcpOAuthProvider(input: RuntimeMcpOAuthOpts):
   });
   const credential = await tokenStore.load(provider, input.credential.broker_credential_id);
   if (credential !== null) {
-    const clientInformation = vaultCredentialClientInformation(credential as VaultOAuthCredential);
+    const clientInformation = vaultCredentialClientInformation(credential);
     if (clientInformation !== undefined) providerInstance.saveClientInformation(clientInformation);
   }
   return providerInstance;

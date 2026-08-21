@@ -588,7 +588,7 @@ describe("proxy reload half (issue #123/#197 seam)", () => {
   ) => Promise<Response> = async (input, init) => {
       reloadCalls.push({
         url: input instanceof Request ? input.url : String(input),
-        auth: (init?.headers as Record<string, string> | undefined)?.["Authorization"] ?? "",
+        auth: new Headers(init?.headers).get("Authorization") ?? "",
       });
       return new Response("ok", { status: 200 });
     };

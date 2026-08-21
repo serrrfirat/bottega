@@ -17,7 +17,7 @@ import { BOOT_SECRETS } from "../server/boot-secrets";
 import { createStore, type Store } from "../store/db";
 import { CONNECT_EXTENSION_TOOL, type BrokerConnectResult } from "./connect";
 import { fixtureManifest } from "./fixture";
-import type { ExtensionManifest } from "./manifest";
+import type { ExtensionManifest, JsonObject } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
 import {
   createStaticOAuthClientStore,
@@ -112,25 +112,26 @@ class CapabilityStub {
   }
   handle(req: Request): Response {
     const url = new URL(req.url);
-    const json = (body: Record<string, unknown>, status = 200): Response =>
+    const json = (body: JsonObject, status = 200): Response =>
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
     if (url.pathname.startsWith("/.well-known/oauth-protected-resource/")) {
       return json({ resource: this.mcpUrl, authorization_servers: [this.baseUrl], scopes_supported: ["default"] });
     }
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       if (!this.metadata) return new Response("not found", { status: 404 });
-      return json({
+      const metadata: JsonObject = {
         issuer: this.baseUrl,
         authorization_endpoint: `${this.baseUrl}/authorize`,
         token_endpoint: `${this.baseUrl}/token`,
-        ...(this.registrationEndpoint ? { registration_endpoint: `${this.baseUrl}/register` } : {}),
         scopes_supported: ["default"],
         response_types_supported: ["code"],
         response_modes_supported: ["query"],
         grant_types_supported: ["authorization_code"],
         token_endpoint_auth_methods_supported: ["none"],
         code_challenge_methods_supported: ["S256"],
-      });
+      };
+      if (this.registrationEndpoint) metadata["registration_endpoint"] = `${this.baseUrl}/register`;
+      return json(metadata);
     }
     return new Response("not found", { status: 404 });
   }

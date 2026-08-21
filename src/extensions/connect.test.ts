@@ -676,20 +676,46 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     headers?: Record<string, string>;
   }
 
+  interface CatalogRecordFixture {
+    domain: string;
+  }
+
+  type TestFetch = (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => Promise<Response>;
+
+  /** Adds Bun's non-request preconnect member to a hermetic fetch double. */
+  function withFetchContract(implementation: TestFetch): typeof fetch {
+    return Object.assign(implementation, { preconnect: fetch.preconnect });
+  }
+
+  function requestUrl(input: Parameters<typeof fetch>[0]): string {
+    return input instanceof Request ? input.url : input.toString();
+  }
+
   /** The derived candidate endpoints for a catalog record's domain (issue #286 §3). */
-  function derivedCandidates(record: unknown): string[] {
-    const domain = (record as { domain: string }).domain;
-    const host = domain.startsWith("mcp.") ? domain : `mcp.${domain}`;
+  function derivedCandidates(record: CatalogRecordFixture): string[] {
+    const host = record.domain.startsWith("mcp.") ? record.domain : `mcp.${record.domain}`;
     return [`https://${host}/mcp`, `https://${host}/mcp/v1`];
   }
 
   /** Catalog doc + probe double routing: hermetic, no network. */
-  function stubCatalogFetch(records: unknown[], opts: { wellKnownStatus?: number; routes?: Route[] } = {}): typeof fetch {
-    const routes = [...(opts.routes ?? []), ...records.flatMap((record) => derivedCandidates(record).map((url) => ({ match: url, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } } as Route)))];
-    // SAFETY: the stub implements fetch's call contract; Bun's fetch also
-    // exposes fetch.preconnect, which the catalog client never calls.
-    return (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  function stubCatalogFetch(
+    records: CatalogRecordFixture[],
+    opts: { wellKnownStatus?: number; routes?: Route[] } = {},
+  ): typeof fetch {
+    const derivedRoutes: Route[] = records.flatMap((record) =>
+      derivedCandidates(record).map((url) => ({
+        match: url,
+        status: 200,
+        body: INITIALIZE_RESULT,
+        headers: { "content-type": "application/json" },
+      })),
+    );
+    const routes = [...(opts.routes ?? []), ...derivedRoutes];
+    return withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === DEFAULT_CATALOG_URL) {
         return new Response(JSON.stringify({ version: 1, data: records }), { status: 200 });
       }
@@ -701,7 +727,7 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
       }
       if (url.includes("/.well-known/")) return new Response("", { status: opts.wellKnownStatus ?? 404 });
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
   }
 
   /** In-memory store-backed runtime registry (issue #233). */
@@ -1114,16 +1140,9 @@ describe("connectExtension fail-closed deny branches (issue #198/#247)", () => {
       policy: allowedPolicy(),
       broker: new RecordingBroker({ identityKey: "email:ada@example.com", brokerCredentialId: 5 }),
     });
-    // SAFETY: the deps store slot only needs the three connect methods; the
-    // wrapper delegates everything and throws only on the credential write.
-    const original = h.deps.store as Pick<typeof h.store, "upsertExtensionCredential" | "listExtensionCredentials" | "listRuntimeExtensions">;
-    h.deps.store = {
-      upsertExtensionCredential: async () => {
-        throw new Error("db write failed");
-      },
-      listExtensionCredentials: original.listExtensionCredentials.bind(original),
-      listRuntimeExtensions: original.listRuntimeExtensions.bind(original),
-    } as typeof h.deps.store;
+    h.deps.store.upsertExtensionCredential = async () => {
+      throw new Error("db write failed");
+    };
 
     const outcome = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
     expect(outcome.ok).toBe(false);

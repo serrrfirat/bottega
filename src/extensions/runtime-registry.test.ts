@@ -137,6 +137,11 @@ describe("store-backed runtime extension registry (issue #233)", () => {
     const store = freshStore();
     // A legacy notion binding with the #275 record shape: the endpoint
     // rides on the mcp binding (an unknown field the validator ignores).
+    const legacyMcp: McpBinding & { tokenEndpoint: string } = {
+      serverUrl: "https://mcp.notion.com/mcp",
+      transport: "streamable-http",
+      tokenEndpoint: "https://mcp.notion.com/token",
+    };
     const snapshot: PinnedSnapshot = {
       schema: SNAPSHOT_SCHEMA,
       extensionId: "notion",
@@ -147,11 +152,7 @@ describe("store-backed runtime extension registry (issue #233)", () => {
         label: "Notion",
         vendor: "Notion",
         kind: "mcp",
-        mcp: {
-          serverUrl: "https://mcp.notion.com/mcp",
-          transport: "streamable-http",
-          tokenEndpoint: "https://mcp.notion.com/token",
-        } as unknown as McpBinding,
+        mcp: legacyMcp,
         credentialSchema: { type: "oauth" },
         domains: ["notion.com", "mcp.notion.com"],
         credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
@@ -167,10 +168,10 @@ describe("store-backed runtime extension registry (issue #233)", () => {
     const record = runtimeRecordFromRow(rows[0]!);
     expect(record.snapshot.manifest.kind).toBe("mcp");
     if (record.snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect((record.snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in record.snapshot.manifest.mcp).toBe(false);
     const set = await runtimeSnapshotsFromStore(store);
     if (set[0]!.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect((set[0]!.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in set[0]!.manifest.mcp).toBe(false);
     // The egress merge still allowlists the OAuth domains from the record.
     expect(set[0]!.manifest.domains).toContain("mcp.notion.com");
   });

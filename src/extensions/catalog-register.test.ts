@@ -76,7 +76,25 @@ const DOCS_RECORD = {
   domain: "docs.google.com",
 };
 
-function catalogDoc(records: unknown[]): string {
+interface CatalogRecordFixture {
+  domain: string;
+}
+
+type TestFetch = (
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => Promise<Response>;
+
+/** Adds Bun's non-request preconnect member to a hermetic fetch double. */
+function withFetchContract(implementation: TestFetch): typeof fetch {
+  return Object.assign(implementation, { preconnect: fetch.preconnect });
+}
+
+function requestUrl(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : input.toString();
+}
+
+function catalogDoc(records: readonly CatalogRecordFixture[]): string {
   return JSON.stringify({ version: 1, generatedAt: "2026-08-18T00:00:00.000Z", data: records });
 }
 
@@ -88,14 +106,12 @@ function catalogDoc(records: unknown[]): string {
  * `defaultStatus` (both 404 — fail closed).
  */
 function stubFetch(
-  records: unknown[],
+  records: CatalogRecordFixture[],
   routes: Route[] = [],
   opts: { wellKnownStatus?: number; defaultStatus?: number } = {},
 ): typeof fetch {
-  // SAFETY: the stub implements fetch's call contract; Bun's fetch also
-  // exposes fetch.preconnect, which the catalog client never calls.
-  return (async (input: string | URL | Request) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  return withFetchContract(async (input) => {
+    const url = requestUrl(input);
     if (url === CATALOG_URL) return new Response(catalogDoc(records), { status: 200 });
     const exact = routes.find((r) => r.match === url);
     const route =
@@ -105,7 +121,7 @@ function stubFetch(
     }
     if (url.includes("/.well-known/")) return new Response("", { status: opts.wellKnownStatus ?? 404 });
     return new Response("", { status: opts.defaultStatus ?? 404 });
-  }) as typeof fetch;
+  });
 }
 
 /** A valid MCP initialize result body the endpoint doubles serve. */
@@ -143,20 +159,16 @@ function statusAt(url: string, status: number): Route {
 }
 
 /** The derived candidate endpoints for a catalog record's domain (issue #286 §3). */
-function derivedCandidates(record: unknown): string[] {
-  const domain = (record as { domain: string }).domain;
-  const host = domain.startsWith("mcp.") ? domain : `mcp.${domain}`;
+function derivedCandidates(record: CatalogRecordFixture): string[] {
+  const host = record.domain.startsWith("mcp.") ? record.domain : `mcp.${record.domain}`;
   return [`https://${host}/mcp`, `https://${host}/mcp/v1`];
 }
 
 /** A throwing fetch: the discovery must fail loudly, never guess. */
 function throwingFetch(): typeof fetch {
-  // SAFETY: same contract as stubFetch; the cast goes through `unknown`
-  // because the throwing arrow's return type (Promise<never>) does not
-  // overlap typeof fetch structurally (no preconnect member).
-  return (async (_input: string | URL | Request, _init?: RequestInit) => {
+  return withFetchContract(async () => {
     throw new Error("connection refused");
-  }) as unknown as typeof fetch;
+  });
 }
 
 /**
@@ -194,7 +206,7 @@ interface Harness {
   dir: string;
 }
 
-function makeHarness(opts: { records?: unknown[]; wellKnownStatus?: number; routes?: Route[] } = {}): Harness {
+function makeHarness(opts: { records?: CatalogRecordFixture[]; wellKnownStatus?: number; routes?: Route[] } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), "bottega-catalog-register-"));
   const snapshotsDir = join(dir, "extensions");
   const egressPath = join(dir, "egress.yml");
@@ -271,14 +283,14 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
     // Only the SECOND well-known path returns 200 — the discovery probes
     // both the protected-resource and the authorization-server metadata —
     // but only AFTER the endpoint's initialize probe accepted it.
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       if (url === "https://mcp.linear.app/mcp") {
         return new Response(INITIALIZE_RESULT, { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("", { status: url.includes("oauth-authorization-server") ? 200 : 404 });
-    }) as typeof fetch;
+    });
     const discovered = await discoverCatalogMcp(entry, { fetchImpl });
     expect(discovered.oauthGated).toBe(true);
     expect(discovered.credentialSchema).toEqual({ type: "oauth" });
@@ -328,8 +340,8 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
     // /mcp/v1 endpoint. The derived mcp.gmail.googleapis.com candidate must
     // never even be probed.
     let derivedProbes = 0;
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       if (url === "https://gmailmcp.googleapis.com/mcp/v1") {
         return new Response(INITIALIZE_RESULT, { status: 200, headers: { "content-type": "application/json" } });
@@ -338,7 +350,7 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
         derivedProbes += 1;
       }
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
     const explicit: CatalogEntry = {
       ...entry,
       slug: "gmail-googleapis-com",
@@ -353,15 +365,15 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
 
   test("an HTTP 401 + Bearer challenge on the endpoint implies oauth WITHOUT the RFC 8414 metadata probe", async () => {
     let metadataProbes = 0;
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       if (url === "https://mcp.linear.app/mcp") {
         return new Response("", { status: 401, headers: { "www-authenticate": 'Bearer error="invalid_token"' } });
       }
       if (url.includes("/.well-known/")) metadataProbes += 1;
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
     const discovered = await discoverCatalogMcp(entry, { fetchImpl });
     expect(discovered.serverUrl).toBe("https://mcp.linear.app/mcp");
     expect(discovered.oauthGated).toBe(true);
@@ -371,15 +383,15 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
 
   test("a redirect to another host is rejected — the redirect host is never allowlisted", async () => {
     let evilHits = 0;
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([NOTION_RECORD]), { status: 200 });
       if (url === "https://mcp.notion.com/mcp") {
         return new Response("", { status: 301, headers: { location: "https://evil.example/mcp" } });
       }
       if (url.includes("evil.example")) evilHits += 1;
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
     await expect(discoverCatalogMcp({ ...entry, slug: "notion", domain: "notion.com" }, { fetchImpl })).rejects.toThrow(
       /redirect/,
     );
@@ -388,12 +400,12 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
 
   test("an http:// candidate is rejected (HTTPS only) — never probed", async () => {
     let probed = false;
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       probed = true;
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
     const httpEntry: CatalogEntry = { ...entry, mcpEndpoint: "http://mcp.linear.app/mcp" };
     await expect(discoverCatalogMcp(httpEntry, { fetchImpl })).rejects.toThrow(/must be https/);
     expect(probed).toBe(false);
@@ -457,6 +469,7 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
       label: "Notion",
       kind: "mcp",
       domains: ["notion.com", "mcp.notion.com"],
+      credentialTargets: [{ host: "mcp.notion.com", pathPrefix: "/mcp" }],
       mcpEndpoint: "https://mcp.notion.com/mcp",
       credentialSchema: { type: "oauth" },
       oauthGated: true,
@@ -635,7 +648,7 @@ describe("registerExtensionAtRuntime (issue #233) — store write → egress reg
     const egress = readFileSync(h.egressPath, "utf8");
     expect(egress).toContain('"mcp.notion.com"');
     expect(egress).toContain('"mcp.acme.example.com"');
-    expect(readFileSync(h.devEgressPath, "utf8")).toContain("mcp.acme.example.com");
+    expect(readFileSync(h.devEgressPath, "utf8")).toContain('- "*"');
   });
 
   test("a failed store write fails the registration closed — nothing registers", async () => {
@@ -764,25 +777,25 @@ describe("OAuth discovery carries no token endpoint on the record (issue #284 �
     // endpoint-free — the SDK re-discovers RFC 8414 metadata itself at
     // connect/call time. The 200 on the metadata path is the classification
     // signal only (the endpoint's initialize probe must still pass first).
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       if (url === "https://mcp.notion.com/mcp") {
         return new Response(INITIALIZE_RESULT, { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response(AS_METADATA, { status: 200 });
-    }) as typeof fetch;
+    });
     const discovered = await discoverCatalogMcp(NOTION_ENTRY, { fetchImpl });
     expect(discovered.oauthGated).toBe(true);
-    expect((discovered as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in discovered).toBe(false);
   });
 
   test("the protected-resource metadata 200 classifies OAuth-gated with no follow-hop (issue #284)", async () => {
     // The old discovery followed `authorization_servers` to the AS metadata
     // to extract the token endpoint. Issue #284: any 200 on the well-known
     // paths is the OAuth signal; there is no endpoint extraction hop.
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
       if (url === CATALOG_URL) return new Response(catalogDoc([]), { status: 200 });
       if (url === "https://mcp.linear.app/mcp") {
         return new Response(INITIALIZE_RESULT, { status: 200, headers: { "content-type": "application/json" } });
@@ -794,11 +807,11 @@ describe("OAuth discovery carries no token endpoint on the record (issue #284 �
         );
       }
       return new Response("", { status: 404 });
-    }) as typeof fetch;
+    });
     const entry: CatalogEntry = { ...NOTION_ENTRY, slug: "linear", domain: "linear.app" };
     const discovered = await discoverCatalogMcp(entry, { fetchImpl });
     expect(discovered.oauthGated).toBe(true);
-    expect((discovered as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in discovered).toBe(false);
   });
 
   test("lookupCatalogExtension registers an endpoint-free OAuth snapshot (the record carries no token endpoint)", async () => {
@@ -812,7 +825,7 @@ describe("OAuth discovery carries no token endpoint on the record (issue #284 �
       transport: "streamable-http",
     });
     expect(result.facts.oauthGated).toBe(true);
-    expect((result.facts as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in result.facts).toBe(false);
   });
 
   test("registerExtensionAtRuntime for an OAuth catalog entry regenerates egress WITHOUT any warning — allowlist only (issue #284)", async () => {
@@ -835,6 +848,6 @@ describe("OAuth discovery carries no token endpoint on the record (issue #284 �
     const persisted = parsePinnedSnapshot(JSON.stringify(h.runtimeRegistry.rows[0]!));
     expect(persisted.manifest.kind).toBe("mcp");
     if (persisted.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect((persisted.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in persisted.manifest.mcp).toBe(false);
   });
 });

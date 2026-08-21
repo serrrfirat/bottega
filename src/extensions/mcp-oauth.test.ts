@@ -23,14 +23,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
-import { REMOTE_REFRESH_SENTINEL, type OAuthCredential } from "@oh-my-pi/pi-ai";
+import { REMOTE_REFRESH_SENTINEL } from "@oh-my-pi/pi-ai";
+import { z } from "zod";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../policy/approval-router";
 import { createAudit } from "../policy/audit";
 import { parseOrgConfigYaml, type PolicyConfig } from "../policy/config";
 import { createStore, type Store } from "../store/db";
 import { EXTENSION_CONNECTED_EVENT, STATIC_CLIENT_PROVISIONED_EVENT } from "../store/audit-events";
-import type { ExtensionManifest } from "./manifest";
-import type { JsonValue } from "./manifest";
+import type { ExtensionManifest, JsonObject, JsonValue } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
 import {
   completeMcpOAuthFlow,
@@ -41,14 +41,14 @@ import {
   startMcpOAuthFlow,
   tokensToVaultCredential,
   vaultCredentialToTokens,
+  type McpOAuthFlowDeps,
   type McpOAuthTokenStore,
-  type PersistedOAuthFlow,
+  type VaultOAuthCredential,
 } from "./mcp-oauth";
 import { startOAuthCallbackServer } from "./oauth-callback";
 import { mountUploadLink, uploadLinkPublicBase } from "./upload-link";
 import { connectExtension, type ConnectExtensionDeps } from "./connect";
 import type { StaticOAuthClientStore } from "./static-oauth-client";
-import type { VaultOAuthCredential } from "./mcp-oauth";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-oauth-"));
 const stores: Store[] = [];
@@ -102,6 +102,39 @@ function json(body: JsonValue, status = 200): Response {
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
 }
+
+/** Parsed MCP JSON-RPC request fields used by the hermetic server. */
+const MCP_REQUEST_SCHEMA = z.object({
+  jsonrpc: z.string(),
+  id: z.number(),
+  method: z.string(),
+});
+
+/** Parsed RFC 7591 fields used by the hermetic registration endpoint. */
+const DCR_REQUEST_SCHEMA = z.object({
+  client_name: z.string().optional(),
+  redirect_uris: z.array(z.string()).optional(),
+  grant_types: z.array(z.string()).optional(),
+  scope: z.string().optional(),
+  token_endpoint_auth_method: z.string().optional(),
+});
+
+/** Parsed authorization-server metadata fields asserted by the test. */
+const AUTHORIZATION_SERVER_METADATA_SCHEMA = z.object({
+  grant_types_supported: z.array(z.string()),
+});
+
+/** Parsed persisted-flow fields asserted by the static-client round trip. */
+const PERSISTED_FLOW_TEST_SCHEMA = z.object({
+  clientInformation: z
+    .object({
+      client_id: z.string(),
+      client_secret: z.string().optional(),
+      token_endpoint_auth_method: z.string().optional(),
+    })
+    .optional(),
+  codeVerifier: z.string().optional(),
+});
 
 /** OAuth server state the tests assert on (client registrations, exchanges, refreshes). */
 interface StubState {
@@ -236,10 +269,7 @@ class StubOAuthMcp {
         }
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers });
       }
-      // SAFETY: the MCP SDK sends jsonrpc/id/method on every request; the
-      // stub reads only method and id, and anything else falls through to
-      // the unknown-method response.
-      const body = (await req.json()) as { jsonrpc: string; id: number; method: string };
+      const body = MCP_REQUEST_SCHEMA.parse(await req.json());
       if (body.method === "initialize") {
         return json({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stub-oauth-mcp", version: "1.0.0" } } });
       }
@@ -267,27 +297,26 @@ class StubOAuthMcp {
       const registrationEndpoint =
         this.registrationEndpointOverride ??
         (this.registrationEndpoint ? `${this.baseUrl}/register` : undefined);
-      return json({
+      const metadata: JsonObject = {
         issuer: this.baseUrl,
         authorization_endpoint: `${this.baseUrl}/authorize`,
         token_endpoint: `${this.baseUrl}/token`,
-        ...(registrationEndpoint !== undefined ? { registration_endpoint: registrationEndpoint } : {}),
         scopes_supported: ["default"],
         response_types_supported: ["code"],
         response_modes_supported: ["query"],
         grant_types_supported: this.grantRefresh ? ["authorization_code", "refresh_token"] : ["authorization_code"],
         token_endpoint_auth_methods_supported: this.confidential ? ["client_secret_basic", "client_secret_post"] : ["none"],
         code_challenge_methods_supported: ["S256"],
-      });
+      };
+      if (registrationEndpoint !== undefined) metadata["registration_endpoint"] = registrationEndpoint;
+      return json(metadata);
     }
     if (url.pathname === "/register") {
       if (!this.oauthMetadata || !this.registrationEndpoint) return new Response("not found", { status: 404 });
       this.state.registerCalls += 1;
-      // SAFETY: the DCR request carries these optional fields (RFC 7591);
-      // the stub defaults each missing one in the registration response.
-      const body = (await req.json()) as { client_name?: string; redirect_uris?: string[]; grant_types?: string[]; scope?: string; token_endpoint_auth_method?: string };
-      this.state.registeredScopes.push(typeof body.scope === "string" ? body.scope : "");
-      const requestedMethod = typeof body.token_endpoint_auth_method === "string" ? body.token_endpoint_auth_method : "none";
+      const body = DCR_REQUEST_SCHEMA.parse(await req.json());
+      this.state.registeredScopes.push(body.scope ?? "");
+      const requestedMethod = body.token_endpoint_auth_method ?? "none";
       this.state.registeredAuthMethods.push(requestedMethod);
       const clientId = `client-${this.state.registerCalls}`;
       // Issue #257: a confidential-enabled server issues a client_secret ONLY
@@ -431,12 +460,12 @@ class StubOAuthMcp {
  * a specific credential (expired/stripped/etc.).
  */
 class FakeVaultStore implements McpOAuthTokenStore {
-  saves: Array<{ provider: string; credential: OAuthCredential; brokerCredentialId: number }> = [];
-  #rows = new Map<string, OAuthCredential>();
+  saves: Array<{ provider: string; credential: VaultOAuthCredential; brokerCredentialId: number }> = [];
+  #rows = new Map<string, VaultOAuthCredential>();
   #rowIds = new Map<string, number>();
   #nextId = 901;
-  loadResult: OAuthCredential | null | undefined = undefined;
-  async save(provider: string, credential: OAuthCredential): Promise<{ brokerCredentialId: number }> {
+  loadResult: VaultOAuthCredential | null | undefined = undefined;
+  async save(provider: string, credential: VaultOAuthCredential): Promise<{ brokerCredentialId: number }> {
     this.#rows.set(provider, credential);
     let rowId = this.#rowIds.get(provider);
     if (rowId === undefined) {
@@ -447,7 +476,7 @@ class FakeVaultStore implements McpOAuthTokenStore {
     this.saves.push({ provider, credential, brokerCredentialId: rowId });
     return { brokerCredentialId: rowId };
   }
-  async load(provider: string): Promise<OAuthCredential | null> {
+  async load(provider: string): Promise<VaultOAuthCredential | null> {
     if (this.loadResult !== undefined) return this.loadResult;
     return this.#rows.get(provider) ?? null;
   }
@@ -481,15 +510,24 @@ class FakeStaticClientStore implements StaticOAuthClientStore {
   }
 }
 
-function flowDeps(store: Store, registry: ExtensionRegistry, vault: FakeVaultStore, baseUrl: string, staticStore?: FakeStaticClientStore) {
-  return {
+type FlowDeps = McpOAuthFlowDeps & { registry: ExtensionRegistry };
+
+function flowDeps(
+  store: Store,
+  registry: ExtensionRegistry,
+  vault: FakeVaultStore,
+  baseUrl: string,
+  staticStore?: FakeStaticClientStore,
+): FlowDeps {
+  const deps: FlowDeps = {
     registry,
     store,
     audit: createAudit(store),
     callbackBaseUrl: () => baseUrl,
     tokenStore: vault,
-    ...(staticStore !== undefined ? { staticClientStore: staticStore } : {}),
   };
+  if (staticStore !== undefined) deps.staticClientStore = staticStore;
+  return deps;
 }
 
 describe("startMcpOAuthFlow — discovery + DCR + PKCE (issue #198)", () => {
@@ -887,7 +925,7 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
         const saved = vault.saves[0]!.credential;
         expect(saved.type).toBe("oauth");
         expect(saved.refresh).toBe("");
-        expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+        expect(saved.refreshable).toBe(false);
         expect(saved.expires).toBeGreaterThan(Date.now());
         expect(saved.expires).toBeLessThanOrEqual(Date.now() + 3_700_000); // expires_in 3600s
         expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
@@ -936,7 +974,7 @@ describe("issue #256 — offline_access + a durable refresh token", () => {
         expect(vault.saves).toHaveLength(1);
         const saved = vault.saves[0]!.credential;
         expect(saved.refresh).toBe("");
-        expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+        expect(saved.refreshable).toBe(false);
         expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
       } finally {
         callback.stop();
@@ -1346,9 +1384,9 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
       const vault = new FakeVaultStore();
       // The AS DOES advertise refresh_token (the #263 shape — Notion
       // advertises refresh_token yet grants an access-only token).
-      const metadata = (await (await fetch(`${stub.baseUrl}/.well-known/oauth-authorization-server`)).json()) as {
-        grant_types_supported: string[];
-      };
+      const metadata = AUTHORIZATION_SERVER_METADATA_SCHEMA.parse(
+        await (await fetch(`${stub.baseUrl}/.well-known/oauth-authorization-server`)).json(),
+      );
       expect(metadata.grant_types_supported).toContain("refresh_token");
 
       // Decision B (issue #265): the access-only outcome is ACCEPTED — the
@@ -1359,7 +1397,7 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
       expect(vault.saves).toHaveLength(1); // exchange save only — probe skipped
       const saved = vault.saves[0]!.credential;
       expect(saved.refresh).toBe("");
-      expect((saved as VaultOAuthCredential).refreshable).toBe(false);
+      expect(saved.refreshable).toBe(false);
       expect(await store.listExtensionCredentials("fixture.oauthmcp")).toHaveLength(1);
       expect(stub.state.refreshCalls).toBe(0); // non-renewable: no mint probe
     } finally {
@@ -1445,7 +1483,7 @@ describe("issue #263 — precise fail-closed cause + DEBUG token-endpoint captur
 
 describe("token refresh — the runtime provider (issue #198)", () => {
   /** Runs a real connect round trip and returns the vault-saved credential. */
-  async function connectCredential(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<OAuthCredential> {
+  async function connectCredential(stub: StubOAuthMcp, store: Store, vault: FakeVaultStore): Promise<VaultOAuthCredential> {
     const callback = startOAuthCallbackServer({ store, audit: createAudit(store), tokenStore: vault, port: 0 });
     try {
       const deps = flowDeps(store, registryWith(stub.mcpUrl), vault, callback.baseUrl);
@@ -1587,7 +1625,7 @@ describe("token refresh — the runtime provider (issue #198)", () => {
 
 describe("vault credential <-> SDK token conversion", () => {
   test("tokensToVaultCredential preserves the previous refresh token when the server does not rotate", () => {
-    const previous: OAuthCredential = { type: "oauth", access: "old", refresh: "refresh-keep", expires: 1 };
+    const previous: VaultOAuthCredential = { type: "oauth", access: "old", refresh: "refresh-keep", expires: 1 };
     const converted = tokensToVaultCredential({ access_token: "new", token_type: "Bearer", expires_in: 3600 }, previous);
     expect(converted).toMatchObject({ type: "oauth", access: "new", refresh: "refresh-keep" });
     expect(converted.expires).toBeGreaterThan(Date.now());
@@ -2010,7 +2048,7 @@ describe("issue #288 — static OAuth clients for no-DCR authorization servers",
         const row = store.getOAuthFlow(state);
         expect(row).not.toBeNull();
         if (row) {
-          const flow = JSON.parse(row.flow) as PersistedOAuthFlow;
+          const flow = PERSISTED_FLOW_TEST_SCHEMA.parse(JSON.parse(row.flow));
           expect(flow.clientInformation).toMatchObject({
             client_id: STATIC_CLIENT_ID,
             client_secret: STATIC_CLIENT_SECRET,

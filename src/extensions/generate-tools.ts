@@ -161,8 +161,8 @@ export function paramsFromInputSchema(schema: JsonObject): ExtensionToolParam[] 
     const param: ExtensionToolParam = {
       name,
       type,
-      ...(jsonType !== undefined ? { jsonType } : {}),
     };
+    if (jsonType !== undefined) param.jsonType = jsonType;
     if (parsedDescription.success && parsedDescription.data.trim() !== "") {
       param.description = parsedDescription.data.trim();
     }

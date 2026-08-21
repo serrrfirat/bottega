@@ -78,7 +78,13 @@ function gateFor(policy: PolicyConfig, router: ApprovalRouter) {
   return { loadPolicy: () => Promise.resolve(policy), router, timeoutMs: 60_000 };
 }
 
-function freshAudit(): { audit: AuditModule; store: Store; auditRows(): Promise<AuditRow[]> } {
+interface AuditHarness {
+  audit: AuditModule;
+  store: Store;
+  auditRows(): Promise<AuditRow[]>;
+}
+
+function freshAudit(): AuditHarness {
   const store = createStore(join(dir, `test-${stores.length}.db`));
   stores.push(store);
   return {

@@ -191,7 +191,7 @@ describe("extension manifest validation (fail closed)", () => {
     );
     expect(manifest.kind).toBe("mcp");
     if (manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-    expect((manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+    expect("tokenEndpoint" in manifest.mcp).toBe(false);
   });
 
   test("mcp serverUrl must be an http(s) URL", () => {

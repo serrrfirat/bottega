@@ -18,6 +18,8 @@ const roots: string[] = [];
 const stores: Store[] = [];
 const PHASE_AUDIT_SCHEMA = z.object({ phase: z.string() });
 
+type LifecycleToolArgs = Record<string, string | number>;
+
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -123,7 +125,7 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
     );
   }
 
-  async function call(actor: string, name: string, args: Record<string, unknown>) {
+  async function call(actor: string, name: string, args: LifecycleToolArgs) {
     const tool = tools(actor).get(name);
     if (!tool) throw new Error(`missing tool ${name}`);
     return tool.execute("call", args, undefined, undefined, {
@@ -176,7 +178,7 @@ describe("connection lifecycle caller surface (#318)", () => {
   test("replacement rolls back on proxy preparation failure, then switches by expected revision and revokes only the old authority", async () => {
     const h = await harness();
     const a = await h.seed("UA", "personal", 21);
-    const b = await h.seed("UB", "personal", 22);
+    await h.seed("UB", "personal", 22);
     h.boundary.failPrepare = true;
 
     const failed = await h.call("UA", "replace_connection", { connection_id: a.id, expected_revision: 1 });
