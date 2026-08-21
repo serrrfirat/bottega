@@ -529,6 +529,31 @@ export interface DmCardAttachment {
 export const DM_CARD_COLOR = "#5B7DB1";
 
 /**
+ * How many characters of a DM card's body may appear as the top-level
+ * `text` (issue #296). Real Slack renders top-level text ABOVE attachments,
+ * so repeating the full body there duplicates it in the client: a bordered
+ * color-bar attachment copy plus the plain copy. A SHORT bounded preview
+ * keeps push notifications readable (Slack uses top-level text for the
+ * mobile/ping surface) while the attachment owns the full body.
+ */
+export const DM_CARD_NOTIFICATION_LIMIT = 80;
+
+/**
+ * The top-level `text` for any card-bearing DM send (issue #296): a bounded,
+ * whitespace-collapsed notification preview of the body. The attachment —
+ * NOT this text — carries the full body as nested Block Kit plus the
+ * plain-text `fallback`. Keeping a single space here (never an empty
+ * string) preserves Slack's notification/ping surface without duplicating
+ * the body in the client. Bodies already shorter than the limit pass
+ * through unchanged.
+ */
+export function dmCardNotificationText(body: string): string {
+  const single = body.replace(/\s+/g, " ").trim();
+  if (single.length <= DM_CARD_NOTIFICATION_LIMIT) return single;
+  return `${single.slice(0, DM_CARD_NOTIFICATION_LIMIT).trimEnd()}…`;
+}
+
+/**
  * The live status card for a top-level DM (issue #296): a single attachment
  * carrying the trusted status line (the rotating thinking phrase or the live
  * progress line) as nested Block Kit. The same mrkdwn is the accessible
@@ -1089,17 +1114,20 @@ export class SlackTurnPresenter {
     // errors and empty completions show no count.
     const actionsCompleted = reply !== undefined ? this.#completedActionsCount : 0;
     if (pendingTs !== undefined) {
-      const { attachments, fallback } = renderDmFinalCard(text, actionsCompleted);
+      const { attachments } = renderDmFinalCard(text, actionsCompleted);
+      // Issue #296: top-level text is a bounded notification preview — the
+      // full answer already lives in the attachment; repeating it above the
+      // attachment would render it twice in real Slack.
       console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
       void this.adapter
-        .updateMessage(this.spaceId, pendingTs, fallback, { attachments })
+        .updateMessage(this.spaceId, pendingTs, dmCardNotificationText(text), { attachments })
         .catch((err) => {
           console.error(`[slack-turn-presenter] failed to update DM reply in ${this.spaceId}:`, err);
         });
     } else {
-      const { attachments, fallback } = renderDmFinalCard(text, actionsCompleted);
+      const { attachments } = renderDmFinalCard(text, actionsCompleted);
       void this.adapter
-        .postMessage(this.spaceId, fallback, { ...this.replyOpts(), attachments })
+        .postMessage(this.spaceId, dmCardNotificationText(text), { ...this.replyOpts(), attachments })
         .then((ts) => {
           if (ts !== undefined) console.log(`presenter: final reply posted/edited ${this.spaceId} ${ts}`);
         })
@@ -1341,9 +1369,10 @@ export class SlackTurnPresenter {
     // Issue #296: a top-level DM's opening card is a Slack ATTACHMENT (a
     // documented visible container) — the trusted status line nested as
     // Block Kit with the same mrkdwn as the accessible fallback text. The
-    // final answer replaces this same timestamp.
+    // final answer replaces this same timestamp. Top-level text stays a
+    // bounded notification preview (never a duplicate of the status body).
     if (this.#dmTopLevel) {
-      return this.adapter.postMessage(this.spaceId, openingText, { ...opts, attachments: renderDmStatusCard(openingText) });
+      return this.adapter.postMessage(this.spaceId, dmCardNotificationText(openingText), { ...opts, attachments: renderDmStatusCard(openingText) });
     }
     return this.adapter.postMessage(this.spaceId, openingText, opts);
   }
@@ -1625,7 +1654,7 @@ export class SlackTurnPresenter {
     // plain-text rotation.
     if (this.#dmTopLevel) {
       const phrase = this.#nextPhrase();
-      return this.sendTextChunk(pendingTs, phrase, { attachments: renderDmStatusCard(phrase) });
+      return this.sendTextChunk(pendingTs, dmCardNotificationText(phrase), { attachments: renderDmStatusCard(phrase) });
     }
     return this.sendTextChunk(pendingTs, this.#nextPhrase());
   }
@@ -1868,7 +1897,7 @@ export class SlackTurnPresenter {
       // status card (trusted status line nested as Block Kit); channels/
       // threads keep the plain-text in-place update.
       if (this.#dmTopLevel) {
-        await this.sendTextChunk(entry.ts, entry.text, { attachments: renderDmStatusCard(entry.text) });
+        await this.sendTextChunk(entry.ts, dmCardNotificationText(entry.text), { attachments: renderDmStatusCard(entry.text) });
       } else {
         await this.sendTextChunk(entry.ts, entry.text);
       }
