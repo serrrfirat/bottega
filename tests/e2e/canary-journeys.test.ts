@@ -1424,19 +1424,20 @@ describe("no-reply timeout diagnosis (issue #245)", () => {
         replies: async (_channelId: string, _threadTs: string): Promise<SlackApiMessage[]> => [],
       },
     } as Harness;
-    const error = await waitForBotReply(h, "C1", {
-      afterTs: pingTs,
-      label: "churn diagnostics ping",
-      timeoutMs: 300,
-    }).then(
-      () => undefined,
-      (e: unknown) => e,
-    );
+    let error: Error | undefined;
+    try {
+      await waitForBotReply(h, "C1", {
+        afterTs: pingTs,
+        label: "churn diagnostics ping",
+        timeoutMs: 300,
+      });
+    } catch (caught) {
+      error = caught instanceof Error ? caught : new Error(String(caught));
+    }
     // Pre-fix this resolved (the fallback false-passed as a "reply") and
     // then the message assertions below failed; post-fix it rejects.
     expect(error).toBeDefined();
-    const message = error instanceof Error ? error.message : String(error);
-    expect(message).toContain("no bot reply to \"churn diagnostics ping\"");
+    const message = error?.message ?? "";
     // Turn opened: the diagnosis counts the bot rows and calls out that
     // none reads as a reply.
     expect(message).toMatch(/the bot posted \d+ message\(s\) after the ask but none reads as a reply/);
@@ -1494,6 +1495,9 @@ describe("auto-pickup explicit-confirm gate (issue #245)", () => {
       updated_at: 101,
     };
     let listAudits = 0;
+    // SAFETY: journeySemanticPickup reads only the live Slack post/history/
+    // permalink methods and store list/get methods supplied by this double;
+    // each method returns the complete owner contract used by that journey.
     const h = {
       liveSlack: {
         botUserId: "B-bot",

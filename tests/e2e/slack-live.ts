@@ -53,15 +53,24 @@ export interface LiveSlackTokens {
  * approver, ordinary member, second member. Each maps to a distinct
  * workspace user + its own xoxp token for live-role journeys.
  */
-export type FixedIdentity = "requester" | "approver" | "member" | "second-member";
+export const FIXED_IDENTITIES = ["requester", "approver", "member", "second-member"] as const;
+export type FixedIdentity = (typeof FIXED_IDENTITIES)[number];
+
+type FixedIdentityTokenKey = "requesterToken" | "approverToken" | "memberToken" | "secondMemberToken";
 
 /** The token slot + user-id slot for one of the four fixed identities. */
-const FIXED_IDENTITY_SLOTS: Record<FixedIdentity, { tokenKey: "requesterToken" | "approverToken" | "memberToken" | "secondMemberToken"; userIdEnv: string; userNameEnv: string }> = {
+interface FixedIdentitySlot {
+  tokenKey: FixedIdentityTokenKey;
+  userIdEnv: string;
+  userNameEnv: string;
+}
+
+const FIXED_IDENTITY_SLOTS = {
   requester: { tokenKey: "requesterToken", userIdEnv: "SLACK_QA_REQUESTER_ID", userNameEnv: "SLACK_QA_REQUESTER_NAME" },
   approver: { tokenKey: "approverToken", userIdEnv: "SLACK_QA_APPROVER_ID", userNameEnv: "SLACK_QA_APPROVER_NAME" },
   member: { tokenKey: "memberToken", userIdEnv: "SLACK_QA_MEMBER_ID", userNameEnv: "SLACK_QA_MEMBER_NAME" },
   "second-member": { tokenKey: "secondMemberToken", userIdEnv: "SLACK_QA_SECOND_MEMBER_ID", userNameEnv: "SLACK_QA_SECOND_MEMBER_NAME" },
-};
+} satisfies Record<FixedIdentity, FixedIdentitySlot>;
 
 /** A raw message row as Slack's history APIs return it. */
 export interface SlackApiMessage {
@@ -275,7 +284,7 @@ export async function bootLiveSlack(tokens: LiveSlackTokens): Promise<LiveSlackH
   // lacks the user.
   const identityClients = new Map<FixedIdentity, SlackApiClient>();
   const identityUserIds = new Map<FixedIdentity, string>();
-  for (const identity of Object.keys(FIXED_IDENTITY_SLOTS) as FixedIdentity[]) {
+  for (const identity of FIXED_IDENTITIES) {
     const slot = FIXED_IDENTITY_SLOTS[identity];
     const token = tokens[slot.tokenKey];
     if (!token) continue;

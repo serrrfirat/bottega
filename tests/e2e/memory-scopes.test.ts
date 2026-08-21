@@ -24,6 +24,7 @@ import { describe, expect, test } from "bun:test";
 import type { MemoryScopeKey } from "../../src/memory/types";
 import type { StubTurn } from "./harness";
 import { bootHarness, type Harness } from "./harness";
+import { z } from "zod";
 
 async function waitFor<T>(
   fn: () => T | undefined | null | Promise<T | undefined | null>,
@@ -46,12 +47,25 @@ function recallTurn(query: string): StubTurn[] {
   ];
 }
 
+/** One logical scope and its recall count in a `memory.recalled` audit payload. */
+interface RecalledScope {
+  scope: string;
+  key: string;
+  count: number;
+}
+
+const RecalledScopeSchema: z.ZodType<RecalledScope> = z.object({
+  scope: z.string(),
+  key: z.string(),
+  count: z.number(),
+});
+const RecalledScopesPayloadSchema = z.object({ scopes: z.array(RecalledScopeSchema) });
+
 /** The logical scopes a `memory.recalled` row reports, keyed by kind. */
-async function recalledScopes(h: Harness, actor: string, spaceId: string): Promise<Array<{ scope: string; key: string; count: number }>> {
+async function recalledScopes(h: Harness, actor: string, spaceId: string): Promise<RecalledScope[]> {
   const rows = (await h.store.listAudit({ event_type: "memory.recalled", space: spaceId })).filter((r) => r.actor === actor);
   if (rows.length === 0) return [];
-  const payload = JSON.parse(rows[rows.length - 1]!.payload) as { scopes: Array<{ scope: string; key: string; count: number }> };
-  return payload.scopes;
+  return RecalledScopesPayloadSchema.parse(JSON.parse(rows[rows.length - 1]!.payload)).scopes;
 }
 
 /** Seed a logical-scope fact through the real provider. */
@@ -246,7 +260,7 @@ describe("permission-aware memory recall (issue #137, caller-level)", () => {
       const row = rows[rows.length - 1]!;
       expect(row.actor).toBe(principal);
       expect(row.space_id).toBe(spaceId);
-      const payload = JSON.parse(row.payload) as { scopes?: unknown };
+      const payload = RecalledScopesPayloadSchema.parse(JSON.parse(row.payload));
       // Scopes + counts present; the query and the fact content are absent.
       expect(payload.scopes).toBeDefined();
       expect(row.payload).not.toContain("supersecretquery");

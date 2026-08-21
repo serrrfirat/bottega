@@ -392,7 +392,7 @@ const FIXTURE_PIN_INITIALIZE_RESULT = JSON.stringify({
 export function canaryFixturePinFetch(verdict: "valid" | "invalid" = "valid"): typeof fetch {
   // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>.
   return (async (input: string | URL | Request) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = input instanceof URL ? input.href : input instanceof Request ? input.url : input;
     if (url !== FIXTURE_PIN_MCP_URL) return new Response("", { status: 404 });
     if (verdict === "invalid") return new Response("", { status: 404 });
     return new Response(FIXTURE_PIN_INITIALIZE_RESULT, {
@@ -984,6 +984,8 @@ async function journeyWorkItem(h: Harness, channelId: string, runId: string): Pr
   }
 }
 
+const MessageReceivedPayloadSchema = z.object({ ts: z.string().optional() });
+
 async function journeyConnect(h: Harness, channelId: string): Promise<JourneyResult> {
   const live = h.liveSlack!;
   const spaceId = `slack:${channelId}`;
@@ -1006,7 +1008,11 @@ async function journeyConnect(h: Harness, channelId: string): Promise<JourneyRes
     await waitFor(
       async () => {
         const rows = await h.store.listAudit({ space: spaceId, event_type: MESSAGE_RECEIVED_EVENT });
-        return rows.some((r) => (JSON.parse(r.payload) as { ts?: string }).ts === inboundTs) ? rows : undefined;
+        const hasInbound = rows.some((row) => {
+          const payload = MessageReceivedPayloadSchema.safeParse(JSON.parse(row.payload));
+          return payload.success && payload.data.ts === inboundTs;
+        });
+        return hasInbound ? rows : undefined;
       },
       STORE_TIMEOUT_MS,
       "a message.in audit row for the connect-shaped message",
@@ -2183,10 +2189,12 @@ const ROLES_WITH_LABEL: Array<{ identity: FixedIdentity; label: string }> = [
  * zero identities — the caller FAILS CLOSED (never a vacuous pass). Pure,
  * exported for the hermetic role-filter regressions.
  */
-export function resolveRoleIdentities(onlyRole?: string): {
+export interface RoleIdentityResolution {
   identities: FixedIdentity[];
   problem?: string;
-} {
+}
+
+export function resolveRoleIdentities(onlyRole?: string): RoleIdentityResolution {
   if (onlyRole === undefined) return { identities: ROLES_WITH_LABEL.map((r) => r.identity) };
   const canonical = canonicalIdentity(onlyRole);
   if (canonical === undefined) {
@@ -2234,11 +2242,13 @@ export function registryJourneyLayer(id: string): string | undefined {
  *   - an unknown id → { problem } (not a registered journey).
  * NEVER "validated then ignored".
  */
-export function resolveLiveJourneySelection(journeyId: string): {
+export interface LiveJourneySelection {
   runner: "roles" | undefined;
   problem: string | undefined;
-} {
-  if ((LIVE_REGISTRY_IDS as readonly string[]).includes(journeyId)) {
+}
+
+export function resolveLiveJourneySelection(journeyId: string): LiveJourneySelection {
+  if (LIVE_REGISTRY_IDS.includes(journeyId)) {
     return { runner: "roles", problem: undefined };
   }
   const layer = registryJourneyLayer(journeyId);

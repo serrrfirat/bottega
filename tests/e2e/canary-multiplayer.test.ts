@@ -42,6 +42,7 @@ import { createSqliteMemoryProvider } from "../../src/memory/sqlite";
 import { connectExtension, type ConnectExtensionDeps, type BrokerConnector } from "../../src/extensions/connect";
 import { FIXTURE_EXTENSION_ID, createFixtureRegistry } from "../../src/extensions/fixture";
 import type { ApprovalRouter } from "../../src/policy/approval-router";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 /** Org policy for the multiplayer journeys: work items + memory auto-approve; model_settings prompts (the approve/deny path). */
 const MULTIPLAYER_ORG = [
@@ -92,11 +93,20 @@ function toolsForActor(store: Store, actor: string) {
   return workItemToolDefinitions(store, { orgPolicy: parseOrgConfigYaml(MULTIPLAYER_ORG), actor, agentDir: dir });
 }
 
+interface ToolRunContext {
+  sessionManager: { getSessionFile(): string };
+}
+
 /** A minimal session ctx the tool definitions read the space id from. */
-const ctx = (spaceId: string) =>
-  ({
+function ctx(spaceId: string): ExtensionContext {
+  const context: ToolRunContext = {
     sessionManager: { getSessionFile: () => `data/sessions/${spaceId}.json` },
-  }) as never;
+  };
+  // SAFETY: the memory and work-item tool definitions used below derive the
+  // space id only through sessionManager.getSessionFile; this double supplies
+  // that complete executed boundary.
+  return context as ExtensionContext;
+}
 
 async function auditActors(store: Store, eventType: string): Promise<string[]> {
   const rows = await store.listAudit({ event_type: eventType });

@@ -424,6 +424,10 @@ export interface SlackHandle {
   stop(): void;
 }
 
+interface FetchHandlerRef {
+  fetch(req: Request): Response | Promise<Response>;
+}
+
 function bootSlackEmulator(extraUserNames: string[] = []): SlackEmulatorHandle {
   // Bind once on an ephemeral port and serve the emulator through an
   // indirection. The earlier probe-then-rebind (bind port 0, stop, seed,
@@ -433,7 +437,7 @@ function bootSlackEmulator(extraUserNames: string[] = []): SlackEmulatorHandle {
   // mutable handler keeps the port stable from the first bind onward; the
   // constructor + seeding are synchronous, so no request can arrive before
   // the emulator handler is installed.
-  const handlerRef: { fetch: (req: Request) => Response | Promise<Response> } = {
+  const handlerRef: FetchHandlerRef = {
     fetch: () => new Response("bottega emulator not ready"),
   };
   const http = Bun.serve({ port: 0, fetch: (req) => handlerRef.fetch(req) });

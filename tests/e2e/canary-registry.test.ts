@@ -28,8 +28,6 @@ import {
   selectJourneys,
 } from "./canary-registry";
 
-const CLASSES = new Set<string>(CAPABILITY_CLASSES as readonly string[]);
-const SURFACED = new Set<string>(SURFACED_TOOL_NAMES);
 
 describe("hybrid canary tool-coverage gate (issue #298)", () => {
   test("every surfaced built-in tool is covered or explicitly excluded", () => {
@@ -48,7 +46,9 @@ describe("hybrid canary tool-coverage gate (issue #298)", () => {
     for (const j of JOURNEYS) {
       if (j.exclusionReason !== undefined) continue;
       for (const key of j.covers) {
-        if (!SURFACED.has(key) && !CLASSES.has(key)) bogus.push(`${j.id}:${key}`);
+        if (!SURFACED_TOOL_NAMES.includes(key) && !CAPABILITY_CLASSES.some((capability) => capability === key)) {
+          bogus.push(`${j.id}:${key}`);
+        }
       }
     }
     expect(bogus).toEqual([]);

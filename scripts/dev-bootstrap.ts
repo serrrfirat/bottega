@@ -37,7 +37,7 @@ function fileInfo(path: string): FileInfo | null {
       size: stat.size,
     };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
     throw error;
   }
 }
@@ -52,7 +52,7 @@ export const nodeBootstrapFs: BootstrapFs = {
       mkdirSync(path, { mode });
       return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      if (error instanceof Error && "code" in error && error.code === "EEXIST") return false;
       throw error;
     }
   },
@@ -286,7 +286,9 @@ function printPlan(deps: BootstrapDeps, plan: SetupPlan, apply: boolean): void {
 }
 
 function commandOptions(config: BootstrapConfig, env: Record<string, string>, timeoutMs?: number): CommandOptions {
-  return { cwd: config.root, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
+  const options: CommandOptions = { cwd: config.root, env };
+  if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
+  return options;
 }
 
 async function prerequisites(deps: BootstrapDeps, config: BootstrapConfig, env: Record<string, string>): Promise<string[]> {
@@ -326,7 +328,7 @@ async function validateCa(deps: BootstrapDeps, config: BootstrapConfig, env: Rec
   return null;
 }
 
-function runtimeEnv(config: BootstrapConfig, env: Record<string, string>): Record<string, string> {
+function runtimeEnv(config: BootstrapConfig, env: Record<string, string>) {
   return {
     ...env,
     COMPOSE_PROJECT_NAME: config.composeProject,
@@ -334,7 +336,7 @@ function runtimeEnv(config: BootstrapConfig, env: Record<string, string>): Recor
     BOTTEGA_DEV_CERTS_DIR: config.certsDir,
     BOTTEGA_PROXY_SECRETS_DIR: join(config.dataDir, "proxy-secrets"),
     BOTTEGA_PUBLIC_BASE_URL_FILE: config.publicBaseFile,
-  };
+  } satisfies Record<string, string>;
 }
 function composeRuntimeEnv(deps: BootstrapDeps, config: BootstrapConfig, env: Record<string, string>): Record<string, string> {
   const result = runtimeEnv(config, env);
@@ -617,7 +619,7 @@ async function runDev(
     return 1;
   }
 
-  const finalEnv: Record<string, string> = {
+  const finalEnv = {
     ...env,
     HTTP_PROXY: PROXY_TUNNEL_URL,
     HTTPS_PROXY: PROXY_TUNNEL_URL,
@@ -629,7 +631,7 @@ async function runDev(
     BOTTEGA_PROXY_CONTROL_TOKEN: proxyToken,
     OMP_AUTH_BROKER_URL: "http://127.0.0.1:8765",
     OMP_AUTH_BROKER_TOKEN: brokerToken,
-  };
+  } satisfies Record<string, string>;
   deps.log("bottega dev: prerequisites ready; starting the server (credential values redacted)");
   return deps.commands.exec(
     ["bun", "run", ...(args.includes("--watch") ? ["--watch"] : []), "src/server/index.ts"],
@@ -686,10 +688,12 @@ async function httpProbe(kind: ProbeKind, token?: string): Promise<ProbeResult> 
   }
 }
 
-function processEnv(env: NodeJS.ProcessEnv): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) if (value !== undefined) result[key] = value;
-  return result;
+function definedEnvEntry(entry: [string, string | undefined]): entry is [string, string] {
+  return entry[1] !== undefined;
+}
+
+function processEnv(env: NodeJS.ProcessEnv) {
+  return Object.fromEntries(Object.entries(env).filter(definedEnvEntry));
 }
 
 const systemCommands: CommandPort = {

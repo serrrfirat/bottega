@@ -51,7 +51,7 @@ function devComposeProjectFrom(cwd: string, adopt?: string): string {
 }
 
 /** Creates a fresh hermetic canonical-checkout topology and returns {top, checkout}. */
-function freshTopology(prefix: string): { top: string; checkout: string } {
+function freshTopology(prefix: string) {
   const top = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   return { top, checkout: join(top, "camp-flavor") };
 }

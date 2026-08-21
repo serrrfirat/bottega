@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EGRESS_KEYS, NO_PROXY_LIST, PROXY_TUNNEL_URL, exportProxyEnv, proxyEnv } from "./canary-egress";
 
-function freshCwd(): { cwd: string; cleanup: () => void } {
+function freshCwd() {
   const cwd = mkdtempSync(join(tmpdir(), "canary-egress-"));
   return { cwd, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
 }
@@ -23,13 +23,26 @@ function freshCwd(): { cwd: string; cleanup: () => void } {
 /** The five proxy env vars the egress needs + the canonical certs-dir override (issue #301). */
 const AMBIENT_KEYS = [...EGRESS_KEYS, "BOTTEGA_DEV_CERTS_DIR"] as const;
 
-type EgressSnapshot = Record<string, string | undefined>;
+interface EgressSnapshot {
+  HTTP_PROXY: string | undefined;
+  HTTPS_PROXY: string | undefined;
+  NO_PROXY: string | undefined;
+  NODE_EXTRA_CA_CERTS: string | undefined;
+  SSL_CERT_FILE: string | undefined;
+  BOTTEGA_DEV_CERTS_DIR: string | undefined;
+}
 
 function snapshotEgressEnv(): EgressSnapshot {
-  const snapshot: EgressSnapshot = {};
-  for (const key of AMBIENT_KEYS) snapshot[key] = process.env[key];
-  return snapshot;
+  return {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+    NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+    BOTTEGA_DEV_CERTS_DIR: process.env.BOTTEGA_DEV_CERTS_DIR,
+  };
 }
+
 
 function restoreEgressEnv(snapshot: EgressSnapshot): void {
   for (const key of AMBIENT_KEYS) {
@@ -40,7 +53,7 @@ function restoreEgressEnv(snapshot: EgressSnapshot): void {
 }
 
 /** Runs `fn` with the ambient egress + canonical-certs env cleared (hermetic). */
-function withEnv(fn: () => unknown): unknown {
+function withEnv<T>(fn: () => T): T {
   const before = snapshotEgressEnv();
   for (const key of AMBIENT_KEYS) delete process.env[key];
   try {

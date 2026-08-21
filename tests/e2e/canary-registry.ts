@@ -21,8 +21,10 @@ import { BUILTIN_TOOLS, HIDDEN_TOOLS } from "@oh-my-pi/pi-coding-agent";
 import { PROJECT_TOOL_NAMES } from "../../src/extensions/manifest";
 import { SPACE_AGENT_TOOLS } from "../../src/server/drivers/agent-driver";
 
+
 /** The three layers every journey belongs to; each journey has exactly one. */
-export type JourneyLayer = "hermetic" | "live-api" | "browser";
+export const JOURNEY_LAYERS = ["hermetic", "live-api", "browser"] as const;
+export type JourneyLayer = (typeof JOURNEY_LAYERS)[number];
 
 /** A typed journey descriptor shared by coverage + reporting. */
 export interface CanaryJourney {
@@ -60,6 +62,7 @@ export const CAPABILITY_CLASSES = [
   "cli", // command-line bindings
   "oauth", // OAuth credential flows
 ] as const;
+
 export type CapabilityClass = (typeof CAPABILITY_CLASSES)[number];
 
 /**
@@ -69,8 +72,8 @@ export type CapabilityClass = (typeof CAPABILITY_CLASSES)[number];
  * exclusion row covers all of them.
  */
 export const NON_SURFACED_SDK_BUILTINS: string[] = Object.keys(BUILTIN_TOOLS).filter(
-  (name) => !SPACE_AGENT_TOOLS.includes(name as (typeof SPACE_AGENT_TOOLS)[number]) &&
-    !PROJECT_TOOL_NAMES.includes(name as (typeof PROJECT_TOOL_NAMES)[number]),
+  (name) => !SPACE_AGENT_TOOLS.some((toolName) => toolName === name) &&
+    !PROJECT_TOOL_NAMES.some((toolName) => toolName === name),
 ).concat(Object.keys(HIDDEN_TOOLS));
 
 /**
@@ -87,7 +90,7 @@ export const SURFACED_TOOL_NAMES: readonly string[] = Array.from(
   new Set([
     ...SPACE_AGENT_TOOLS,
     ...PROJECT_TOOL_NAMES,
-    ...Object.keys(BUILTIN_TOOLS).filter((n) => SPACE_AGENT_TOOLS.includes(n as (typeof SPACE_AGENT_TOOLS)[number])),
+    ...Object.keys(BUILTIN_TOOLS).filter((name) => SPACE_AGENT_TOOLS.some((toolName) => toolName === name)),
     // Scheduler administration tools (src/scheduler/scheduler-tools.ts).
     "create_scheduler_job",
     "list_scheduler_jobs",
@@ -464,6 +467,7 @@ export function journeyById(
 
 /** The four fixed identities the role/multiplayer matrix drives (issue #298). */
 export const LIVE_IDENTITIES = ["requester", "approver", "member", "second-member"] as const;
+export type LiveIdentity = (typeof LIVE_IDENTITIES)[number];
 
 /**
  * Canonicalize a role alias to a fixed identity (issue #298). The registry
@@ -471,10 +475,9 @@ export const LIVE_IDENTITIES = ["requester", "approver", "member", "second-membe
  * `approver` identity; anything not a fixed identity or a known alias is
  * undefined (unknown role → caller must fail closed, never vacuously pass).
  */
-const ROLE_TO_IDENTITY: Record<string, string> = { "space-approver": "approver" };
-export function canonicalIdentity(role: string): string | undefined {
-  if (ROLE_TO_IDENTITY[role]) return ROLE_TO_IDENTITY[role];
-  return (LIVE_IDENTITIES as readonly string[]).includes(role) ? role : undefined;
+export function canonicalIdentity(role: string): LiveIdentity | undefined {
+  if (role === "space-approver") return "approver";
+  return LIVE_IDENTITIES.find((identity) => identity === role);
 }
 
 /**
@@ -504,10 +507,11 @@ export function parseCanaryFilters(
   const filters: CanaryFilters = {};
   const layer = value(layerIdx);
   if (layer !== undefined) {
-    if (!["hermetic", "live-api", "browser"].includes(layer)) {
+    const parsedLayer = JOURNEY_LAYERS.find((candidate) => candidate === layer);
+    if (parsedLayer === undefined) {
       throw new Error(`invalid --layer "${layer}": expected hermetic | live-api | browser`);
     }
-    filters.layer = layer as JourneyLayer;
+    filters.layer = parsedLayer;
   }
   const journey = value(journeyIdx);
   if (journey !== undefined) {

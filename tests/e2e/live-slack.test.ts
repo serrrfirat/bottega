@@ -18,6 +18,7 @@ import { parseCanaryFilters } from "./canary-registry";
 import { bootHarness, CANARY_MODEL_REFS, pickRealModelRef } from "./harness";
 import { resolveChannelMembers, type SlackInviteApi } from "./slack-live";
 import type { JsonObject } from "../../src/extensions/manifest";
+import { z } from "zod";
 
 /** Env vars the canary reads; scrubbed and restored around each test. */
 const CANARY_ENV_KEYS = [
@@ -325,16 +326,23 @@ describe("channel membership flag (issue #245)", () => {
     // qa: true } — the already-joined bot reads as absent.
     let members = ["B-bot"];
     const calls: string[] = [];
+    const InviteBodySchema = z.object({ users: z.string() });
     const api: SlackInviteApi = {
       call: async <T = JsonObject>(method: string, body?: JsonObject): Promise<T> => {
         calls.push(method);
-        if (method === "conversations.members") return { members } as T;
+        if (method === "conversations.members") {
+          // SAFETY: resolveChannelMembers requests `{ members: string[] }` for this method,
+          // and this stub returns that exact owner contract.
+          return { members } as T;
+        }
         if (method === "conversations.invite") {
-          const userId = typeof body?.users === "string" ? body.users : "";
+          const userId = InviteBodySchema.parse(body).users;
           if (members.includes(userId)) {
             throw new Error("slack api conversations.invite: already_in_channel");
           }
           members = [...members, userId];
+          // SAFETY: resolveChannelMembers ignores the invite response; this stub still
+          // returns Slack's `{ ok: true }` response under the caller-selected generic.
           return { ok: true } as T;
         }
         throw new Error(`unexpected slack api method ${method}`);
@@ -381,8 +389,8 @@ describe("live-API focused filters (issue #298 re-review)", () => {
     expect(LIVE_REGISTRY_IDS).toContain("live.roles.queue-ownership");
     // No short ids leak into the canonical selectable set (the old defect):
     // a short id is NOT a registry id, so it cannot select a body.
-    expect((LIVE_REGISTRY_IDS as readonly string[]).includes("roles")).toBe(false);
-    expect((LIVE_REGISTRY_IDS as readonly string[]).includes("chat-reply")).toBe(false);
+    expect(LIVE_REGISTRY_IDS.includes("roles")).toBe(false);
+    expect(LIVE_REGISTRY_IDS.includes("chat-reply")).toBe(false);
     // A no-body registry journey resolves to its layer for the precise
     // fail-closed message: browser + hermetic journeys have no live-API body.
     expect(registryJourneyLayer("browser.dm-card-lifecycle")).toBe("browser");

@@ -27,6 +27,7 @@
  */
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { z } from "zod";
 
 /** The five registered browser journeys (stable ids, mirrors canary-registry.ts). */
 export const BROWSER_JOURNEY_IDS = [
@@ -60,6 +61,33 @@ export interface BrowserRunResult {
 // Minimal Chrome DevTools Protocol client over Bun's WebSocket.
 // ---------------------------------------------------------------------------
 
+const CdpMessageSchema = z.object({
+  id: z.number().optional(),
+  method: z.string().optional(),
+  params: z.unknown().optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+});
+type CdpMessage = z.infer<typeof CdpMessageSchema>;
+
+const TraceDataCollectedSchema = z.object({
+  value: z.string().optional(),
+  values: z.array(z.string()).optional(),
+});
+const EvaluatedValueSchema = z.json().optional();
+type EvaluatedValue = z.infer<typeof EvaluatedValueSchema>;
+const RuntimeEvaluateResultSchema = z.object({
+  result: z.object({
+    value: EvaluatedValueSchema,
+    description: z.string().optional(),
+  }).optional(),
+});
+const ChromeVersionSchema = z.object({ webSocketDebuggerUrl: z.string().optional() });
+const ScreenshotResultSchema = z.object({ data: z.string().optional() });
+const IgnoredCdpResultSchema = z.unknown().transform(() => undefined);
+
+type CdpParams = Readonly<Record<string, string | number | boolean>>;
+
 interface CdpSession {
   socket: WebSocket;
   nextId: number;
@@ -67,59 +95,61 @@ interface CdpSession {
   trace: string[];
 }
 
-interface CdpMessage {
-  id?: number;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-}
-
 function connectCdp(url: string): Promise<CdpSession> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    const session: CdpSession = { socket, nextId: 1, pending: new Map(), trace: [] };
-    socket.onopen = () => resolve(session);
-    socket.onerror = () => reject(new Error(`failed to connect to CDP at ${url}`));
-    socket.onmessage = (ev) => {
-      const msg = JSON.parse(String(ev.data)) as CdpMessage;
-      if (msg.id !== undefined) {
-        const res = session.pending.get(msg.id);
-        if (res) {
-          session.pending.delete(msg.id);
-          res(msg);
-        }
-      } else if (msg.method === "Tracing.dataCollected") {
-        // Finding #8: the trace arrives as dataCollected events, NOT in the
-        // Tracing.end response. Accumulate each chunk.
-        const params = msg.params as { value?: string; values?: string[] };
-        if (typeof params?.value === "string") session.trace.push(params.value);
-        for (const v of params?.values ?? []) if (typeof v === "string") session.trace.push(v);
+  const { promise, resolve, reject } = Promise.withResolvers<CdpSession>();
+  const socket = new WebSocket(url);
+  const session: CdpSession = { socket, nextId: 1, pending: new Map(), trace: [] };
+  socket.onopen = () => resolve(session);
+  socket.onerror = () => reject(new Error(`failed to connect to CDP at ${url}`));
+  socket.onmessage = (ev) => {
+    const msg = CdpMessageSchema.parse(JSON.parse(String(ev.data)));
+    if (msg.id !== undefined) {
+      const res = session.pending.get(msg.id);
+      if (res) {
+        session.pending.delete(msg.id);
+        res(msg);
       }
-    };
-  });
+    } else if (msg.method === "Tracing.dataCollected") {
+      // Finding #8: the trace arrives as dataCollected events, NOT in the
+      // Tracing.end response. Accumulate each chunk after validating the
+      // protocol event payload.
+      const params = TraceDataCollectedSchema.safeParse(msg.params);
+      if (!params.success) return;
+      if (params.data.value !== undefined) session.trace.push(params.data.value);
+      for (const value of params.data.values ?? []) session.trace.push(value);
+    }
+  };
+  return promise;
 }
 
-function cdpCall(session: CdpSession, method: string, params: unknown = {}): Promise<unknown> {
+function cdpCall<T>(
+  session: CdpSession,
+  method: string,
+  resultSchema: z.ZodType<T>,
+  params: CdpParams = {},
+): Promise<T> {
   const id = session.nextId++;
-  return new Promise((resolve, reject) => {
-    session.pending.set(id, (msg) => {
-      if (msg.result !== undefined) resolve(msg.result);
-      else reject(new Error(`CDP ${method} failed: ${JSON.stringify(msg.params ?? msg)}`));
-    });
-    session.socket.send(JSON.stringify({ id, method, params }));
+  const { promise, resolve, reject } = Promise.withResolvers<T>();
+  session.pending.set(id, (msg) => {
+    if (msg.result !== undefined) resolve(resultSchema.parse(msg.result));
+    else reject(new Error(`CDP ${method} failed: ${JSON.stringify(msg.params ?? msg)}`));
   });
+  session.socket.send(JSON.stringify({ id, method, params }));
+  return promise;
 }
 
 function waitTicks(n = 3): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 250 * n));
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, 250 * n);
+  return promise;
 }
 
-async function evalJs(session: CdpSession, expression: string): Promise<unknown> {
-  const res = (await cdpCall(session, "Runtime.evaluate", {
+async function evalJs(session: CdpSession, expression: string): Promise<EvaluatedValue> {
+  const res = await cdpCall(session, "Runtime.evaluate", RuntimeEvaluateResultSchema, {
     expression,
     returnByValue: true,
     awaitPromise: true,
-  })) as { result?: { value?: unknown; description?: string } };
+  });
   return res.result?.value ?? res.result?.description;
 }
 
@@ -148,20 +178,13 @@ interface JourneyEnv {
 }
 
 /** Fixed identities (mirrors slack-live.ts / canary-registry). */
-export type FixedIdentity = "requester" | "approver" | "member" | "second-member";
-export const FIXED_IDENTITIES: readonly FixedIdentity[] = [
-  "requester",
-  "approver",
-  "member",
-  "second-member",
-];
+export const FIXED_IDENTITIES = ["requester", "approver", "member", "second-member"] as const;
+export type FixedIdentity = (typeof FIXED_IDENTITIES)[number];
+
 /** Canonical role alias: `space-approver` maps to the `approver` identity (finding #3). */
-const ROLE_TO_IDENTITY: Record<string, FixedIdentity> = {
-  "space-approver": "approver",
-};
 export function canonicalIdentity(role: string): FixedIdentity | undefined {
-  if (ROLE_TO_IDENTITY[role]) return ROLE_TO_IDENTITY[role];
-  return (FIXED_IDENTITIES as readonly string[]).includes(role) ? (role as FixedIdentity) : undefined;
+  if (role === "space-approver") return "approver";
+  return FIXED_IDENTITIES.find((identity) => identity === role);
 }
 // ---------------------------------------------------------------------------
 // Real Slack interaction helpers.
@@ -248,9 +271,9 @@ async function clickApprovalButton(session: CdpSession, approve: boolean): Promi
 
 /** Navigate to a URL and wait for load. */
 async function navigate(session: CdpSession, url: string): Promise<void> {
-  await cdpCall(session, "Page.enable");
-  await cdpCall(session, "Runtime.enable");
-  await cdpCall(session, "Page.navigate", { url });
+  await cdpCall(session, "Page.enable", IgnoredCdpResultSchema);
+  await cdpCall(session, "Runtime.enable", IgnoredCdpResultSchema);
+  await cdpCall(session, "Page.navigate", IgnoredCdpResultSchema, { url });
   await waitForVisible(session, `document.readyState === 'complete'`, 45_000);
 }
 
@@ -298,7 +321,7 @@ async function bootChrome(profileDir: string, port: number): Promise<CdpSession>
   for (let i = 0; i < 40 && !session; i++) {
     try {
       const http = await fetch(`http://127.0.0.1:${port}/json/version`);
-      const info = (await http.json()) as { webSocketDebuggerUrl?: string };
+      const info = ChromeVersionSchema.parse(await http.json());
       if (info.webSocketDebuggerUrl) session = await connectCdp(info.webSocketDebuggerUrl);
     } catch {
       await waitTicks(2);
@@ -324,7 +347,7 @@ async function assertAuthenticated(session: CdpSession, env: JourneyEnv): Promis
 /** Starts a CDP trace; chunks accumulate in session.trace via dataCollected (finding #8). */
 async function startTrace(session: CdpSession): Promise<void> {
   session.trace.length = 0;
-  await cdpCall(session, "Tracing.start", {
+  await cdpCall(session, "Tracing.start", IgnoredCdpResultSchema, {
     categories:
       "devtools.timeline,disabled-by-default-devtools.timeline,disabled-by-default-v8.cpu_profiler",
   });
@@ -333,7 +356,7 @@ async function startTrace(session: CdpSession): Promise<void> {
 /** Stops the trace and writes the accumulated chunks to a JSON array file. */
 async function stopTrace(session: CdpSession, outDir: string, name: string): Promise<string> {
   try {
-    await cdpCall(session, "Tracing.end");
+    await cdpCall(session, "Tracing.end", IgnoredCdpResultSchema);
     await waitTicks(2);
   } catch {
     /* ignore end errors */
@@ -344,7 +367,7 @@ async function stopTrace(session: CdpSession, outDir: string, name: string): Pro
 }
 
 async function screenshot(session: CdpSession, outDir: string, name: string): Promise<string> {
-  const res = (await cdpCall(session, "Page.captureScreenshot", { format: "png" })) as { data?: string };
+  const res = await cdpCall(session, "Page.captureScreenshot", ScreenshotResultSchema, { format: "png" });
   if (!res.data) throw new Error("captureScreenshot returned no data");
   const file = join(outDir, `${name}.png`);
   await writeFile(file, Buffer.from(res.data, "base64"));
@@ -377,7 +400,7 @@ async function runJourney(
 ): Promise<BrowserJourneyResult> {
   try {
     return await executeJourney(env, sessions, id);
-  } catch (err) {
+  } catch {
     // Screenshot + trace on EVERY failure (using the requester session).
     const requester = sessions.get("requester");
     try {
@@ -553,12 +576,15 @@ export function parseBrowserArgv(env: Record<string, string | undefined>, argv: 
     );
   }
   const journeyRaw = value("--journey");
-  const journeys: BrowserJourneyId[] =
-    journeyRaw !== undefined ? ([journeyRaw] as BrowserJourneyId[]) : ([...BROWSER_JOURNEY_IDS] as BrowserJourneyId[]);
-  for (const j of journeys) {
-    if (!(BROWSER_JOURNEY_IDS as readonly string[]).includes(j)) {
-      throw new Error(`browser canary: unknown journey "${j}" — expected one of ${BROWSER_JOURNEY_IDS.join(", ")}`);
+  let journeys: BrowserJourneyId[];
+  if (journeyRaw === undefined) {
+    journeys = [...BROWSER_JOURNEY_IDS];
+  } else {
+    const journey = BROWSER_JOURNEY_IDS.find((candidate) => candidate === journeyRaw);
+    if (journey === undefined) {
+      throw new Error(`browser canary: unknown journey "${journeyRaw}" — expected one of ${BROWSER_JOURNEY_IDS.join(", ")}`);
     }
+    journeys = [journey];
   }
   if (!requesterProfileDir) {
     throw new Error(
@@ -566,21 +592,22 @@ export function parseBrowserArgv(env: Record<string, string | undefined>, argv: 
     );
   }
   if (!workspaceUrl) throw new Error("browser canary: a workspace URL is required (SLACK_WORKSPACE_URL / --workspace)");
-  const profiles: Partial<Record<FixedIdentity, string>> = {
+  const profiles = {
     requester: requesterProfileDir,
     approver: env.BROWSER_PROFILE_APPROVER,
     member: env.BROWSER_PROFILE_MEMBER,
     "second-member": env.BROWSER_PROFILE_SECOND_MEMBER,
-  };
+  } satisfies Partial<Record<FixedIdentity, string>>;
   return { requesterProfileDir, outDir, workspaceUrl, botName, journeys, role, profiles };
 }
 
 /** Fail-closed selection: a focused filter that selects zero journeys THROWS (finding #3/#4). */
 export function selectBrowserJourneys(argv: BrowserArgv): BrowserJourneyId[] {
-  if (argv.role !== undefined) {
-    const byRole = argv.journeys.filter((id) => browserJourneyActsOn(id, argv.role!));
+  const role = argv.role;
+  if (role !== undefined) {
+    const byRole = argv.journeys.filter((id) => browserJourneyActsOn(id, role));
     if (byRole.length === 0) {
-      throw new Error(`browser canary: --role ${argv.role} selects no browser journeys — fail closed (issue #298)`);
+      throw new Error(`browser canary: --role ${role} selects no browser journeys — fail closed (issue #298)`);
     }
     return byRole;
   }

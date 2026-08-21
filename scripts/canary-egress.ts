@@ -35,7 +35,7 @@ export type TunnelProbe = (tunnelUrl: string) => Promise<boolean>;
  * dev server booted from ANY worktree uses the shared CA, never a
  * worktree-local cert the shared proxy is not terminating with.
  */
-export function proxyEnv(cwd: string): EgressEnv {
+export function proxyEnv(cwd: string) {
   const certsDir = process.env.BOTTEGA_DEV_CERTS_DIR ?? join(cwd, "certs");
   const caCert = join(certsDir, "ca.crt");
   return {
@@ -44,7 +44,7 @@ export function proxyEnv(cwd: string): EgressEnv {
     NO_PROXY: NO_PROXY_LIST,
     NODE_EXTRA_CA_CERTS: caCert,
     SSL_CERT_FILE: caCert,
-  };
+  } satisfies EgressEnv;
 }
 
 function tcpProbe(tunnelUrl: string, timeoutMs = 1_000): Promise<boolean> {
