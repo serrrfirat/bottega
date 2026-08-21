@@ -472,21 +472,18 @@ describe("iron-proxy dev-permissive leg (skip-gated)", () => {
 });
 
 /**
- * Strict-config secrets leg (issue #177, gap #2): boots the pinned image
- * with a TEST-RENDERED strict config — the REAL allowlist domains from
- * config/egress.yml plus a leg-local target mapped to a local Bun.serve
- * upstream, the REAL generated secrets transform (renderSecretsTransform,
- * issue #53), and the management block (issue #123) — and proves, against
- * the actual binary:
- *   - a non-allowlisted host is 403'd and NEVER receives the injected
- *     Authorization header (the upstream never sees the request),
- *   - an allowlisted host without a secrets rule passes with NO header,
- *   - an allowlisted host with the rule receives the boundary's secret as
- *     `Authorization: Bearer <value>` — via the REAL boundary code path
- *     (mode-0600 write-temp + rename, POST /v1/reload with the management
- *     token), so rotation applies to a RUNNING proxy without a restart,
- *   - the secret file honors the mode-0600 boundary contract,
- *   - the management API is token-gated (a reload without the token 401s),
+ * Strict-config scoped-authorization leg: boots the pinned image with a
+ * test-rendered strict config. It uses the real allowlist, a local upstream,
+ * the generated scoped marker region, and the management API. Against the
+ * actual binary it proves:
+ *   - a non-allowlisted host is denied before the upstream,
+ *   - an allowlisted host without authority receives no credential,
+ *   - an exact `/mcp` target receives the selected credential only while its
+ *     random per-call placeholder is active,
+ *   - `/public`, `/mcp-evil`, a redirect destination, and a replay after
+ *     revocation never receive the credential,
+ *   - query strings do not widen or disable the reviewed path boundary,
+ *   - the management API is token-gated,
  *   - DNS sinkhole answers arbitrary names with the proxy IP.
  *
  * The judge transform is intentionally omitted (needs the

@@ -297,8 +297,10 @@ describe("extension manifest validation (fail closed)", () => {
   });
 
   test("wildcard domains with a leading *. are accepted", () => {
-    const manifest = validateManifest(asJsonDoc({ ...fixtureManifest(), domains: ["*.fixture.weather.test"] }));
-    expect(manifest.domains).toEqual(["*.fixture.weather.test"]);
+    const manifest = validateManifest(
+      asJsonDoc({ ...fixtureManifest(), domains: ["fixture.weather.test", "*.fixture.weather.test"] }),
+    );
+    expect(manifest.domains).toEqual(["fixture.weather.test", "*.fixture.weather.test"]);
   });
 
   test("credential targets are required and stay separate from reachable domains (issue #307)", () => {
@@ -353,7 +355,7 @@ describe("extension manifest validation (fail closed)", () => {
         domains: ["*.fixture.weather.test"],
         credentialTargets: [{ host: "*.weather.test", pathPrefix: "/mcp" }],
       }),
-      "must be covered by domains",
+      "must be covered by an identical wildcard",
     );
     expectInvalid(
       asJsonDoc({
