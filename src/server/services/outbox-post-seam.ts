@@ -47,7 +47,6 @@ import {
 import type { SlackAdapter } from "../adapters/slack";
 import { issueCard, type SlackBlock } from "../adapters/blocks";
 import { dispatchIngestEvent } from "../../ingest/dispatch";
-import type { IngestEvent } from "../../ingest/types";
 import { createAudit } from "../../policy/audit";
 
 /** Post-seam pass interval. Default 5000 ms — the delivery poller's cadence. */
@@ -114,12 +113,19 @@ const workItemNotificationSchema = z
  * in-process — dispatch + Slack post stay server-side (the server holds the
  * Slack tokens).
  */
+const ingestEventSchema = z.object({
+  provider: z.enum(["github", "linear"]),
+  eventType: z.string(),
+  payload: z.unknown(),
+  occurredAt: z.string(),
+});
+
 const ingestPollOutcomeSchema = z.object({
   state: z.string().optional(),
   result: z
     .object({
       provider: z.string(),
-      events: z.array(z.unknown()).default([]),
+      events: z.array(ingestEventSchema).default([]),
     })
     .optional(),
 });
@@ -376,7 +382,7 @@ async function postIngestPollRow(
     return false;
   }
   const audit = createAudit(store);
-  const events = (parsed.data.result?.events ?? []) as IngestEvent[];
+  const events = parsed.data.result?.events ?? [];
   for (const event of events) {
     // Defense in depth: dispatchIngestEvent re-validates every event and
     // audits any rejection — nothing unvalidated ever reaches a work item

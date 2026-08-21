@@ -25,6 +25,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { z } from "zod";
 import { createStore } from "../store/db";
 import type { SchedulerJob } from "../scheduler/types";
 import type { McpBinding } from "../extensions/manifest";
@@ -38,6 +39,21 @@ import { main } from "./index";
  * temp deployment root so a hermetic boot loads the real tools-less
  * manifests instead of an empty registry. */
 const EXTENSIONS_DIR = resolve(import.meta.dir, "../../config/extensions");
+
+const jsonRpcRequestSchema = z.object({
+  jsonrpc: z.string(),
+  id: z.number().optional(),
+  method: z.string(),
+});
+const extensionManifestDocumentSchema = z
+  .object({
+    manifest: z
+      .object({
+        mcp: z.object({ serverUrl: z.string() }).passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
 
 /** The scheduler tool execute never touches a session context. */
 // SAFETY: scheduler tool executes ignore their ExtensionContext; the empty
@@ -467,7 +483,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
             return new Response("", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
           }
           seenAuth.push(authorization);
-          const body = (await req.json()) as { jsonrpc: string; id: number; method: string };
+          const body = jsonRpcRequestSchema.parse(await req.json());
           if (body.method === "initialize") {
             return Response.json({
               jsonrpc: "2.0",
@@ -493,7 +509,9 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       });
       // Patch the manifest's placeholder serverUrl to the live stub port.
       const manifestPath = join(env.dir, "config", "extensions", `${OAUTH_ID}.json`);
-      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { manifest: { mcp: { serverUrl: string } } };
+      const manifest = extensionManifestDocumentSchema.parse(
+        JSON.parse(readFileSync(manifestPath, "utf8")),
+      );
       manifest.manifest.mcp.serverUrl = `http://127.0.0.1:${mcp.port}/mcp`;
       writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
       // Pre-seed the boot store's PERSISTED extension credential (the

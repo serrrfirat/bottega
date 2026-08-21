@@ -16,12 +16,19 @@
  * `approval.requested` / `approval.resolved` around the `request()` call
  * (issue #33 vocabulary).
  */
+import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../../policy/approval-router";
 import { redact } from "../../policy/audit";
 import { summarizeToolArgs } from "../../policy/gate";
 import { DEFAULT_TIMEOUT_MINUTES } from "../../policy/config";
-import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
+import {
+  APPROVE_ACTION_ID,
+  DENY_ACTION_ID,
+  type SlackAction,
+  type SlackAdapter,
+  type SlackBlockPayload,
+} from "./slack";
 import { emitToolStep, nextToolStepId, toolStepTitle, type ToolStepSink } from "../services/slack-turn-presenter";
 
 /** Cap for the args summary text rendered in the approval prompt (redacted first). */
@@ -90,6 +97,19 @@ export interface ApprovalArgRow {
   value: string;
 }
 
+const approvalArgsSchema = z.object({}).passthrough();
+type ApprovalArgs = z.infer<typeof approvalArgsSchema>;
+const approvalArgTextSchema = z.string();
+const approvalArgScalarSchema = z.union([z.number(), z.boolean()]);
+const approvalSkillSummarySchema = z.object({
+  name: z.string().optional(),
+  expected_revision: z.string().optional(),
+  document: z.object({ bytes: z.number(), sha256: z.string() }).optional(),
+  companion_files: z
+    .array(z.object({ path: z.string(), bytes: z.number(), sha256: z.string() }))
+    .optional(),
+});
+
 /**
  * Humanizes an arg key: camelCase / snake_case / kebab-case become spaced
  * title words ('addTeams'/'due_date' → 'Add teams' / 'Due date').
@@ -115,43 +135,41 @@ export function humanizeToolName(name: string): string {
   return humanizeKey(base);
 }
 
-/** True for values that carry no information on an approval card (elided). */
-function isEmptyValue(v: unknown): boolean {
-  if (v === null || v === undefined) return true;
-  if (typeof v === "string") return v === "";
-  if (typeof v === "number" || typeof v === "boolean") return false;
-  if (Array.isArray(v)) return v.length === 0;
-  if (v instanceof Set) return v.size === 0;
-  if (v instanceof Map) return v.size === 0;
-  return Object.keys(v).length === 0;
-}
-
-/**
- * One arg value rendered for the prompt: redacted FIRST (the same redaction
- * the audit module applies — secret-shaped values never reach the card),
- * then capped per value with an ellipsis.
- */
-function renderArgValue(v: unknown): string {
-  let text: string;
-  if (typeof v === "string") text = v;
-  else if (typeof v === "number" || typeof v === "boolean") text = String(v);
-  else text = JSON.stringify(v) ?? "";
-  text = redact(text);
-  return text.length > ARGS_ROW_VALUE_MAX ? `${text.slice(0, ARGS_ROW_VALUE_MAX)}…` : text;
-}
-
 /**
  * Humanized, redacted, capped rows for the would-be-write payload (issue
  * #277): keys become title words, empty values are elided, values are
  * redacted then capped, and the row list is capped.
  */
-export function humanizeArgsRows(args: unknown): ApprovalArgRow[] {
-  if (args === null || typeof args !== "object" || Array.isArray(args)) return [];
-  const entries = Object.entries(args as Record<string, unknown>);
+export function humanizeArgsRows(args: ApprovalArgs): ApprovalArgRow[] {
   const rows: ApprovalArgRow[] = [];
-  for (const [key, value] of entries) {
-    if (isEmptyValue(value)) continue;
-    rows.push({ label: humanizeKey(key), value: renderArgValue(value) });
+  for (const [key, value] of Object.entries(args)) {
+    const textValue = approvalArgTextSchema.safeParse(value);
+    const scalarValue = approvalArgScalarSchema.safeParse(value);
+    const empty =
+      value === null ||
+      value === undefined ||
+      (textValue.success && textValue.data === "") ||
+      (Array.isArray(value) && value.length === 0) ||
+      (value instanceof Set && value.size === 0) ||
+      (value instanceof Map && value.size === 0) ||
+      (!textValue.success &&
+        !scalarValue.success &&
+        !Array.isArray(value) &&
+        !(value instanceof Set) &&
+        !(value instanceof Map) &&
+        Object.keys(Object(value)).length === 0);
+    if (empty) continue;
+
+    let text = textValue.success
+      ? textValue.data
+      : scalarValue.success
+        ? String(scalarValue.data)
+        : JSON.stringify(value) ?? "";
+    text = redact(text);
+    rows.push({
+      label: humanizeKey(key),
+      value: text.length > ARGS_ROW_VALUE_MAX ? `${text.slice(0, ARGS_ROW_VALUE_MAX)}…` : text,
+    });
   }
   return rows;
 }
@@ -162,24 +180,26 @@ export function humanizeArgsRows(args: unknown): ApprovalArgRow[] {
  */
 export function approvalArgsRows(request: ApprovalRequest): ApprovalArgRow[] {
   if (request.tool !== "create_space_skill" && request.tool !== "update_space_skill") {
-    return humanizeArgsRows(request.args);
+    const parsedArgs = approvalArgsSchema.safeParse(request.args);
+    return parsedArgs.success ? humanizeArgsRows(parsedArgs.data) : [];
   }
-  const parsed: unknown = JSON.parse(summarizeToolArgs(request.tool, request.args));
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
-  const summary = parsed as Record<string, unknown>;
+  const parsed = approvalSkillSummarySchema.safeParse(
+    JSON.parse(summarizeToolArgs(request.tool, request.args)),
+  );
+  if (!parsed.success) return [];
+  const summary = parsed.data;
   const rows: ApprovalArgRow[] = [];
-  if (typeof summary.name === "string") rows.push({ label: "Skill", value: summary.name });
-  if (typeof summary.expected_revision === "string") {
+  if (summary.name !== undefined) rows.push({ label: "Skill", value: summary.name });
+  if (summary.expected_revision !== undefined) {
     rows.push({ label: "Expected revision", value: summary.expected_revision });
   }
-  if (summary.document !== null && typeof summary.document === "object" && !Array.isArray(summary.document)) {
-    const document = summary.document as Record<string, unknown>;
+  if (summary.document !== undefined) {
     rows.push({
       label: "SKILL.md",
-      value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${String(document.bytes)} bytes (sha256 ${String(document.sha256)})`,
+      value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${summary.document.bytes} bytes (sha256 ${summary.document.sha256})`,
     });
   }
-  if (Array.isArray(summary.companion_files)) {
+  if (summary.companion_files !== undefined) {
     rows.push({
       label: "Companion set",
       value:
@@ -187,12 +207,10 @@ export function approvalArgsRows(request: ApprovalRequest): ApprovalArgRow[] {
           ? `add ${summary.companion_files.length} declared file(s)`
           : `replace complete set with ${summary.companion_files.length} declared file(s); omitted old files are deleted`,
     });
-    for (const item of summary.companion_files) {
-      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
-      const file = item as Record<string, unknown>;
+    for (const file of summary.companion_files) {
       rows.push({
-        label: `Companion ${String(file.path)}`,
-        value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${String(file.bytes)} bytes (sha256 ${String(file.sha256)})`,
+        label: `Companion ${file.path}`,
+        value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${file.bytes} bytes (sha256 ${file.sha256})`,
       });
     }
   }
@@ -269,7 +287,9 @@ export class ApprovalFailureMemory {
     this.entries.delete(key);
     this.entries.set(key, reason);
     while (this.entries.size > this.max) {
-      this.entries.delete(this.entries.keys().next().value as string);
+      const oldest = this.entries.keys().next();
+      if (oldest.done) break;
+      this.entries.delete(oldest.value);
     }
   }
 
@@ -285,9 +305,13 @@ export class ApprovalFailureMemory {
  * 'last confirmed write failed' banner, then Approve/Deny buttons carrying
  * the request id. Pure so the outbound rendering is testable without Slack.
  */
-export function buildApprovalBlocks(d: ApprovalRequest, id: string, rememberedFailure?: string): unknown[] {
+export function buildApprovalBlocks(
+  d: ApprovalRequest,
+  id: string,
+  rememberedFailure?: string,
+): SlackBlockPayload[] {
   const args = renderArgsRowsText(approvalArgsRows(d));
-  const blocks: unknown[] = [
+  const blocks: SlackBlockPayload[] = [
     {
       type: "section",
       text: { type: "mrkdwn", text: `*Approval required* — \`${d.tool}\`` },

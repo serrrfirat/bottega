@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Skill } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 
 export const DEFAULT_SKILLS_ROOT = "data/skills";
 export const SKILLS_ROOT_ENV = "BOTTEGA_SKILLS_DIR";
@@ -40,6 +41,15 @@ export const MAX_COMPANION_PATH_DEPTH = 8;
 
 const MANIFEST_FILE = ".bottega-skill.json";
 const MANIFEST_SCHEMA = "bottega.space-skill.v1";
+function hasForbiddenTextControl(text: string): boolean {
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    if ((code >= 0 && code <= 8) || code === 11 || code === 12 || (code >= 14 && code <= 31)) {
+      return true;
+    }
+  }
+  return false;
+}
 const SPACE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9:._-]*$/;
 
 export interface SkillsResolveOpts {
@@ -124,6 +134,19 @@ interface StoredManifest {
   files: Array<{ path: string; size: number; sha256: string }>;
 }
 
+const stringValueSchema = z.string();
+const storedManifestSchema = z.object({
+  schema: z.literal(MANIFEST_SCHEMA),
+  revision: z.string(),
+  document_sha256: z.string(),
+  files: z.array(z.unknown()),
+});
+const storedManifestFileSchema = z.object({
+  path: z.string(),
+  size: z.number(),
+  sha256: z.string(),
+});
+
 const spaceCache = new Map<string, Skill[]>();
 const builtinCache = new Map<string, Skill[]>();
 
@@ -191,12 +214,15 @@ export function spaceSkillsDir(spaceId: string, opts: SkillsResolveOpts = {}): s
 function decodeYamlScalar(value: string): string {
   const trimmed = value.trim();
   if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    let decoded: unknown;
     try {
-      const parsed: unknown = JSON.parse(trimmed);
-      if (typeof parsed === "string") return parsed;
+      decoded = JSON.parse(trimmed);
     } catch {
       throw new Error("skill frontmatter contains an invalid quoted scalar");
     }
+    const parsed = stringValueSchema.safeParse(decoded);
+    if (parsed.success) return parsed.data;
+    throw new Error("skill frontmatter contains an invalid quoted scalar");
   }
   return trimmed;
 }
@@ -238,7 +264,8 @@ export function validateCompanionPath(path: string): string {
 }
 
 function decodeCompanion(value: CompanionFileInput, path: string): Uint8Array {
-  if (typeof value === "string") return Buffer.from(value, "utf8");
+  const text = stringValueSchema.safeParse(value);
+  if (text.success) return Buffer.from(text.data, "utf8");
   if (value instanceof Uint8Array) return value;
   if (value.encoding === "text") return Buffer.from(value.content, "utf8");
   const encoded = value.content;
@@ -322,23 +349,21 @@ function parseStoredManifest(bytes: Uint8Array): StoredManifest {
   } catch {
     throw new Error("skill metadata is invalid JSON");
   }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("skill metadata is invalid");
-  const record = value as Record<string, unknown>;
-  if (record.schema !== MANIFEST_SCHEMA || typeof record.revision !== "string" || typeof record.document_sha256 !== "string" || !Array.isArray(record.files)) {
-    throw new Error("skill metadata is invalid");
-  }
-  const files = record.files.map((item) => {
-    if (item === null || typeof item !== "object" || Array.isArray(item)) throw new Error("skill metadata file entry is invalid");
-    const file = item as Record<string, unknown>;
-    if (typeof file.path !== "string" || typeof file.size !== "number" || typeof file.sha256 !== "string") {
-      throw new Error("skill metadata file entry is invalid");
-    }
-    return { path: validateCompanionPath(file.path), size: file.size, sha256: file.sha256 };
+  const parsed = storedManifestSchema.safeParse(value);
+  if (!parsed.success) throw new Error("skill metadata is invalid");
+  const files = parsed.data.files.map((item) => {
+    const file = storedManifestFileSchema.safeParse(item);
+    if (!file.success) throw new Error("skill metadata file entry is invalid");
+    return {
+      path: validateCompanionPath(file.data.path),
+      size: file.data.size,
+      sha256: file.data.sha256,
+    };
   });
   return {
     schema: MANIFEST_SCHEMA,
-    revision: record.revision,
-    document_sha256: record.document_sha256,
+    revision: parsed.data.revision,
+    document_sha256: parsed.data.document_sha256,
     files,
   };
 }
@@ -406,7 +431,7 @@ function summary(skill: StoredSkill, shadows: Array<"builtin"> = []): SkillSumma
 function outputCompanion(file: FileEntry): CompanionFileOutput {
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
-    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) {
+    if (hasForbiddenTextControl(text)) {
       return { encoding: "base64", content: Buffer.from(file.bytes).toString("base64") };
     }
     return { encoding: "text", content: text };
@@ -427,7 +452,7 @@ function detail(skill: StoredSkill): SkillDetail {
   };
 }
 
-function tierRecords(spaceId: string, opts: SkillsResolveOpts): { space: StoredSkill[]; builtin: StoredSkill[] } {
+function tierRecords(spaceId: string, opts: SkillsResolveOpts) {
   const space = readTier(spaceSkillsDir(spaceId, opts), "space", `space:${spaceId}`);
   const builtin = readTier(builtinSkillsDir(opts), "builtin", BUILTIN_SKILL_SOURCE);
   return { space, builtin };
@@ -615,5 +640,7 @@ export async function deleteSpaceSkill(
   }
   bustSpaceSkillsCache(spaceId, opts);
   const builtin = readTier(builtinSkillsDir(opts), "builtin", BUILTIN_SKILL_SOURCE).find((skill) => skill.name === name);
-  return { deleted: summary(previous), ...(builtin ? { revealed: summary(builtin) } : undefined) };
+  const deleted = summary(previous);
+  if (builtin === undefined) return { deleted };
+  return { deleted, revealed: summary(builtin) };
 }

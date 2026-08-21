@@ -6,7 +6,11 @@ import { createMemoryConsolidationTrigger } from "./services/memory-consolidatio
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { evaluatePolicyGate } from "../policy/gate";
-import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
+import {
+  bootstrapRuntime,
+  type BootstrapRuntime,
+  type BootstrapRuntimeDeps,
+} from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { listConnectionReadModel } from "../extensions/lifecycle";
@@ -41,7 +45,11 @@ import { storeRuntimeRegistrySeam } from "../extensions/runtime-registry";
 import { mountUploadLink, uploadLinkPublicBase } from "../extensions/upload-link";
 import { createStaticOAuthClientStore } from "../extensions/static-oauth-client";
 import { createMcpOAuthConnector } from "../extensions/mcp-oauth";
-import { callbackPort, startOAuthCallbackServer } from "../extensions/oauth-callback";
+import {
+  callbackPort,
+  startOAuthCallbackServer,
+  type OAuthCallbackEndpointDeps,
+} from "../extensions/oauth-callback";
 import type { McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import { SNAPSHOTS_DIR } from "../egress/generate";
 import {
@@ -74,6 +82,7 @@ import {
   SCHEDULER_RESUME_ACTION_ID,
   SCHEDULER_RUN_NOW_ACTION_ID,
   isDmChannel,
+  slackBlockPayloadSchema,
   type SlackAction,
   type SlackAdapter,
 } from "./adapters/slack";
@@ -234,15 +243,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // seam; late-bound like approvalRouter — assigned after the adapter and
   // store are available, before main() returns.
   let deliveryActionHandler: (a: SlackAction) => Promise<void>;
-  const wiring = await bootstrapRuntime({
+  const bootstrapDeps: BootstrapRuntimeDeps = {
     router: () => approvalRouter,
-    ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : undefined),
-    ...(opts.mcpOAuthTokenStore !== undefined ? { mcpOAuthTokenStore: opts.mcpOAuthTokenStore } : undefined),
-    ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
     // Issue #193: extension-tool steps reach the space's turn presenter
     // too — late-bound, same pattern as the driver gate below.
     onToolStep: (step) => spaceService.routeToolStep(step),
-  });
+  };
+  if (opts.surfaceTransport !== undefined) bootstrapDeps.mcpTransport = opts.surfaceTransport;
+  if (opts.mcpOAuthTokenStore !== undefined) bootstrapDeps.mcpOAuthTokenStore = opts.mcpOAuthTokenStore;
+  if (opts.boundary !== undefined) bootstrapDeps.boundary = opts.boundary;
+  const wiring = await bootstrapRuntime(bootstrapDeps);
   const {
     store,
     audit,
@@ -496,7 +506,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       "bottega boot: ingest webhook leg not mounted — no org channel (onboarding.space_id) configured",
     );
   }
-  const oauthCallback = startOAuthCallbackServer({
+  const callbackDeps: OAuthCallbackEndpointDeps = {
     store,
     audit,
     port: stablePort,
@@ -504,13 +514,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // listener as the callback + webhook route — one stable port, one
     // tunnel target, one public base for every browser leg.
     uploadLink: uploadMount,
-    // Issue #57: the ingest webhook route (/webhooks/<extension>) joins the
-    // OAuth callback's inbound HTTP surface — ONE public ingress serves all
-    // paths (ngrok in dev compose; nginx + TLS in production). The dispatch
-    // targets the org channel (onboarding.space_id, the org settings blob);
-    // WITHOUT a configured org channel the leg is NOT mounted — /webhooks/*
-    // 404s, fail closed: an undeliverable delivery is never accepted.
-    ...(ingestWebhooks !== undefined ? { webhooks: ingestWebhooks } : undefined),
     // Issue #281: the browser leg is the only place that knows the connect
     // actually completed — surface the connected space so its live session
     // toolset refreshes WITHOUT a restart. Late-bound (spaceService is
@@ -523,12 +526,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       if (spaceId === null) return;
       void spaceService.refreshExtensionTools(spaceId, provider).catch((err) => {
         console.error(
-          `[bottega] post-connect toolset refresh failed for ${spaceId} (${provider}): ` +
-            `${err instanceof Error ? err.message : String(err)}`,
+          `[extensions] ${provider} connected, but refreshing tools for ${spaceId} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
     },
-  });
+  };
+  // Issue #57: the ingest webhook route joins the same inbound HTTP
+  // listener only when the org channel exists; omission keeps the route 404.
+  if (ingestWebhooks !== undefined) callbackDeps.webhooks = ingestWebhooks;
+  const oauthCallback = startOAuthCallbackServer(callbackDeps);
+
   // The connect seam's generic MCP OAuth connector (issue #198): shared by
   // the space-service connect path and the per-session connect tool. The
   // callback base is the loopback URL by default (local dev — the browser
@@ -691,7 +698,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // (constructed after the toolset) — the closure reads it only at call
     // time, the same pattern as listTodos above.
     chartToolDefinition({
-      postChart: (spaceId, block) => spaceService.postChart(spaceId, block),
+      postChart: (spaceId, block) => {
+        spaceService.postChart(spaceId, slackBlockPayloadSchema.parse(block));
+      },
     }),
     // Web search (issue #278): read-tier tool that returns cited results
     // via a search provider; the key rides the proxy seam (boot-seeded
@@ -730,13 +739,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // moment it succeeds the FULL surface lands in that session. Resolved
   // providers pass through as cache hits — zero I/O in the steady state.
   const refreshExtensionToolset = async (): Promise<ToolDefinition[]> => {
+    const refreshOpts: NonNullable<Parameters<typeof refreshMissingExtensionSurfaces>[2]> = {
+      authProvider: surfaceAuthProvider,
+    };
+    if (opts.surfaceTransport !== undefined) refreshOpts.mcpTransport = opts.surfaceTransport;
     const surfaces = await refreshMissingExtensionSurfaces(
       extensionRegistry.list(),
       extensionSurfaces,
-      {
-        ...(opts.surfaceTransport !== undefined ? { mcpTransport: opts.surfaceTransport } : {}),
-        authProvider: surfaceAuthProvider,
-      },
+      refreshOpts,
     );
     return buildExtensionToolset(surfaces);
   };

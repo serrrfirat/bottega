@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { JOB_UNCLAIMED_EVENT, OUTBOX_FAILED_EVENT, OUTBOX_POSTED_EVENT } from "../../store/audit-events";
 import { createStore, type Store } from "../../store/db";
 import { DEFAULT_UNCLAIMED_TTL_MS, postOutboxRow, type OutboxRow } from "../../store/outbox";
-import type { SlackAdapter } from "../adapters/slack";
+import type { SlackAdapter, SlackBlockPayload } from "../adapters/slack";
 import {
   DEFAULT_OUTBOX_MAX_POST_ATTEMPTS,
   nudgeUnclaimedOutboxRowsToSlack,
@@ -57,12 +57,12 @@ function outboxRow(store: Store, id: string): OutboxRow | null {
 }
 
 class FakeAdapter implements Pick<SlackAdapter, "postMessage"> {
-  posted: Array<{ spaceId: string; text: string; blocks?: unknown[] }> = [];
+  posted: Array<{ spaceId: string; text: string; blocks?: SlackBlockPayload[] }> = [];
   /** Fail this many postMessage calls, then succeed. */
   failuresLeft = 0;
   failForever = false;
 
-  async postMessage(spaceId: string, text: string, opts?: { blocks?: unknown[] }): Promise<string | undefined> {
+  async postMessage(spaceId: string, text: string, opts?: { blocks?: SlackBlockPayload[] }): Promise<string | undefined> {
     if (this.failForever || this.failuresLeft > 0) {
       if (!this.failForever) this.failuresLeft -= 1;
       throw new Error("postMessage failed (fake)");
@@ -148,8 +148,7 @@ describe("renderOutboxMessage", () => {
     };
     const blocks = renderOutboxBlocks(row);
     expect(blocks).toBeDefined();
-    const card = blocks![0] as { text?: { text?: string } };
-    const text = card.text!.text!;
+    const text = blocks?.[0]?.text?.text ?? "";
     expect(text).toContain("🔍");
     expect(text).toContain("*check the PR*");
     expect(text).toContain("https://github.com/acme/sandbox/work/wi_x");
@@ -237,8 +236,8 @@ describe("postPendingOutboxRows", () => {
     expect(adapter.posted[0]!.spaceId).toBe(SPACE);
     expect(adapter.posted[0]!.text).toBe("Blocked: do the thing — no repo");
     // The issueCard carries the state icon + bold description.
-    const blocks = adapter.posted[0]!.blocks as Array<{ text?: { text?: string } }>;
-    const cardText = blocks[0]!.text!.text!;
+    const blocks = adapter.posted[0]!.blocks ?? [];
+    const cardText = blocks[0]?.text?.text ?? "";
     expect(cardText).toContain("🚫");
     expect(cardText).toContain("*do the thing*");
     expect(outboxRow(store, "wi_x:blocked")!.status).toBe("posted");

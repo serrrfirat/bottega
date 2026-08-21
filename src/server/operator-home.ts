@@ -4,11 +4,11 @@ import type { AuditModule } from "../policy/audit";
 import type { PolicyConfig } from "../policy/config";
 import { OPERATOR_HOME_READ_EVENT } from "../store/audit-events";
 import { summarizeAuditRow, type AuditSummary } from "../store/audit-read";
-import type { CredentialScope, Store } from "../store/db";
+import type { Store } from "../store/db";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1_000;
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9 _.:/-]{0,63}$/;
-const RECENT_OUTCOME_EVENTS: Readonly<Record<string, true>> = {
+const RECENT_OUTCOME_EVENTS = {
   "policy.decision": true,
   "approval.resolved": true,
   "scheduler.error": true,
@@ -16,7 +16,7 @@ const RECENT_OUTCOME_EVENTS: Readonly<Record<string, true>> = {
   "job.failed": true,
   "outbox.failed": true,
   "governance_digest.failed": true,
-};
+} satisfies Readonly<Record<string, true>>;
 
 export interface OperatorViewer {
   id: string;

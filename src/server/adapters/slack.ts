@@ -97,6 +97,35 @@ export interface SlackAction {
   messageTs: string;
 }
 
+const slackTextObjectSchema = z.object({
+  type: z.enum(["mrkdwn", "plain_text"]),
+  text: z.string(),
+});
+
+const slackBlockElementSchema = z
+  .object({
+    type: z.string().optional(),
+    text: z.union([z.string(), slackTextObjectSchema]).optional(),
+    action_id: z.string().optional(),
+    value: z.string().optional(),
+    style: z.string().optional(),
+  })
+  .passthrough();
+
+/**
+ * One normalized outbound Block Kit object. The adapter owns this broad
+ * Slack boundary type because callers build several concrete block kinds.
+ */
+export const slackBlockPayloadSchema = z
+  .object({
+    type: z.string(),
+    text: slackTextObjectSchema.optional(),
+    elements: z.array(slackBlockElementSchema).optional(),
+    block_id: z.string().optional(),
+  })
+  .passthrough();
+export type SlackBlockPayload = z.infer<typeof slackBlockPayloadSchema>;
+
 export interface SlackAdapter {
   /**
    * Posts a message; resolves with the created message ts (undefined when the
@@ -107,13 +136,13 @@ export interface SlackAdapter {
   postMessage(
     spaceId: string,
     text: string,
-    opts?: { threadTs?: string; blocks?: unknown[] },
+    opts?: { threadTs?: string; blocks?: SlackBlockPayload[] },
   ): Promise<string | undefined>;
   /**
    * Replaces the text of an already-posted message (chat.update); optional
    * blocks mirror postMessage.
    */
-  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: unknown[] }): Promise<void>;
+  updateMessage(spaceId: string, ts: string, text: string, opts?: { blocks?: SlackBlockPayload[] }): Promise<void>;
   /** Downloads a Slack file and returns its normalized metadata and bytes. */
   downloadFile(
     fileId: string,
@@ -440,6 +469,20 @@ export function renderSlackText(markdown: string): string {
   );
 }
 
+interface SlackPostMessageArgs {
+  channel: string;
+  text: string;
+  thread_ts?: string;
+  blocks?: SlackBlockPayload[];
+}
+
+interface SlackUpdateMessageArgs {
+  channel: string;
+  ts: string;
+  text: string;
+  blocks?: SlackBlockPayload[];
+}
+
 /**
  * Maps adapter arguments onto `chat.postMessage` arguments. Pure so the
  * outbound rendering is testable without a live Slack connection. Text is
@@ -451,14 +494,14 @@ export function renderSlackText(markdown: string): string {
 export function buildPostMessageArgs(
   spaceId: string,
   text: string,
-  opts?: { threadTs?: string; blocks?: unknown[] },
+  opts?: { threadTs?: string; blocks?: SlackBlockPayload[] },
 ) {
-  const args = {
+  const args: SlackPostMessageArgs = {
     channel: channelFromSpaceId(spaceId),
     text: renderSlackText(text),
-    ...(opts?.threadTs !== undefined ? { thread_ts: opts.threadTs } : undefined),
-    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-  } satisfies { channel: string; text: string; thread_ts?: string; blocks?: unknown[] };
+  };
+  if (opts?.threadTs !== undefined) args.thread_ts = opts.threadTs;
+  if (opts?.blocks !== undefined) args.blocks = opts.blocks;
   return args;
 }
 
@@ -472,14 +515,15 @@ export function buildUpdateMessageArgs(
   spaceId: string,
   ts: string,
   text: string,
-  opts?: { blocks?: unknown[] },
+  opts?: { blocks?: SlackBlockPayload[] },
 ) {
-  return {
+  const args: SlackUpdateMessageArgs = {
     channel: channelFromSpaceId(spaceId),
     ts,
     text: renderSlackText(text),
-    ...(opts?.blocks !== undefined ? { blocks: opts.blocks } : undefined),
-  } satisfies { channel: string; ts: string; text: string; blocks?: unknown[] };
+  };
+  if (opts?.blocks !== undefined) args.blocks = opts.blocks;
+  return args;
 }
 
 /**
@@ -615,7 +659,7 @@ export function buildStopStreamArgs(
 }
 
 /** The `{ ok: false, error, needed?, provided? }` PlatformError payload when a thrown value carries one. */
-const slackApiErrorSchema = z.object({
+export const slackApiErrorSchema = z.object({
   data: z.object({
     error: z.string(),
     needed: z.string().optional(),
@@ -624,7 +668,7 @@ const slackApiErrorSchema = z.object({
 });
 
 /** A thrown value this adapter can classify: the PlatformError payload, an Error, or nothing. */
-type SlackApiError = z.infer<typeof slackApiErrorSchema> | Error | undefined;
+export type SlackApiError = z.infer<typeof slackApiErrorSchema> | Error | undefined;
 
 /**
  * The `error` code on a @slack/web-api PlatformError payload
@@ -692,15 +736,10 @@ const STREAM_REQUEST_VALIDATION_CODES = new Set([
  * failures (see {@link isStreamingCapabilityError}); everything else keeps
  * the fail-closed cache flip.
  */
-export function isStreamRequestValidationError(err: unknown): boolean {
+export function isStreamRequestValidationError(err: SlackApiError): boolean {
   if (err instanceof SlackStreamRequestError) return true;
-  if (err === undefined || typeof err !== "object") return false;
-  // @slack/web-api's PlatformError extends Error but ALSO carries the
-  // `{ ok, error, ... }` payload on `data` — decode it like the probe
-  // does, so a request code on a thrown PlatformError is recognized.
-  const parsed = slackApiErrorSchema.safeParse(err);
-  if (parsed.success) return STREAM_REQUEST_VALIDATION_CODES.has(parsed.data.data.error);
-  return false;
+  if (err instanceof Error || err === undefined) return false;
+  return STREAM_REQUEST_VALIDATION_CODES.has(err.data.error);
 }
 
 /**
@@ -900,8 +939,8 @@ export const SLACK_BOOT_CONNECT_TIMEOUT_MS = 60_000;
 
 /** The socket-mode client surface the watchdog drives (real value: SocketModeReceiver#client). */
 export interface SocketModeClientLike {
-  on(event: string, listener: () => void): unknown;
-  start(): Promise<unknown>;
+  on(event: string, listener: () => void): void;
+  start(): Promise<void>;
 }
 
 export interface ReconnectWatchdogTiming {
@@ -916,6 +955,10 @@ export interface ReconnectWatchdogLog {
   failure: (message: string) => void;
 }
 
+export interface ReconnectWatchdog {
+  dispose(): void;
+}
+
 /**
  * Watches a socket-mode client for drops and reconnects with bounded
  * backoff. Backoff scale is injectable so regression tests run on
@@ -928,7 +971,7 @@ export function watchSocketModeReconnect(
   client: SocketModeClientLike,
   log: ReconnectWatchdogLog,
   timing: ReconnectWatchdogTiming = {},
-): { dispose(): void } {
+): ReconnectWatchdog {
   const baseDelayMs = timing.baseDelayMs ?? SLACK_RECONNECT_BASE_DELAY_MS;
   const maxDelayMs = timing.maxDelayMs ?? SLACK_RECONNECT_MAX_DELAY_MS;
   const multiplier = timing.backoffMultiplier ?? SLACK_RECONNECT_BACKOFF_MULTIPLIER;
@@ -1186,9 +1229,9 @@ export function createSlackAdapter(opts: {
       return res.ts;
     },
     async updateMessage(spaceId, ts, text, updateOpts) {
-      // Same SAFETY as postMessage: buildUpdateMessageArgs returns only chat.update
-      // fields the builder checked against its args contract; widening to the SDK
-      // args type only adds options this adapter leaves unset.
+      // SAFETY: buildUpdateMessageArgs emits only channel, ts, text, and
+      // schema-normalized blocks; every emitted field is accepted by the
+      // SDK update contract, and no unchecked SDK-only field is added.
       const args = buildUpdateMessageArgs(spaceId, ts, text, updateOpts) as Parameters<WebClient["chat"]["update"]>[0];
       await app.client.chat.update(args);
     },
@@ -1293,7 +1336,13 @@ export function createSlackAdapter(opts: {
         // workspace's: fall back to phrase+edit for this turn and keep
         // streaming enabled — a later message with valid arguments can
         // still open a panel.
-        if (isStreamRequestValidationError(err)) {
+        const parsedError = slackApiErrorSchema.safeParse(err);
+        const apiError: SlackApiError = parsedError.success
+          ? parsedError.data
+          : err instanceof Error
+            ? err
+            : undefined;
+        if (isStreamRequestValidationError(apiError)) {
           console.error(
             `[slack] chat.startStream rejected this request (${err instanceof Error ? err.message : String(err)}) — ` +
               "falling back to phrase+edit for this turn; streaming stays enabled",

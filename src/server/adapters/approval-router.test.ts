@@ -25,6 +25,7 @@ import {
   DENY_ACTION_ID,
   type SlackAction,
   type SlackAdapter,
+  type SlackBlockPayload,
 } from "./slack";
 import {
   ARGS_ROW_VALUE_MAX,
@@ -38,7 +39,7 @@ import {
 interface Posted {
   spaceId: string;
   text?: string;
-  blocks?: unknown[];
+  blocks?: SlackBlockPayload[];
 }
 
 interface FakeAdapterHarness {
@@ -67,16 +68,8 @@ function fakeAdapter(overrides?: { failPost?: boolean; onPosted?: () => void }):
   };
 }
 
-interface Block {
-  type: string;
-  text?: { type: string; text: string };
-  elements?: { type: string; text?: { type: string; text: string }; action_id?: string; value?: string; style?: string }[];
-}
-
-function actionBlocks(posted: Posted[]): Block[] {
-  // SAFETY: the router posts blocks as JSON with section/actions shapes that
-  // match the Block test interface; unknown[] widens only the union Slack uses.
-  return (posted[0].blocks as Block[] | undefined) ?? [];
+function actionBlocks(posted: Posted[]): SlackBlockPayload[] {
+  return posted[0]?.blocks ?? [];
 }
 
 function buttonsFrom(posted: Posted[]): { actionId: string; value: string; style?: string }[] {
@@ -92,10 +85,7 @@ function requestIdFrom(posted: Posted[]): string {
 
 /** Request id of the i-th posted prompt (0-based). */
 function requestIdAt(posted: Posted[], i: number): string {
-  // SAFETY: the router posts actions blocks whose elements carry value; the
-  // cast narrows the JSON blocks to the Block test interface those match.
-  const actions = (posted[i].blocks as Block[] | undefined)?.find((b) => b.type === "actions");
-  return actions?.elements?.find((e) => e.value !== undefined)?.value ?? "";
+  return buttonsFrom(posted.slice(i, i + 1))[0]?.value ?? "";
 }
 
 function click(actionId: string, value: string, overrides: Partial<SlackAction> = {}): SlackAction {
@@ -372,9 +362,7 @@ describe("buildApprovalBlocks", () => {
       { ...REQUEST, args: { api_key: "AKIA1234567890ABCDEF", due_date: "2026-08-20", addTeams: ["a", "b"] } },
       "req-123",
     );
-    // SAFETY: buildApprovalBlocks emits section + actions blocks whose
-    // text/elements shapes match the Block test interface.
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -388,9 +376,7 @@ describe("buildApprovalBlocks", () => {
     // Secret-shaped values are redacted, never shown verbatim.
     expect(rendered).toContain("[REDACTED]");
     expect(rendered).not.toContain("AKIA1234567890ABCDEF");
-    // SAFETY: buildApprovalBlocks emits an actions block whose elements carry
-    // action_id/value/style — the shape the Block test interface declares.
-    const buttons = (blocks as Block[])
+    const buttons = blocks
       .find((b) => b.type === "actions")
       ?.elements?.filter((e) => e.action_id !== undefined && e.value !== undefined);
     expect(buttons?.map((b) => b.value)).toEqual(["req-123", "req-123"]);
@@ -402,7 +388,7 @@ describe("buildApprovalBlocks", () => {
       { ...REQUEST, args: { title: "keep me", empty: "", none: [], obj: {}, set: new Set(), keep: "also" } },
       "req-123",
     );
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -419,7 +405,7 @@ describe("buildApprovalBlocks", () => {
     const args: Record<string, string> = {};
     for (let i = 0; i < 15; i += 1) args[`field_${i}`] = `v${i}`;
     const blocks = buildApprovalBlocks({ ...REQUEST, args }, "req-123");
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -428,7 +414,7 @@ describe("buildApprovalBlocks", () => {
 
   test("a remembered confirmed-write failure is surfaced on the card (issue #277)", () => {
     const blocks = buildApprovalBlocks(REQUEST, "req-123", "write-blob: disk full");
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -443,7 +429,7 @@ describe("buildApprovalBlocks", () => {
     for (let i = 0; i < 40; i += 1) args[`field_${i}`] = "x".repeat(ARGS_ROW_VALUE_MAX);
     const blocks = buildApprovalBlocks({ ...REQUEST, args }, "req-123", "y".repeat(10_000));
 
-    const sectionTexts = (blocks as Block[])
+    const sectionTexts = blocks
       .filter((b) => b.type === "section")
       .map((s) => (s.text?.text ?? "").length);
 
@@ -454,7 +440,7 @@ describe("buildApprovalBlocks", () => {
     expect(Math.max(...sectionTexts)).toBeLessThan(ARGS_SECTION_TEXT_MAX + 64);
 
     // And the failure banner reason was truncated, not echoed in full.
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -466,7 +452,7 @@ describe("buildApprovalBlocks", () => {
 
   test("an empty args payload omits the would-be-write section", () => {
     const blocks = buildApprovalBlocks({ ...REQUEST, args: {} }, "req-123");
-    const rendered = (blocks as Block[])
+    const rendered = blocks
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");
@@ -630,7 +616,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
       await Promise.resolve();
     }
     expect(posted).toHaveLength(2);
-    const rendered = (posted[1].blocks as Block[])
+    const rendered = (posted[1]?.blocks ?? [])
       .filter((b) => b.type === "section")
       .map((s) => s.text?.text ?? "")
       .join("\n");

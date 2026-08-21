@@ -21,7 +21,13 @@ import type { OrgSettings } from "../../store/org-settings";
 import { MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT } from "../../store/audit-events";
 import { redact } from "../../policy/audit";
 import { humanizeToolName } from "../adapters/approval-router";
-import { SlackStreamRequestError, type SlackAdapter, type SlackMessage, type SlackStreamTask } from "../adapters/slack";
+import {
+  SlackStreamRequestError,
+  type SlackAdapter,
+  type SlackBlockPayload,
+  type SlackMessage,
+  type SlackStreamTask,
+} from "../adapters/slack";
 import {
   STREAM_FINAL_RETRY_LIMIT,
   STREAM_UPDATE_INTERVAL_MS,
@@ -55,8 +61,8 @@ interface RecordedAdapter {
   texts: Array<{ spaceId: string; ts: string; text: string }>;
   tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }>;
   stops: Array<{ spaceId: string; ts: string; text?: string }>;
-  posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }>;
-  updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }>;
+  posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: SlackBlockPayload[] } }>;
+  updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: SlackBlockPayload[] } }>;
   reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }>;
 }
 
@@ -73,16 +79,14 @@ function recordingAdapter(
   const texts: Array<{ spaceId: string; ts: string; text: string }> = [];
   const tasks: Array<{ spaceId: string; ts: string; task: SlackStreamTask }> = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
-  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
-  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }> = [];
+  const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: SlackBlockPayload[] } }> = [];
+  const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: SlackBlockPayload[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
   let tsSeq = 0;
   let startStreamRequests = 0;
   const adapter: SlackAdapter = {
     async postMessage(spaceId, text, replyOpts) {
-      // SAFETY: the presenter passes { threadTs } as post options; issue #278
-      // carries cited-search blocks on the same seam, so record opts fully.
-      posts.push({ spaceId, text, opts: replyOpts as { threadTs?: string; blocks?: unknown[] } | undefined });
+      posts.push({ spaceId, text, opts: replyOpts });
       tsSeq += 1;
       return `post-${tsSeq}`;
     },
@@ -404,9 +408,11 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     });
 
     // SlackMessage.principal is zod-required on the wire, but the presenter
-    // must not depend on it: with the identity unavailable, the turn takes
-    // the phrase+edit path WITHOUT ever attempting chat.startStream.
-    presenter.onInbound({ ...msg({ ts: "1.1" }), principal: undefined } as unknown as SlackMessage);
+    // must not depend on it. Delete it after creating a valid normalized
+    // message to simulate identity loss inside the process.
+    const missingPrincipal = msg({ ts: "1.1" });
+    Reflect.deleteProperty(missingPrincipal, "principal");
+    presenter.onInbound(missingPrincipal);
     await flush();
     expect(rec.streams).toHaveLength(0); // zero startStream calls
     expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
@@ -1945,7 +1951,7 @@ describe("renderSearchResultBlocks (issue #278)", () => {
   ];
 
   test("renders a header + one section per cited result (capped) with an elided tail count", () => {
-    const blocks = renderSearchResultBlocks(RESULTS) as { type: string; text?: { text?: string } }[];
+    const blocks = renderSearchResultBlocks(RESULTS);
     expect(blocks[0].type).toBe("header");
     expect(String(blocks[0].text?.text)).toContain("Search results");
     // Cap: SEARCH_TABLE_MAX_ROWS rows, then the elided tail.
@@ -1955,12 +1961,12 @@ describe("renderSearchResultBlocks (issue #278)", () => {
     for (const section of sections.slice(0, SEARCH_TABLE_MAX_ROWS)) {
       expect(section.text?.text).toContain("https://example.com/");
     }
-    const context = blocks.find((b) => b.type === "context") as { elements?: { text?: string }[] };
+    const context = blocks.find((b) => b.type === "context");
     expect(context.elements?.[0]?.text).toContain("1 more result");
   });
 
   test("the citations used section lists every cited source URL", () => {
-    const blocks = renderSearchResultBlocks(RESULTS) as { type: string; text?: { text?: string } }[];
+    const blocks = renderSearchResultBlocks(RESULTS);
     const footer = blocks.filter((b) => b.type === "section").pop();
     expect(footer?.text?.text).toContain("*Sources used:*");
     for (const row of RESULTS.slice(0, SEARCH_TABLE_MAX_ROWS)) {
@@ -1971,17 +1977,17 @@ describe("renderSearchResultBlocks (issue #278)", () => {
   });
 
   test("empty results render a no-sources surface, never throwing", () => {
-    const blocks = renderSearchResultBlocks([]) as { type: string; text?: { text?: string } }[];
+    const blocks = renderSearchResultBlocks([]);
     const body = blocks.map((b) => b.text?.text ?? "").join("\n");
     expect(body).toContain("No search results to cite");
     expect(body).toContain("_none_");
   });
 
   test("a custom row cap is honored", () => {
-    const blocks = renderSearchResultBlocks(RESULTS, 2) as { type: string; text?: { text?: string } }[];
+    const blocks = renderSearchResultBlocks(RESULTS, 2);
     const sections = blocks.filter((b) => b.type === "section");
     expect(sections.length).toBe(3); // 2 rows + the sources-used footer
-    const context = blocks.find((b) => b.type === "context") as { elements?: { text?: string }[] };
+    const context = blocks.find((b) => b.type === "context");
     expect(context.elements?.[0]?.text).toContain("5 more results");
   });
 });
@@ -2015,7 +2021,7 @@ describe("presentSearchResults cited-table dispatch (issue #278)", () => {
     // The cited table travels as blocks inside the post opts — the
     // acceptance that citations reach the human, not just JSON to the model.
     expect(Array.isArray(post.opts?.blocks)).toBe(true);
-    const blocks = (post.opts?.blocks ?? []) as { type: string; text?: { text?: string }; elements?: { text?: string }[] }[];
+    const blocks = post.opts?.blocks ?? [];
     expect(blocks[0]!.type).toBe("header");
     expect(String(blocks[0]!.text?.text)).toContain("Search results");
     const sections = blocks.filter((b) => b.type === "section");

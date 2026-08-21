@@ -52,7 +52,10 @@ import {
   channelFromSpaceId,
   isDmChannel,
   isStreamRequestValidationError,
+  slackApiErrorSchema,
   type SlackAdapter,
+  type SlackApiError,
+  type SlackBlockPayload,
   type SlackMessage,
 } from "../adapters/slack";
 
@@ -393,6 +396,17 @@ export interface SearchResultRow {
   snippet: string;
 }
 
+const searchResultPayloadSchema = z.object({
+  results: z.array(z.unknown()),
+});
+const searchResultRowSchema = z
+  .object({
+    title: z.string().optional(),
+    url: z.string(),
+    snippet: z.string().optional(),
+  })
+  .passthrough();
+
 /** Max rows the citations table renders; the remainder folds into the elided tail count. */
 export const SEARCH_TABLE_MAX_ROWS = 6;
 
@@ -407,8 +421,8 @@ export const SEARCH_TABLE_MAX_ROWS = 6;
 export function renderSearchResultBlocks(
   results: readonly SearchResultRow[],
   maxRows: number = SEARCH_TABLE_MAX_ROWS,
-): unknown[] {
-  const blocks: unknown[] = [
+): SlackBlockPayload[] {
+  const blocks: SlackBlockPayload[] = [
     {
       type: "header",
       text: { type: "plain_text", text: "🔎 Search results (cited)" },
@@ -457,24 +471,22 @@ export function renderSearchResultBlocks(
  */
 export function parseSearchResultRows(text: string): SearchResultRow[] {
   if (!text) return [];
-  let parsed: unknown;
+  let decoded: unknown;
   try {
-    parsed = JSON.parse(text);
+    decoded = JSON.parse(text);
   } catch {
     return [];
   }
-  if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { results?: unknown }).results)) {
-    return [];
-  }
+  const payload = searchResultPayloadSchema.safeParse(decoded);
+  if (!payload.success) return [];
   const rows: SearchResultRow[] = [];
-  for (const raw of (parsed as { results: unknown[] }).results) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const row = raw as Record<string, unknown>;
-    if (typeof row.url !== "string" || row.url.trim() === "") continue;
+  for (const raw of payload.data.results) {
+    const parsed = searchResultRowSchema.safeParse(raw);
+    if (!parsed.success || parsed.data.url.trim() === "") continue;
     rows.push({
-      title: typeof row.title === "string" ? row.title : row.url,
-      url: row.url,
-      snippet: typeof row.snippet === "string" ? row.snippet : "",
+      title: parsed.data.title ?? parsed.data.url,
+      url: parsed.data.url,
+      snippet: parsed.data.snippet ?? "",
     });
   }
   return rows;
@@ -1216,7 +1228,7 @@ export class SlackTurnPresenter {
    * as replyOpts(), so the chart lands beside the reply (DMs post plainly).
    * Fire-and-forget: a Slack failure logs and never throws into the turn.
    */
-  postChartBlock(block: unknown): void {
+  postChartBlock(block: SlackBlockPayload): void {
     void this.adapter
       .postMessage(this.spaceId, "", { ...this.replyOpts(), blocks: [block] })
       .catch((err) => {
@@ -1966,7 +1978,13 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
       if (ts !== undefined) this.#streamTs = ts;
       return ts;
     } catch (err) {
-      if (isStreamRequestValidationError(err)) {
+      const parsedError = slackApiErrorSchema.safeParse(err);
+      const apiError: SlackApiError = parsedError.success
+        ? parsedError.data
+        : err instanceof Error
+          ? err
+          : undefined;
+      if (isStreamRequestValidationError(apiError)) {
         // The REQUEST was rejected for this message (missing/invalid
         // recipient or thread args) — not a workspace capability failure:
         // fall back to phrase+edit for THIS turn and keep streaming

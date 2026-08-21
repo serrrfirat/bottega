@@ -34,13 +34,12 @@ class FakeSocketModeClient {
     for (const listener of this.listeners[event] ?? []) listener();
   }
 
-  async start(): Promise<unknown> {
+  async start(): Promise<void> {
     this.startCalls.push(Date.now());
     if (this.failNextStart > 0) {
       this.failNextStart -= 1;
       throw new Error("apps.connections.open simulated failure");
     }
-    return { ok: true };
   }
 }
 

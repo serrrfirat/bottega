@@ -7,7 +7,13 @@ import { z } from "zod";
 import { requireDigestPruning, type MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
-import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
+import {
+  channelFromSpaceId,
+  isDmChannel,
+  type SlackAdapter,
+  type SlackBlockPayload,
+  type SlackMessage,
+} from "../adapters/slack";
 import { resolveSpaceSkills } from "../skills";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
@@ -361,7 +367,7 @@ export class SpaceService {
    * presenter yet and are dropped — a chart can only follow an inbound
    * message, so a presenter exists by then.
    */
-  postChart(spaceId: string, block: unknown): void {
+  postChart(spaceId: string, block: SlackBlockPayload): void {
     this.#presenterFor(spaceId).postChartBlock(block);
   }
 

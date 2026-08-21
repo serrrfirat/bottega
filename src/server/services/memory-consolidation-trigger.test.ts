@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { createSqliteMemoryProvider } from "../../memory/sqlite";
 import { createStore, type Store } from "../../store/db";
 import {
@@ -35,8 +36,8 @@ function sqliteBackend(store: Store) {
 }
 
 function jobCount(store: Store): number {
-  const row = store.getDb().query("SELECT COUNT(*) AS c FROM worker_jobs").get() as { c: number };
-  return row.c;
+  const row = store.getDb().query("SELECT COUNT(*) AS c FROM worker_jobs").get();
+  return z.object({ c: z.number() }).parse(row).c;
 }
 
 describe("memory consolidation trigger (issue #272)", () => {
@@ -105,12 +106,11 @@ describe("memory consolidation trigger (issue #272)", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const fakeStore = {
-      enqueueJob: async () => {
-        enqueues += 1;
-        await gate;
-      },
-    } as unknown as Store;
+    const fakeStore = freshStore();
+    fakeStore.enqueueJob = async () => {
+      enqueues += 1;
+      await gate;
+    };
     const trigger = createMemoryConsolidationTrigger({
       store: fakeStore,
       memoryProvider: {

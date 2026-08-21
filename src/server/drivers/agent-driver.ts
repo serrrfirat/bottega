@@ -50,7 +50,6 @@ import type { PolicyConfig } from "../../policy/config";
 import { loadSpacePolicy, resolveTier } from "../../policy/config";
 import { evaluatePolicyGate, summarizeToolArgs, type PolicyGateOutcome } from "../../policy/gate";
 import type { PolicyExtensionDeps } from "../../policy/extension";
-import type { Store } from "../../store/db";
 import { humanizeToolName } from "../adapters/approval-router";
 import { emitToolStep, nextToolStepId, toolStepTitle, parseSearchResultRows } from "../services/slack-turn-presenter";
 
@@ -704,11 +703,11 @@ export function isBusySettlementError(err: Error): boolean {
  * multi-item result still parses. Unshaped results yield "".
  */
 function searchTextFromResult(result: { content?: Array<{ type?: string; text?: string }> }): string {
-  if (!result || !Array.isArray(result.content)) return "";
-  return result.content
-    .filter((c) => c && c.type === "text" && typeof c.text === "string")
-    .map((c) => c.text as string)
-    .join("");
+  const chunks: string[] = [];
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && item.text !== undefined) chunks.push(item.text);
+  }
+  return chunks.join("");
 }
 
 /**
