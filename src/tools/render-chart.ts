@@ -91,6 +91,30 @@ type ChartArgs =
       axis_config: { categories: string[] };
     };
 
+export interface PieChartBlock {
+  type: "data_visualization";
+  title: string;
+  chart: {
+    type: "pie";
+    segments: Array<{ label: string; value: number }>;
+  };
+}
+
+export interface AxisChartBlock {
+  type: "data_visualization";
+  title: string;
+  chart: {
+    type: "bar" | "area" | "line";
+    series: Array<{
+      name: string;
+      data: Array<{ label: string; value: number }>;
+    }>;
+    axis_config: { categories: string[] };
+  };
+}
+
+export type SlackChartBlock = PieChartBlock | AxisChartBlock;
+
 /**
  * Builds the Slack native chart block (Block Kit `type: "data_visualization"`,
  * issue #276) from an already-validated {@link ChartArgs} payload. Pure and
@@ -100,7 +124,7 @@ type ChartArgs =
  * total — it emits min(values.length, categories.length) points so a caller
  * that skips the cross-field gate can never produce an `undefined` value.
  */
-export function buildChartBlock(payload: ChartArgs): unknown {
+export function buildChartBlock(payload: ChartArgs): SlackChartBlock {
   if (payload.type === "pie") {
     return {
       type: "data_visualization",
@@ -138,7 +162,7 @@ export interface RenderChartOpts {
    * the boot. Exactly one call per tool result — the block is never
    * duplicated per streamed chunk.
    */
-  postChart: (spaceId: string, block: unknown) => void;
+  postChart: (spaceId: string, block: SlackChartBlock) => void;
 }
 
 /**

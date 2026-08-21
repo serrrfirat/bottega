@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { App } from "@slack/bolt";
+import { App, LogLevel } from "@slack/bolt";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -142,7 +142,7 @@ describe("admin-only Slack operator Home caller surface (#320)", () => {
         warn: (...args: unknown[]) => void logs.push(args.join(" ")),
         error: (...args: unknown[]) => void logs.push(args.join(" ")),
         setLevel: () => {},
-        getLevel: () => "info" as never,
+        getLevel: () => LogLevel.INFO,
         setName: () => {},
       },
     });

@@ -15,7 +15,7 @@ import {
 } from "../policy/config";
 import * as auditEventVocabulary from "../store/audit-events";
 import { AUDIT_READ_EVENT, POLICY_EXPLAINED_EVENT } from "../store/audit-events";
-import { summarizeAuditRow } from "../store/audit-read";
+import { summarizeAuditRow, type AuditReasonCategory } from "../store/audit-read";
 import type { AuditCursor, Store } from "../store/db";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { toolError } from "./helpers";
@@ -24,10 +24,41 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
 const MAX_LOOKBACK_MS = 365 * DAY_MS;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const KNOWN_AUDIT_EVENTS: Readonly<Record<string, true>> = Object.fromEntries(
-  Object.values(auditEventVocabulary)
-    .filter((value): value is string => typeof value === "string")
-    .map((event) => [event, true]),
+  Object.values(auditEventVocabulary).map((event) => [event, true]),
 );
+const PolicyOverlaySchema = z.object({
+  tools: z.record(z.string(), z.unknown()).optional().catch(undefined),
+  extensions: z.unknown().optional(),
+});
+
+interface AuditSearchPayload {
+  space: string;
+  limit: number;
+  event?: string;
+  actor?: string;
+  tool?: string;
+  extension?: string;
+  since?: number;
+  until?: number;
+}
+
+type PolicyCredentialExplanation =
+  | { kind: "available"; provider: string; scope: "org" | "personal" }
+  | { kind: "scope_required"; provider: string }
+  | { kind: "unavailable"; provider: string; scope: "org" | "me" | "auto" };
+
+type PolicyRuleSource = "org_floor" | "space_overlay" | "tool_tier" | "known_tool_table" | "policy_error";
+
+interface PolicyExplanation {
+  tool: string;
+  space: string;
+  tier: Tier;
+  decision: "allow" | "deny" | "ask-human";
+  reason: AuditReasonCategory;
+  rule_source: PolicyRuleSource;
+  approval_required: boolean;
+  credential?: PolicyCredentialExplanation;
+}
 
 const auditSearchArgsSchema = z
   .object({
@@ -107,12 +138,10 @@ async function authorizeTarget(
 
 function overlayDefinesRule(policyJson: string, tool: string, extension: string | undefined): boolean {
   try {
-    const parsed: unknown = JSON.parse(policyJson);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    if ("tools" in parsed && parsed.tools && typeof parsed.tools === "object" && !Array.isArray(parsed.tools)) {
-      if (Object.prototype.hasOwnProperty.call(parsed.tools, tool)) return true;
-    }
-    return extension !== undefined && "extensions" in parsed;
+    const parsed = PolicyOverlaySchema.safeParse(JSON.parse(policyJson));
+    if (!parsed.success) return false;
+    if (parsed.data.tools && Object.prototype.hasOwnProperty.call(parsed.data.tools, tool)) return true;
+    return extension !== undefined && "extensions" in parsed.data;
   } catch {
     return false;
   }
@@ -126,7 +155,7 @@ function ruleSource(input: {
   extension?: string;
   extensionTier?: Tier;
   autoApproved: boolean;
-}): "org_floor" | "space_overlay" | "tool_tier" | "known_tool_table" | "policy_error" {
+}): PolicyRuleSource {
   if (!input.effective.ok) return "policy_error";
   if (input.overlayDefines || toolAction(input.effective, input.tool) !== toolAction(input.org, input.tool)) {
     return "space_overlay";
@@ -188,7 +217,7 @@ export function operatorReadToolDefinitions(store: Store, opts: OperatorReadTool
         cursor,
         limit,
       });
-      const filterAudit: Record<string, string | number> = { space: target, limit };
+      const filterAudit: AuditSearchPayload = { space: target, limit };
       if (params.event !== undefined) filterAudit.event = params.event;
       if (params.actor !== undefined) filterAudit.actor = params.actor;
       if (params.tool !== undefined) filterAudit.tool = params.tool;
@@ -247,7 +276,7 @@ export function operatorReadToolDefinitions(store: Store, opts: OperatorReadTool
       const effectiveTier = extensionTier ?? resolveTier(params.tool);
       const policyDecision = decidePolicyCall(effective, params.tool, false, params.extension, extensionTier);
       const space = await store.getSpace(target);
-      const explanation: Record<string, unknown> = {
+      const explanation: PolicyExplanation = {
         tool: params.tool,
         space: target,
         tier: effectiveTier,

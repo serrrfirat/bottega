@@ -3,7 +3,7 @@ import { issueCard, TABLE_ROW_CAP, tableBlock, type SlackBlock } from "./blocks"
 
 /** Asserts a Slack section block carries the given mrkdwn text. */
 function sectionText(blocks: SlackBlock[], index: number): string {
-  const block = blocks[index] as { text?: { text?: string } };
+  const block = blocks[index];
   const text = block.text?.text;
   if (text === undefined) throw new Error(`no mrkdwn text on block ${index}`);
   return text;
@@ -21,7 +21,7 @@ describe("issueCard", () => {
       owner: "U_FINISHER",
       link: "https://github.com/acme/sandbox/work/wi_x",
     });
-    const text = sectionText([card as SlackBlock], 0);
+    const text = sectionText([card], 0);
     expect(text).toContain("🚫");
     expect(text).toContain("*do the thing*");
     expect(text).toContain("U_FINISHER");
@@ -30,7 +30,7 @@ describe("issueCard", () => {
 
   test("renders the review state with its own icon and an optional timestamp", () => {
     const [card] = issueCard({ title: "check the PR", state: "review", timestamp: "2026-08-18T10:00:00Z" });
-    const text = sectionText([card as SlackBlock], 0);
+    const text = sectionText([card], 0);
     expect(text).toContain("🔍");
     expect(text).toContain("*check the PR*");
     expect(text).toContain("2026-08-18T10:00:00Z");

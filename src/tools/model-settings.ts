@@ -176,7 +176,7 @@ export function modelToolsDefinitions(
         // default on the next turn.
         if (
           (key === "model" || key.endsWith("_model")) &&
-          (MODEL_ROLE_REFS as readonly string[]).includes(trimmed.toLowerCase())
+          MODEL_ROLE_REFS.some((role) => role === trimmed.toLowerCase())
         ) {
           return toolError(
             `model_settings ${key} names the role ref '${trimmed}' — a model ROLE, not a model id; ` +

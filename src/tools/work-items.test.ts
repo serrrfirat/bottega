@@ -411,6 +411,7 @@ describe("create_work_item", () => {
     const s = freshStore();
     const space = await s.getOrCreateSpace({ platform: "slack", channel_id: "T-skills-deny" });
     const [createTool] = loadTools(s);
+    // SAFETY: SQLite COUNT(*) returns one row whose aliased n column is numeric.
     const before = s.getDb().query("SELECT COUNT(*) AS n FROM work_items").get() as { n: number };
 
     for (const params of [{ description: "bad", skills: ["../evil"] }, { description: "bad", skills: [] }]) {
@@ -419,6 +420,7 @@ describe("create_work_item", () => {
       expect(resultText(res)).toMatch(/invalid skill name|skills must be a non-empty list/);
     }
 
+    // SAFETY: SQLite COUNT(*) returns one row whose aliased n column is numeric.
     const after = s.getDb().query("SELECT COUNT(*) AS n FROM work_items").get() as { n: number };
     expect(after.n).toBe(before.n);
   });

@@ -56,6 +56,7 @@ export function runMemoryConformanceTests(
 
     test("user scope requires a principal", async () => {
       const { provider: p } = await makeHarness();
+      // SAFETY: this malformed fixture intentionally omits the person principal to exercise each provider's runtime validation.
       expect(() => p.save({ scope: { kind: "person" } as MemoryScopeKey, content: "x" })).toThrow(/principal/);
     });
 

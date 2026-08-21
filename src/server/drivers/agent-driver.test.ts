@@ -1272,7 +1272,7 @@ describe("OmpSessionDriver todo read seam (issue #228)", () => {
     return {
       content: [{ type: "text", text: "ok" }],
       details: { op: "init", phases, storage: "session" },
-    } as unknown as JsonObject;
+    };
   }
 
   const PLAN: TodoPhase[] = [
@@ -1377,6 +1377,7 @@ describe("empty completions surface at the presenter (issue #226)", () => {
     const posts: Array<{ text: string }> = [];
     const updates: Array<{ ts: string; text: string }> = [];
     let tsSeq = 0;
+    // SAFETY: this recording double implements every SlackAdapter member used by SlackTurnPresenter in these tests.
     const adapter = {
       async postMessage(_spaceId: string, text: string) {
         posts.push({ text });
@@ -1404,6 +1405,7 @@ describe("empty completions surface at the presenter (issue #226)", () => {
       async start() {},
       async stop() {},
     } as SlackAdapter;
+    // SAFETY: this store double implements the two Store operations SlackTurnPresenter uses in these tests.
     const store = {
       appendAudit: async (_entry: { space_id: string | null; actor: string; event_type: string; payload: string }) => 1,
       getOrgSettings: (): OrgSettings | null => null,
@@ -2315,7 +2317,9 @@ describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
       rmSync(join(secretDir, `${SEARCH_PROVIDER}.secret`));
       const res = await tool.execute("c1", { query: "bottega" }, undefined, undefined, ctx);
       expect(res.isError).toBe(true);
-      expect((res.content[0] as { text: string }).text).toContain("unavailable");
+      const content = res.content[0];
+      if (content?.type !== "text") throw new Error("expected a text tool result");
+      expect(content.text).toContain("unavailable");
       expect(calls).toHaveLength(0);
     } finally {
       cleanup();

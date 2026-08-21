@@ -13,10 +13,37 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext, TodoPhase } from "@oh-my-pi/pi-coding-agent";
+import { z, type AgentToolResult, type ExtensionContext, type TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../store/db";
 import { DenyRouter } from "../policy/approval-router";
 import { listTodosToolDefinition, listTodosArgsSchema } from "./list-todos";
+
+const ListTodosSnapshotSchema = z.object({
+  work_items: z.object({
+    count: z.number(),
+    in_progress: z.number(),
+    items: z.array(z.object({
+      id: z.string(),
+      description: z.string(),
+      state: z.string(),
+      assignee: z.string().nullable(),
+      created: z.number(),
+    })),
+  }),
+  pending_approvals: z.array(z.object({ tool: z.string() })),
+  scheduled_jobs: z.array(z.object({
+    action: z.string(),
+    cron: z.string(),
+  })),
+  plan: z.object({
+    active: z.boolean(),
+    steps_total: z.number().optional(),
+    steps_completed: z.number().optional(),
+    current: z.string().optional(),
+    message: z.string(),
+  }),
+});
+type ListTodosSnapshot = z.infer<typeof ListTodosSnapshotSchema>;
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-list-todos-"));
 const stores: Store[] = [];
@@ -49,9 +76,11 @@ function ctxFor(spaceId: string): ExtensionContext {
   } as ExtensionContext;
 }
 
-async function resultOf(res: Awaited<ReturnType<ReturnType<typeof toolFor>["execute"]>>): Promise<unknown> {
+async function resultOf(res: AgentToolResult): Promise<ListTodosSnapshot> {
   expect(res.isError).not.toBe(true);
-  return JSON.parse((res.content[0] as { text: string }).text);
+  const content = res.content[0];
+  if (content?.type !== "text") throw new Error("expected a text tool result");
+  return ListTodosSnapshotSchema.parse(JSON.parse(content.text));
 }
 
 /** A long plan (3 steps across 2 phases) — the same shape the presenter renders. */
@@ -116,12 +145,7 @@ describe("list_todos snapshot", () => {
       getTodoPhases: (spaceId) => (spaceId === space.id ? PLAN : []),
     });
 
-    const snapshot = (await resultOf(await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id)))) as {
-      work_items: { count: number; in_progress: number; items: Array<{ description: string; state: string }> };
-      pending_approvals: Array<{ tool: string }>;
-      scheduled_jobs: Array<{ action: string; cron: string }>;
-      plan: { active: boolean; steps_total: number; steps_completed: number; current: string; message: string };
-    };
+    const snapshot = await resultOf(await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id)));
 
     // Work items: the same query list_work_items runs — queue + counts.
     expect(snapshot.work_items.count).toBe(2);
@@ -151,12 +175,7 @@ describe("list_todos snapshot", () => {
     const tool = toolFor(s); // no router seam, no session seam
 
     const res = await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id));
-    const snapshot = (await resultOf(res)) as {
-      work_items: { count: number; in_progress: number; items: unknown[] };
-      pending_approvals: unknown[];
-      scheduled_jobs: unknown[];
-      plan: { active: boolean; message: string };
-    };
+    const snapshot = await resultOf(res);
     expect(snapshot.work_items).toEqual({ count: 0, in_progress: 0, items: [] });
     expect(snapshot.pending_approvals).toEqual([]);
     expect(snapshot.scheduled_jobs).toEqual([]);
@@ -172,7 +191,9 @@ describe("list_todos snapshot", () => {
     const noCtx = { sessionManager: { getSessionFile: (): string | undefined | null => null } } as ExtensionContext;
     const res = await tool.execute("tc1", {}, undefined, undefined, noCtx);
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toMatch(/requires a space session/);
+    const content = res.content[0];
+    if (content?.type !== "text") throw new Error("expected a text tool result");
+    expect(content.text).toMatch(/requires a space session/);
   });
 
   test("an explicit space reads that space's snapshot (work items + approvals filtered by space)", async () => {
@@ -202,10 +223,7 @@ describe("list_todos snapshot", () => {
     });
 
     const res = await tool.execute("tc1", { space: spaceB.id }, undefined, undefined, ctxFor(spaceA.id));
-    const snapshot = (await resultOf(res)) as {
-      work_items: { count: number; items: Array<{ description: string }> };
-      pending_approvals: Array<{ tool: string }>;
-    };
+    const snapshot = await resultOf(res);
     expect(snapshot.work_items.count).toBe(1);
     expect(snapshot.work_items.items[0]!.description).toBe("B's item");
     expect(snapshot.pending_approvals).toEqual([{ tool: "read" }]);
@@ -224,7 +242,7 @@ describe("ApprovalRouter pendingPrompts seam (issue #228)", () => {
         (DenyRouter.pendingPrompts?.() ?? []).filter((p) => p.spaceId === spaceId).map((p) => ({ tool: p.tool })),
     });
     const res = await tool.execute("tc1", {}, undefined, undefined, ctxFor(space.id));
-    const snapshot = (await resultOf(res)) as { pending_approvals: unknown[] };
+    const snapshot = await resultOf(res);
     expect(snapshot.pending_approvals).toEqual([]);
   });
 });

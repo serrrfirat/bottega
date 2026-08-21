@@ -159,11 +159,13 @@ function snippet(text: string, max = 200): string {
   return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
 }
 
+type Mem0ScopeParams = { agent_id: string } | { user_id: string };
+
 /** Scope mapping, see module docstring. */
 function scopeParams(
   scope: MemoryScopeKey,
   agentId: string | undefined,
-): Record<string, string> {
+): Mem0ScopeParams {
   if (scope.kind === "org") {
     // Org memory is shared across principals: pin it to one agent id.
     return { agent_id: agentId ?? MEM0_ORG_AGENT_ID };

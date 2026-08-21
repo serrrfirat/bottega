@@ -7,18 +7,41 @@
  * set) and posts the structured result shape the agent renders as a table.
  */
 import { describe, expect, test } from "bun:test";
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { z, type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { searchWebArgsSchema, searchWebToolDefinition, SEARCH_PROVIDER, searchKeySeeded } from "./search-web";
 
+const SearchRequestSchema = z.object({
+  query: z.string(),
+  max_results: z.number(),
+});
+type SearchRequest = z.infer<typeof SearchRequestSchema>;
+
+const SearchToolResponseSchema = z.object({
+  query: z.string(),
+  count: z.number(),
+  results: z.array(z.object({
+    title: z.string(),
+    url: z.string(),
+    snippet: z.string(),
+  })),
+});
+type SearchToolResponse = z.infer<typeof SearchToolResponseSchema>;
+
+function resultText(result: AgentToolResult): string {
+  const content = result.content[0];
+  if (content?.type !== "text") throw new Error("expected a text tool result");
+  return content.text;
+}
+
 interface SearchStubHarness {
   dir: string;
   server: Server<undefined>;
   baseUrl: string;
-  requests: Array<{ path: string; auth: string | null; body: unknown }>;
+  requests: Array<{ path: string; auth: string | null; body: SearchRequest | null }>;
   cleanup: () => void;
 }
 
@@ -30,7 +53,8 @@ function stubSearchProvider(): SearchStubHarness {
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      const body = (await req.json().catch(() => null)) as unknown;
+      const parsedBody = SearchRequestSchema.safeParse(await req.json().catch(() => null));
+      const body = parsedBody.success ? parsedBody.data : null;
       requests.push({
         path: url.pathname,
         auth: req.headers.get("authorization"),
@@ -83,7 +107,7 @@ function toolHarness(h: SearchStubHarness) {
   });
 }
 
-// The tool never touches ctx (stateless, read-only); a minimal stub satisfies the SDK type.
+// SAFETY: search_web is stateless and never reads ExtensionContext; the empty fixture cannot hide an accessed dependency.
 const NONE_CTX = {} as ExtensionContext;
 
 describe("search_web registration", () => {
@@ -119,11 +143,7 @@ describe("search_web execution (hermetic, local double)", () => {
       const tool = toolHarness(h);
       const res = await tool.execute("tc1", { query: "bottega", max_results: 5 }, undefined, undefined, NONE_CTX);
       expect(res.isError).toBeFalsy();
-      const parsed = JSON.parse((res.content[0] as { text: string }).text) as {
-        query: string;
-        count: number;
-        results: Array<{ title: string; url: string; snippet: string }>;
-      };
+      const parsed: SearchToolResponse = SearchToolResponseSchema.parse(JSON.parse(resultText(res)));
       expect(parsed.query).toBe("bottega");
       expect(parsed.count).toBe(3);
       expect(parsed.results).toHaveLength(3);
@@ -138,7 +158,7 @@ describe("search_web execution (hermetic, local double)", () => {
       expect(h.requests).toHaveLength(1);
       expect(h.requests[0].path).toBe("/search");
       expect(h.requests[0].auth).toBe("Bearer bottega-proxy-placeholder");
-      expect((h.requests[0].body as { query: string; max_results: number }).query).toBe("bottega");
+      expect(h.requests[0].body?.query).toBe("bottega");
     } finally {
       h.cleanup();
     }
@@ -151,7 +171,7 @@ describe("search_web execution (hermetic, local double)", () => {
       const tool = toolHarness(h);
       const res = await tool.execute("tc1", { query: "bottega", max_results: 2 }, undefined, undefined, NONE_CTX);
       expect(res.isError).toBeFalsy();
-      const parsed = JSON.parse((res.content[0] as { text: string }).text) as { count: number };
+      const parsed = SearchToolResponseSchema.parse(JSON.parse(resultText(res)));
       expect(parsed.count).toBe(2);
     } finally {
       h.cleanup();
@@ -165,8 +185,8 @@ describe("search_web execution (hermetic, local double)", () => {
       const tool = toolHarness(h);
       const res = await tool.execute("tc1", { query: "bottega" }, undefined, undefined, NONE_CTX);
       expect(res.isError).toBe(true);
-      expect((res.content[0] as { text: string }).text).toMatch(/unavailable/);
-      expect((res.content[0] as { text: string }).text).toContain("tavily");
+      expect(resultText(res)).toMatch(/unavailable/);
+      expect(resultText(res)).toContain("tavily");
       // Fail closed: NO network call happened.
       expect(h.requests).toHaveLength(0);
     } finally {
@@ -202,7 +222,7 @@ describe("search_web execution (hermetic, local double)", () => {
       });
       const res = await tool.execute("tc1", { query: "bottega" }, undefined, undefined, NONE_CTX);
       expect(res.isError).toBe(true);
-      expect((res.content[0] as { text: string }).text).toContain("429");
+      expect(resultText(res)).toContain("429");
     } finally {
       server.stop(true);
       rmSync(dir, { recursive: true, force: true });

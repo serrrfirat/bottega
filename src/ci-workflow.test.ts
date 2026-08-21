@@ -1,23 +1,39 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { z } from "zod";
+
+const WorkflowStepSchema = z.object({
+  run: z.string().optional(),
+  "continue-on-error": z.boolean().optional(),
+  if: z.string().optional(),
+});
+const WorkflowSchema = z.object({
+  on: z.array(z.string()),
+  jobs: z.object({
+    ci: z.object({
+      steps: z.array(WorkflowStepSchema),
+    }),
+  }),
+});
+const PackageJsonSchema = z.object({
+  scripts: z.record(z.string(), z.string()),
+});
+
 
 const ROOT = resolve(import.meta.dir, "..");
-const workflow = Bun.YAML.parse(
+const workflow = WorkflowSchema.parse(Bun.YAML.parse(
   readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8"),
-) as Record<string, unknown>;
-const packageJson = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf8")) as {
-  scripts?: Record<string, string>;
-};
+));
+const packageJson = PackageJsonSchema.parse(JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf8")));
 
 describe("required CI workflow", () => {
   test("runs the package lint command after install and before tests", () => {
-    expect(packageJson.scripts?.["lint"]).toBeDefined();
-    expect(workflow["on"]).toEqual(["push", "pull_request"]);
+    expect(packageJson.scripts["lint"]).toBeDefined();
+    expect(workflow.on).toEqual(["push", "pull_request"]);
 
-    const jobs = workflow["jobs"] as Record<string, Record<string, unknown>>;
-    const steps = jobs["ci"]?.["steps"] as Array<Record<string, unknown>>;
-    const commands = steps.map((step) => step["run"]).filter((run): run is string => typeof run === "string");
+    const steps = workflow.jobs.ci.steps;
+    const commands = steps.flatMap((step) => (step.run === undefined ? [] : [step.run]));
 
     const installIndex = commands.indexOf("bun install --frozen-lockfile");
     const lintIndex = commands.indexOf("bun run lint");

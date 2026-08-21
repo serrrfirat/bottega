@@ -51,6 +51,12 @@ import {
   type WizardCheck,
 } from "./admin";
 
+const FetchUrlSchema = z.union([
+  z.string(),
+  z.instanceof(URL).transform((url) => url.href),
+  z.object({ url: z.string() }).transform((request) => request.url),
+]);
+
 // SAFETY: the admin tools never touch the extension context; an empty stub
 // stands in for the real session context.
 const noopCtx = {} as ExtensionContext;
@@ -223,7 +229,7 @@ function stubFetch(catalog: StubCatalogDoc = CATALOG, routes: StubRoute[] = []):
   // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
   // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
   return (async (input: string | URL | Request, _init?: RequestInit) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = FetchUrlSchema.parse(input);
     if (url === "https://integrations.sh/api.json") {
       return new Response(JSON.stringify(catalog), { status: 200 });
     }
@@ -265,8 +271,8 @@ function writeCompletedDraft(draftsDir: string, overrides: Record<string, JsonVa
   writeFileSync(join(draftsDir, "linear.draft.json"), JSON.stringify(draft, null, 2) + "\n");
 }
 
-/** The gmailDraft helper's typed shape (the pin action's draft contract). */
-interface GmailDraftShape {
+/** The gmailDraft helper's domain contract used by the pin action. */
+interface GmailDraft {
   schema: string;
   extensionId: string;
   pinnedAt: string;
@@ -289,7 +295,7 @@ interface GmailDraftShape {
  * pins. The catalog record only links documentation; the endpoint is a
  * human-reviewed fact, never derived.
  */
-function gmailDraft(overrides: Record<string, JsonValue> = {}): GmailDraftShape {
+function gmailDraft(overrides: Partial<GmailDraft> = {}): GmailDraft {
   return {
     schema: "bottega.extension-snapshot.v1",
     extensionId: "gmail-googleapis-com",
@@ -310,7 +316,7 @@ function gmailDraft(overrides: Record<string, JsonValue> = {}): GmailDraftShape 
 }
 
 /** Writes a draft JSON to `draftsDir/<spec>.draft.json` (the pin action's file contract). */
-function writeDraft(draftsDir: string, spec: string, draft: object): void {
+function writeDraft(draftsDir: string, spec: string, draft: GmailDraft): void {
   mkdirSync(draftsDir, { recursive: true });
   writeFileSync(join(draftsDir, `${spec}.draft.json`), JSON.stringify(draft, null, 2) + "\n");
 }
@@ -974,7 +980,7 @@ describe("catalog_browser pin (issue #195)", () => {
       const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
       expect(snapshot.manifest.kind).toBe("mcp");
       if (snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-      expect((snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+      expect("tokenEndpoint" in snapshot.manifest.mcp).toBe(false);
       const egress = readFileSync(egressPath, "utf8");
       expect(egress).toContain("mcp.linear.app");
       expect(egress).not.toContain("token_endpoint:");
@@ -1016,7 +1022,7 @@ describe("catalog_browser pin (issue #195)", () => {
       const snapshot = parsePinnedSnapshot(readFileSync(join(snapshotsDir, "linear.json"), "utf8"));
       expect(snapshot.manifest.kind).toBe("mcp");
       if (snapshot.manifest.kind !== "mcp") throw new Error("expected an mcp manifest");
-      expect((snapshot.manifest.mcp as { tokenEndpoint?: string }).tokenEndpoint).toBeUndefined();
+      expect("tokenEndpoint" in snapshot.manifest.mcp).toBe(false);
       // The regenerated egress allowlists the binding host with NO mint
       // machinery (the SDK sends its own bearer).
       const egress = readFileSync(egressPath, "utf8");
@@ -1326,7 +1332,7 @@ describe("catalog_browser pin (issue #195)", () => {
       let probed = false;
       // SAFETY: the counting stub implements fetch's call contract.
       const countingFetch = (async (input: string | URL | Request) => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        const url = FetchUrlSchema.parse(input);
         if (url === "https://integrations.sh/api.json") {
           return new Response(JSON.stringify(GMAIL_CATALOG), { status: 200 });
         }
@@ -1359,7 +1365,13 @@ describe("catalog_browser pin (issue #195)", () => {
  * `docker compose ps --format json <service>` regardless of args (issue #297:
  * Docker Compose v5 emits a single JSON object instead of an array).
  */
-function fakeDockerBin(stdout: string): { withBin: () => void; restore: () => void; cleanup: () => void } {
+interface FakeDockerBin {
+  withBin: () => void;
+  restore: () => void;
+  cleanup: () => void;
+}
+
+function fakeDockerBin(stdout: string): FakeDockerBin {
   const bin = mkdtempSync(join(tmpdir(), "bottega-docker-"));
   const outFile = join(bin, "out.json");
   writeFileSync(outFile, stdout);

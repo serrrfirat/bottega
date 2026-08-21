@@ -2,10 +2,25 @@ import { z } from "zod";
 import type { AuditRow } from "./db";
 
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const AuditPayloadSchema = z.record(z.string(), z.unknown());
+const SafeNameSchema = z.string().regex(SAFE_NAME);
 const TierSchema = z.enum(["read", "write", "exec"]);
 const DecisionSchema = z.enum(["allow", "deny", "ask-human"]);
 const ScopeSchema = z.enum(["org", "personal"]);
+const AuditPayloadSchema = z.object({
+  tool: SafeNameSchema.optional().catch(undefined),
+  extension: SafeNameSchema.optional().catch(undefined),
+  provider: SafeNameSchema.optional().catch(undefined),
+  tier: TierSchema.optional().catch(undefined),
+  decision: DecisionSchema.optional().catch(undefined),
+  reason: z.string().optional().catch(undefined),
+  approved: z.boolean().optional().catch(undefined),
+  approver: z.union([SafeNameSchema, z.null()]).optional().catch(undefined),
+  scope: ScopeSchema.optional().catch(undefined),
+  status: SafeNameSchema.optional().catch(undefined),
+  result: SafeNameSchema.optional().catch(undefined),
+});
+
+type AuditPayload = z.infer<typeof AuditPayloadSchema>;
 
 export type AuditReasonCategory =
   | "policy_denied"
@@ -20,8 +35,7 @@ export type AuditReasonCategory =
   | "other";
 
 /** Stable reason codes for operator reads. Raw policy/error strings never cross the read boundary. */
-export function auditReasonCategory(reason: unknown): AuditReasonCategory | undefined {
-  if (typeof reason !== "string") return undefined;
+export function auditReasonCategory(reason: string): AuditReasonCategory | undefined {
   if (reason === "policy denies the tool") return "policy_denied";
   if (reason === "tool is not in the known tool table") return "unknown_tool";
   if (reason === "policy requires a human prompt" || reason === "exec-tier tool requires human approval") {
@@ -56,8 +70,9 @@ export interface AuditSummary {
   status?: string;
 }
 
-function safeName(value: unknown): string | undefined {
-  return typeof value === "string" && SAFE_NAME.test(value) ? value : undefined;
+function safeName(value: string): string | undefined {
+  const parsed = SafeNameSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /** Event-specific, allowlisted audit DTO. It never returns the stored payload or arbitrary payload values. */
@@ -66,35 +81,25 @@ export function summarizeAuditRow(row: AuditRow): AuditSummary {
   const actor = safeName(row.actor) ?? "unknown";
   const space = row.space_id === null ? null : safeName(row.space_id) ?? null;
   const summary: AuditSummary = { id: row.id, ts: row.ts, event, space, actor };
-  let payload: Record<string, unknown> = {};
+  let payload: AuditPayload;
   try {
     const parsed = AuditPayloadSchema.safeParse(JSON.parse(row.payload));
-    if (parsed.success) payload = parsed.data;
+    if (!parsed.success) return summary;
+    payload = parsed.data;
   } catch {
     return summary;
   }
 
-  const tool = safeName(payload.tool);
-  if (tool !== undefined) summary.tool = tool;
-  const extension = safeName(payload.extension);
-  if (extension !== undefined) summary.extension = extension;
-  const provider = safeName(payload.provider);
-  if (provider !== undefined) summary.provider = provider;
-  const tier = TierSchema.safeParse(payload.tier);
-  if (tier.success) summary.tier = tier.data;
-  const decision = DecisionSchema.safeParse(payload.decision);
-  if (decision.success) summary.decision = decision.data;
-  const reason = auditReasonCategory(payload.reason);
-  if (reason !== undefined) summary.reason = reason;
-  if (typeof payload.approved === "boolean") summary.approved = payload.approved;
-  if (payload.approver === null) summary.approver = null;
-  else {
-    const approver = safeName(payload.approver);
-    if (approver !== undefined) summary.approver = approver;
-  }
-  const scope = ScopeSchema.safeParse(payload.scope);
-  if (scope.success) summary.scope = scope.data;
-  const status = safeName(payload.status ?? payload.result);
+  if (payload.tool !== undefined) summary.tool = payload.tool;
+  if (payload.extension !== undefined) summary.extension = payload.extension;
+  if (payload.provider !== undefined) summary.provider = payload.provider;
+  if (payload.tier !== undefined) summary.tier = payload.tier;
+  if (payload.decision !== undefined) summary.decision = payload.decision;
+  if (payload.reason !== undefined) summary.reason = auditReasonCategory(payload.reason);
+  if (payload.approved !== undefined) summary.approved = payload.approved;
+  if (payload.approver !== undefined) summary.approver = payload.approver;
+  if (payload.scope !== undefined) summary.scope = payload.scope;
+  const status = payload.status ?? payload.result;
   if (status !== undefined) summary.status = status;
   return summary;
 }

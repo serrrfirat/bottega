@@ -156,7 +156,7 @@ export async function recallMemories(
       scope: scope.kind,
       key: encodeAuditKey(scope),
       count: entries.length,
-    } as { scope: string; key: string; count: number }));
+    }));
     await options.audit.appendAudit({
       space_id: ctx.spaceId,
       actor: ctx.principal ?? "agent",
