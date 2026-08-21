@@ -212,4 +212,32 @@ describe("scripts/dev.sh shared dev stack wiring (issue #301)", () => {
     const egressSrc = readFileSync(resolve(import.meta.dir, "../../scripts/canary-egress.ts"), "utf8");
     expect(egressSrc).toContain('process.env.BOTTEGA_DEV_CERTS_DIR ?? join(cwd, "certs")');
   });
+
+  test("fails closed when the broker CLI fallback's canonical data dir is outside HOME (issue #301)", () => {
+    // The local omp CLI resolves PI_CONFIG_DIR as HOME-relative; if the
+    // canonical data dir is NOT under HOME the fallback broker would serve a
+    // double-prefixed config dir and 401 every vault fetch. dev.sh must fail
+    // closed (clear remedy) instead of silently booting a broken broker.
+    expect(devSh).toContain("is outside HOME");
+    expect(devSh).toContain("cannot resolve a HOME-relative PI_CONFIG_DIR");
+  });
+
+  test("serializes shared CA generation and validates the cert/key pair (issue #301)", () => {
+    // Two worktrees cold-booting could race `generate-ca` into the shared
+    // canonical certs dir; dev.sh must serialize with a lockdir and validate
+    // the resulting cert/key pair with openssl (fail closed on a torn/wrong
+    // CA) — including the `modulus` match check.
+    expect(devSh).toContain(".gen-lock");
+    expect(devSh).toContain("openssl x509 -in \"$BOTTEGA_DEV_CERTS_DIR/ca.crt\" -noout -modulus");
+    expect(devSh).toContain("cert_mod\" != \"$key_mod\"");
+    expect(devSh).toContain("generated MITM CA at $BOTTEGA_DEV_CERTS_DIR is INVALID");
+  });
+
+  test("teardown resolves the SAME adopted/persisted project name (issue #301)", () => {
+    // A bare `docker compose ... down` defaults COMPOSE_PROJECT_NAME to the
+    // worktree basename and would MISS the shared (adopted `camp-flavor`)
+    // project. Teardown must source the helper and pin the resolved name.
+    expect(devSh).toContain('COMPOSE_PROJECT_NAME="$(dev_compose_project)"');
+    expect(devSh).toContain("docker compose -f docker-compose.yml -f docker-compose.dev.yml down");
+  });
 });

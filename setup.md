@@ -38,11 +38,20 @@ runtime's broker secret resolver fetch vault credentials, so connected
 extensions (GitHub, …) resolve their secrets in local runs exactly like in
 compose. The server runs with `HTTP(S)_PROXY` at the tunnel, `NO_PROXY` for
 internal names, and `NODE_EXTRA_CA_CERTS` so Bun/Node trust the proxy's MITM
-certs. The proxy + broker stay up between runs; stop them with:
+certs. The proxy + broker stay up between runs; stop them from ANY worktree
+(not just the canonical checkout) by resolving the SAME adopted/persisted
+project name — a bare `down` would default COMPOSE_PROJECT_NAME to the
+current worktree's basename and miss the shared project:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+source scripts/shared-data-dir.sh
+COMPOSE_PROJECT_NAME="$(dev_compose_project)" \
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 ```
+
+This resolves `camp-flavor` (the adopted legacy stack) or the persisted id
+for this repo, so the shared proxy/broker and egress network stop cleanly
+from any worktree.
 
 Integration tests use the [emulate.dev](https://emulate.dev) GitHub emulator
 for the PR-creation path (no live GitHub needed); everything else is hermetic
@@ -350,9 +359,11 @@ worktree — including `.worktrees/<name>` feature worktrees — reads the same
 `data/public-base-url` the tunnel writes (a worktree's own `data/` stays
 per-checkout state; the public-base store is shared). The ENTIRE local dev
 stack shares the same way (issue #301): `bun run dev` pins the Compose
-project to a stable hash of the canonical checkout's realpath (worktrees of
-one repo share a project; unrelated same-basename clones diverge), and it
-exports the canonical data dir, certs dir, and credential-boundary secret
+project to a stable dev identity — reusing the existing legacy
+canonical-basename stack (`camp-flavor`, so a pre-#301 running stack
+converges onto its existing network instead of stranding the subnet) when
+one is running, else a stable hash of the canonical checkout's realpath — and
+it exports the canonical data dir, certs dir, and credential-boundary secret
 dir to the Compose override and the server env. So every worktree reuses
 ONE iron-proxy egress network, ONE proxy/broker container set, ONE MITM CA,
 and ONE secret store — instead of each worktree creating its own

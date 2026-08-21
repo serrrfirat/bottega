@@ -39,8 +39,12 @@
 #      the proxy's MITM leaf certs against the generated CA), and
 #      BOTTEGA_PROXY_CONTROL_URL/TOKEN (the boundary's reload half).
 # The proxy + broker stay up between dev runs (restart: on-failure); stop
-# them with:
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+# them from ANY worktree with the same RESOLVED project name (else the bare
+# `down` would default COMPOSE_PROJECT_NAME to the worktree basename and
+# miss the adopted/persisted canonical project, e.g. `camp-flavor`):
+#   source scripts/shared-data-dir.sh
+#   COMPOSE_PROJECT_NAME="$(dev_compose_project)" \
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 #
 # The OMP agent dir (data/omp-agent, issue #9) gets the deployment templates
 # on first run — same catalog compose mounts at config/omp — so local and
@@ -146,15 +150,49 @@ fi
 #    trust the SAME CA the shared proxy terminates with — a second worktree
 #    boot reuses it instead of generating its own (which the shared proxy
 #    would not be terminating with).
+#    Serialized (issue #301): two worktrees cold-booting at once could both
+#    see `! -f ca.crt` and race `generate-ca` into the same dir, corrupting
+#    the shared CA. A portable lockdir mutex (mkdir is atomic; no flock on
+#    macOS) lets one boot generate while the other waits, then validates the
+#    cert/key pair with openssl before any container trusts it.
 if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
-  echo "iron-proxy: generating MITM CA ($BOTTEGA_DEV_CERTS_DIR, gitignored)..."
-  mkdir -p "$BOTTEGA_DEV_CERTS_DIR"
-  if ! docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null 2>&1; then
-    echo "bottega dev: iron-proxy CA generation failed (issue #123) — is the ironsh/iron-proxy:0.49.0 image pullable?" >&2
-    echo "  docker pull ironsh/iron-proxy:0.49.0" >&2
+  if ! mkdir "$BOTTEGA_DEV_CERTS_DIR/.gen-lock" 2>/dev/null; then
+    echo "iron-proxy: another boot is generating the shared CA — waiting..."
+    for _ in $(seq 1 60); do
+      [[ -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]] && break
+      sleep 1
+    done
+  fi
+  if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
+    echo "iron-proxy: generating MITM CA ($BOTTEGA_DEV_CERTS_DIR, gitignored)..."
+    mkdir -p "$BOTTEGA_DEV_CERTS_DIR"
+    if ! docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null 2>&1; then
+      echo "bottega dev: iron-proxy CA generation failed (issue #123) — is the ironsh/iron-proxy:0.49.0 image pullable?" >&2
+      echo "  docker pull ironsh/iron-proxy:0.49.0" >&2
+      rm -rf "$BOTTEGA_DEV_CERTS_DIR/.gen-lock"
+      exit 1
+    fi
+  fi
+  rm -rf "$BOTTEGA_DEV_CERTS_DIR/.gen-lock"
+  # Validate the generated CA before the shared proxy terminates with it: the
+  # cert must parse, the key must parse, and their public-key moduli must
+  # MATCH (a torn write from a concurrent generator or a bad image would show
+  # up here). Invalid -> fail closed with a clear remedy, never ship a broken
+  # CA the dev server would trust against the proxy's different one.
+  local ca_ok=1
+  if command -v openssl >/dev/null 2>&1; then
+    local cert_mod key_mod
+    cert_mod="$(openssl x509 -in "$BOTTEGA_DEV_CERTS_DIR/ca.crt" -noout -modulus 2>/dev/null || true)"
+    key_mod="$(openssl rsa -in "$BOTTEGA_DEV_CERTS_DIR/ca.key" -noout -modulus 2>/dev/null || true)"
+    if [[ -z "$cert_mod" || "$cert_mod" != "$key_mod" ]]; then ca_ok=0; fi
+  fi
+  if [[ "$ca_ok" != 1 ]]; then
+    echo "bottega dev: generated MITM CA at $BOTTEGA_DEV_CERTS_DIR is INVALID (cert/key mismatch or unreadable) — removing it so the next boot regenerates:" >&2
+    rm -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" "$BOTTEGA_DEV_CERTS_DIR/ca.key"
+    echo "  re-run: bun run dev" >&2
     exit 1
   fi
-  echo "iron-proxy: MITM CA generated at $BOTTEGA_DEV_CERTS_DIR/ca.crt"
+  echo "iron-proxy: MITM CA ready at $BOTTEGA_DEV_CERTS_DIR/ca.crt"
 fi
 
 # 3. Management API token for the boundary reload (issue #123). Persisted
@@ -270,6 +308,18 @@ else
   # store, so a server restarted from any worktree resolves the SAME vault
   # token). PI_CONFIG_DIR is HOME-relative (the CLI path.joins it), so use
   # the canonical data dir's HOME-relative form, never the worktree's PWD.
+  # Fail closed (issue #301): if the canonical data dir is NOT under HOME,
+  # the HOME-relative PI_CONFIG_DIR would double-prefix (path.join), and the
+  # fallback broker would 401 every snapshot fetch — so refuse to boot a
+  # broken broker and direct the user to the compose path instead.
+  if [[ "$BOTTEGA_DEV_DATA_DIR" != "$HOME" && "$BOTTEGA_DEV_DATA_DIR" != "$HOME/"* ]]; then
+    echo "bottega dev: canonical data dir ($BOTTEGA_DEV_DATA_DIR) is outside HOME ($HOME) —" >&2
+    echo "the local omp CLI fallback cannot resolve a HOME-relative PI_CONFIG_DIR (issue #301)." >&2
+    echo "Pull the broker image once so the compose path runs, then re-run:" >&2
+    echo "  docker pull oh-my-pi/pi:dev" >&2
+    echo "  bun run dev" >&2
+    exit 1
+  fi
   local_rel="${BOTTEGA_DEV_DATA_DIR#${HOME}/}/.omp"
   PI_CONFIG_DIR="$local_rel" OMP_AUTH_BROKER_TOKEN="$(<"$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token")" \
     nohup omp auth-broker serve --bind=0.0.0.0:8765 >> "$BOTTEGA_DEV_DATA_DIR/auth-broker.log" 2>&1 &

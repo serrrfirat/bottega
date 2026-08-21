@@ -113,10 +113,12 @@ lives in the canonical checkout's `data/` and is SHARED across worktrees:
 `scripts/dev.sh` propagates it to any worktree-started server (issue #293).
 The whole local dev stack (iron-proxy egress network + containers + MITM CA
 + secret store) is shared the same way: every worktree boots into ONE
-Compose project — a stable hash of the canonical checkout's realpath, so
-worktrees of one repo share it while unrelated same-basename clones diverge
-(issue #301) — reusing a single egress network, proxy/broker, CA, and
-credential store instead of colliding on the fixed `172.30.0.0/24` subnet.
+Compose project — reusing the existing legacy canonical-basename stack
+(`camp-flavor`) when one is running, else a stable hash of the canonical
+checkout's realpath, so worktrees of one repo share it while unrelated
+same-basename clones diverge (issue #301) — reusing a single egress network,
+proxy/broker, CA, and credential store instead of colliding on the fixed
+`172.30.0.0/24` subnet.
 `BOTTEGA_OAUTH_CALLBACK_BASE_URL` (see `.env.example`) is a deployment-only
 override for a fixed DNS host that never rotates.
 
