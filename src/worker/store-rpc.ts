@@ -160,6 +160,8 @@ export class JobStoreRpcServer {
   private readonly memory: MemoryProvider;
   private readonly storeDb: Database;
   private readonly modelCallRequesters = new Map<number, { resolve: (v: string | undefined) => void; reject: (e: Error) => void }>();
+  /** Monotonic supervisor→child model-call request id (unique across the server lifetime). */
+  private modelCallNextId = 0;
 
   private constructor(
     baseStore: Store,
@@ -327,13 +329,24 @@ export class JobStoreRpcServer {
     systemPrompt: string,
     input: string,
   ): Promise<string | undefined> {
-    const id = (Date.now() % 2_147_483_647) + 1;
+    const id = ++this.modelCallNextId;
     const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
-    if (this.modelCallRequesters.has(id)) {
-      reject(new Error("sandbox model-call id collision"));
-      return promise;
-    }
-    this.modelCallRequesters.set(id, { resolve, reject });
+    // A bounded supervisor→child call: if the worker never replies, reject
+    // loudly and drop the requester so the server never leaks or hangs.
+    const timeout = setTimeout(() => {
+      this.modelCallRequesters.delete(id);
+      reject(new Error(`sandbox model call timed out after ${RPC_CALL_TIMEOUT_MS} ms`));
+    }, RPC_CALL_TIMEOUT_MS);
+    this.modelCallRequesters.set(id, {
+      resolve: (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      reject: (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    });
     socket.write(
       Buffer.from(`${JSON.stringify({ ns: "memory", id, method: "@model-call", args: [systemPrompt, input] })}\n`),
     );
@@ -371,6 +384,7 @@ export class JobStoreRpcServer {
   }
 
   close(): void {
+    this.rejectAllModelCalls(new Error("sandbox store RPC server closed mid-consolidation"));
     if (this.connection !== null) this.connection.destroy();
     this.server.close();
   }
@@ -541,7 +555,12 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
 
   return {
     store,
-    memoryProvider,
+    // A getter, not a by-value snapshot: ready() rebinds the local
+    // `memoryProvider` to the supervisor-resolved readonly capabilities/
+    // backend, and callers must observe the resolved provider after ready().
+    get memoryProvider(): ResolvedMemoryProvider {
+      return memoryProvider;
+    },
     ready: async () => {
       try {
         const [capabilities, backend] = await Promise.all([
