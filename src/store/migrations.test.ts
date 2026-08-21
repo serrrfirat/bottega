@@ -1,0 +1,230 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createStore } from "./db";
+import { MIGRATIONS, runMigrations, type Migration } from "./migrations";
+
+const dirs: string[] = [];
+const EXPECTED_MIGRATION_IDS = [
+  "001_create_latest_schema",
+  "002_add_work_items_repo",
+  "003_add_work_items_delivery",
+  "004_add_work_items_pr_context",
+  "005_add_work_items_model_pins",
+  "006_add_work_items_skills",
+  "007_add_work_items_assignee",
+  "008_expand_outbox_kinds",
+  "009_expand_worker_job_kinds",
+  "010_add_spaces_settings",
+] as const;
+
+function tempDb(name: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "bottega-migrations-"));
+  dirs.push(dir);
+  return join(dir, name);
+}
+
+function ledgerIds(db: Database): string[] {
+  return (db.query("SELECT id FROM schema_migrations ORDER BY rowid").all() as Array<{ id: string }>).map(
+    ({ id }) => id,
+  );
+}
+
+function schemaSnapshot(db: Database): Record<string, unknown> {
+  const tables = (
+    db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all() as Array<{ name: string }>
+  ).map(({ name }) => name);
+
+  return Object.fromEntries(
+    tables.map((table) => {
+      const columns = (
+        db.query(`PRAGMA table_info(${JSON.stringify(table)})`).all() as Array<{
+          name: string;
+          type: string;
+          notnull: number;
+          dflt_value: string | null;
+          pk: number;
+        }>
+      )
+        .map(({ name, type, notnull, dflt_value, pk }) => ({ name, type, notnull, dflt_value, pk }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const foreignKeys = db.query(`PRAGMA foreign_key_list(${JSON.stringify(table)})`).all();
+      const indexes = (
+        db.query(`PRAGMA index_list(${JSON.stringify(table)})`).all() as Array<{ name: string; unique: number; partial: number }>
+      )
+        .filter(({ name }) => !name.startsWith("sqlite_autoindex_"))
+        .map(({ name, unique, partial }) => ({
+          name,
+          unique,
+          partial,
+          columns: (db.query(`PRAGMA index_info(${JSON.stringify(name)})`).all() as Array<{ name: string }>).map(
+            (column) => column.name,
+          ),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      return [table, { columns, foreignKeys, indexes }];
+    }),
+  );
+}
+
+function createPreLedgerLegacyDatabase(path: string): void {
+  const db = new Database(path);
+  db.exec(`
+    CREATE TABLE spaces (
+      id TEXT PRIMARY KEY,
+      platform TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      name TEXT,
+      policy_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE work_items (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id),
+      requester TEXT NOT NULL,
+      description TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','claimed','working','review','done','blocked','aborted')),
+      approvals TEXT NOT NULL DEFAULT '[]',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      result TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE outbox (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+      payload TEXT NOT NULL,
+      space TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','posted','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      posted_at INTEGER
+    );
+    CREATE TABLE worker_jobs (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled')),
+      payload TEXT NOT NULL,
+      space_id TEXT,
+      status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      lease_until INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO spaces VALUES ('slack:legacy', 'slack', 'legacy', 'Legacy', '{"tools":{}}', 1, 2);
+    INSERT INTO work_items VALUES ('wi_legacy', 'slack:legacy', 'U1', 'keep me', 'open', '[]', '[]', NULL, 3, 4);
+    INSERT INTO outbox VALUES ('out_legacy', 'git', '{"ok":true}', 'slack:legacy', 'pending', 1, 5, NULL);
+    INSERT INTO worker_jobs VALUES ('job_legacy', 'git', '{"task":true}', 'slack:legacy', 'queued', 2, NULL, 6, 7);
+  `);
+  db.close();
+}
+
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("ordered SQLite migrations", () => {
+  test("fresh creation applies the complete ordered history", () => {
+    const store = createStore(tempDb("fresh.db"));
+    expect(ledgerIds(store.getDb())).toEqual(EXPECTED_MIGRATION_IDS);
+    store.close();
+  });
+
+  test("a pre-ledger database preserves data, converges on the fresh schema, and reopens without rerunning", async () => {
+    const legacyPath = tempDb("legacy.db");
+    const freshPath = tempDb("canonical.db");
+    createPreLedgerLegacyDatabase(legacyPath);
+
+    const upgraded = createStore(legacyPath);
+    // SAFETY: the migration runner owns this ledger schema and the query selects its three typed columns.
+    const firstLedger = upgraded
+      .getDb()
+      .query("SELECT rowid, id, applied_at FROM schema_migrations ORDER BY rowid")
+      .all() as Array<{ rowid: number; id: string; applied_at: number }>;
+    expect(firstLedger.map(({ id }) => id)).toEqual(EXPECTED_MIGRATION_IDS);
+    expect(await upgraded.getWorkItem("wi_legacy")).toMatchObject({ requester: "U1", assignee: "U1", delivery: "git" });
+    expect(upgraded.getDb().query("SELECT * FROM outbox WHERE id = 'out_legacy'").get()).toMatchObject({ attempts: 1 });
+    expect(upgraded.getDb().query("SELECT * FROM worker_jobs WHERE id = 'job_legacy'").get()).toMatchObject({ attempts: 2 });
+
+    const fresh = createStore(freshPath);
+    expect(schemaSnapshot(upgraded.getDb())).toEqual(schemaSnapshot(fresh.getDb()));
+    fresh.close();
+    upgraded.close();
+
+    const reopened = createStore(legacyPath);
+    expect(
+      reopened.getDb().query("SELECT rowid, id, applied_at FROM schema_migrations ORDER BY rowid").all(),
+    ).toEqual(firstLedger);
+    expect(await reopened.getWorkItem("wi_legacy")).toMatchObject({ requester: "U1", assignee: "U1" });
+    reopened.close();
+  });
+
+  test("a failed migration rolls back its schema, data, and version row, then retries safely", () => {
+    const path = tempDb("rollback.db");
+    const db = new Database(path);
+    const failing: readonly Migration[] = [
+      {
+        id: "001_create_probe",
+        up(database) {
+          database.exec("CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+        },
+      },
+      {
+        id: "002_injected_failure",
+        up(database) {
+          database.exec("ALTER TABLE probe ADD COLUMN transient TEXT");
+          database.exec("INSERT INTO probe (id, value, transient) VALUES (1, 'partial', 'partial')");
+          throw new Error("injected failure");
+        },
+      },
+    ];
+
+    expect(() => runMigrations(db, failing)).toThrow("migration 002_injected_failure failed: injected failure");
+    expect(ledgerIds(db)).toEqual(["001_create_probe"]);
+    expect((db.query("PRAGMA table_info(probe)").all() as Array<{ name: string }>).map(({ name }) => name)).toEqual([
+      "id",
+      "value",
+    ]);
+    expect(db.query("SELECT COUNT(*) AS count FROM probe").get()).toEqual({ count: 0 });
+
+    const fixed: readonly Migration[] = [
+      failing[0]!,
+      {
+        id: "002_injected_failure",
+        up(database) {
+          database.exec("ALTER TABLE probe ADD COLUMN recovered TEXT");
+          database.exec("INSERT INTO probe (id, value, recovered) VALUES (1, 'complete', 'safe')");
+        },
+      },
+    ];
+    runMigrations(db, fixed);
+    expect(ledgerIds(db)).toEqual(["001_create_probe", "002_injected_failure"]);
+    expect(db.query("SELECT id, value, recovered FROM probe").get()).toEqual({ id: 1, value: "complete", recovered: "safe" });
+    db.close();
+  });
+
+  test("unknown and inconsistent ledger entries fail closed with the offending migration ID", () => {
+    const unknownPath = tempDb("unknown.db");
+    const unknownStore = createStore(unknownPath);
+    unknownStore.close();
+    const unknownDb = new Database(unknownPath);
+    unknownDb.query("INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)").run("999_future", Date.now());
+    unknownDb.close();
+    expect(() => createStore(unknownPath)).toThrow("unknown migration ID: 999_future");
+
+    const inconsistentPath = tempDb("inconsistent.db");
+    const inconsistentStore = createStore(inconsistentPath);
+    inconsistentStore.close();
+    const inconsistentDb = new Database(inconsistentPath);
+    const missingId = MIGRATIONS[1]!.id;
+    const offendingId = MIGRATIONS[2]!.id;
+    inconsistentDb.query("DELETE FROM schema_migrations WHERE id = ?").run(missingId);
+    inconsistentDb.close();
+    expect(() => createStore(inconsistentPath)).toThrow(`inconsistent migration ID: ${offendingId}`);
+  });
+});

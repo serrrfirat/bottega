@@ -1,5 +1,5 @@
--- Bottega store schema (v1). Idempotent: every object is IF NOT EXISTS,
--- so re-running this file (e.g. on every boot, server and executor) is a no-op.
+-- Latest Bottega application schema. The ordered migration registry applies
+-- this idempotent definition first, then records every historical upgrade.
 
 CREATE TABLE IF NOT EXISTS spaces (
   id          TEXT PRIMARY KEY,          -- "slack:C0123" (DMs, no threads)
