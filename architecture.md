@@ -844,8 +844,28 @@ sequenceDiagram
     H->>A: approve delivery
     A->>S: delivery.resolved (first durable click wins)
     S->>E: audit-backed onDelivery wait resolves
+    E->>E: validate workspace authority → remove checkout
     E->>E: working → review → done
 ```
+
+## Git workspace authority boundary (#310)
+
+`src/worker/workspace-lifecycle.ts` is the only executor component allowed to
+replace or remove a Git workspace. The directory name alone grants no
+authority. The component resolves the configured root and target, requires
+the target to be a canonical direct child, rejects symlinks and path escape,
+and validates `.git/bottega-workspace.json` against the same work-item ID and
+repository. The marker also carries a versioned Bottega owner and unique
+creation identity, but never a credential.
+
+An agent, Git, delivery, or approval failure leaves the marker and checkout
+intact. Retry can replace only that exact marker-matched checkout. Approved
+delivery validates and removes it while the item is still `working`; an
+uncertain cleanup therefore blocks instead of becoming `done`. The explicit
+operator purge first requires database authority for a `blocked` item, then
+uses the same filesystem authority check and writes `workspace.purge`
+decision/result audit rows. Nothing scans or deletes unknown directories,
+and there is no automatic age-based purge.
 
 ## Worker boundary direction (epic #170)
 

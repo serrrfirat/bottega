@@ -48,7 +48,7 @@
  * stale-run window) and denies, landing the item in `blocked` instead of
  * hanging at `working` forever.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { recoverStaleWorkItems, type Store, type SpaceModelSettings, type WorkItem } from "./store/db";
 import {
@@ -67,7 +67,7 @@ import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSche
 import { inProcessSandboxRunner, runJobInSandbox, type SandboxRunner } from "./worker/run-job";
 import type { Poller } from "./ingest/types";
 import { getWatermarkedPoller } from "./ingest/registry";
-import { createAudit } from "./policy/audit";
+import { createAudit, redact } from "./policy/audit";
 import { loadKbConfig } from "./kb/config";
 import { ingestSource } from "./kb/ingest";
 import type { MemoryProvider } from "./memory/types";
@@ -97,6 +97,7 @@ import type { Skill, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 import { resolveWorkItemSkills } from "./server/skills";
+import { defaultWorkspaceRoot, WorkspaceLifecycle } from "./worker/workspace-lifecycle";
 
 /** The session driver "message" event payload: { spaceId, text }. */
 const driverMessageSchema = z.object({ text: z.string() });
@@ -776,7 +777,8 @@ export async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item:
       return (await deps.store.getWorkItem(item.id)) ?? item;
     }
 
-    const workspace = join(cfg.workspacesDir, item.id);
+    const workspaceLifecycle = new WorkspaceLifecycle(cfg.workspacesDir);
+    const workspace = workspaceLifecycle.workspacePath(item.id);
     // Repo gate (issue #47): the repo comes from the conversation, the
     // allowlist is the authorization fence. Fail closed before any git work.
     const repo = item.repo;
@@ -797,20 +799,22 @@ export async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item:
       return (await deps.store.getWorkItem(item.id)) ?? item;
     }
     console.log(`[${item.id}] working (${repo}, workspace ${workspace})`);
-    await setupWorkspace(cfg, item, repo, workspace);
+    await setupWorkspace(cfg, item, repo, workspaceLifecycle);
     const summary = await runAgentSession(deps, cfg, item, workspace);
-    await deliver(deps, cfg, item, workspace, summary);
-    // Delivered: drop the checkout (the transcript stays for the audit trail).
-    rmSync(workspace, { recursive: true, force: true });
+    await deliver(deps, cfg, item, repo, workspace, summary, workspaceLifecycle);
     return (await deps.store.getWorkItem(item.id)) ?? item;
   } catch (err) {
     // Failure: git workspaces are kept for forensics; every delivery kind
     // lands the item in blocked with evidence — never silently dropped.
-    const message = err instanceof Error ? err.message : String(err);
+    const message = redact(err instanceof Error ? err.message : String(err));
     console.log(`[${item.id}] blocked: ${message}`);
+    const candidateWorkspace = join(cfg.workspacesDir, item.id);
+    const evidence = item.delivery === "git" && existsSync(candidateWorkspace)
+      ? `executor failed; workspace retained or left untouched at "${candidateWorkspace}": ${message}`
+      : `executor failed: ${message}`;
     try {
       await deps.store.transitionWorkItem(item.id, "working", "blocked", {
-        evidence: `executor failed: ${message.slice(0, 2000)}`,
+        evidence: evidence.slice(0, 2000),
         by: "executor",
       });
     } catch (transitionErr) {
@@ -1004,14 +1008,18 @@ function parseExtensionDeliveryEnvelope(output: string): ExtensionDeliveryResult
   throw new Error(`extension worker output missing a valid JSON envelope (${validationError})`);
 }
 
-async function setupWorkspace(cfg: ExecutorConfig, item: WorkItem, repo: string, workspace: string): Promise<void> {
-  mkdirSync(cfg.workspacesDir, { recursive: true });
-  // Fresh per item: a crashed run may have left a checkout behind.
-  rmSync(workspace, { recursive: true, force: true });
-  // The askpass contract covers every authenticated git operation: cloning
-  // a private org repo needs the PAT just like the push does.
-  await git(["clone", `${cfg.gitBaseUrl}/${repo}.git`, workspace], {
-    env: { GIT_ASKPASS: cfg.askpassScript, EXECUTOR_GIT_TOKEN_FILE: cfg.tokenFile },
+async function setupWorkspace(
+  cfg: ExecutorConfig,
+  item: WorkItem,
+  repo: string,
+  lifecycle: WorkspaceLifecycle,
+): Promise<void> {
+  const workspace = await lifecycle.create(item.id, repo, async (destination) => {
+    // The askpass contract covers every authenticated git operation: cloning
+    // a private org repo needs the PAT just like the push does.
+    await git(["clone", `${cfg.gitBaseUrl}/${repo}.git`, destination], {
+      env: { GIT_ASKPASS: cfg.askpassScript, EXECUTOR_GIT_TOKEN_FILE: cfg.tokenFile },
+    });
   });
   await git(["checkout", "-b", `bottega/${item.id}`], { cwd: workspace });
   // Commit identity for the agent session's commits.
@@ -1228,8 +1236,10 @@ async function deliver(
   deps: ExecutorDeps,
   cfg: ExecutorConfig,
   item: WorkItem,
+  repository: string,
   workspace: string,
   summary: string,
+  lifecycle: WorkspaceLifecycle,
 ): Promise<void> {
   const branch = `bottega/${item.id}`;
   const token = readFileSync(cfg.tokenFile, "utf8").trim();
@@ -1262,6 +1272,10 @@ async function deliver(
     });
     return;
   }
+  // Cleanup is part of successful delivery. Authority failure happens while
+  // the item is still working, so the caller can block it and retain the
+  // uncertain path instead of ever reporting success.
+  lifecycle.removeOwned(item.id, repository);
   const result = JSON.stringify({ pr_url: prUrl, summary });
   // The legal map (issue #10): review requires a recorded approval; done
   // requires result.pr_url. Both transitions carry their obligations.
@@ -1368,8 +1382,7 @@ export function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   const repos = settings?.repos ?? fileConfig.repos;
   const gitBaseUrl = (settings?.gitBaseUrl ?? fileConfig.gitBaseUrl).replace(/\/+$/, "");
   const apiBaseUrl = (settings?.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
-  const workspacesDir =
-    settings?.workspacesDir ?? (existsSync("/workspaces") ? "/workspaces" : "data/workspaces");
+  const workspacesDir = settings?.workspacesDir ?? defaultWorkspaceRoot();
   const allowLoosePat = settings?.allowLoosePat ?? false;
   const tokenFile = process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
   if (!existsSync(tokenFile)) {

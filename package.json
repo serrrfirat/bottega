@@ -14,7 +14,8 @@
     "test": "bun test --parallel=1 tests/e2e src/models/proxy-placeholder.test.ts && bun test --path-ignore-patterns 'tests/e2e/**' --path-ignore-patterns 'src/models/proxy-placeholder.test.ts'",
     "test:e2e": "bun test tests/e2e/",
     "check-coverage": "bun run scripts/check-coverage.ts",
-    "dev:watch": "bash scripts/dev.sh --watch"
+    "dev:watch": "bash scripts/dev.sh --watch",
+    "workspace:purge": "bun run scripts/purge-workspace.ts"
   },
   "devDependencies": {
     "@emulators/core": "^0.9.0",

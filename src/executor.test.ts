@@ -13,7 +13,7 @@ import { Database } from "bun:sqlite";
 import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, type SpaceModelSettings, type Store, type WorkItem, type WorkItemState } from "./store/db";
@@ -46,6 +46,7 @@ import {
   type ExecutorDeps,
   type ExtensionWorkerToolset,
 } from "./executor";
+import { WORKSPACE_MARKER_FILE } from "./worker/workspace-lifecycle";
 import { resolveDeliveryAction } from "./server/adapters/delivery-router";
 import { pollPendingDeliveries } from "./server/services/delivery-poller";
 import { postPendingOutboxRows } from "./server/services/outbox-post-seam";
@@ -396,6 +397,22 @@ async function runUntil(fx: Fixture, itemId: string, state: WorkItemState, deps:
   }
 }
 
+/** Test-only retry reset: production retry re-dispatches the same durable item id. */
+function resetBlockedItemForRetry(fx: Fixture, itemId: string, repo?: string): void {
+  fx.store
+    .getDb()
+    .run(
+      "UPDATE work_items SET state = 'open', repo = COALESCE(?, repo), approvals = '[]', evidence = '[]', result = NULL, updated_at = ? WHERE id = ?",
+      [repo ?? null, Date.now(), itemId],
+    );
+  fx.store
+    .getDb()
+    .run(
+      "UPDATE worker_jobs SET status = 'queued', attempts = 0, lease_until = NULL, updated_at = ? WHERE id = ?",
+      [Date.now(), itemId],
+    );
+}
+
 async function waitForState(store: Store, id: string, state: WorkItemState, timeoutMs = 10_000): Promise<WorkItem> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -541,6 +558,194 @@ describe("claim loop", () => {
     }
   });
 
+  test("an unmarked item directory blocks before git and preserves its sentinel", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-unmarked" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do not delete foreign data",
+        repo: "acme/sandbox",
+      });
+      const workspace = join(fx.workspacesDir, item.id);
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "sentinel"), "foreign");
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      expect(readFileSync(join(workspace, "sentinel"), "utf8")).toBe("foreign");
+      expect(fx.driver.sessions).toHaveLength(0);
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
+      expect(evidence[0].url).toContain(workspace);
+      expect(evidence[0].url).toMatch(/marker.*missing/i);
+      expect(evidence[0].url).not.toContain(PAT);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a marker-matched retry replaces the retained workspace for the same item and repository", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.failure = new Error(`agent failed with ${PAT}`);
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-retry" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "retry safely",
+        repo: "acme/sandbox",
+      });
+
+      const first = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+      const workspace = join(fx.workspacesDir, item.id);
+      const markerPath = join(workspace, ".git", WORKSPACE_MARKER_FILE);
+      expect(existsSync(markerPath)).toBe(true);
+      const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      expect(marker).toMatchObject({
+        workItemId: item.id,
+        repository: "acme/sandbox",
+        creationId: expect.any(String),
+      });
+      expect(JSON.stringify(marker)).not.toContain(PAT);
+      expect(first.evidence).not.toContain(PAT);
+      expect(first.evidence).toContain("[REDACTED]");
+      writeFileSync(join(workspace, "old-sentinel"), "replace me");
+
+      resetBlockedItemForRetry(fx, item.id);
+      fx.driver.failure = null;
+      const done = await runUntil(fx, item.id, "done", makeDeps(fx));
+
+      expect(done.state).toBe("done");
+      expect(existsSync(workspace)).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a retry with a different repository blocks and leaves the retained workspace untouched", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.failure = new Error("first attempt failed");
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-mismatch" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "do not cross repositories",
+        repo: "acme/sandbox",
+      });
+      await runUntil(fx, item.id, "blocked", makeDeps(fx));
+      const workspace = join(fx.workspacesDir, item.id);
+      writeFileSync(join(workspace, "sentinel"), "keep");
+
+      resetBlockedItemForRetry(fx, item.id, "acme/tooling");
+      fx.driver.failure = null;
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      expect(readFileSync(join(workspace, "sentinel"), "utf8")).toBe("keep");
+      expect(fx.driver.sessions).toHaveLength(1);
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
+      expect(evidence[0].url).toContain(workspace);
+      expect(evidence[0].url).toMatch(/repository.*does not match/i);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a symlinked item workspace blocks and never touches the symlink target", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-symlink" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "reject linked workspaces",
+        repo: "acme/sandbox",
+      });
+      const outside = join(fx.dir, "outside");
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "sentinel"), "keep");
+      mkdirSync(fx.workspacesDir, { recursive: true });
+      symlinkSync(outside, join(fx.workspacesDir, item.id));
+
+      const blocked = await runUntil(fx, item.id, "blocked", makeDeps(fx));
+
+      expect(readFileSync(join(outside, "sentinel"), "utf8")).toBe("keep");
+      expect(fx.driver.sessions).toHaveLength(0);
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
+      expect(evidence[0].url).toMatch(/symbolic link/i);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("an escaped database item id blocks before git and leaves the outside path untouched", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-escape" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "reject path escape",
+        repo: "acme/sandbox",
+      });
+      const escapedId = "../outside-workspace";
+      fx.store
+        .getDb()
+        .run("UPDATE worker_jobs SET id = ?, payload = ? WHERE id = ?", [
+          escapedId,
+          JSON.stringify({ workItemId: escapedId }),
+          item.id,
+        ]);
+      fx.store.getDb().run("UPDATE work_items SET id = ? WHERE id = ?", [escapedId, item.id]);
+      const outside = join(fx.workspacesDir, escapedId);
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "sentinel"), "keep");
+
+      const blocked = await runUntil(fx, escapedId, "blocked", makeDeps(fx));
+
+      expect(readFileSync(join(outside, "sentinel"), "utf8")).toBe("keep");
+      expect(fx.driver.sessions).toHaveLength(0);
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
+      expect(evidence[0].url).toMatch(/direct child/i);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("success cleanup with a mismatched marker blocks instead of reporting done or deleting", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1-cleanup-authority" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "verify before cleanup",
+        repo: "acme/sandbox",
+      });
+      const workspace = join(fx.workspacesDir, item.id);
+      const deps = makeDeps(fx, {
+        onDelivery: async () => {
+          const markerPath = join(workspace, ".git", WORKSPACE_MARKER_FILE);
+          const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+          writeFileSync(markerPath, JSON.stringify({ ...marker, repository: "acme/tooling" }));
+          writeFileSync(join(workspace, "sentinel"), "keep");
+          return { approver: "U_HUMAN" };
+        },
+      });
+
+      const blocked = await runUntil(fx, item.id, "blocked", deps);
+
+      expect(readFileSync(join(workspace, "sentinel"), "utf8")).toBe("keep");
+      expect(blocked.state).toBe("blocked");
+      expect(blocked.result).toBeNull();
+      const evidence = z.array(urlEvidenceSchema).parse(JSON.parse(blocked.evidence));
+      expect(evidence[0].url).toMatch(/marker repository.*does not match/i);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
   test("denied delivery approval blocks the item (PR stays open on the remote)", async () => {
     const fx = makeFixture(null);
     try {
@@ -557,6 +762,7 @@ describe("claim loop", () => {
       expect(fx.deliveries).toHaveLength(1);
       expect(JSON.parse(blocked.evidence)[0].url).toContain("approval denied");
       expect(JSON.parse(blocked.approvals)).toEqual([]);
+      expect(existsSync(join(fx.workspacesDir, item.id, ".git", WORKSPACE_MARKER_FILE))).toBe(true);
       // The PR itself was still opened before the approval request.
       const pulls = await fetch(`${fx.emulatorBase}/repos/acme/sandbox/pulls`, {
         headers: { Authorization: `Bearer ${fx.pat}` },
@@ -1754,10 +1960,15 @@ describe("worker job envelope (epic #170)", () => {
       const adapter = { postMessage: async (spaceId: string, text: string) => void posted.push({ spaceId, text }) };
       const pass = await postPendingOutboxRows(fx.store, adapter);
       expect(pass.posted).toBe(1);
-      // The one-line notification carries the landing's evidence ("executor
-      // failed: ...") — the why, in the #219 short-line style.
+      // The one-line notification carries the retained workspace and failure
+      // reason so an operator can inspect the exact checkout.
       expect(posted).toEqual([
-        { spaceId: space.id, text: "Blocked: do the thing — executor failed: agent crashed: exit code 42" },
+        {
+          spaceId: space.id,
+          text:
+            `Blocked: do the thing — executor failed; workspace retained or left untouched at ` +
+            `\"${join(fx.workspacesDir, item.id)}\": agent crashed: exit code 42`,
+        },
       ]);
       // No audit claim that a bare completion row posted: only the
       // notification row's outbox.posted audit exists.

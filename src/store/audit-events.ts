@@ -23,6 +23,12 @@ export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
 export const WORK_ITEM_LIST_EVENT = "work_item.list";
 /** Executor failure landing an item in blocked (payload {id, error}). */
 export const WORK_ITEM_FAILED_EVENT = "work_item.failed";
+/**
+ * Explicit operator purge of a retained failed workspace (issue #310):
+ * payload {id, workspace, decision, reason?}. `decision` is requested,
+ * removed, or refused; marker contents and credentials never enter it.
+ */
+export const WORKSPACE_PURGE_EVENT = "workspace.purge";
 /** Executor marker: PR open, delivery approval pending (payload {id, pr_url, summary}). */
 export const DELIVERY_PENDING_EVENT = "work_item.delivery_pending";
 /**

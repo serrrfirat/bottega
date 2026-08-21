@@ -548,6 +548,29 @@ first-configured-repo fallback; an empty allowlist means no pushes until a
 repo is configured. Set the allowlist, git base, or API base via the
 `settings` tool.
 
+### Retained failed workspaces
+
+Git workspaces that block stay on disk for investigation. Each clone carries
+an executor ownership marker in `.git/bottega-workspace.json`. Retry and
+successful cleanup first require an exact work-item ID and repository match,
+a canonical direct child of the configured workspace root, and no symlink.
+An unmarked or uncertain path is left untouched and the item blocks with the
+workspace path and reason. The marker, evidence, logs, and audit contain no
+credentials.
+
+Removal is explicit. There is no age-based workspace cleanup. To purge one
+retained workspace, name the blocked work item and the operator identity:
+
+```bash
+BOTTEGA_DB_PATH=data/bottega.db \
+  bun run workspace:purge -- wi_<uuid> --actor operator:<identity>
+```
+
+The command checks the database item is `blocked`, validates the same marker
+authority, removes only that one workspace, and writes `workspace.purge`
+request/result audit rows. Missing, active, mismatched, unmarked, symlinked,
+or escaped targets are refused and remain untouched.
+
 ### First-run checklist
 
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.
