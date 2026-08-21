@@ -58,7 +58,7 @@ import { validateManifest, type ExtensionManifest, type McpBinding } from "../ex
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { createExtensionRuntime } from "../extensions/runtime";
 import { resetToolSurfaceCache } from "../extensions/surface";
-import { createMemoryMcpServer, type McpInternalToolsOptions } from "./server";
+import { bootMemoryMcpServer, createMemoryMcpServer, type McpInternalToolsOptions } from "./server";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
 
@@ -1192,6 +1192,51 @@ describe("MCP server policy + audit enforcement", () => {
       expect(res.isError).not.toBe(true);
     } finally {
       await h.cleanup();
+    }
+  });
+});
+
+describe("bootMemoryMcpServer fail-closed (issue #172)", () => {
+  test("an unknown pinned space refuses to boot — never an un-pinned session", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-boot-"));
+    const savedCwd = process.cwd();
+    const saved = {
+      configDir: process.env.BOTTEGA_CONFIG_DIR,
+      dbPath: process.env.BOTTEGA_DB_PATH,
+      spaceId: process.env.BOTTEGA_SPACE_ID,
+    };
+    try {
+      process.chdir(dir);
+      // Deployment config the boot reads: a KB config + an empty extensions
+      // dir (no snapshots — the space guard throws before any extension is
+      // used). The cwd default "data/proxy-secrets" resolves under THIS temp
+      // dir, never the live repo's.
+      mkdirSync(join(dir, "config", "extensions"), { recursive: true });
+      writeFileSync(join(dir, "config", "kb.yml"), "sources:\n");
+      delete process.env.BOTTEGA_CONFIG_DIR;
+      delete process.env.BOTTEGA_DB_PATH;
+      delete process.env.BOTTEGA_SPACE_ID;
+      const dbPath = join(dir, "data", "bottega.db");
+      await expect(
+        bootMemoryMcpServer({
+          dbPath,
+          configDir: join(dir, "config"),
+          extensionsDir: join(dir, "config", "extensions"),
+          sessionDir: join(dir, "sessions"),
+          spaceId: "slack:DOES-NOT-EXIST",
+        }),
+      ).rejects.toThrow(/space slack:DOES-NOT-EXIST not found/);
+    } finally {
+      process.chdir(savedCwd);
+      const restore = (key: string, envName: string) => {
+        const value = (saved as Record<string, string | undefined>)[key];
+        if (value === undefined) delete process.env[envName];
+        else process.env[envName] = value;
+      };
+      restore("configDir", "BOTTEGA_CONFIG_DIR");
+      restore("dbPath", "BOTTEGA_DB_PATH");
+      restore("spaceId", "BOTTEGA_SPACE_ID");
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

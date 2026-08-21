@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   BOOT_SECRETS,
   bootSecretForProvider,
+  fetchVaultApiKeysFromEnv,
   keychainServiceFor,
   seedBootSecretsFromVault,
 } from "./boot-secrets";
@@ -287,5 +288,37 @@ describe("live boot with the secrets in the vault (issue #201, shrunk #208)", ()
       env.cleanup();
       broker.stop();
     }
+  });
+});
+
+describe("fetchVaultApiKeysFromEnv error legs (issue #201)", () => {
+  test("a configured-but-unreachable broker yields an empty map — never a boot failure", async () => {
+    // Bind a listener, grab its port, then stop it so connect is refused —
+    // the exact "broker is down" failure a stale deployment sees.
+    const probe = Bun.serve({ port: 0, fetch: () => new Response("", { status: 500 }) });
+    const url = `http://127.0.0.1:${probe.port}`;
+    probe.stop(true);
+    const env = { OMP_AUTH_BROKER_URL: url, OMP_AUTH_BROKER_TOKEN: "t" };
+    const keys = await fetchVaultApiKeysFromEnv(env);
+    expect(keys.size).toBe(0);
+  });
+
+  test("a broker that returns a non-200 snapshot yields an empty map and does not throw", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => new Response("unavailable", { status: 503 }),
+    });
+    try {
+      const env = { OMP_AUTH_BROKER_URL: `http://127.0.0.1:${server.port}`, OMP_AUTH_BROKER_TOKEN: "t" };
+      const keys = await fetchVaultApiKeysFromEnv(env);
+      expect(keys.size).toBe(0);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("missing broker env is the no-op default (no network touched)", async () => {
+    const keys = await fetchVaultApiKeysFromEnv({});
+    expect(keys.size).toBe(0);
   });
 });
