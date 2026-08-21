@@ -233,6 +233,19 @@ describe("scripts/dev.sh shared dev stack wiring (issue #301)", () => {
     expect(devSh).toContain("generated MITM CA at $BOTTEGA_DEV_CERTS_DIR is INVALID");
   });
 
+  test("creates the CANONICAL certs parent BEFORE the lock (fresh clone no false wait, issue #301)", () => {
+    // On a fresh clone the canonical certs dir may not exist; `mkdir
+    // $CERTS_DIR/.gen-lock` would then fail with ENOENT, which dev.sh must
+    // NOT misread as "another boot owns the lock" (that would wait the full
+    // 60s the first time). The parent must be `mkdir -p`'d before the lock.
+    const mkdirParent = "mkdir -p \"$BOTTEGA_DEV_CERTS_DIR\"";
+    const lock = "mkdir \"$BOTTEGA_DEV_CERTS_DIR/.gen-lock\"";
+    expect(devSh).toContain(mkdirParent);
+    expect(devSh).toContain(lock);
+    // Parent creation appears before the lock attempt in the source.
+    expect(devSh.indexOf(mkdirParent)).toBeLessThan(devSh.indexOf(lock));
+  });
+
   test("teardown resolves the SAME adopted/persisted project name (issue #301)", () => {
     // A bare `docker compose ... down` defaults COMPOSE_PROJECT_NAME to the
     // worktree basename and would MISS the shared (adopted `camp-flavor`)

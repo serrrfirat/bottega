@@ -276,22 +276,39 @@ describe("shared dev Compose project name (issue #301)", () => {
     }
   });
 
-  test("FAILS CLOSED when a legacy `$base` project exists but is NOT owned by this checkout", () => {
-    // If a legacy compose project named after the canonical basename exists
-    // (its `camp-flavor_egress` network owns the fixed subnet) but its
-    // iron-proxy working_dir is NOT under this checkout — an unrelated
-    // same-basename clone's stack — we must NOT adopt it (never touch a
-    // stranger's network) AND NOT mint a parallel project on the same subnet.
-    // The only safe boot is a loud failure with a hand remedy.
+  test("FAILS CLOSED when a surviving legacy container is NOT owned by this checkout", () => {
+    // If a legacy `${base}_egress` network owns the fixed subnet AND a
+    // surviving `$base` container's working_dir is NOT under this checkout
+    // (an unrelated same-basename clone's stack), we must NOT adopt it (never
+    // touch a stranger's state) and NOT mint a parallel project on the
+    // occupied subnet. The only safe boot is a loud failure with a remedy.
     const { top, checkout } = freshTopology("bottega-dev-compose-foreign-");
     const worktreeA = join(checkout, ".worktrees", "feature-a");
     try {
       mkdirSync(worktreeA, { recursive: true });
       const err = devComposeProjectFailsFrom(worktreeA, "__foreign__");
-      expect(err).toMatch(/NOT under this checkout/);
+      expect(err).toMatch(/NOT under/);
       expect(err).toMatch(/DIFFERENT clone/);
-      // No default name was emitted, no project-id file was written.
-      expect(devComposeProjectFailsFrom(worktreeA, "__foreign__")).toContain("refusing to adopt");
+      expect(err).toMatch(/Do NOT adopt or disturb it/);
+    } finally {
+      rmSync(top, { recursive: true, force: true });
+    }
+  });
+
+  test("FAILS CLOSED on an orphaned legacy egress network with no surviving container", () => {
+    // A dead/removed foreign container can leave `${base}_egress` on the
+    // fixed subnet with NO surviving `$base` container. The subnet is STILL
+    // occupied, so dev_compose_project must NOT fall through to the hashed
+    // name (that recreates the exact "invalid pool request" collision) — it
+    // must fail closed with a precise cleanup remedy.
+    const { top, checkout } = freshTopology("bottega-dev-compose-orphan-");
+    const worktreeA = join(checkout, ".worktrees", "feature-a");
+    try {
+      mkdirSync(worktreeA, { recursive: true });
+      const err = devComposeProjectFailsFrom(worktreeA, "__orphan__");
+      expect(err).toMatch(/no surviving/);
+      expect(err).toMatch(/orphaned\/foreign leftover/);
+      expect(err).toMatch(/do NOT create a parallel network/i);
     } finally {
       rmSync(top, { recursive: true, force: true });
     }

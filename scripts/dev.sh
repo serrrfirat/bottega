@@ -156,6 +156,11 @@ fi
 #    macOS) lets one boot generate while the other waits, then validates the
 #    cert/key pair with openssl before any container trusts it.
 if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
+  # Create the canonical certs parent BEFORE taking the lock: on a fresh
+  # clone the dir may not exist yet, and `mkdir $CERTS_DIR/.gen-lock` would
+  # fail with ENOENT — which the code would misread as "another boot owns the
+  # lock" and wait a full 60s. mkdir -p first, then the atomic lockdir.
+  mkdir -p "$BOTTEGA_DEV_CERTS_DIR"
   if ! mkdir "$BOTTEGA_DEV_CERTS_DIR/.gen-lock" 2>/dev/null; then
     echo "iron-proxy: another boot is generating the shared CA — waiting..."
     for _ in $(seq 1 60); do
@@ -165,7 +170,6 @@ if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
   fi
   if [[ ! -f "$BOTTEGA_DEV_CERTS_DIR/ca.crt" ]]; then
     echo "iron-proxy: generating MITM CA ($BOTTEGA_DEV_CERTS_DIR, gitignored)..."
-    mkdir -p "$BOTTEGA_DEV_CERTS_DIR"
     if ! docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null 2>&1; then
       echo "bottega dev: iron-proxy CA generation failed (issue #123) — is the ironsh/iron-proxy:0.49.0 image pullable?" >&2
       echo "  docker pull ironsh/iron-proxy:0.49.0" >&2
