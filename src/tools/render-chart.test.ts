@@ -12,7 +12,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 import { chartArgsSchema, chartToolDefinition, buildChartBlock } from "./render-chart";
 import { SlackTurnPresenter } from "../server/services/slack-turn-presenter";
 import type { SlackAdapter, SlackMessage } from "../server/adapters/slack";
@@ -23,14 +24,51 @@ import { DenyRouter } from "../policy/approval-router";
 import { parseOrgConfigYaml, resolveTier, isKnownTool } from "../policy/config";
 import { withPolicyGate } from "../server/drivers/agent-driver";
 
+
+const textToolResult = z.object({
+  content: z.array(z.object({ type: z.literal("text"), text: z.string() })).min(1),
+});
+
+const pieChartBlockSchema = z.object({
+  type: z.literal("data_visualization"),
+  title: z.string(),
+  chart: z.object({
+    type: z.literal("pie"),
+    segments: z.array(z.object({ label: z.string(), value: z.number() })),
+  }),
+});
+
+const axisChartBlockSchema = z.object({
+  type: z.literal("data_visualization"),
+  title: z.string(),
+  chart: z.object({
+    type: z.enum(["bar", "area", "line"]),
+    axis_config: z.object({ categories: z.array(z.string()) }),
+    series: z.array(
+      z.object({
+        name: z.string(),
+        data: z.array(z.object({ label: z.string(), value: z.number() })),
+      }),
+    ),
+  }),
+});
+
+function resultText(result: AgentToolResult): string {
+  return textToolResult.parse(result).content[0]!.text;
+}
 // ---------------------------------------------------------------------------
 // Tool-level: schema + validation + the pure renderer.
 // ---------------------------------------------------------------------------
 
 /** Minimal ctx carrying a space session, so execute() derives the space id. */
-function ctxFor(spaceId = "slack:C1"): ExtensionContext {
+function ctxFor(spaceId: string | null = "slack:C1"): ExtensionContext {
+  // SAFETY: render_chart and the policy gate only read the session file path
+  // from this context, and the fake supplies that exact boundary method.
   return {
-    sessionManager: { getSessionFile: (): string | undefined => join("/tmp/sessions", `${spaceId}.jsonl`) },
+    sessionManager: {
+      getSessionFile: (): string | undefined =>
+        spaceId === null ? undefined : join("/tmp/sessions", `${spaceId}.jsonl`),
+    },
   } as ExtensionContext;
 }
 
@@ -119,7 +157,7 @@ describe("render_chart execute: validation fails closed (issue #276)", () => {
       axis_config: { categories: ["A", "B", "C"] }, // 3 categories
     }, undefined, undefined, ctxFor());
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toContain("exactly one value per category");
+    expect(resultText(res)).toContain("exactly one value per category");
     expect(posts).toHaveLength(0);
   });
 
@@ -136,7 +174,7 @@ describe("render_chart execute: validation fails closed (issue #276)", () => {
       axis_config: { categories: ["A"] },
     }, undefined, undefined, ctxFor());
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toContain("duplicate series label");
+    expect(resultText(res)).toContain("duplicate series label");
     expect(posts).toHaveLength(0);
   });
 
@@ -149,21 +187,21 @@ describe("render_chart execute: validation fails closed (issue #276)", () => {
       segments: [{ label: "Zero", value: 0 }],
     }, undefined, undefined, ctxFor());
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toContain("greater than 0");
+    expect(resultText(res)).toContain("greater than 0");
     expect(posts).toHaveLength(0);
   });
 });
 
 describe("buildChartBlock: the Slack data-visualization shape (issue #276)", () => {
   test("pie renders type data_visualization with labeled segments", () => {
-    const block = buildChartBlock({
+    const block = pieChartBlockSchema.parse(buildChartBlock({
       type: "pie",
       title: "Fruit",
       segments: [
         { label: "Apples", value: 3 },
         { label: "Bananas", value: 7 },
       ],
-    }) as { type: string; title: string; chart: { type: string; segments: Array<{ label: string; value: number }> } };
+    }));
     expect(block.type).toBe("data_visualization");
     expect(block.title).toBe("Fruit");
     expect(block.chart.type).toBe("pie");
@@ -175,7 +213,7 @@ describe("buildChartBlock: the Slack data-visualization shape (issue #276)", () 
 
   test("bar/area/line render axis_config and series whose data count matches categories", () => {
     for (const type of ["bar", "area", "line"] as const) {
-      const block = buildChartBlock({
+      const block = axisChartBlockSchema.parse(buildChartBlock({
         type,
         title: `${type} chart`,
         series: [
@@ -183,14 +221,7 @@ describe("buildChartBlock: the Slack data-visualization shape (issue #276)", () 
           { label: "South", values: [4, 5, 6] },
         ],
         axis_config: { categories: ["Mon", "Tue", "Wed"] },
-      }) as {
-        type: string;
-        chart: {
-          type: string;
-          axis_config: { categories: string[] };
-          series: Array<{ name: string; data: Array<{ label: string; value: number }> }>;
-        };
-      };
+      }));
       expect(block.type).toBe("data_visualization");
       expect(block.chart.type).toBe(type);
       expect(block.chart.axis_config.categories).toEqual(["Mon", "Tue", "Wed"]);
@@ -230,7 +261,7 @@ describe("render_chart execute: poster path posts exactly one block (issue #276)
     // Exactly ONE block — never a per-chunk duplication.
     expect(posts).toHaveLength(1);
     expect(posts[0]!.spaceId).toBe("slack:C1");
-    expect((posts[0]!.block as { type: string }).type).toBe("data_visualization");
+    expect(pieChartBlockSchema.parse(posts[0]!.block).type).toBe("data_visualization");
   });
 });
 
@@ -280,7 +311,7 @@ function chartStore(): Store {
   // the executed surface (mirrors slack-turn-presenter.test.ts).
   return {
     appendAudit: async () => 0,
-  } as unknown as Store;
+  } as Store;
 }
 
 function inboundMsg(overrides: Partial<SlackMessage> = {}): SlackMessage {
@@ -346,9 +377,7 @@ describe("render_chart policy reachability (issue #276)", () => {
         router: DenyRouter,
         store,
       });
-      const ctx = {
-        sessionManager: { getSessionFile: (): string | undefined => join(dir, "sessions", "slack:C1.jsonl") },
-      } as ExtensionContext;
+      const ctx = ctxFor("slack:C1");
       const result = await tool.execute("c1", {
         type: "pie",
         title: "Fruit",
@@ -372,16 +401,14 @@ describe("render_chart execute: missing space session fails closed (issue #276)"
     const posts: Array<{ spaceId: string; block: unknown }> = [];
     const tool = toolFor(posts);
     // A headless/no-session context: getSessionFile yields no space id.
-    const ctx = {
-      sessionManager: { getSessionFile: (): string | undefined => undefined },
-    } as ExtensionContext;
+    const ctx = ctxFor(null);
     const res = await tool.execute("c1", {
       type: "pie",
       title: "Fruit",
       segments: [{ label: "Apples", value: 3 }],
     }, undefined, undefined, ctx);
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toBe("render_chart requires a space session");
+    expect(resultText(res)).toBe("render_chart requires a space session");
     expect(posts).toHaveLength(0);
   });
 });

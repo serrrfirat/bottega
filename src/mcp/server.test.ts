@@ -40,7 +40,6 @@ import { standupDigestAction } from "../scheduler/standup";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
 import { nextCronFire } from "../scheduler/cron";
 import { tickScheduler } from "../scheduler/runner";
-import type { SchedulerJob } from "../scheduler/types";
 import { kbToolDefinitions } from "../tools/kb-tools";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { workItemToolDefinitions } from "../tools/work-items";
@@ -165,21 +164,77 @@ async function auditRows(store: Store, eventType: string): Promise<AuditRow[]> {
   return store.listAudit({ event_type: eventType });
 }
 
+const auditPayloadSchema: z.ZodType<Record<string, JsonValue>> = z.record(z.string(), z.json());
+
+const schedulerJobResultSchema = z
+  .object({
+    id: z.string(),
+    cron: z.string(),
+    nextFireAt: z.number(),
+    revision: z.number(),
+    enabled: z.boolean(),
+  })
+  .passthrough();
+
+const revisionResultSchema = z.object({ revision: z.string() }).passthrough();
+const listedSpaceSkillSchema = z
+  .object({
+    name: z.string(),
+    description: z.string(),
+    source_tier: z.string(),
+    revision: z.string(),
+    companion_files: z.array(z.string()),
+    shadows: z.array(z.string()),
+  })
+  .passthrough();
+const spaceSkillResultSchema = z.object({
+  skill: z
+    .object({
+      document: z.string(),
+      revision: z.string(),
+      description: z.string(),
+      companion_files: z.record(
+        z.string(),
+        z.object({ encoding: z.string(), content: z.string() }),
+      ),
+    })
+    .passthrough(),
+  shadowed: z.array(z.object({ source_tier: z.string() }).passthrough()).optional(),
+});
+
 function payload(row: AuditRow): Record<string, JsonValue> {
-  // SAFETY: audit payloads are written via JSON.stringify, so the parsed value is a JSON object.
-  return JSON.parse(row.payload) as Record<string, JsonValue>;
+  return auditPayloadSchema.parse(JSON.parse(row.payload));
 }
 
-/** The SDK's callTool return type is index-signature-heavy; narrow it here. */
-interface ToolCallResult {
-  content: Array<{ type?: string; text?: string }>;
-  isError?: boolean;
+/** The SDK's callTool return type is index-signature-heavy; parse the asserted surface here. */
+const toolCallResultSchema = z
+  .object({
+    content: z.array(
+      z
+        .object({
+          type: z.string().optional(),
+          text: z.string().optional(),
+        })
+        .passthrough(),
+    ),
+    isError: z.boolean().optional(),
+  })
+  .passthrough();
+type ToolCallResult = z.infer<typeof toolCallResultSchema>;
+
+function toolText(result: ToolCallResult): string {
+  const first = result.content[0];
+  if (first?.type !== "text" || first.text === undefined) throw new Error("expected text tool result");
+  return first.text;
+}
+
+function parsedToolText<T>(result: ToolCallResult, schema: z.ZodType<T>): T {
+  return schema.parse(JSON.parse(toolText(result)));
 }
 
 /** callTool wrapper: narrows the SDK's index-signature-heavy result to the surface these tests assert on. */
 async function callTool(client: Client, name: string, args: Record<string, JsonValue>): Promise<ToolCallResult> {
-  // SAFETY: a callTool result is a JSON message whose content blocks carry text/type and an optional isError flag.
-  return (await client.callTool({ name, arguments: args })) as ToolCallResult;
+  return toolCallResultSchema.parse(await client.callTool({ name, arguments: args }));
 }
 
 /** Org floor allowing the built-in memory and transcript-search tools. */
@@ -659,7 +714,7 @@ describe("MCP scheduler lifecycle caller surface (issues #308, #322)", () => {
         params: { text: "after" },
       });
       expect(updatedResult.isError).not.toBe(true);
-      const updated = JSON.parse(updatedResult.content[0]!.text!) as SchedulerJob;
+      const updated = parsedToolText(updatedResult, schedulerJobResultSchema);
       expect(updated.nextFireAt).toBe(nextCronFire(updated.cron, now));
 
       const stale = await callTool(h.client, "update_scheduler_job", {
@@ -674,7 +729,7 @@ describe("MCP scheduler lifecycle caller surface (issues #308, #322)", () => {
         id: created.id,
         expected_revision: updated.revision,
       });
-      const paused = JSON.parse(pausedResult.content[0]!.text!) as SchedulerJob;
+      const paused = parsedToolText(pausedResult, schedulerJobResultSchema);
       expect(paused.enabled).toBe(false);
 
       now += 37 * 60_000;
@@ -682,7 +737,7 @@ describe("MCP scheduler lifecycle caller surface (issues #308, #322)", () => {
         id: created.id,
         expected_revision: paused.revision,
       });
-      const resumed = JSON.parse(resumedResult.content[0]!.text!) as SchedulerJob;
+      const resumed = parsedToolText(resumedResult, schedulerJobResultSchema);
       expect(resumed.nextFireAt).toBe(nextCronFire(resumed.cron, now));
       const recurringNext = resumed.nextFireAt;
 
@@ -1275,11 +1330,11 @@ describe("MCP server extension surface (in-process deps)", () => {
         companion_files: { "scripts/run.sh": { encoding: "text", content: "echo private-v1" } },
       });
       expect(created.isError).not.toBe(true);
-      const createdBody = JSON.parse(created.content[0]!.text!) as { revision: string };
+      const createdBody = parsedToolText(created, revisionResultSchema);
       expect(createdBody.revision).toMatch(/^[a-f0-9]{64}$/);
 
       const listed = await callTool(h.client, "list_space_skills", {});
-      expect(JSON.parse(listed.content[0]!.text!)).toEqual([
+      expect(parsedToolText(listed, z.array(listedSpaceSkillSchema))).toEqual([
         expect.objectContaining({
           name: "review_loop",
           description: "Space review v1.",
@@ -1291,10 +1346,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       ]);
 
       const got = await callTool(h.client, "get_space_skill", { name: "review_loop" });
-      const gotBody = JSON.parse(got.content[0]!.text!) as {
-        skill: { document: string; companion_files: Record<string, { encoding: string; content: string }> };
-        shadowed: Array<{ source_tier: string }>;
-      };
+      const gotBody = parsedToolText(got, spaceSkillResultSchema);
       expect(gotBody.skill.document).toContain("Space review v1.");
       expect(gotBody.skill.companion_files["scripts/run.sh"]).toEqual({ encoding: "text", content: "echo private-v1" });
       expect(gotBody.shadowed).toEqual([expect.objectContaining({ source_tier: "builtin" })]);
@@ -1313,7 +1365,7 @@ describe("MCP server extension surface (in-process deps)", () => {
         companion_files: { "scripts/run.sh": { encoding: "text", content: "echo private-v2" } },
       });
       expect(updated.isError).not.toBe(true);
-      const updatedBody = JSON.parse(updated.content[0]!.text!) as { revision: string };
+      const updatedBody = parsedToolText(updated, revisionResultSchema);
       expect(updatedBody.revision).not.toBe(createdBody.revision);
 
       const stale = await callTool(h.client, "update_space_skill", {
@@ -1324,7 +1376,7 @@ describe("MCP server extension surface (in-process deps)", () => {
       });
       expect(stale.isError).toBe(true);
       const afterStale = await callTool(h.client, "get_space_skill", { name: "review_loop" });
-      expect(JSON.parse(afterStale.content[0]!.text!)).toMatchObject({
+      expect(parsedToolText(afterStale, spaceSkillResultSchema)).toMatchObject({
         skill: { revision: updatedBody.revision, description: "Space review v2." },
       });
 
@@ -1594,14 +1646,13 @@ describe("bootMemoryMcpServer fail-closed (issue #172)", () => {
       ).rejects.toThrow(/space slack:DOES-NOT-EXIST not found/);
     } finally {
       process.chdir(savedCwd);
-      const restore = (key: string, envName: string) => {
-        const value = (saved as Record<string, string | undefined>)[key];
+      const restore = (value: string | undefined, envName: string) => {
         if (value === undefined) delete process.env[envName];
         else process.env[envName] = value;
       };
-      restore("configDir", "BOTTEGA_CONFIG_DIR");
-      restore("dbPath", "BOTTEGA_DB_PATH");
-      restore("spaceId", "BOTTEGA_SPACE_ID");
+      restore(saved.configDir, "BOTTEGA_CONFIG_DIR");
+      restore(saved.dbPath, "BOTTEGA_DB_PATH");
+      restore(saved.spaceId, "BOTTEGA_SPACE_ID");
       rmSync(dir, { recursive: true, force: true });
     }
   });

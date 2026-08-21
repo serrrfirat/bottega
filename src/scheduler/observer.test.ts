@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import type { AuditModule } from "../policy/audit";
 import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { OBSERVER_READ_EVENT } from "../store/audit-events";
@@ -10,6 +11,10 @@ const NOW = Date.UTC(2026, 7, 17, 12);
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
 type AuditInput = Parameters<AuditModule["appendAudit"]>[0];
+
+const pulseBlockSchema = z.object({
+  text: z.object({ text: z.string().optional() }).optional(),
+});
 
 class FakeMemoryProvider implements MemoryProvider {
   readonly capabilities = {
@@ -33,7 +38,7 @@ class FakeMemoryProvider implements MemoryProvider {
     if (this.searchError) throw this.searchError;
 
     return this.entries
-      .filter((entry) => entry.key.kind === (query.scope as { kind: string }).kind)
+      .filter((entry) => entry.key.kind === query.scope.kind)
       .filter((entry) =>
         Object.entries(query.metadata ?? {}).every(([key, value]) => entry.metadata[key] === value),
       )
@@ -173,9 +178,8 @@ describe("orgPulseAction", () => {
     expect(posts[0]!.text).not.toContain("ref_old");
     expect(posts[0]!.text).not.toContain("digest_old");
     // Issue #279: the pulse also ships as Block Kit tables alongside the text.
-    const blocks = posts[0]!.blocks as Array<{ text?: { text?: string } }>;
-    expect(blocks).toBeDefined();
-    const tableText = blocks.map((b) => b.text?.text ?? "").join("\n");
+    const blocks = z.array(pulseBlockSchema).parse(posts[0]!.blocks);
+    const tableText = blocks.map((block) => block.text?.text ?? "").join("\n");
     expect(tableText).toContain("*Reflection topics*");
     expect(tableText).toContain("*Notable digest themes*");
     expect(tableText).toContain("Reliability");

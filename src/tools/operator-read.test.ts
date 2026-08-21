@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createAudit } from "../policy/audit";
 import { decidePolicyCall, loadSpacePolicy, parseOrgConfigYaml } from "../policy/config";
 import { createStore, type Store } from "../store/db";
@@ -24,17 +25,69 @@ interface ToolExecutionResult {
   content: Array<{ type: string; text?: string }>;
 }
 
+interface OperatorToolParams {
+  event?: string;
+  since?: string;
+  tool?: string;
+  limit?: number;
+  cursor?: string | null;
+  space?: string;
+  provider?: string;
+  credential_scope?: string;
+}
+
+const auditPageSchema = z.object({
+  rows: z.array(
+    z
+      .object({
+        id: z.number(),
+        ts: z.number(),
+        event: z.string(),
+        space: z.string(),
+        actor: z.string(),
+        tool: z.string().optional(),
+        tier: z.string().optional(),
+        decision: z.string().optional(),
+        reason: z.string().optional(),
+      })
+      .passthrough(),
+  ),
+  next_cursor: z.string().nullable(),
+});
+
+const policyExplanationSchema = z
+  .object({
+    decision: z.string(),
+    tier: z.string(),
+    approval_required: z.boolean(),
+    rule_source: z.string(),
+    credential: z
+      .object({
+        kind: z.string(),
+        provider: z.string(),
+        scope: z.string(),
+      })
+      .optional(),
+  })
+  .passthrough();
+
 function resultText(result: ToolExecutionResult): string {
   const first = result.content[0];
   if (!first || first.type !== "text" || first.text === undefined) throw new Error("expected text tool result");
   return first.text;
 }
 
-function ctx(spaceId: string) {
-  return { sessionManager: { getSessionFile: () => `${spaceId}.jsonl` } } as never;
+function resultJson<T>(result: ToolExecutionResult, schema: z.ZodType<T>): T {
+  return schema.parse(JSON.parse(resultText(result)));
 }
 
-async function run(tool: ToolDefinition, params: Record<string, unknown>, space = "slack:C1") {
+function ctx(spaceId: string): ExtensionContext {
+  // SAFETY: Operator read tools only inspect the session file path on this
+  // context, and the fake supplies that exact boundary method.
+  return { sessionManager: { getSessionFile: () => `${spaceId}.jsonl` } } as ExtensionContext;
+}
+
+async function run(tool: ToolDefinition, params: OperatorToolParams, space = "slack:C1") {
   return tool.execute("call-1", params, undefined, undefined, ctx(space));
 }
 
@@ -73,10 +126,7 @@ describe("audit_search caller surface (#161)", () => {
 
     const first = await run(search!, { event: "policy.decision", since: "7d", tool: "bash", limit: 2 });
     expect(first.isError).not.toBe(true);
-    const page = JSON.parse(resultText(first)) as {
-      rows: Array<Record<string, unknown>>;
-      next_cursor: string | null;
-    };
+    const page = resultJson(first, auditPageSchema);
     expect(page.rows).toHaveLength(2);
     expect(page.next_cursor).toBeString();
     expect(page.rows[0]).toEqual({
@@ -103,7 +153,7 @@ describe("audit_search caller surface (#161)", () => {
       limit: 2,
       cursor: page.next_cursor,
     });
-    expect((JSON.parse(resultText(second)) as { rows: unknown[] }).rows).toHaveLength(1);
+    expect(resultJson(second, auditPageSchema).rows).toHaveLength(1);
 
     const reads = await store.listAudit({ event_type: "audit.read" });
     expect(reads).toHaveLength(2);
@@ -143,7 +193,7 @@ describe("audit_search caller surface (#161)", () => {
       event: "approval.resolved",
     });
     expect(admin.isError).not.toBe(true);
-    expect((JSON.parse(resultText(admin)) as { rows: Array<{ space: string }> }).rows[0]!.space).toBe("slack:C2");
+    expect(resultJson(admin, auditPageSchema).rows[0]!.space).toBe("slack:C2");
     store.close();
   });
 });
@@ -165,12 +215,7 @@ describe("explain_policy read-only parity (#320)", () => {
     for (const tool of ["edit", "bash", "list_work_items"] as const) {
       const result = await run(explain!, { tool });
       expect(result.isError).not.toBe(true);
-      const explanation = JSON.parse(resultText(result)) as {
-        decision: string;
-        tier: string;
-        approval_required: boolean;
-        rule_source: string;
-      };
+      const explanation = resultJson(result, policyExplanationSchema);
       const effective = await loadSpacePolicy(orgPolicy, store, "slack:C1");
       expect(explanation.decision).toBe(decidePolicyCall(effective, tool).decision);
       expect(explanation.approval_required).toBe(explanation.decision === "ask-human");
@@ -216,8 +261,8 @@ describe("explain_policy read-only parity (#320)", () => {
 
     const me = await run(explain!, { tool: "list_work_items", provider: "github", credential_scope: "me" });
     const auto = await run(explain!, { tool: "list_work_items", provider: "github", credential_scope: "auto" });
-    expect(JSON.parse(resultText(me)).credential).toEqual({ kind: "available", provider: "github", scope: "personal" });
-    expect(JSON.parse(resultText(auto)).credential).toEqual({ kind: "available", provider: "github", scope: "org" });
+    expect(resultJson(me, policyExplanationSchema).credential).toEqual({ kind: "available", provider: "github", scope: "personal" });
+    expect(resultJson(auto, policyExplanationSchema).credential).toEqual({ kind: "available", provider: "github", scope: "org" });
     for (const text of [resultText(me), resultText(auto)]) {
       expect(text).not.toContain("identity");
       expect(text).not.toContain("broker");

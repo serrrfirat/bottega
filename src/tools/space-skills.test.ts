@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 import { createAudit } from "../policy/audit";
 import { MAX_COMPANION_FILE_BYTES, type SkillsResolveOpts } from "../server/skills";
 import {
@@ -24,10 +25,52 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+interface SpaceSkillHarness {
+  store: Store;
+  root: string;
+  byName: Record<string, ToolDefinition>;
+}
+
+interface CompanionFileInput {
+  encoding: string;
+  content: string;
+}
+
+interface SpaceSkillToolParams {
+  name?: string;
+  document?: string;
+  expected_revision?: string;
+  companion_files?: Record<string, CompanionFileInput>;
+}
+
+const revisionResultSchema = z.object({ revision: z.string() }).passthrough();
+const listedSkillSchema = z
+  .object({
+    name: z.string(),
+    description: z.string(),
+    source_tier: z.string(),
+    revision: z.string(),
+    companion_files: z.array(z.string()),
+    shadows: z.array(z.string()),
+  })
+  .passthrough();
+const companionFileSchema = z.object({ encoding: z.string(), content: z.string() });
+const skillResultSchema = z.object({
+  skill: z
+    .object({
+      document: z.string(),
+      revision: z.string(),
+      description: z.string(),
+      companion_files: z.record(z.string(), companionFileSchema),
+    })
+    .passthrough(),
+  shadowed: z.array(z.object({ source_tier: z.string() }).passthrough()).optional(),
+});
+
 function harness(
   name: string,
   mutationHook?: SkillsResolveOpts["mutationHook"],
-): { store: Store; root: string; byName: Record<string, ToolDefinition> } {
+): SpaceSkillHarness {
   const store = createStore(join(dir, `${name}.db`));
   stores.push(store);
   const root = join(dir, name);
@@ -45,18 +88,24 @@ function harness(
   return { store, root, byName };
 }
 
-function context(spaceId = "slack:C1"): ExtensionContext {
-  return { sessionManager: { getSessionFile: () => `${spaceId}.jsonl` } } as ExtensionContext;
+function context(spaceId: string | undefined): ExtensionContext {
+  // SAFETY: Space-skill tools only read the session file path from this
+  // extension context, and the fake provides that exact boundary method.
+  return { sessionManager: { getSessionFile: () => (spaceId === undefined ? undefined : `${spaceId}.jsonl`) } } as ExtensionContext;
 }
 
-async function call(tool: ToolDefinition, params: unknown, ctx = context()) {
-  return tool.execute("call", params as never, new AbortController().signal, () => {}, ctx);
+async function call(tool: ToolDefinition, params: SpaceSkillToolParams, ctx = context("slack:C1")) {
+  return tool.execute("call", params, new AbortController().signal, () => {}, ctx);
 }
 
 function text(result: AgentToolResult<unknown>): string {
   const content = result.content[0];
   if (!content || content.type !== "text") throw new Error("space-skill tool did not return text");
   return content.text;
+}
+
+function parsedText<T>(result: AgentToolResult<unknown>, schema: z.ZodType<T>): T {
+  return schema.parse(JSON.parse(text(result)));
 }
 
 const DOC_V1 = "---\nname: review\ndescription: Review v1.\n---\nPrivate procedure one.\n";
@@ -115,14 +164,14 @@ describe("space-skill lifecycle tools", () => {
       companion_files: { "scripts/run.sh": { encoding: "text", content: "private-script-one" } },
     });
     expect(createdResult.isError).not.toBe(true);
-    const created = JSON.parse(text(createdResult)) as { revision: string };
+    const created = parsedText(createdResult, revisionResultSchema);
 
     const listed = await call(byName.list_space_skills!, {});
-    expect(JSON.parse(text(listed))).toEqual([
+    expect(parsedText(listed, z.array(listedSkillSchema))).toEqual([
       expect.objectContaining({ name: "review", revision: created.revision, companion_files: ["scripts/run.sh"] }),
     ]);
     const got = await call(byName.get_space_skill!, { name: "review" });
-    expect(JSON.parse(text(got))).toMatchObject({
+    expect(parsedText(got, skillResultSchema)).toMatchObject({
       skill: { document: DOC_V1, companion_files: { "scripts/run.sh": { encoding: "text", content: "private-script-one" } } },
     });
 
@@ -133,7 +182,7 @@ describe("space-skill lifecycle tools", () => {
       companion_files: { "scripts/new.sh": { encoding: "text", content: "private-script-two" } },
     });
     expect(updatedResult.isError).not.toBe(true);
-    const updated = JSON.parse(text(updatedResult)) as { revision: string };
+    const updated = parsedText(updatedResult, revisionResultSchema);
 
     const deleted = await call(byName.delete_space_skill!, { name: "review", expected_revision: updated.revision });
     expect(deleted.isError).not.toBe(true);
@@ -166,7 +215,7 @@ describe("space-skill lifecycle tools", () => {
       document: DOC_V1,
       companion_files: { "run.sh": { encoding: "text", content: "before" } },
     });
-    const created = JSON.parse(text(createdResult)) as { revision: string };
+    const created = parsedText(createdResult, revisionResultSchema);
 
     const stale = await call(byName.update_space_skill!, {
       name: "review",
@@ -185,7 +234,7 @@ describe("space-skill lifecycle tools", () => {
     expect(oversized.isError).toBe(true);
 
     const got = await call(byName.get_space_skill!, { name: "review" });
-    expect(JSON.parse(text(got))).toMatchObject({
+    expect(parsedText(got, skillResultSchema)).toMatchObject({
       skill: { revision: created.revision, description: "Review v1.", companion_files: { "run.sh": { encoding: "text", content: "before" } } },
     });
     expect(existsSync(join(root, "slack:C1", "review", "run.sh"))).toBe(true);
@@ -207,14 +256,14 @@ describe("space-skill lifecycle tools", () => {
     });
     expect(failedCommit.isError).toBe(true);
     const afterRollback = await call(byName.get_space_skill!, { name: "review" });
-    expect(JSON.parse(text(afterRollback))).toMatchObject({
+    expect(parsedText(afterRollback, skillResultSchema)).toMatchObject({
       skill: { revision: created.revision, description: "Review v1.", companion_files: { "run.sh": { encoding: "text", content: "before" } } },
     });
   });
 
   test("a non-space session cannot read or mutate the skill store", async () => {
     const { root, byName } = harness("wrong-context");
-    const badContext = { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext;
+    const badContext = context(undefined);
     for (const [name, params] of [
       ["list_space_skills", {}],
       ["get_space_skill", { name: "review" }],

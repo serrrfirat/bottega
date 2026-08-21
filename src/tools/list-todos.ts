@@ -45,6 +45,14 @@ export interface ListTodosExtensionOpts {
   getTodoPhases?: (spaceId: string) => TodoPhase[];
 }
 
+interface ListTodosPlan {
+  active: boolean;
+  steps_total?: number;
+  steps_completed?: number;
+  current?: string;
+  message: string;
+}
+
 /**
  * The list_todos tool as an SDK {@link ToolDefinition} (issue #228): rides
  * the session toolset's gated custom-tools bridge like the work-item and
@@ -88,11 +96,15 @@ export function listTodosToolDefinition(store: Store, opts: ListTodosExtensionOp
         // same renderer the presenter's in-place plan message uses.
         const phases = opts.getTodoPhases?.(spaceId) ?? [];
         const progress = todoProgress(phases);
-        const plan = {
+        const plan: ListTodosPlan = {
           active: phases.flatMap((phase) => phase.tasks).length > 0,
-          ...(progress !== undefined ? { steps_total: progress.total, steps_completed: progress.index - 1, current: progress.current } : {}),
           message: renderTodoPlan(phases),
         };
+        if (progress !== undefined) {
+          plan.steps_total = progress.total;
+          plan.steps_completed = progress.index - 1;
+          plan.current = progress.current;
+        }
         return {
           content: [
             {

@@ -101,6 +101,29 @@ export interface SchedulerToolOptions {
   renderList?: (spaceId: string, jobs: SchedulerJob[]) => Promise<void>;
 }
 
+interface SchedulerJobSummary extends SchedulerJob {
+  summary: string;
+}
+
+interface SchedulerRunNowResult {
+  invocationId: string;
+  enqueued: boolean;
+  status: "pending" | "running" | "completed";
+  jobId: string;
+}
+
+interface SchedulerDeleteResult {
+  id: string;
+  deleted: true;
+}
+
+type SchedulerToolResultPayload =
+  | SchedulerJob
+  | SchedulerJob[]
+  | SchedulerJobSummary
+  | SchedulerRunNowResult
+  | SchedulerDeleteResult;
+
 /**
  * Renders common 5-field cron shapes in user terms ("daily at 10:00 UTC",
  * "every 5 minutes"); falls back to the raw expression for anything else.
@@ -157,7 +180,7 @@ async function authorizeJob(
   });
 }
 
-function result(value: unknown): AgentToolResult {
+function result(value: SchedulerToolResultPayload): AgentToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 
@@ -204,7 +227,7 @@ export function schedulerToolDefinitions(
         if (!(await authorizeJob(options, create.name, toolCallId, currentSpace, spaceId))) {
           return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
         }
-        const jobParams = { ...(params.params ?? {}) };
+        const jobParams = { ...params.params };
         if (params.description !== undefined) jobParams.description = params.description;
         if (params.schedule !== undefined) jobParams.schedule = params.schedule;
         if (spaceScoped && spaceId !== null) jobParams.space = spaceId;

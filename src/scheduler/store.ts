@@ -58,10 +58,9 @@ function parseParams(jobId: string, text: string): Record<string, string> {
 export function schedulerJobFromRow(row: SchedulerJobRow): SchedulerJob {
   return {
     id: row.id,
-    // Direct database edits can contain a removed name. The runner still
-    // checks the live registry and disables unknown names before execution.
-    // SAFETY: row.action is one of the registry names in practice; a removed
-    // name survives as a string that the runner treats as unknown and skips.
+    // SAFETY: Both scheduler execution paths look this value up in the live
+    // registry and reject a missing handler before invoking it, so a removed
+    // database action name remains inert.
     action: row.action as SchedulerActionName,
     cron: row.cron,
     params: parseParams(row.id, row.params),
@@ -81,6 +80,8 @@ export function schedulerInvocationFromRow(row: SchedulerInvocationRow): Schedul
   return {
     id: row.id,
     jobId: row.job_id,
+    // SAFETY: Claimed invocations also go through the live registry lookup;
+    // an unknown database action produces an error result and is never run.
     action: row.action as SchedulerActionName,
     params: parseParams(row.id, row.params),
     spaceId: row.space_id,

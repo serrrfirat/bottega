@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { z } from "zod";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,33 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+interface SchedulerCallArgs {
+  id?: string;
+  expected_revision?: number;
+  action?: string;
+  cron?: string;
+  params?: Record<string, string>;
+  invocation_id?: string;
+}
+
+const schedulerJobResultSchema = z
+  .object({
+    id: z.string(),
+    cron: z.string(),
+    params: z.record(z.string(), z.string()),
+    enabled: z.boolean(),
+    revision: z.number(),
+    nextFireAt: z.number(),
+  })
+  .passthrough();
+
+const runNowResultSchema = z.object({
+  invocationId: z.string(),
+  enqueued: z.boolean(),
+  status: z.enum(["pending", "running", "completed"]),
+  jobId: z.string(),
+});
+
 function freshStore(): Store {
   const store = createStore(join(dir, `${stores.length}.db`));
   stores.push(store);
@@ -41,6 +69,8 @@ function freshStore(): Store {
 }
 
 function context(spaceId: string | undefined): ExtensionContext {
+  // SAFETY: Scheduler tools only read sessionManager.getSessionFile from the
+  // extension context, and this fake supplies that exact session boundary.
   return {
     sessionManager: {
       getSessionFile: () => (spaceId === undefined ? undefined : join("/tmp/sessions", `${spaceId}.jsonl`)),
@@ -57,7 +87,7 @@ function tool(definitions: ToolDefinition[], name: string): ToolDefinition {
 async function call(
   definitions: ToolDefinition[],
   name: string,
-  args: Record<string, unknown>,
+  args: SchedulerCallArgs,
   spaceId: string | undefined,
   invocationId = `call-${name}`,
 ): Promise<AgentToolResult> {
@@ -70,10 +100,10 @@ async function call(
   );
 }
 
-function body<T>(result: AgentToolResult): T {
+function body<T>(result: AgentToolResult, schema: z.ZodType<T>): T {
   const text = result.content.find((part) => part.type === "text")?.text;
   if (!text) throw new Error("scheduler tool returned no text");
-  return JSON.parse(text) as T;
+  return schema.parse(JSON.parse(text));
 }
 
 function runnerDeps(store: Store, registry: SchedulerActionRegistry, now: () => number) {
@@ -83,7 +113,9 @@ function runnerDeps(store: Store, registry: SchedulerActionRegistry, now: () => 
     registry,
     memoryProvider: memory,
     postMessage: async () => undefined,
-    loadPolicy: async () => undefined as never,
+    loadPolicy: async () => {
+      throw new Error("unused policy loader");
+    },
     log: () => {},
     now,
   };
@@ -130,7 +162,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       "update-1",
     );
     expect(updatedResult.isError).not.toBe(true);
-    const updated = body<SchedulerJob>(updatedResult);
+    const updated = body(updatedResult, schedulerJobResultSchema);
     expect(updated).toMatchObject({
       id: created.id,
       cron: "*/15 * * * *",
@@ -177,7 +209,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       "slack:C1",
       "pause-1",
     );
-    const paused = body<SchedulerJob>(pausedResult);
+    const paused = body(pausedResult, schedulerJobResultSchema);
     expect(paused.enabled).toBe(false);
     await tickScheduler(runnerDeps(store, registry, () => now));
     expect(fires).toBe(0);
@@ -190,7 +222,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       "slack:C1",
       "resume-1",
     );
-    const resumed = body<SchedulerJob>(resumedResult);
+    const resumed = body(resumedResult, schedulerJobResultSchema);
     expect(resumed.enabled).toBe(true);
     expect(resumed.nextFireAt).toBe(nextCronFire(created.cron, now));
     expect((await audit.listAudit({ event_type: SCHEDULER_JOB_PAUSED_EVENT })).length).toBe(1);
@@ -216,13 +248,13 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       call(definitions, "run_scheduler_job_now", args, "slack:C1", "run-call-1"),
       call(definitions, "run_scheduler_job_now", args, "slack:C1", "run-call-2"),
     ]);
-    expect(body(first)).toEqual({
+    expect(body(first, runNowResultSchema)).toEqual({
       invocationId: "manual-check-1",
       enqueued: true,
       status: "pending",
       jobId: created.id,
     });
-    expect(body(repeated)).toEqual({
+    expect(body(repeated, runNowResultSchema)).toEqual({
       invocationId: "manual-check-1",
       enqueued: false,
       status: "pending",
@@ -244,7 +276,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       "slack:C1",
       "run-call-3",
     );
-    expect(body(distinct)).toMatchObject({ invocationId: "manual-check-2", enqueued: true, status: "pending" });
+    expect(body(distinct, runNowResultSchema)).toMatchObject({ invocationId: "manual-check-2", enqueued: true, status: "pending" });
     await tickScheduler(runnerDeps(store, registry, () => now));
     expect(fires).toBe(2);
     expect(await store.listSchedulerInvocations({ jobId: created.id })).toHaveLength(2);
@@ -332,7 +364,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
     const definitions = schedulerToolDefinitions(store, audit, registry, { now: () => 1_800_000_000_000 });
     const foreign = await createJob(store, "slack:C2");
     const scopedList = await call(definitions, "list_scheduler_jobs", {}, "slack:C1", "list-own-space");
-    expect(body<SchedulerJob[]>(scopedList)).toEqual([]);
+    expect(body(scopedList, z.array(schedulerJobResultSchema))).toEqual([]);
 
     const denied = await call(
       definitions,
@@ -359,7 +391,7 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
       "slack:C1",
       "org-approved-pause",
     );
-    const approved = body<SchedulerJob>(approvedResult);
+    const approved = body(approvedResult, schedulerJobResultSchema);
     expect(approved.enabled).toBe(false);
     expect(authorityChecks).toEqual(["slack:C1->slack:C2"]);
 
