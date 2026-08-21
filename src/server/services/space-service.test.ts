@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext, Skill, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../../store/db";
-import type { MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
+import type { MemoryProvider, MemoryProviderCapabilities, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, THINKING_PHRASES, emptyResponseFallback, churnMessageText, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
 import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
@@ -195,9 +195,17 @@ class FakeDriver implements AgentDriver {
  * "marker advanced" behavior is observable across dispose cycles.
  */
 class FakeMemoryProvider implements MemoryProvider {
+  readonly prunes: Array<{ spaceId: string; keep: number }> = [];
   saved: MemorySaveInput[] = [];
   /** Digest entries (newest last): {space, since, until}. */
   digests: Array<{ space: string; since: string; until: string }> = [];
+
+  constructor(
+    readonly capabilities: MemoryProviderCapabilities = {
+      consolidation: "explicit",
+      digestPruning: "explicit",
+    },
+  ) {}
 
   async save(input: MemorySaveInput) {
     this.saved.push(input);
@@ -234,6 +242,11 @@ class FakeMemoryProvider implements MemoryProvider {
         : [];
     }
     return [];
+  }
+
+  async pruneDigests(spaceId: string, keep: number): Promise<number> {
+    this.prunes.push({ spaceId, keep });
+    return 0;
   }
 }
 
@@ -2194,20 +2207,45 @@ describe("SpaceService digest-on-idle", () => {
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const provider = new FakeMemoryProvider();
-    const prunes: Array<{ spaceId: string; keep: number }> = [];
     const service = makeSpaceService({
       store,
       adapter,
       driver,
       memoryProvider: provider,
-      digestPrune: async (spaceId, keep) => void prunes.push({ spaceId, keep }),
     });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     driver.last().autoReply = "- digest";
     await service.stop();
 
-    expect(prunes).toEqual([{ spaceId: "slack:C1", keep: DIGEST_CAP }]);
+    expect(provider.prunes).toEqual([{ spaceId: "slack:C1", keep: DIGEST_CAP }]);
+  });
+
+  test("fails before summary or save when the configured provider cannot prune digests", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const provider = new FakeMemoryProvider({
+      consolidation: "on-save",
+      digestPruning: "unsupported",
+    });
+    const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.autoReply = "- must not be produced";
+    await service.stop();
+
+    expect(session.prompts).toHaveLength(1);
+    expect(provider.saved).toHaveLength(0);
+    expect(provider.prunes).toHaveLength(0);
+    const failure = audit.find((entry) => entry.event_type === DIGEST_FAILED_EVENT);
+    expect(JSON.parse(failure!.payload)).toEqual({
+      reason:
+        "configured memory provider does not support required digest pruning; " +
+        "digest production cannot enforce the per-space retention cap",
+    });
+    expect(session.disposed).toBe(true);
   });
 
   test("no messages newer than the marker means no digest", async () => {

@@ -1,7 +1,6 @@
 /**
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
-import { pruneDigestMemories } from "../memory/sqlite";
 import { sessionSearchToolDefinitions } from "../memory/session-search";
 import { createMemoryConsolidationTrigger } from "./services/memory-consolidation-trigger";
 import type { ApprovalRouter } from "../policy/approval-router";
@@ -806,12 +805,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // Per-space response mode (issue #55): the request-only directive is
     // appended at session creation.
     responseModeFor,
-    // Digest-on-idle (#42): summarize idle spaces into org memory; the cap
-    // prunes digest memories beyond the newest 20 per space on this file.
+    // Digest-on-idle (#42): the configured provider owns enforcement of the
+    // per-space cap and rejects before production when it cannot honor it.
     memoryProvider,
-    digestPrune: (spaceId, keep) => {
-      pruneDigestMemories(store.getDb(), spaceId, keep);
-    },
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
   });

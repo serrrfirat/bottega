@@ -521,16 +521,16 @@ describe("mem0 conformance", () => {
   let stub: StubHarness;
 
   beforeAll(() => {
-    stub = createStub();
+    stub = createStub({ consolidateDuplicates: true });
   });
 
   afterAll(async () => {
     await stub.stop();
   });
 
-  runMemoryConformanceTests(async () =>
-    createMem0MemoryProvider({ baseUrl: stub.server.url.href, agentId: "conform-agent" }),
-  );
+  runMemoryConformanceTests(async () => ({
+    provider: createMem0MemoryProvider({ baseUrl: stub.server.url.href, agentId: "conform-agent" }),
+  }));
 });
 
 describe("docker-compose.yml (issue #135 mem0 deployment default)", () => {

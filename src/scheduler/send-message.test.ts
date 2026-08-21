@@ -38,6 +38,10 @@ function context(overrides: { postError?: Error } = {}) {
       },
     },
     memoryProvider: {
+      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      async pruneDigests() {
+        throw new Error("send_message must not prune memory");
+      },
       async save() {
         throw new Error("send_message must not save memory");
       },
@@ -100,6 +104,10 @@ describe("sendMessageAction (issue #220)", () => {
       audit,
       registry,
       memoryProvider: {
+        capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+        async pruneDigests() {
+          throw new Error("unused memory prune");
+        },
         async save() {
           throw new Error("unused memory save");
         },

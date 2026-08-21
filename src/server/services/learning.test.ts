@@ -114,6 +114,14 @@ class ScriptedDriver implements AgentDriver {
 }
 
 class RecordingMemory implements MemoryProvider {
+  readonly capabilities = {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+  } as const;
+
+  async pruneDigests(): Promise<number> {
+    throw new Error("learning must not prune memory");
+  }
   readonly saved: MemorySaveInput[] = [];
 
   constructor(private readonly reject?: (input: MemorySaveInput) => boolean) {}

@@ -45,6 +45,12 @@ export function memoryConsolidationAction(): SchedulerAction {
   return {
     name: ACTION_NAME,
     async run(_params, ctx) {
+      if (ctx.memoryProvider.capabilities.consolidation !== "explicit") {
+        throw new Error(
+          `memory_consolidation requires an explicit-consolidation provider; ` +
+            `configured mode is ${ctx.memoryProvider.capabilities.consolidation}`,
+        );
+      }
       const modelCall = ctx.consolidationModelCall;
       if (!modelCall) {
         throw new Error(

@@ -13,6 +13,10 @@ type AuditInput = Parameters<AuditModule["appendAudit"]>[0];
 const stores: Store[] = [];
 
 const unusedMemory: MemoryProvider = {
+  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  async pruneDigests() {
+    throw new Error("recurring work must not prune memory");
+  },
   async save() {
     throw new Error("recurring work must not save memory");
   },

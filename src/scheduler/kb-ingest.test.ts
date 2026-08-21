@@ -12,6 +12,10 @@ import { z } from "zod";
 const stores: Store[] = [];
 
 const unusedMemory: MemoryProvider = {
+  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  async pruneDigests() {
+    throw new Error("kb ingest action must not prune memory");
+  },
   async save() {
     throw new Error("kb ingest action must not save memory (the worker does)");
   },

@@ -25,6 +25,10 @@ function freshStore(): Store {
 }
 
 const unusedMemory: MemoryProvider = {
+  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  pruneDigests: async () => {
+    throw new Error("unused memory prune");
+  },
   save: async () => {
     throw new Error("unused memory save");
   },

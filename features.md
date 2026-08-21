@@ -188,6 +188,16 @@ and give mem0 an LLM key (`OPENAI_API_KEY`, see [setup.md](setup.md)); the switc
 on the next server start. `MEM0_API_KEY` stays an optional env secret for
 mem0 auth.
 
+Memory maintenance is provider-declared (#155/#321). SQLite runs scheduled
+consolidation and enforces the per-space digest cap. mem0 consolidates on
+save, but does not support Bottega's explicit digest-pruning operation.
+Digest producers fail before model, post, or save side effects when the
+configured backend cannot enforce that required cap; maintenance never
+silently succeeds against the wrong store. The provider has no general
+update/delete API. Only old derived digest summaries can be pruned, while
+their source transcripts remain durable. Provenance normalization,
+correction, and tombstones remain owned by #163.
+
 ## Durable objects (issue #124)
 
 Slack file shares attach to the space as durable, content-addressed objects,

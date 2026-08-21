@@ -15,6 +15,14 @@ import { memoryToolsExtension, sha256Hex } from "./memory";
 const noopCtx: ExtensionContext = Object.create(null);
 
 class FakeProvider implements MemoryProvider {
+  readonly capabilities = {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+  } as const;
+
+  async pruneDigests(): Promise<number> {
+    throw new Error("memory tool must not prune memory");
+  }
   saved: MemorySaveInput[] = [];
   searched: MemorySearchQuery[] = [];
   private next = 1;
@@ -217,6 +225,10 @@ describe("memory.save", () => {
 
   test("provider failures surface as tool errors", async () => {
     const failing: MemoryProvider = {
+      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      pruneDigests: async () => {
+        throw new Error("unused memory prune");
+      },
       save: async () => {
         throw new Error("disk full");
       },

@@ -459,11 +459,17 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
     return graphCapabilities;
   };
 
+  const capabilities = {
+    consolidation: "on-save",
+    digestPruning: "unsupported",
+  } as const;
+
   // NOTE: save/search are deliberately NOT async — validation must throw
   // synchronously so callers (and the conformance suite) see contract
   // violations as immediate throws, not rejected promises. Network work
   // happens in the async helpers below.
   return {
+    capabilities,
     save(input: MemorySaveInput): Promise<MemoryEntry> {
       validateSaveInput(input);
       return saveToMem0(baseUrl, apiKey, agentId, timeoutMs, getGraphCapabilities, input);
@@ -471,6 +477,14 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
     search(query: MemorySearchQuery): Promise<MemoryEntry[]> {
       validateSearchQuery(query);
       return searchMem0(baseUrl, apiKey, agentId, timeoutMs, getGraphCapabilities, query);
+    },
+    pruneDigests(_spaceId: string, _keep: number): Promise<number> {
+      return Promise.reject(
+        new Error(
+          "mem0 memory provider does not support required digest pruning; " +
+            "the configured backend cannot enforce the per-space digest cap",
+        ),
+      );
     },
   };
 }

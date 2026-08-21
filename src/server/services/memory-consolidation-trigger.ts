@@ -1,15 +1,14 @@
 /**
- * Server-side memory consolidation trigger (issue #272, epic #229 P2): the
- * sqlite-backed server enqueues a `scheduled` memory_consolidation WORKER
- * job at boot and every 6 hours — the LLM leg runs in the executor (the
- * job-context model-call seam), never in this process. The trigger
- * semantics are unchanged (sqlite backend gate + the pipeline's compaction
- * threshold); only WHERE the LLM leg runs moved. The model-call seam is
- * deliberately ABSENT from this module's surface: the trigger's only side
- * effect is the enqueue.
+ * Server-side memory consolidation trigger (issues #272, #155, and #321):
+ * a provider that reports explicit consolidation gets a scheduled
+ * memory_consolidation WORKER job at boot and every 6 hours. The LLM leg
+ * runs in the executor, never in this process. A provider that consolidates
+ * on save needs no scheduled pass. An unsupported configured provider fails
+ * loudly instead of looking like a successful maintenance no-op.
  */
 import { errorMessage } from "../../tools/helpers";
 import { dispatchMemoryConsolidationJob } from "../../scheduler/memory-consolidation";
+import type { MemoryProvider } from "../../memory/types";
 import type { Store } from "../../store/db";
 
 /** The server-side cadence, preserved from the pre-#272 in-process run. */
@@ -17,16 +16,16 @@ export const DEFAULT_CONSOLIDATION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface MemoryConsolidationTriggerDeps {
   store: Store;
-  /** Only the backend gate is read; the model call is NOT part of this surface. */
-  memoryProvider: { backend: "mem0" | "sqlite" };
+  /** Capability reporting is the only provider behavior this trigger reads. */
+  memoryProvider: Pick<MemoryProvider, "capabilities">;
   log?: (line: string) => void;
 }
 
 export interface MemoryConsolidationTrigger {
   /**
-   * One pass: enqueue one scheduled job when the backend is sqlite and no
-   * pass is already in flight. Returns the job id, or null when skipped
-   * (non-sqlite backend or a fire already running).
+   * One pass. Returns a job id when explicit consolidation is enqueued, or
+   * null only when consolidation is provider-managed on save or another fire
+   * is already running. An unsupported configured provider rejects.
    */
   fire(): Promise<string | null>;
   /** Fires the boot pass immediately and starts the 6-hour interval. */
@@ -47,7 +46,13 @@ export function createMemoryConsolidationTrigger(
   let timer: ReturnType<typeof setInterval> | null = null;
 
   const fire = async (): Promise<string | null> => {
-    if (deps.memoryProvider.backend !== "sqlite" || inFlight) return null;
+    const mode = deps.memoryProvider.capabilities.consolidation;
+    if (mode === "unsupported") {
+      throw new Error(
+        "configured memory provider does not support required consolidation",
+      );
+    }
+    if (mode === "on-save" || inFlight) return null;
     inFlight = (async () => {
       try {
         const id = await dispatchMemoryConsolidationJob(deps.store);
@@ -66,7 +71,13 @@ export function createMemoryConsolidationTrigger(
   return {
     fire,
     start() {
-      if (deps.memoryProvider.backend !== "sqlite") return;
+      const mode = deps.memoryProvider.capabilities.consolidation;
+      if (mode === "unsupported") {
+        throw new Error(
+          "configured memory provider does not support required consolidation",
+        );
+      }
+      if (mode === "on-save") return;
       void fire();
       if (timer !== null) return;
       timer = setInterval(() => {

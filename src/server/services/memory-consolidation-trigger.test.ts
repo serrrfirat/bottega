@@ -1,11 +1,7 @@
 /**
- * Server-side memory-consolidation trigger tests (issue #272, epic #229 P2):
- * the server process no longer runs consolidation side sessions — the
- * trigger path enqueues a `scheduled` memory_consolidation WORKER job
- * instead of calling the model. These tests pin that the trigger's only
- * side effect is the enqueue (the model-call seam is absent from the
- * trigger's surface entirely) and that the sqlite-backend gate is
- * preserved.
+ * Server-side memory-consolidation trigger tests (issues #272, #155, and
+ * #321): the server enqueues explicit consolidation, accepts declared
+ * provider-managed consolidation, and rejects unsupported maintenance.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -65,11 +61,13 @@ describe("memory consolidation trigger (issue #272)", () => {
     trigger.stop();
   });
 
-  test("the trigger no-ops on a non-sqlite backend (the existing gate), never enqueuing", async () => {
+  test("does not enqueue when the provider declares on-save consolidation", async () => {
     const store = freshStore();
     const deps: MemoryConsolidationTriggerDeps = {
       store,
-      memoryProvider: { backend: "mem0" },
+      memoryProvider: {
+        capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
+      },
       log: () => {},
     };
     const trigger = createMemoryConsolidationTrigger(deps);
@@ -77,6 +75,24 @@ describe("memory consolidation trigger (issue #272)", () => {
     expect(await trigger.fire()).toBeNull();
     expect(jobCount(store)).toBe(0);
     trigger.stop();
+  });
+
+  test("rejects a configured provider that cannot honor consolidation", async () => {
+    const store = freshStore();
+    const trigger = createMemoryConsolidationTrigger({
+      store,
+      memoryProvider: {
+        capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      },
+    });
+
+    await expect(trigger.fire()).rejects.toThrow(
+      /does not support required consolidation/,
+    );
+    expect(() => trigger.start()).toThrow(
+      /does not support required consolidation/,
+    );
+    expect(jobCount(store)).toBe(0);
   });
 
   test("fires are deduped while one is in flight", async () => {
@@ -97,7 +113,9 @@ describe("memory consolidation trigger (issue #272)", () => {
     } as unknown as Store;
     const trigger = createMemoryConsolidationTrigger({
       store: fakeStore,
-      memoryProvider: { backend: "sqlite" },
+      memoryProvider: {
+        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+      },
       log: () => {},
     });
 

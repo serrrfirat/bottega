@@ -1,5 +1,5 @@
 /**
- * Memory provider selection tests (issues #43, #67).
+ * Memory provider selection tests (issues #43, #67, #155, and #321).
  *
  * resolveMemoryProvider reads ONLY the passed settings object (plus the env
  * record for the optional API key): memory_backend.base_url set → mem0
@@ -88,6 +88,10 @@ describe("resolveMemoryProvider (issue #43)", () => {
         { MEM0_BASE_URL: "http://127.0.0.1:1", MEM0_API_KEY: "m0sk-test" },
       );
       expect(provider.backend).toBe("mem0");
+      expect(provider.capabilities).toEqual({
+        consolidation: "on-save",
+        digestPruning: "unsupported",
+      });
       const saved = await provider.save({ scope: { kind: "org" }, content: "selection test fact" });
       expect(saved.content).toBe("selection test fact");
       // Wire contract: org scope maps to a fixed agent_id, key travels as
@@ -126,6 +130,10 @@ describe("resolveMemoryProvider (issue #43)", () => {
     const db = freshDb();
     const provider = resolveMemoryProvider(null, db, {});
     expect(provider.backend).toBe("sqlite");
+    expect(provider.capabilities).toEqual({
+      consolidation: "explicit",
+      digestPruning: "explicit",
+    });
     const saved = await provider.save({ scope: { kind: "org" }, content: "sqlite fallback fact" });
     expect(saved.id).toBeTruthy();
     const hits = await provider.search({ scope: { kind: "org" }, query: "sqlite fallback" });

@@ -12,6 +12,14 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
 type AuditInput = Parameters<AuditModule["appendAudit"]>[0];
 
 class FakeMemoryProvider implements MemoryProvider {
+  readonly capabilities = {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+  } as const;
+
+  async pruneDigests(): Promise<number> {
+    throw new Error("observer must not prune memory");
+  }
   readonly searches: MemorySearchQuery[] = [];
 
   constructor(private readonly entries: MemoryEntry[], private readonly searchError?: Error) {}

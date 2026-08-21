@@ -643,6 +643,65 @@ get partial support (documented limitation): they can run for
 non-authenticated operations, but credentialed gRPC calls are not
 supported.
 
+## Memory producer and maintenance contract (#155/#321)
+
+`MemoryProvider` (`src/memory/types.ts`) is the production boundary for
+validated saves, scoped searches, exact metadata filters, capability
+reporting, and derived-digest retention. Providers expose no general update
+or delete method. Callers must not inspect a backend name or reach into its
+storage to perform maintenance.
+
+The current producers and their persisted metadata are:
+
+| Producer | Scope/content | Metadata contract | Maintenance owner |
+| --- | --- | --- | --- |
+| Manual `memory.save` | Derived writable scope; caller text | Caller metadata; no reserved `kind` | None |
+| Auto extraction | Person or channel scope; human-stated facts only | `source=auto_extract` | None |
+| Idle digest | Org summary of one space transcript interval | `kind=digest`, `space`, `since`, `until` | Provider digest cap |
+| Standup digest | Org summary of work-item state | `kind=digest`, `space`, `since`, `until` | Provider digest cap |
+| Daily reflection | Org deterministic activity fact | `kind=reflection`, `space`, `date`, `topic` | None |
+| KB ingestion | Org source chunk | `kind=kb`, `source=<source id>`, `url` | None; refresh appends |
+| SQLite consolidation | Org/person compacted fact | `source=consolidation`, `consolidated=1` | Scheduled explicit compactor |
+
+The org-pulse observer is not a producer. It performs metadata-only reads of
+digest and reflection rows and posts a report. Every provider must preserve
+metadata values and exact-match filtering because these producer tags are
+the stable search seam.
+
+#163 owns the atomic move to normalized provenance. Its required logical
+shape is `producer`, `space`, `ts`, and `source_ref`, with an absent field
+when it does not apply. That change must migrate every producer together and
+extend both provider conformance legs; mixed producer-specific and normalized
+shapes are not a supported end state. #155 does not add correction,
+redaction, tombstones, or a user-facing forget operation.
+
+Maintenance capabilities are explicit:
+
+- SQLite reports `consolidation=explicit` and
+  `digestPruning=explicit`. The worker runs consolidation across each org and
+  person pool after the new-fact threshold. The model may request strict
+  `ADD`, `UPDATE`, or `DELETE` actions against the numbered active pool;
+  malformed or out-of-range actions are ignored, and a compaction marker
+  prevents replay. Digest pruning removes only derived `kind=digest` rows
+  older than the newest per-space cap.
+- mem0 reports `consolidation=on-save` because its add operation maintains
+  the active set and provider history. It reports
+  `digestPruning=unsupported`; a digest producer must reject before its model
+  call, post, or save rather than silently leaving an uncapped digest.
+
+Retention is not a general deletion authority. Saves append. KB, reflection,
+auto-extracted, and manual content is outside the digest pruner. Digest
+pruning is the narrow exception for replaceable summaries whose source
+transcript remains durable. Consolidation changes only the active fact pool
+under its declared mode. Human correction/deletion remains unavailable until
+the tombstone contract in #163.
+
+The shared provider conformance suite uses a temporary SQLite database and a
+hermetic mem0 HTTP double. It drives representative save/search metadata,
+the declared consolidation mode, digest pruning or its loud rejection, and
+the absence of general update/delete paths. Caller tests also prove idle and
+standup digest producers check pruning capability before side effects.
+
 ## Scheduler: durable cron (epic #111)
 
 `src/scheduler/` implements a durable, UTC-only scheduler with policy-gated
@@ -658,7 +717,7 @@ flowchart LR
     RUN -- "first pass after boot: occurrences<br/>before now" --> MISS["audit 'missed', skip — no replay of backlog"]
     RUN -- "job due" --> ACT["action registry — typed handlers<br/>standup_digest | reflection | org_pulse | recurring_work"]
     ACT --> POST["postMessage → Slack space"]
-    ACT --> MEM["memory provider — org memories (append-only)"]
+    ACT --> MEM["memory provider — org memories<br/>append-only save; capability-gated maintenance"]
     ACT --> WI["work_items — recurring extension work"]
     RUN --> AUD[("audit — fired / missed / error events")]
 ```

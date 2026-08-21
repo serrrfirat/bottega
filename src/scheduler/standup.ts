@@ -1,4 +1,4 @@
-import { pruneDigestMemories } from "../memory/sqlite";
+import { requireDigestPruning } from "../memory/types";
 import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import type { WorkItemState } from "../store/db";
 import { sha256Hex } from "../tools/memory";
@@ -55,6 +55,11 @@ export const standupDigestAction: SchedulerAction = {
 
       const policy = await ctx.loadPolicy(spaceId);
       if (policy.responseMode !== "always") return;
+
+      // A digest without its retention cap is not a successful run. Check
+      // before posting or saving so unsupported providers fail without a
+      // partial digest side effect.
+      requireDigestPruning(ctx.memoryProvider);
 
       const now = ctx.now();
       const currentDayStart = Math.floor(now / DAY_MS) * DAY_MS;
@@ -131,7 +136,7 @@ export const standupDigestAction: SchedulerAction = {
           content_hash: sha256Hex(digest),
         },
       });
-      pruneDigestMemories(ctx.store.getDb(), spaceId, DIGEST_CAP);
+      await ctx.memoryProvider.pruneDigests(spaceId, DIGEST_CAP);
     } catch (error) {
       const reason = errorMessage(error);
       try {

@@ -1,10 +1,11 @@
 /**
- * SQLite memory backend (memory epic, issue #20).
+ * SQLite memory backend (memory epic, issues #20, #155, and #321).
  *
- * Default MemoryProvider for per-org self-hosted bottega: the provider
- * borrows the store's Database handle and keeps memories in the same
- * SQLite file (`data/bottega.db`), zero external services. The provider
- * exposes only save + search; storage maintenance is kept outside its contract.
+ * Default MemoryProvider for per-org self-hosted bottega. The provider
+ * borrows the store's Database handle and keeps memories in the same SQLite
+ * file (`data/bottega.db`), with zero external services. Save, search,
+ * capability reporting, and derived-digest retention all stay behind the
+ * MemoryProvider seam.
  */
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
@@ -120,14 +121,11 @@ function toFtsQuery(value: string): string | null {
 }
 
 /**
- * Digest cap (issue #42): deletes digest memories for `spaceId` beyond the
- * newest `keep`, so digests cannot pile up (the space transcript retains the
- * full history, so pruning loses nothing). Returns the number of deleted
- * rows. This is deliberately not part of the MemoryProvider contract —
- * memory is never deleted through the provider (issue #19); the cap is a
- * bottega-owned storage-management rule on the shared SQLite file.
+ * SQLite's narrow digest-retention operation. It removes only derived digest
+ * rows beyond the newest `keep` for one space. The source transcript remains
+ * durable; this is not a general memory deletion path.
  */
-export function pruneDigestMemories(db: Database, spaceId: string, keep: number): number {
+function pruneSqliteDigests(db: Database, spaceId: string, keep: number): number {
   const deleted = db
     .query(
       `DELETE FROM memories
@@ -165,6 +163,11 @@ export function createSqliteMemoryProvider(
   );
   const now = options.now ?? Date.now;
 
+  const capabilities = {
+    consolidation: "explicit",
+    digestPruning: "explicit",
+  } as const;
+
   // NOTE: plain functions, not async — validators must throw synchronously so
   // callers can rely on validation errors surfacing without awaiting.
 
@@ -188,6 +191,16 @@ export function createSqliteMemoryProvider(
       metadata: input.metadata ?? {},
       createdAt,
     });
+  }
+
+  function pruneDigests(spaceId: string, keep: number): Promise<number> {
+    if (!spaceId) {
+      throw new Error("memory.pruneDigests: space id must be non-empty");
+    }
+    if (!Number.isInteger(keep) || keep < 1) {
+      throw new Error("memory.pruneDigests: keep must be a positive integer");
+    }
+    return Promise.resolve(pruneSqliteDigests(db, spaceId, keep));
   }
 
   function filterAndLimit(rows: MemoryRow[], query: MemorySearchQuery): MemoryEntry[] {
@@ -262,5 +275,5 @@ export function createSqliteMemoryProvider(
     return Promise.resolve(filterAndLimit(rows, query));
   }
 
-  return { save, search };
+  return { capabilities, save, search, pruneDigests };
 }

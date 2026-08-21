@@ -4,7 +4,7 @@ import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type Se
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import { z } from "zod";
-import type { MemoryProvider } from "../../memory/types";
+import { requireDigestPruning, type MemoryProvider } from "../../memory/types";
 import type { AuditModule } from "../../policy/audit";
 import type { PolicyConfig, ResponseMode } from "../../policy/config";
 import { channelFromSpaceId, isDmChannel, type SlackAdapter, type SlackMessage } from "../adapters/slack";
@@ -60,11 +60,6 @@ export interface SpaceServiceDeps {
    * the newest digest's `until` doubles as the next run's marker.
    */
   memoryProvider?: MemoryProvider;
-  /**
-   * Digest cap hook: prune digest memories for the space beyond `keep`
-   * (defaults to nothing — the SQLite wiring supplies the real cap).
-   */
-  digestPrune?: (spaceId: string, keep: number) => Promise<void> | void;
   /** Bound for the digest summary turn. Default 60s. */
   digestTimeoutMs?: number;
   /**
@@ -263,7 +258,6 @@ export class SpaceService {
   readonly #idleTimeoutMs: number;
   readonly #transcriptDir: string;
   readonly #memoryProvider: MemoryProvider | undefined;
-  readonly #digestPrune: ((spaceId: string, keep: number) => Promise<void> | void) | undefined;
   readonly #digestTimeoutMs: number;
   readonly #responseModeFor: (spaceId: string) => ResponseMode | Promise<ResponseMode>;
   readonly #modelRoles: SessionModelRoleRegistry | undefined;
@@ -304,7 +298,6 @@ export class SpaceService {
     this.#idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.#transcriptDir = deps.transcriptDir ?? DEFAULT_TRANSCRIPT_DIR;
     this.#memoryProvider = deps.memoryProvider;
-    this.#digestPrune = deps.digestPrune;
     this.#digestTimeoutMs = deps.digestTimeoutMs ?? DEFAULT_DIGEST_TIMEOUT_MS;
     this.#responseModeFor = deps.responseModeFor ?? (() => "always");
     this.#modelRoles = deps.modelRoles;
@@ -858,6 +851,10 @@ export class SpaceService {
       const marker = await this.#newestDigestUntil(provider, spaceId);
       const lastTs = this.#presenterFor(spaceId).latestInboundTs();
       if (!lastTs || (marker !== null && Number(lastTs) <= Number(marker))) return;
+      // Retention is part of producing a digest, not optional cleanup.
+      // Check before the model call or save so unsupported backends cannot
+      // leave a partial, uncapped digest behind.
+      requireDigestPruning(provider);
       const summary = await this.#runDigestTurn(live, marker);
       if (!summary) {
         await this.#auditDigestFailure(spaceId, "empty summary");
@@ -868,7 +865,7 @@ export class SpaceService {
         content: summary,
         metadata: { kind: "digest", space: spaceId, since: marker ?? "", until: lastTs },
       });
-      await this.#digestPrune?.(spaceId, DIGEST_CAP);
+      await provider.pruneDigests(spaceId, DIGEST_CAP);
     } catch (err) {
       await this.#auditDigestFailure(spaceId, err instanceof Error ? err.message : String(err));
     }

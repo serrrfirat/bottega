@@ -1,9 +1,31 @@
 /**
- * Pluggable memory contract (memory epic, issue #19; permission-aware
- * scopes, issue #137).
+ * Pluggable memory contract (memory epic, issues #19, #137, #155, and #321).
  *
- * The single seam for all memory backends. Memory is never deleted —
- * providers expose save + search only.
+ * The single seam for every backend owns validated save/search behavior,
+ * exact metadata filtering, capability reporting, and the one narrow
+ * maintenance operation used by digest producers. There is no general
+ * update/delete API.
+ *
+ * Producer metadata is intentionally explicit until #163 normalizes the
+ * shared provenance shape:
+ *   manual/tool save → caller metadata (no reserved kind)
+ *   auto extraction → source=auto_extract
+ *   idle + standup digest → kind=digest, space, since, until
+ *   reflection → kind=reflection, space, date, topic
+ *   KB ingestion → kind=kb, source=<source id>, url
+ *   SQLite consolidation → source=consolidation, consolidated=1
+ * The weekly observer is read-only; it searches digest/reflection rows and
+ * never produces memory.
+ *
+ * Consolidation has two equivalent lifecycle positions. SQLite reports
+ * `explicit` because Bottega schedules its compactor. mem0 reports `on-save`
+ * because the service consolidates each add and retains provider history.
+ * Digest retention is different from correction/deletion: it may remove only
+ * derived `kind=digest` rows beyond the per-space cap, whose source transcript
+ * remains durable. A backend that cannot enforce that cap reports
+ * `unsupported`, and `pruneDigests` rejects loudly instead of succeeding as a
+ * no-op. Correction, redaction, tombstones, and normalized provenance belong
+ * to #163, not this seam.
  *
  * Logical scope model (#137): a memory belongs to one of four logical keys —
  * `org` (the company-wide floor), `person:<principal>` (one human), a
@@ -16,9 +38,7 @@
  * Physical persistence stays on the existing `org|user` SQLite contract (#19)
  * — no schema migration. Logical keys map to physical rows:
  *   org         → scope='org',  principal=NULL
- *   person:P    → scope='user', principal=P        (raw principal: existing
- *                                 `user` rows ARE person rows, so legacy
- *                                 data reads back unchanged)
+ *   person:P    → scope='user', principal=P
  *   channel:S   → scope='user', principal='channel:S'
  *   team:T      → scope='user', principal='team:T'
  * The `channel:`/`team:` prefixes cannot collide with Slack principals
@@ -133,9 +153,39 @@ export interface MemorySearchQuery {
   metadata?: Record<string, string>;
 }
 
+export interface MemoryProviderCapabilities {
+  /**
+   * `explicit`: Bottega must run its scheduled compactor.
+   * `on-save`: the backend consolidates as part of save; no scheduled pass.
+   * `unsupported`: a caller requiring consolidation must reject.
+   */
+  readonly consolidation: "explicit" | "on-save" | "unsupported";
+  /**
+   * `explicit`: pruneDigests enforces the per-space cap.
+   * `unsupported`: pruneDigests must reject without deleting content.
+   */
+  readonly digestPruning: "explicit" | "unsupported";
+}
+
 export interface MemoryProvider {
+  readonly capabilities: MemoryProviderCapabilities;
   save(input: MemorySaveInput): Promise<MemoryEntry>;
   search(query: MemorySearchQuery): Promise<MemoryEntry[]>;
+  /**
+   * Enforces derived-digest retention for one space. Unsupported providers
+   * reject loudly; returning zero is reserved for a supported no-deletion pass.
+   */
+  pruneDigests(spaceId: string, keep: number): Promise<number>;
+}
+
+/** Fails before a digest producer starts when the configured backend cannot enforce its cap. */
+export function requireDigestPruning(provider: MemoryProvider): void {
+  if (provider.capabilities.digestPruning !== "explicit") {
+    throw new Error(
+      "configured memory provider does not support required digest pruning; " +
+        "digest production cannot enforce the per-space retention cap",
+    );
+  }
 }
 
 export const MEMORY_LIMIT_DEFAULT = 5;

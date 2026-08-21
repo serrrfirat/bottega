@@ -23,6 +23,14 @@ function entry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
 }
 
 class FakeProvider implements MemoryProvider {
+  readonly capabilities = {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+  } as const;
+
+  async pruneDigests(): Promise<number> {
+    throw new Error("memory context must not prune memory");
+  }
   searches: MemorySearchQuery[] = [];
   hits: MemoryEntry[] = [];
 

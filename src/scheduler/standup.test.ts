@@ -271,10 +271,52 @@ describe("standupDigestAction (issue #92)", () => {
     expect(tableText).toContain("8 more not shown");
   });
 
+  test("fails before posting or saving when digest pruning is unsupported", async () => {
+    const store = freshStore();
+    const space = await createSpace(store, "NO_PRUNE", JSON.stringify({ proactive: { standup: true } }));
+    let saves = 0;
+    const unsupportedMemory: MemoryProvider = {
+      capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
+      async save(input) {
+        saves += 1;
+        return {
+          id: "unexpected",
+          key: input.scope,
+          content: input.content,
+          metadata: input.metadata ?? {},
+          createdAt: FIXED_NOW,
+        };
+      },
+      async search() {
+        return [];
+      },
+      async pruneDigests() {
+        throw new Error("must not reach prune after the capability check");
+      },
+    };
+    const { ctx, posted } = context(store, { memoryProvider: unsupportedMemory });
+
+    await standupDigestAction.run({ space }, ctx);
+
+    expect(posted).toHaveLength(0);
+    expect(saves).toBe(0);
+    const failures = await store.listAudit({ space, event_type: DIGEST_FAILED_EVENT });
+    expect(failures).toHaveLength(1);
+    expect(JSON.parse(failures[0]!.payload)).toEqual({
+      reason:
+        "configured memory provider does not support required digest pruning; " +
+        "digest production cannot enforce the per-space retention cap",
+    });
+  });
+
   test("audits a failure and never throws past the runner", async () => {
     const store = freshStore();
     const space = await createSpace(store, "FAIL", JSON.stringify({ proactive: { standup: true } }));
     const failingMemory: MemoryProvider = {
+      capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+      async pruneDigests() {
+        return 0;
+      },
       async save() {
         throw new Error("memory backend unavailable");
       },

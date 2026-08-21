@@ -264,6 +264,10 @@ describe("reflectionAction (issue #93)", () => {
       payload: "{}",
     });
     const failingMemory: MemoryProvider = {
+      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      async pruneDigests() {
+        throw new Error("reflection must not prune memory");
+      },
       async save() {
         throw new Error("reflection memory unavailable");
       },

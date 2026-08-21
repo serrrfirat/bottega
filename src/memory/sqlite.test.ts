@@ -10,7 +10,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { createSqliteMemoryProvider, ftsAvailable, pruneDigestMemories } from "./sqlite";
+import { createSqliteMemoryProvider, ftsAvailable } from "./sqlite";
+import { maintainMemory } from "./consolidation";
 import { runMemoryConformanceTests } from "./conformance.test";
 import { createStore } from "../store/db";
 
@@ -26,7 +27,15 @@ afterAll(() => {
   for (const db of dbs) db.close();
 });
 
-runMemoryConformanceTests(() => Promise.resolve(createSqliteMemoryProvider(freshDb())));
+runMemoryConformanceTests(async () => {
+  const db = freshDb();
+  return {
+    provider: createSqliteMemoryProvider(db),
+    runExplicitConsolidation: async (modelCall) => {
+      await maintainMemory(db, modelCall, { compactAfter: 1 });
+    },
+  };
+});
 
 describe("sqlite memory backend specifics", () => {
   test("LIKE wildcards in the query are escaped", async () => {
@@ -125,16 +134,15 @@ describe("sqlite memory backend specifics", () => {
     expect(() => p.search({ scope: { kind: "org" }, query: "" })).toThrow(/non-empty/);
   });
 
-  test("pruneDigestMemories keeps only the newest `keep` digests per space", async () => {
-    const db = freshDb();
-    const p = createSqliteMemoryProvider(db);
+  test("pruneDigests keeps only the newest `keep` digests per space", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
     for (let i = 1; i <= 25; i++) {
       await p.save({ scope: { kind: "org" }, content: `digest ${i}`, metadata: { kind: "digest", space: "slack:C1", until: `${i}.0` } });
     }
     await p.save({ scope: { kind: "org" }, content: "other space", metadata: { kind: "digest", space: "slack:C2", until: "1.0" } });
     await p.save({ scope: { kind: "org" }, content: "plain memory" });
 
-    const deleted = pruneDigestMemories(db, "slack:C1", 20);
+    const deleted = await p.pruneDigests("slack:C1", 20);
     expect(deleted).toBe(5);
 
     const [newest] = await p.search({ scope: { kind: "org" }, query: "", metadata: { kind: "digest", space: "slack:C1" }, limit: 1 });
