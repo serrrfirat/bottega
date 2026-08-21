@@ -1824,6 +1824,8 @@ describe("worker job envelope (epic #170)", () => {
       expect(rows.map((r) => r.kind).sort()).toEqual(["git", "work_item"]);
       const completion = rows.find((r) => r.kind === "git")!;
       expect(completion).toMatchObject({ id: item.id, kind: "git", space: space.id });
+      // SAFETY: the git completion outbox payload is serialized by the
+      // executor with a terminal state and delivery result containing pr_url.
       const payload = JSON.parse(completion.payload) as { state: string; result: { pr_url: string } };
       expect(payload.state).toBe("done");
       expect(payload.result.pr_url).toContain("/acme/sandbox/pull/1");
@@ -1968,7 +1970,7 @@ describe("worker job envelope (epic #170)", () => {
           spaceId: space.id,
           text:
             `Blocked: do the thing — executor failed; workspace retained or left untouched at ` +
-            `\"${join(fx.workspacesDir, item.id)}\": agent crashed: exit code 42`,
+            `"${join(fx.workspacesDir, item.id)}": agent crashed: exit code 42`,
         },
       ]);
       // No audit claim that a bare completion row posted: only the

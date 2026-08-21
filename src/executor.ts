@@ -69,7 +69,7 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
-import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, type WorkerJob } from "./worker/envelope";
 import {
   createChildProcessSandboxRunner,
   probeChildProcessSandbox,
@@ -102,7 +102,7 @@ import { syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "./extensions/boundary";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { McpBinding, JsonValue } from "./extensions/manifest";
+import type { McpBinding } from "./extensions/manifest";
 import { memoryToolDefinitions } from "./tools/memory";
 import type { Skill, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
@@ -114,6 +114,8 @@ import { defaultWorkspaceRoot, WorkspaceLifecycle } from "./worker/workspace-lif
 const driverMessageSchema = z.object({ text: z.string() });
 /** The session driver "error" event payload: { spaceId, message }. */
 const driverErrorSchema = z.object({ message: z.string() });
+/** Stored work-item skill pins must be a non-empty JSON string array. */
+const itemSkillsSchema = z.array(z.string()).min(1);
 
 /**
  * Work-item session tool allowlist: file/code tools + bash. Git runs through
@@ -137,8 +139,8 @@ async function resolveItemSkills(item: WorkItem): Promise<Skill[]> {
   const itemSkills = (() => {
     if (!item.skills || item.skills.length === 0) return defaulted();
     try {
-      const parsed: unknown = JSON.parse(item.skills);
-      return Array.isArray(parsed) && parsed.length > 0 ? (parsed as string[]) : defaulted();
+      const parsed = itemSkillsSchema.safeParse(JSON.parse(item.skills));
+      return parsed.success ? parsed.data : defaulted();
     } catch {
       return defaulted();
     }
@@ -710,45 +712,6 @@ export async function runKbJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobR
   return { state: "completed", result };
 }
 
-/**
- * Runs a work-item-backed job (git/extension) through the existing delivery
- * paths, unchanged in behavior: the work item's own state machine (open →
- * claimed → working → done/blocked) is the double-execution guard. When the
- * item already settled (aborted/blocked/done elsewhere), the job completes
- * as a no-op; when a concurrent owner holds it mid-flight (a lease-reclaim
- * race after a crash), the job is requeued — never double-executed.
- */
-async function runWorkItemJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
-  const parsed = workItemJobPayloadSchema.safeParse(job.payload);
-  if (!parsed.success) {
-    throw new Error(`job ${job.id} (${job.kind}) payload must be { workItemId } — failing closed`);
-  }
-  const workItemId = parsed.data.workItemId;
-  const item = await deps.store.claimWorkItemById(workItemId);
-  if (item === null) {
-    const current = await deps.store.getWorkItem(workItemId);
-    if (current === null) throw new Error(`work item ${workItemId} not found`);
-    if (current.state === "done" || current.state === "blocked" || current.state === "aborted") {
-      console.log(`[${job.id}] work item already ${current.state} — job completes as a no-op`);
-      return { state: current.state, result: null };
-    }
-    // claimed/working/review under a live owner (lease-reclaim race): requeue
-    // with backoff instead of ever running the item twice.
-    throw new Error(`work item ${workItemId} is ${current.state} — another worker owns it`);
-  }
-  const settled = await processItem(deps, cfg, item);
-  return { state: settled.state, result: safeParseJson(settled.result) };
-}
-
-/** Parses a work item's result JSON column; null when absent or corrupt. */
-function safeParseJson(text: string | null): JsonValue {
-  if (text === null) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Full lifecycle of one claimed work item. Never throws for work failures:
@@ -814,7 +777,7 @@ export async function processItem(deps: ExecutorDeps, cfg: ExecutorConfig, item:
         evidence: evidence.slice(0, 2000),
         by: "executor",
       });
-    } catch (transitionErr) {
+    } catch {
       await deps.store.appendAudit({
         space_id: item.space_id,
         actor: "executor",

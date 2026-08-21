@@ -1218,6 +1218,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     expectedRevision?: number,
   ): ExtensionCredential {
     if (row) return row;
+    // SAFETY: SELECT * mirrors the extension_credentials table and therefore
+    // returns an ExtensionCredential row when the id exists; absence is checked below.
     const current = db.query("SELECT * FROM extension_credentials WHERE id = ?").get(id) as ExtensionCredential | null;
     if (!current) throw new Error(`connection "${id}" not found`);
     if (expectedRevision !== undefined && current.revision !== expectedRevision) {
@@ -1238,6 +1240,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     if (!vaultProvider || !identityKey) {
       throw new Error("replacement connection needs a vault provider and identity key");
     }
+    // SAFETY: UPDATE ... RETURNING * yields the full ExtensionCredential row
+    // when the revision and active-state predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE extension_credentials
@@ -1254,6 +1258,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function commitExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    // SAFETY: UPDATE ... RETURNING * yields the full ExtensionCredential row
+    // when the replacement is complete and the lifecycle predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE extension_credentials
@@ -1278,6 +1284,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function rollbackExtensionConnectionReplacement(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    // SAFETY: UPDATE ... RETURNING * yields the full ExtensionCredential row
+    // when the revision and replacing-state predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE extension_credentials
@@ -1294,6 +1302,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function beginExtensionConnectionDisconnect(id: string, expectedRevision: number): Promise<ExtensionCredential> {
+    // SAFETY: UPDATE ... RETURNING * yields the full ExtensionCredential row
+    // when the revision and active-state predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE extension_credentials
@@ -1312,6 +1322,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     clearRetiringAuthority?: boolean;
   }): Promise<ExtensionCredential> {
     const retirementUpdate = input.clearRetiringAuthority ? ", retiring_broker_credential_id = NULL" : "";
+    // SAFETY: UPDATE ... RETURNING * yields the full ExtensionCredential row
+    // when the requested source status matches, otherwise no row.
     const row = db
       .query(
         `UPDATE extension_credentials SET status = ?, updated_at = ?${retirementUpdate} ` +
@@ -1337,6 +1349,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // Idempotent upsert by extension id: a re-register (the same catalog
     // connect running again after a restart) refreshes the row, never
     // duplicates it.
+    // SAFETY: INSERT ... RETURNING * always yields the inserted or updated
+    // extension_registry row, whose columns exactly match RuntimeExtensionRow.
     return db
       .query(
         `INSERT INTO extension_registry (id, snapshot, registered_by, space_id, created_at, updated_at)
@@ -1582,6 +1596,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const params = input.params ?? current.params;
     // The revision predicate is the write authority. Another connection that
     // wins after the read makes this UPDATE return no row, never a lost write.
+    // SAFETY: UPDATE ... RETURNING * yields the full SchedulerJobRow when the
+    // id and revision predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE scheduler_jobs
@@ -1603,6 +1619,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function pauseSchedulerJob(id: string, expectedRevision: number): Promise<SchedulerJob> {
+    // SAFETY: UPDATE ... RETURNING * yields the full SchedulerJobRow when the
+    // id, revision, and enabled-state predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE scheduler_jobs
@@ -1629,6 +1647,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     }
     if (current.enabled) throw new Error(`scheduler job is already enabled: ${id}`);
     const nextFireAt = nextCronFire(current.cron, now);
+    // SAFETY: UPDATE ... RETURNING * yields the full SchedulerJobRow when the
+    // id, revision, and disabled-state predicates match, otherwise no row.
     const row = db
       .query(
         `UPDATE scheduler_jobs
@@ -1702,6 +1722,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     }
     if (!Number.isSafeInteger(input.requestedAt)) throw new Error("scheduler request time must be a safe integer");
     const enqueue = db.transaction(() => {
+      // SAFETY: SELECT * mirrors scheduler_invocations, so a matching id yields
+      // a SchedulerInvocationRow; the no-row case is handled immediately.
       const existing = db
         .query("SELECT * FROM scheduler_invocations WHERE id = ?")
         .get(input.invocationId) as SchedulerInvocationRow | null;
@@ -1711,6 +1733,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         }
         return { invocation: schedulerInvocationFromRow(existing), created: false };
       }
+      // SAFETY: the prepared SELECT * statement mirrors scheduler_jobs, so a
+      // matching id yields a SchedulerJobRow; the no-row case is checked below.
       const jobRow = getSchedulerJobStmt.get(input.jobId) as SchedulerJobRow | null;
       if (!jobRow) throw new Error(`scheduler job not found: ${input.jobId}`);
       if (jobRow.revision !== input.expectedRevision) {
@@ -1718,6 +1742,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
           `stale revision for scheduler job ${input.jobId}: expected ${input.expectedRevision}, current ${jobRow.revision}`,
         );
       }
+      // SAFETY: INSERT ... RETURNING * always yields the newly inserted
+      // scheduler_invocations row, whose columns match SchedulerInvocationRow.
       const row = db
         .query(
           `INSERT INTO scheduler_invocations
@@ -1748,6 +1774,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       throw new Error("scheduler occurrence times must be safe integers");
     }
     const enqueue = db.transaction(() => {
+      // SAFETY: SELECT * mirrors scheduler_jobs, so matching identity, enabled,
+      // and next-fire predicates yield a SchedulerJobRow; no match returns no row.
       const jobRow = db
         .query("SELECT * FROM scheduler_jobs WHERE id = ? AND enabled = 1 AND next_fire_at = ?")
         .get(jobId, expectedNextFireAt) as SchedulerJobRow | null;
@@ -1777,6 +1805,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         )
         .run(nextFireAt, jobId, expectedNextFireAt);
       if (advanced.changes !== 1) throw new Error(`scheduler occurrence claim lost for job ${jobId}`);
+      // SAFETY: this SELECT * reads the scheduler_invocations row just inserted
+      // in the same immediate transaction; the defensive no-row case throws below.
       const row = db.query("SELECT * FROM scheduler_invocations WHERE id = ?").get(invocationId) as
         | SchedulerInvocationRow
         | null;
@@ -1788,6 +1818,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
 
   async function claimNextSchedulerInvocation(now: number): Promise<SchedulerInvocation | null> {
     if (!Number.isSafeInteger(now)) throw new Error("scheduler claim time must be a safe integer");
+    // SAFETY: UPDATE ... RETURNING * yields a full SchedulerInvocationRow when
+    // a pending invocation is claimed, otherwise no row.
     const row = db
       .query(
         `UPDATE scheduler_invocations
@@ -1811,6 +1843,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   ): Promise<void> {
     if (!Number.isSafeInteger(completedAt)) throw new Error("scheduler completion time must be a safe integer");
     const complete = db.transaction(() => {
+      // SAFETY: UPDATE ... RETURNING * yields a full SchedulerInvocationRow
+      // when the id is running, otherwise no row.
       const row = db
         .query(
           `UPDATE scheduler_invocations
@@ -1832,6 +1866,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   async function listSchedulerInvocations(
     filter: { jobId?: string } = {},
   ): Promise<SchedulerInvocation[]> {
+    // SAFETY: both SELECT * branches mirror scheduler_invocations and therefore
+    // return SchedulerInvocationRow arrays, with the optional branch only adding a job filter.
     const rows =
       filter.jobId === undefined
         ? (db

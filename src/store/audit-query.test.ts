@@ -74,6 +74,8 @@ describe("indexed cursor-backed audit reads (#161)", () => {
     expect(page.rows).toHaveLength(100);
     expect(page.nextCursor).not.toBeNull();
 
+    // SAFETY: EXPLAIN QUERY PLAN always returns rows with a string detail
+    // column; this query selects no other result columns.
     const plan = store
       .getDb()
       .query("EXPLAIN QUERY PLAN SELECT id, ts, space_id, actor, event_type, payload FROM audit WHERE event_type = ? AND ts >= ? ORDER BY ts DESC, id DESC LIMIT ?")

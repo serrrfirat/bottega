@@ -9,7 +9,9 @@ import {
   MAX_SANDBOX_REQUEST_BYTES,
   SANDBOX_PROTOCOL_VERSION,
   sandboxRequestSchema,
+  sandboxResponseSchema,
   type SandboxRequest,
+  type SandboxResponse,
 } from "./sandbox-protocol";
 
 const FORBIDDEN_ENV_NAMES = [
@@ -50,8 +52,9 @@ function forbiddenEnvironment(): string[] {
   return FORBIDDEN_ENV_NAMES.filter((name) => process.env[name] !== undefined);
 }
 
-function sendResponse(response: unknown): void {
-  writeSync(3, JSON.stringify(response));
+function sendResponse(response: SandboxResponse): void {
+  const parsed = sandboxResponseSchema.parse(response);
+  writeSync(3, JSON.stringify(parsed));
 }
 
 async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
