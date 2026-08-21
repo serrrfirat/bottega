@@ -5,27 +5,55 @@ import type { YamlNode } from "../yaml-subset";
 const IRON_PROXY_IP = "172.30.0.2";
 
 describe("docker-compose.yml (issue #8 egress topology)", () => {
-  test("parses and declares the six services", () => {
-    expect(Object.keys(services).sort()).toEqual([
+  test("declares every required egress topology service", () => {
+    const names = Object.keys(services);
+    for (const name of [
       "auth-broker",
       "auth-gateway",
+      "egress-config-init",
       "executor",
       "iron-proxy",
       "mem0",
       "server",
-    ]);
+    ]) {
+      expect(names).toContain(name);
+    }
   });
 
-  test("iron-proxy is pinned to the latest stable image and is config-driven", () => {
+  test("iron-proxy is pinned to the latest stable image and loads the mutable policy", () => {
     const proxy = service("iron-proxy");
     expect(proxy["image"]).toBe("ironsh/iron-proxy:0.49.0");
     // SAFETY: the hand-authored compose fixture declares command as a list for iron-proxy.
     const command = proxy["command"] as string[];
-    expect(command).toEqual(["-config", "/etc/iron-proxy/egress.yml"]);
+    expect(command).toEqual(["-config", "/data/egress.yml"]);
     // SAFETY: the fixture's iron-proxy service declares volumes as a list of mount strings.
     const vol = proxy["volumes"] as string[];
-    expect(vol).toContain("./config/egress.yml:/etc/iron-proxy/egress.yml:ro");
+    expect(vol).toContain("data:/data");
     expect(vol.some((v) => v.startsWith("./certs:") && v.endsWith(":ro"))).toBe(true);
+  });
+
+  test("seeds the mutable policy before proxy start and shares it with the server boundary", () => {
+    const init = service("egress-config-init");
+    // SAFETY: the fixture declares the init command as a scalar list.
+    expect(init["command"] as string[]).toEqual([
+      "sh",
+      "-c",
+      "cp /seed/egress.yml /data/egress.yml && chmod 600 /data/egress.yml",
+    ]);
+    // SAFETY: the fixture declares volumes as a list of mount strings on both services.
+    const initVolumes = init["volumes"] as string[];
+    expect(initVolumes).toContain("./config/egress.yml:/seed/egress.yml:ro");
+    expect(initVolumes).toContain("data:/data");
+
+    // SAFETY: depends_on is a map whose init entry carries its completion condition.
+    const dependsOn = service("iron-proxy")["depends_on"] as Record<string, YamlNode>;
+    expect((dependsOn["egress-config-init"] as Record<string, YamlNode>)["condition"]).toBe(
+      "service_completed_successfully",
+    );
+
+    expect(serviceEnv("server")["BOTTEGA_PROXY_CONFIG_PATH"]).toBe("/app/data/egress.yml");
+    // SAFETY: the fixture declares the server's volumes as a list of mount strings.
+    expect(service("server")["volumes"] as string[]).toContain("data:/app/data");
   });
 
   test("iron-proxy receives the management API token for boundary reloads (issue #123)", () => {

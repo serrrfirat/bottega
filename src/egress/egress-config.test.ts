@@ -133,60 +133,62 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(prompt).toMatch(/clearly required by the\s+current task/i);
   });
 
-  test("secrets transform (issue #53 + #208 + #230) runs AFTER judge and injects auth per api_key extension + model gateway", () => {
+  test("secrets transform runs after judge, reserves scoped extension targets, and wires every model gateway", () => {
     const secrets = transforms.find((t) => asRecord(t)["name"] === "secrets")!;
     expect(secrets).toBeDefined();
     // Ordering: allowlist, judge, secrets — the LLM judge must never see
     // real credentials (iron-proxy README's recommended ordering). Issue
-    // #284: there is NO oauth_token transform (the SDK owns hosted-MCP
-    // OAuth; the proxy is transport/allowlist only).
+    // #317: per-call extension entries are installed only inside the marked
+    // region; the committed seed starts empty so no authority survives a
+    // prior process.
     const names = transforms.map((t) => asString(asRecord(t)["name"]));
     expect(names).toEqual(["allowlist", "judge", "secrets"]);
-    const cfg = asRecord(secrets["config"]);
-    const entries = asRecordArray(cfg["secrets"]);
-    // api_key extensions (github) + the six model-gateway keys (#208 +
-    // #230, incl. the openai-codex static access token) + the Tavily web
-    // search provider (issue #278). The OAuth extensions (linear/attio)
-    // get NO file entry (issue #284 — the SDK sends its own bearer).
-    expect(entries).toHaveLength(7); // github + near/opencode/openai/anthropic/openai-codex/tavily
+    const raw = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
+    const scopedBegin = "# bottega:scoped-authorizations begin";
+    const scopedEnd = "# bottega:scoped-authorizations end";
+    expect(raw).toContain(`${scopedBegin}\n        ${scopedEnd}`);
+    expect(raw.indexOf(scopedBegin)).toBe(raw.lastIndexOf(scopedBegin));
+    expect(raw.indexOf(scopedEnd)).toBe(raw.lastIndexOf(scopedEnd));
+
+    const config = asRecord(secrets["config"]);
+    const entries = asRecordArray(config["secrets"]);
+    const expectedGatewayTargets: Record<string, readonly string[]> = {
+      "/data/proxy-secrets/near.secret": ["cloud-api.near.ai"],
+      "/data/proxy-secrets/opencode.secret": ["opencode.ai"],
+      "/data/proxy-secrets/openai.secret": ["api.openai.com"],
+      "/data/proxy-secrets/anthropic.secret": ["api.anthropic.com"],
+      "/data/proxy-secrets/openai-codex.secret": ["chatgpt.com"],
+      "/data/proxy-secrets/tavily.secret": ["api.tavily.com"],
+    };
+    const actualGatewayPaths = new Set<string>();
+
     for (const entry of entries) {
       const source = asRecord(entry["source"]);
       expect(source["type"]).toBe("file");
-      expect(asString(source["path"])).toMatch(/^\/data\/proxy-secrets\/([a-z-]+)\.secret$/);
+      const path = asString(source["path"]);
+      expect(path).toMatch(/^\/data\/proxy-secrets\/([a-z-]+)\.secret$/);
+      const expectedHosts = expectedGatewayTargets[path];
+      expect(expectedHosts, `unexpected static secret entry ${path}`).toBeDefined();
+      actualGatewayPaths.add(path);
+
       const inject = asRecord(entry["inject"]);
       expect(inject["header"]).toBe("Authorization");
       expect(inject["formatter"]).toBe("Bearer {{ .Value }}");
+      expect(asString(inject["require"])).toBe("true");
+
       const rules = asRecordArray(entry["rules"]);
-      expect(rules.length).toBeGreaterThanOrEqual(1);
+      expect(rules.map((rule) => String(rule["host"]))).toEqual(expectedHosts!);
       for (const rule of rules) {
         expect(asStringArray(allowlistCfg["domains"])).toContain(String(rule["host"]));
       }
     }
-    // The model-gateway entries are REQUIRED (fail closed — issue #208),
-    // including the Tavily web-search provider (issue #278).
-    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex", "tavily"]) {
-      const entry = entries.find((e) => asString(asRecord(e["source"])["path"]).includes(`${provider}.secret`));
-      expect(entry, `${provider} gateway entry`).toBeDefined();
-      expect(asString(asRecord(entry!["inject"])["require"])).toBe("true");
+
+    // Identity, not a raw count, is the contract: each configured model
+    // gateway must have one fail-closed secret source, while extension
+    // credentials belong only in the call-scoped region above.
+    for (const path of Object.keys(expectedGatewayTargets)) {
+      expect(actualGatewayPaths.has(path), `${path} gateway entry`).toBe(true);
     }
-    // The Tavily web-search entry's specific contract (issue #278): the
-    // search_web tool's provider key is a REQUIRED proxy secret injected at
-    // egress for api.tavily.com — fail closed if the app ever holds it, and
-    // the entry must exist (removal → meaningful failure, not just a count).
-    const tavily = entries.find((e) => asString(asRecord(e["source"])["path"]).includes("tavily.secret"));
-    expect(tavily).toBeDefined();
-    expect(asString(asRecord(tavily!["source"])["path"])).toBe("/data/proxy-secrets/tavily.secret");
-    expect(asString(asRecord(tavily!["inject"])["require"])).toBe("true");
-    const tavilyRules = asRecordArray(tavily!["rules"]);
-    expect(tavilyRules.map((r) => String(r["host"]))).toEqual(["api.tavily.com"]);
-    // The codex static entry's specific contract (issue #230): the seed
-    // writes the minted access token to openai-codex.secret (the static
-    // secrets pattern — no oauth_token entry, the proxy never touches
-    // auth.openai.com for codex), injected for chatgpt.com.
-    const codex = entries.find((e) => asString(asRecord(e["source"])["path"]).includes("openai-codex.secret"));
-    expect(codex).toBeDefined();
-    const codexRules = asRecordArray(codex!["rules"]);
-    expect(codexRules.map((r) => String(r["host"]))).toEqual(["chatgpt.com"]);
   });
 
   test("NO oauth_token transform — hosted-MCP OAuth is SDK-owned; the proxy is transport/allowlist only (issue #284)", () => {
