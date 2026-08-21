@@ -827,7 +827,10 @@ current-state documentation.
 ## Persistence & audit
 
 One SQLite file (`bun:sqlite`, WAL, busy_timeout for the server+executor
-two-process share), migrated idempotently at boot:
+two-process share) uses the ordered registry in `src/store/migrations.ts`.
+Each pending migration commits its schema/data change and `schema_migrations`
+ledger row in one transaction. Boot rejects unknown or non-prefix ledger IDs
+before exposing the store, and a retry resumes from the last committed ID.
 
 - `spaces` — registry + per-space policy/model settings. First contact uses
   an idempotent upsert that never overwrites an existing overlay (#188).

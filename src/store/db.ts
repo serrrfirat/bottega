@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { postOutboxRow } from "./outbox";
+import { runMigrations } from "./migrations";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { WorkerJob, WorkerJobKind, WorkerJobStatus } from "../worker/envelope";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -627,149 +628,21 @@ function parseWorkerJob(row: WorkerJobRow): WorkerJob {
 }
 
 /**
- * Opens (creating if needed) the SQLite store at `dbPath` and runs the
- * idempotent schema migration (src/store/schema.sql). WAL mode + busy_timeout
- * so the server and the executor can share the file.
+ * Opens (creating if needed) the SQLite store at `dbPath` and applies every
+ * pending ordered migration before exposing the database.
  */
 export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const objectsDir = join(dirname(dbPath), "objects");
   mkdirSync(objectsDir, { recursive: true });
   const db = new Database(dbPath);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA busy_timeout = 5000;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  db.exec(readFileSync(join(import.meta.dir, "schema.sql"), "utf8"));
-  // Idempotent migration (issue #47): databases created before the repo
-  // column existed keep their work_items table (CREATE TABLE IF NOT EXISTS
-  // is a no-op), so add the column explicitly when it is missing.
-  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
-  const workItemColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
-  if (!workItemColumns.includes("repo")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN repo TEXT");
-  }
-  // Idempotent migration (issue #128): CREATE TABLE IF NOT EXISTS cannot add
-  // delivery to existing work_items tables. PRAGMA guards SQLite's otherwise
-  // non-idempotent ALTER TABLE; the default backfills every existing row.
-  if (!workItemColumns.includes("delivery")) {
-    db.exec(
-      "ALTER TABLE work_items ADD COLUMN delivery TEXT NOT NULL DEFAULT 'git' CHECK (delivery IN ('git','extension','chat'))",
-    );
-  }
-  // Idempotent migration (issue #186): the resolve-conflicts job shape's
-  // PR-context columns (pr_url set on a git item = rebase/resolve/push an
-  // existing PR instead of opening one). Nullable; existing rows are
-  // untouched (implement-and-open-PR remains the default).
-  if (!workItemColumns.includes("pr_url")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN pr_url TEXT");
-  }
-  if (!workItemColumns.includes("pr_branch")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN pr_branch TEXT");
-  }
-  if (!workItemColumns.includes("base_branch")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN base_branch TEXT");
-  }
-  // Idempotent migration (issue #185): per-task model pin columns. Fresh
-  // databases get them from schema.sql; existing work_items tables need the
-  // explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op for them).
-  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
-  const pinColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
-  if (!pinColumns.includes("model")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN model TEXT");
-  }
-  if (!pinColumns.includes("reasoning_effort")) {
-    db.exec(
-      "ALTER TABLE work_items ADD COLUMN reasoning_effort TEXT CHECK (reasoning_effort IN ('off','low','medium','high'))",
-    );
-  }
-  // Idempotent migration (issues #234/#235): the explicit task-level skills
-  // column (JSON-array TEXT of skill names injected at claim). Fresh
-  // databases get it from schema.sql; existing work_items tables need the
-  // explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op for them). The
-  // default backfills every existing row — no pre-existing item has explicit
-  // skills until one is created with them.
-  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
-  const skillsColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
-  if (!skillsColumns.includes("skills")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'");
-  }
-  // Idempotent migration (issue #159): the assignee column (who owns the
-  // item). Nullable for legacy rows; the one-shot backfill makes the
-  // requester the owner of every pre-#159 item — ownership starts as the
-  // requester, exactly like fresh creates.
-  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
-  const assigneeColumns = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name);
-  if (!assigneeColumns.includes("assignee")) {
-    db.exec("ALTER TABLE work_items ADD COLUMN assignee TEXT");
-    db.exec("UPDATE work_items SET assignee = requester WHERE assignee IS NULL");
-  }
-  // Idempotent migration (issues #159/#101): the outbox CHECK gained the
-  // 'work_item' notification kind and then the 'ingest_poll' kind. SQLite
-  // cannot ALTER a CHECK constraint, so rebuild the table when its
-  // definition predates the latest kind; fresh databases get the widened
-  // CHECK from schema.sql directly. The rebuild preserves every row (the
-  // rename keeps the old table's data until the copy completes).
-  // SAFETY: sqlite_master.sql always exists for tables; a missing row (no
-  // outbox yet) skips the rebuild entirely.
-  const outboxSql =
-    (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as
-      | { sql: string }
-      | null)?.sql ?? "";
-  if (!outboxSql.includes("'ingest_poll'")) {
-    db.exec(`
-      ALTER TABLE outbox RENAME TO outbox_old;
-      CREATE TABLE outbox (
-        id         TEXT PRIMARY KEY,
-        kind       TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','work_item','ingest_poll')),
-        payload    TEXT NOT NULL,
-        space      TEXT,
-        status     TEXT NOT NULL DEFAULT 'pending'
-                   CHECK (status IN ('pending','posted','failed')),
-        attempts   INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        posted_at  INTEGER
-      );
-      INSERT INTO outbox SELECT id, kind, payload, space, status, attempts, created_at, posted_at FROM outbox_old;
-      DROP TABLE outbox_old;
-      CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
-    `);
-  }
-  // Idempotent migration (issue #101): the worker_jobs CHECK gained the
-  // 'ingest_poll' kind the poll-fetch leg enqueues. Same SQLite rebuild
-  // pattern as the outbox table above; fresh databases get the widened
-  // CHECK from schema.sql directly.
-  // SAFETY: sqlite_master.sql always exists for tables; a missing row (no
-  // worker_jobs yet) skips the rebuild entirely.
-  const workerJobsSql =
-    (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_jobs'").get() as
-      | { sql: string }
-      | null)?.sql ?? "";
-  if (!workerJobsSql.includes("'ingest_poll'")) {
-    db.exec(`
-      ALTER TABLE worker_jobs RENAME TO worker_jobs_old;
-      CREATE TABLE worker_jobs (
-        id          TEXT PRIMARY KEY,
-        kind        TEXT NOT NULL CHECK (kind IN ('git','extension','kb','scheduled','ingest_poll')),
-        payload     TEXT NOT NULL,
-        space_id    TEXT,
-        status      TEXT NOT NULL DEFAULT 'queued'
-                    CHECK (status IN ('queued','running','completed','failed')),
-        attempts    INTEGER NOT NULL DEFAULT 0,
-        lease_until INTEGER,
-        created_at  INTEGER NOT NULL,
-        updated_at  INTEGER NOT NULL
-      );
-      INSERT INTO worker_jobs SELECT id, kind, payload, space_id, status, attempts, lease_until, created_at, updated_at FROM worker_jobs_old;
-      DROP TABLE worker_jobs_old;
-      CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue ON worker_jobs(status, created_at);
-    `);
-  }
-  // Idempotent migration (issue #64): databases created before the model
-  // settings column existed keep their spaces table (CREATE TABLE IF NOT
-  // EXISTS is a no-op), so add the column explicitly when it is missing.
-  // SAFETY: PRAGMA table_info rows always expose a `name` column; the migration only reads that value.
-  const spaceColumns = (db.query("PRAGMA table_info(spaces)").all() as { name: string }[]).map((c) => c.name);
-  if (!spaceColumns.includes("settings")) {
-    db.exec("ALTER TABLE spaces ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'");
+  try {
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA busy_timeout = 5000;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    runMigrations(db);
+  } catch (error) {
+    db.close();
+    throw error;
   }
 
   const getSpaceStmt = db.query("SELECT * FROM spaces WHERE id = ?");
