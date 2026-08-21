@@ -19,6 +19,7 @@
 import { randomUUID } from "node:crypto";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../../policy/approval-router";
 import { redact } from "../../policy/audit";
+import { summarizeToolArgs } from "../../policy/gate";
 import { DEFAULT_TIMEOUT_MINUTES } from "../../policy/config";
 import { APPROVE_ACTION_ID, DENY_ACTION_ID, type SlackAction, type SlackAdapter } from "./slack";
 import { emitToolStep, nextToolStepId, toolStepTitle, type ToolStepSink } from "../services/slack-turn-presenter";
@@ -156,6 +157,49 @@ export function humanizeArgsRows(args: unknown): ApprovalArgRow[] {
 }
 
 /**
+ * Skill mutation approvals show a content-safe replacement plan: paths,
+ * byte counts, and hashes. Procedure/file bodies never reach Slack.
+ */
+export function approvalArgsRows(request: ApprovalRequest): ApprovalArgRow[] {
+  if (request.tool !== "create_space_skill" && request.tool !== "update_space_skill") {
+    return humanizeArgsRows(request.args);
+  }
+  const parsed: unknown = JSON.parse(summarizeToolArgs(request.tool, request.args));
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const summary = parsed as Record<string, unknown>;
+  const rows: ApprovalArgRow[] = [];
+  if (typeof summary.name === "string") rows.push({ label: "Skill", value: summary.name });
+  if (typeof summary.expected_revision === "string") {
+    rows.push({ label: "Expected revision", value: summary.expected_revision });
+  }
+  if (summary.document !== null && typeof summary.document === "object" && !Array.isArray(summary.document)) {
+    const document = summary.document as Record<string, unknown>;
+    rows.push({
+      label: "SKILL.md",
+      value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${String(document.bytes)} bytes (sha256 ${String(document.sha256)})`,
+    });
+  }
+  if (Array.isArray(summary.companion_files)) {
+    rows.push({
+      label: "Companion set",
+      value:
+        request.tool === "create_space_skill"
+          ? `add ${summary.companion_files.length} declared file(s)`
+          : `replace complete set with ${summary.companion_files.length} declared file(s); omitted old files are deleted`,
+    });
+    for (const item of summary.companion_files) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+      const file = item as Record<string, unknown>;
+      rows.push({
+        label: `Companion ${String(file.path)}`,
+        value: `${request.tool === "create_space_skill" ? "add" : "replace"} ${String(file.bytes)} bytes (sha256 ${String(file.sha256)})`,
+      });
+    }
+  }
+  return rows;
+}
+
+/**
  * Mrkdwn lines for the humanized rows (issue #277): capped by row count
  * (ARGS_ROW_MAX) AND by a block-safe character budget (ARGS_SECTION_TEXT_MAX)
  * so a dense payload never pushes a section past Slack's 3000-char cap —
@@ -187,7 +231,7 @@ export function renderArgsRowsText(rows: readonly ApprovalArgRow[]): string {
  * never raw flat JSON.
  */
 export function approvalArgsSummary(d: ApprovalRequest): string {
-  const text = renderArgsRowsText(humanizeArgsRows(d.args));
+  const text = renderArgsRowsText(approvalArgsRows(d));
   return text.length > ARGS_SUMMARY_MAX_CHARS ? `${text.slice(0, ARGS_SUMMARY_MAX_CHARS)}...[truncated]` : text;
 }
 
@@ -242,7 +286,7 @@ export class ApprovalFailureMemory {
  * the request id. Pure so the outbound rendering is testable without Slack.
  */
 export function buildApprovalBlocks(d: ApprovalRequest, id: string, rememberedFailure?: string): unknown[] {
-  const args = renderArgsRowsText(humanizeArgsRows(d.args));
+  const args = renderArgsRowsText(approvalArgsRows(d));
   const blocks: unknown[] = [
     {
       type: "section",

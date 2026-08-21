@@ -10,7 +10,7 @@ import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { workItemToolDefinitions } from "../tools/work-items";
-import { writeSpaceSkillToolDefinition } from "../tools/space-skills";
+import { spaceSkillToolDefinitions } from "../tools/space-skills";
 import { memoryToolDefinitions } from "../tools/memory";
 import { objectToolDefinitions } from "../tools/objects";
 import { modelToolsDefinitions } from "../tools/model-settings";
@@ -573,12 +573,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // onSessionToolset seam can expose the wiring to caller-level boot tests.
   const sessionToolset = [
     ...workItemToolDefinitions(store, { orgPolicy, agentDir }),
-    // Space-skill governance (issues #234/#235, Tier 1): the policy-gated
-    // write_space_skill rides the same custom-tools bridge as the work-item
-    // tools — the driver's gate wraps it identically (exec tier → ask-human
-    // by default), every write is audited, and the space's cached skills are
-    // busted so the NEXT session claims the skill.
-    writeSpaceSkillToolDefinition(store, { audit }),
+    // Complete skill lifecycle uses the same policy-gated definitions on
+    // both the SDK-session and MCP channels. Reads are read-tier; code
+    // injection/removal is exec-tier and refreshes only the next session.
+    ...spaceSkillToolDefinitions(store, { audit }),
     // Memory tools (issue #137): recall/save scopes derive from the
     // authenticated invocation context — space id (from the session file),
     // the TURN principal (getTurnPrincipal, the same seam the connect tool

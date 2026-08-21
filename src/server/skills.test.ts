@@ -1,117 +1,265 @@
-/**
- * Skills store (issues #234/#235): module-level unit tests for the write
- * path's fail-closed validation, the frontmatter contract, the in-process
- * cache invalidation that makes a written skill claimable on the NEXT
- * session, and Tier-3 resolution (space shadows builtin, unknown skipped).
- */
+
+/** Filesystem-boundary tests for the revisioned space-skill lifecycle. */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  resolveBuiltinSkills,
+  createSpaceSkill,
+  deleteSpaceSkill,
+  getSpaceSkill,
+  listSpaceSkills,
+  MAX_COMPANION_FILE_BYTES,
+  MAX_SKILL_DOCUMENT_BYTES,
+  MAX_SKILL_TOTAL_BYTES,
   resolveSpaceSkills,
   resolveWorkItemSkills,
-  writeSpaceSkill,
+  updateSpaceSkill,
 } from "./skills";
 
-const dir = mkdtempSync(join(tmpdir(), "bottega-skills-"));
+const dir = mkdtempSync(join(tmpdir(), "bottega-skills-lifecycle-"));
+const SPACE = "slack:C123";
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-const SPACE = "slack:C1";
+function root(name: string): string {
+  return join(dir, name);
+}
 
-describe("writeSpaceSkill", () => {
-  test("rejects names with path separators, leading dots, and empty descriptions (fail closed)", async () => {
-    const root = join(dir, "deny");
-    for (const bad of ["../evil", ".hidden", "a/b", "with space", "a:b"]) {
-      await expect(writeSpaceSkill(SPACE, { name: bad, description: "d" }, { root })).rejects.toThrow(
-        /invalid skill name/,
-      );
-    }
-    await expect(
-      writeSpaceSkill(SPACE, { name: "ok_name", description: "", }, { root }),
-    ).rejects.toThrow(/description/);
-    // No file was touched by any rejected write.
-    expect(existsSync(join(root, SPACE))).toBe(false);
-  });
+function document(name: string, description: string, body = "Procedure."): string {
+  return `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`;
+}
 
-  test("writes a SKILL.md whose frontmatter the SDK loader round-trips", async () => {
-    const root = join(dir, "write");
-    const { name, path } = await writeSpaceSkill(
+describe("space-skill storage lifecycle", () => {
+  test("creates, lists, reads, replaces the complete declared file set, and deletes only the space tier", async () => {
+    const skillsRoot = root("lifecycle-space");
+    const builtinDir = root("lifecycle-builtin");
+    mkdirSync(join(builtinDir, "review"), { recursive: true });
+    writeFileSync(join(builtinDir, "review", "SKILL.md"), document("review", "Built-in."));
+
+    const created = await createSpaceSkill(
       SPACE,
-      { name: "code_review_1", description: "Review diffs against the checklist.", body: "Step one.\n\nStep two.", triggers: ["review", 'say "hi"'] },
-      { root },
+      {
+        name: "review",
+        document: document("review", "Space v1."),
+        companionFiles: { "scripts/run.sh": { encoding: "text", content: "echo v1" }, "assets/data.bin": { encoding: "base64", content: "AAEC" } },
+      },
+      { root: skillsRoot, builtinDir },
     );
-    expect(name).toBe("code_review_1");
-    expect(path).toBe(join(root, SPACE, "code_review_1", "SKILL.md"));
-    expect(existsSync(path)).toBe(true);
+    expect(created).toMatchObject({
+      name: "review",
+      source_tier: "space",
+      companion_files: ["assets/data.bin", "scripts/run.sh"],
+      shadows: [],
+    });
+    expect(created.revision).toMatch(/^[a-f0-9]{64}$/);
 
-    const doc = readFileSync(path, "utf8");
-    expect(doc).toContain("name: code_review_1");
-    expect(doc).toContain("description: Review diffs against the checklist.");
-    expect(doc).toContain('  - "say \\"hi\\""'); // trigger quotes are escaped
-    expect(doc).toContain("Step two.");
+    expect(await listSpaceSkills(SPACE, { root: skillsRoot, builtinDir })).toEqual([
+      expect.objectContaining({ name: "review", source_tier: "space", shadows: ["builtin"] }),
+    ]);
+    const got = await getSpaceSkill(SPACE, "review", { root: skillsRoot, builtinDir });
+    expect(got.skill.companion_files).toEqual({
+      "assets/data.bin": { encoding: "base64", content: "AAEC" },
+      "scripts/run.sh": { encoding: "text", content: "echo v1" },
+    });
+    expect(got.shadowed).toEqual([expect.objectContaining({ source_tier: "builtin" })]);
 
-    // The same loader the sessions use reads name + description back.
-    const skills = await resolveSpaceSkills(SPACE, { root });
-    expect(skills.map((s) => s.name)).toContain("code_review_1");
-    const loaded = skills.find((s) => s.name === "code_review_1")!;
-    expect(loaded.description).toBe("Review diffs against the checklist.");
-    expect(loaded.source).toBe(`space:${SPACE}`);
-  });
-});
+    await expect(
+      createSpaceSkill(
+        SPACE,
+        { name: "review", document: document("review", "Silent replacement."), companionFiles: {} },
+        { root: skillsRoot, builtinDir },
+      ),
+    ).rejects.toThrow(/already exists/);
+    expect((await getSpaceSkill(SPACE, "review", { root: skillsRoot, builtinDir })).skill.revision).toBe(created.revision);
 
-describe("resolveSpaceSkills", () => {
-  test("a missing space dir resolves to an empty list (never an error, never a create-on-read)", async () => {
-    const root = join(dir, "empty");
-    const skills = await resolveSpaceSkills(SPACE, { root });
-    expect(skills).toEqual([]);
-    expect(existsSync(join(root, SPACE))).toBe(false);
-  });
+    const updated = await updateSpaceSkill(
+      SPACE,
+      {
+        name: "review",
+        expectedRevision: created.revision,
+        document: document("review", "Space v2."),
+        companionFiles: { "scripts/new.sh": { encoding: "text", content: "echo v2" } },
+      },
+      { root: skillsRoot, builtinDir },
+    );
+    expect(updated.skill.revision).not.toBe(created.revision);
+    expect(existsSync(join(skillsRoot, SPACE, "review", "scripts", "run.sh"))).toBe(false);
+    expect(existsSync(join(skillsRoot, SPACE, "review", "assets", "data.bin"))).toBe(false);
+    expect((await getSpaceSkill(SPACE, "review", { root: skillsRoot, builtinDir })).skill.companion_files).toEqual({
+      "scripts/new.sh": { encoding: "text", content: "echo v2" },
+    });
 
-  test("a write busts the cache so the space's next resolution sees the new skill", async () => {
-    const root = join(dir, "cache");
-    const first = await resolveSpaceSkills(SPACE, { root });
-    expect(first).toEqual([]);
-
-    await writeSpaceSkill(SPACE, { name: "alpha", description: "A." }, { root });
-    // Without a reload the cached empty list would hide it; write busted the cache.
-    const second = await resolveSpaceSkills(SPACE, { root });
-    expect(second.map((s) => s.name)).toEqual(["alpha"]);
-  });
-});
-
-describe("resolveWorkItemSkills (Tier 3 merge)", () => {
-  test("space-authored skills shadow the same-named builtin", async () => {
-    const root = join(dir, "shadow");
-    await writeSpaceSkill(SPACE, { name: "pr_review", description: "space's own loop" }, { root });
-    const skills = await resolveWorkItemSkills(SPACE, ["pr_review"], { root });
-    expect(skills).toHaveLength(1);
-    expect(skills[0].source).toBe(`space:${SPACE}`);
-    expect(skills[0].description).toBe("space's own loop");
-  });
-
-  test("unknown names are skipped, the rest still resolve (no new skills are ever fabricated)", async () => {
-    const root = join(dir, "unknown");
-    const skills = await resolveWorkItemSkills(SPACE, ["no_such_skill_zz", "pr_review"], { root });
-    expect(skills.map((s) => s.name)).toEqual(["pr_review"]);
-    expect(skills[0].source).toBe("builtin");
+    const removed = await deleteSpaceSkill(SPACE, "review", updated.skill.revision, { root: skillsRoot, builtinDir });
+    expect(removed.deleted.source_tier).toBe("space");
+    expect(removed.revealed?.source_tier).toBe("builtin");
+    expect((await getSpaceSkill(SPACE, "review", { root: skillsRoot, builtinDir })).skill.source_tier).toBe("builtin");
   });
 
-  test("empty pins resolve to nothing", async () => {
-    const skills = await resolveWorkItemSkills(SPACE, [], { root: join(dir, "none") });
-    expect(skills).toEqual([]);
+  test("rejects traversal, absolute, platform-separator, hidden, and reserved companion paths before touching disk", async () => {
+    for (const [index, path] of [
+      "../escape",
+      "nested/../../escape",
+      "/absolute",
+      "C:\\absolute",
+      "nested\\escape",
+      ".hidden",
+      "nested/.hidden",
+      "SKILL.md",
+      "nested/SKILL.md",
+      ".bottega-skill.json",
+    ].entries()) {
+      const skillsRoot = root(`invalid-path-${index}`);
+      await expect(
+        createSpaceSkill(
+          SPACE,
+          { name: "safe", document: document("safe", "Safe."), companionFiles: { [path]: { encoding: "text", content: "no" } } },
+          { root: skillsRoot },
+        ),
+      ).rejects.toThrow(/companion path|reserved|relative/);
+      expect(existsSync(join(skillsRoot, SPACE))).toBe(false);
+    }
   });
-});
 
-describe("resolveBuiltinSkills", () => {
-  test("the committed builtins ship the pr_review skill", async () => {
-    const skills = await resolveBuiltinSkills();
-    const pr = skills.find((s) => s.name === "pr_review");
-    expect(pr).toBeDefined();
-    expect(pr!.description.length).toBeGreaterThan(0);
-    expect(pr!.source).toBe("builtin");
-    // skill://pr_review resolves against the committed SKILL.md's dir.
-    expect(existsSync(join(pr!.baseDir, "SKILL.md"))).toBe(true);
+  test("rejects symlink roots, skill directories, and companion entries without crossing the configured root", async () => {
+    const outside = root("symlink-outside");
+    mkdirSync(outside, { recursive: true });
+    const linkedRoot = root("linked-root");
+    symlinkSync(outside, linkedRoot, "dir");
+    await expect(
+      createSpaceSkill(SPACE, { name: "safe", document: document("safe", "Safe.") }, { root: linkedRoot }),
+    ).rejects.toThrow(/symlink/);
+    expect(existsSync(join(outside, SPACE))).toBe(false);
+
+    const skillsRoot = root("symlink-entry");
+    const created = await createSpaceSkill(
+      SPACE,
+      { name: "safe", document: document("safe", "Safe."), companionFiles: { "run.sh": { encoding: "text", content: "inside" } } },
+      { root: skillsRoot },
+    );
+    const outsideFile = join(outside, "outside.txt");
+    writeFileSync(outsideFile, "outside");
+    rmSync(join(skillsRoot, SPACE, "safe", "run.sh"));
+    symlinkSync(outsideFile, join(skillsRoot, SPACE, "safe", "run.sh"));
+    await expect(getSpaceSkill(SPACE, "safe", { root: skillsRoot })).rejects.toThrow(/symlink/);
+    await expect(
+      updateSpaceSkill(
+        SPACE,
+        {
+          name: "safe",
+          expectedRevision: created.revision,
+          document: document("safe", "Changed."),
+          companionFiles: {},
+        },
+        { root: skillsRoot },
+      ),
+    ).rejects.toThrow(/symlink/);
+    expect(await Bun.file(outsideFile).text()).toBe("outside");
+  });
+
+  test("enforces document, per-file, and total byte caps at the filesystem boundary", async () => {
+    await expect(
+      createSpaceSkill(
+        SPACE,
+        { name: "large_doc", document: document("large_doc", "Large.", "é".repeat(MAX_SKILL_DOCUMENT_BYTES)) },
+        { root: root("large-doc") },
+      ),
+    ).rejects.toThrow(/SKILL\.md exceeds/);
+
+    await expect(
+      createSpaceSkill(
+        SPACE,
+        {
+          name: "large_file",
+          document: document("large_file", "Large."),
+          companionFiles: { "data.bin": new Uint8Array(MAX_COMPANION_FILE_BYTES + 1) },
+        },
+        { root: root("large-file") },
+      ),
+    ).rejects.toThrow(/companion file.*exceeds/);
+
+    const chunk = new Uint8Array(Math.floor(MAX_SKILL_TOTAL_BYTES / 4));
+    await expect(
+      createSpaceSkill(
+        SPACE,
+        {
+          name: "large_total",
+          document: document("large_total", "Large."),
+          companionFiles: {
+            "a.bin": chunk,
+            "b.bin": chunk,
+            "c.bin": chunk,
+            "d.bin": chunk,
+          },
+        },
+        { root: root("large-total") },
+      ),
+    ).rejects.toThrow(/total bytes/);
+  });
+
+  test("stale revisions and commit failures roll back without changing the existing tree or cache", async () => {
+    const skillsRoot = root("rollback");
+    const created = await createSpaceSkill(
+      SPACE,
+      { name: "atomic", document: document("atomic", "Before."), companionFiles: { "run.sh": { encoding: "text", content: "before" } } },
+      { root: skillsRoot },
+    );
+    const activeSnapshot = await resolveSpaceSkills(SPACE, { root: skillsRoot });
+
+    await expect(
+      updateSpaceSkill(
+        SPACE,
+        { name: "atomic", expectedRevision: "0".repeat(64), document: document("atomic", "Stale."), companionFiles: {} },
+        { root: skillsRoot },
+      ),
+    ).rejects.toThrow(/stale skill revision/);
+
+    await expect(
+      updateSpaceSkill(
+        SPACE,
+        {
+          name: "atomic",
+          expectedRevision: created.revision,
+          document: document("atomic", "After."),
+          companionFiles: { "run.sh": { encoding: "text", content: "after" } },
+        },
+        {
+          root: skillsRoot,
+          mutationHook(stage) {
+            if (stage === "after-backup") throw new Error("injected commit failure");
+          },
+        },
+      ),
+    ).rejects.toThrow("injected commit failure");
+
+    const after = await getSpaceSkill(SPACE, "atomic", { root: skillsRoot });
+    expect(after.skill).toMatchObject({ revision: created.revision, description: "Before." });
+    expect(after.skill.companion_files).toEqual({ "run.sh": { encoding: "text", content: "before" } });
+    expect(activeSnapshot[0]?.description).toBe("Before.");
+    expect(readdirSync(join(skillsRoot, SPACE)).filter((name) => name.startsWith("."))).toEqual([]);
+  });
+
+  test("metadata rejects undeclared leftovers and successful mutations refresh only future resolutions", async () => {
+    const skillsRoot = root("manifest-and-cache");
+    const builtinDir = root("manifest-builtin");
+    mkdirSync(join(builtinDir, "memo"), { recursive: true });
+    writeFileSync(join(builtinDir, "memo", "SKILL.md"), document("memo", "Built-in memo."));
+    const created = await createSpaceSkill(SPACE, { name: "memo", document: document("memo", "Space memo.") }, { root: skillsRoot, builtinDir });
+    const sessionOne = await resolveWorkItemSkills(SPACE, ["memo"], { root: skillsRoot, builtinDir });
+
+    writeFileSync(join(skillsRoot, SPACE, "memo", "undeclared.txt"), "leftover");
+    await expect(getSpaceSkill(SPACE, "memo", { root: skillsRoot, builtinDir })).rejects.toThrow(/undeclared/);
+    rmSync(join(skillsRoot, SPACE, "memo", "undeclared.txt"));
+
+    const updated = await updateSpaceSkill(
+      SPACE,
+      { name: "memo", expectedRevision: created.revision, document: document("memo", "New memo."), companionFiles: {} },
+      { root: skillsRoot, builtinDir },
+    );
+    expect(sessionOne[0]?.description).toBe("Space memo.");
+    expect((await resolveWorkItemSkills(SPACE, ["memo"], { root: skillsRoot, builtinDir }))[0]?.description).toBe("New memo.");
+
+    await deleteSpaceSkill(SPACE, "memo", updated.skill.revision, { root: skillsRoot, builtinDir });
+    expect(sessionOne[0]?.description).toBe("Space memo.");
+    expect((await resolveWorkItemSkills(SPACE, ["memo"], { root: skillsRoot, builtinDir }))[0]?.description).toBe("Built-in memo.");
   });
 });

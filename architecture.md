@@ -386,51 +386,64 @@ approval logic — a denied extension is denied outright (with reason + audit)
 and never reaches credential resolution. `org_credentials: deny` makes the
 credential ladder's `auto` scope skip org credentials.
 
-## Skills (issues #234/#235, #87)
+## Skills (issues #234/#235, #314, #87)
 
-Skills are durable procedures a session can load on demand via
-`skill://<name>`; the agent claims them by `name` + `description`. One
-`SKILL.md` per skill (frontmatter `name` + `description`, then the body;
-any file the body references sits next to it so `skill://` reads resolve
-against the skill's own directory).
+Skills are durable procedures a session can load on demand through
+`skill://<name>`. Each skill directory contains one `SKILL.md` plus its
+declared companion files. `SKILL.md` frontmatter must name the directory and
+provide the non-empty description used to claim the skill.
 
-**Store layout.** Built-ins ship with the repo at `skills/`
-(`BOTTEGA_BUILTIN_SKILLS_DIR` overrides; the shipped `pr_review` review-
-the-diff skill lives there) and load once per boot. Per-space skills live at
-`<BOTTEGA_SKILLS_DIR>/<spaceId>/<name>/SKILL.md` (default root
-`data/skills`) with source label `space:<spaceId>`; a missing space dir
-resolves to an empty list — never an error, never a create-on-read side
-effect. In `resolveWorkItemSkills`, `[...spaceSkills, ...builtinSkills]`
-with first-name-wins means a space-authored skill **shadows** a same-named
-built-in (a space can override `pr_review`).
+**Tiers and reads.** Built-ins ship read-only at `skills/`
+(`BOTTEGA_BUILTIN_SKILLS_DIR` overrides). Per-space skills live at
+`<BOTTEGA_SKILLS_DIR>/<spaceId>/<name>/` (default `data/skills`). The
+effective order is space then built-in, first name wins. `list_space_skills`
+and `get_space_skill` report the effective source tier, content revision,
+companion names, and any lower built-in shadowed by the space version. Only
+`get_space_skill` returns the bounded document and companion bodies.
 
-**Injection seam.** Both session creators resolve skills and hand them to
-`AgentDriver.createSession(opts.skills)` at cold start, so the skill
-snapshot is fixed for the session's whole life:
+**Lifecycle boundary.** `create_space_skill`, `update_space_skill`, and
+`delete_space_skill` mutate only the selected space tier. Create refuses an
+existing name. Update replaces `SKILL.md` and the complete declared
+companion set and requires the current SHA-256 content revision. Delete also
+requires that revision and cannot delete a built-in. A stale revision,
+invalid document/path, symlink, cap violation, or filesystem failure leaves
+the prior tree unchanged. Writes stage beside the destination and roll back
+the directory swap on failure. Successful writes record a small internal
+manifest so later reads reject undeclared, missing, or modified files.
 
-- `SpaceService.#createLive` passes `resolveSpaceSkills(spaceId)` — the
-  space tier (Tier 1 — per-space authored skills, the current surface).
-- The executor passes `resolveItemSkills(item)` — the task tier (Tier 3),
-  `WorkItem.skills` pins resolved against the space tier then the built-ins.
+Companion paths are relative POSIX paths only. Absolute paths, backslashes,
+empty/dot/hidden/traversal segments, reserved `SKILL.md` or metadata names,
+more than 8 path segments, and paths over 240 UTF-8 bytes are rejected at
+both the tool schema and filesystem boundary. The fixed content limits are:
 
-The OMP driver forwards `opts.skills` to `createAgentSession`, where the SDK
-sets its active skill snapshot and `skill://<name>` (plus the rendered
-`<skills>` listing) resolves inside that session. Skill injection is
-SDK-session-only: a driver outside the SDK surfaces `unsupported`
-(honored-or-throws, like `allowTools`). The three tiers, per the epic:
-per-space governed skills (Tier 1, today) → org-shared skills (Tier 2,
-future) → task-level skills via `WorkItem.skills` + `resolveItemSkills`
-(Tier 3), where a git-delivery item with no explicit pins deterministically
-carries the built-in `pr_review`; extension items carry none. An unknown
-pin name is skip-logged, never fatal.
+- `SKILL.md`: 64 KiB.
+- One companion file: 256 KiB.
+- Companion count: 32.
+- Whole skill document plus companion bytes: 1 MiB.
 
-**Reload semantics.** `resolveSpaceSkills` caches in-process per space;
-`writeSpaceSkill` busts that cache after the write. A change therefore
-applies on the **next** session that cold-starts the space — never to a
-running session (its snapshot is already fixed) and never mid-session. The
-built-in cache is per boot. `write_space_skill` is exec-tier (policy-gated
-before it touches disk), so auto-approving it requires both a `tools:`
-allow entry and `approvals.always_approve` membership (see setup.md).
+No read or mutation follows a symlink or resolves outside the configured
+space root. Audit rows contain names, revisions, file names, sizes, and
+SHA-256 hashes, never document or companion bodies. Slack mutation approval
+cards use the same hash-and-size replacement summary.
+
+**Injection and refresh.** Both session creators resolve skills and pass an
+immutable snapshot to `AgentDriver.createSession(opts.skills)`:
+
+- `SpaceService.#createLive` resolves the space tier.
+- The executor resolves `WorkItem.skills` against space then built-ins.
+- A git-delivery item with no explicit pins receives built-in `pr_review`;
+  extension items receive none. Unknown pins are skip-logged.
+
+The OMP driver forwards the snapshot to `createAgentSession`, which resolves
+`skill://` within each skill directory. Successful create, update, and
+delete operations invalidate only the per-space loader cache. A running
+session keeps its original snapshot. The next cold-started space or
+work-item session deterministically sees the new version, or the revealed
+built-in after delete. Built-ins remain cached once per process.
+
+List/get are read-tier. Create/update/delete are exec-tier and therefore
+need both a `tools:` allow entry and `approvals.always_approve` membership
+to skip human approval (see setup.md).
 
 ## Extension runtime: the safety spine
 

@@ -657,10 +657,10 @@ export class SpaceService {
       spaceId,
       transcriptDir: this.#transcriptDir,
       appendSystemPrompt,
-      // Skills (issues #234/#235, Tier 1): the space's authored skills are
-      // injected at cold start so `skill://<name>` resolves for the whole
-      // session. resolveSpaceSkills caches in-process and is re-read on the
-      // NEXT cold start after write_space_skill (documented reload).
+      // Space skills are injected only at cold start, so `skill://<name>`
+      // stays deterministic for the session. Lifecycle mutations bust the
+      // loader cache for the next cold session; they never mutate this
+      // session's snapshot.
       skills: await resolveSpaceSkills(spaceId),
       // A persona floor widens only the visible session toolset (#130).
       // The existing per-space policy gate still decides whether each call

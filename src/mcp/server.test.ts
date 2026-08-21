@@ -10,7 +10,7 @@
  * state; each test cleans up its process, DB, and temp dir.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -44,6 +44,7 @@ import type { SchedulerJob } from "../scheduler/types";
 import { kbToolDefinitions } from "../tools/kb-tools";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { workItemToolDefinitions } from "../tools/work-items";
+import { spaceSkillToolDefinitions } from "../tools/space-skills";
 import {
   APPROVAL_REQUESTED_EVENT,
   APPROVAL_RESOLVED_EVENT,
@@ -67,6 +68,7 @@ import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/r
 import { createExtensionRuntime } from "../extensions/runtime";
 import { resetToolSurfaceCache } from "../extensions/surface";
 import { bootMemoryMcpServer, createMemoryMcpServer, type McpInternalToolsOptions } from "./server";
+import { resolveWorkItemSkills } from "../server/skills";
 
 const SERVER_ENTRY = join(import.meta.dir, "server.ts");
 
@@ -116,6 +118,8 @@ async function launch(opts: LaunchOpts): Promise<Harness> {
   env.BOTTEGA_SESSION_DIR = sessionsDir;
   if (spaceId) env.BOTTEGA_SPACE_ID = spaceId;
   if (opts.defaultPrincipal) env.BOTTEGA_MCP_DEFAULT_PRINCIPAL = opts.defaultPrincipal;
+  env.BOTTEGA_SKILLS_DIR = join(dir, "skills");
+  env.BOTTEGA_BUILTIN_SKILLS_DIR = join(dir, "builtin-skills");
   // Pin an empty extensions dir so the spawned server never picks up the
   // repo's real snapshots via the cwd-relative default; seed it when the
   // test asks for extensions (issue #61).
@@ -213,7 +217,10 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
     internal?: boolean;
     /** Internal-surface overrides (issue #206 tests): the catalog seam / KB config. */
     internalOptions?: Partial<
-      Pick<McpInternalToolsOptions, "agentDir" | "listModels" | "kb" | "schedulerRegistry" | "schedulerNow">
+      Pick<
+        McpInternalToolsOptions,
+        "agentDir" | "listModels" | "kb" | "schedulerRegistry" | "schedulerNow" | "skillsRoot" | "builtinSkillsDir"
+      >
     >;
   } = {}): Promise<InProcessHarness> {
     const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
@@ -355,12 +362,16 @@ describe("MCP server conformance (spawned entrypoint)", () => {
         "complete_work_item",
         "connect_extension",
         "create_scheduler_job",
+        "create_space_skill",
         "create_work_item",
         "delete_scheduler_job",
+        "delete_space_skill",
         "disconnect_connection",
+        "get_space_skill",
         "inspect_connection",
         "list_connections",
         "list_scheduler_jobs",
+        "list_space_skills",
         "list_work_items",
         "memory.save",
         "memory.search",
@@ -370,9 +381,10 @@ describe("MCP server conformance (spawned entrypoint)", () => {
         "resume_scheduler_job",
         "run_scheduler_job_now",
         "session_search",
-        "work_item_cancel",
         "update_scheduler_job",
-        "write_space_skill",
+        "update_space_skill",
+        "work_item_cancel",
+
       ]);
 
       const connect = tools.find((t) => t.name === "connect_extension")!;
@@ -716,12 +728,16 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "complete_work_item",
         "connect_extension",
         "create_scheduler_job",
+        "create_space_skill",
         "create_work_item",
         "delete_scheduler_job",
+        "delete_space_skill",
         "disconnect_connection",
+        "get_space_skill",
         "inspect_connection",
         "list_connections",
         "list_scheduler_jobs",
+        "list_space_skills",
         "list_work_items",
         "memory.save",
         "memory.search",
@@ -731,10 +747,11 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "resume_scheduler_job",
         "run_scheduler_job_now",
         "session_search",
+        "update_scheduler_job",
+        "update_space_skill",
         FIXTURE_EXTENSION_TOOL,
         "work_item_cancel",
-        "update_scheduler_job",
-        "write_space_skill",
+
       ]);
 
       const weather = tools.find((t) => t.name === FIXTURE_EXTENSION_TOOL)!;
@@ -1144,6 +1161,11 @@ describe("MCP server extension surface (in-process deps)", () => {
           agentDir: internal.agentDir,
           listModels: internal.listModels,
         }),
+        ...spaceSkillToolDefinitions(h.store, {
+          audit: h.audit,
+          skillsRoot: internal.skillsRoot,
+          builtinSkillsDir: internal.builtinSkillsDir,
+        }),
         ...modelToolsDefinitions(h.store, {
           audit: h.audit,
           agentDir: internal.agentDir,
@@ -1210,6 +1232,196 @@ describe("MCP server extension surface (in-process deps)", () => {
       expect(await auditRows(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(1);
     } finally {
       await h.cleanup();
+    }
+  });
+
+  test("space-skill lifecycle is complete through the real MCP registry and refreshes only cold sessions", async () => {
+    const fsRoot = mkdtempSync(join(tmpdir(), "bottega-mcp-skills-"));
+    const skillsRoot = join(fsRoot, "space");
+    const builtinSkillsDir = join(fsRoot, "builtin");
+    mkdirSync(join(builtinSkillsDir, "review_loop"), { recursive: true });
+    writeFileSync(
+      join(builtinSkillsDir, "review_loop", "SKILL.md"),
+      "---\nname: review_loop\ndescription: Built-in review procedure.\n---\nUse the built-in checklist.\n",
+    );
+    const h = await makeInProcessHarness({
+      policy: parseOrgConfigYaml(
+        "tools:\n  unknown: allow\napprovals:\n  always_approve:\n" +
+          "    - create_space_skill\n    - update_space_skill\n    - delete_space_skill\n",
+      ),
+      internalOptions: { skillsRoot, builtinSkillsDir },
+    });
+    try {
+      const created = await callTool(h.client, "create_space_skill", {
+        name: "review_loop",
+        document:
+          "---\nname: review_loop\ndescription: Space review v1.\n---\nTOP SECRET procedure version one.\n",
+        companion_files: { "scripts/run.sh": { encoding: "text", content: "echo private-v1" } },
+      });
+      expect(created.isError).not.toBe(true);
+      const createdBody = JSON.parse(created.content[0]!.text!) as { revision: string };
+      expect(createdBody.revision).toMatch(/^[a-f0-9]{64}$/);
+
+      const listed = await callTool(h.client, "list_space_skills", {});
+      expect(JSON.parse(listed.content[0]!.text!)).toEqual([
+        expect.objectContaining({
+          name: "review_loop",
+          description: "Space review v1.",
+          source_tier: "space",
+          revision: createdBody.revision,
+          companion_files: ["scripts/run.sh"],
+          shadows: ["builtin"],
+        }),
+      ]);
+
+      const got = await callTool(h.client, "get_space_skill", { name: "review_loop" });
+      const gotBody = JSON.parse(got.content[0]!.text!) as {
+        skill: { document: string; companion_files: Record<string, { encoding: string; content: string }> };
+        shadowed: Array<{ source_tier: string }>;
+      };
+      expect(gotBody.skill.document).toContain("Space review v1.");
+      expect(gotBody.skill.companion_files["scripts/run.sh"]).toEqual({ encoding: "text", content: "echo private-v1" });
+      expect(gotBody.shadowed).toEqual([expect.objectContaining({ source_tier: "builtin" })]);
+
+      const activeSessionSnapshot = await resolveWorkItemSkills("slack:C1", ["review_loop"], {
+        root: skillsRoot,
+        builtinDir: builtinSkillsDir,
+      });
+      expect(activeSessionSnapshot[0]?.description).toBe("Space review v1.");
+
+      const updated = await callTool(h.client, "update_space_skill", {
+        name: "review_loop",
+        expected_revision: createdBody.revision,
+        document:
+          "---\nname: review_loop\ndescription: Space review v2.\n---\nTOP SECRET procedure version two.\n",
+        companion_files: { "scripts/run.sh": { encoding: "text", content: "echo private-v2" } },
+      });
+      expect(updated.isError).not.toBe(true);
+      const updatedBody = JSON.parse(updated.content[0]!.text!) as { revision: string };
+      expect(updatedBody.revision).not.toBe(createdBody.revision);
+
+      const stale = await callTool(h.client, "update_space_skill", {
+        name: "review_loop",
+        expected_revision: createdBody.revision,
+        document: "---\nname: review_loop\ndescription: stale overwrite\n---\nwrong\n",
+        companion_files: {},
+      });
+      expect(stale.isError).toBe(true);
+      const afterStale = await callTool(h.client, "get_space_skill", { name: "review_loop" });
+      expect(JSON.parse(afterStale.content[0]!.text!)).toMatchObject({
+        skill: { revision: updatedBody.revision, description: "Space review v2." },
+      });
+
+      // Existing sessions retain their immutable snapshot; the next cold
+      // resolution sees the successful cache-busting update.
+      expect(activeSessionSnapshot[0]?.description).toBe("Space review v1.");
+      expect(
+        (await resolveWorkItemSkills("slack:C1", ["review_loop"], {
+          root: skillsRoot,
+          builtinDir: builtinSkillsDir,
+        }))[0]?.description,
+      ).toBe("Space review v2.");
+
+      const deleted = await callTool(h.client, "delete_space_skill", {
+        name: "review_loop",
+        expected_revision: updatedBody.revision,
+      });
+      expect(deleted.isError).not.toBe(true);
+      const revealed = await callTool(h.client, "get_space_skill", { name: "review_loop" });
+      expect(JSON.parse(revealed.content[0]!.text!)).toMatchObject({
+        skill: { source_tier: "builtin", description: "Built-in review procedure." },
+        shadowed: [],
+      });
+      expect(
+        (await resolveWorkItemSkills("slack:C1", ["review_loop"], {
+          root: skillsRoot,
+          builtinDir: builtinSkillsDir,
+        }))[0]?.source,
+      ).toBe("builtin");
+
+      const auditText = (await h.store.listAudit()).map((row) => row.payload).join("\n");
+      expect(auditText).not.toContain("TOP SECRET");
+      expect(auditText).not.toContain("private-v1");
+      expect(auditText).not.toContain("private-v2");
+      expect(auditText).toContain("sha256");
+    } finally {
+      await h.cleanup();
+      rmSync(fsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("space-skill mutation authorization denies before filesystem execution", async () => {
+    const fsRoot = mkdtempSync(join(tmpdir(), "bottega-mcp-skills-deny-"));
+    const skillsRoot = join(fsRoot, "space");
+    const h = await makeInProcessHarness({
+      policy: parseOrgConfigYaml("tools:\n  list_space_skills: allow\n"),
+      internalOptions: { skillsRoot, builtinSkillsDir: join(fsRoot, "builtin") },
+    });
+    try {
+      await expect(
+        h.client.callTool({
+          name: "create_space_skill",
+          arguments: {
+            name: "blocked",
+            document: "---\nname: blocked\ndescription: Blocked.\n---\nMust not land.\n",
+          },
+        }),
+      ).rejects.toThrow(/policy/);
+      expect(existsSync(skillsRoot)).toBe(false);
+      const decisions = await auditRows(h.store, POLICY_DECISION_EVENT);
+      expect(decisions).toHaveLength(1);
+      expect(payload(decisions[0]!)).toMatchObject({ tool: "create_space_skill", decision: "deny", tier: "exec" });
+    } finally {
+      await h.cleanup();
+      rmSync(fsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("MCP skill schemas reject traversal and caps while the storage boundary rejects symlink roots", async () => {
+    const fsRoot = mkdtempSync(join(tmpdir(), "bottega-mcp-skills-boundary-"));
+    const outside = join(fsRoot, "outside");
+    mkdirSync(outside);
+    const skillsRoot = join(fsRoot, "linked-space");
+    symlinkSync(outside, skillsRoot, "dir");
+    const h = await makeInProcessHarness({
+      policy: parseOrgConfigYaml(
+        "tools:\n  unknown: allow\napprovals:\n  always_approve:\n    - create_space_skill\n",
+      ),
+      internalOptions: { skillsRoot, builtinSkillsDir: join(fsRoot, "builtin") },
+    });
+    try {
+      await expect(
+        h.client.callTool({
+          name: "create_space_skill",
+          arguments: {
+            name: "bad",
+            document: "---\nname: bad\ndescription: Bad.\n---\nNo.\n",
+            companion_files: { "../outside": { encoding: "text", content: "escape" } },
+          },
+        }),
+      ).rejects.toThrow(/invalid arguments/);
+      await expect(
+        h.client.callTool({
+          name: "create_space_skill",
+          arguments: {
+            name: "bad",
+            document: "x".repeat(64 * 1024 + 1),
+            companion_files: {},
+          },
+        }),
+      ).rejects.toThrow(/invalid arguments/);
+
+      const symlinked = await callTool(h.client, "create_space_skill", {
+        name: "safe",
+        document: "---\nname: safe\ndescription: Safe.\n---\nNo crossing.\n",
+        companion_files: {},
+      });
+      expect(symlinked.isError).toBe(true);
+      expect(symlinked.content[0]?.text ?? "").toContain("symlink");
+      expect(existsSync(join(outside, "slack:C1"))).toBe(false);
+    } finally {
+      await h.cleanup();
+      rmSync(fsRoot, { recursive: true, force: true });
     }
   });
 

@@ -1,129 +1,231 @@
-/**
- * `write_space_skill` (issues #234/#235, Tier 1 governance): caller-surface
- * tests driving the real tool against a real store + real audit. A valid
- * write lands a SKILL.md the loader reads back on the next session (cache
- * bust) and appends the `space_skill.written` audit row; every malformed
- * write is rejected without touching disk or the audit trail.
- */
+
+/** Caller-surface coverage for the complete space-skill tool definitions. */
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { createStore, type Store } from "../store/db";
+import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createAudit } from "../policy/audit";
-import { resolveSpaceSkills } from "../server/skills";
-import { SPACE_SKILL_WRITTEN_EVENT } from "../store/audit-events";
-import { writeSpaceSkillToolDefinition } from "./space-skills";
+import { MAX_COMPANION_FILE_BYTES, type SkillsResolveOpts } from "../server/skills";
+import {
+  SPACE_SKILL_CREATED_EVENT,
+  SPACE_SKILL_DELETED_EVENT,
+  SPACE_SKILL_LISTED_EVENT,
+  SPACE_SKILL_READ_EVENT,
+  SPACE_SKILL_UPDATED_EVENT,
+} from "../store/audit-events";
+import { createStore, type Store } from "../store/db";
+import { spaceSkillToolDefinitions } from "./space-skills";
 
-const dir = mkdtempSync(join(tmpdir(), "bottega-space-skills-"));
+const dir = mkdtempSync(join(tmpdir(), "bottega-space-skill-tools-"));
 const stores: Store[] = [];
-const roots: string[] = [];
-
-function freshStore(): Store {
-  const s = createStore(join(dir, `store-${stores.length}.db`));
-  stores.push(s);
-  return s;
-}
-
-function freshRoot(): string {
-  const root = join(dir, `root-${roots.length}`);
-  roots.push(root);
-  return root;
-}
-
 afterAll(() => {
-  for (const s of stores) s.close();
+  for (const store of stores) store.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
-function ctxFor(spaceId: string): ExtensionContext {
-  // SAFETY: the tool reads only sessionManager.getSessionFile(); the rest of
-  // the ExtensionContext surface is inert for this path.
-  return { sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) } } as ExtensionContext;
+function harness(
+  name: string,
+  mutationHook?: SkillsResolveOpts["mutationHook"],
+): { store: Store; root: string; byName: Record<string, ToolDefinition> } {
+  const store = createStore(join(dir, `${name}.db`));
+  stores.push(store);
+  const root = join(dir, name);
+  const byName = Object.fromEntries(
+    spaceSkillToolDefinitions(store, {
+      audit: createAudit(store),
+      skillsRoot: root,
+      builtinSkillsDir: join(dir, `${name}-builtin`),
+      mutationHook,
+    }).map((tool) => [
+      tool.name,
+      tool,
+    ]),
+  );
+  return { store, root, byName };
 }
 
-function resultText(res: Awaited<ReturnType<ReturnType<typeof writeSpaceSkillToolDefinition>["execute"]>>): string {
-  return (res.content[0] as { text: string }).text;
+function context(spaceId = "slack:C1"): ExtensionContext {
+  return { sessionManager: { getSessionFile: () => `${spaceId}.jsonl` } } as ExtensionContext;
 }
 
-describe("write_space_skill", () => {
-  test("a valid write lands SKILL.md, audits, and loads on the space's next resolution", async () => {
-    const store = freshStore();
-    const root = freshRoot();
-    const audit = createAudit(store);
-    const tool = writeSpaceSkillToolDefinition(store, { audit, skillsRoot: root });
+async function call(tool: ToolDefinition, params: unknown, ctx = context()) {
+  return tool.execute("call", params as never, new AbortController().signal, () => {}, ctx);
+}
 
-    const res = await tool.execute("call-1", { name: "code_review", description: "Review diffs.", body: "Follow the checklist." }, new AbortController().signal, () => {}, ctxFor("slack:C1"));
+function text(result: AgentToolResult<unknown>): string {
+  const content = result.content[0];
+  if (!content || content.type !== "text") throw new Error("space-skill tool did not return text");
+  return content.text;
+}
 
-    // The caller-facing result names the artifact and its space.
-    const out = JSON.parse(resultText(res)) as { name: string; path: string; space: string };
-    expect(out).toMatchObject({ name: "code_review", space: "slack:C1" });
+const DOC_V1 = "---\nname: review\ndescription: Review v1.\n---\nPrivate procedure one.\n";
+const DOC_V2 = "---\nname: review\ndescription: Review v2.\n---\nPrivate procedure two.\n";
 
-    // Durable evidence: the SKILL.md sits in the space's dir + the audit row.
-    const docPath = join(root, "slack:C1", "code_review", "SKILL.md");
-    expect(out.path).toBe(docPath);
-    expect(existsSync(docPath)).toBe(true);
-    const auditRows = await store.listAudit({ event_type: SPACE_SKILL_WRITTEN_EVENT });
-    expect(JSON.parse(auditRows[0].payload)).toMatchObject({ name: "code_review", path: docPath });
+describe("space-skill lifecycle tools", () => {
+  test("exposes list/get/create/update/delete with bounded schemas", () => {
+    const { byName } = harness("schemas");
+    expect(Object.keys(byName).sort()).toEqual([
+      "create_space_skill",
+      "delete_space_skill",
+      "get_space_skill",
+      "list_space_skills",
+      "update_space_skill",
+    ]);
+    expect(byName.create_space_skill?.approval).toBe("exec");
+    expect(byName.update_space_skill?.approval).toBe("exec");
+    expect(byName.delete_space_skill?.approval).toBe("exec");
+    expect(byName.list_space_skills?.approval).toBe("read");
+    expect(byName.get_space_skill?.approval).toBe("read");
 
-    // The space's NEXT session claims it (the loader round-trips the frontmatter).
-    const skills = await resolveSpaceSkills("slack:C1", { root });
-    expect(skills.map((s) => s.name)).toContain("code_review");
-    const loaded = skills.find((s) => s.name === "code_review")!;
-    expect(loaded.description).toBe("Review diffs.");
-    expect(loaded.source).toBe("space:slack:C1");
+    expect(
+      byName.create_space_skill?.parameters.safeParse({
+        name: "review",
+        document: DOC_V1,
+        companion_files: { "../outside": { encoding: "text", content: "bad" } },
+      }).success,
+    ).toBe(false);
+    expect(
+      byName.create_space_skill?.parameters.safeParse({
+        name: "review",
+        document: DOC_V1,
+        companion_files: { "data.bin": { encoding: "base64", content: "A".repeat(Math.ceil(MAX_COMPANION_FILE_BYTES / 3) * 4 + 1) } },
+      }).success,
+    ).toBe(false);
+    const cappedChunk = "x".repeat(MAX_COMPANION_FILE_BYTES);
+    expect(
+      byName.create_space_skill?.parameters.safeParse({
+        name: "review",
+        document: DOC_V1,
+        companion_files: {
+          "a.bin": { encoding: "text", content: cappedChunk },
+          "b.bin": { encoding: "text", content: cappedChunk },
+          "c.bin": { encoding: "text", content: cappedChunk },
+          "d.bin": { encoding: "text", content: cappedChunk },
+        },
+      }).success,
+    ).toBe(false);
   });
 
-  test("a second write is visible after the first without a process restart (cache bust)", async () => {
-    const store = freshStore();
-    const root = freshRoot();
-    const audit = createAudit(store);
-    const tool = writeSpaceSkillToolDefinition(store, { audit, skillsRoot: root });
+  test("runs the complete lifecycle and audits hashes/metadata without procedure or companion bodies", async () => {
+    const { store, byName } = harness("lifecycle");
+    const createdResult = await call(byName.create_space_skill!, {
+      name: "review",
+      document: DOC_V1,
+      companion_files: { "scripts/run.sh": { encoding: "text", content: "private-script-one" } },
+    });
+    expect(createdResult.isError).not.toBe(true);
+    const created = JSON.parse(text(createdResult)) as { revision: string };
 
-    await tool.execute("call-1", { name: "alpha", description: "A." }, new AbortController().signal, () => {}, ctxFor("slack:C1"));
-    await tool.execute("call-2", { name: "beta", description: "B." }, new AbortController().signal, () => {}, ctxFor("slack:C1"));
+    const listed = await call(byName.list_space_skills!, {});
+    expect(JSON.parse(text(listed))).toEqual([
+      expect.objectContaining({ name: "review", revision: created.revision, companion_files: ["scripts/run.sh"] }),
+    ]);
+    const got = await call(byName.get_space_skill!, { name: "review" });
+    expect(JSON.parse(text(got))).toMatchObject({
+      skill: { document: DOC_V1, companion_files: { "scripts/run.sh": { encoding: "text", content: "private-script-one" } } },
+    });
 
-    const skills = await resolveSpaceSkills("slack:C1", { root });
-    expect(skills.map((s) => s.name).sort()).toEqual(["alpha", "beta"]);
+    const updatedResult = await call(byName.update_space_skill!, {
+      name: "review",
+      expected_revision: created.revision,
+      document: DOC_V2,
+      companion_files: { "scripts/new.sh": { encoding: "text", content: "private-script-two" } },
+    });
+    expect(updatedResult.isError).not.toBe(true);
+    const updated = JSON.parse(text(updatedResult)) as { revision: string };
+
+    const deleted = await call(byName.delete_space_skill!, { name: "review", expected_revision: updated.revision });
+    expect(deleted.isError).not.toBe(true);
+    expect(existsSync(join(dir, "lifecycle", "slack:C1", "review"))).toBe(false);
+
+    expect(await store.listAudit({ event_type: SPACE_SKILL_CREATED_EVENT })).toHaveLength(1);
+    expect(await store.listAudit({ event_type: SPACE_SKILL_LISTED_EVENT })).toHaveLength(1);
+    expect(await store.listAudit({ event_type: SPACE_SKILL_READ_EVENT })).toHaveLength(1);
+    expect(await store.listAudit({ event_type: SPACE_SKILL_UPDATED_EVENT })).toHaveLength(1);
+    expect(await store.listAudit({ event_type: SPACE_SKILL_DELETED_EVENT })).toHaveLength(1);
+    const auditText = (await store.listAudit()).map((row) => row.payload).join("\n");
+    expect(auditText).not.toContain("Private procedure");
+    expect(auditText).not.toContain("private-script");
+    expect(auditText).toContain(created.revision);
+    expect(auditText).toContain(updated.revision);
   });
 
-  test("malformed writes are rejected without touching disk or the audit trail", async () => {
-    const store = freshStore();
-    const root = freshRoot();
-    const audit = createAudit(store);
-    const tool = writeSpaceSkillToolDefinition(store, { audit, skillsRoot: root });
+  test("server boundary rejects traversal and stale/oversized updates leave the prior revision unchanged", async () => {
+    const { store, root, byName } = harness("fail-closed");
+    const invalid = await call(byName.create_space_skill!, {
+      name: "review",
+      document: DOC_V1,
+      companion_files: { "../outside": { encoding: "text", content: "escaped" } },
+    });
+    expect(invalid.isError).toBe(true);
+    expect(existsSync(join(dir, "outside"))).toBe(false);
 
-    for (const params of [
-      { name: "../evil", description: "d" },
-      { name: ".hidden", description: "d" },
-      { name: "with space", description: "d" },
-      { name: "ok_name", description: "" },
-    ]) {
-      const res = await tool.execute("call-x", params, new AbortController().signal, () => {}, ctxFor("slack:C1"));
-      expect(res.isError).toBe(true);
-      expect(resultText(res)).toMatch(/invalid skill name|description/);
-    }
+    const createdResult = await call(byName.create_space_skill!, {
+      name: "review",
+      document: DOC_V1,
+      companion_files: { "run.sh": { encoding: "text", content: "before" } },
+    });
+    const created = JSON.parse(text(createdResult)) as { revision: string };
 
-    expect(existsSync(join(root, "slack:C1"))).toBe(false);
-    const auditRows = await store.listAudit({ event_type: SPACE_SKILL_WRITTEN_EVENT });
-    expect(auditRows).toHaveLength(0);
-  });
+    const stale = await call(byName.update_space_skill!, {
+      name: "review",
+      expected_revision: "0".repeat(64),
+      document: DOC_V2,
+      companion_files: {},
+    });
+    expect(stale.isError).toBe(true);
 
-  test("rejects outside a space session (no session file → no space id)", async () => {
-    const store = freshStore();
-    const root = freshRoot();
-    const tool = writeSpaceSkillToolDefinition(store, { audit: createAudit(store), skillsRoot: root });
-    const res = await tool.execute(
-      "call-1",
-      { name: "whatever", description: "d" },
-      new AbortController().signal,
-      () => {},
-      // SAFETY: getSessionFile returns undefined → the tool must refuse.
-      { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext,
+    const oversized = await call(byName.update_space_skill!, {
+      name: "review",
+      expected_revision: created.revision,
+      document: DOC_V2,
+      companion_files: { "run.sh": { encoding: "text", content: "x".repeat(MAX_COMPANION_FILE_BYTES + 1) } },
+    });
+    expect(oversized.isError).toBe(true);
+
+    const got = await call(byName.get_space_skill!, { name: "review" });
+    expect(JSON.parse(text(got))).toMatchObject({
+      skill: { revision: created.revision, description: "Review v1.", companion_files: { "run.sh": { encoding: "text", content: "before" } } },
+    });
+    expect(existsSync(join(root, "slack:C1", "review", "run.sh"))).toBe(true);
+
+    const rollbackByName = Object.fromEntries(
+      spaceSkillToolDefinitions(store, {
+        audit: createAudit(store),
+        skillsRoot: root,
+        mutationHook(stage) {
+          if (stage === "after-backup") throw new Error("injected caller-level commit failure");
+        },
+      }).map((tool) => [tool.name, tool]),
     );
-    expect(res.isError).toBe(true);
-    expect(resultText(res)).toMatch(/space session/);
-    expect(existsSync(join(root))).toBe(false);
+    const failedCommit = await call(rollbackByName.update_space_skill!, {
+      name: "review",
+      expected_revision: created.revision,
+      document: DOC_V2,
+      companion_files: { "run.sh": { encoding: "text", content: "after" } },
+    });
+    expect(failedCommit.isError).toBe(true);
+    const afterRollback = await call(byName.get_space_skill!, { name: "review" });
+    expect(JSON.parse(text(afterRollback))).toMatchObject({
+      skill: { revision: created.revision, description: "Review v1.", companion_files: { "run.sh": { encoding: "text", content: "before" } } },
+    });
+  });
+
+  test("a non-space session cannot read or mutate the skill store", async () => {
+    const { root, byName } = harness("wrong-context");
+    const badContext = { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext;
+    for (const [name, params] of [
+      ["list_space_skills", {}],
+      ["get_space_skill", { name: "review" }],
+      ["create_space_skill", { name: "review", document: DOC_V1 }],
+      ["update_space_skill", { name: "review", expected_revision: "0".repeat(64), document: DOC_V1, companion_files: {} }],
+      ["delete_space_skill", { name: "review", expected_revision: "0".repeat(64) }],
+    ] as const) {
+      const result = await call(byName[name]!, params, badContext);
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain("space session");
+    }
+    expect(existsSync(root)).toBe(false);
   });
 });

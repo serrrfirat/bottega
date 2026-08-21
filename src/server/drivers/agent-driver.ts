@@ -48,7 +48,7 @@ import { redact } from "../../policy/audit";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import type { PolicyConfig } from "../../policy/config";
 import { loadSpacePolicy, resolveTier } from "../../policy/config";
-import { evaluatePolicyGate, summarizeArgs, type PolicyGateOutcome } from "../../policy/gate";
+import { evaluatePolicyGate, summarizeToolArgs, type PolicyGateOutcome } from "../../policy/gate";
 import type { PolicyExtensionDeps } from "../../policy/extension";
 import type { Store } from "../../store/db";
 import { humanizeToolName } from "../adapters/approval-router";
@@ -470,9 +470,13 @@ export const SPACE_AGENT_TOOLS = [
   "create_work_item",
   "work_item_cancel",
   "list_work_items",
-  // Skill governance (issues #234/#235, Tier 1): the policy-gated writer for
-  // the space's skill store — exec tier (ask-human) like create_work_item.
-  "write_space_skill",
+  // Complete selected-space lifecycle. Mutations remain exec-tier; reads
+  // are read-tier, and every successful mutation refreshes the next session.
+  "list_space_skills",
+  "get_space_skill",
+  "create_space_skill",
+  "update_space_skill",
+  "delete_space_skill",
   "connect_extension",
   "memory.save",
   "memory.search",
@@ -731,7 +735,7 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       const tier = deps.toolTier?.(def.name) ?? resolveTier(def.name);
-      const stepArgs = sink !== undefined ? redact(summarizeArgs(params)) : undefined;
+      const stepArgs = sink !== undefined ? redact(summarizeToolArgs(def.name, params)) : undefined;
       const taskId = nextToolStepId();
       // #295: the human-readable footer label for the tool NAME, derived at
       // the source (no internal tool identifiers reach Slack).

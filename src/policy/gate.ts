@@ -98,6 +98,54 @@ export function summarizeArgs<T>(input: T): string {
   return text.length > ARGS_SUMMARY_MAX ? `${text.slice(0, ARGS_SUMMARY_MAX)}...[truncated]` : text;
 }
 
+/**
+ * Tool-aware audit/step summary. Skill documents and companion bodies are
+ * executable operator content, so lifecycle mutations expose only byte
+ * counts and SHA-256 hashes even before schema validation or approval.
+ */
+export function summarizeToolArgs(tool: string, input: unknown): string {
+  if (tool !== "create_space_skill" && tool !== "update_space_skill") return summarizeArgs(input);
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return summarizeArgs({});
+  const args = input as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+  if (typeof args.name === "string") safe.name = args.name;
+  if (typeof args.expected_revision === "string") safe.expected_revision = args.expected_revision;
+  if (typeof args.document === "string") {
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(args.document);
+    safe.document = {
+      bytes: Buffer.byteLength(args.document, "utf8"),
+      sha256: hasher.digest("hex"),
+    };
+  }
+  if (args.companion_files !== null && typeof args.companion_files === "object" && !Array.isArray(args.companion_files)) {
+    safe.companion_files = Object.entries(args.companion_files as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([path, value]) => {
+        let bytes: Uint8Array;
+        let encoding: "text" | "base64" | "invalid" = "invalid";
+        if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+          const file = value as Record<string, unknown>;
+          if (file.encoding === "text" && typeof file.content === "string") {
+            bytes = Buffer.from(file.content, "utf8");
+            encoding = "text";
+          } else if (file.encoding === "base64" && typeof file.content === "string") {
+            bytes = Buffer.from(file.content, "base64");
+            encoding = "base64";
+          } else {
+            bytes = Buffer.from("");
+          }
+        } else {
+          bytes = Buffer.from("");
+        }
+        const hasher = new Bun.CryptoHasher("sha256");
+        hasher.update(bytes);
+        return { path, encoding, bytes: bytes.byteLength, sha256: hasher.digest("hex") };
+      });
+  }
+  return summarizeArgs(safe);
+}
+
 export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateCall): Promise<PolicyGateOutcome> {
   let policy = await deps.loadPolicy(call.spaceId);
   // Unknown extension ids in allow/deny are a structural error (issue #56):
@@ -130,8 +178,8 @@ export async function evaluatePolicyGate(deps: PolicyGateDeps, call: PolicyGateC
       tier: extensionTier ?? resolveTier(call.tool),
       decision,
       reason,
-      // Args are redacted and capped by appendAudit before the row is written.
-      args: summarizeArgs(call.args),
+      // Skill mutation bodies are reduced to sizes + hashes before audit.
+      args: summarizeToolArgs(call.tool, call.args),
     },
   });
 
