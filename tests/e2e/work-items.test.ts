@@ -246,7 +246,7 @@ function startExecutor(
       // Issue #335: the same hermetic runner double the executor unit tests
       // use (#101) — the real isolated job body in-process over the scoped
       // store, so prepareExecutor's fail-closed guard passes without Docker
-      // while production wiring (createChildProcessSandboxRunner) stays
+      // while production wiring (createDockerSandboxRunner) stays
       // untouched.
       sandboxRunner: inProcessSandboxRunner(),
     },
