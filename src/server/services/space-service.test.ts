@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionContext, Skill, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../../store/db";
 import type { MemoryProvider, MemoryProviderCapabilities, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
-import { sessionFilePath, SessionModelRoleRegistry, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
+import { sessionFilePath, SessionModelRoleRegistry, FORBIDDEN_SPACE_HOST_TOOLS, spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, THINKING_PHRASES, emptyResponseFallback, churnMessageText, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
 import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
 import type { ResponseMode } from "../../policy/config";
@@ -158,6 +158,8 @@ interface CreateSessionOpts {
   onOutput: (spaceId: string, text: string) => void;
   getPrincipal?: () => string | undefined;
   appendSystemPrompt?: string;
+  /** The session tool allowlist the service requests (space-agent default) — captured for #338 boundary assertions. */
+  allowTools?: readonly string[];
   /** Space-authored skills injected at cold start (issues #234/#235). */
   skills?: readonly Skill[];
 }
@@ -940,6 +942,39 @@ describe("SpaceService session lifecycle", () => {
     await service.handleInboundMessage(msg({ principal: "UB", ts: "3.3" }));
     expect(session.prompts[2].opts).toEqual({ principal: "UB" }); // fresh turn
     expect(getPrincipal()).toBe("UB");
+  });
+
+  test("issue #338: the default space session surfaces create_work_item, never a host shell/filesystem/subagent tool", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver });
+
+    // A shell request arrives on the Slack channel. The service cold-starts
+    // the default space session (no explicit executor allowTools), so the
+    // session's requested tool surface must be the #338-boundaried space
+    // allowlist: the ONLY local-work delegation surface is create_work_item
+    // (which dispatches into a one-job Docker sandbox); no host-native
+    // shell/filesystem/subagent tool may be present.
+    await service.handleInboundMessage(msg({ text: "run git status in a shell", ts: "1.1" }));
+
+    expect(driver.created).toHaveLength(1);
+    const sessionTools = driver.created[0]!.opts.allowTools ?? [];
+    // Sanctioned surfaces: orchestration/conversation + the work-delegation
+    // tool that routes local execution into the sandbox.
+    expect(sessionTools).toContain("create_work_item");
+    expect(sessionTools).toContain("web_search");
+    // No host-native surface (issue #338): a shell request cannot execute
+    // locally — the only path is create_work_item.
+    for (const forbidden of FORBIDDEN_SPACE_HOST_TOOLS) {
+      expect(sessionTools).not.toContain(forbidden);
+    }
+    // The service wires the boundary at the shared assembly point.
+    expect([...sessionTools].sort()).toEqual(
+      spaceAgentToolNames([], undefined, [], { applyHostToolBoundary: true }).sort(),
+    );
+    // The conversation surface still answers (the model decides the reply).
+    expect(driver.last().prompts).toEqual([{ text: "run git status in a shell", opts: { principal: "U1" } }]);
   });
 });
 

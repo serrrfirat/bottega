@@ -27,6 +27,7 @@ import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
   ensureAgentDirModelPin,
+  FORBIDDEN_SPACE_HOST_TOOLS,
   opencodeSafeToolName,
   sessionFilePath,
   SPACE_AGENT_TOOLS,
@@ -230,18 +231,18 @@ describe("createOmpSdkDriver toolset contract", () => {
         expect(customToolNames).not.toContain("weather.current");
 
         // The REAL session built from the driver's exact options surfaces the
-        // space-agent toolset: conversational/read-only tools + custom tools,
-        // and never the executor tools (write/bash/edit are executor-only).
+        // space-agent toolset: conversation/orchestration + custom tools only.
+        // Issue #338: a default space session never surfaces host-native
+        // shell/filesystem/subagent tools — not even read/glob/grep/task.
         const { session } = await createAgentSession(captured!);
         const active = session.getActiveToolNames();
-        for (const name of ["read", "glob", "grep", "web_search", "task", "inspect_image"]) {
-          expect(active).toContain(name);
-        }
+        expect(active).toContain("web_search");
         expect(active).toContain("weather_current");
         expect(active).toContain("linear_search_issues");
-        expect(active).not.toContain("write");
-        expect(active).not.toContain("bash");
-        expect(active).not.toContain("edit");
+        // No host-native surface (issue #338).
+        for (const forbidden of FORBIDDEN_SPACE_HOST_TOOLS) {
+          expect(active).not.toContain(forbidden);
+        }
         session.beginDispose();
         await session.dispose();
       } finally {
@@ -261,7 +262,7 @@ describe("createOmpSdkDriver toolset contract", () => {
       "linear.create_issue",
     ]);
     // Already-allowlisted floor tools dedupe.
-    expect(spaceAgentToolNames([], undefined, ["read"])).toEqual([...SPACE_AGENT_TOOLS]);
+    expect(spaceAgentToolNames([], undefined, ["web_search"])).toEqual([...SPACE_AGENT_TOOLS]);
     // Floor merges before extension tools.
     expect(spaceAgentToolNames(["ext.tool"], undefined, ["floor.tool"])).toEqual([
       ...SPACE_AGENT_TOOLS,
@@ -270,6 +271,12 @@ describe("createOmpSdkDriver toolset contract", () => {
     ]);
     // An explicit allowTools override still gains the floor.
     expect(spaceAgentToolNames([], ["read", "grep"], ["floor.tool"])).toEqual(["read", "grep", "floor.tool"]);
+    // Issue #338: when the space-agent boundary is applied, a forbidden
+    // host-native floor tool is stripped — the default space session can
+    // never be widened back to bash/read/etc. through a persona.
+    expect(
+      spaceAgentToolNames([], undefined, ["read", "bash", "task"], { applyHostToolBoundary: true }),
+    ).toEqual([...SPACE_AGENT_TOOLS]);
   });
 
   test("a persona floor plumbed through allowTools reaches the session toolNames", async () => {
@@ -290,7 +297,9 @@ describe("createOmpSdkDriver toolset contract", () => {
           spaceId: "slack:C1",
           transcriptDir: join(dir, "sessions"),
           onOutput: () => {},
-          allowTools: spaceAgentToolNames([], undefined, ["linear.create_issue"]),
+          allowTools: spaceAgentToolNames([], undefined, ["linear.create_issue"], {
+            applyHostToolBoundary: true,
+          }),
         }),
       ).rejects.toThrow("factory stub: no real session");
       // The floor tool reaches the session toolNames under its gateway-safe
@@ -298,7 +307,12 @@ describe("createOmpSdkDriver toolset contract", () => {
       // boundary, #78); the canonical dotted name survives in the policy
       // gate's closure, never on the session surface.
       expect(captured?.toolNames).toContain("linear_create_issue");
-      expect(captured?.toolNames).toContain("read");
+      expect(captured?.toolNames).toContain("web_search");
+      // Issue #338: the space-service boundary is applied, so a host-native
+      // tool is never on the surfaced toolNames.
+      expect(captured?.toolNames).not.toContain("read");
+      expect(captured?.toolNames).not.toContain("bash");
+      expect(captured?.toolNames).not.toContain("task");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

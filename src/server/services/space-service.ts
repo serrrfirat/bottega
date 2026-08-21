@@ -671,7 +671,13 @@ export class SpaceService {
       // A persona floor widens only the visible session toolset (#130).
       // The existing per-space policy gate still decides whether each call
       // is allowed, so a restrictive space overlay always wins.
-      allowTools: spaceAgentToolNames([], undefined, persona?.toolFloor),
+      // Issue #338: the default space session applies the host-tool
+      // boundary — a persona floor (or any merge) can never reintroduce a
+      // host-native shell/filesystem/subagent tool; local work routes
+      // through create_work_item into the Docker sandbox.
+      allowTools: spaceAgentToolNames([], undefined, persona?.toolFloor, {
+        applyHostToolBoundary: true,
+      }),
       // Output arrives on the session's event channel below. onOutput is the
       // same signal (both drivers emit both), so it must stay unconsumed or
       // every reply would be posted twice.

@@ -27,6 +27,7 @@ import { EXTENSION_CALL_EVENT, POLICY_DECISION_EVENT } from "../../store/audit-e
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
+  FORBIDDEN_SPACE_HOST_TOOLS,
   OmpSessionDriver,
   opencodeSafeToolName,
   opencodeToolNameMap,
@@ -251,26 +252,18 @@ describe("omp sdk agent driver", () => {
     }
   });
 
-  test("space-agent allowlist: conversation/read-only + task + queue/memory/session/connect/model/settings tools, no executor tools", () => {
-    // The space agent is a participant, not an executor: it may read the
-    // workspace, delegate via task, and use the work-item + memory + model
-    // tools — never write/bash/edit (those are EXECUTOR_TOOLS in
-    // executor.ts). The connect capability (issue #52) is listed here; its
-    // definition rides the custom-tools path, see createOmpSdkDriver. The
-    // model tools (issue #64) are the chat settings/role-switch surface;
-    // the settings tool (issue #67) is the durable org/space settings
-    // surface.
+  test("space-agent allowlist: conversation/orchestration only — no host-native shell, filesystem, or subagent tools (issue #338)", () => {
+    // The default space agent is a participant, not an executor (issue
+    // #338): it may orchestrate (work items, memory, policy, model, connect)
+    // and call structurally bounded remote tools (web_search), but NEVER
+    // reaches the server host through bash/write/edit/read/glob/grep/
+    // ast_grep/lsp/inspect_image, and never starts an in-process `task`
+    // subagent. Local work dispatches through create_work_item into a
+    // one-job Docker sandbox.
     const allowed: readonly string[] = SPACE_AGENT_TOOLS;
     expect([...allowed].sort()).toEqual(
       [
-        "read",
-        "glob",
-        "grep",
-        "ast_grep",
         "web_search",
-        "inspect_image",
-        "lsp",
-        "task",
         "create_work_item",
         "work_item_cancel",
         "list_work_items",
@@ -311,9 +304,44 @@ describe("omp sdk agent driver", () => {
         "explain_policy",
       ].sort(),
     );
-    expect(SPACE_AGENT_TOOLS).not.toContain("write");
-    expect(SPACE_AGENT_TOOLS).not.toContain("bash");
-    expect(SPACE_AGENT_TOOLS).not.toContain("edit");
+    // No host-native surface may be exposed to the default space agent
+    // (issue #338): shell, host filesystem read/edit, file/image inspection,
+    // LSP, or in-process subagent must all be absent. Local work only
+    // through create_work_item.
+    for (const forbidden of FORBIDDEN_SPACE_HOST_TOOLS) {
+      expect(SPACE_AGENT_TOOLS).not.toContain(forbidden);
+    }
+    // The sanctioned delegation + orchestration surfaces stay.
+    expect(SPACE_AGENT_TOOLS).toContain("create_work_item");
+    expect(SPACE_AGENT_TOOLS).toContain("web_search");
+  });
+
+  test("spaceAgentToolNames: the #338 host-tool boundary strips forbidden names even when re-added", () => {
+    // Fail closed: a persona floor, an explicit allowTools override, or a
+    // merged extension name can never reintroduce a host-native
+    // shell/filesystem/subagent tool into the DEFAULT space-agent session.
+    const boundary = { applyHostToolBoundary: true } as const;
+    expect(spaceAgentToolNames([], undefined, [], boundary)).toEqual([...SPACE_AGENT_TOOLS]);
+    // Persona floor cannot re-add a forbidden native name.
+    expect(spaceAgentToolNames([], undefined, ["read"], boundary)).toEqual([...SPACE_AGENT_TOOLS]);
+    expect(spaceAgentToolNames([], undefined, ["bash", "edit", "grep"], boundary)).toEqual([...SPACE_AGENT_TOOLS]);
+    // An explicit allowTools override cannot re-add them either.
+    expect(
+      spaceAgentToolNames([], ["read", "grep", "create_work_item"], [], boundary).sort(),
+    ).toEqual(["create_work_item"]);
+    // Merged extension/custom tool names are stripped too.
+    expect(
+      spaceAgentToolNames(["task", "bash", "weather.current"], ["create_work_item"], [], boundary).sort(),
+    ).toEqual(["create_work_item", "weather.current"]);
+    // Without the opt-in (an executor-style explicit allowTools) nothing is
+    // stripped — executors run inside a sandbox and keep bash/write/read.
+    expect(spaceAgentToolNames(["ext.tool"], ["bash", "read", "write"], ["grep"], undefined).sort()).toEqual([
+      "bash",
+      "read",
+      "write",
+      "grep",
+      "ext.tool",
+    ]);
   });
 
   test("spaceAgentToolNames merges extension tools after the allowlist", () => {

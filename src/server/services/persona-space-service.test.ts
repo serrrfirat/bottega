@@ -107,8 +107,13 @@ describe("SpaceService department personas (issue #130)", () => {
     await service.handleInboundMessage({ spaceId: "slack:C130", principal: "U1", text: "triage", ts: "2.0" });
 
     expect(driver.sessions[0]?.allowTools).toEqual(
-      expect.arrayContaining(["read", "memory.search", "memory.save", "create_work_item", "linear.create_issue"]),
+      expect.arrayContaining(["web_search", "memory.search", "memory.save", "create_work_item", "linear.create_issue"]),
     );
+    // Issue #338: the persona floor widens the surface but never re-adds a
+    // host-native shell/filesystem/subagent tool to the space session.
+    expect(driver.sessions[0]?.allowTools).not.toContain("read");
+    expect(driver.sessions[0]?.allowTools).not.toContain("bash");
+    expect(driver.sessions[0]?.allowTools).not.toContain("task");
     await service.stop();
   });
 });

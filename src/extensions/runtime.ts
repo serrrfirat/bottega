@@ -42,9 +42,9 @@
  * keeps internal names (localhost, data, auth-broker, mem0) direct — the
  * proxy env passthrough is Bun-native (proven in src/egress/proxy-env.test.ts).
  */
+import { isIP } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -456,10 +456,96 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
 }
 
 /**
- * The production MCP transport for a binding (issue #53): streamable-http
- * for remote official servers, stdio for preinstalled servers. Shared by
- * the runtime's call path and the manifest tool generator's tools/list
- * discovery (issue #157); tests inject in-memory transports instead.
+ * Throws when `host` is a loopback / link-local / private-network /
+ * cloud-metadata (or otherwise non-public) destination that the SERVER must
+ * never reach with a model-controlled MCP transport (issue #338). Public,
+ * fully-qualified hostnames pass — reachability and credential routing stay
+ * the iron-proxy egress policy's job, not this guard's (no egress-policy
+ * duplication). DNS names that cannot be public internet (single-label
+ * `localhost`, bare internal labels, or reserved internal TLDs) and IP
+ * literals in a private/loopback/link-local/reserved range are rejected
+ * fail-closed before a transport could be created.
+ */
+export function assertPublicMcpEndpointHost(host: string): void {
+  if (host === "") {
+    throw new Error("MCP serverUrl has no host — refusing a Unix-socket / empty-authority http endpoint");
+  }
+  const normalized = host.toLowerCase();
+  if (isIP(host) !== 0) {
+    if (isBlockedIpLiteral(host)) {
+      throw new Error(`MCP serverUrl host "${host}" is a loopback/link-local/private/reserved address — refused server-side`);
+    }
+    return;
+  }
+  // DNS name: reject anything that cannot be public internet.
+  const labels = normalized.split(".");
+  if (labels.length < 2) {
+    throw new Error(`MCP serverUrl host "${host}" is a bare internal/single-label name — refused server-side`);
+  }
+  if (labels.some((label) => label === "")) {
+    throw new Error(`MCP serverUrl host "${host}" has an empty DNS label — refused server-side`);
+  }
+  const tld = labels[labels.length - 1]!;
+  if (INTERNAL_HOST_SLICE[tld] === true || RESERVED_INTERNAL_TLDS[tld] === true || normalized === "localhost") {
+    throw new Error(`MCP serverUrl host "${host}" is an internal/reserved destination — refused server-side`);
+  }
+}
+
+/** IP literals whose leading octets are a private, loopback, or link-local range. */
+function isBlockedIpLiteral(ip: string): boolean {
+  if (isIP(ip) === 4) {
+    if (ip === "0.0.0.0") return true;
+    const octets = ip.split(".").map((octet) => Number.parseInt(octet, 10));
+    const a = octets[0];
+    const b = octets[1];
+    if (a === undefined || b === undefined) return true;
+    if (a === 10) return true; // 10/8  private
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 127) return true; // loopback
+    if (a === 169 && b === 254) return true; // link-local + cloud-metadata (169.254.169.254)
+    if (a >= 224) return true; // multicast + reserved
+    return false;
+  }
+  // IPv6: collapse and test leading hextets.
+  const lower = ip.toLowerCase();
+  // ::1 (loopback), :: (unspecified), ff00::/8 (multicast).
+  if (lower === "::1" || lower === "::") return true;
+  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) return true; // fe80::/10 link-local
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // fc00::/7 unique-local
+  if (lower.startsWith("ff")) return true; // ff00::/8 multicast
+  // IPv4-mapped (::ffff:a.b.c.d) — recurse on the tail.
+  const v4mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4mapped !== null) return isBlockedIpLiteral(v4mapped[1]!);
+  return false;
+}
+
+/** Reserved internal TLDs that can never be public internet. */
+const RESERVED_INTERNAL_TLDS: Record<string, true> = Object.fromEntries(
+  ["local", "internal", "home", "localhost", "lan", "intranet", "arpa"].map((suffix) => [suffix, true]),
+);
+
+/**
+ * Leading labels that always denote an internal machine (never a public
+ * internet hostname the model may reach).
+ */
+const INTERNAL_HOST_SLICE: Record<string, true> = Object.fromEntries(
+  ["metadata", "localhost"].map((slice) => [slice, true]),
+);
+
+/**
+ * The production MCP transport for a binding (issue #53): remote
+ * streamable-http for official servers; stdio for preinstalled servers.
+ * Shared by the runtime's call path and the manifest tool generator's
+ * tools/list discovery (issue #157); tests inject in-memory transports
+ * instead.
+ *
+ * Issue #338 boundary: the SERVER only ever creates a remote Streamable
+ * HTTP transport to a PUBLIC host. stdio/local-command MCP and
+ * loopback/private/link-local/metadata/Unix-socket endpoints are refused
+ * before a transport object exists — they belong to the work-item Docker
+ * sandbox, not the server process. Validation runs before transport
+ * creation so an unsafe binding can never reach the MCP SDK.
  *
  * For streamable-http bindings whose credential is an OAuth token (issue
  * #198), the optional `authProvider` attaches the MCP SDK's OAuth client:
@@ -474,27 +560,42 @@ export function defaultMcpTransport(
   authProvider?: OAuthClientProvider,
   authorization?: AuthorizationContext,
 ): Transport {
-  if (binding.transport === "streamable-http") {
-    const headers =
-      authorization === undefined
-        ? undefined
-        : { Authorization: `Bearer ${authorization.placeholder}` };
-    return new StreamableHTTPClientTransport(new URL(binding.serverUrl), {
-      ...(authProvider !== undefined ? { authProvider } : undefined),
-      ...(headers !== undefined ? { requestInit: { headers } } : undefined),
-      ...(authorization !== undefined
-        ? {
-            fetch: (input, init) =>
-              fetch(input, { ...init, signal: authorization.signal }),
-          }
-        : undefined),
-    });
+  // stdio / local-command MCP belongs in the one-job Docker sandbox, never
+  // the server process (issue #338): the model must not reach a local
+  // process or the host filesystem through MCP. Fail closed before any
+  // StdioClientTransport is created.
+  if (binding.transport !== "streamable-http") {
+    throw new Error(
+      "MCP stdio/local-command bindings are refused in the server process (issue #338) — " +
+        "stdio MCP belongs in a one-job Docker sandbox; server-side MCP is remote Streamable HTTP only",
+    );
   }
-  // stderr: "pipe" (issue #205): the discovery/call paths drain a bounded
-  // prefix, so a misbehaving stdio server's exec noise (e.g. a shell
-  // interpreting the MCP JSON-RPC) never reaches the server log and the
-  // child cannot deadlock on an unwritten stderr buffer.
-  return new StdioClientTransport({ command: binding.command, stderr: "pipe" });
+  let serverUrl: URL;
+  try {
+    serverUrl = new URL(binding.serverUrl);
+  } catch {
+    throw new Error(`MCP serverUrl is not a valid URL: ${binding.serverUrl}`);
+  }
+  if (serverUrl.protocol !== "http:" && serverUrl.protocol !== "https:") {
+    throw new Error(`MCP serverUrl must be an http(s) URL (got "${serverUrl.protocol}")`);
+  }
+  // Reject loopback/link-local/private/metadata/Unix-socket destinations
+  // BEFORE a StreamableHTTPClientTransport is constructed.
+  assertPublicMcpEndpointHost(serverUrl.hostname);
+  const headers =
+    authorization === undefined
+      ? undefined
+      : { Authorization: `Bearer ${authorization.placeholder}` };
+  return new StreamableHTTPClientTransport(serverUrl, {
+    ...(authProvider !== undefined ? { authProvider } : undefined),
+    ...(headers !== undefined ? { requestInit: { headers } } : undefined),
+    ...(authorization !== undefined
+      ? {
+          fetch: (input, init) =>
+            fetch(input, { ...init, signal: authorization.signal }),
+        }
+      : undefined),
+  });
 }
 
 /**

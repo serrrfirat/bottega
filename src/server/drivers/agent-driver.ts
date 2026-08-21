@@ -446,11 +446,53 @@ export function collectTextBlocks(message: { content?: unknown } | null): string
 }
 
 /**
- * Space agent tool allowlist: conversation/read-only tools + `task` for
- * delegating to work executors. Deliberately no bash/write/edit — the space
- * agent is a participant, not an executor. The work item queue tools
- * (issue #10) are listed so the agent can create, cancel, and list work
- * items (issue #159), and (issue #22) so it can save and search memory. The connect capability
+ * Host-native tool names the DEFAULT space agent (the Slack conversation /
+ * orchestration plane) must NEVER surface (issue #338). The server process
+ * runs the conversation agent and MUST NOT expose to the model any shell,
+ * host filesystem traversal/edit, LSP, image/file inspection, or in-process
+ * subagent capability — local execution happens only through
+ * `create_work_item`, which dispatches into a one-job Docker sandbox.
+ *
+ * This set is fail-closed: any of these names arriving from the default
+ * allowlist, a persona floor, or an extension/merge path is stripped at the
+ * space-session tool assembly point (see spaceAgentToolNames). Explicit
+ * WORK-EXECUTOR allowlists (which run inside a sandbox and intentionally
+ * receive bash/write/read/etc.) are NOT filtered — see EXECUTOR_TOOLS.
+ *
+ * `web_search` is intentionally NOT here: it is a structurally bounded
+ * remote API call that still crosses the shared policy gate.
+ */
+export const FORBIDDEN_SPACE_HOST_TOOLS = [
+  "bash",
+  "write",
+  "edit",
+  "read",
+  "glob",
+  "grep",
+  "ast_grep",
+  "lsp",
+  "inspect_image",
+  "task",
+] as const;
+
+const FORBIDDEN_SPACE_HOST_TOOL_SET: Record<string, true> = Object.fromEntries(
+  FORBIDDEN_SPACE_HOST_TOOLS.map((name) => [name, true]),
+);
+
+/** True when `name` is a host-native tool the default space agent must not surface (#338). */
+function isForbiddenSpaceHostTool(name: string): boolean {
+  return FORBIDDEN_SPACE_HOST_TOOL_SET[name] === true;
+}
+
+/**
+ * Space agent tool allowlist: conversation + orchestration tools only.
+ * Deliberately no host execution surface — no bash/write/edit/read/glob/
+ * grep/ast_grep/lsp/inspect_image and no in-process `task`: the space agent
+ * is a participant, not an executor, and any local shell/filesystem work it
+ * needs is dispatched through `create_work_item` into a one-job Docker
+ * sandbox (issue #338). The work item queue tools (issue #10) are listed so
+ * the agent can create, cancel, and list work items (issue #159), and
+ * (issue #22) so it can save and search memory. The connect capability
  * (issue #52) rides the custom-tools path
  * (createOmpSdkDriver builds its definition per session) and is listed here
  * so the allowlist documents it — keep in sync with PROJECT_TOOL_NAMES.
@@ -458,14 +500,7 @@ export function collectTextBlocks(message: { content?: unknown } | null): string
  * per-space model settings and switch its own next-turn model role.
  */
 export const SPACE_AGENT_TOOLS = [
-  "read",
-  "glob",
-  "grep",
-  "ast_grep",
   "web_search",
-  "inspect_image",
-  "lsp",
-  "task",
   "create_work_item",
   "work_item_cancel",
   "list_work_items",
@@ -522,11 +557,27 @@ export const SPACE_AGENT_TOOLS = [
  * The SDK's restricted sessions only surface custom tools that are ALSO
  * named here (see allowRestrictedCustomTools), so extension tools must be
  * merged into the list the driver passes.
+ *
+ * Issue #338 host-tool boundary: when `opts.applyHostToolBoundary` is true
+ * (the DEFAULT space conversation session — the production caller sets it
+ * at src/server/services/space-service.ts, and the driver's default
+ * allowTools-undefined branch opts in), any forbidden host-native tool name
+ * (bash/write/edit/read/glob/grep/ast_grep/lsp/inspect_image/`task`) is
+ * stripped from the assembled list — even when a persona floor or a
+ * merged extension/tool name reintroduces it. Fail closed: a forbidden name
+ * can never be surfaced by the space agent through the floor, extension
+ * merging, or malformed configuration.
+ *
+ * Explicit WORK-EXECUTOR allowlists (which run inside a one-job Docker
+ * sandbox and intentionally receive bash/write/read/etc.) are NOT filtered:
+ * `applyHostToolBoundary` is only ever true on the space-agent assembly
+ * path, so executor sessions keep exactly the tools the caller requested.
  */
 export function spaceAgentToolNames(
   extensionToolNames: readonly string[],
   allowTools?: readonly string[],
   toolFloor: readonly string[] = [],
+  opts?: { applyHostToolBoundary?: boolean },
 ): string[] {
   const names = allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS];
   for (const name of toolFloor) {
@@ -534,6 +585,9 @@ export function spaceAgentToolNames(
   }
   for (const name of extensionToolNames) {
     if (!names.includes(name)) names.push(name);
+  }
+  if (opts?.applyHostToolBoundary === true) {
+    return names.filter((name) => !isForbiddenSpaceHostTool(name));
   }
   return names;
 }
@@ -1311,8 +1365,16 @@ export function createOmpSdkDriver(
       const customNames = new Set(
         [...gatedTools, ...sessionCustomTools].map((def) => def.name),
       );
+      // Issue #338: the allowTools-absent branch is the DEFAULT space-agent
+      // surface, so the host-tool boundary applies. An explicit allowTools
+      // (a pre-filtered space list from space-service, or an executor
+      // allowlist that intentionally receives bash/write/read) passes
+      // through unfiltered — executors run in a sandbox and keep their tools.
+      const applyHostBoundary = allowTools === undefined;
       const builtinNames = gate
-        ? spaceAgentToolNames([...customNames], allowTools).filter(
+        ? spaceAgentToolNames([...customNames], allowTools, [], {
+            applyHostToolBoundary: applyHostBoundary,
+          }).filter(
             (name) =>
               !customNames.has(name) &&
               GATE_WRAPPED_BUILTINS.some((builtin) => builtin === name),
@@ -1410,6 +1472,9 @@ export function createOmpSdkDriver(
           // The allowlist vocabulary stays canonical (policy/gate), but the
           // session's toolNames must name the gateway-safe forms (issue #78).
           (allowTools ? [...allowTools] : [...SPACE_AGENT_TOOLS]).map(opencodeSafeToolName),
+          [],
+          // Issue #338 default-space boundary (see applyHostBoundary above).
+          { applyHostToolBoundary: applyHostBoundary },
         ),
         // Extension seam: kept for unrestricted sessions and API compat; under
         // restrictToolNames the SDK ignores it (issue #69) — the gate and the

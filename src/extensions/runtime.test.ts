@@ -30,7 +30,7 @@ import type { CredentialBoundary } from "./boundary";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "./fixture";
 import { validateManifest, type ExtensionManifest, type JsonObject, type McpBinding } from "./manifest";
 import { createExtensionRegistry } from "./registry";
-import { createExtensionRuntime, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
+import { createExtensionRuntime, assertPublicMcpEndpointHost, defaultMcpTransport, type ExtensionRuntime, type ExtensionRuntimeDeps } from "./runtime";
 import { resetToolSurfaceCache, resolveExtensionSurfaces } from "./surface";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-runtime-"));
@@ -1101,5 +1101,84 @@ describe("extension runtime: array/object MCP params restore native JSON before 
 
     expect(result.ok).toBe(true);
     expect(seen[0]!.args).toEqual({ fields: ["id", "name"], filters: { state: "open" } });
+  });
+});
+
+describe("issue #338 MCP transport boundary (server-side, reject before transport creation)", () => {
+  test("assertPublicMcpEndpointHost accepts public FQ hosts and rejects internal destinations", () => {
+    const publicHosts = [
+      "api.github.com",
+      "mcp.linear.app",
+      "mcp.notion.so",
+      "sub.example.co.uk",
+      "8.8.8.8",
+      "9.9.9.9",
+      "example.com",
+    ];
+    for (const host of publicHosts) {
+      expect(() => assertPublicMcpEndpointHost(host)).not.toThrow();
+    }
+    // loopback / private / link-local / metadata / arbitrary endpoint
+    // overrides are all rejected by the same guard.
+    const blocked = [
+      "localhost",
+      "127.0.0.1",
+      "127.0.0.2",
+      "10.0.0.5",
+      "172.16.5.4",
+      "172.31.255.255",
+      "192.168.1.1",
+      "169.254.169.254", // cloud metadata
+      "169.254.10.10", // link-local
+      "0.0.0.0",
+      "224.0.0.1",
+      "::1",
+      "::",
+      "fe80::1",
+      "fc00::1",
+      "metadata",
+      "metadata.google.internal",
+      "postgres", // single label
+      "service.local",
+      "host.internal",
+      "server.lan",
+    ];
+    for (const host of blocked) {
+      expect(() => assertPublicMcpEndpointHost(host)).toThrow();
+    }
+  });
+
+  test("defaultMcpTransport refuses stdio/local-command MCP bindings in the server process", () => {
+    // stdio MCP belongs in the one-job Docker sandbox, never the server.
+    expect(() =>
+      defaultMcpTransport({ command: "linear-mcp", transport: "stdio" }),
+    ).toThrow(/stdio|streamable/i);
+  });
+
+  test("defaultMcpTransport refuses loopback/private/link-local/metadata server URLs before transport creation", () => {
+    for (const url of [
+      "http://127.0.0.1:3000/mcp",
+      "http://localhost:8080/mcp",
+      "http://10.1.2.3/mcp",
+      "http://192.168.0.10/mcp",
+      "http://169.254.169.254/latest/meta-data", // cloud metadata
+      "http://internal.example/mcp",
+      "http://postgres/mcp",
+    ]) {
+      expect(() =>
+        defaultMcpTransport({ serverUrl: url, transport: "streamable-http" }),
+      ).toThrow();
+    }
+  });
+
+  test("defaultMcpTransport still builds a valid remote HTTPS transport without throwing", () => {
+    // A valid pinned remote HTTPS endpoint must remain compatible: no throw,
+    // a transport object is produced (the iron-proxy/policy egress path
+    // governs reachability, not this guard).
+    const transport = defaultMcpTransport({
+      serverUrl: "https://mcp.linear.app/mcp",
+      transport: "streamable-http",
+    });
+    expect(transport).toBeDefined();
   });
 });
