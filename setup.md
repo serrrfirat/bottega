@@ -98,6 +98,16 @@ spaces never receive unsolicited posts. On restart, the scheduler skips
 overdue occurrences instead of catching up, advances each job to its next
 future occurrence, and records `scheduler.missed` in the audit trail.
 
+Use `list_scheduler_jobs` to see the current revision, enabled state, and
+next/last fire time. In Slack, the list renders Pause/Resume and Run now
+controls. The same lifecycle is available through
+`update_scheduler_job`, `pause_scheduler_job`, `resume_scheduler_job`, and
+`run_scheduler_job_now`. Every mutation that targets an existing job takes
+`expected_revision`; refresh the list after a stale-revision error. Resume
+computes the next occurrence from the resume time. Run now creates one
+durable execution identity and uses the same scheduler claim/fire path as a
+cron occurrence. It does not move the recurring cron or `nextFireAt`.
+
 The `org_pulse` action is a weekly, read-only summary of recent digest and
 reflection memories. Create it with no job-level space and set
 `params` to `{"pulse_space":"slack:C123"}` so the summary posts to that
@@ -117,18 +127,27 @@ tools:
   create_scheduler_job: allow
   list_scheduler_jobs: allow
   delete_scheduler_job: allow
+  update_scheduler_job: allow
+  pause_scheduler_job: allow
+  resume_scheduler_job: allow
+  run_scheduler_job_now: allow
   kb_ingest: allow
 approvals:
   always_approve:
     - create_scheduler_job
     - delete_scheduler_job
+    - update_scheduler_job
+    - pause_scheduler_job
+    - resume_scheduler_job
+    - run_scheduler_job_now
 ```
 
-`create_scheduler_job` and `delete_scheduler_job` are exec-tier tools:
-`action: allow` still asks a human unless they appear in
-`approvals.always_approve`. Remove the `approvals` block when every
-scheduler mutation should require an Approve button. Listing is read-only,
-and KB ingestion is write-tier, so neither needs `always_approve`.
+All scheduler mutation tools are exec-tier: `action: allow` still asks a
+human unless the tool appears in `approvals.always_approve`. Remove the
+`approvals` block when every scheduler mutation should require an Approve
+button. Listing is read-only, and KB ingestion is write-tier, so neither
+needs `always_approve`. A space session can mutate only that space's jobs;
+org-wide or foreign-space jobs cross a second org approval gate.
 
 ## Work items
 

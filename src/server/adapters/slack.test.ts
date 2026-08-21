@@ -7,6 +7,9 @@ import {
   DELIVERY_APPROVE_ACTION_ID,
   DELIVERY_DENY_ACTION_ID,
   DENY_ACTION_ID,
+  SCHEDULER_PAUSE_ACTION_ID,
+  SCHEDULER_RESUME_ACTION_ID,
+  SCHEDULER_RUN_NOW_ACTION_ID,
   buildAppendTaskArgs,
   buildAppendTextArgs,
   buildPostMessageArgs,
@@ -386,6 +389,26 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
     expect(received.map((a) => a.actionId)).toEqual([DELIVERY_APPROVE_ACTION_ID, DELIVERY_DENY_ACTION_ID]);
     expect(received[0].value).toBe("wi_1");
     expect(received[1].value).toBe("wi_2");
+  });
+
+  test("delivers scheduler lifecycle clicks to onAction (issue #308)", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (action) => { received.push(action); });
+    for (const actionId of [
+      SCHEDULER_PAUSE_ACTION_ID,
+      SCHEDULER_RESUME_ACTION_ID,
+      SCHEDULER_RUN_NOW_ACTION_ID,
+    ]) {
+      await deliver({
+        ...approveBody,
+        actions: [{ type: "button", action_id: actionId, value: "{\"id\":\"sj_1\",\"revision\":1}" }],
+      });
+    }
+    expect(received.map((action) => action.actionId)).toEqual([
+      SCHEDULER_PAUSE_ACTION_ID,
+      SCHEDULER_RESUME_ACTION_ID,
+      SCHEDULER_RUN_NOW_ACTION_ID,
+    ]);
   });
 
   test("unrelated action ids do not reach onAction", async () => {

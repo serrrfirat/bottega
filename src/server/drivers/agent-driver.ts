@@ -487,6 +487,15 @@ export const SPACE_AGENT_TOOLS = [
   "stack_health",
   "deploy_info",
   "first_run_wizard",
+  // Scheduler lifecycle (issues #86/#308): read state and mutate through
+  // the same policy-gated custom-tool surface.
+  "create_scheduler_job",
+  "list_scheduler_jobs",
+  "update_scheduler_job",
+  "pause_scheduler_job",
+  "resume_scheduler_job",
+  "run_scheduler_job_now",
+  "delete_scheduler_job",
 ] as const;
 
 /**

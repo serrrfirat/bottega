@@ -149,6 +149,36 @@ export const MIGRATIONS: readonly Migration[] = [
       }
     },
   },
+  {
+    id: "011_add_scheduler_lifecycle",
+    up(db) {
+      if (!columnNames(db, "scheduler_jobs").includes("revision")) {
+        db.exec("ALTER TABLE scheduler_jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS scheduler_invocations (
+          id            TEXT PRIMARY KEY,
+          job_id        TEXT NOT NULL,
+          action        TEXT NOT NULL,
+          params        TEXT NOT NULL,
+          space_id      TEXT,
+          source        TEXT NOT NULL CHECK (source IN ('scheduled','manual')),
+          scheduled_for INTEGER,
+          requested_at  INTEGER NOT NULL,
+          job_revision  INTEGER NOT NULL,
+          status        TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','running','completed')),
+          claimed_at    INTEGER,
+          completed_at  INTEGER,
+          result        TEXT CHECK (result IN ('ok','error'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_claim
+          ON scheduler_invocations(status, requested_at, id);
+        CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_job
+          ON scheduler_invocations(job_id, requested_at, id);
+      `);
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {

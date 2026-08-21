@@ -78,6 +78,10 @@ export const DENY_ACTION_ID = "bottega_deny";
  */
 export const DELIVERY_APPROVE_ACTION_ID = "bottega_delivery_approve";
 export const DELIVERY_DENY_ACTION_ID = "bottega_delivery_deny";
+/** Scheduler lifecycle controls (issue #308). */
+export const SCHEDULER_PAUSE_ACTION_ID = "bottega_scheduler_pause";
+export const SCHEDULER_RESUME_ACTION_ID = "bottega_scheduler_resume";
+export const SCHEDULER_RUN_NOW_ACTION_ID = "bottega_scheduler_run_now";
 
 /**
  * A normalized interactive-component event (issue #44): a block-action
@@ -790,28 +794,29 @@ export function registerMessageHandler(
 }
 
 /**
- * Routes block-action clicks (exec-tier `bottega_approve` / `bottega_deny`
- * issue #44, and delivery `bottega_delivery_approve` /
- * `bottega_delivery_deny` issue #149) to `onAction`. Unparseable payloads
- * are dropped and logged, never thrown. Exported so the inbound wiring is
- * testable hermetically through the real Bolt router (`App.processEvent`,
- * issue #29); the adapter installs it on its app when `onAction` is
- * provided.
+ * Routes approval, delivery, and scheduler lifecycle block-action clicks
+ * to `onAction`. Unparseable payloads are dropped and logged, never thrown.
+ * Exported so the inbound wiring is testable hermetically through the real
+ * Bolt router (`App.processEvent`, issue #29); the adapter installs it on
+ * its app when `onAction` is provided.
  */
 export function registerActionHandler(
   app: Pick<App, "action">,
   onAction: (a: SlackAction) => Promise<void>,
 ): void {
-  app.action(/^bottega_(approve|deny|delivery_approve|delivery_deny)$/, async ({ action, body, ack, logger }) => {
-    // Ack first: Slack retries unacked interactive payloads.
-    await ack();
-    const normalized = normalizeActionEvent(action, body);
-    if (!normalized) {
-      logger.info("slack: dropping action event (unparseable)");
-      return;
-    }
-    await onAction(normalized);
-  });
+  app.action(
+    /^bottega_(approve|deny|delivery_approve|delivery_deny|scheduler_pause|scheduler_resume|scheduler_run_now)$/,
+    async ({ action, body, ack, logger }) => {
+      // Ack first: Slack retries unacked interactive payloads.
+      await ack();
+      const normalized = normalizeActionEvent(action, body);
+      if (!normalized) {
+        logger.info("slack: dropping action event (unparseable)");
+        return;
+      }
+      await onAction(normalized);
+    },
+  );
 }
 
 /**

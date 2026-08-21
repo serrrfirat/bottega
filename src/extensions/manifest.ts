@@ -155,6 +155,14 @@ export const PROJECT_TOOL_NAMES = [
   "stack_health",
   "deploy_info",
   "first_run_wizard",
+  // Scheduler lifecycle (issues #86/#308): policy-gated custom tools.
+  "create_scheduler_job",
+  "list_scheduler_jobs",
+  "update_scheduler_job",
+  "pause_scheduler_job",
+  "resume_scheduler_job",
+  "run_scheduler_job_now",
+  "delete_scheduler_job",
 ] as const;
 
 /**

@@ -104,7 +104,15 @@ describe("scheduler runner (issue #86)", () => {
     expect(updated?.nextFireAt).toBe(nextCronFire(job.cron, fireTime));
     const rows = await audit.listAudit({ event_type: SCHEDULER_FIRE_EVENT });
     expect(payloads(rows)).toEqual([
-      { id: job.id, action: action.name, space_id: null, result: "ok" },
+      {
+        id: job.id,
+        action: action.name,
+        space_id: null,
+        result: "ok",
+        invocation_id: `scheduled:${job.id}:${fireTime}`,
+        source: "scheduled",
+        scheduled_for: fireTime,
+      },
     ]);
   });
 
@@ -122,10 +130,23 @@ describe("scheduler runner (issue #86)", () => {
 
     expect((await store.getSchedulerJob(job.id))?.lastResult).toBe("error");
     expect(payloads(await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT }))).toEqual([
-      { id: job.id, action: "reflection", error: "reflection broke" },
+      {
+        id: job.id,
+        action: "reflection",
+        error: "reflection broke",
+        invocation_id: `scheduled:${job.id}:${fireTime}`,
+      },
     ]);
     expect(payloads(await audit.listAudit({ event_type: SCHEDULER_FIRE_EVENT }))).toEqual([
-      { id: job.id, action: "reflection", space_id: null, result: "error" },
+      {
+        id: job.id,
+        action: "reflection",
+        space_id: null,
+        result: "error",
+        invocation_id: `scheduled:${job.id}:${fireTime}`,
+        source: "scheduled",
+        scheduled_for: fireTime,
+      },
     ]);
   });
 
@@ -238,6 +259,7 @@ describe("scheduler runner (issue #86)", () => {
         lists += 1;
         return [];
       },
+      claimNextSchedulerInvocation: async () => null,
     } as never;
     const audit = {
       appendAudit: async () => 1,

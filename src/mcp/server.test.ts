@@ -38,6 +38,9 @@ import { sendMessageAction } from "../scheduler/send-message";
 import { reflectionAction } from "../scheduler/reflection";
 import { standupDigestAction } from "../scheduler/standup";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
+import { nextCronFire } from "../scheduler/cron";
+import { tickScheduler } from "../scheduler/runner";
+import type { SchedulerJob } from "../scheduler/types";
 import { kbToolDefinitions } from "../tools/kb-tools";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { workItemToolDefinitions } from "../tools/work-items";
@@ -48,6 +51,11 @@ import {
   EXTENSION_CONNECTED_EVENT,
   EXTENSION_CREDENTIAL_RESOLVED_EVENT,
   POLICY_DECISION_EVENT,
+  SCHEDULER_FIRE_EVENT,
+  SCHEDULER_JOB_PAUSED_EVENT,
+  SCHEDULER_JOB_RESUMED_EVENT,
+  SCHEDULER_JOB_UPDATED_EVENT,
+  SCHEDULER_RUN_REQUESTED_EVENT,
   WORK_ITEM_CREATED_EVENT,
 } from "../store/audit-events";
 import type { CredentialBoundary } from "../extensions/boundary";
@@ -204,7 +212,9 @@ const ALLOW_ALL = "tools:\n  memory.save: allow\n  memory.search: allow\n  sessi
      */
     internal?: boolean;
     /** Internal-surface overrides (issue #206 tests): the catalog seam / KB config. */
-    internalOptions?: Partial<Pick<McpInternalToolsOptions, "agentDir" | "listModels" | "kb" | "schedulerRegistry">>;
+    internalOptions?: Partial<
+      Pick<McpInternalToolsOptions, "agentDir" | "listModels" | "kb" | "schedulerRegistry" | "schedulerNow">
+    >;
   } = {}): Promise<InProcessHarness> {
     const dir = mkdtempSync(join(tmpdir(), "bottega-mcp-inproc-"));
     const store = createStore(join(dir, "test.db"));
@@ -352,8 +362,12 @@ describe("MCP server conformance (spawned entrypoint)", () => {
         "memory.save",
         "memory.search",
         "model_settings",
+        "pause_scheduler_job",
+        "resume_scheduler_job",
+        "run_scheduler_job_now",
         "session_search",
         "work_item_cancel",
+        "update_scheduler_job",
         "write_space_skill",
       ]);
 
@@ -573,6 +587,115 @@ describe("MCP server conformance (spawned entrypoint)", () => {
   });
 });
 
+
+describe("MCP scheduler lifecycle caller surface (issue #308)", () => {
+  test("drives update, pause, resume, and run-now through the durable runner with fake time", async () => {
+    let now = Date.UTC(2026, 7, 21, 12, 34);
+    const calls: Array<Record<string, string>> = [];
+    const schedulerRegistry = buildRegistry([
+      {
+        name: "send_message",
+        run: async (params) => {
+          calls.push(params);
+        },
+      },
+    ]);
+    const policy = parseOrgConfigYaml(
+      "tools:\n" +
+        "  unknown: allow\n" +
+        "approvals:\n" +
+        "  always_approve:\n" +
+        "    - update_scheduler_job\n" +
+        "    - pause_scheduler_job\n" +
+        "    - resume_scheduler_job\n" +
+        "    - run_scheduler_job_now\n",
+    );
+    const h = await makeInProcessHarness({
+      policy,
+      internalOptions: { schedulerRegistry, schedulerNow: () => now },
+    });
+    try {
+      const names = (await h.client.listTools()).tools.map(({ name }) => name);
+      expect(names).toContain("update_scheduler_job");
+      expect(names).toContain("pause_scheduler_job");
+      expect(names).toContain("resume_scheduler_job");
+      expect(names).toContain("run_scheduler_job_now");
+
+      const created = await h.store.createSchedulerJob({
+        action: "send_message",
+        cron: "0 * * * *",
+        params: { text: "before" },
+        spaceId: "slack:C1",
+        createdBy: "U1",
+      });
+      const updatedResult = await callTool(h.client, "update_scheduler_job", {
+        id: created.id,
+        expected_revision: created.revision,
+        cron: "*/15 * * * *",
+        params: { text: "after" },
+      });
+      expect(updatedResult.isError).not.toBe(true);
+      const updated = JSON.parse(updatedResult.content[0]!.text!) as SchedulerJob;
+      expect(updated.nextFireAt).toBe(nextCronFire(updated.cron, now));
+
+      const stale = await callTool(h.client, "update_scheduler_job", {
+        id: created.id,
+        expected_revision: created.revision,
+        params: { text: "lost" },
+      });
+      expect(stale.isError).toBe(true);
+      expect((await h.store.getSchedulerJob(created.id))?.params).toEqual({ text: "after" });
+
+      const pausedResult = await callTool(h.client, "pause_scheduler_job", {
+        id: created.id,
+        expected_revision: updated.revision,
+      });
+      const paused = JSON.parse(pausedResult.content[0]!.text!) as SchedulerJob;
+      expect(paused.enabled).toBe(false);
+
+      now += 37 * 60_000;
+      const resumedResult = await callTool(h.client, "resume_scheduler_job", {
+        id: created.id,
+        expected_revision: paused.revision,
+      });
+      const resumed = JSON.parse(resumedResult.content[0]!.text!) as SchedulerJob;
+      expect(resumed.nextFireAt).toBe(nextCronFire(resumed.cron, now));
+      const recurringNext = resumed.nextFireAt;
+
+      const runArgs = {
+        id: created.id,
+        expected_revision: resumed.revision,
+        invocation_id: "mcp-manual-1",
+      };
+      await Promise.all([
+        callTool(h.client, "run_scheduler_job_now", runArgs),
+        callTool(h.client, "run_scheduler_job_now", runArgs),
+      ]);
+      expect(await h.store.listSchedulerInvocations({ jobId: created.id })).toHaveLength(1);
+      await tickScheduler({
+        store: h.store,
+        audit: h.audit,
+        registry: schedulerRegistry,
+        memoryProvider: h.provider,
+        postMessage: async () => undefined,
+        loadPolicy: async () => policy,
+        log: () => {},
+        now: () => now,
+      });
+      expect(calls).toEqual([{ text: "after", space: "slack:C1" }]);
+      expect((await h.store.getSchedulerJob(created.id))?.nextFireAt).toBe(recurringNext);
+      expect(await h.audit.listAudit({ event_type: SCHEDULER_JOB_UPDATED_EVENT })).toHaveLength(1);
+      expect(await h.audit.listAudit({ event_type: SCHEDULER_JOB_PAUSED_EVENT })).toHaveLength(1);
+      expect(await h.audit.listAudit({ event_type: SCHEDULER_JOB_RESUMED_EVENT })).toHaveLength(1);
+      expect(await h.audit.listAudit({ event_type: SCHEDULER_RUN_REQUESTED_EVENT })).toHaveLength(1);
+      expect(await h.audit.listAudit({ event_type: SCHEDULER_FIRE_EVENT })).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+
 /** Org floor allowing extension calls (unknown default) + memory + connect. */
 const EXT_ALLOW =
   "tools:\n  unknown: allow\n  memory.save: allow\n  memory.search: allow\n  session_search: allow\n  connect_extension: allow\n";
@@ -593,9 +716,13 @@ describe("MCP server extension surface (spawned entrypoint)", () => {
         "memory.save",
         "memory.search",
         "model_settings",
+        "pause_scheduler_job",
+        "resume_scheduler_job",
+        "run_scheduler_job_now",
         "session_search",
         FIXTURE_EXTENSION_TOOL,
         "work_item_cancel",
+        "update_scheduler_job",
         "write_space_skill",
       ]);
 

@@ -5,6 +5,7 @@ import { sessionSearchToolDefinitions } from "../memory/session-search";
 import { createMemoryConsolidationTrigger } from "./services/memory-consolidation-trigger";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
+import { evaluatePolicyGate } from "../policy/gate";
 import { bootstrapRuntime, type BootstrapRuntime } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
@@ -60,11 +61,15 @@ import { startDeliveryPoller } from "./services/delivery-poller";
 import { startOutboxPostSeam } from "./services/outbox-post-seam";
 import { SlackApprovalRouter } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
+import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
 import {
   channelFromSpaceId,
   createSlackAdapter,
   DELIVERY_APPROVE_ACTION_ID,
   DELIVERY_DENY_ACTION_ID,
+  SCHEDULER_PAUSE_ACTION_ID,
+  SCHEDULER_RESUME_ACTION_ID,
+  SCHEDULER_RUN_NOW_ACTION_ID,
   isDmChannel,
   type SlackAction,
   type SlackAdapter,
@@ -328,10 +333,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     botToken,
     onMessage: (m) => spaceService.handleInboundMessage(m),
     onAction: (a) => {
-      // Delivery buttons (issue #149) resolve the executor's delivery seam;
-      // every other interactive click is an exec-tier approval (issue #44).
+      // Delivery decisions and schedule controls have dedicated durable
+      // resolvers; every other click belongs to the exec-tier approval flow.
       if (a.actionId === DELIVERY_APPROVE_ACTION_ID || a.actionId === DELIVERY_DENY_ACTION_ID) {
         return deliveryActionHandler(a);
+      }
+      if (
+        a.actionId === SCHEDULER_PAUSE_ACTION_ID ||
+        a.actionId === SCHEDULER_RESUME_ACTION_ID ||
+        a.actionId === SCHEDULER_RUN_NOW_ACTION_ID
+      ) {
+        return resolveSchedulerAction({ store, audit, adapter }, a).then(() => undefined);
       }
       return approvalRouter.handleAction(a);
     },
@@ -608,7 +620,31 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // first-run wizard — gated like the settings tool (write tier →
     // org-settings access via approval); deploy_info is read-tier (anyone).
     ...adminToolDefinitions(store, { audit, registry: extensionRegistry }),
-    ...schedulerToolDefinitions(store, audit, schedulerRegistry),
+    ...schedulerToolDefinitions(store, audit, schedulerRegistry, {
+      authorizeCrossSpace: async ({ tool, invocationId, sessionSpaceId, targetSpaceId }) => {
+        const outcome = await evaluatePolicyGate(
+          {
+            loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
+            audit,
+            router: approvalRouter,
+          },
+          {
+            tool: "scheduler_org_mutation",
+            args: {
+              requested_tool: tool,
+              invocation_id: invocationId,
+              target_space: targetSpaceId,
+            },
+            spaceId: sessionSpaceId,
+            actor: "agent",
+          },
+        );
+        return outcome.allowed;
+      },
+      renderList: async (spaceId, jobs) => {
+        await adapter.postMessage(spaceId, "Schedules", { blocks: buildSchedulerBlocks(jobs) });
+      },
+    }),
     ...kbToolDefinitions(kbDeps),
     // Todo snapshot (issue #228): read-tier assembly of the space's live
     // state — work items (same query as list_work_items), pending

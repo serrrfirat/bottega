@@ -60,6 +60,7 @@
  *   BOTTEGA_SESSION_DIR            transcript JSONL dir (default data/sessions)
  */
 import type { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -239,6 +240,8 @@ export interface McpInternalToolsOptions {
   listModels?: (agentDir: string) => Promise<ModelCatalogEntry[]>;
   /** Scheduler action registry (create_scheduler_job validates the action name, issue #86). */
   schedulerRegistry?: SchedulerActionRegistry;
+  /** Injectable scheduler lifecycle clock for hermetic caller tests. */
+  schedulerNow?: () => number;
   /** KB config for kb_ingest (issue #91); absent → kb_ingest is not advertised. */
   kb?: KbConfig;
 }
@@ -600,7 +603,7 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           throw new McpError(ErrorCode.InvalidParams, `${name}: invalid arguments: ${zodIssues(parsed.error)}`);
         }
         try {
-          const result = await definition.execute("0", parsed.data, undefined, undefined, ctx);
+          const result = await definition.execute(`mcp_${randomUUID()}`, parsed.data, undefined, undefined, ctx);
           return { content: result.content, ...(result.isError === true ? { isError: true } : undefined) };
         } catch (err) {
           // Execution failures are tool outcomes, not protocol errors.
@@ -630,7 +633,12 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
           listModels: opts.internal.listModels,
         }),
         ...(opts.internal.schedulerRegistry !== undefined
-          ? schedulerToolDefinitions(opts.internal.store, opts.audit, opts.internal.schedulerRegistry)
+          ? schedulerToolDefinitions(
+              opts.internal.store,
+              opts.audit,
+              opts.internal.schedulerRegistry,
+              opts.internal.schedulerNow !== undefined ? { now: opts.internal.schedulerNow } : {},
+            )
           : []),
         ...(opts.internal.kb !== undefined
           ? kbToolDefinitions({ store: opts.internal.store, config: opts.internal.kb })

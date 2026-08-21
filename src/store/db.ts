@@ -10,8 +10,17 @@ import { OrgSettingsParseError, parseOrgSettingsJson } from "./org-settings";
 import type { OrgSettings, OrgSettingsInput } from "./org-settings";
 import { KNOWN_ACTIONS } from "../scheduler/actions";
 import { nextCronFire } from "../scheduler/cron";
-import { schedulerJobFromRow, type SchedulerJobRow } from "../scheduler/store";
-import type { SchedulerActionName, SchedulerJob } from "../scheduler/types";
+import {
+  schedulerInvocationFromRow,
+  schedulerJobFromRow,
+  type SchedulerInvocationRow,
+  type SchedulerJobRow,
+} from "../scheduler/store";
+import type {
+  SchedulerActionName,
+  SchedulerInvocation,
+  SchedulerJob,
+} from "../scheduler/types";
 import { z } from "zod";
 
 export type Space = {
@@ -434,12 +443,38 @@ export interface Store {
   }): Promise<SchedulerJob>;
   getSchedulerJob(id: string): Promise<SchedulerJob | null>;
   listSchedulerJobs(): Promise<SchedulerJob[]>;
+  /** Compare-and-swap update. Omitted fields retain their current values. */
+  updateSchedulerJob(input: {
+    id: string;
+    expectedRevision: number;
+    action?: string;
+    cron?: string;
+    params?: Record<string, string>;
+    now: number;
+  }): Promise<SchedulerJob>;
+  pauseSchedulerJob(id: string, expectedRevision: number): Promise<SchedulerJob>;
+  resumeSchedulerJob(id: string, expectedRevision: number, now: number): Promise<SchedulerJob>;
   /** Returns false when no row existed. */
   deleteSchedulerJob(id: string): Promise<boolean>;
   updateSchedulerNextFire(id: string, nextFireAt: number): Promise<void>;
-  /** Records a result and advances from `at` to the next cron occurrence. */
+  skipSchedulerOccurrence(id: string, expectedNextFireAt: number, nextFireAt: number): Promise<boolean>;
+  /** Legacy direct-fire state seam; normal runner fires use durable invocations. */
   markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void>;
   setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void>;
+  enqueueSchedulerRunNow(input: {
+    jobId: string;
+    expectedRevision: number;
+    invocationId: string;
+    requestedAt: number;
+  }): Promise<{ invocation: SchedulerInvocation; created: boolean }>;
+  claimScheduledSchedulerInvocation(
+    jobId: string,
+    expectedNextFireAt: number,
+    requestedAt: number,
+  ): Promise<SchedulerInvocation | null>;
+  claimNextSchedulerInvocation(now: number): Promise<SchedulerInvocation | null>;
+  completeSchedulerInvocation(id: string, result: "ok" | "error", completedAt: number): Promise<void>;
+  listSchedulerInvocations(filter?: { jobId?: string }): Promise<SchedulerInvocation[]>;
   appendAudit(entry: AuditEntry): Promise<number>;
   listAudit(opts?: ListAuditOpts): Promise<AuditRow[]>;
   /** The durable ingest poll cursor for a provider (issue #101); null when never persisted. */
@@ -1292,6 +1327,94 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .all() as SchedulerJobRow[];
     return rows.map(schedulerJobFromRow);
   }
+  async function updateSchedulerJob(input: {
+    id: string;
+    expectedRevision: number;
+    action?: string;
+    cron?: string;
+    params?: Record<string, string>;
+    now: number;
+  }): Promise<SchedulerJob> {
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new Error("scheduler expected revision must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(input.now)) throw new Error("scheduler update time must be a safe integer");
+    const current = await getSchedulerJob(input.id);
+    if (!current) throw new Error(`scheduler job not found: ${input.id}`);
+    if (current.revision !== input.expectedRevision) {
+      throw new Error(
+        `stale revision for scheduler job ${input.id}: expected ${input.expectedRevision}, current ${current.revision}`,
+      );
+    }
+    const action = input.action ?? current.action;
+    if (!isKnownSchedulerAction(action)) throw new Error(`unknown scheduler action: ${action}`);
+    const cron = input.cron ?? current.cron;
+    const nextFireAt = input.cron === undefined ? current.nextFireAt : nextCronFire(cron, input.now);
+    const params = input.params ?? current.params;
+    // The revision predicate is the write authority. Another connection that
+    // wins after the read makes this UPDATE return no row, never a lost write.
+    const row = db
+      .query(
+        `UPDATE scheduler_jobs
+         SET action = ?, cron = ?, params = ?, next_fire_at = ?, revision = revision + 1
+         WHERE id = ? AND revision = ?
+         RETURNING *`,
+      )
+      .get(action, cron, JSON.stringify(params), nextFireAt, input.id, input.expectedRevision) as
+      | SchedulerJobRow
+      | null;
+    if (!row) {
+      const latest = await getSchedulerJob(input.id);
+      if (!latest) throw new Error(`scheduler job not found: ${input.id}`);
+      throw new Error(
+        `stale revision for scheduler job ${input.id}: expected ${input.expectedRevision}, current ${latest.revision}`,
+      );
+    }
+    return schedulerJobFromRow(row);
+  }
+
+  async function pauseSchedulerJob(id: string, expectedRevision: number): Promise<SchedulerJob> {
+    const row = db
+      .query(
+        `UPDATE scheduler_jobs
+         SET enabled = 0, revision = revision + 1
+         WHERE id = ? AND revision = ? AND enabled = 1
+         RETURNING *`,
+      )
+      .get(id, expectedRevision) as SchedulerJobRow | null;
+    if (row) return schedulerJobFromRow(row);
+    const current = await getSchedulerJob(id);
+    if (!current) throw new Error(`scheduler job not found: ${id}`);
+    if (current.revision !== expectedRevision) {
+      throw new Error(`stale revision for scheduler job ${id}: expected ${expectedRevision}, current ${current.revision}`);
+    }
+    throw new Error(`scheduler job is already paused: ${id}`);
+  }
+
+  async function resumeSchedulerJob(id: string, expectedRevision: number, now: number): Promise<SchedulerJob> {
+    if (!Number.isSafeInteger(now)) throw new Error("scheduler resume time must be a safe integer");
+    const current = await getSchedulerJob(id);
+    if (!current) throw new Error(`scheduler job not found: ${id}`);
+    if (current.revision !== expectedRevision) {
+      throw new Error(`stale revision for scheduler job ${id}: expected ${expectedRevision}, current ${current.revision}`);
+    }
+    if (current.enabled) throw new Error(`scheduler job is already enabled: ${id}`);
+    const nextFireAt = nextCronFire(current.cron, now);
+    const row = db
+      .query(
+        `UPDATE scheduler_jobs
+         SET enabled = 1, next_fire_at = ?, revision = revision + 1
+         WHERE id = ? AND revision = ? AND enabled = 0
+         RETURNING *`,
+      )
+      .get(nextFireAt, id, expectedRevision) as SchedulerJobRow | null;
+    if (!row) {
+      const latest = await getSchedulerJob(id);
+      if (!latest) throw new Error(`scheduler job not found: ${id}`);
+      throw new Error(`stale revision for scheduler job ${id}: expected ${expectedRevision}, current ${latest.revision}`);
+    }
+    return schedulerJobFromRow(row);
+  }
 
   async function deleteSchedulerJob(id: string): Promise<boolean> {
     return db.query("DELETE FROM scheduler_jobs WHERE id = ?").run(id).changes > 0;
@@ -1301,6 +1424,23 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     if (!Number.isSafeInteger(nextFireAt)) throw new Error("scheduler nextFireAt must be a safe integer");
     const result = db.query("UPDATE scheduler_jobs SET next_fire_at = ? WHERE id = ?").run(nextFireAt, id);
     if (result.changes === 0) throw new Error(`scheduler job not found: ${id}`);
+  }
+
+  async function skipSchedulerOccurrence(
+    id: string,
+    expectedNextFireAt: number,
+    nextFireAt: number,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(expectedNextFireAt) || !Number.isSafeInteger(nextFireAt)) {
+      throw new Error("scheduler occurrence times must be safe integers");
+    }
+    return (
+      db
+        .query(
+          "UPDATE scheduler_jobs SET next_fire_at = ? WHERE id = ? AND enabled = 1 AND next_fire_at = ?",
+        )
+        .run(nextFireAt, id, expectedNextFireAt).changes === 1
+    );
   }
 
   async function markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void> {
@@ -1321,6 +1461,157 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       .query("UPDATE scheduler_jobs SET enabled = ? WHERE id = ?")
       .run(enabled ? 1 : 0, id);
     if (result.changes === 0) throw new Error(`scheduler job not found: ${id}`);
+  }
+  async function enqueueSchedulerRunNow(input: {
+    jobId: string;
+    expectedRevision: number;
+    invocationId: string;
+    requestedAt: number;
+  }): Promise<{ invocation: SchedulerInvocation; created: boolean }> {
+    if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(input.invocationId)) {
+      throw new Error("scheduler invocation id must be 1-200 safe identity characters");
+    }
+    if (!Number.isSafeInteger(input.requestedAt)) throw new Error("scheduler request time must be a safe integer");
+    const enqueue = db.transaction(() => {
+      const existing = db
+        .query("SELECT * FROM scheduler_invocations WHERE id = ?")
+        .get(input.invocationId) as SchedulerInvocationRow | null;
+      if (existing) {
+        if (existing.job_id !== input.jobId || existing.source !== "manual") {
+          throw new Error(`scheduler invocation identity is already in use: ${input.invocationId}`);
+        }
+        return { invocation: schedulerInvocationFromRow(existing), created: false };
+      }
+      const jobRow = getSchedulerJobStmt.get(input.jobId) as SchedulerJobRow | null;
+      if (!jobRow) throw new Error(`scheduler job not found: ${input.jobId}`);
+      if (jobRow.revision !== input.expectedRevision) {
+        throw new Error(
+          `stale revision for scheduler job ${input.jobId}: expected ${input.expectedRevision}, current ${jobRow.revision}`,
+        );
+      }
+      const row = db
+        .query(
+          `INSERT INTO scheduler_invocations
+           (id, job_id, action, params, space_id, source, scheduled_for, requested_at, job_revision)
+           VALUES (?, ?, ?, ?, ?, 'manual', NULL, ?, ?)
+           RETURNING *`,
+        )
+        .get(
+          input.invocationId,
+          jobRow.id,
+          jobRow.action,
+          jobRow.params,
+          jobRow.space_id,
+          input.requestedAt,
+          jobRow.revision,
+        ) as SchedulerInvocationRow;
+      return { invocation: schedulerInvocationFromRow(row), created: true };
+    });
+    return enqueue.immediate();
+  }
+
+  async function claimScheduledSchedulerInvocation(
+    jobId: string,
+    expectedNextFireAt: number,
+    requestedAt: number,
+  ): Promise<SchedulerInvocation | null> {
+    if (!Number.isSafeInteger(expectedNextFireAt) || !Number.isSafeInteger(requestedAt)) {
+      throw new Error("scheduler occurrence times must be safe integers");
+    }
+    const enqueue = db.transaction(() => {
+      const jobRow = db
+        .query("SELECT * FROM scheduler_jobs WHERE id = ? AND enabled = 1 AND next_fire_at = ?")
+        .get(jobId, expectedNextFireAt) as SchedulerJobRow | null;
+      if (!jobRow) return null;
+      const invocationId = `scheduled:${jobId}:${expectedNextFireAt}`;
+      const inserted = db
+        .query(
+          `INSERT OR IGNORE INTO scheduler_invocations
+           (id, job_id, action, params, space_id, source, scheduled_for, requested_at, job_revision)
+           VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?)`,
+        )
+        .run(
+          invocationId,
+          jobRow.id,
+          jobRow.action,
+          jobRow.params,
+          jobRow.space_id,
+          expectedNextFireAt,
+          requestedAt,
+          jobRow.revision,
+        );
+      if (inserted.changes === 0) return null;
+      const nextFireAt = nextCronFire(jobRow.cron, requestedAt);
+      const advanced = db
+        .query(
+          "UPDATE scheduler_jobs SET next_fire_at = ? WHERE id = ? AND enabled = 1 AND next_fire_at = ?",
+        )
+        .run(nextFireAt, jobId, expectedNextFireAt);
+      if (advanced.changes !== 1) throw new Error(`scheduler occurrence claim lost for job ${jobId}`);
+      const row = db.query("SELECT * FROM scheduler_invocations WHERE id = ?").get(invocationId) as
+        | SchedulerInvocationRow
+        | null;
+      if (!row) throw new Error(`scheduler invocation disappeared after enqueue: ${invocationId}`);
+      return schedulerInvocationFromRow(row);
+    });
+    return enqueue.immediate();
+  }
+
+  async function claimNextSchedulerInvocation(now: number): Promise<SchedulerInvocation | null> {
+    if (!Number.isSafeInteger(now)) throw new Error("scheduler claim time must be a safe integer");
+    const row = db
+      .query(
+        `UPDATE scheduler_invocations
+         SET status = 'running', claimed_at = ?
+         WHERE id = (
+           SELECT id FROM scheduler_invocations
+           WHERE status = 'pending'
+           ORDER BY requested_at, id
+           LIMIT 1
+         )
+         RETURNING *`,
+      )
+      .get(now) as SchedulerInvocationRow | null;
+    return row ? schedulerInvocationFromRow(row) : null;
+  }
+
+  async function completeSchedulerInvocation(
+    id: string,
+    result: "ok" | "error",
+    completedAt: number,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(completedAt)) throw new Error("scheduler completion time must be a safe integer");
+    const complete = db.transaction(() => {
+      const row = db
+        .query(
+          `UPDATE scheduler_invocations
+           SET status = 'completed', completed_at = ?, result = ?
+           WHERE id = ? AND status = 'running'
+           RETURNING *`,
+        )
+        .get(completedAt, result, id) as SchedulerInvocationRow | null;
+      if (!row) throw new Error(`scheduler invocation not found or not running: ${id}`);
+      // A deletion can race an already claimed execution. History remains
+      // complete even when the recurring parent no longer exists.
+      db.query(
+        "UPDATE scheduler_jobs SET last_fired_at = ?, last_result = ? WHERE id = ?",
+      ).run(completedAt, result, row.job_id);
+    });
+    complete.immediate();
+  }
+
+  async function listSchedulerInvocations(
+    filter: { jobId?: string } = {},
+  ): Promise<SchedulerInvocation[]> {
+    const rows =
+      filter.jobId === undefined
+        ? (db
+            .query("SELECT * FROM scheduler_invocations ORDER BY requested_at, id")
+            .all() as SchedulerInvocationRow[])
+        : (db
+            .query("SELECT * FROM scheduler_invocations WHERE job_id = ? ORDER BY requested_at, id")
+            .all(filter.jobId) as SchedulerInvocationRow[]);
+    return rows.map(schedulerInvocationFromRow);
   }
 
   async function markStaleWorkItems(olderThanMs: number, from: WorkItemState): Promise<number> {
@@ -1489,10 +1780,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     createSchedulerJob,
     getSchedulerJob,
     listSchedulerJobs,
+    updateSchedulerJob,
+    pauseSchedulerJob,
+    resumeSchedulerJob,
     deleteSchedulerJob,
+    skipSchedulerOccurrence,
     updateSchedulerNextFire,
     markSchedulerFired,
     setSchedulerJobEnabled,
+    enqueueSchedulerRunNow,
+    claimScheduledSchedulerInvocation,
+    claimNextSchedulerInvocation,
+    completeSchedulerInvocation,
+    listSchedulerInvocations,
     appendAudit,
     listAudit,
     getIngestWatermark,

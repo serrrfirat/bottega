@@ -160,7 +160,34 @@ CREATE TABLE IF NOT EXISTS scheduler_jobs (
   next_fire_at  INTEGER NOT NULL,
   last_fired_at INTEGER,
   last_result   TEXT CHECK (last_result IN ('ok','error')),
-  enabled       INTEGER NOT NULL DEFAULT 1
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  revision      INTEGER NOT NULL DEFAULT 1
+);
+
+-- One durable execution per cron occurrence or explicit run-now invocation
+-- (issue #308). The row snapshots the job at enqueue time, so an edit that
+-- wins after the claim affects future occurrences without rewriting an
+-- already claimed fire.
+CREATE TABLE IF NOT EXISTS scheduler_invocations (
+  id            TEXT PRIMARY KEY,
+  job_id        TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  params        TEXT NOT NULL,
+  space_id      TEXT,
+  source        TEXT NOT NULL CHECK (source IN ('scheduled','manual')),
+  scheduled_for INTEGER,
+  requested_at  INTEGER NOT NULL,
+  job_revision  INTEGER NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','running','completed')),
+  claimed_at    INTEGER,
+  completed_at  INTEGER,
+  result        TEXT CHECK (result IN ('ok','error'))
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_claim
+  ON scheduler_invocations(status, requested_at, id);
+CREATE INDEX IF NOT EXISTS idx_scheduler_invocations_job
+  ON scheduler_invocations(job_id, requested_at, id);
 );
 
 CREATE TABLE IF NOT EXISTS audit (

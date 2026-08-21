@@ -243,6 +243,13 @@ const TIER_BY_TOOL: ToolTiers = {
   // exec-tier, listing is read-only, and KB ingestion is a durable write.
   create_scheduler_job: "exec",
   delete_scheduler_job: "exec",
+  update_scheduler_job: "exec",
+  pause_scheduler_job: "exec",
+  resume_scheduler_job: "exec",
+  run_scheduler_job_now: "exec",
+  // Secondary gate for a space session targeting an org-wide or foreign
+  // schedule. Never user-visible; absent approval fails closed.
+  scheduler_org_mutation: "exec",
   kb_ingest: "write",
 };
 

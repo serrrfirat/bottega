@@ -1,6 +1,6 @@
 /** SQLite row mapping for durable scheduler jobs (issue #86). */
 import { z } from "zod";
-import type { SchedulerActionName, SchedulerJob } from "./types";
+import type { SchedulerActionName, SchedulerInvocation, SchedulerJob } from "./types";
 
 export interface SchedulerJobRow {
   id: string;
@@ -14,8 +14,24 @@ export interface SchedulerJobRow {
   last_fired_at: number | null;
   last_result: "ok" | "error" | null;
   enabled: number;
+  revision: number;
 }
 
+export interface SchedulerInvocationRow {
+  id: string;
+  job_id: string;
+  action: string;
+  params: string;
+  space_id: string | null;
+  source: "scheduled" | "manual";
+  scheduled_for: number | null;
+  requested_at: number;
+  job_revision: number;
+  status: "pending" | "running" | "completed";
+  claimed_at: number | null;
+  completed_at: number | null;
+  result: "ok" | "error" | null;
+}
 const paramsSchema = z.record(z.string(), z.string());
 
 function parseParams(jobId: string, text: string): Record<string, string> {
@@ -56,5 +72,50 @@ export function schedulerJobFromRow(row: SchedulerJobRow): SchedulerJob {
     lastFiredAt: row.last_fired_at,
     lastResult: row.last_result,
     enabled: row.enabled === 1,
+    revision: row.revision,
+  };
+}
+
+/** Converts a durable execution row into the runner's typed claim. */
+export function schedulerInvocationFromRow(row: SchedulerInvocationRow): SchedulerInvocation {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    action: row.action as SchedulerActionName,
+    params: parseParams(row.id, row.params),
+    spaceId: row.space_id,
+    source: row.source,
+    scheduledFor: row.scheduled_for,
+    requestedAt: row.requested_at,
+    jobRevision: row.job_revision,
+    status: row.status,
+    claimedAt: row.claimed_at,
+    completedAt: row.completed_at,
+    result: row.result,
+  };
+}
+
+export interface SchedulerJobAuditMetadata {
+  id: string;
+  action: SchedulerActionName;
+  cron: string;
+  space_id: string | null;
+  enabled: boolean;
+  revision: number;
+  next_fire_at: number;
+  params_keys: string[];
+}
+
+/** Secret-free metadata for lifecycle audit before/after fields. */
+export function schedulerJobMetadata(job: SchedulerJob): SchedulerJobAuditMetadata {
+  return {
+    id: job.id,
+    action: job.action,
+    cron: job.cron,
+    space_id: job.spaceId,
+    enabled: job.enabled,
+    revision: job.revision,
+    next_fire_at: job.nextFireAt,
+    params_keys: Object.keys(job.params).sort(),
   };
 }

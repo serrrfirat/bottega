@@ -520,11 +520,14 @@ no worker.
 The agent doesn't only react — it can work on a schedule, on its own, when
 a space opts in.
 
-- **Durable UTC scheduler (#86)** — three policy-gated tools create, list,
-  and delete recurring five-field cron jobs. Jobs survive restarts, never
-  overlap scheduler passes, and record created, deleted, fired, missed, and
-  failed events in the audit trail. The boot policy skips missed runs
-  instead of replaying a backlog.
+- **Durable UTC scheduler (#86, #308)** — policy-gated tools create, list,
+  edit, pause, resume, run now, and delete recurring five-field cron jobs.
+  Revision checks prevent lost edits. Pause preserves history, resume
+  computes the next occurrence from its resume time, and run now enters the
+  ordinary durable claim/fire path without moving recurring state. Slack
+  renders the same state with idempotent controls. Jobs survive restarts,
+  never overlap scheduler passes, and audit every mutation and execution.
+  The boot policy skips missed runs instead of replaying a backlog.
 - **Standup digest (#92)** — an opted-in space can post a weekday summary
   of work finished yesterday, work still open, and blocked items. Each
   digest includes item details and pull-request links, saves an org-memory

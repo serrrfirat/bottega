@@ -73,11 +73,19 @@ export const MEMORY_AUTO_SAVED_EVENT = "memory.auto_saved";
 export const MEMORY_RECALLED_EVENT = "memory.recalled";
 /** Observer read/post/failure (payload {scope, metadata, count}, {pulse_space, posted}, or {error}). */
 export const OBSERVER_READ_EVENT = "observer.read";
-/** Scheduler job created (payload {id, action, cron, space_id?}). */
+/** Scheduler job created (payload {id, invocation_id, before:null, after}). */
 export const SCHEDULER_JOB_CREATED_EVENT = "scheduler.job_created";
-/** Scheduler job deleted (payload {id}). */
+/** Scheduler job deleted (payload {id, invocation_id, before, after:null}). */
 export const SCHEDULER_JOB_DELETED_EVENT = "scheduler.job_deleted";
-/** Scheduler handler completed (payload {id, action, space_id?, result}). */
+/** Scheduler job fields changed (payload {invocation_id, before, after}). */
+export const SCHEDULER_JOB_UPDATED_EVENT = "scheduler.job_updated";
+/** Scheduler job paused (payload {invocation_id, before, after}). */
+export const SCHEDULER_JOB_PAUSED_EVENT = "scheduler.job_paused";
+/** Scheduler job resumed (payload {invocation_id, before, after}). */
+export const SCHEDULER_JOB_RESUMED_EVENT = "scheduler.job_resumed";
+/** A manual ordinary execution was durably enqueued (payload {invocation_id, before, after}). */
+export const SCHEDULER_RUN_REQUESTED_EVENT = "scheduler.run_requested";
+/** Scheduler invocation completed (payload {id, action, invocation_id, source, result, scheduled_for?}). */
 export const SCHEDULER_FIRE_EVENT = "scheduler.fire";
 /** Scheduler skipped an occurrence missed while down (payload {id, action, scheduled_for}). */
 export const SCHEDULER_MISSED_EVENT = "scheduler.missed";

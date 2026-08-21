@@ -708,21 +708,24 @@ standup digest producers check pruning capability before side effects.
 ## Scheduler: durable cron (epic #111)
 
 `src/scheduler/` implements a durable, UTC-only scheduler with policy-gated
-tools (issue #86) and four built-in actions: standups (#92), reflection
-(#93), org pulse (#90), and recurring work-item dispatch (#131).
+lifecycle tools (issues #86 and #308) and typed built-in actions for
+standups, reflection, org pulse, recurring work, messages, and ingestion.
 
 ```mermaid
 flowchart LR
-    TOOL["scheduler tools<br/>create / list / delete (policy-gated, exec-tier)"]
-    TOOL --> DB[("scheduler_jobs (SQLite)<br/>id, action, cron, params, space_id,<br/>next_fire_at, enabled")]
-    DB --> RUN["tick runner — every 5 s, non-overlapping passes"]
+    TOOL["scheduler tools<br/>create / list / update / pause / resume / run now / delete"]
+    TOOL --> DB[("scheduler_jobs (SQLite)<br/>cron state + enabled + revision")]
+    DB --> ENQ["atomic occurrence enqueue<br/>snapshot + advance next fire"]
+    TOOL -- "run now" --> INV[("scheduler_invocations<br/>manual + scheduled snapshots")]
+    ENQ --> INV
+    INV --> RUN["durable claim/fire runner — every 5 s"]
     RUN --> CRON["nextCronFire — five-field UTC cron<br/>(no DST; OR semantics; ? allowed once)"]
     RUN -- "first pass after boot: occurrences<br/>before now" --> MISS["audit 'missed', skip — no replay of backlog"]
-    RUN -- "job due" --> ACT["action registry — typed handlers<br/>standup_digest | reflection | org_pulse | recurring_work"]
+    RUN --> ACT["typed action registry"]
     ACT --> POST["postMessage → Slack space"]
     ACT --> MEM["memory provider — org memories<br/>append-only save; capability-gated maintenance"]
     ACT --> WI["work_items — recurring extension work"]
-    RUN --> AUD[("audit — fired / missed / error events")]
+    RUN --> AUD[("audit — lifecycle / fired / missed / error events")]
 ```
 
 - **Boot skip policy, not catch-up** — on the first successful tick after
@@ -731,6 +734,11 @@ flowchart LR
   replays a backlog after downtime.
 - **No overlap** — scheduler passes never run concurrently (single tick
   runner, non-overlapping), so a slow action can't double-fire.
+- **Linearized lifecycle** — expected revisions reject lost updates.
+  Pause blocks future occurrence claims; resume computes from its own time.
+  A claimed execution keeps its snapshot while a concurrent edit changes
+  only future executions. Run-now uses the same durable invocation claim and
+  fire path and never advances recurring state.
 - **Fail closed** — jobs and actions resolve through the same policy,
   memory, and audit spines as everything else; a firing job with invalid
   params is audited as an error, not silently dropped.
@@ -933,7 +941,10 @@ before exposing the store, and a retry resumes from the last committed ID.
   evidence, `blocked` requires evidence, and git `review` requires a recorded
   human approval. Stale claimed/working rows recover to `blocked`.
 - `scheduler_jobs` — durable cron rows (id, action, cron, params, space id,
-  next fire, last result, enabled).
+  next fire, last result, enabled, operator revision).
+- `scheduler_invocations` — immutable-at-enqueue action snapshots for cron
+  occurrences and run-now requests, with one pending/running/completed claim
+  state and a caller-visible idempotency identity.
 - `upload_tokens` — opaque, expiring, single-use #196 browser-upload
   grants. The MCP child and server endpoint share the table; atomic delete
   makes only the first valid POST consumable.

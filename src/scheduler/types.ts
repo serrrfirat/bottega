@@ -53,6 +53,26 @@ export interface SchedulerJob {
   lastFiredAt: number | null;
   lastResult: "ok" | "error" | null;
   enabled: boolean;
+  /** Compare-and-swap revision for operator mutations. Fires do not change it. */
+  revision: number;
+}
+
+/** One durable execution claimed by the scheduler runner. */
+export interface SchedulerInvocation {
+  /** Caller-supplied idempotency identity for manual runs; deterministic occurrence id for cron runs. */
+  id: string;
+  jobId: string;
+  action: SchedulerActionName;
+  params: Record<string, string>;
+  spaceId: string | null;
+  source: "scheduled" | "manual";
+  scheduledFor: number | null;
+  requestedAt: number;
+  jobRevision: number;
+  status: "pending" | "running" | "completed";
+  claimedAt: number | null;
+  completedAt: number | null;
+  result: "ok" | "error" | null;
 }
 
 /**

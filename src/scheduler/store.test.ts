@@ -142,6 +142,15 @@ describe("scheduler job store (issue #86)", () => {
     expect(resolveTier("list_scheduler_jobs")).toBe("read");
     expect(isKnownTool("delete_scheduler_job")).toBe(true);
     expect(resolveTier("delete_scheduler_job")).toBe("exec");
+    for (const name of [
+      "update_scheduler_job",
+      "pause_scheduler_job",
+      "resume_scheduler_job",
+      "run_scheduler_job_now",
+    ]) {
+      expect(isKnownTool(name)).toBe(true);
+      expect(resolveTier(name)).toBe("exec");
+    }
   });
 
   test("admin tools validate the registry and audit create/delete rows", async () => {
@@ -203,13 +212,21 @@ describe("scheduler job store (issue #86)", () => {
       SCHEDULER_JOB_CREATED_EVENT,
       SCHEDULER_JOB_DELETED_EVENT,
     ]);
-    expect(JSON.parse(rows[0]!.payload)).toEqual({
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({
       id: job!.id,
       action: "standup_digest",
       cron: "0 9 * * *",
       space_id: "slack:C1",
+      invocation_id: "call-create",
+      before: null,
+      after: { id: job!.id, revision: 1 },
     });
-    expect(JSON.parse(rows[1]!.payload)).toEqual({ id: job!.id });
+    expect(JSON.parse(rows[1]!.payload)).toMatchObject({
+      id: job!.id,
+      invocation_id: "call-delete",
+      before: { id: job!.id, revision: 1 },
+      after: null,
+    });
   });
 });
 

@@ -197,9 +197,17 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       const createJob = tools.find((tool) => tool.name === "create_scheduler_job");
       const listJobs = tools.find((tool) => tool.name === "list_scheduler_jobs");
       const deleteJob = tools.find((tool) => tool.name === "delete_scheduler_job");
+      const updateJob = tools.find((tool) => tool.name === "update_scheduler_job");
+      const pauseJob = tools.find((tool) => tool.name === "pause_scheduler_job");
+      const resumeJob = tools.find((tool) => tool.name === "resume_scheduler_job");
+      const runNow = tools.find((tool) => tool.name === "run_scheduler_job_now");
       expect(createJob).toBeDefined();
       expect(listJobs).toBeDefined();
       expect(deleteJob).toBeDefined();
+      expect(updateJob).toBeDefined();
+      expect(pauseJob).toBeDefined();
+      expect(resumeJob).toBeDefined();
+      expect(runNow).toBeDefined();
 
       const actions = ["standup_digest", "reflection", "org_pulse"] as const;
       const created: Array<{ action: string; cron: string }> = [];

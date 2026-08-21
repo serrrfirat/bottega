@@ -20,6 +20,7 @@ import { nextCronFire } from "./cron";
 import type {
   SchedulerActionContext,
   SchedulerActionRegistry,
+  SchedulerInvocation,
   SchedulerJob,
 } from "./types";
 
@@ -68,12 +69,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-async function auditError(deps: SchedulerTickDeps, job: SchedulerJob, error: string): Promise<void> {
+async function auditError(
+  deps: SchedulerTickDeps,
+  execution: Pick<SchedulerJob, "id" | "action" | "spaceId">,
+  error: string,
+  invocationId?: string,
+): Promise<void> {
   await deps.audit.appendAudit({
-    space_id: job.spaceId,
+    space_id: execution.spaceId,
     actor: "scheduler",
     event_type: SCHEDULER_ERROR_EVENT,
-    payload: { id: job.id, action: job.action, error },
+    payload: {
+      id: execution.id,
+      action: execution.action,
+      error,
+      ...(invocationId !== undefined ? { invocation_id: invocationId } : undefined),
+    },
   });
 }
 
@@ -91,6 +102,10 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
   };
   const jobs = await deps.store.listSchedulerJobs();
 
+  // First durably enqueue each due cron occurrence. The store snapshots the
+  // row and advances next_fire_at in one immediate transaction. An edit or
+  // pause that wins first prevents this stale occurrence claim; a claim that
+  // wins first keeps its snapshot while the edit affects future occurrences.
   for (const job of jobs) {
     if (!job.enabled) continue;
     const action = deps.registry.get(job.action);
@@ -99,46 +114,80 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
       await deps.store.setSchedulerJobEnabled(job.id, false);
       continue;
     }
-
     if (deps.firstTick && job.nextFireAt < fireTime) {
-      await deps.audit.appendAudit({
-        space_id: job.spaceId,
-        actor: "scheduler",
-        event_type: SCHEDULER_MISSED_EVENT,
-        payload: { id: job.id, action: job.action, scheduled_for: job.nextFireAt },
-      });
       try {
-        await deps.store.updateSchedulerNextFire(job.id, nextCronFire(job.cron, fireTime));
-      } catch (err) {
-        await auditError(deps, job, errorMessage(err));
+        const advanced = await deps.store.skipSchedulerOccurrence(
+          job.id,
+          job.nextFireAt,
+          nextCronFire(job.cron, fireTime),
+        );
+        if (advanced) {
+          await deps.audit.appendAudit({
+            space_id: job.spaceId,
+            actor: "scheduler",
+            event_type: SCHEDULER_MISSED_EVENT,
+            payload: { id: job.id, action: job.action, scheduled_for: job.nextFireAt },
+          });
+        }
+      } catch (error) {
+        await auditError(deps, job, errorMessage(error));
         await deps.store.setSchedulerJobEnabled(job.id, false);
       }
       continue;
     }
-    if (job.nextFireAt > fireTime) continue;
+    if (job.nextFireAt <= fireTime) {
+      await deps.store.claimScheduledSchedulerInvocation(job.id, job.nextFireAt, fireTime);
+    }
+  }
 
-    let result: "ok" | "error" = "ok";
-    try {
-      // Issue #220: the job's bound space is the fallback target for
-      // space-scoped actions — thread it into the params so handlers read
-      // params.space even when the row carries no params.space of its own
-      // (e.g. a DB-patched legacy job). An explicit params.space always wins.
-      const jobParams = { ...job.params };
-      if (jobParams.space === undefined && job.spaceId !== null) {
-        jobParams.space = job.spaceId;
+  // Manual and cron occurrences share this ordinary durable claim/fire path.
+  let invocation: SchedulerInvocation | null;
+  while ((invocation = await deps.store.claimNextSchedulerInvocation(fireTime)) !== null) {
+    const action = deps.registry.get(invocation.action);
+    let fireResult: "ok" | "error" = "ok";
+    if (!action) {
+      fireResult = "error";
+      await auditError(
+        deps,
+        { id: invocation.jobId, action: invocation.action, spaceId: invocation.spaceId },
+        `unknown scheduler action: ${invocation.action}`,
+        invocation.id,
+      );
+    } else {
+      try {
+        const invocationParams = { ...invocation.params };
+        if (invocationParams.space === undefined && invocation.spaceId !== null) {
+          invocationParams.space = invocation.spaceId;
+        }
+        await withTimeout(
+          action.run(invocationParams, context),
+          deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS,
+        );
+      } catch (error) {
+        fireResult = "error";
+        await auditError(
+          deps,
+          { id: invocation.jobId, action: invocation.action, spaceId: invocation.spaceId },
+          errorMessage(error),
+          invocation.id,
+        );
       }
-      await withTimeout(action.run(jobParams, context), deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS);
-    } catch (err) {
-      result = "error";
-      await auditError(deps, job, errorMessage(err));
     }
     await deps.audit.appendAudit({
-      space_id: job.spaceId,
+      space_id: invocation.spaceId,
       actor: "scheduler",
       event_type: SCHEDULER_FIRE_EVENT,
-      payload: { id: job.id, action: job.action, space_id: job.spaceId, result },
+      payload: {
+        id: invocation.jobId,
+        action: invocation.action,
+        space_id: invocation.spaceId,
+        result: fireResult,
+        invocation_id: invocation.id,
+        source: invocation.source,
+        ...(invocation.scheduledFor !== null ? { scheduled_for: invocation.scheduledFor } : undefined),
+      },
     });
-    await deps.store.markSchedulerFired(job.id, result, fireTime);
+    await deps.store.completeSchedulerInvocation(invocation.id, fireResult, fireTime);
   }
 }
 
