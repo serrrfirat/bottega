@@ -125,132 +125,44 @@ describe("docker-compose.dev.yml (local-dev overrides: iron-proxy #123, auth-bro
   });
 });
 
-describe("scripts/dev.sh broker wiring contract (issue #143)", () => {
+describe("local development bootstrap wiring (#143/#301/#311)", () => {
   const devSh = readFileSync(resolve(import.meta.dir, "../../scripts/dev.sh"), "utf8");
+  const bootstrap = readFileSync(resolve(import.meta.dir, "../../scripts/dev-bootstrap.ts"), "utf8");
 
-  test("starts the auth-broker through the same compose dev override", () => {
-    expect(devSh).toContain('"${COMPOSE_DEV[@]}" up -d auth-broker');
+  test("keeps the shell launcher thin and routes both package entrypoints through the shared module", () => {
+    expect(devSh).toContain("scripts/dev-bootstrap.ts setup");
+    expect(devSh).toContain("scripts/dev-bootstrap.ts dev");
+    expect(devSh).not.toContain("docker compose");
+    expect(devSh).not.toContain("auth-broker.token");
   });
 
-  test("waits for the token file AND the broker health probe before exporting env", () => {
-    // Readiness reads the token from the CANONICAL data dir (issue #301 —
-    // the shared broker bootstraps it there), plus the health probe.
-    expect(devSh).toContain('[[ -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]]');
-    expect(devSh).toContain("http://127.0.0.1:8765/v1/healthz");
-  });
-
-  test("exports the resolver's env contract from the 0600 token file", () => {
-    expect(devSh).toContain('export OMP_AUTH_BROKER_URL="http://127.0.0.1:8765"');
-    expect(devSh).toContain('export OMP_AUTH_BROKER_TOKEN="$(<"$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token")"');
-  });
-
-  test("fails loudly with the remedy when the broker cannot become ready (never silent)", () => {
-    expect(devSh).toContain("auth-broker did not become ready");
-    expect(devSh).toContain("docker pull oh-my-pi/pi:dev");
-    expect(devSh).toContain("exit 1");
-  });
-});
-
-describe("scripts/dev.sh shared dev stack wiring (issue #301)", () => {
-  const devSh = readFileSync(resolve(import.meta.dir, "../../scripts/dev.sh"), "utf8");
-
-  test("pins ONE canonical Compose project so every worktree reuses the same egress network", () => {
-    // The fix: a worktree's `compose up` must target the CANONICAL checkout's
-    // project name (issue #301), not its own dir basename — otherwise each
-    // worktree creates a fresh <worktree>_egress network on the same explicit
-    // 172.30.0.0/24 subnet and Docker rejects the second with "invalid pool
-    // request: Pool overlaps with other one on this address space".
+  test("pins the canonical Compose project, data, credential, public-base, and CA paths", () => {
     expect(devSh).toContain('export COMPOSE_PROJECT_NAME="$(dev_compose_project)"');
-  });
-
-  test("binds the CANONICAL data dir so the shared project's mounts do not flip between worktrees", () => {
-    // Sharing one project across worktrees REQUIRES a stable /data bind;
-    // dev.sh points it at the shared_data_dir (the same canonical store
-    // #293 already routes BOTTEGA_PUBLIC_BASE_URL_FILE through).
     expect(devSh).toContain('export BOTTEGA_DEV_DATA_DIR="$(shared_data_dir)"');
-    // The two env exports must come from the shared helper (sourced once),
-    // reusing its canonical-checkout resolution rather than duplicating it.
-    expect(devSh).toContain('. "$(dirname "$0")/shared-data-dir.sh"');
-  });
-
-  test("routes the credential boundary's secret files to the CANONICAL data dir (issue #301)", () => {
-    // The host server writes extension secret files to BOTTEGA_PROXY_SECRETS_DIR;
-    // that MUST be the canonical data dir's proxy-secrets (the same dir the
-    // shared dev proxy reads via PROXY_SECRETS_MOUNT_PATH from the
-    // BOTTEGA_DEV_DATA_DIR bind). A worktree-local dir would inject secrets
-    // the shared proxy's /data mount cannot see (the fresh-worktree bug).
     expect(devSh).toContain('export BOTTEGA_PROXY_SECRETS_DIR="$(shared_data_dir)/proxy-secrets"');
-    // The proxy's persistence + management token must be canonical too.
-    expect(devSh).toContain('TOKEN_FILE="$BOTTEGA_DEV_DATA_DIR/proxy-mgmt-token"');
-    expect(devSh).toContain('export IRON_MANAGEMENT_API_KEY="$(<$TOKEN_FILE)"');
-  });
-
-  test("routes the management + broker tokens and the MITM CA to the CANONICAL store (issue #301)", () => {
-    // Broker readiness + token must read the CANONICAL data dir (.omp/
-    // auth-broker.token), never a worktree-local data/.omp the shared broker
-    // never wrote — a fresh secondary worktree boot must not wait on a local
-    // token or inject state the shared proxy/broker cannot see.
-    expect(devSh).toContain('[[ -f "$BOTTEGA_DEV_DATA_DIR/.omp/auth-broker.token" ]]');
-
-    // The egress CA must be the canonical certs dir (dev.sh exports it),
-    // so canary-egress.ts / NODE_EXTRA_CA_CERTS / SSL_CERT_FILE trust the
-    // SAME CA the shared proxy terminates with, never a worktree-local cert.
+    expect(devSh).toContain('export BOTTEGA_PUBLIC_BASE_URL_FILE="$(shared_data_dir)/public-base-url"');
     expect(devSh).toContain('export BOTTEGA_DEV_CERTS_DIR="$(shared_certs_dir)"');
-    expect(devSh).toContain('mkdir -p "$BOTTEGA_DEV_CERTS_DIR"');
-    expect(devSh).toContain('docker run --rm -v "$BOTTEGA_DEV_CERTS_DIR:/certs"');
   });
 
-  test("renders CANONICAL host paths into the Compose override and the egress CA env", () => {
-    // The Compose override's /data and certs binds are interpolated from the
-    // canonical dirs dev.sh exports — so host and container share one path.
+  test("the shared module preserves broker fallback, token readiness, and fail-closed HOME handling", () => {
+    expect(bootstrap).toContain('"oh-my-pi/pi:dev"');
+    expect(bootstrap).toContain('["omp", "auth-broker", "serve", "--bind=0.0.0.0:8765"]');
+    expect(bootstrap).toContain("brokerTokenReady");
+    expect(bootstrap).toContain("is outside HOME");
+  });
+
+  test("the shared module serializes and validates the canonical CA", () => {
+    expect(bootstrap).toContain('join(config.certsDir, ".gen-lock")');
+    expect(bootstrap).toContain('["openssl", "x509"');
+    expect(bootstrap).toContain('["openssl", "rsa"');
+    expect(bootstrap).toContain("cert.stdout.trim() !== key.stdout.trim()");
+  });
+
+  test("renders canonical host paths into Compose and the canonical egress env", () => {
     const vols = proxy["volumes"] as string[];
     expect(vols).toContain("${BOTTEGA_DEV_DATA_DIR:-./data}:/data");
     expect(vols).toContain("${BOTTEGA_DEV_CERTS_DIR:-./certs}:/etc/iron-proxy/certs:ro");
-    // scripts/canary-egress.ts must derive the CA cert path from
-    // BOTTEGA_DEV_CERTS_DIR (the canonical certs dir) when dev.sh sets it —
-    // read the source, not the rendered dev env (no docker needed).
     const egressSrc = readFileSync(resolve(import.meta.dir, "../../scripts/canary-egress.ts"), "utf8");
     expect(egressSrc).toContain('process.env.BOTTEGA_DEV_CERTS_DIR ?? join(cwd, "certs")');
-  });
-
-  test("fails closed when the broker CLI fallback's canonical data dir is outside HOME (issue #301)", () => {
-    // The local omp CLI resolves PI_CONFIG_DIR as HOME-relative; if the
-    // canonical data dir is NOT under HOME the fallback broker would serve a
-    // double-prefixed config dir and 401 every vault fetch. dev.sh must fail
-    // closed (clear remedy) instead of silently booting a broken broker.
-    expect(devSh).toContain("is outside HOME");
-    expect(devSh).toContain("cannot resolve a HOME-relative PI_CONFIG_DIR");
-  });
-
-  test("serializes shared CA generation and validates the cert/key pair (issue #301)", () => {
-    // Two worktrees cold-booting could race `generate-ca` into the shared
-    // canonical certs dir; dev.sh must serialize with a lockdir and validate
-    // the resulting cert/key pair with openssl (fail closed on a torn/wrong
-    // CA) — including the `modulus` match check.
-    expect(devSh).toContain(".gen-lock");
-    expect(devSh).toContain("openssl x509 -in \"$BOTTEGA_DEV_CERTS_DIR/ca.crt\" -noout -modulus");
-    expect(devSh).toContain("cert_mod\" != \"$key_mod\"");
-    expect(devSh).toContain("generated MITM CA at $BOTTEGA_DEV_CERTS_DIR is INVALID");
-  });
-
-  test("creates the CANONICAL certs parent BEFORE the lock (fresh clone no false wait, issue #301)", () => {
-    // On a fresh clone the canonical certs dir may not exist; `mkdir
-    // $CERTS_DIR/.gen-lock` would then fail with ENOENT, which dev.sh must
-    // NOT misread as "another boot owns the lock" (that would wait the full
-    // 60s the first time). The parent must be `mkdir -p`'d before the lock.
-    const mkdirParent = "mkdir -p \"$BOTTEGA_DEV_CERTS_DIR\"";
-    const lock = "mkdir \"$BOTTEGA_DEV_CERTS_DIR/.gen-lock\"";
-    expect(devSh).toContain(mkdirParent);
-    expect(devSh).toContain(lock);
-    // Parent creation appears before the lock attempt in the source.
-    expect(devSh.indexOf(mkdirParent)).toBeLessThan(devSh.indexOf(lock));
-  });
-
-  test("teardown resolves the SAME adopted/persisted project name (issue #301)", () => {
-    // A bare `docker compose ... down` defaults COMPOSE_PROJECT_NAME to the
-    // worktree basename and would MISS the shared (adopted `camp-flavor`)
-    // project. Teardown must source the helper and pin the resolved name.
-    expect(devSh).toContain('COMPOSE_PROJECT_NAME="$(dev_compose_project)"');
-    expect(devSh).toContain("docker compose -f docker-compose.yml -f docker-compose.dev.yml down");
   });
 });

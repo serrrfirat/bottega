@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bash scripts/dev.sh",
+    "setup": "bash scripts/dev.sh --setup",
     "canary": "bash scripts/canary.sh",
     "canary:browser": "bun run tests/e2e/browser-canary.ts",
     "canary:rerun": "bun run scripts/canary-rerun.ts",

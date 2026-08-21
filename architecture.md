@@ -158,33 +158,36 @@ proxy passes everything; routing through it is harmless). `NEARAI_JUDGE_API_KEY`
 is a deployment concern only. The compose topology above still routes
 everything through the strict config/egress.yml, unchanged.
 
-### Local development topology (#123/#143)
+### Local development topology (#123/#143/#311)
 
-`bun run dev` keeps the production boundaries in the loop instead of
-starting the Bun server alone. `scripts/dev.sh`:
+`scripts/dev.sh` is a thin path/canonical-worktree launcher. Both `bun run
+setup` and `bun run dev` delegate decisions to `scripts/dev-bootstrap.ts`.
+The TypeScript bootstrap owns no ambient side effects: command, filesystem,
+clock, and readiness operations enter through explicit ports.
 
-1. Seeds each missing `config.yml`, `models.yml`, and `secrets.yml` into
-   `data/omp-agent` with `scripts/seed-agent-dir.ts`. Existing files are
-   never overwritten; the later model-pin sync only appends a missing
-   `modelRoles` block.
-2. Requires Docker for iron-proxy, generates the gitignored MITM CA under
-   `certs/` on first run, persists a mode-0600 management token, starts the
-   proxy with `docker-compose.dev.yml`, and proves readiness by reloading
-   `config/egress.dev.yml`.
-3. Starts the auth-broker vault on `127.0.0.1:8765`. `scripts/dev.sh`
-   checks for the private `oh-my-pi/pi:dev` image **before** invoking
-   Compose, so a missing image cannot hang on a pull. It falls back to
-   `omp auth-broker serve`; that CLI's `PI_CONFIG_DIR` is deliberately
-   HOME-relative, while the same mode-0600 token remains at
-   `data/.omp/auth-broker.token`.
-4. Starts the server only after both boundaries are ready. It exports
-   `HTTP_PROXY`/`HTTPS_PROXY`, an internal-only `NO_PROXY`,
-   `NODE_EXTRA_CA_CERTS`, `BOTTEGA_PROXY_CONTROL_URL`,
-   `BOTTEGA_PROXY_CONTROL_TOKEN`, `OMP_AUTH_BROKER_URL`, and
-   `OMP_AUTH_BROKER_TOKEN`. The proxy variables route traffic through the
-   proxy, the CA lets Bun verify its MITM certificates, the control pair
-   reloads rotated proxy secrets, and the broker pair fetches vault
-   credentials.
+The bootstrap has two separate phases:
+
+1. Setup check/plan reads declared state and readiness only. It performs no
+   writes or service starts. Explicit `--apply` validates Docker, Compose,
+   Bun's native SQLite binding, file owner/mode/type, templates, and any
+   existing CA pair before the first mutation.
+2. Apply seeds only missing OMP defaults, generates the shared CA under a
+   lock, creates the mode-0600 proxy token, and starts the existing proxy and
+   broker topology. Proxy readiness is the authenticated config reload. A
+   401 permits one force-recreate recovery. Broker readiness is conjunctive:
+   health plus the owned mode-0600 token. The private-image miss takes the
+   existing HOME-relative local CLI fallback.
+
+Development start is mutation-free. It reports the full missing
+prerequisite plan and exits before the server unless setup is complete. Once
+ready, it exports `HTTP_PROXY`/`HTTPS_PROXY`, internal-only `NO_PROXY`, the
+shared CA paths, `BOTTEGA_PROXY_CONTROL_URL`/token, and
+`OMP_AUTH_BROKER_URL`/token, then runs the server. `dev:watch` changes only
+the final `--watch` argument.
+
+User credentials never become setup defaults or output. Provisioning keeps
+the existing `connect_upload_link` browser-to-vault boundary, and the
+existing `first_run_wizard` remains the single guided credential checklist.
 
 The broker fallback does not remove the Docker requirement: local
 iron-proxy still runs in Compose. Deployment keeps the base
