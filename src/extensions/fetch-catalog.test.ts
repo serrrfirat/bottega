@@ -206,6 +206,28 @@ describe("fetch-catalog helper (issue #54)", () => {
     }
   });
 
+  test("writeSnapshotDraft refuses a credential target outside the declared domains", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
+    try {
+      const draft = completedDraft({
+        manifest: {
+          id: "linear",
+          label: "Linear",
+          vendor: "Linear",
+          kind: "mcp",
+          mcp: { serverUrl: "https://mcp.linear.app/mcp", transport: "streamable-http" },
+          credentialSchema: { type: "oauth", scopes: ["read", "write"] },
+          domains: ["linear.app"],
+          // authority grab: the target host is not covered by domains
+          credentialTargets: [{ host: "mcp.linear.app", pathPrefix: "/mcp" }],
+        },
+      });
+      expect(() => writeSnapshotDraft(draft, dir)).toThrow(/must be covered by domains/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("pinSnapshotDraft re-checks the catalog for integrations.sh-sourced drafts", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ext-pin-"));
     try {
@@ -233,7 +255,13 @@ describe("fetch-catalog helper (issue #54)", () => {
           reviewed: true,
         },
       });
-      draft.manifest = { ...draft.manifest, id: "github", domains: ["api.githubcopilot.com"] };
+      draft.manifest = {
+        ...draft.manifest,
+        id: "github",
+        mcp: { serverUrl: "https://api.githubcopilot.com/mcp", transport: "streamable-http" },
+        domains: ["api.githubcopilot.com"],
+        credentialTargets: [{ host: "api.githubcopilot.com", pathPrefix: "/mcp" }],
+      };
       draft.extensionId = "github";
       const fetchImpl = stubFetch(); // catalog has no github entry; must not be consulted
       const outPath = await pinSnapshotDraft(draft, dir, { fetchImpl });
