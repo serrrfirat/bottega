@@ -166,9 +166,12 @@ describe("e2e journey 1: chat + memory", () => {
         // The digest turn was silent: no extra channel message appeared.
         expect(h.messages(h.slack.dmChannelId).length).toBe(1);
 
-        // Let the dispose settle, then a new message cold-starts a fresh
-        // session (request 3) and replies normally.
-        await Bun.sleep(100);
+        // Wait until dispose FULLY completes before cold-starting "again":
+        // the digest turn streams while dispose is mid-flight, and a message
+        // arriving while the session is mid-dispose is dropped (issue #119)
+        // — so sending early would never produce request 3. `hasLiveSession`
+        // flips to false only after dispose tears the session down.
+        await waitFor(() => !h.spaceService.hasLiveSession(spaceId));
         await h.deliverMessage(h.slack.dmChannelId, "again");
         await h.modelStub.waitForRequests(3);
         const reply = await waitFor(() => h.messages(h.slack.dmChannelId).find((m) => m.text === "first reply"));

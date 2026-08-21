@@ -417,6 +417,19 @@ export class SpaceService {
     return this.#sessions.get(spaceId)?.session.getTurnPrincipal?.();
   }
 
+  /**
+   * True while a READY live session exists for the space (created, not
+   * mid-dispose). Exposed for test observability only — the hot path never
+   * consults it. A message arriving while a session is mid-dispose is
+   * dropped (issue #119), so a caller that must cold-start a fresh session
+   * waits for `false` here before delivering: it flips to false only after
+   * dispose fully tears the session down (including any digest turn).
+   */
+  hasLiveSession(spaceId: string): boolean {
+    const live = this.#sessions.get(spaceId);
+    return live !== undefined && !live.disposing;
+  }
+
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
     try {
       // Turn-lifecycle INFO (issue #212 follow-up): the adapter's accepted
