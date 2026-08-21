@@ -1114,12 +1114,18 @@ describe("issue #338 MCP transport boundary (server-side, reject before transpor
       "8.8.8.8",
       "9.9.9.9",
       "example.com",
+      // A PUBLIC IPv6 literal (bracketed as URL.hostname reports it) must
+      // pass the IP branch, not be misrouted to a bogus DNS denial.
+      "2606:4700::6810:84e5",
+      "[2606:4700::6810:84e5]",
     ];
     for (const host of publicHosts) {
       expect(() => assertPublicMcpEndpointHost(host)).not.toThrow();
     }
-    // loopback / private / link-local / metadata / arbitrary endpoint
-    // overrides are all rejected by the same guard.
+    // loopback / private / CGNAT / link-local / metadata / arbitrary endpoint
+    // overrides are all rejected by the same guard. IPv6 cases cover the
+    // bracket forms URL.hostname reports (so the IP branch is exercised,
+    // not an accidental single-label denial) plus each blocked class.
     const blocked = [
       "localhost",
       "127.0.0.1",
@@ -1132,10 +1138,20 @@ describe("issue #338 MCP transport boundary (server-side, reject before transpor
       "169.254.10.10", // link-local
       "0.0.0.0",
       "224.0.0.1",
+      // CGNAT (RFC 6598) 100.64/10 — shared-address space treated as private.
+      "100.64.0.1",
+      "100.100.100.100",
+      "100.127.255.254",
+      "100.128.0.1", // outside 100.64/10 — must NOT be rejected
       "::1",
+      "[::1]", // bracketed loopback (as URL.hostname reports IPv6 literals)
       "::",
       "fe80::1",
+      "[fe80::1]", // link-local
       "fc00::1",
+      "[fc00::1]", // unique-local
+      "[ff02::1]", // multicast
+      "[::ffff:127.0.0.1]", // IPv4-mapped loopback
       "metadata",
       "metadata.google.internal",
       "postgres", // single label
@@ -1143,8 +1159,25 @@ describe("issue #338 MCP transport boundary (server-side, reject before transpor
       "host.internal",
       "server.lan",
     ];
+    // The one value just outside CGNAT must pass; everything else must throw.
     for (const host of blocked) {
+      if (host === "100.128.0.1") {
+        expect(() => assertPublicMcpEndpointHost(host)).not.toThrow();
+        continue;
+      }
       expect(() => assertPublicMcpEndpointHost(host)).toThrow();
+    }
+  });
+
+  test("DNS-resolving private addresses are left to the pinned endpoint + iron-proxy policy, not re-checked here", () => {
+    // A PUBLIC hostname is accepted even though its DNS record could resolve
+    // to a private/loopback address on some network: the extension's PINNED
+    // endpoint and the iron-proxy egress allowlist (the configured domains)
+    // are the boundary that keeps a resolved private destination unreachable.
+    // This guard deliberately does not duplicate the resolver or the egress
+    // policy — it rejects literals and structurally-internal names only.
+    for (const host of ["api.example.com", "mcp.trusted.dev"]) {
+      expect(() => assertPublicMcpEndpointHost(host)).not.toThrow();
     }
   });
 
@@ -1161,9 +1194,11 @@ describe("issue #338 MCP transport boundary (server-side, reject before transpor
       "http://localhost:8080/mcp",
       "http://10.1.2.3/mcp",
       "http://192.168.0.10/mcp",
+      "http://100.64.0.5/mcp", // CGNAT (RFC 6598)
       "http://169.254.169.254/latest/meta-data", // cloud metadata
-      "http://internal.example/mcp",
-      "http://postgres/mcp",
+      "http://service.local/mcp", // reserved internal TLD
+      "http://postgres/mcp", // single label
+      "http://[::1]:3000/mcp", // bracketed loopback as URL.hostname reports it
     ]) {
       expect(() =>
         defaultMcpTransport({ serverUrl: url, transport: "streamable-http" }),

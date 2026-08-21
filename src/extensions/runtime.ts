@@ -457,26 +457,39 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
 
 /**
  * Throws when `host` is a loopback / link-local / private-network /
- * cloud-metadata (or otherwise non-public) destination that the SERVER must
- * never reach with a model-controlled MCP transport (issue #338). Public,
- * fully-qualified hostnames pass — reachability and credential routing stay
- * the iron-proxy egress policy's job, not this guard's (no egress-policy
- * duplication). DNS names that cannot be public internet (single-label
- * `localhost`, bare internal labels, or reserved internal TLDs) and IP
- * literals in a private/loopback/link-local/reserved range are rejected
- * fail-closed before a transport could be created.
+ * CGNAT / cloud-metadata (or otherwise non-public) destination that the
+ * SERVER must never reach with a model-controlled MCP transport (issue
+ * #338). Public, fully-qualified hostnames pass — reachability and
+ * credential routing stay the iron-proxy egress policy's job, not this
+ * guard's (no egress-policy duplication). DNS names that cannot be public
+ * internet (single-label `localhost`, bare internal labels, or reserved
+ * internal TLDs) and IP literals in a private/loopback/link-local/reserved
+ * range are rejected fail-closed before a transport could be created.
+ *
+ * A PUBLIC DNS name whose resolution happens to point at a private address
+ * is not re-checked here: the extension's PINNED endpoint + the iron-proxy
+ * egress allowlist (the configured domains) are the boundary that keeps a
+ * resolved private/loopback destination unreachable. This guard rejects
+ * literals and structurally-internal names only; it deliberately does not
+ * duplicate the resolver's DNS lookup or the egress policy's allowlist.
  */
 export function assertPublicMcpEndpointHost(host: string): void {
   if (host === "") {
     throw new Error("MCP serverUrl has no host — refusing a Unix-socket / empty-authority http endpoint");
   }
-  const normalized = host.toLowerCase();
-  if (isIP(host) !== 0) {
-    if (isBlockedIpLiteral(host)) {
+  // URL.hostname brackets a literal IPv6 (`[::1]`); strip them so the
+  // literal is tested by the IP branch, not misrouted to the DNS-name
+  // branch (a single `[::1]` label would otherwise be a false single-label
+  // denial, and a public IPv6 like `[2606:4700::6810:84e5]` would be
+  // wrongly rejected instead of passing through to the IP branch).
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (isIP(bare) !== 0) {
+    if (isBlockedIpLiteral(bare)) {
       throw new Error(`MCP serverUrl host "${host}" is a loopback/link-local/private/reserved address — refused server-side`);
     }
     return;
   }
+  const normalized = bare.toLowerCase();
   // DNS name: reject anything that cannot be public internet.
   const labels = normalized.split(".");
   if (labels.length < 2) {
@@ -500,8 +513,9 @@ function isBlockedIpLiteral(ip: string): boolean {
     const b = octets[1];
     if (a === undefined || b === undefined) return true;
     if (a === 10) return true; // 10/8  private
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
-    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT (RFC 6598)
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12 private
+    if (a === 192 && b === 168) return true; // 192.168/16 private
     if (a === 127) return true; // loopback
     if (a === 169 && b === 254) return true; // link-local + cloud-metadata (169.254.169.254)
     if (a >= 224) return true; // multicast + reserved
