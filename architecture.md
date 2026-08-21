@@ -867,44 +867,56 @@ uses the same filesystem authority check and writes `workspace.purge`
 decision/result audit rows. Nothing scans or deletes unknown directories,
 and there is no automatic age-based purge.
 
-## Worker boundary direction (epic #170)
+## Worker isolation boundary (epic #170, #101, #105)
 
 ```mermaid
 flowchart LR
-    subgraph shipped["Shipped boundary"]
-        SL["server<br/>conversation, receipt, approvals,<br/>scheduling, orchestration"]
-        Q[("SQLite queue + audit<br/>current cross-process seam")]
-        EX["executor container<br/>claim loop"]
-        GIT["git job<br/>workspace → branch → PR"]
-        EXT["extension job<br/>headless session → provider result"]
-        DEL["delivery approval seam (#149)<br/>pending → resolved → done"]
-        SL --> Q --> EX
-        EX --> GIT --> DEL --> Q
-        EX --> EXT --> Q
-    end
-
-    subgraph planned["Epic #170 direction — not all shipped"]
-        OUT["durable outbox (#187)<br/>reliable dispatch"]
-        ROUTER["worker router<br/>job kind"]
-        C1["per-job container<br/>git"]
-        C2["per-job container<br/>extension"]
-        C3["per-job container<br/>other risky/credentialed work"]
-        OUT --> ROUTER
-        ROUTER --> C1
-        ROUTER --> C2
-        ROUTER --> C3
-    end
-
-    Q -. "planned cutover" .-> OUT
+    SL["server<br/>conversation + orchestration"]
+    Q[("SQLite queue + outbox + audit")]
+    EX["hardened executor container<br/>claim + lease supervisor"]
+    CH["one child process group per job<br/>strict DTO + scoped store"]
+    WORK["git | extension | kb | ingest_poll | scheduled"]
+    PXY["iron-proxy<br/>default-deny egress"]
+    SL --> Q --> EX
+    EX --> CH --> WORK
+    WORK --> Q
+    WORK --> PXY
 ```
 
-The server's target responsibility is conversation + orchestration. Risky
-or credentialed execution belongs behind the worker boundary. The
-preconditions already shipped are the complete delivery round-trip (#149)
-and composition-root parity (#172); the durable outbox is separately
-tracked in #187. Today there is one shared executor container for git and
-extension deliveries, and no chat worker. The right side is direction, not
-current-state documentation.
+Every durable worker kind crosses the same mandatory child boundary. The
+executor serializes one strict, bounded, non-secret job request. The child
+reopens only the configured SQLite file, derives the job scope from that
+envelope, and writes lifecycle, outbox, and audit rows through the scoped
+store facade. There is no production in-process fallback. Missing launcher
+wiring, invalid IPC, an unavailable Linux resource-limit profile, a timeout,
+or lease loss fails closed. Timeout and lease loss kill the complete process
+group before the supervisor maps the exact child exit contract.
+
+The child environment is an allowlist. Slack and webhook secrets, provider
+keys, and proxy-management credentials are absent. The git PAT file is
+mounted only for `git` jobs. The auth-broker token file is mounted only for
+`extension` jobs. Other kinds receive neither credential mount. HTTP(S)
+uses the executor container's iron-proxy settings; the deployment DNS and
+proxy policy remain the network truth.
+
+The current Linux deployment applies the reachable #105 controls at the
+executor-container boundary: read-only image root, writable durable data and
+disposable workspace mounts, all capabilities dropped, no-new-privileges,
+Docker's default seccomp profile, bounded PIDs/memory, and an init reaper.
+Each child also uses `prlimit` for address-space, descriptor, process-count,
+and wall-clock caps; missing `prlimit` refuses work.
+
+One OS-level leg remains deployment-gated: child processes share the
+executor container's network namespace and seccomp profile. A distinct
+network namespace and mount table for every job requires a nested container
+runtime or a host sandbox service. The deployment intentionally exposes
+neither a Docker socket nor host privileges to the executor because either
+would be a larger escape capability. Local non-Linux runs therefore verify
+the process/IPC/teardown boundary but skip Linux resource enforcement. CI's
+Docker job is the required no-skip lane for read-only root, writable
+workspace, capabilities, seccomp, network isolation, resource caps, and
+container teardown; the existing iron-proxy integration lane separately
+proves allowed egress still works and unlisted egress remains denied.
 
 ## Persistence & audit
 
@@ -962,8 +974,8 @@ is never deleted: "cleanup" evicts caches, never rows.
 | Untrusted ingress | Adapters validate every event; only adapters mint messages |
 | Credential exposure | Per-turn principal selects the credential; omp-broker or 1Password Connect resolves it; mode-0600 files and iron-proxy inject it only at the allowlisted host. API-key onboarding can use a single-use browser upload (#196). Slack tokens stay server-only; the git PAT stays file-only |
 | Secret pasted into a typed connect/memory write | Recognized shapes are refused before broker/persistence/audit and redirected to OAuth, the configured vault, or `connect_upload_link`. This does not scrub arbitrary Slack text already received |
-| Malicious repo content | Work items run in the executor container in disposable workspaces; the server never mounts repository paths. Epic #170 moves toward per-job containers |
-| Exfiltration / rogue egress | Default-deny deployment proxy: allowlist, judge, secret injection, and DNS sinkhole. Dev uses `config/egress.dev.yml` (allow-all/no judge) but keeps the proxy and injection path |
+| Malicious repo content | Every job runs in a dedicated child process group and disposable workspace; the server never mounts repository paths. The hardened executor container has a read-only image root, dropped capabilities, seccomp, no-new-privileges, and bounded resources |
+| Exfiltration / rogue egress | Child env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Deployment egress remains default-deny through iron-proxy allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
 | Unauthorized side effects | Policy gate on every tool call; exec and org-settings writes ask humans; unknown → deny |
 | Cross-user credential confusion | The driver binds the fresh turn's principal; steers do not replace it (#152), and one tool call dispatches once (#178) |
 | Data loss / tampering | Append-only audit, retained transcripts, delivery decisions as durable cross-process rows |
@@ -977,8 +989,10 @@ at the caller surface is. `src/server/boot-wiring.test.ts`,
 `src/executor-boot.test.ts`, and
 `src/server/composition-root-parity.test.ts` boot the real construction
 paths in temporary directories. The driver conformance suite runs the OMP
-driver. `src/executor.test.ts` drives the full delivery approval round-trip
-through real SQLite and boundary doubles.
+driver. `src/executor.test.ts` drives the delivery round-trip through real
+SQLite, while `src/worker/sandbox-process.test.ts` drives the production
+supervisor and child entrypoint, timeout, lease-loss, bounded IPC, secret
+denial, and process-tree teardown.
 
 The definition of done is caller-level acceptance coverage (#174): drive a
 real inbound message, tool call, scheduler fire, or executor claim and assert

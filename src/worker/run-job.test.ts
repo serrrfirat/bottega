@@ -16,6 +16,7 @@ import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } fr
 import type { WorkerJob } from "./envelope";
 import type { SchedulerAction, SchedulerActionName, SchedulerActionRegistry } from "../scheduler/types";
 import {
+  inProcessSandboxRunner,
   runJobInSandbox,
   runJobSandboxBody,
   runScheduledJobBody,
@@ -78,6 +79,26 @@ describe("job-scoped store facade (issue #101)", () => {
     expect(() => sandbox.enqueueJob({ id: "j", kind: "git", payload: {} })).toThrow(ScopedStoreAccessError);
     expect(() => sandbox.claimNextJob(60_000)).toThrow(ScopedStoreAccessError);
     expect(() => sandbox.markStaleWorkItems()).toThrow(ScopedStoreAccessError);
+  });
+
+  test("two concurrent scopes cannot read or mutate each other's rows", async () => {
+    const store = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_CONCURRENT" });
+    const [first, second] = await Promise.all([
+      store.createWorkItem({ space_id: space.id, requester: "U1", description: "first", delivery: "git" }),
+      store.createWorkItem({ space_id: space.id, requester: "U2", description: "second", delivery: "git" }),
+    ]);
+    const firstStore = createJobScopedStore(store, { jobId: first.id, workItemId: first.id });
+    const secondStore = createJobScopedStore(store, { jobId: second.id, workItemId: second.id });
+
+    const claims = await Promise.all([
+      firstStore.claimWorkItemById(first.id, "executor:first"),
+      secondStore.claimWorkItemById(second.id, "executor:second"),
+    ]);
+
+    expect(claims.map((item) => item?.id).sort()).toEqual([first.id, second.id].sort());
+    expect(() => firstStore.getWorkItem(second.id)).toThrow(ScopedStoreAccessError);
+    expect(() => secondStore.transitionWorkItem(first.id, "claimed", "working")).toThrow(ScopedStoreAccessError);
   });
 
   test("jobScopeFromEnvelope re-derives ONLY the job's own item, failing closed", () => {
@@ -181,6 +202,7 @@ describe("ingest_poll split: worker fetches, server dispatch+post stays in-proce
     };
     const poller: Poller = { poll: async () => [event] };
     const deps: ExecutorDeps = {
+      sandboxRunner: inProcessSandboxRunner(),
       store,
       // SAFETY: ingest_poll jobs never touch memory or a driver — stubs.
       memoryProvider: undefined as never,
@@ -688,6 +710,7 @@ describe("issue #302: malformed git envelope fails closed through the real claim
 
     const deps: ExecutorDeps = {
       store,
+      sandboxRunner: inProcessSandboxRunner(),
       memoryProvider: undefined as never,
       driver: undefined as never,
       orgConfigDir: join(dir, "config"),

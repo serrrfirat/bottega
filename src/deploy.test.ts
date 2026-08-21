@@ -52,12 +52,28 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
   test("executor reads the git PAT from the container path of the data volume", () => {
     const env = serviceEnv("executor");
     expect(env["EXECUTOR_GIT_TOKEN_FILE"]).toBe("/app/data/secrets/github-pat");
+    expect(env["OMP_AUTH_BROKER_TOKEN_FILE"]).toBe("/app/data/.omp/auth-broker.token");
     // Issue #67: the workspaces dir is an org SETTING (settings.workspaces_dir),
     // not an env var — unset, the executor resolves the container default
     // /workspaces (the data volume mounted below).
     expect(env["WORKSPACES_DIR"]).toBeUndefined();
     const volumes = asStringArray(service("executor")["volumes"]);
     expect(volumes).toContain("data:/workspaces");
+  });
+
+  test("executor container keeps the reachable #105 hardening profile mandatory", () => {
+    const executor = service("executor");
+    expect(executor["read_only"]).toBe("true");
+    expect(executor["pids_limit"]).toBe("256");
+    expect(asStringArray(executor["cap_drop"])).toEqual(["ALL"]);
+    expect(asStringArray(executor["security_opt"])).toEqual([
+      "no-new-privileges:true",
+      "seccomp=default",
+    ]);
+    expect(asStringArray(executor["tmpfs"])).toContain("/tmp:rw,noexec,nosuid,size=64m");
+    const volumes = asStringArray(executor["volumes"]);
+    expect(volumes).not.toContain("./config/omp:/app/data/omp-agent");
+    expect(volumes).toContain("./certs:/etc/iron-proxy/certs:ro");
   });
 });
 

@@ -317,6 +317,7 @@ function makeFixture(approval: DeliveryApproval | null = { approver: "U_HUMAN" }
 function makeDeps(fx: Fixture, overrides: Partial<ExecutorDeps> = {}): ExecutorDeps {
   return {
     store: fx.store,
+    sandboxRunner: inProcessSandboxRunner(),
     memoryProvider: resolveMemoryProvider(fx.store.getOrgSettings(), fx.store.getDb()),
     driver: fx.driver,
     orgConfigDir: fx.orgConfigDir,

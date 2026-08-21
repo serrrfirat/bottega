@@ -64,7 +64,12 @@ import {
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
 import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
-import { inProcessSandboxRunner, runJobInSandbox, type SandboxRunner } from "./worker/run-job";
+import {
+  createChildProcessSandboxRunner,
+  probeChildProcessSandbox,
+  runJobInSandbox,
+  type SandboxRunner,
+} from "./worker/run-job";
 import type { Poller } from "./ingest/types";
 import { getWatermarkedPoller } from "./ingest/registry";
 import { createAudit, redact } from "./policy/audit";
@@ -231,17 +236,13 @@ export interface ExecutorDeps {
    */
   onUnclaimed?: (job: WorkerJob) => void | Promise<void>;
   /**
-   * Per-job sandbox isolation (issue #101): when present, git/extension
-   * jobs run through this runner instead of the in-process delivery path.
-   * The runner re-derives the job's scope from the envelope id, drives the
-   * whole job through the job-scoped store facade, and returns the exit
-   * code contract (0 = completed, 2 = self-failed, 3 = transient requeue;
-   * anything else is a crash → the supervisor fails the job loudly +
-   * unsticks the work item). Absent → today's in-process runWorkItemJob
-   * path (legacy tests and runner-less deployments).
+   * Mandatory per-job isolation boundary. Production supplies the real
+   * child-process launcher; tests may inject a hermetic runner. Missing
+   * wiring refuses executor startup — no job kind has an in-process
+   * fallback.
    */
   sandboxRunner?: SandboxRunner;
-  /** SQLite database path for a sandbox child process (production wiring; unused while the runner stays in-process). */
+  /** SQLite database path mounted for the sandbox child. Production always sets this explicitly. */
   dbPath?: string;
   /**
    * Poller factories for the ingest_poll job kind (issue #101): one per
@@ -322,6 +323,14 @@ export interface ExecutorBoot {
  */
 export async function bootExecutorRuntime(opts: {
   agentDir?: string;
+  /** Database opened by this composition root. Sandbox children pass the one allowlisted database mount. */
+  dbPath?: string;
+  /** Secret env names a sandbox child must never seed into its process. */
+  skipBootSecretEnvNames?: readonly string[];
+  /** Sandbox children inherit no secret env and must not contact the boot vault. */
+  skipBootSecretSeed?: boolean;
+  /** Sandbox children never rewrite the process-external proxy credential mount. */
+  skipProxyCredentialSync?: boolean;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (binding: McpBinding) => Transport;
   /**
@@ -340,10 +349,15 @@ export async function bootExecutorRuntime(opts: {
   // server and MCP roots. Issue #208: then push the provider credentials
   // into the proxy (the app process never holds them — models.yml carries
   // the placeholder, the proxy injects the real key at egress).
-  await seedBootSecretsFromVault();
-  await syncProxyCredentialsFromEnv();
+  if (opts.skipBootSecretSeed !== true) {
+    await seedBootSecretsFromVault(
+      opts.skipBootSecretEnvNames === undefined ? undefined : { skipEnvNames: opts.skipBootSecretEnvNames },
+    );
+  }
+  if (opts.skipProxyCredentialSync !== true) await syncProxyCredentialsFromEnv();
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
+    ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : undefined),
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
@@ -422,8 +436,11 @@ export interface ExecutorConfig {
   jobSweepIntervalMs: number;
 }
 
-/** Boot: resolve config, recover stale runs (#10), surface unclaimed jobs (#170), install the askpass helper. */
+/** Boot: require isolation, resolve config, recover stale runs, sweep unclaimed jobs, and install askpass. */
 export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfig> {
+  if (deps.sandboxRunner === undefined) {
+    throw new Error("sandbox runner unavailable: executor refuses to start without per-job isolation");
+  }
   const cfg = resolveConfig(deps);
   await recoverStaleWorkItems(deps.store, DEFAULT_STALE_AFTER_MS);
   // Epic #170 fail-loud: a dispatched job no worker claimed within its TTL
@@ -559,50 +576,24 @@ export interface JobRunOutcome {
   selfReported?: boolean;
 }
 
-/**
- * Kind routing (epic #170): git and extension drive a work item through the
- * existing delivery paths; kb runs the real ingest worker (Wave 2) against
- * the declared source set; scheduled stays a fail-closed stub until Wave 2
- * dispatchers land — a dispatch can never silently no-op. Each kind's
- * toolset/environment is its handler's composition (the git path uses the
- * exec toolset, the extension path the memory+extension toolset, the kb
- * path the org memory provider); per-kind isolation (#101) falls out per
- * kind on top.
- */
+/** Every durable job kind crosses the mandatory per-job sandbox boundary. */
 async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
-  switch (job.kind) {
-    case "git":
-    case "extension":
-      // Issue #101: with a sandbox runner wired, git/extension jobs execute
-      // in an isolated per-job scope (one job's rows, its own caps); without
-      // one, the legacy in-process delivery path runs unchanged.
-      if (deps.sandboxRunner) {
-        return runJobInSandbox(deps, cfg, job, deps.sandboxRunner);
-      }
-      return runWorkItemJob(deps, cfg, job);
-    case "kb":
-      return runKbJob(deps, job);
-    case "ingest_poll":
-      return runIngestPollJob(deps, job);
-    case "scheduled": {
-      const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
-      if (!parsed.success) {
-        throw new Error(`scheduled job payload must be { action, ... } — failing closed: ${parsed.error.message}`);
-      }
-      // Issue #272 (epic #229 P2): the scheduled kind dispatches to the
-      // executor's action registry under the job-scoped sandbox runner. The
-      // model-call seam (memory consolidation's LLM leg) rides the job
-      // context — it runs HERE, never in the server process. The default
-      // registry holds the worker-runnable actions (memory_consolidation);
-      // pure scheduler actions stay in-process in the server.
-      const scheduledDeps: ExecutorDeps = {
-        ...deps,
-        scheduledActions: deps.scheduledActions ?? buildRegistry([memoryConsolidationAction()]),
-        consolidationModelCall: deps.consolidationModelCall ?? defaultConsolidationModelCall(deps.driver),
-      };
-      return runJobInSandbox(scheduledDeps, cfg, job, deps.sandboxRunner ?? inProcessSandboxRunner());
-    }
+  const runner = deps.sandboxRunner;
+  if (runner === undefined) {
+    throw new Error("sandbox runner unavailable: refusing in-process job execution");
   }
+  if (job.kind !== "scheduled") return runJobInSandbox(deps, cfg, job, runner);
+
+  const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
+  if (!parsed.success) {
+    throw new Error(`scheduled job payload must be { action, ... } — failing closed: ${parsed.error.message}`);
+  }
+  const scheduledDeps: ExecutorDeps = {
+    ...deps,
+    scheduledActions: deps.scheduledActions ?? buildRegistry([memoryConsolidationAction()]),
+    consolidationModelCall: deps.consolidationModelCall ?? createDefaultConsolidationModelCall(deps.driver),
+  };
+  return runJobInSandbox(scheduledDeps, cfg, job, runner);
 }
 
 /**
@@ -611,7 +602,7 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
  * to the EXECUTOR's driver so the LLM leg runs in the worker process. The
  * driver resolves lazily on first call. Tests stub the seam instead.
  */
-function defaultConsolidationModelCall(driver: AgentDriver | Promise<AgentDriver>): ConsolidationModelCall {
+export function createDefaultConsolidationModelCall(driver: AgentDriver | Promise<AgentDriver>): ConsolidationModelCall {
   let consolidationSequence = 0;
   return async (systemPrompt, input) => {
     const resolved = await driver;
@@ -660,7 +651,7 @@ function defaultConsolidationModelCall(driver: AgentDriver | Promise<AgentDriver
  * (getIngestWatermark/setIngestWatermark), so a crash re-polls from the
  * last boundary instead of re-fetching the world.
  */
-async function runIngestPollJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
+export async function runIngestPollJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
   const parsed = ingestPollJobPayloadSchema.safeParse(job.payload);
   if (!parsed.success) {
     throw new Error(`job ${job.id} (ingest_poll) payload must be { provider } — failing closed: ${parsed.error.message}`);
@@ -686,7 +677,7 @@ async function runIngestPollJob(deps: ExecutorDeps, job: WorkerJob): Promise<Job
  * malformed payload → schema reject; URL host outside the declared set →
  * refused; URL naming no declared source → fail loud.
  */
-async function runKbJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
+export async function runKbJob(deps: ExecutorDeps, job: WorkerJob): Promise<JobRunOutcome> {
   const parsed = kbJobPayloadSchema.safeParse(job.payload);
   if (!parsed.success) {
     throw new Error(`job ${job.id} (kb) payload must be { url } — failing closed: ${parsed.error.message}`);
@@ -1448,11 +1439,16 @@ async function git(args: string[], opts: { cwd?: string; env?: Record<string, st
 }
 
 if (import.meta.main) {
-  const boot = await bootExecutorRuntime();
+  const dbPath = process.env.BOTTEGA_DB_PATH ?? "data/bottega.db";
+  const boot = await bootExecutorRuntime({ dbPath });
   const { store } = boot.runtime;
+  const sandboxRunner = createChildProcessSandboxRunner({ dbPath });
+  await probeChildProcessSandbox({ dbPath, transcriptDir: "data/transcripts" });
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,
+    dbPath,
+    sandboxRunner,
     memoryProvider: boot.runtime.memoryProvider,
     get driver(): AgentDriver | Promise<AgentDriver> {
       return (driver ??= boot.getDriver());

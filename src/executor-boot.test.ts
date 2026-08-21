@@ -28,6 +28,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { inProcessSandboxRunner } from "./worker/run-job";
 import type { McpBinding } from "./extensions/manifest";
 import { resetToolSurfaceCache } from "./extensions/surface";
 import { bootExecutorRuntime, prepareExecutor, type ExecutorDeps } from "./executor";
@@ -138,6 +139,7 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       let driver: ExecutorDeps["driver"];
       const deps: ExecutorDeps = {
         store: boot.runtime.store,
+        sandboxRunner: inProcessSandboxRunner(),
         memoryProvider: boot.runtime.memoryProvider,
         get driver() {
           return (driver ??= boot.getDriver());

@@ -210,6 +210,21 @@ services:
       - "run"
       - "src/executor.ts"
     restart: on-failure
+    # Issue #105 reachable hardening: immutable image root, no Linux
+    # capabilities, Docker's default seccomp allowlist, bounded PIDs, and an
+    # init process that reaps sandbox descendants. The only writable mounts
+    # are durable SQLite state and disposable workspaces below.
+    read_only: true
+    init: true
+    pids_limit: 256
+    mem_limit: 1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=default
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     depends_on:
       - iron-proxy
     dns:
@@ -230,10 +245,12 @@ services:
       # dir is an org setting (settings.workspaces_dir, issue #67); unset it
       # resolves to the container default /workspaces (mounted below).
       EXECUTOR_GIT_TOKEN_FILE: /app/data/secrets/github-pat
+      # Related only to extension jobs: the supervisor passes this FILE
+      # mount to that child kind, never the bearer value or other jobs.
+      OMP_AUTH_BROKER_TOKEN_FILE: /app/data/.omp/auth-broker.token
     volumes:
       - data:/app/data
       - data:/workspaces
-      - ./config/omp:/app/data/omp-agent
       # The egress MITM CA (NODE_EXTRA_CA_CERTS above).
       - ./certs:/etc/iron-proxy/certs:ro
     networks:

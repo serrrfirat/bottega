@@ -26,7 +26,10 @@
  * but that one job, caps, and the exit-code mapping — is implemented here
  * and is what the caller-surface tests pin.
  */
-import { processItem, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
 import type { Store } from "../store/db";
 import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
 import { postOutboxRow } from "../store/outbox";
@@ -35,15 +38,26 @@ import type { SchedulerActionName } from "../scheduler/types";
 import { scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import { resolveKindCaps, type JobResourceCaps } from "./caps";
+import {
+  MAX_SANDBOX_REQUEST_BYTES,
+  MAX_SANDBOX_RESPONSE_BYTES,
+  SANDBOX_PROTOCOL_VERSION,
+  sandboxResponseSchema,
+  type SandboxRequest,
+} from "./sandbox-protocol";
 
 /** What a sandbox run reported back to the boss loop. */
 export interface SandboxResult {
-  /** The child/body exit code. null when the runner died by signal. */
+  /** The child/body exit code. null when the runner died by signal or invalid IPC. */
   exitCode: number | null;
   /** The terminating signal, if any. */
   signal: string | null;
   /** True when the run was torn down by the supervisor's deadline. */
   timedOut: boolean;
+  /** True when lease renewal proved that the parent no longer owns the job. */
+  leaseLost?: boolean;
+  /** Bounded protocol validation failure. Never contains child output beyond the cap. */
+  protocolError?: string;
 }
 
 /** Per-run context handed to the runner. */
@@ -52,6 +66,8 @@ export interface SandboxRunnerContext {
   cfg: ExecutorConfig;
   /** The kind's resolved resource caps (org overrides on the defaults). */
   caps: JobResourceCaps;
+  /** Aborted by the boss loop when lease renewal fails. The runner must kill the full process tree. */
+  signal: AbortSignal;
 }
 
 /** The injectable runner seam (tests supply fakes; production supplies the child). */
@@ -68,12 +84,9 @@ export function capsFor(kind: WorkerJob["kind"], store: Store): JobResourceCaps 
 }
 
 /**
- * The runner the boss loop is handed when none was injected: executes the
- * job through the per-kind body — {@link runJobSandboxBody} for the
- * work-item kinds, {@link runScheduledJobBody} for the scheduled kind (the
- * runner's DISPATCH MODE, issue #272) — with the store RE-WIRED to the
- * job-scoped facade, so the whole run writes like the production child
- * (which constructs its own deps.store as the facade).
+ * In-process body adapter for hermetic unit tests only. Production wiring
+ * always uses {@link createChildProcessSandboxRunner}; the executor refuses
+ * to start without an explicitly supplied runner.
  */
 export function inProcessSandboxRunner(): SandboxRunner {
   return async (job, ctx) => {
@@ -81,10 +94,309 @@ export function inProcessSandboxRunner(): SandboxRunner {
       ...ctx.deps,
       store: createJobScopedStore(ctx.deps.store, jobScopeFromEnvelope(job)),
     };
-    return job.kind === "scheduled"
-      ? runScheduledJobBody(deps, ctx.cfg, ctx.caps, job)
-      : runJobSandboxBody(deps, ctx.cfg, ctx.caps, job);
+    return runIsolatedJobBody(deps, ctx.cfg, ctx.caps, job);
   };
+}
+
+export interface ChildProcessSandboxOptions {
+  /** The one database file made available to the child. */
+  dbPath: string;
+  /** Test seam; production uses the checked-in child entrypoint. */
+  entrypoint?: string;
+  /** Related credential mount used only by extension jobs. Never serialized or copied into other jobs. */
+  brokerTokenFile?: string;
+  /** Linux deployment must have prlimit; other OSes run the process-boundary lane only. */
+  requireOsResourceLimits?: boolean;
+}
+
+export interface SandboxProbe {
+  pid: number;
+  childMarker: "1";
+  forbiddenEnvNames: string[];
+}
+
+const SANDBOX_CHILD_ENTRYPOINT = fileURLToPath(new URL("./run-job-child.ts", import.meta.url));
+const SAFE_CHILD_ENV_NAMES = [
+  "PATH",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS",
+  "BOTTEGA_EXTENSIONS_DIR",
+  "BOTTEGA_CONFIG_DIR",
+  "OMP_AUTH_BROKER_URL",
+  "BOTTEGA_PROXY_CONTROL_URL",
+  "BOTTEGA_PROXY_SECRETS_DIR",
+] as const;
+
+/**
+ * Production launcher: one strict DTO over bounded stdin, one bounded reply
+ * over fd 3, an allowlisted environment, a new process group, and hard
+ * timeout/lease-loss teardown of that entire group.
+ */
+export function createChildProcessSandboxRunner(options: ChildProcessSandboxOptions): SandboxRunner {
+  if (options.dbPath.trim() === "") throw new Error("sandbox database path is required");
+  const entrypoint = options.entrypoint ?? SANDBOX_CHILD_ENTRYPOINT;
+  const requireLimits = options.requireOsResourceLimits ?? process.platform === "linux";
+  const brokerTokenFile =
+    options.brokerTokenFile ?? process.env.OMP_AUTH_BROKER_TOKEN_FILE ?? "/app/data/.omp/auth-broker.token";
+  return async (job, ctx) => {
+    const request: SandboxRequest = {
+      version: SANDBOX_PROTOCOL_VERSION,
+      mode: "execute",
+      dbPath: options.dbPath,
+      job,
+      config: ctx.cfg,
+      caps: ctx.caps,
+    };
+    const response = await spawnSandboxChild(request, {
+      entrypoint,
+      caps: ctx.caps,
+      signal: ctx.signal,
+      tokenFile: ctx.cfg.tokenFile,
+      brokerTokenFile,
+      requireLimits,
+    });
+    if ("result" in response) return response.result;
+    if ("probe" in response) {
+      return { exitCode: null, signal: null, timedOut: false, protocolError: "invalid sandbox IPC: unexpected probe" };
+    }
+    return response;
+  };
+}
+
+/** Boot-time proof that the checked-in child entrypoint and sanitized env work. */
+export async function probeChildProcessSandbox(options: {
+  dbPath: string;
+  transcriptDir: string;
+  requireOsResourceLimits?: boolean;
+}): Promise<SandboxProbe> {
+  const response = await spawnSandboxChild(
+    { version: SANDBOX_PROTOCOL_VERSION, mode: "probe" },
+    {
+      entrypoint: SANDBOX_CHILD_ENTRYPOINT,
+      caps: { timeoutMs: 10_000, memoryMb: 512 },
+      signal: new AbortController().signal,
+      tokenFile: "",
+      brokerTokenFile: "",
+      requireLimits: options.requireOsResourceLimits ?? process.platform === "linux",
+    },
+  );
+  if (!("probe" in response)) throw new Error(response.protocolError ?? "sandbox probe failed");
+  return response.probe;
+}
+
+type SpawnChildResult =
+  | { result: SandboxResult }
+  | { probe: SandboxProbe }
+  | SandboxResult;
+
+async function spawnSandboxChild(
+  request: SandboxRequest,
+  options: {
+    entrypoint: string;
+    caps: JobResourceCaps;
+    signal: AbortSignal;
+    tokenFile: string;
+    requireLimits: boolean;
+    brokerTokenFile: string;
+  },
+): Promise<SpawnChildResult> {
+  const encoded = JSON.stringify(request);
+  if (Buffer.byteLength(encoded) > MAX_SANDBOX_REQUEST_BYTES) {
+    return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox request exceeds IPC limit" };
+  }
+  const command = sandboxCommand(options.entrypoint, options.caps.memoryMb, options.requireLimits);
+  if ("error" in command) {
+    return { exitCode: null, signal: null, timedOut: false, protocolError: command.error };
+  }
+  const env: Record<string, string> = { BOTTEGA_SANDBOX_CHILD: "1" };
+  for (const name of SAFE_CHILD_ENV_NAMES) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  if (options.tokenFile !== "" && request.mode === "execute" && request.job.kind === "git") {
+    env.EXECUTOR_GIT_TOKEN_FILE = options.tokenFile;
+  }
+  if (options.brokerTokenFile !== "" && request.mode === "execute" && request.job.kind === "extension") {
+    env.OMP_AUTH_BROKER_TOKEN_FILE = options.brokerTokenFile;
+  }
+
+  let child: ChildProcess;
+  try {
+    child = spawn(command.file, command.args, {
+      detached: process.platform !== "win32",
+      env,
+      stdio: ["pipe", "inherit", "inherit", "pipe"],
+    });
+  } catch (error) {
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      protocolError: `sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const responseStream = child.stdio[3];
+  if (responseStream === null || child.stdin === null) {
+    killProcessTree(child);
+    return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox IPC pipes unavailable" };
+  }
+
+  let responseBytes: Buffer;
+  const boundedResponse = readBounded(responseStream, MAX_SANDBOX_RESPONSE_BYTES, () => killProcessTree(child));
+  child.stdin.end(encoded);
+  let timedOut = false;
+  let leaseLost = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    killProcessTree(child);
+  }, options.caps.timeoutMs);
+  const abort = (): void => {
+    leaseLost = true;
+    killProcessTree(child);
+  };
+  options.signal.addEventListener("abort", abort, { once: true });
+  const exitWait = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  child.once("error", () => exitWait.resolve({ code: null, signal: null }));
+  child.once("exit", (code, signal) => exitWait.resolve({ code, signal }));
+  const exited = await exitWait.promise;
+  clearTimeout(timeout);
+  options.signal.removeEventListener("abort", abort);
+  try {
+    responseBytes = await boundedResponse;
+  } catch (error) {
+    return {
+      exitCode: null,
+      signal: exited.signal,
+      timedOut,
+      ...(leaseLost ? { leaseLost: true } : {}),
+      protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (timedOut || leaseLost) {
+    return { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut, ...(leaseLost ? { leaseLost: true } : {}) };
+  }
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(responseBytes.toString("utf8"));
+  } catch {
+    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" };
+  }
+  const parsed = sandboxResponseSchema.safeParse(parsedJson);
+  if (!parsed.success || parsed.data.pid !== child.pid) {
+    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" };
+  }
+  if (parsed.data.mode === "probe") {
+    return {
+      probe: {
+        pid: parsed.data.pid,
+        childMarker: parsed.data.childMarker,
+        forbiddenEnvNames: parsed.data.forbiddenEnvNames,
+      },
+    };
+  }
+  const expectedProcessExit = parsed.data.result.exitCode ?? 70;
+  if (exited.signal !== null || exited.code !== expectedProcessExit) {
+    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" };
+  }
+  return { result: parsed.data.result };
+}
+
+function sandboxCommand(
+  entrypoint: string,
+  memoryMb: number,
+  requireLimits: boolean,
+): { file: string; args: string[] } | { error: string } {
+  if (process.platform !== "linux") return { file: process.execPath, args: [entrypoint] };
+  const prlimit = "/usr/bin/prlimit";
+  if (!existsSync(prlimit)) {
+    if (requireLimits) return { error: "sandbox unavailable: /usr/bin/prlimit is required for resource caps" };
+    return { file: process.execPath, args: [entrypoint] };
+  }
+  return {
+    file: prlimit,
+    args: [
+      `--as=${memoryMb * 1024 * 1024}`,
+      "--nofile=256:256",
+      "--nproc=128:128",
+      "--",
+      process.execPath,
+      entrypoint,
+    ],
+  };
+}
+
+function killProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  try {
+    if (process.platform === "win32") child.kill("SIGKILL");
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The process already exited. The exit event below is the teardown proof.
+    }
+  }
+}
+
+function readBounded(
+  stream: NodeJS.ReadableStream,
+  limit: number,
+  onOverflow: () => void,
+): Promise<Buffer> {
+  const read = Promise.withResolvers<Buffer>();
+  const chunks: Buffer[] = [];
+  let size = 0;
+  stream.on("data", (chunk: Buffer | string) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > limit) {
+      onOverflow();
+      read.reject(new Error(`response exceeds ${limit} bytes`));
+      return;
+    }
+    chunks.push(bytes);
+  });
+  stream.once("end", () => read.resolve(Buffer.concat(chunks)));
+  stream.once("error", read.reject);
+  return read.promise;
+}
+
+/** Dispatches every durable worker kind inside the same real isolation boundary. */
+export async function runIsolatedJobBody(
+  deps: ExecutorDeps,
+  cfg: ExecutorConfig,
+  caps: JobResourceCaps,
+  job: WorkerJob,
+): Promise<SandboxResult> {
+  switch (job.kind) {
+    case "git":
+    case "extension":
+      return runJobSandboxBody(deps, cfg, caps, job);
+    case "scheduled":
+      return runScheduledJobBody(deps, cfg, caps, job);
+    case "kb":
+    case "ingest_poll": {
+      const store = createJobScopedStore(deps.store, jobScopeFromEnvelope(job));
+      const audit = createAudit(store);
+      try {
+        const outcome =
+          job.kind === "kb" ? await runKbJob({ ...deps, store }, job) : await runIngestPollJob({ ...deps, store }, job);
+        await completeSelf(store, audit, job, outcome);
+        return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
+      } catch (error) {
+        await failJobSelf(store, audit, job, error);
+        return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
+      }
+    }
+  }
 }
 
 /**
@@ -227,21 +539,27 @@ export async function runJobInSandbox(
   runner: SandboxRunner,
 ): Promise<JobRunOutcome> {
   const caps = capsFor(job.kind, deps.store);
-  // Lease renewal (epic #170 / issue #101): a long run (caps go to 30 min,
-  // the lease default) must not let its claim expire mid-flight, or another
-  // worker on the same store could reclaim and double-run it. Renew at
-  // lease/2 — renewJobLease returns false only once the row is no longer
-  // running (swept/re-claimed), which the child-process supervisor turns
-  // into a kill; the in-process path just stops renewing.
+  const leaseAbort = new AbortController();
+  let renewing = false;
   let renewTimer: ReturnType<typeof setInterval> | null = null;
   if (cfg.jobLeaseMs > 0) {
     renewTimer = setInterval(() => {
-      void deps.store.renewJobLease(job.id, Date.now() + cfg.jobLeaseMs);
-    }, Math.max(1_000, Math.floor(cfg.jobLeaseMs / 2)));
+      if (renewing || leaseAbort.signal.aborted) return;
+      renewing = true;
+      void deps.store
+        .renewJobLease(job.id, Date.now() + cfg.jobLeaseMs)
+        .then((renewed) => {
+          if (!renewed) leaseAbort.abort("lease_lost");
+        })
+        .catch(() => leaseAbort.abort("lease_lost"))
+        .finally(() => {
+          renewing = false;
+        });
+    }, Math.max(10, Math.floor(cfg.jobLeaseMs / 2)));
   }
   let result: SandboxResult;
   try {
-    result = await runner(job, { deps, cfg, caps });
+    result = await runner(job, { deps, cfg, caps, signal: leaseAbort.signal });
   } finally {
     if (renewTimer !== null) clearInterval(renewTimer);
   }
@@ -270,8 +588,13 @@ export async function runJobInSandbox(
  * a failed job + a blocked work item (the #149 landing).
  */
 async function failLoud(deps: ExecutorDeps, job: WorkerJob, result: SandboxResult): Promise<void> {
-  const reason =
-    result.timedOut ? "sandbox timeout" : `sandbox crashed (exit ${result.exitCode ?? "signal"}${result.signal ? ` ${result.signal}` : ""})`;
+  const reason = result.leaseLost
+    ? "sandbox lease lost"
+    : result.timedOut
+      ? "sandbox timeout"
+      : result.protocolError
+        ? result.protocolError
+        : `sandbox crashed (exit ${result.exitCode ?? "signal"}${result.signal ? ` ${result.signal}` : ""})`;
   await deps.store.failJob(job.id);
   await deps.store.appendAudit({
     space_id: job.spaceId ?? null,
@@ -341,6 +664,13 @@ async function failSelf(
   workItemId: string,
   err: unknown,
 ): Promise<void> {
+  await failJobSelf(store, audit, job, err);
+  const message = err instanceof Error ? err.message : String(err);
+  await unstickWorkItem(store, workItemId, message);
+}
+
+/** Failure bookkeeping for isolated kinds that do not own a work-item row. */
+async function failJobSelf(store: Store, audit: AuditModule, job: WorkerJob, err: unknown): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
   await store.failJob(job.id);
   await audit.appendAudit({
@@ -351,7 +681,6 @@ async function failSelf(
     payload: JSON.stringify({ id: job.id, kind: job.kind, error: message.slice(0, 2000) }),
   });
   console.log(`[${job.id}] sandbox failed the job (${job.kind}): ${message}`);
-  await unstickWorkItem(store, workItemId, message);
 }
 
 /** Parses a work item's result JSON column; null when absent or corrupt. */

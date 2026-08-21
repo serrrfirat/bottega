@@ -89,6 +89,29 @@ jobs:
             'gh --version && jq --version && curl --version && git --version' \
             >/dev/null
 
+      - name: Per-job sandbox hardening (no skip)
+        run: |
+          docker run --rm \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --security-opt seccomp=default \
+            --pids-limit 32 \
+            --memory 256m \
+            --network none \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /workspaces:rw,nosuid,size=64m \
+            bottega:ci sh -ec '
+              ! touch /app/rootfs-write
+              touch /workspaces/job-write
+              test "$(awk "/^CapEff:/ {print \$2}" /proc/self/status)" = "0000000000000000"
+              test "$(awk "/^Seccomp:/ {print \$2}" /proc/self/status)" = "2"
+              ! curl --connect-timeout 1 https://example.com
+            '
+          docker run --rm --init --name bottega-sandbox-teardown bottega:ci \
+            sh -c 'sleep 30 &'
+          test -z "$(docker ps -aq --filter name=^/bottega-sandbox-teardown$)"
+
       - name: Server fails closed without Slack tokens
         run: |
           set +e

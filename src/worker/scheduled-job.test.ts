@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runExecutor, type ExecutorDeps } from "../executor";
+import { inProcessSandboxRunner } from "./run-job";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import type { ConsolidationModelCall } from "../memory/consolidation";
 import { createAudit } from "../policy/audit";
@@ -83,6 +84,7 @@ function makeFixture(): Fixture {
 function makeDeps(fx: Fixture, overrides: Partial<ExecutorDeps> = {}): ExecutorDeps {
   return {
     store: fx.store,
+    sandboxRunner: inProcessSandboxRunner(),
     memoryProvider: createSqliteMemoryProvider(fx.store.getDb()),
     driver: fx.driver,
     orgConfigDir: join(fx.dir, "config"),
