@@ -19,6 +19,7 @@ jobs:
           # The `ci` job fits its 5-min budget without install caching, so
           # nothing further is configured here (issue #70).
       - run: bun install --frozen-lockfile
+      - run: bun run lint
       - run: bun check
       # Run via the package.json script (not bare `bun test`): the script
       # bounds e2e/journey stub-harness concurrency by running those files
