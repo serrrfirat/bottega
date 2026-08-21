@@ -926,7 +926,7 @@ flowchart LR
     SL["server<br/>conversation + orchestration"]
     Q[("SQLite queue + outbox + audit")]
     EX["hardened executor container<br/>claim + lease supervisor"]
-    CH["one child process group per job<br/>strict DTO + scoped store"]
+    CH["one disposable Docker container per job<br/>strict DTO + scoped store (bounded result IPC)"]
     WORK["git | extension | kb | ingest_poll | scheduled"]
     PXY["iron-proxy<br/>default-deny egress"]
     SL --> Q --> EX
@@ -935,40 +935,40 @@ flowchart LR
     WORK --> PXY
 ```
 
-Every durable worker kind crosses the same mandatory child boundary. The
-executor serializes one strict, bounded, non-secret job request. The child
-reopens only the configured SQLite file, derives the job scope from that
-envelope, and writes lifecycle, outbox, and audit rows through the scoped
-store facade. There is no production in-process fallback. Missing launcher
-wiring, invalid IPC, an unavailable Linux resource-limit profile, a timeout,
-or lease loss fails closed. Timeout and lease loss kill the complete process
-group before the supervisor maps the exact child exit contract.
+Every durable worker kind crosses the same mandatory container boundary. The
+executor serializes one strict, bounded, non-secret job request into the
+job container's stdin; the container reopens only the configured SQLite
+file, derives the job scope from that envelope, and writes lifecycle,
+outbox, and audit rows through the scoped-store facade. There is no
+production in-process fallback. Missing launcher wiring, invalid IPC, an
+unavailable Docker/container runtime, a timeout, or lease loss fails
+closed. Timeout and lease loss deterministically remove the full container
+tree before the supervisor maps the exit contract.
 
-The child environment is an allowlist. Slack and webhook secrets, provider
-keys, and proxy-management credentials are absent. The git PAT file is
-mounted only for `git` jobs. The auth-broker token file is mounted only for
-`extension` jobs. Other kinds receive neither credential mount. HTTP(S)
-uses the executor container's iron-proxy settings; the deployment DNS and
-proxy policy remain the network truth.
+The job-container environment is an allowlist. Slack and webhook secrets,
+provider keys, and proxy-management credentials are absent. The git PAT file
+is mounted (or, on the shared data volume, present) only for `git` jobs. The
+auth-broker token file is present only for `extension` jobs. Other kinds
+receive neither credential mount. HTTP(S) uses iron-proxy settings; the job
+container's egress has no direct route and must traverse the proxy.
 
-The current Linux deployment applies the reachable #105 controls at the
-executor-container boundary: read-only image root, writable durable data and
-disposable workspace mounts, all capabilities dropped, no-new-privileges,
-Docker's default seccomp profile, bounded PIDs/memory, and an init reaper.
-Each child also uses `prlimit` for address-space, descriptor, process-count,
-and wall-clock caps; missing `prlimit` refuses work.
+The deployment applies the #105 controls at the executor-container boundary
+(read-only image root, writable durable data and disposable workspace
+mounts, all capabilities dropped, no-new-privileges, seccomp, bounded
+PIDs/memory, an init reaper) and the per-job container likewise runs
+read-only root with only the declared store/workspace/credential mounts,
+dropped capabilities, bounded memory/PIDs, and an allowlisted env. Timeout
+and lease loss deterministically remove the whole container (and its
+process tree) via `docker kill`, so no job ever leaks a container.
 
-One OS-level leg remains deployment-gated: child processes share the
-executor container's network namespace and seccomp profile. A distinct
-network namespace and mount table for every job requires a nested container
-runtime or a host sandbox service. The deployment intentionally exposes
-neither a Docker socket nor host privileges to the executor because either
-would be a larger escape capability. Local non-Linux runs therefore verify
-the process/IPC/teardown boundary but skip Linux resource enforcement. CI's
+One deployment-gated leg remains for end-to-end network isolation: the
+per-job container joins the egress network with the proxy as DNS, which the
+CI Docker job exercises. Local non-Linux runs verify the request/result IPC,
+scope, and teardown boundary hermetically (injected docker/client seams) and
+skip the real-container lane only where no Docker socket is present; CI's
 Docker job is the required no-skip lane for read-only root, writable
-workspace, capabilities, seccomp, network isolation, resource caps, and
-container teardown; the existing iron-proxy integration lane separately
-proves allowed egress still works and unlisted egress remains denied.
+workspace, capabilities, bounded result IPC, container teardown, and
+mandatory-proxy egress.
 
 ## Persistence & audit
 
@@ -1031,8 +1031,8 @@ is never deleted: "cleanup" evicts caches, never rows.
 | Untrusted ingress | Adapters validate every event; only adapters mint messages |
 | Credential exposure | Per-turn principal selects the credential; omp-broker or 1Password Connect resolves it; mode-0600 files and iron-proxy inject it only at the allowlisted host. API-key onboarding can use a single-use browser upload (#196). Slack tokens stay server-only; the git PAT stays file-only |
 | Secret pasted into a typed connect/memory write | Recognized shapes are refused before broker/persistence/audit and redirected to OAuth, the configured vault, or `connect_upload_link`. This does not scrub arbitrary Slack text already received |
-| Malicious repo content | Every job runs in a dedicated child process group and disposable workspace; the server never mounts repository paths. The hardened executor container has a read-only image root, dropped capabilities, seccomp, no-new-privileges, and bounded resources |
-| Exfiltration / rogue egress | Child env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Deployment egress remains default-deny through iron-proxy allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
+| Malicious repo content | Every job runs in a dedicated disposable Docker container with its own writable workspace; the server never mounts repository paths. Root is read-only, capabilities are dropped, and the job container cannot touch host paths outside the declared store/workspace mounts |
+| Exfiltration / rogue egress | Job-container env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Egress has no direct route and traverses iron-proxy default-deny allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
 | Unauthorized side effects | Policy gate on every tool call; exec and org-settings writes ask humans; unknown → deny |
 | Cross-user credential confusion | The driver binds the fresh turn's principal; steers do not replace it (#152), and one tool call dispatches once (#178) |
 | Data loss / tampering | Append-only audit, retained transcripts, delivery decisions as durable cross-process rows |

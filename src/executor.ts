@@ -71,8 +71,8 @@ import {
 import { postOutboxRow } from "./store/outbox";
 import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, type WorkerJob } from "./worker/envelope";
 import {
-  createChildProcessSandboxRunner,
-  probeChildProcessSandbox,
+  createDockerSandboxRunner,
+  probeDockerSandbox,
   runJobInSandbox,
   type SandboxRunner,
 } from "./worker/run-job";
@@ -1423,8 +1423,34 @@ if (import.meta.main) {
   const dbPath = process.env.BOTTEGA_DB_PATH ?? "data/bottega.db";
   const boot = await bootExecutorRuntime({ dbPath });
   const { store } = boot.runtime;
-  const sandboxRunner = createChildProcessSandboxRunner({ dbPath });
-  await probeChildProcessSandbox({ dbPath, transcriptDir: "data/transcripts" });
+  // Production isolation: one disposable Docker container per job. The
+  // supervisor mounts the store file, the workspaces root and transcripts,
+  // and the job-scoped credential files; prox/CA config comes from the
+  // deployment env. When the supervisor itself runs inside a container the
+  // job container is a sibling on the host, so the mount SOURCE paths must
+  // be the host-visible ones provided by the deployment (BOTTEGA_SANDBOX_*_HOST).
+  const sandboxHostDb = process.env.BOTTEGA_SANDBOX_DB_HOST ?? dbPath;
+  const sandboxWorkspaces = process.env.BOTTEGA_SANDBOX_WORKSPACES_HOST ?? defaultWorkspaceRoot();
+  const sandboxRunner = createDockerSandboxRunner({
+    dbPath: sandboxHostDb,
+    workspacesDir: sandboxWorkspaces,
+    transcriptDir: process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts",
+    volume: process.env.BOTTEGA_SANDBOX_DATA_VOLUME,
+    gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
+    brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
+    network: process.env.BOTTEGA_SANDBOX_NETWORK,
+    dns: process.env.BOTTEGA_SANDBOX_DNS ? process.env.BOTTEGA_SANDBOX_DNS.split(",") : undefined,
+    proxyUrl: process.env.BOTTEGA_SANDBOX_PROXY_URL,
+    caCertHostPath: process.env.BOTTEGA_SANDBOX_CA_CERT_HOST,
+    requireDocker: true,
+  });
+  await probeDockerSandbox({
+    dbPath: sandboxHostDb,
+    workspacesDir: sandboxWorkspaces,
+    transcriptDir: process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts",
+    volume: process.env.BOTTEGA_SANDBOX_DATA_VOLUME,
+    requireDocker: true,
+  });
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
   const executorDeps: ExecutorDeps = {
     store,

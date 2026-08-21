@@ -52,9 +52,23 @@ function forbiddenEnvironment(): string[] {
   return FORBIDDEN_ENV_NAMES.filter((name) => process.env[name] !== undefined);
 }
 
+/**
+ * The Docker lane has no extra file descriptor like the child lane's fd 3:
+ * the container's stdout is the single bounded protocol channel and every
+ * job log is redirected to stderr, so stdout carries ONLY the response JSON.
+ * The child lane (tests/protocol mechanics) keeps fd 3 for the response.
+ */
+const DOCKER_LANE = process.env.BOTTEGA_SANDBOX_DOCKER === "1";
+
 function sendResponse(response: SandboxResponse): void {
   const parsed = sandboxResponseSchema.parse(response);
-  writeSync(3, JSON.stringify(parsed));
+  const payload = JSON.stringify(parsed);
+  if (DOCKER_LANE) {
+    // Reserved channel: stdout must stay a single bounded JSON document.
+    process.stdout.write(payload + "\n");
+    return;
+  }
+  writeSync(3, payload);
 }
 
 async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
@@ -108,6 +122,11 @@ async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): P
 
 async function main(): Promise<void> {
   process.env.BOTTEGA_SANDBOX_CHILD = "1";
+  if (DOCKER_LANE) {
+    // stdout is the reserved bounded protocol channel; every job log goes to
+    // stderr so it can never corrupt or exceed the result document.
+    console.log = (...args: unknown[]) => console.error(...args);
+  }
   const request = readRequest();
   if (request.mode === "probe") {
     sendResponse({

@@ -20,14 +20,19 @@
  *        — the blocked landing guarantees the work item surfaces).
  *
  * P1 scope note: the runner is the per-job ISOLATION BOUNDARY — one job,
- * its own scoped store surface, per-kind resource caps. True child-PROCESS
- * teardown via Bun.spawn is the production wiring (deferred to the
- * follow-up); the contract — scope re-derivation, fail-closed on anything
- * but that one job, caps, and the exit-code mapping — is implemented here
- * and is what the caller-surface tests pin.
+ * its own scoped store surface, per-kind resource caps. The PRODUCTION
+ * boundary is one disposable Docker container (#101/#338): exactly one
+ * validated job envelope enters exactly one container with an allowlisted
+ * environment and explicit mounts, and the container is deterministically
+ * removed on timeout/lease loss. The child-process and in-process runners
+ * are TEST FABRIC ONLY and never used by production wiring (the executor
+ * refuses to boot without the Docker runner). The contract — scope
+ * re-derivation, fail-closed on anything but that one job, caps, and the
+ * exit-code mapping — is implemented here and is what the caller-surface
+ * tests pin.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
@@ -71,7 +76,7 @@ export interface SandboxRunnerContext {
   signal: AbortSignal;
 }
 
-/** The injectable runner seam (tests supply fakes; production supplies the child). */
+/** The injectable runner seam (tests supply fakes; production supplies the Docker container). */
 export type SandboxRunner = (job: WorkerJob, ctx: SandboxRunnerContext) => Promise<SandboxResult>;
 
 /** Exit contract (see module doc). */
@@ -86,7 +91,7 @@ export function capsFor(kind: WorkerJob["kind"], store: Store): JobResourceCaps 
 
 /**
  * In-process body adapter for hermetic unit tests only. Production wiring
- * always uses {@link createChildProcessSandboxRunner}; the executor refuses
+ * always uses {@link createDockerSandboxRunner}; the executor refuses
  * to start without an explicitly supplied runner.
  */
 export function inProcessSandboxRunner(): SandboxRunner {
@@ -136,9 +141,11 @@ const SAFE_CHILD_ENV_NAMES = [
 ] as const;
 
 /**
- * Production launcher: one strict DTO over bounded stdin, one bounded reply
- * over fd 3, an allowlisted environment, a new process group, and hard
- * timeout/lease-loss teardown of that entire group.
+ * TEST-FABRIC ONLY (never production): one strict DTO over bounded stdin, one
+ * bounded reply over fd 3, an allowlisted environment, a new process group,
+ * and hard timeout/lease-loss teardown of that entire group. Production uses
+ * {@link createDockerSandboxRunner} — a child process is insufficient for the
+ * #338 boundary because it shares the host filesystem and kernel namespace.
  */
 export function createChildProcessSandboxRunner(options: ChildProcessSandboxOptions): SandboxRunner {
   if (options.dbPath.trim() === "") throw new Error("sandbox database path is required");
@@ -191,6 +198,472 @@ export async function probeChildProcessSandbox(options: {
   if ("protocolError" in response) throw new Error(response.protocolError);
   if (!("probe" in response)) throw new Error("sandbox probe failed");
   return response.probe;
+}
+
+// ---------------------------------------------------------------------------
+// Production Docker sandbox runner (issue #101, epic #229 P1, issue #338).
+//
+// One disposable container per claimed job. The container receives ONLY:
+//   - the validated job envelope (a strict DTO over bounded stdin),
+//   - the writable work-item workspace and the single SQLite store file
+//     (the existing scoped-store/envelope boundary — the job-scoped facade
+//     guards every row access to this job's own rows),
+//   - job-scoped credential FILE mounts (git PAT / auth-broker token) for
+//     the kinds that need them,
+//   - an allowlisted environment (no Slack tokens, no parent env),
+//   - proxy/CA configuration for egress.
+// It receives NO Docker socket, no raw store handle beyond the scoped file,
+// no unrelated credentials, and no undeclared mounts. Root filesystem is
+// read-only; resource caps and full-container teardown are mandatory.
+// stdout carries the single bounded result JSON; stderr streams job logs.
+// ---------------------------------------------------------------------------
+
+/** Container-internal mount points (the app image WORKDIR is /app). */
+const CONTAINER_DATA_DIR = "/app/data";
+const CONTAINER_DB_PATH = "/app/data/bottega.db";
+const CONTAINER_WORKSPACES_DIR = "/workspaces";
+const CONTAINER_TRANSCRIPT_DIR = "/app/data/transcripts";
+const CONTAINER_GIT_TOKEN_FILE = "/app/data/secrets/github-pat";
+const CONTAINER_BROKER_TOKEN_FILE = "/app/data/.omp/auth-broker.token";
+const CONTAINER_CA_CERT_PATH = "/etc/iron-proxy/certs/ca.crt";
+const CONTAINER_ASKPASS_SCRIPT = "/app/data/secrets/git-askpass.sh";
+/** The job container image: the app image builds FROM the curated tools image. */
+const DEFAULT_SANDBOX_IMAGE = process.env.BOTTEGA_SANDBOX_IMAGE ?? "bottega:local";
+/** Docker-out-of-Docker: the executor mounts the host socket to launch siblings. */
+const DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock";
+/** Where the checked-in child entrypoint lives inside the app image. */
+const CONTAINER_CHILD_ENTRYPOINT = "/app/src/worker/run-job-child.ts";
+
+export interface DockerSandboxOptions {
+  /** Host path to the single SQLite store file, mounted rw into the container. */
+  dbPath: string;
+  /** Host path to the workspaces root (org setting), mounted rw into the container. */
+  workspacesDir: string;
+  /** Host path to the transcripts dir, mounted rw into the container. */
+  transcriptDir: string;
+  /**
+   * When set (e.g. "data"), the runner mounts that Docker named volume at the
+   * container-internal paths instead of the host paths above. Used by the
+   * compose deployment where the executor and the job container are siblings
+   * sharing the `data` volume and the executor cannot see host paths.
+   */
+  volume?: string;
+  /** Job container image (defaults to the app/tools-derived image). */
+  image?: string;
+  /** Docker network the job container joins (egress). "none" for hermetic. */
+  network?: string;
+  /** DNS server(s) for the container (iron-proxy default-deny). */
+  dns?: string[];
+  /** HTTP/HTTPS proxy URL passed into the container (iron-proxy tunnel). */
+  proxyUrl?: string;
+  /** Host path to the egress MITM CA cert, bind-mounted read-only. */
+  caCertHostPath?: string;
+  /** Host path to the git PAT file (git kind only). */
+  gitTokenFile?: string;
+  /** Host path to the auth-broker token file (extension kind only). */
+  brokerTokenFile?: string;
+  /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
+  docker?: DockerClient;
+  /** Fail closed at boot when docker is unavailable (no in-process/child fallback). */
+  requireDocker?: boolean;
+  /** Unique container name prefix; tests assert it to prove container identity. */
+  namePrefix?: string;
+}
+
+/** The docker CLI seam the supervisor talks through (testable without docker). */
+export interface DockerClient {
+  launch(args: string[]): DockerProcess;
+}
+
+/** A running `docker` subprocess driving one job container. */
+export interface DockerProcess {
+  /** Write the request DTO and end (bounded stdin). */
+  stdin: Writable;
+  /** The bounded protocol channel (container stdout). */
+  stdout: Readable;
+  /** Job log stream (container stderr). */
+  stderr: Readable;
+  /** Resolves when the docker CLI process exits. */
+  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  /** Deterministic full-container teardown. */
+  kill(signal?: NodeJS.Signals): void;
+}
+
+/** The real docker CLI client. */
+export function createDockerClient(socket: string): DockerClient {
+  return {
+    launch(args: string[]): DockerProcess {
+      const child = spawn("docker", args, {
+        env: { ...process.env, DOCKER_HOST: socket.startsWith("/") ? `unix://${socket}` : socket },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let spawnError: Error | null = null;
+      const processError: Promise<{ code: null; signal: null }> = new Promise((resolve) => {
+        child.once("error", (error: Error) => {
+          spawnError = error;
+          resolve({ code: null, signal: null });
+        });
+      });
+      // A missing docker binary or unreachable socket must fail closed (never
+      // hang on a dead stdout). Surface the spawn error on stdout so the
+      // bounded read rejects and the exit promise settles fast.
+      void processError.then(() => {
+        if (child.stdout) child.stdout.destroy(spawnError ?? undefined);
+        if (child.stderr) child.stderr.destroy();
+      });
+      return {
+        stdin: child.stdin as Writable,
+        stdout: child.stdout as Readable,
+        stderr: child.stderr as Readable,
+        exit: Promise.race([
+          new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+            child.once("exit", (code, signal) => resolve({ code, signal }));
+          }),
+          processError,
+        ]),
+        kill(signal: NodeJS.Signals = "SIGKILL") {
+          try {
+            child.kill(signal);
+          } catch {
+            // already gone; the exit event is the teardown proof.
+          }
+        },
+      };
+    },
+  };
+}
+
+/** Boot-time proof that docker and the job container image are usable. */
+export async function probeDockerSandbox(options: {
+  dbPath: string;
+  workspacesDir: string;
+  transcriptDir: string;
+  volume?: string;
+  image?: string;
+  network?: string;
+  gitTokenFile?: string;
+  brokerTokenFile?: string;
+  requireDocker?: boolean;
+}): Promise<SandboxProbe> {
+  const docker = options.requireDocker ? requireDockerClient() : optionalDockerClient();
+  if (docker === null) throw new Error("sandbox unavailable: docker CLI or socket is not available (no container fallback)");
+  const response = await launchDockerContainer(docker, { mode: "probe" }, {
+    dbPath: options.dbPath,
+    workspacesDir: options.workspacesDir,
+    transcriptDir: options.transcriptDir,
+    volume: options.volume,
+    image: options.image ?? DEFAULT_SANDBOX_IMAGE,
+    network: options.network ?? process.env.BOTTEGA_SANDBOX_NETWORK ?? "none",
+    gitTokenFile: options.gitTokenFile,
+    brokerTokenFile: options.brokerTokenFile,
+    jobId: "probe",
+    caps: { timeoutMs: 10_000, memoryMb: 512 },
+    signal: new AbortController().signal,
+    containerName: `bottega-sandbox-probe-${Date.now().toString(36)}`,
+  });
+  if (response.kind === "error") throw new Error(response.protocolError);
+  if (response.kind === "result" && response.result.protocolError) throw new Error(response.result.protocolError);
+  if (response.kind !== "probe") throw new Error("sandbox probe failed");
+  return response.probe;
+}
+
+/**
+ * Production one-job Docker runner. Exactly one validated job envelope
+ * enters exactly one disposable container; container exit, signal, timeout,
+ * lease loss, and protocol mismatch all fail closed. There is NO fallback to
+ * a host child process or in-process execution.
+ */
+export function createDockerSandboxRunner(options: DockerSandboxOptions): SandboxRunner {
+  if (options.dbPath.trim() === "") throw new Error("sandbox database path is required");
+  if (options.workspacesDir.trim() === "") throw new Error("sandbox workspaces dir is required");
+  const docker = options.docker ?? (options.requireDocker ? requireDockerClient() : optionalDockerClient());
+  if (docker === null) {
+    throw new Error("sandbox unavailable: docker CLI or socket is not available (no container fallback)");
+  }
+  const image = options.image ?? DEFAULT_SANDBOX_IMAGE;
+  const network = options.network ?? process.env.BOTTEGA_SANDBOX_NETWORK ?? "none";
+  const namePrefix = options.namePrefix ?? "bottega-sandbox";
+  return async (job, ctx) => {
+    const request: SandboxRequest = {
+      version: SANDBOX_PROTOCOL_VERSION,
+      mode: "execute",
+      dbPath: CONTAINER_DB_PATH,
+      job,
+      config: containerConfig(ctx.cfg, options),
+      caps: ctx.caps,
+    };
+    const containerName = `${namePrefix}-${sanitizeContainerName(job.id)}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const response = await launchDockerContainer(docker, request, {
+      dbPath: options.dbPath,
+      workspacesDir: options.workspacesDir,
+      transcriptDir: options.transcriptDir,
+      volume: options.volume,
+      askpassScript: ctx.cfg.askpassScript,
+      image,
+      network,
+      dns: options.dns,
+      proxyUrl: options.proxyUrl,
+      caCertHostPath: options.caCertHostPath,
+      gitTokenFile: options.gitTokenFile,
+      brokerTokenFile: options.brokerTokenFile,
+      jobId: job.id,
+      caps: ctx.caps,
+      signal: ctx.signal,
+      containerName,
+    });
+    if (response.kind === "result") return response.result;
+    if (response.kind === "probe") {
+      return { exitCode: null, signal: null, timedOut: false, protocolError: "invalid sandbox IPC: unexpected probe" };
+    }
+    return { exitCode: null, signal: null, timedOut: false, protocolError: response.protocolError };
+  };
+}
+
+/** Rewrites the host config paths to their container-internal mount points. */
+function containerConfig(cfg: ExecutorConfig, _options: DockerSandboxOptions): ExecutorConfig {
+  return {
+    ...cfg,
+    workspacesDir: CONTAINER_WORKSPACES_DIR,
+    transcriptDir: CONTAINER_TRANSCRIPT_DIR,
+    tokenFile: CONTAINER_GIT_TOKEN_FILE,
+    askpassScript: CONTAINER_ASKPASS_SCRIPT,
+  };
+}
+
+function sanitizeContainerName(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
+}
+
+function requireDockerClient(): DockerClient {
+  return createDockerClient(process.env.BOTTEGA_SANDBOX_DOCKER_SOCKET ?? DEFAULT_DOCKER_SOCKET);
+}
+
+function optionalDockerClient(): DockerClient | null {
+  const socket = process.env.BOTTEGA_SANDBOX_DOCKER_SOCKET ?? DEFAULT_DOCKER_SOCKET;
+  if (!existsSync(socket)) return null;
+  return createDockerClient(socket);
+}
+
+type DockerLaunchResult =
+  | { kind: "result"; result: SandboxResult }
+  | { kind: "probe"; probe: SandboxProbe }
+  | { kind: "error"; protocolError: string };
+
+interface DockerLaunchOptions {
+  dbPath: string;
+  workspacesDir: string;
+  transcriptDir: string;
+  volume?: string;
+  askpassScript?: string;
+  image: string;
+  network: string;
+  dns?: string[];
+  proxyUrl?: string;
+  caCertHostPath?: string;
+  gitTokenFile?: string;
+  brokerTokenFile?: string;
+  jobId: string;
+  caps: JobResourceCaps;
+  signal: AbortSignal;
+  containerName: string;
+}
+
+/**
+ * Launches one disposable job container, writes the bounded request DTO over
+ * stdin, reads the single bounded result JSON from stdout (job logs stream
+ * from stderr), and deterministically removes the container on timeout,
+ * lease loss, IPC violation, or normal exit.
+ */
+async function launchDockerContainer(
+  docker: DockerClient,
+  request: SandboxRequest,
+  opts: DockerLaunchOptions,
+): Promise<DockerLaunchResult> {
+  const encoded = JSON.stringify(request);
+  if (Buffer.byteLength(encoded) > MAX_SANDBOX_REQUEST_BYTES) {
+    return { kind: "error", protocolError: "sandbox request exceeds IPC limit" };
+  }
+  const args = dockerRunArgs(request, opts);
+  let proc: DockerProcess;
+  try {
+    proc = docker.launch(args);
+  } catch (error) {
+    return { kind: "error", protocolError: `sandbox unavailable: docker launch failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+
+  let responseBytes: Buffer;
+  let timedOut = false;
+  let leaseLost = false;
+  const boundedResponse = readBounded(proc.stdout, MAX_SANDBOX_RESPONSE_BYTES, () => {
+    if (proc.stdin.writable) proc.stdin.destroy();
+    killDockerContainer(docker, opts.containerName);
+  });
+  // Job logs (stderr) stream to the supervisor log; never captured past a cap.
+  proc.stderr.on("data", (chunk: Buffer | string) => {
+    const text = chunk.toString("utf8").trim();
+    if (text.length > 0) console.log(`[${opts.jobId}] sandbox: ${text.slice(0, 2000)}`);
+  });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    if (proc.stdin.writable) proc.stdin.destroy();
+    killDockerContainer(docker, opts.containerName);
+  }, opts.caps.timeoutMs);
+  const abort = (): void => {
+    leaseLost = true;
+    if (proc.stdin.writable) proc.stdin.destroy();
+    killDockerContainer(docker, opts.containerName);
+  };
+  opts.signal.addEventListener("abort", abort, { once: true });
+  try {
+    proc.stdin.end(encoded);
+  } catch {
+    // stdin already closed; the container will fail closed on its own IPC read.
+  }
+  const exited = await proc.exit;
+  clearTimeout(timeout);
+  opts.signal.removeEventListener("abort", abort);
+  // Guaranteed cleanup: never leak a container after the launcher returns
+  // (--rm already removes it on exit; the net rm covers unexpected states).
+  ensureContainerRemoved(docker, opts.containerName);
+
+  if (timedOut || leaseLost) {
+    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
+    if (leaseLost) tornDown.leaseLost = true;
+    return { kind: "result", result: tornDown };
+  }
+  try {
+    responseBytes = await boundedResponse;
+  } catch (error) {
+    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}` } };
+  }
+  if (responseBytes.length === 0) {
+    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: empty response" } };
+  }
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(responseBytes.toString("utf8"));
+  } catch {
+    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" } };
+  }
+  const parsed = sandboxResponseSchema.safeParse(parsedJson);
+  if (!parsed.success || !Number.isInteger(parsed.data.pid) || parsed.data.pid <= 0) {
+    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" } };
+  }
+  if (parsed.data.mode === "probe") {
+    return { kind: "probe", probe: { pid: parsed.data.pid, childMarker: parsed.data.childMarker, forbiddenEnvNames: parsed.data.forbiddenEnvNames } };
+  }
+  const expectedProcessExit = parsed.data.result.exitCode ?? 70;
+  if (exited.signal !== null || exited.code !== expectedProcessExit) {
+    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" } };
+  }
+  return { kind: "result", result: parsed.data.result };
+}
+
+/** Builds the one `docker run --rm -i` invocation for a single job container. */
+function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions): string[] {
+  const args = [
+    "run",
+    "--rm",
+    "-i",
+    "--name",
+    opts.containerName,
+    "--memory",
+    `${opts.caps.memoryMb}m`,
+    "--pids-limit",
+    "128",
+    "--cap-drop",
+    "ALL",
+    "--read-only",
+    "--network",
+    opts.network,
+  ];
+  if (opts.dns !== undefined && opts.dns.length > 0) {
+    for (const dns of opts.dns) args.push("--dns", dns);
+  }
+  // Explicit mounts only: the store file, the workspace root, transcripts,
+  // and (for the kinds that need them) the job-scoped credential files and
+  // the egress CA. Root stays read-only. In named-volume mode the executor
+  // and the job container are Docker-out-of-Docker siblings sharing a volume,
+  // so the same volume is mounted at the container-internal paths the child
+  // expects (the deploy mounts `data` at both /app/data and /workspaces).
+  if (opts.volume !== undefined && opts.volume !== "") {
+    args.push("-v", `${opts.volume}:${CONTAINER_DATA_DIR}:rw`);
+    args.push("-v", `${opts.volume}:${CONTAINER_WORKSPACES_DIR}:rw`);
+  } else {
+    args.push("-v", `${opts.dbPath}:${CONTAINER_DB_PATH}:rw`);
+    args.push("-v", `${opts.workspacesDir}:${CONTAINER_WORKSPACES_DIR}:rw`);
+    args.push("-v", `${opts.transcriptDir}:${CONTAINER_TRANSCRIPT_DIR}:rw`);
+  }
+  if (opts.caCertHostPath !== undefined && opts.caCertHostPath !== "") {
+    args.push("-v", `${opts.caCertHostPath}:${CONTAINER_CA_CERT_PATH}:ro`);
+  }
+  if (request.mode === "execute" && request.job.kind === "git" && (opts.volume === undefined || opts.volume === "") && opts.askpassScript !== undefined && opts.askpassScript !== "") {
+    // Host-path mode: the askpass script (host file) is mounted read-only at
+    // the container path; it cats the EXECUTOR_GIT_TOKEN_FILE env so the token
+    // file itself stays file-scoped. Volume mode covers it via the data volume.
+    args.push("-v", `${opts.askpassScript}:${CONTAINER_ASKPASS_SCRIPT}:ro`);
+  }
+  if (opts.volume === undefined || opts.volume === "") {
+    // Host-path mode: mount the job-scoped credential files explicitly.
+    if (opts.gitTokenFile !== undefined && opts.gitTokenFile !== "" && request.mode === "execute" && request.job.kind === "git") {
+      args.push("-v", `${opts.gitTokenFile}:${CONTAINER_GIT_TOKEN_FILE}:ro`);
+    }
+    if (opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "" && request.mode === "execute" && request.job.kind === "extension") {
+      args.push("-v", `${opts.brokerTokenFile}:${CONTAINER_BROKER_TOKEN_FILE}:ro`);
+    }
+  }
+  // Allowlisted environment only: the child marker + Docker lane marker, the
+  // job-scoped credential handles, and the allowlisted host passthroughs.
+  const env: Record<string, string> = { BOTTEGA_SANDBOX_CHILD: "1", BOTTEGA_SANDBOX_DOCKER: "1" };
+  for (const name of SAFE_CHILD_ENV_NAMES) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  if (opts.proxyUrl !== undefined && opts.proxyUrl !== "") {
+    env.HTTP_PROXY = opts.proxyUrl;
+    env.HTTPS_PROXY = opts.proxyUrl;
+    env.NO_PROXY ??= "localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0";
+  }
+  if (opts.caCertHostPath !== undefined && opts.caCertHostPath !== "") {
+    env.NODE_EXTRA_CA_CERTS = CONTAINER_CA_CERT_PATH;
+  }
+  if (request.mode === "execute") {
+    if (request.job.kind === "git" && opts.gitTokenFile !== undefined && opts.gitTokenFile !== "") {
+      env.EXECUTOR_GIT_TOKEN_FILE = CONTAINER_GIT_TOKEN_FILE;
+    }
+    if (request.job.kind === "extension" && opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "") {
+      env.OMP_AUTH_BROKER_TOKEN_FILE = CONTAINER_BROKER_TOKEN_FILE;
+    }
+  }
+  for (const [name, value] of Object.entries(env)) {
+    args.push("--env", `${name}=${value}`);
+  }
+  args.push(opts.image, "bun", CONTAINER_CHILD_ENTRYPOINT);
+  return args;
+}
+
+/** Deterministic full-container teardown: SIGKILL the container's cgroup. */
+function killDockerContainer(docker: DockerClient, name: string): void {
+  // `docker kill` SIGKILLs the container's PID 1; the runtime then tears
+  // down the whole container process tree/cgroup. The `--rm` flag removes
+  // the filesystem on exit. Fire-and-forget (docker kill runs to completion;
+  // the `docker run` process the supervisor is attached to exits once the
+  // container dies, and that exit is the teardown proof).
+  try {
+    docker.launch(["kill", name]);
+  } catch {
+    // container already gone
+  }
+}
+
+/** Best-effort, guaranteed no-leak removal after the launcher returns. */
+function ensureContainerRemoved(docker: DockerClient, name: string): void {
+  try {
+    const rm = docker.launch(["rm", "-f", name]);
+    void rm.exit.catch(() => undefined);
+  } catch {
+    // already removed by --rm
+  }
 }
 
 type SpawnChildResult =
@@ -417,8 +890,8 @@ export async function runIsolatedJobBody(
 }
 
 /**
- * One job's isolated run body: the code that runs inside the sandbox (child
- * process in production, injected runner in tests). Re-derives the scope
+ * One job's isolated run body: the code that runs inside the sandbox (the
+ * job Docker container in production, an injected runner in tests). Re-derives the scope
  * from the envelope id (fail closed: the facade permits ONLY this job's
  * rows), claims the work item, runs the item's full delivery lifecycle, and
  * writes ITS OWN terminal lifecycle (completeJob + own outbox row + audit)

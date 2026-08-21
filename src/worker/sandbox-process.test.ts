@@ -8,6 +8,10 @@ import type { WorkerJob } from "./envelope";
 import {
   createChildProcessSandboxRunner,
   probeChildProcessSandbox,
+  createDockerSandboxRunner,
+  probeDockerSandbox,
+  type DockerClient,
+  type DockerProcess,
   runJobInSandbox,
   type SandboxRunnerContext,
 } from "./run-job";
@@ -108,7 +112,7 @@ afterEach(() => {
     await expect(prepareExecutor(deps(store, dbPath))).rejects.toThrow(/sandbox runner unavailable/);
   });
 
-describe("production child-process sandbox boundary (#101)", () => {
+describe("child-process protocol lane (test fabric — NOT the production boundary)", () => {
   test("the real child entrypoint has a distinct PID and receives no parent secret environment", async () => {
     const { store, dbPath, dir } = freshStore();
     process.env.SLACK_BOT_TOKEN = "parent-secret-must-not-cross";
@@ -198,5 +202,222 @@ describe("production child-process sandbox boundary (#101)", () => {
     expect(await processGone(Number(readFileSync(pidFile, "utf8")))).toBe(true);
     const failed = await store.listAudit({ event_type: JOB_FAILED_EVENT });
     expect(failed.some((row) => JSON.parse(row.payload).error === "sandbox lease lost")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Production Docker sandbox boundary (#101/#338).
+//
+// The hermetic tests drive `createDockerSandboxRunner` through an injected
+// fake docker CLI so they FAIL on the child-process/in-process runners (which
+// never invoke docker, never mint a container name, and never prove distinct
+// container identity). The real-container lane is gated separately below.
+// ---------------------------------------------------------------------------
+
+import { Readable, Writable } from "node:stream";
+import { MAX_SANDBOX_RESPONSE_BYTES, SANDBOX_PROTOCOL_VERSION, type SandboxResponse } from "./sandbox-protocol";
+
+function sandboxResponse(mode: "execute" | "probe", pid: number, result?: { exitCode: number | null; signal: string | null; timedOut: boolean }): string {
+  const body: SandboxResponse =
+    mode === "probe"
+      ? { version: SANDBOX_PROTOCOL_VERSION, mode: "probe", pid, childMarker: "1", forbiddenEnvNames: [] }
+      : { version: SANDBOX_PROTOCOL_VERSION, mode: "execute", pid, result: result ?? { exitCode: 0, signal: null, timedOut: false } };
+  return JSON.stringify(body);
+}
+
+/** One fake docker CLI subprocess representing a launched container. */
+class FakeProc implements DockerProcess {
+  stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+  stdout = new Readable({ read() {} });
+  stderr = new Readable({ read() {} });
+  constructor(readonly innerPid: number, private readonly fake: FakeDocker) {}
+  private resolveExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+  exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    this.resolveExit = resolve;
+  });
+  /** Emit the job container's full JSON response then signal EOF on stdout. */
+  respond(opts: { exitCode?: number | null; signal?: NodeJS.Signals | null } = {}): void {
+    this.stdout.push(Buffer.from(sandboxResponse("execute", this.innerPid, { exitCode: opts.exitCode ?? 0, signal: opts.signal ?? null, timedOut: false })));
+    this.stdout.push(null);
+    this.stderr.push(null);
+    this.resolveExit({ code: opts.exitCode ?? 0, signal: opts.signal ?? null });
+    this.fake.completedRuns.push(this.innerPid);
+  }
+  kill(_signal?: NodeJS.Signals): void {
+    // The container's PID 1 is killed; the `docker run` process exits as the
+    // runtime tears down the whole container tree/cgroup.
+    this.stdout.destroy();
+    this.stderr.destroy();
+    this.resolveExit({ code: null, signal: "SIGKILL" });
+  }
+}
+
+/** A scripted docker CLI behind the DockerClient seam. */
+class FakeDocker {
+  launches: { args: string[]; proc: FakeProc | null }[] = [];
+  broken = false;
+  completedRuns: number[] = [];
+  private nextInnerPid = 2000;
+  /** Active containers keyed by --name, so a kill tears the run down. */
+  private runsByContainer = new Map<string, FakeProc>();
+
+  launch(args: string[]): DockerProcess {
+    if (this.broken) throw new Error("spawn docker ENOENT");
+    if (args.includes("run")) {
+      const proc = new FakeProc(this.nextInnerPid++, this);
+      this.runsByContainer.set(args[args.indexOf("--name") + 1], proc);
+      this.launches.push({ args, proc });
+      return proc;
+    }
+    if (args.includes("kill")) {
+      // `docker kill <name>` terminates the container's PID 1; the attached
+      // `docker run` process (the run FakeProc) exits as the tree is torn down.
+      const name = args[args.length - 1];
+      const run = this.runsByContainer.get(name);
+      if (run) run.kill();
+      const proc = new FakeProc(0, this);
+      this.launches.push({ args, proc });
+      return proc;
+    }
+    const proc = new FakeProc(0, this);
+    this.launches.push({ args, proc });
+    return proc;
+  }
+  /** The `docker run` launch for a job (container-identity proof). */
+  runLaunch(): FakeProc {
+    const run = this.launches.find((l) => l.args.includes("run"));
+    if (!run?.proc) throw new Error("expected a `docker run` launch — the child runner never issues one");
+    return run.proc;
+  }
+  /** docker-kill launches issued by the supervisor. */
+  killLaunches(): string[][] {
+    return this.launches.filter((l) => l.args.includes("kill")).map((l) => l.args);
+  }
+}
+
+describe("production docker sandbox boundary (#101/#338)", () => {
+  test("the runner mints a distinct disposable container per job (no in-process fallback)", async () => {
+    const { store, dbPath, dir } = freshStore();
+    const fake = new FakeDocker();
+    await store.enqueueJob({ id: "docker-job", kind: "scheduled", payload: { action: "memory_consolidation" } });
+    const job = await store.claimNextJob(1_000);
+    if (!job) throw new Error("expected claimed job");
+    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 1_000), job, runner);
+    const run = fake.runLaunch();
+    const runArgs = fake.launches.find((l) => l.args.includes("run"))!.args;
+    run.respond();
+
+    const outcome = await pending;
+    expect(outcome.state).toBe("done");
+    // Distinct container identity: a disposable (`--rm`) container with a
+    // unique --name and an inner PID that differs from the host server.
+    expect(runArgs).toContain("--rm");
+    expect(runArgs).toContain("run");
+    const nameIndex = runArgs.indexOf("--name");
+    expect(nameIndex).toBeGreaterThan(-1);
+    expect(runArgs[nameIndex + 1]).toMatch(/bottega-sandbox/);
+    expect(runArgs[nameIndex + 1]).toContain("docker-job");
+    expect(run.innerPid).not.toBe(process.pid);
+    expect(fake.completedRuns).toContain(run.innerPid);
+  });
+
+  test("timeout issues a docker kill and fails closed", async () => {
+    const { store, dbPath, dir } = freshStore();
+    const fake = new FakeDocker();
+    const job: WorkerJob = { id: "docker-timeout", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const result = await runner(job, runnerContext(store, dbPath, dir, 60));
+
+    expect(result.timedOut).toBe(true);
+    expect(fake.killLaunches().length).toBeGreaterThan(0);
+  });
+
+  test("lease loss aborts the container and fails the job loudly", async () => {
+    const { store, dbPath, dir } = freshStore();
+    const fake = new FakeDocker();
+    await store.enqueueJob({ id: "docker-lease", kind: "scheduled", payload: { action: "memory_consolidation" } });
+    const job = await store.claimNextJob(100);
+    if (!job) throw new Error("expected claimed job");
+    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: fake });
+    const pending = runJobInSandbox(deps(store, dbPath), cfg(dir, 40), job, runner);
+    // Register the container so a lease-abort docker kill can tear it down.
+    fake.runLaunch();
+    // Once the container is "running", lose the lease: the renewal abort must
+    // docker-kill the container tree and fail the job loudly.
+    await store.failJob(job.id);
+
+    const outcome = await pending;
+    expect(outcome.state).toBe("blocked");
+    expect(fake.killLaunches().length).toBeGreaterThan(0);
+    const failed = await store.listAudit({ event_type: JOB_FAILED_EVENT });
+    expect(failed.some((row) => JSON.parse(row.payload).error === "sandbox lease lost")).toBe(true);
+  });
+
+  test("bounded IPC overflow is a crash, never a completion", async () => {
+    const { store, dbPath, dir } = freshStore();
+    const job: WorkerJob = { id: "docker-overflow", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    // A run whose stdout exceeds the bounded result cap; the supervisor must
+    // docker-kill it (which terminates the attached run process -> exit resolves).
+    let runExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+    const overflowing: DockerClient = {
+      launch(args: string[]) {
+        if (args.includes("run")) {
+          const stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+          const stdout = new Readable({ read() {} });
+          stdout.push(Buffer.alloc(MAX_SANDBOX_RESPONSE_BYTES + 1));
+          stdout.push(null);
+          const stderr = new Readable({ read() {} });
+          stderr.push(null);
+          const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => { runExit = r; });
+          return { stdin, stdout, stderr, exit, kill: () => runExit({ code: null, signal: "SIGKILL" }) };
+        }
+        if (args.includes("kill")) {
+          // docker kill terminates the container; the attached run exits.
+          runExit({ code: null, signal: "SIGKILL" });
+        }
+        return { stdin: new Writable({ write(_c, _e, cb) { cb(); } }), stdout: new Readable({ read() {} }), stderr: new Readable({ read() {} }), exit: new Promise<{ code: null; signal: null }>(() => {}), kill: () => {} };
+      },
+    };
+    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: overflowing });
+    const result = await runner(job, runnerContext(store, dbPath, dir, 2_000));
+
+    expect(result.exitCode).toBeNull();
+    expect(result.protocolError).toMatch(/invalid sandbox IPC|exceeds/);
+  });
+
+  test("missing docker refuses to run — no child/in-process fallback", async () => {
+    const { store, dbPath, dir } = freshStore();
+    const broken = new FakeDocker();
+    broken.broken = true;
+    const job: WorkerJob = { id: "docker-missing", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    const runner = createDockerSandboxRunner({ dbPath, workspacesDir: join(dir, "workspaces"), transcriptDir: join(dir, "transcripts"), docker: broken });
+    const result = await runner(job, runnerContext(store, dbPath, dir, 2_000));
+
+    expect(result.exitCode).toBeNull();
+    expect(result.protocolError).toMatch(/sandbox unavailable/);
+  });
+});
+
+// Required real-container lane (issue #101/#338). Gated on an explicit
+// integration flag so the hermetic suite never depends on a pre-built job
+// image: CI builds `bottega:local` and sets BOTTEGA_RUN_INTEGRATION=1 (the
+// required no-skip lane), while local runs skip it. Proves a genuine
+// container with a distinct inner PID and zero parent-secret leakage.
+const dockerSocketPresent = existsSync("/var/run/docker.sock") || process.env.BOTTEGA_SANDBOX_DOCKER_SOCKET !== undefined;
+describe("real-container Docker sandbox lane (#101/#338)", { skip: !dockerSocketPresent || process.env.BOTTEGA_RUN_INTEGRATION !== "1" }, () => {
+  test("a real container launches with a distinct inner PID and no parent secrets", async () => {
+    const { dir } = freshStore();
+    const probe = await probeDockerSandbox({
+      dbPath: join(dir, "store.db"),
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: join(dir, "transcripts"),
+      image: process.env.BOTTEGA_SANDBOX_IMAGE ?? "bottega:local",
+      requireDocker: true,
+    });
+    expect(probe.childMarker).toBe("1");
+    expect(probe.pid).toBeGreaterThan(0);
+    expect(probe.pid).not.toBe(process.pid);
+    expect(probe.forbiddenEnvNames).toEqual([]);
   });
 });
