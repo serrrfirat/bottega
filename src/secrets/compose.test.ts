@@ -82,14 +82,18 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     }
   });
 
-  test("OMP agent config templates mount at the SDK agent dir", () => {
+  test("OMP agent config templates mount at the server's SDK agent dir only", () => {
     // /app/data/omp-agent is the container path of the app's relative
     // data/omp-agent (WORKDIR /app, issue #12).
-    for (const name of ["server", "executor"]) {
-      // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
-      const volumes = service(name)["volumes"] as string[];
-      expect(volumes).toContain("./config/omp:/app/data/omp-agent");
-    }
+    // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
+    const serverVolumes = service("server")["volumes"] as string[];
+    expect(serverVolumes).toContain("./config/omp:/app/data/omp-agent");
+    // The executor intentionally has no OMP config bind mount (#101/#105):
+    // its image root is read-only and only durable data + disposable
+    // workspace mounts are writable; it creates data/omp-agent at boot on
+    // the data volume. deploy.test.ts asserts the same exclusion.
+    const executorVolumes = service("executor")["volumes"] as string[];
+    expect(executorVolumes).not.toContain("./config/omp:/app/data/omp-agent");
   });
 
   test("broker bootstrap generates the 0600 token once and execs omp with forwarded args", async () => {

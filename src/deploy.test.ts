@@ -43,10 +43,26 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     }
   });
 
-  test("every service restarts on failure", () => {
-    for (const name of Object.keys(services)) {
+  test("long-running services restart on failure", () => {
+    for (const name of ["iron-proxy", "auth-broker", "auth-gateway", "mem0", "server", "executor"]) {
       expect(service(name)["restart"]).toBe("on-failure");
     }
+  });
+
+  test("egress-config-init runs exactly once, before the proxy reads the policy (issue #317)", () => {
+    // One-shot seed copy (issue #317): no restart policy — a restart loop
+    // would re-copy over the credential boundary's call-scoped region.
+    const init = service("egress-config-init");
+    expect(init["restart"]).toBeUndefined();
+    const volumes = asStringArray(init["volumes"]);
+    expect(volumes).toContain("./config/egress.yml:/seed/egress.yml:ro");
+    expect(volumes).toContain("data:/data");
+    // The proxy reads the seeded policy from the shared volume and starts
+    // only after the init exits successfully.
+    const dependsOn = asRecord(service("iron-proxy")["depends_on"]);
+    expect(asRecord(dependsOn["egress-config-init"])["condition"]).toBe(
+      "service_completed_successfully",
+    );
   });
 
   test("executor reads the git PAT from the container path of the data volume", () => {
