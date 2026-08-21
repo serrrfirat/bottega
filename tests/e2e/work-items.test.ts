@@ -38,6 +38,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { bootHarness, type Harness, type StubTurn } from "./harness";
 import { runExecutor, type DeliveryApproval, type DeliveryInfo } from "../../src/executor";
+import { inProcessSandboxRunner } from "../../src/worker/run-job";
 import { resolveMemoryProvider } from "../../src/server/memory-provider";
 import { startDeliveryPoller } from "../../src/server/services/delivery-poller";
 import { buildApprovalBlocks } from "../../src/server/adapters/approval-router";
@@ -242,6 +243,12 @@ function startExecutor(
       transcriptDir: harness.transcriptDir,
       pollIntervalMs: 10,
       onDelivery: gate.request,
+      // Issue #335: the same hermetic runner double the executor unit tests
+      // use (#101) — the real isolated job body in-process over the scoped
+      // store, so prepareExecutor's fail-closed guard passes without Docker
+      // while production wiring (createChildProcessSandboxRunner) stays
+      // untouched.
+      sandboxRunner: inProcessSandboxRunner(),
     },
     ac.signal,
   );
