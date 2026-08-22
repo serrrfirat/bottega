@@ -7,7 +7,7 @@ import { createAudit } from "../policy/audit";
 import { defaultPolicy } from "../policy/config";
 import { createStore, type SpaceObject, type Store } from "../store/db";
 import { objectToolDefinitions } from "./objects";
-import { sha256Hex } from "./memory";
+import { sha256Hex } from "./helpers";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-object-tools-"));
 const stores: Store[] = [];

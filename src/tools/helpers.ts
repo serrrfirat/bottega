@@ -13,3 +13,32 @@ export function toolError(text: string): AgentToolResult {
 export function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
+
+/** SHA-256 hex digest: the audit stores the hash of saved content, never the content. */
+export function sha256Hex(text: string): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(text);
+  return hasher.digest("hex");
+}
+
+/**
+ * Rejects with a timeout error after `ms`; the underlying promise keeps
+ * running (it cannot be cancelled). `message` names the timed-out operation
+ * so each caller keeps its own error text.
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}

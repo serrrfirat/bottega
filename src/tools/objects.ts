@@ -6,8 +6,7 @@ import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { channelFromSpaceId, type SlackAdapter } from "../server/adapters/slack";
 import { OBJECT_CREATED_EVENT } from "../store/audit-events";
 import type { Store } from "../store/db";
-import { errorMessage, toolError } from "./helpers";
-import { sha256Hex } from "./memory";
+import { errorMessage, sha256Hex, toolError } from "./helpers";
 
 export interface ObjectToolsOpts {
   /** Principal recorded on created objects and audits. Default "agent". */

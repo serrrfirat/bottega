@@ -9,5 +9,15 @@ certs/
 .DS_Store
 .worktrees/
 
+# One-off root probe/scratch scripts (issue #341) — not part of the app.
+probe-membership.ts
+probe244.scratch.ts
+probe244b.scratch.ts
+probe244c.scratch.ts
+read-dm.ts
+read-dm-run.ts
+verify-roundtrip.ts
+prep-qa-channel.ts
+
 # Deployment-local policy floor (fail-closed default when absent).
 config.yml

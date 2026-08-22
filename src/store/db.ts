@@ -553,8 +553,6 @@ export interface Store {
   deleteSchedulerJob(id: string): Promise<boolean>;
   updateSchedulerNextFire(id: string, nextFireAt: number): Promise<void>;
   skipSchedulerOccurrence(id: string, expectedNextFireAt: number, nextFireAt: number): Promise<boolean>;
-  /** Legacy direct-fire state seam; normal runner fires use durable invocations. */
-  markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void>;
   setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void>;
   enqueueSchedulerRunNow(input: {
     jobId: string;
@@ -1858,19 +1856,6 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     );
   }
 
-  async function markSchedulerFired(id: string, result: "ok" | "error", at: number): Promise<void> {
-    if (!Number.isSafeInteger(at)) throw new Error("scheduler fire time must be a safe integer");
-    // SAFETY: get() yields undefined when the id is absent; the not-found branch throws before any use.
-    const row = getSchedulerJobStmt.get(id) as SchedulerJobRow | null;
-    if (!row) throw new Error(`scheduler job not found: ${id}`);
-    const nextFireAt = nextCronFire(row.cron, at);
-    db.query(
-      `UPDATE scheduler_jobs
-       SET last_fired_at = ?, last_result = ?, next_fire_at = ?
-       WHERE id = ?`,
-    ).run(at, result, nextFireAt, id);
-  }
-
   async function setSchedulerJobEnabled(id: string, enabled: boolean): Promise<void> {
     const result = db
       .query("UPDATE scheduler_jobs SET enabled = ? WHERE id = ?")
@@ -2293,7 +2278,6 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     deleteSchedulerJob,
     skipSchedulerOccurrence,
     updateSchedulerNextFire,
-    markSchedulerFired,
     setSchedulerJobEnabled,
     enqueueSchedulerRunNow,
     claimScheduledSchedulerInvocation,

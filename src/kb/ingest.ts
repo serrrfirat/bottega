@@ -2,7 +2,7 @@
 import type { MemoryProvider } from "../memory/types";
 import type { AuditModule } from "../policy/audit";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
-import { sha256Hex } from "../tools/memory";
+import { sha256Hex } from "../tools/helpers";
 import type { KbConfig, KbSource } from "./config";
 
 export const KB_CHUNK_MAX_CHARS = 2_000;

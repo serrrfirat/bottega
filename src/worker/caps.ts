@@ -60,5 +60,6 @@ function isOrgCapKind(kind: WorkerJobKindLike): kind is OrgCapKind {
 }
 
 // Avoid a type import cycle with the envelope: the kind union is the one
-// string set this module is keyed by, spelled out inline.
-export type WorkerJobKindLike = OrgCapKind | (string & {});
+// string set this module is keyed by, spelled out inline. Any job-kind
+// string is accepted; unknown kinds fail closed to git's caps (isOrgCapKind).
+export type WorkerJobKindLike = OrgCapKind | string;

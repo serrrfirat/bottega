@@ -6,7 +6,7 @@ import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { createAudit } from "../policy/audit";
 import { MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { createStore, type Store } from "../store/db";
-import { sha256Hex } from "../tools/memory";
+import { sha256Hex } from "../tools/helpers";
 import { chunkText, ingestAll, ingestSource } from "./ingest";
 import type { KbSource } from "./config";
 

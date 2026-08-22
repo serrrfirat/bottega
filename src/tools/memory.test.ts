@@ -9,7 +9,8 @@ import type { AuditModule } from "../policy/audit";
 import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import type { MemoryScopeContext } from "../memory/scope";
-import { memoryToolsExtension, sha256Hex } from "./memory";
+import { memoryToolsExtension } from "./memory";
+import { sha256Hex } from "./helpers";
 
 /** The memory tools never read the extension context; only the arity needs it. */
 const noopCtx: ExtensionContext = Object.create(null);

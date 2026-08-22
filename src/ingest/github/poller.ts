@@ -22,6 +22,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { z } from "zod";
+import { errorMessage } from "../../tools/helpers";
 import { githubMentionPayloadSchema, type GithubMentionPayload } from "../dispatch";
 import type { IngestEvent, Poller } from "../types";
 
@@ -74,10 +75,6 @@ const searchItemSchema = z.object({
   updated_at: z.string(),
 });
 const searchResponseSchema = z.object({ items: z.array(searchItemSchema) });
-
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
 
 /** "https://api.github.com/repos/owner/name" → "owner/name". */
 function repoFromRepositoryUrl(repositoryUrl: string): string {

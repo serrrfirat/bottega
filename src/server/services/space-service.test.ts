@@ -18,7 +18,7 @@ import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIV
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
-import { sha256Hex } from "../../tools/memory";
+import { sha256Hex } from "../../tools/helpers";
 
 // ---------------------------------------------------------------------------
 // Fakes: no real model, no network. The driver seam is what keeps these tests

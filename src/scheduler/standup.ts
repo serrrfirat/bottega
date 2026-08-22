@@ -1,8 +1,7 @@
 import { requireDigestPruning } from "../memory/types";
 import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import type { WorkItemState } from "../store/db";
-import { sha256Hex } from "../tools/memory";
-import { errorMessage } from "../tools/helpers";
+import { errorMessage, sha256Hex } from "../tools/helpers";
 import { tableBlock, type SlackBlock } from "../server/adapters/blocks";
 import { DIGEST_CAP } from "../server/services/space-service";
 import { proactiveEnabled } from "./proactive-config";

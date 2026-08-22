@@ -15,6 +15,7 @@ import {
   MAX_SKILL_DOCUMENT_BYTES,
   updateSpaceSkill,
   MAX_SKILL_TOTAL_BYTES,
+  SKILL_NAME_RE,
   validateCompanionPath,
   type SkillsResolveOpts,
 } from "../server/skills";
@@ -29,7 +30,7 @@ import type { AuditModule } from "../policy/audit";
 import { errorMessage, toolError } from "./helpers";
 import type { Store } from "../store/db";
 
-const skillNameSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/);
+const skillNameSchema = z.string().regex(SKILL_NAME_RE);
 const revisionSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const companionPathSchema = z
   .string()

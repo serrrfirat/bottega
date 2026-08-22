@@ -14,7 +14,15 @@
     "tools/oxlint/anti-slop/**",
     ".worktrees/**",
     "node_modules/**",
-    "data/**"
+    "data/**",
+    "probe-membership.ts",
+    "probe244.scratch.ts",
+    "probe244b.scratch.ts",
+    "probe244c.scratch.ts",
+    "read-dm.ts",
+    "read-dm-run.ts",
+    "verify-roundtrip.ts",
+    "prep-qa-channel.ts"
   ],
   "jsPlugins": [{ "name": "anti-slop", "specifier": "./tools/oxlint/anti-slop/dist/index.js" }],
   "rules": {
