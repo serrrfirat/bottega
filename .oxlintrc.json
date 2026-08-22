@@ -10,6 +10,7 @@
     ".opencode/**",
     ".pi/**",
     ".roo/**",
+    ".scratch/**",
     ".windsurf/**",
     "tools/oxlint/anti-slop/**",
     ".worktrees/**",
