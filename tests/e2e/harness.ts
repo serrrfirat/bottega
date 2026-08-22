@@ -116,6 +116,14 @@ export interface StubRequest {
   model: string;
   stream: boolean;
   messages: Array<{ role: string; content: unknown }>;
+  /**
+   * The tool schema the provider boundary delivered to the model — the
+   * wire `tools` array, each entry `{ type: "function", function: { name,
+   * ... } }`. Names are the model-facing surface (issue #338): the space
+   * agent must NOT see host-native shell/filesystem/subagent tools here.
+   * Absent when the request carried no tools array.
+   */
+  tools?: Array<{ type?: unknown; function?: { name?: unknown } }>;
 }
 
 /** Fallback turn when the script is exhausted or empty — reasoning-safe. */
@@ -159,18 +167,21 @@ function createModelStub(): ModelStub {
         return new Response("not found", { status: 404 });
       }
       // SAFETY: the stub reads only optional fields (model/stream/messages/
-      // stream_options) with fallbacks for absent ones; a non-object JSON
-      // body still yields undefined fields, matching the pre-check behavior.
+      // tools/stream_options) with fallbacks for absent ones; a non-object
+      // JSON body still yields undefined fields, matching the pre-check
+      // behavior.
       const body = (await req.json()) as {
         model?: string;
         stream?: boolean;
         messages?: Array<{ role: string; content: unknown }>;
+        tools?: Array<{ type?: unknown; function?: { name?: unknown } }>;
         stream_options?: { include_usage?: boolean };
       };
       requests.push({
         model: String(body.model ?? ""),
         stream: body.stream === true,
         messages: (body.messages ?? []).map((m) => ({ role: m.role, content: m.content })),
+        ...(Array.isArray(body.tools) ? { tools: body.tools } : {}),
       });
       while (waiters.length > 0) waiters.shift()!();
 

@@ -8,7 +8,8 @@
  * the REAL `createAgentSession` through the e2e harness and pins the
  * driver-level replacement wiring: the gate fires on every gated tool call
  * (decision + audit + approval), the work-item/memory tools are present,
- * built-ins stay callable THROUGH the gate, and the memory-context injection
+ * the host-tool boundary keeps read/write/grep/task/bash out of the
+ * model-facing tool schema (issue #338), and the memory-context injection
  * rides the driver's appendSystemPrompt seam.
  *
  * All assertions are observable-contract: audit rows, durable state, and the
@@ -19,6 +20,7 @@ import { z } from "zod";
 import { z as sdkZ, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, type EmulatorMessage, type Harness, type StubTurn } from "./harness";
 import { APPROVAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../../src/store/audit-events";
+import { FORBIDDEN_SPACE_HOST_TOOLS } from "../../src/server/drivers/agent-driver";
 
 const dirs: Array<{ cleanup(): Promise<void> }> = [];
 afterAll(async () => {
@@ -140,27 +142,48 @@ describe("journey 4: restricted real-SDK session (issue #69)", () => {
   );
 
   test(
-    "built-in read stays callable through the gate in a restricted session (allow decision audited)",
+    "the host-tool boundary strips read/write/grep/task/bash from the exposed tool schema in a restricted session (#338)",
     async () => {
       const h = await harness(
-        [{ type: "tool_calls", calls: [{ name: "read", args: { path: "package.json" } }] }, { type: "text", text: "read done" }],
-        "tools:\n  read: allow\n",
+        [{ type: "text", text: "surface" }],
+        // Fail-closed default: the space agent surfaces only the allowlist.
+        "",
       );
       try {
-        await h.deliverMessage(h.slack.dmChannelId, "read package.json");
-        await h.modelStub.waitForRequests(2);
+        await h.deliverMessage(h.slack.dmChannelId, "list the tools you can use");
+        await h.modelStub.waitForRequests(1);
 
-        // Read tier + allow policy → allow, audited like every call.
+        // The FIRST model request carries the session's entire tool schema —
+        // the model-facing surface (issue #338). Every forbidden host-native
+        // name must be absent: the space agent is a participant, not an
+        // executor, so read/write/grep/task/bash (and the rest of the
+        // boundary — edit/glob/ast_grep/lsp/inspect_image) never reach the
+        // model. The full authoritative set comes from the driver constant.
+        const first = h.modelStub.requests[0]!;
+        expect(first.tools).toBeDefined();
+        const names = (first.tools ?? []).map((tool) => tool.function?.name);
+        for (const forbidden of FORBIDDEN_SPACE_HOST_TOOLS) {
+          expect(names, `host tool "${forbidden}" must not be surfaced`).not.toContain(forbidden);
+        }
+
+        // The boundary is surgical, not a blanket strip: the allowed
+        // remote/API tools stay exposed. `web_search` is a bounded remote
+        // call that still crosses the shared policy gate (issue #338
+        // deliberately leaves it in), and the driver-surfaced orchestration
+        // tools prove the surface is intact, just host-tool-free. Their
+        // callable/audited behavior is proven adjacent: the #292 multi-tool
+        // journey below executes custom tools through the real SDK, and
+        // extensions.test.ts audits an allowed API tool (fixture.weather)
+        // through the runtime — referenced here, not duplicated.
+        expect(names).toContain("web_search");
+        expect(names).toContain("create_work_item");
+        expect(names).toContain("memory_save");
+
+        // `read` was never exposed, so the gate never saw it — no policy
+        // decision is fabricated for a tool the model could not call (the
+        // old pre-#338 surface audited an `allow` for read instead).
         const decisions = await auditRows(h, POLICY_DECISION_EVENT);
-        const readDecision = decisions.find((row) => row.tool === "read");
-        expect(readDecision).toBeDefined();
-        expect(readDecision!.decision).toBe("allow");
-        expect(readDecision!.tier).toBe("read");
-
-        // The turn completed: the scripted reply landed in the channel
-        // (posts land a beat after the turn).
-        const reply = await waitForReply(h, "read done");
-        expect(reply).toBeDefined();
+        expect(decisions.find((row) => row.tool === "read")).toBeUndefined();
       } finally {
         await h.cleanup();
       }
