@@ -216,8 +216,6 @@ export async function probeChildProcessSandbox(options: {
   dbPath: string;
   transcriptDir: string;
   requireOsResourceLimits?: boolean;
-  /** Launch-context directory to defend against: the sandbox never runs the child from here, so a hostile `.env` here cannot load (issue #105). */
-  cwd?: string;
 }): Promise<SandboxProbe> {
   const response = await spawnSandboxChild(
     { version: SANDBOX_PROTOCOL_VERSION, mode: "probe" },
@@ -228,7 +226,6 @@ export async function probeChildProcessSandbox(options: {
       tokenFile: "",
       brokerTokenFile: "",
       requireLimits: options.requireOsResourceLimits ?? process.platform === "linux",
-      cwd: options.cwd,
     },
   );
   if ("protocolError" in response) throw new Error(response.protocolError);
@@ -1030,8 +1027,6 @@ async function spawnSandboxChild(
     tokenFile: string;
     requireLimits: boolean;
     brokerTokenFile: string;
-    /** Launch-context directory to defend against; never the child's actual cwd (issue #105). */
-    cwd?: string;
   },
 ): Promise<SpawnChildResult> {
   const encoded = JSON.stringify(request);
@@ -1060,6 +1055,19 @@ async function spawnSandboxChild(
   // child can never inherit Slack/provider/credential secrets from the parent.
   sanitizeSandboxEnv(env);
 
+  // Issue #105 (P2): the child now runs from its own EMPTY temp cwd, so the
+  // natural `BOTTEGA_CONFIG_DIR ?? process.cwd()` fallback for relative
+  // `config/` and knowledge-base paths would resolve against that empty dir
+  // instead of the caller's real config root. When the caller did not pin
+  // BOTTEGA_CONFIG_DIR, re-pin it to the caller's own effective config root
+  // (the coordinator cwd that the child previously inherited) so those
+  // relative paths keep resolving exactly as they did before. The child's
+  // cwd itself stays empty — only the config anchor is made explicit and
+  // absolute.
+  if (env.BOTTEGA_CONFIG_DIR === undefined) {
+    env.BOTTEGA_CONFIG_DIR = process.cwd();
+  }
+
   // The child must NEVER run from a cwd that can carry a `.env`: Bun itself
   // eagerly auto-loads `.env`/`.env.local`/mode dotenv files from the
   // process cwd (issue #105), and `@oh-my-pi/pi-coding-agent` additionally
@@ -1067,8 +1075,8 @@ async function spawnSandboxChild(
   // because they happen inside the nested Bun AFTER spawn. `--no-env-file`
   // (in `sandboxCommand`) stops Bun's implicit load, but it cannot stop the
   // third-party cwd read. So the child is always spawned from a dedicated,
-  // fresh, EMPTY temp directory of the sandbox's own — never the coordinator
-  // cwd (`options.cwd` is only the launch context to defend against). No
+  // fresh, EMPTY temp directory of the sandbox's own — never whatever cwd
+  // spawned this runner. No
   // dotenv file can exist there, so neither loader can ever find one.
   const childCwd = mkdtempSync(join(tmpdir(), "bottega-sandbox-child-"));
   try {

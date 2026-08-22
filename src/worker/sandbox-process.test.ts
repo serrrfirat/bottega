@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createStore, type Store } from "../store/db";
 import { prepareExecutor, type ExecutorConfig, type ExecutorDeps } from "../executor";
 import type { WorkerJob } from "./envelope";
@@ -101,6 +103,23 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+/**
+ * Narrow the JSON the controller printed back into a typed probe report.
+ * The fields are runtime-checked (never trusted from the subprocess blindly)
+ * so the subsequent `forbiddenEnvNames` assertion is honest.
+ */
+function narrowProbeReport(value: unknown, raw: string): { pid: number; forbiddenEnvNames: string[] } {
+  if (value === null || typeof value !== "object") throw new Error(`controller returned malformed probe: ${raw}`);
+  const record = value as Record<string, unknown>;
+  if (typeof record.pid !== "number" || !Array.isArray(record.forbiddenEnvNames)) {
+    throw new Error(`controller returned malformed probe: ${raw}`);
+  }
+  if (record.forbiddenEnvNames.some((name) => typeof name !== "string")) {
+    throw new Error(`controller returned malformed probe: ${raw}`);
+  }
+  return { pid: record.pid, forbiddenEnvNames: record.forbiddenEnvNames };
+}
+
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -142,26 +161,47 @@ describe("child-process protocol lane (test fabric — NOT the production bounda
     // `process.cwd()/.env` at import time — both bypass the sanitized env
     // because they run inside the nested Bun AFTER spawn. A developer's real
     // `.env` in the runner cwd must never leak into the sandbox child.
-    // Arrange a hostile `.env` in the launch context (`cwd`) and prove the
-    // checked-in child self-reports neither token: the sandbox always runs
-    // the child from its own dedicated EMPTY temp cwd, so no dotenv file can
-    // ever be found there.
+    //
+    // This reproduction FAILS against the pre-fix lane: it drives the real
+    // child lane from a temporary HOSTILE cwd (`probeCwd`) that holds a
+    // `.env`. The old lane spawned the child with no cwd, so the child
+    // inherited that hostile cwd and — lacking `--no-env-file` — Bun eagerly
+    // loaded the `.env`, and the checked-in child self-reported both leaked
+    // Slack tokens. The fixed lane re-spawns the child from its own dedicated
+    // EMPTY temp cwd (`--no-env-file` + no dotenv file), so the child must
+    // self-report no forbidden environment at all.
     const loneDir = tempDir();
+    const probeCwd = join(loneDir, "hostile-cwd");
+    mkdirSync(probeCwd);
     writeFileSync(
-      join(loneDir, ".env"),
+      join(probeCwd, ".env"),
       "SLACK_APP_TOKEN=cwd-dotenv-app-secret\nSLACK_BOT_TOKEN=cwd-dotenv-bot-secret\n",
     );
     const { dbPath } = freshStore();
     process.env.SLACK_APP_TOKEN = "parent-app-secret-must-not-cross";
     process.env.SLACK_BOT_TOKEN = "parent-secret-must-not-cross";
 
-    const probe = await probeChildProcessSandbox({
-      dbPath,
-      transcriptDir: join(loneDir, "transcripts"),
-      cwd: loneDir,
-    });
+    // The static-import controller (dotenv-probe-controller.ts) runs as a
+    // real process FROM the hostile cwd, then drives the real child lane via
+    // probeChildProcessSandbox and prints the checked-in child's own report.
+    const controller = fileURLToPath(new URL("./dotenv-probe-controller.ts", import.meta.url));
+    const run = spawnSync(
+      process.execPath,
+      [
+        controller,
+        `--dbPath=${dbPath}`,
+        `--transcriptDir=${join(loneDir, "transcripts")}`,
+      ],
+      { cwd: probeCwd, encoding: "utf8", timeout: 30_000 },
+    );
+    expect(run.status).toBe(0);
+    expect(run.stderr).toBe("");
+    const parsed = JSON.parse(run.stdout) as unknown;
+    const probe = narrowProbeReport(parsed, run.stdout);
 
     expect(probe.pid).not.toBe(process.pid);
+    // The child's own report must show NO leaked forbidden credential: not
+    // the `.env` values and not the parent-process values either.
     expect(probe.forbiddenEnvNames).toEqual([]);
   });
 
