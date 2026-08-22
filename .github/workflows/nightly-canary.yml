@@ -1,0 +1,183 @@
+# Nightly live-Slack canary (issue #261, ops-safe scope): runs the real
+# live-API canary (tests/e2e/canary.ts, issues #79/#175) EVERY NIGHT at
+# 01:00 Europe/Istanbul (= 22:00 UTC) against origin/main on a hosted
+# runner, and on a RED run opens (or updates) a single tracking GitHub
+# issue labeled `canary-failure` carrying the per-journey report artifact.
+#
+# Scope deviation from the full #261 automation: this workflow ONLY
+# detects + reports failures. It does NOT autonomously fix or push to
+# main — that part stays manual until the user says otherwise. When the
+# workflow reports a failure to the tracking issue it notes this deviation
+# explicitly (see the "Open or update the canary-failure tracking issue"
+# step), so a red run is never mistaken for an already-fixed-by-robot state.
+#
+# Reuses the canary.yml patterns: the live-API job runs on ubuntu-latest
+# with the same repository secrets (CI-strict — missing secrets FAIL, never
+# a silent skip, issue #175) and tees the per-journey output to
+# canary-report.txt (uploaded as an artifact). Unlike canary.yml this is a
+# single tracked-run workflow: no auto-rerun, no release gate — issue #261
+# tracking only, release gating stays with the weekly CI canary.
+#
+# CI-strict facts: the canary CLI (canary.sh → tests/e2e/canary.ts) exits
+# non-zero on any journey failure, so the `canary` step goes red and the
+# "Open or update the canary-failure tracking issue" step below runs with
+# `if: failure() && steps.canary.outcome == 'failure'`.
+name: Nightly Canary
+
+on:
+  schedule:
+    # 01:00 Europe/Istanbul = 22:00 UTC the previous day (Istanbul is UTC+3
+    # year-round). Written as the literal UTC cron so the schedule needs no
+    # timezone-aware evaluation: this is the same instant regardless of the
+    # runner's clock, and it is supported by every GitHub Actions release.
+    # Using the `timezone` key would be equivalent but relies on a feature
+    # the surrounding project may not pin (actionlint 1.7.7 rejects it).
+    - cron: "0 22 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Issue reporting needs the issues API (github-script). The `contents`
+    # permission above stays read-only for checkout; this job elevates only
+    # the issues scope it needs and nothing else.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+
+      # Run the live-Slack canary CI-strict (reuses canary.yml exactly: all
+      # repo secrets the live leg needs). The per-journey report is teed to
+      # canary-report.txt and uploaded as an artifact so even a red run is
+      # fully diagnosable (per-journey status + Slack message permalinks).
+      - name: Run the nightly live-Slack canary (CI-strict)
+        id: canary
+        env:
+          CI: "true"
+          CANARY_CI: "1"
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_QA_USER_TOKEN: ${{ secrets.SLACK_QA_USER_TOKEN }}
+          SLACK_QA_REQUESTER_TOKEN: ${{ secrets.SLACK_QA_REQUESTER_TOKEN }}
+          SLACK_QA_APPROVER_TOKEN: ${{ secrets.SLACK_QA_APPROVER_TOKEN }}
+          SLACK_QA_MEMBER_TOKEN: ${{ secrets.SLACK_QA_MEMBER_TOKEN }}
+          SLACK_QA_SECOND_MEMBER_TOKEN: ${{ secrets.SLACK_QA_SECOND_MEMBER_TOKEN }}
+          SLACK_QA_REQUESTER_ID: ${{ secrets.SLACK_QA_REQUESTER_ID }}
+          SLACK_QA_APPROVER_ID: ${{ secrets.SLACK_QA_APPROVER_ID }}
+          SLACK_QA_MEMBER_ID: ${{ secrets.SLACK_QA_MEMBER_ID }}
+          SLACK_QA_SECOND_MEMBER_ID: ${{ secrets.SLACK_QA_SECOND_MEMBER_ID }}
+          SLACK_QA_USER_ID: ${{ secrets.SLACK_QA_USER_ID }}
+          SLACK_QA_CHANNEL: ${{ secrets.SLACK_QA_CHANNEL }}
+          NEAR_API_KEY: ${{ secrets.NEAR_API_KEY }}
+          CANARY_MODEL_REF: ${{ secrets.CANARY_MODEL_REF }}
+        run: |
+          set -o pipefail
+          # --live-slack dispatches to the real live leg; --ci makes missing
+          # secrets fail loudly instead of skipping (issue #175). The CLI
+          # prints [PASS]/[FAIL] per journey with Slack permalinks, and
+          # exits non-zero on any journey failure (issue #261 tracking).
+          bun run canary --live-slack --ci 2>&1 | tee canary-report.txt
+
+      # Always ship the per-journey report so a red run is diagnosable —
+      # without `if: always()` this step would be skipped when the canary
+      # fails (default step behavior), defeating the point.
+      - name: Upload the per-journey report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-canary-report
+          path: canary-report.txt
+          if-no-files-found: warn
+
+      # On a RED run, open (or update) the single tracking GitHub issue
+      # labeled `canary-failure` with the per-journey report + run link.
+      # Idempotent: the `canary-failure` label is created on demand, and an
+      # already-open tracked issue is re-commented (never duplicated). The
+      # issue body/comment explicitly notes the NO autonomous push-to-main
+      # deviation so a red run is never mistaken for a robot-fixed state.
+      - name: Open or update the canary-failure tracking issue
+        if: failure() && steps.canary.outcome == 'failure'
+        uses: actions/github-script@v7
+        env:
+          REPORT_FILE: canary-report.txt
+        with:
+          script: |
+            const fs = require("fs");
+            const label = "canary-failure";
+            const title = "Nightly canary failure — " + new Date().toISOString().slice(0, 10);
+            const report = fs.existsSync(process.env.REPORT_FILE)
+              ? fs.readFileSync(process.env.REPORT_FILE, "utf8").slice(0, 24000)
+              : "(no report file — the canary failed before producing per-journey output)";
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            // Scope deviation (issue #261 ops-safe): no autonomous fix/push.
+            const deviationNote =
+              "> **Scope note (issue #261, ops-safe workflow):** this nightly workflow only **detects and reports** " +
+              "failures. It does **NOT** autonomously fix or push to `main` — that stays manual until the user says " +
+              "otherwise. Treat this red run as needs-a-human, not as already-fixed-by-robot.";
+
+            // Create the label once (idempotent — errors when it exists already).
+            const labelColor = "d73a4a";
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+                color: labelColor,
+                description: "Tracked nightly live-Slack canary failure (issue #261)",
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e; // 422 = already exists; fine.
+            }
+
+            // Find an open tracked issue, if any.
+            const { data: tracked } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+              per_page: 100,
+            });
+            const existing = tracked.find((i) => !i.pull_request && i.title.startsWith("Nightly canary failure"));
+
+            const body =
+              `## Nightly live-Slack canary failed\n\n` +
+              `${deviationNote}\n\n` +
+              `**Run:** ${runUrl}\n` +
+              `**When:** ${new Date().toISOString()}\n\n` +
+              `### Per-journey report\n\n` +
+              "```\n" + report + "\n```\n";
+
+            if (existing) {
+              // Update the existing open issue rather than creating a duplicate.
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Another nightly canary failure (${new Date().toISOString()}): ${runUrl}`,
+              });
+              console.log(`Updated tracked canary-failure issue #${existing.number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: [label],
+              });
+              console.log(`Opened tracked canary-failure issue #${created.number}`);
+            }
