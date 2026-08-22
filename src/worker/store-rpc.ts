@@ -661,7 +661,7 @@ export class JobStoreRpcServer {
       deny("extension credential read — extension work-item jobs only");
     }
     if (workItemId === null) {
-      deny("extension credential read — extension work-item jobs only");
+      throw new ScopedStoreAccessError(this.job.id, "extension credential read — extension work-item jobs only");
     }
     const item = await this.scopedStore.getWorkItem(workItemId);
     if (item === null || item.delivery !== "extension") {
