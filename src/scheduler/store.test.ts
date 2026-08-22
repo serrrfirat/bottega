@@ -405,7 +405,7 @@ describe("create_scheduler_job surface (issue #220)", () => {
       registry,
       memoryProvider: {
         capabilities: { consolidation: "explicit", digestPruning: "explicit" },
-        save: async () => ({ id: "x", key: "s", content: "c", metadata: {}, createdAt: 0 }),
+        save: async () => ({ id: "x", key: { kind: "org" }, content: "c", metadata: {}, createdAt: 0 }),
         search: async () => [],
         pruneDigests: async () => 0,
       },

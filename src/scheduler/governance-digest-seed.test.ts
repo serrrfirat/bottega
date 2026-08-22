@@ -57,6 +57,7 @@ describe("governance_digest boot seeder (#161)", () => {
     await seedGovernanceDigestJobs(store, () => Date.UTC(2026, 7, 21, 12));
     const afterFirst = await store.listSchedulerJobs();
     expect(afterFirst).toHaveLength(1);
+    expect(afterFirst[0]!.spaceId).toBe(opted);
 
     await seedGovernanceDigestJobs(store, () => Date.UTC(2026, 8, 21, 12));
     const afterSecond = await store.listSchedulerJobs();
