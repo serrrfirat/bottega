@@ -664,14 +664,41 @@ or escaped targets are refused and remain untouched.
 
 ### Backup & rollback
 
-- **Backup** — everything that matters lives on the `data` volume (SQLite store, sessions, transcripts, git credential file). Snapshot it on a schedule and keep a copy off-host:
+- **Backup** — everything that matters lives on the `data` volume (SQLite store, sessions, transcripts, git credential file). Snapshot the store DB with `scripts/backup.sh` (uses Bun's `bun:sqlite` `Database.serialize()` to make a consistent, restorable copy of the live DB — safe to run while the server is up):
 
   ```bash
-  docker run --rm -v bottega_data:/data -v "$PWD":/backup alpine \
-    tar czf /backup/bottega-data-$(date +%F).tar.gz /data
+  # One-off snapshot: writes backups/bottega-<timestamp>.db (mode 0600) next
+  # to the DB and prints the backup path.
+  BOTTEGA_DB_PATH=data/bottega.db bash scripts/backup.sh
+
+  # Nightly cron, keeping the newest 7 snapshots (default) then pruning older.
+  # `docker compose exec` runs inside the container where the DB lives at
+  # /app/data/bottega.db (the volume is mounted at /app/data).
+  0 2 * * * cd /path/to/bottega && docker compose exec -T server \
+    BOTTEGA_DB_PATH=/app/data/bottega.db bash scripts/backup.sh
   ```
 
-  Find the exact volume name with `docker volume ls` (usually `bottega_data`). Restore: stop the stack, untar over the volume, `up -d`.
+  Backup and retention are controlled by env (all optional):
+
+  | Env | Meaning | Default |
+  | --- | --- | --- |
+  | `BOTTEGA_DB_PATH` | Source DB path | `data/bottega.db` |
+  | `BACKUP_DIR` | Directory to write snapshots into (created when missing) | `<dbdir>/backups`, i.e. `data/backups` |
+  | `BACKUP_KEEP` | Newest snapshots to keep; `0` disables pruning | `7` |
+
+  Backups are stored on the `data` volume by default (`data/backups`). Keep a copy off-host (tar the file to object storage or a remote volume on a schedule) so host loss does not lose the history.
+
+- **Restore** — `scripts/restore.sh` copies a snapshot back over the store DB atomically (temp file + `mv`), so a crash mid-restore never leaves a half-written DB. It requires an explicit `yes` confirmation (`--yes` skips it, for cron/CI), validates the file is a real SQLite DB, and prints the next step:
+
+  ```bash
+  # Stop the server, restore the newest snapshot, then start it again.
+  docker compose stop server
+  BOTTEGA_DB_PATH=data/bottega.db \
+    bash scripts/restore.sh data/backups/bottega-<timestamp>.db
+  docker compose start server
+  ```
+
+  Inside a container the DB path is `/app/data/bottega.db` (the volume is named `data` and mounted at `/app/data` — find the exact name with `docker volume ls` if unsure). Restoring SFTP/volume-level copies is also fine: stop the stack, overlay the backup, `up -d`.
 
 - **Rollback** — tag each deploy and pin the known-good tag in `.env`:
 
