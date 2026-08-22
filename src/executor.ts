@@ -48,8 +48,9 @@
  * stale-run window) and denies, landing the item in `blocked` instead of
  * hanging at `working` forever.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { writeFileAtomic } from "./fs-atomic";
 import {
   recoverStaleWorkItems,
   type AuditCursor,
@@ -1437,7 +1438,7 @@ export function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
 /** Idempotent: (re)writes the askpass helper next to the token file, mode 0700. */
 function writeAskpassScript(cfg: ExecutorConfig): void {
   mkdirSync(dirname(cfg.askpassScript), { recursive: true });
-  writeFileSync(
+  writeFileAtomic(
     cfg.askpassScript,
     [
       "#!/bin/sh",
@@ -1447,9 +1448,8 @@ function writeAskpassScript(cfg: ExecutorConfig): void {
       'exec cat "${EXECUTOR_GIT_TOKEN_FILE}"',
       "",
     ].join("\n"),
-    { mode: 0o700 },
+    0o700,
   );
-  chmodSync(cfg.askpassScript, 0o700);
 }
 
 async function git(args: string[], opts: { cwd?: string; env?: Record<string, string> } = {}): Promise<void> {

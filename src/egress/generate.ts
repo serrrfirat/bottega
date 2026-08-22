@@ -24,7 +24,9 @@
  * config/extensions/; the committed config/egress.yml (strict, deployment)
  * and config/egress.dev.yml (dev-permissive, issue #126) are the generated
  * outputs, and egress-config.test.ts / generate.test.ts pin them to the
- * templates (no drift). Base model endpoints stay hardcoded here; extension
+ * templates (no drift). The gateway hosts derive from MODEL_GATEWAY_KEYS
+ * (one source of truth for allowlist + spec); the remaining base endpoints
+ * stay hardcoded here; extension
  * domains append to them, deduped. Default-deny enforcement is unchanged:
  * extension domains merely join the allowlist and still pass the judge
  * transform. The DEV config is the ONLY permissive surface: allow-all
@@ -39,6 +41,64 @@ import {
   SCOPED_AUTHORIZATIONS_END,
 } from "../extensions/boundary";
 
+/** Reviewed credential targets retained separately from general egress reachability. */
+export interface ExtensionEgressEntry {
+  extensionId: string;
+  credentialTargets: PinnedSnapshot["manifest"]["credentialTargets"];
+}
+
+/**
+ * The model-gateway static keys (issue #208 + #230): the providers
+ * config/omp/models.yml declares (near/opencode/openai/anthropic, plus
+ * openai-codex — the ChatGPT subscription credential) talk to their
+ * gateways with a PLACEHOLDER bearer; the proxy injects the real value
+ * from the provider's secret file (`data/proxy-secrets/<provider>.secret`,
+ * seeded at boot by the proxy credential sync, src/extensions/proxy-seed).
+ * Each entry REQUIRES its secret file (`inject.require: true`) — a missing
+ * key fails the request closed (502) instead of letting the placeholder
+ * reach the gateway (the #208 fail-closed invariant). For codex the
+ * secret file holds the ACCESS token minted by the seed's own refresh
+ * (issue #230: the seed owns the rotation; the proxy injects the static
+ * bearer at egress and never touches auth.openai.com).
+ */
+export interface ModelGatewayKey {
+  /** The provider id (the sync's vault provider / Keychain service suffix). */
+  provider: string;
+  /** The gateway host the proxy injects the key for. */
+  host: string;
+}
+
+/** The base model-gateway keys, shared by the strict and dev renderers. */
+export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
+  { provider: "near", host: "cloud-api.near.ai" },
+  // opencode-go's built-in gateway (the catalog entry for
+  // deepseek-v4-flash: https://opencode.ai/zen/go/v1).
+  { provider: "opencode", host: "opencode.ai" },
+  { provider: "openai", host: "api.openai.com" },
+  { provider: "anthropic", host: "api.anthropic.com" },
+  // Issue #214/#230 (the openai-codex model provider): the ChatGPT
+  // subscription OAuth access token, seeded as a STATIC secret by the
+  // proxy credential sync's codex leg (data/proxy-secrets/openai-codex.secret
+  // — the seed owns the refresh and writes the minted access token; the
+  // proxy injects it as the bearer for chatgpt.com, require: true).
+  { provider: "openai-codex", host: "chatgpt.com" },
+  // The Tavily web-search gateway (issue #278): the search_web tool's
+  // outbound call to api.tavily.com/search sends the placeholder bearer;
+  // the proxy injects the real key from data/proxy-secrets/tavily.secret
+  // (seeded at boot — require: true, so a missing key rejects the request
+  // closed instead of reaching the provider unauthenticated).
+  { provider: "tavily", host: "api.tavily.com" },
+] as const;
+
+/** The gateway host for a provider, from {@link MODEL_GATEWAY_KEYS} — the
+ * single source of truth shared by the base allowlist and the spec tests,
+ * so one edit to a gateway host updates both. */
+export function gatewayHost(provider: string): string {
+  const key = MODEL_GATEWAY_KEYS.find((k) => k.provider === provider);
+  if (!key) throw new Error(`egress base allowlist: unknown gateway provider "${provider}"`);
+  return key.host;
+}
+
 /** Base allowlist: model gateways (NEAR.ai, OpenAI, Anthropic — issue #8,
  * #36, #37ee2bf) plus the opencode-go gateway (issue #208 — the pinned
  * deepseek-v4-flash routes to opencode.ai/zen/go/v1), the ChatGPT Codex
@@ -51,13 +111,13 @@ import {
  * the Tavily web-search gateway (issue #278 — the search_web tool's
  * provider host, api.tavily.com). */
 export const BASE_EGRESS_DOMAINS = [
-  "cloud-api.near.ai",
+  gatewayHost("near"),
   "*.completions.near.ai",
-  "opencode.ai",
-  "chatgpt.com",
-  "api.openai.com",
-  "api.anthropic.com",
-  "api.tavily.com",
+  gatewayHost("opencode"),
+  gatewayHost("openai-codex"),
+  gatewayHost("openai"),
+  gatewayHost("anthropic"),
+  gatewayHost("tavily"),
   "raw.githubusercontent.com",
   "files.slack.com",
   "slack.com",
@@ -140,55 +200,6 @@ export function hostFromBaseUrl(baseUrl: string): string | undefined {
     return undefined;
   }
 }
-
-/** Reviewed credential targets retained separately from general egress reachability. */
-export interface ExtensionEgressEntry {
-  extensionId: string;
-  credentialTargets: PinnedSnapshot["manifest"]["credentialTargets"];
-}
-
-/**
- * The model-gateway static keys (issue #208 + #230): the providers
- * config/omp/models.yml declares (near/opencode/openai/anthropic, plus
- * openai-codex — the ChatGPT subscription credential) talk to their
- * gateways with a PLACEHOLDER bearer; the proxy injects the real value
- * from the provider's secret file (`data/proxy-secrets/<provider>.secret`,
- * seeded at boot by the proxy credential sync, src/extensions/proxy-seed).
- * Each entry REQUIRES its secret file (`inject.require: true`) — a missing
- * key fails the request closed (502) instead of letting the placeholder
- * reach the gateway (the #208 fail-closed invariant). For codex the
- * secret file holds the ACCESS token minted by the seed's own refresh
- * (issue #230: the seed owns the rotation; the proxy injects the static
- * bearer at egress and never touches auth.openai.com).
- */
-export interface ModelGatewayKey {
-  /** The provider id (the sync's vault provider / Keychain service suffix). */
-  provider: string;
-  /** The gateway host the proxy injects the key for. */
-  host: string;
-}
-
-/** The base model-gateway keys, shared by the strict and dev renderers. */
-export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
-  { provider: "near", host: "cloud-api.near.ai" },
-  // opencode-go's built-in gateway (the catalog entry for
-  // deepseek-v4-flash: https://opencode.ai/zen/go/v1).
-  { provider: "opencode", host: "opencode.ai" },
-  { provider: "openai", host: "api.openai.com" },
-  { provider: "anthropic", host: "api.anthropic.com" },
-  // Issue #214/#230 (the openai-codex model provider): the ChatGPT
-  // subscription OAuth access token, seeded as a STATIC secret by the
-  // proxy credential sync's codex leg (data/proxy-secrets/openai-codex.secret
-  // — the seed owns the refresh and writes the minted access token; the
-  // proxy injects it as the bearer for chatgpt.com, require: true).
-  { provider: "openai-codex", host: "chatgpt.com" },
-  // The Tavily web-search gateway (issue #278): the search_web tool's
-  // outbound call to api.tavily.com/search sends the placeholder bearer;
-  // the proxy injects the real key from data/proxy-secrets/tavily.secret
-  // (seeded at boot — require: true, so a missing key rejects the request
-  // closed instead of reaching the provider unauthenticated).
-  { provider: "tavily", host: "api.tavily.com" },
-] as const;
 
 /** Reviewed credential-target summaries for authenticated extensions. */
 export function credentialTargetEntries(
