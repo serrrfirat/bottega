@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStore, type Store } from "../store/db";
+import { z } from "zod";
 import { prepareExecutor, type ExecutorConfig, type ExecutorDeps } from "../executor";
 import type { WorkerJob } from "./envelope";
 import {
@@ -103,21 +104,27 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+/** The probe report the checked-in child prints back (fields runtime-checked). */
+const probeReportSchema = z.object({
+  pid: z.number(),
+  forbiddenEnvNames: z.array(z.string()),
+});
+
 /**
  * Narrow the JSON the controller printed back into a typed probe report.
  * The fields are runtime-checked (never trusted from the subprocess blindly)
  * so the subsequent `forbiddenEnvNames` assertion is honest.
  */
-function narrowProbeReport(value: unknown, raw: string): { pid: number; forbiddenEnvNames: string[] } {
-  if (value === null || typeof value !== "object") throw new Error(`controller returned malformed probe: ${raw}`);
-  const record = value as Record<string, unknown>;
-  if (typeof record.pid !== "number" || !Array.isArray(record.forbiddenEnvNames)) {
+function narrowProbeReport(raw: string) {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
     throw new Error(`controller returned malformed probe: ${raw}`);
   }
-  if (record.forbiddenEnvNames.some((name) => typeof name !== "string")) {
-    throw new Error(`controller returned malformed probe: ${raw}`);
-  }
-  return { pid: record.pid, forbiddenEnvNames: record.forbiddenEnvNames };
+  const parsed = probeReportSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`controller returned malformed probe: ${raw}`);
+  return parsed.data;
 }
 
 afterEach(() => {
@@ -196,8 +203,7 @@ describe("child-process protocol lane (test fabric — NOT the production bounda
     );
     expect(run.status).toBe(0);
     expect(run.stderr).toBe("");
-    const parsed = JSON.parse(run.stdout) as unknown;
-    const probe = narrowProbeReport(parsed, run.stdout);
+    const probe = narrowProbeReport(run.stdout);
 
     expect(probe.pid).not.toBe(process.pid);
     // The child's own report must show NO leaked forbidden credential: not

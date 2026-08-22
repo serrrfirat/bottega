@@ -393,6 +393,8 @@ export function createDockerClient(socket: string): DockerClient {
         if (child.stdout) child.stdout.destroy(spawnError ?? undefined);
         if (child.stderr) child.stderr.destroy();
       });
+      // SAFETY: stdio is configured as ["pipe", "pipe", "pipe"], so child.stdin/stdout/stderr
+      // are non-null streams; node's types leave them nullable only because the stdio option is dynamic.
       return {
         stdin: child.stdin as Writable,
         stdout: child.stdout as Readable,
@@ -696,6 +698,25 @@ async function launchDockerContainer(
   }
 }
 
+/**
+ * Environment handed to a Docker-lane job container: the child + Docker lane
+ * markers, the kind-scoped credential file handles, the egress proxy/CA
+ * vars, the mounted store RPC socket path, and the allowlisted host
+ * passthrough names. Built only from the allowlist plus job-scoped
+ * credential *file* handles — never from the coordinator's process.env.
+ */
+type DockerChildEnv = {
+  BOTTEGA_SANDBOX_CHILD: string;
+  BOTTEGA_SANDBOX_DOCKER: string;
+  HTTP_PROXY?: string;
+  HTTPS_PROXY?: string;
+  NO_PROXY?: string;
+  NODE_EXTRA_CA_CERTS?: string;
+  BOTTEGA_SANDBOX_RPC_SOCKET?: string;
+  EXECUTOR_GIT_TOKEN_FILE?: string;
+  OMP_AUTH_BROKER_TOKEN_FILE?: string;
+} & Partial<{ [K in (typeof SAFE_CHILD_ENV_NAMES)[number]]: string }>;
+
 /** Builds the one `docker run --rm -i` invocation for a single job container. */
 function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDirHost: string): string[] {
   const args = [
@@ -737,7 +758,7 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
 
   // Allowlisted environment only: the child marker + Docker lane marker, the
   // job-scoped credential handles, and the allowlisted host passthroughs.
-  const env: Record<string, string> = { BOTTEGA_SANDBOX_CHILD: "1", BOTTEGA_SANDBOX_DOCKER: "1" };
+  const env: DockerChildEnv = { BOTTEGA_SANDBOX_CHILD: "1", BOTTEGA_SANDBOX_DOCKER: "1" };
   for (const name of SAFE_CHILD_ENV_NAMES) {
     const value = process.env[name];
     if (value !== undefined) env[name] = value;

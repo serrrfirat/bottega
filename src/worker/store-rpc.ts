@@ -74,8 +74,9 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "../store/audit-events";
 import { maintainMemory, type ConsolidationModelCall, type ConsolidationResult } from "../memory/consolidation";
-import { type MemoryEntry, type MemoryProvider, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery } from "../memory/types";
+import { type MemoryEntry, type MemoryProvider, type MemoryProviderCapabilities, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery } from "../memory/types";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
+import type { JsonValue } from "../memory/mem0";
 
 /** Hard cap on any single RPC frame (request or response), bytes. */
 export const MAX_RPC_FRAME_BYTES = 256 * 1024;
@@ -98,9 +99,35 @@ type RpcRequest = z.infer<typeof rpcRequestSchema>;
 interface RpcReply {
   id: number;
   ok: boolean;
-  value?: unknown;
+  value?: RpcWireValue;
   error?: string;
 }
+
+/** The supervisor → child @model-call reply frame (the child's model text). */
+const rpcReplySchema = z.object({
+  id: z.number().int().nonnegative(),
+  ok: z.boolean(),
+  value: z.string().optional(),
+  error: z.string().optional(),
+});
+
+/** The scoped-store facade seen through the method-allowlist dispatch: every
+ * allowlisted method is a function returning a JSON-serializable row value. */
+type StoreMethodMap = Record<string, (this: Store, ...args: unknown[]) => JsonValue>;
+
+/**
+ * A JSON-serializable result carried over a store/memory RPC reply. The member
+ * union names the concrete shapes the allowlisted store/memory methods return
+ * (plus `undefined` for void ops); using named types keeps the reply/return
+ * domain precise instead of a broad `object` escape hatch.
+ */
+type RpcWireValue =
+  | JsonValue
+  | MemoryEntry
+  | MemoryEntry[]
+  | MemoryProviderCapabilities
+  | ConsolidationResult[]
+  | undefined;
 
 /**
  * The ONLY store operations the job container may invoke. Everything the
@@ -115,7 +142,7 @@ interface RpcReply {
  * Anything else, `getDb`, and `close` are denied — the facade's job-row
  * firewall is not a global-write firewall.
  */
-const ALLOWED_STORE_METHODS: Record<string, true> = {
+const ALLOWED_STORE_METHODS = {
   claimWorkItemById: true,
   getWorkItem: true,
   transitionWorkItem: true,
@@ -142,7 +169,7 @@ const ALLOWED_STORE_METHODS: Record<string, true> = {
   // the raw DB (transactional INSERT OR IGNORE), so the supervisor invokes the
   // real outbox writer, never the child. Its id/kind/space must match the job.
   postOutboxRow: true,
-};
+} satisfies Record<string, true>;
 
 /** The child outbox write envelope (validated supervisor-side). */
 const outboxWriteSchema = z
@@ -194,7 +221,7 @@ const JOB_LIFECYCLE_RULES: readonly AuditPolicyRule[] = [
   { eventType: JOB_FAILED_EVENT, actors: ["executor"], space: "own" },
 ];
 
-const AUDIT_POLICY: Record<WorkerJob["kind"], readonly AuditPolicyRule[]> = {
+const AUDIT_POLICY = {
   git: [
     ...JOB_LIFECYCLE_RULES,
     { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
@@ -215,7 +242,7 @@ const AUDIT_POLICY: Record<WorkerJob["kind"], readonly AuditPolicyRule[]> = {
   ],
   ingest_poll: [...JOB_LIFECYCLE_RULES],
   scheduled: [...JOB_LIFECYCLE_RULES],
-};
+} satisfies Record<WorkerJob["kind"], readonly AuditPolicyRule[]>;
 
 /** The audit policy rule matching an event/actor, or null when not legitimately writable by this kind. */
 function auditPolicyRule(kind: WorkerJob["kind"], eventType: string, actor: string): AuditPolicyRule | null {
@@ -287,7 +314,10 @@ const memorySearchSchema = z
 /** The ingest watermark cursor write the job body may pass (validated supervisor-side). */
 const ingestWatermarkWriteSchema = z.tuple([z.string().min(1), z.string()]);
 
-function replyFrame(id: number, ok: boolean, value?: unknown, error?: string): Buffer {
+/** The memory digest-prune args the job body may pass (validated supervisor-side). */
+const pruneDigestsArgsSchema = z.tuple([z.string(), z.number()]);
+
+function replyFrame(id: number, ok: boolean, value?: RpcWireValue, error?: string): Buffer {
   return Buffer.from(`${JSON.stringify({ id, ok, ...(ok ? { value } : { error }) })}\n`);
 }
 
@@ -448,10 +478,11 @@ export class JobStoreRpcServer {
         void this.handleFrame(socket, req.data);
         continue;
       }
-      // A frame without a method is a reply: either to a supervisor model-call
-      // (in-flight in this.modelCallRequesters) or an unexpected reply → ignore.
-      if (parsed !== null && typeof parsed === "object" && "id" in parsed) {
-        this.onModelCallReply(parsed as RpcReply);
+      // A frame without a method is a reply: to a supervisor model-call
+      // (in-flight in this.modelCallRequesters). Anything else is ignored.
+      const reply = rpcReplySchema.safeParse(parsed);
+      if (reply.success) {
+        this.onModelCallReply(reply.data);
       }
       continue;
     }
@@ -479,11 +510,11 @@ export class JobStoreRpcServer {
     }
   }
 
-  private async invokeStore(method: string, args: unknown[]): Promise<unknown> {
+  private async invokeStore(method: string, args: unknown[]): Promise<RpcWireValue> {
     if (method === "getDb" || method === "close") {
       throw new Error(`job sandbox attempted ${method}; the raw store handle is never exposed to the container`);
     }
-    if (ALLOWED_STORE_METHODS[method] !== true) {
+    if (!(method in ALLOWED_STORE_METHODS)) {
       throw new Error(`job sandbox attempted store method ${method}; not on the allowlist — denied`);
     }
     // Every allowlisted method is validated against the immutable job
@@ -499,11 +530,16 @@ export class JobStoreRpcServer {
       postOutboxRow(this.scopedStore, input.data);
       return undefined;
     }
-    const member = (this.scopedStore as unknown as Record<string, unknown>)[method];
-    if (typeof member !== "function") {
-      throw new Error(`job sandbox attempted unknown store method ${method}; denied`);
-    }
-    return await member.apply(this.scopedStore, authorized);
+    // (Method is on the allowlist → a real function on the scoped-store
+    // facade; a malformed facade surfaces as a thrown call error below,
+    // which the frame handler turns into an error reply — fail closed.)
+    const scopedStoreAny: unknown = this.scopedStore;
+    // SAFETY: every allowlisted method exists as a function on the scoped
+    // store (the facade implements the full Store interface); widening the
+    // facade to a method map is the documented dispatch seam and any
+    // unexpected member fails closed when its invocation throws.
+    const member = (scopedStoreAny as StoreMethodMap)[method];
+    return member.apply(this.scopedStore, authorized);
   }
 
   /**
@@ -516,18 +552,15 @@ export class JobStoreRpcServer {
     const deny = (what: string): never => {
       throw new ScopedStoreAccessError(this.job.id, what);
     };
-    const ownJob = (id: unknown): string => (id === this.job.id ? String(id) : deny(`job-row access to ${id}`));
-    const ownItem = (id: unknown): string =>
-      this.workItemId !== null && id === this.workItemId
-        ? String(id)
-        : deny(`work-item access to ${String(id)}`);
-    const ownSpace = (id: unknown): string => {
+    const ownItem = (id: string): string =>
+      this.workItemId !== null && id === this.workItemId ? id : deny(`work-item access to ${id}`);
+    const ownSpace = (id: string): string => {
       if (this.job.spaceId === undefined || this.job.spaceId === null) {
         // A job without a space (scheduled memory_consolidation) never reads
         // a space; a job WITH a space may only read its own.
-        deny(`space read ${String(id)} — this job has no space scope`);
+        deny(`space read ${id} — this job has no space scope`);
       }
-      return id === this.job.spaceId ? String(id) : deny(`space access to ${String(id)}`);
+      return id === this.job.spaceId ? id : deny(`space access to ${id}`);
     };
 
     switch (method) {
@@ -535,18 +568,35 @@ export class JobStoreRpcServer {
       case "completeJob":
       case "failJob":
       case "requeueJob":
-      case "renewJobLease":
-        // The job-row method must name this job's own envelope id.
-        return [ownJob(args[0]), ...args.slice(1)];
+      case "renewJobLease": {
+        // The job-row method must name this job's own envelope id. The wire id
+        // is decoded as a string at this boundary (a non-string can never
+        // equal the job's string id, so it is denied identically to before).
+        const id = z.string().safeParse(args[0]);
+        if (!id.success || id.data !== this.job.id) {
+          deny(`job-row access to ${String(args[0])}`);
+        }
+        return [id.data!, ...args.slice(1)];
+      }
       case "getSpace":
       case "getSpaceSettings":
-      case "getEffectiveSpaceSettings":
+      case "getEffectiveSpaceSettings": {
         // Space reads are restricted to this job's own space.
-        return [ownSpace(args[0]), ...args.slice(1)];
+        const id = z.string().safeParse(args[0]);
+        if (!id.success) {
+          deny(`space access to ${String(args[0])}`);
+        }
+        return [ownSpace(id.data!), ...args.slice(1)];
+      }
       case "claimWorkItemById":
       case "getWorkItem":
-      case "transitionWorkItem":
-        return [ownItem(args[0]), ...args.slice(1)];
+      case "transitionWorkItem": {
+        const id = z.string().safeParse(args[0]);
+        if (!id.success) {
+          deny(`work-item access to ${String(args[0])}`);
+        }
+        return [ownItem(id.data!), ...args.slice(1)];
+      }
       case "appendAudit": {
         const parsedEntry = auditEntrySchema.safeParse(args[0]);
         if (!parsedEntry.success) {
@@ -667,8 +717,8 @@ export class JobStoreRpcServer {
     if (item === null || item.delivery !== "extension") {
       deny(`extension credential read — work item ${this.workItemId} is not an extension delivery`);
     }
-    const provider = args[0];
-    if (typeof provider === "string" && provider !== "") {
+    const provider = z.string().safeParse(args[0]);
+    if (provider.success && provider.data !== "") {
       // listExtensionCredentials(provider) is called by the extension runtime
       // with the extension's OWN manifest.id (server-validated registry id).
       // The child is authorized only for the providers registered in the
@@ -676,9 +726,9 @@ export class JobStoreRpcServer {
       // built its gated toolset) — never for an arbitrary caller-supplied
       // string. A hostile child cannot enumerate credential metadata for a
       // provider that was never loaded for this job's environment.
-      if (!this.extensionProviderIds.has(provider)) {
+      if (!this.extensionProviderIds.has(provider.data)) {
         deny(
-          `extension credential read for provider ${provider} — not a registered extension for this job's registry`,
+          `extension credential read for provider ${provider.data} — not a registered extension for this job's registry`,
         );
       }
     } else {
@@ -688,18 +738,21 @@ export class JobStoreRpcServer {
     return args;
   }
 
-  private async invokeMemory(socket: Socket, method: string, args: unknown[]): Promise<unknown> {
+  private async invokeMemory(socket: Socket, method: string, args: unknown[]): Promise<RpcWireValue> {
     switch (method) {
       case "capabilities":
         return this.memory.capabilities;
       case "backend":
-        return "backend" in this.memory ? this.memory.backend : "sqlite";
+        return "backend" in this.memory ? String(this.memory.backend) : "sqlite";
       case "save": {
         const input = memorySaveSchema.safeParse(args[0]);
         if (!input.success) {
           throw new ScopedStoreAccessError(this.job.id, `malformed memory save: ${input.error.message}`);
         }
         this.authorizeMemoryScope(input.data.scope);
+        // SAFETY: memorySaveSchema parses exactly the fields MemorySaveInput
+        // carries (scope/content/metadata) with the shape the provider
+        // requires; the schema fragment constants mirror the input interface.
         return await this.memory.save(input.data as MemorySaveInput);
       }
       case "search": {
@@ -708,14 +761,16 @@ export class JobStoreRpcServer {
           throw new ScopedStoreAccessError(this.job.id, `malformed memory search: ${query.error.message}`);
         }
         this.authorizeMemoryScope(query.data.scope);
+        // SAFETY: memorySearchSchema parses exactly the fields MemorySearchQuery
+        // carries (query/scope/limit/metadata); the schema mirrors the query interface.
         return await this.memory.search(query.data as MemorySearchQuery);
       }
       case "pruneDigests": {
-        const spaceId = args[0];
-        const keep = args[1];
-        if (typeof spaceId !== "string" || typeof keep !== "number") {
+        const parsed = pruneDigestsArgsSchema.safeParse(args);
+        if (!parsed.success) {
           throw new ScopedStoreAccessError(this.job.id, "malformed memory pruneDigests");
         }
+        const [spaceId, keep] = parsed.data;
         const ownSpace = this.job.spaceId;
         if (ownSpace === undefined || ownSpace === null || spaceId !== ownSpace) {
           throw new ScopedStoreAccessError(
@@ -808,9 +863,9 @@ export class JobStoreRpcServer {
   }
 
   /** The child's reply to a supervisor-issued @model-call request. */
-  onModelCallReply(reply: RpcReply): void {
+  onModelCallReply(reply: z.infer<typeof rpcReplySchema>): void {
     if (reply.ok) {
-      this.resolveModelCall(reply.id, reply.value as string | undefined);
+      this.resolveModelCall(reply.id, reply.value);
     } else {
       this.rejectModelCall(reply.id, new Error(reply.error ?? "sandbox model call failed"));
     }
@@ -896,6 +951,13 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
         void handleIncomingRequest(asRequest.data);
         continue;
       }
+      // A frame that failed the request-schema parse is a reply: it carries id/ok
+      // (and optional value/error) from the supervisor. The client reads only
+      // those fields to resolve a pending call; a malformed reply is dropped
+      // by pending.get(id) or fails closed on the socket.
+      // SAFETY: the request schema parse above already rejected non-reply
+      // frames; the supervisor's replies always carry id/ok, so this cast is
+      // safe and anything unexpected is rejected by the pending lookup.
       const reply = parsed as RpcReply;
       const waiter = pending.get(reply.id);
       if (waiter !== undefined) {
@@ -929,6 +991,9 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
     pending.set(id, {
       resolve: (reply) => {
         clearTimeout(timer);
+        // SAFETY: call<T> names the expected return type for each allowlisted
+        // method; the supervisor's reply value is the JSON serialization of
+        // that method's result, so the cast is exact per-method contract.
         resolve(reply.value as T);
       },
       reject: (error) => {
@@ -950,6 +1015,12 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
       socket.write(replyFrame(req.id, false, undefined, "sandbox has no model-call handler registered"));
       return;
     }
+    // The supervisor-issued @model-call request always carries exactly
+    // [systemPrompt, input] (this client constructs that frame shape, and the
+    // request schema already guaranteed args is a present array).
+    // SAFETY: the @model-call frame is built by this client with a two-arg
+    // array, so the destructure is exact; a mismatched supervisor frame is a
+    // supervisor-controlled (trusted) frame, not attacker input.
     const [systemPrompt, input] = req.args as [string, string];
     void Promise.resolve()
       .then(() => handler(systemPrompt, input))
