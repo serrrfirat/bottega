@@ -53,6 +53,22 @@ function isConfigMapping(value: YamlNode | JsonValue): value is JsonObject {
   return z.record(z.string(), z.unknown()).safeParse(value).success;
 }
 
+/**
+ * Warns once per key in a section that is not one of the section's allowed
+ * fields. Unknown keys are ignored (never a structural error) so a stale or
+ * typo'd knob warns instead of silently looking configured.
+ */
+function warnUnknownKeys(
+  policy: PolicyConfig,
+  section: string,
+  entries: JsonObject,
+  allowed: readonly string[],
+): void {
+  for (const key of Object.keys(entries)) {
+    if (!allowed.includes(key)) policy.warnings.push(`${section}.${key}: unknown key ignored`);
+  }
+}
+
 export type Tier = "read" | "write" | "exec";
 export type PolicyAction = "allow" | "deny" | "prompt";
 export type Decision = "allow" | "deny" | "ask-human";
@@ -108,11 +124,18 @@ export type PickupConfidence = "high" | "medium" | "low";
 const DEFAULT_PICKUP_CONFIDENCE: PickupConfidence = "high";
 const PICKUP_CONFIDENCE_VALUES: readonly PickupConfidence[] = ["high", "medium", "low"];
 
-function normalizePickupConfidence(value: ConfigValue): PickupConfidence | undefined {
+function normalizeEnum<T extends string>(
+  value: ConfigValue,
+  allowed: readonly T[],
+): T | undefined {
   const parsed = z.string().safeParse(value);
   if (!parsed.success) return undefined;
   const normalized = parsed.data.trim().toLowerCase();
-  return PICKUP_CONFIDENCE_VALUES.find((v) => v === normalized);
+  return allowed.find((v) => v === normalized);
+}
+
+function normalizePickupConfidence(value: ConfigValue): PickupConfidence | undefined {
+  return normalizeEnum(value, PICKUP_CONFIDENCE_VALUES);
 }
 
 /** Tightening order for response modes: always → mention → request-only. */
@@ -124,10 +147,7 @@ const RESPONSE_MODE_STRICTNESS = { always: 0, mention: 1, "request-only": 2 } sa
 const RESPONSE_MODE_VALUES: readonly ResponseMode[] = ["always", "mention", "request-only"];
 
 function normalizeResponseMode(value: ConfigValue): ResponseMode | undefined {
-  const parsed = z.string().safeParse(value);
-  if (!parsed.success) return undefined;
-  const normalized = parsed.data.trim().toLowerCase();
-  return RESPONSE_MODE_VALUES.find((v) => v === normalized);
+  return normalizeEnum(value, RESPONSE_MODE_VALUES);
 }
 
 /** The stricter of two response modes (mention/request-only tighten; always is the floor). */
@@ -140,10 +160,7 @@ const ORG_CREDENTIALS_STRICTNESS = { allow: 0, deny: 1 } satisfies Record<OrgCre
 const ORG_CREDENTIALS_VALUES: readonly OrgCredentialsMode[] = ["allow", "deny"];
 
 function normalizeOrgCredentials(value: ConfigValue): OrgCredentialsMode | undefined {
-  const parsed = z.string().safeParse(value);
-  if (!parsed.success) return undefined;
-  const normalized = parsed.data.trim().toLowerCase();
-  return ORG_CREDENTIALS_VALUES.find((v) => v === normalized);
+  return normalizeEnum(value, ORG_CREDENTIALS_VALUES);
 }
 
 /** The stricter of two org-credential modes (deny tightens; allow is the floor). */
@@ -515,10 +532,7 @@ export function toolAction(policy: PolicyConfig, toolName: string): PolicyAction
 const ACTION_VALUES: readonly PolicyAction[] = ["allow", "deny", "prompt"];
 
 function normalizeAction(value: ConfigValue): PolicyAction | undefined {
-  const parsed = z.string().safeParse(value);
-  if (!parsed.success) return undefined;
-  const normalized = parsed.data.trim().toLowerCase();
-  return ACTION_VALUES.find((action) => action === normalized);
+  return normalizeEnum(value, ACTION_VALUES);
 }
 
 /** A list of well-formed extension ids, or undefined when malformed (fail closed). */
@@ -615,14 +629,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
       } else if (entries.timeout_minutes !== undefined) {
         policy.warnings.push("approvals.timeout_minutes: invalid — using default");
       }
-      // Unknown keys warn instead of parsing silently (mirrors the agent /
-      // extensions sections): a stale `required_for_org_change` or a typo'd
-      // knob must not look configured.
-      for (const key of Object.keys(entries)) {
-        if (key !== "timeout_minutes" && key !== "always_approve") {
-          policy.warnings.push(`approvals.${key}: unknown key ignored`);
-        }
-      }
+      warnUnknownKeys(policy, "approvals", entries, ["timeout_minutes", "always_approve"]);
       // always_approve (issue #45): an opt-in allowlist of exec-tier tools
       // that skip the ask-human prompt. Known tool names only — an unknown
       // name is a structural error (fail closed), because a typo here would
@@ -651,9 +658,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         }
         policy.objects.maxSizeBytes = maxSizeBytes;
       }
-      for (const key of Object.keys(entries)) {
-        if (key !== "max_size_bytes") policy.warnings.push(`objects.${key}: unknown key ignored`);
-      }
+      warnUnknownKeys(policy, "objects", entries, ["max_size_bytes"]);
     } else if (name === "memory") {
       const injection = entries.injection;
       if (injection !== undefined) {
@@ -700,9 +705,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
         policy.learning.autoExtract = false;
         policy.warnings.push("learning.auto_extract: invalid (true|false) — disabled");
       }
-      for (const key of Object.keys(entries)) {
-        if (key !== "auto_extract") policy.warnings.push(`learning.${key}: unknown key ignored`);
-      }
+      warnUnknownKeys(policy, "learning", entries, ["auto_extract"]);
     } else if (name === "extensions") {
       // Extension policy (issue #56): `allow`/`deny` id lists and the
       // org-credential usage knob. Malformed lists fail the policy closed
@@ -733,11 +736,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
           );
         }
       }
-      for (const key of Object.keys(entries)) {
-        if (key !== "allow" && key !== "deny" && key !== "org_credentials") {
-          policy.warnings.push(`extensions.${key}: unknown key ignored`);
-        }
-      }
+      warnUnknownKeys(policy, "extensions", entries, ["allow", "deny", "org_credentials"]);
     } else if (name === "work_items") {
       // Semantic auto-pickup (issue #89): an opt-in org-floor flag.
       // `auto_pickup` invalid values DISABLE the flag with a warning (fail
@@ -762,11 +761,7 @@ export function parseOrgConfigYaml(text: string): PolicyConfig {
           );
         }
       }
-      for (const key of Object.keys(entries)) {
-        if (key !== "auto_pickup" && key !== "pickup_confidence") {
-          policy.warnings.push(`work_items.${key}: unknown key ignored`);
-        }
-      }
+      warnUnknownKeys(policy, "work_items", entries, ["auto_pickup", "pickup_confidence"]);
     } else {
       policy.warnings.push(`unknown section '${name}' ignored`);
     }

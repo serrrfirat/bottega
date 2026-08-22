@@ -89,6 +89,7 @@ import { buildRegistry } from "./scheduler/actions";
 import { memoryConsolidationAction } from "./scheduler/memory-consolidation";
 import type { SchedulerActionRegistry } from "./scheduler/types";
 import { DenyRouter } from "./policy/approval-router";
+import { MODEL_ROLE_REFS, asRoleRef } from "./models/model-pin";
 import {
   assertAgentDirModelAvailable,
   createOmpSdkDriver,
@@ -1048,7 +1049,7 @@ async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Pro
   return {
     ...settings,
     ...(item.reasoning_effort !== null ? { reasoning_effort: item.reasoning_effort } : undefined),
-    ...(item.model !== null && item.model !== "fast" && item.model !== "reasoning" ? { model: item.model } : undefined),
+    ...(item.model !== null && !MODEL_ROLE_REFS.some((role) => role === item.model) ? { model: item.model } : undefined),
   };
 }
 
@@ -1060,7 +1061,8 @@ async function resolveWorkItemSessionSettings(store: Store, item: WorkItem): Pro
  * session keeps its default.
  */
 function pinSwitchRole(item: WorkItem): ModelRole | null {
-  if (item.model === "fast" || item.model === "reasoning") return item.model;
+  const role = item.model === null ? undefined : asRoleRef(item.model);
+  if (role) return role;
   if (item.model !== null || item.reasoning_effort !== null) return "default";
   return null;
 }
