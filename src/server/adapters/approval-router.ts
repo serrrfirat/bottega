@@ -29,6 +29,7 @@ import {
   type SlackAdapter,
   type SlackBlockPayload,
 } from "./slack";
+import { bestEffortMessageRewrite, resolveBlockAction } from "./block-flow";
 import { emitToolStep, nextToolStepId, toolStepTitle, type ToolStepSink } from "../services/slack-turn-presenter";
 
 /** Cap for the args summary text rendered in the approval prompt (redacted first). */
@@ -500,28 +501,51 @@ export class SlackApprovalRouter implements ApprovalRouter {
    * stale-message guard).
    */
   async handleAction(action: SlackAction): Promise<void> {
-    const entry = this.pending.get(action.value);
-    if (entry === undefined || entry.settled) {
-      this.log(`[approvals] ignoring action ${action.actionId} for unknown request ${action.value}`);
-      return;
-    }
-    if (entry.spaceId !== action.spaceId) {
-      this.log(`[approvals] ignoring action for request ${entry.id} from foreign space ${action.spaceId}`);
-      return;
-    }
-    const approved = action.actionId === APPROVE_ACTION_ID;
-    this.settle(entry, { approved, approver: action.principal }, `Denied by <@${action.principal}>`);
+    await resolveBlockAction(this.log, action, {
+      // The slack action router only delivers approve/deny clicks here.
+      owns: (a) => a.actionId === APPROVE_ACTION_ID || a.actionId === DENY_ACTION_ID,
+      guard: (a) => {
+        const entry = this.pending.get(a.value);
+        if (entry === undefined || entry.settled) {
+          return `[approvals] ignoring action ${a.actionId} for unknown request ${a.value}`;
+        }
+        if (entry.spaceId !== a.spaceId) {
+          return `[approvals] ignoring action for request ${entry.id} from foreign space ${a.spaceId}`;
+        }
+        return null;
+      },
+      settle: (a) => {
+        const entry = this.pending.get(a.value);
+        if (entry === undefined) return null; // defend the settled race, see rewriteIfSettled
+        const approved = a.actionId === APPROVE_ACTION_ID;
+        this.markSettled(entry, { approved, approver: a.principal }, `Denied by <@${a.principal}>`);
+        return { outcome: entry };
+      },
+      // The skeleton passes (action, outcome); outcome is the settled entry.
+      rewrite: (_a, entry) => this.rewriteIfSettled(entry),
+    });
   }
 
   /** Settles a request exactly once: resolve the gate, evict, rewrite the prompt. */
   private settle(entry: PendingRequest, resolution: ApprovalResolution, label: string): void {
+    if (entry.settled) return;
+    this.markSettled(entry, resolution, label);
+    this.rewriteIfSettled(entry);
+  }
+
+  /**
+   * Marks a request settled exactly once (resolve the gate, evict, capture
+   * the outcome for replay). The message rewrite is the caller's job: the
+   * skeleton's rewrite step calls {@link rewriteIfSettled} after this, and
+   * the request-timeout/eviction paths call {@link settle} (state + rewrite).
+   */
+  private markSettled(entry: PendingRequest, resolution: ApprovalResolution, label: string): void {
     if (entry.settled) return;
     entry.settled = true;
     entry.outcome = { resolution, label };
     clearTimeout(entry.timer);
     this.pending.delete(entry.id);
     entry.resolve(resolution);
-    this.rewriteIfSettled(entry);
   }
 
   /**
@@ -532,8 +556,13 @@ export class SlackApprovalRouter implements ApprovalRouter {
   private rewriteIfSettled(entry: PendingRequest): void {
     if (!entry.settled || entry.messageTs === "") return;
     const { resolution, label } = entry.outcome!;
-    void this.adapter
-      .updateMessage(entry.spaceId, entry.messageTs, outcomeText(entry, resolution, label))
-      .catch((err) => this.log(`[approvals] updateMessage failed for ${entry.id}: ${String(err)}`));
+    bestEffortMessageRewrite(
+      this.adapter,
+      entry.spaceId,
+      entry.messageTs,
+      outcomeText(entry, resolution, label),
+      undefined,
+      (reason) => this.log(`[approvals] updateMessage failed for ${entry.id}: ${reason}`),
+    );
   }
 }

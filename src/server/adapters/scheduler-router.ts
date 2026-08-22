@@ -15,25 +15,9 @@ import {
   SCHEDULER_RUN_NOW_ACTION_ID,
   type SlackAction,
   type SlackAdapter,
+  type SlackBlockPayload,
 } from "./slack";
-
-type SchedulerButton = {
-  type: "button";
-  text: { type: "plain_text"; text: string };
-  action_id: string;
-  value: string;
-  style?: "primary" | "danger";
-}
-
-export type SchedulerBlock = {
-  type: "header" | "section" | "actions" | "divider";
-  text?: { type: "plain_text" | "mrkdwn"; text: string };
-  elements?: SchedulerButton[];
-}
-
-function escapeMrkdwn(text: string): string {
-  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
+import { escapeMrkdwn, resolveBlockAction } from "./block-flow";
 
 export function schedulerActionValue(job: Pick<SchedulerJob, "id" | "revision">): string {
   return JSON.stringify({ id: job.id, revision: job.revision });
@@ -62,8 +46,8 @@ function utcTimestamp(ms: number): string {
 }
 
 /** Pure deterministic Slack state renderer. Jobs must already be authority-scoped. */
-export function buildSchedulerBlocks(jobs: readonly SchedulerJob[]): SchedulerBlock[] {
-  const blocks: SchedulerBlock[] = [
+export function buildSchedulerBlocks(jobs: readonly SchedulerJob[]): SlackBlockPayload[] {
+  const blocks: SlackBlockPayload[] = [
     { type: "header", text: { type: "plain_text", text: "Schedules" } },
   ];
   if (jobs.length === 0) {
@@ -85,16 +69,16 @@ export function buildSchedulerBlocks(jobs: readonly SchedulerJob[]): SchedulerBl
           `\`${escapeMrkdwn(job.id)}\` · revision ${job.revision}`,
       },
     });
-    const toggle: SchedulerButton = job.enabled
+    const toggle = job.enabled
       ? {
-          type: "button",
-          text: { type: "plain_text", text: "Pause" },
+          type: "button" as const,
+          text: { type: "plain_text" as const, text: "Pause" },
           action_id: SCHEDULER_PAUSE_ACTION_ID,
           value: schedulerActionValue(job),
         }
       : {
-          type: "button",
-          text: { type: "plain_text", text: "Resume" },
+          type: "button" as const,
+          text: { type: "plain_text" as const, text: "Resume" },
           action_id: SCHEDULER_RESUME_ACTION_ID,
           value: schedulerActionValue(job),
           style: "primary",
@@ -129,80 +113,100 @@ export interface SchedulerActionDeps {
  * identity from the rendered message so concurrent retries enqueue once.
  */
 export async function resolveSchedulerAction(deps: SchedulerActionDeps, action: SlackAction): Promise<boolean> {
-  if (
-    action.actionId !== SCHEDULER_PAUSE_ACTION_ID &&
-    action.actionId !== SCHEDULER_RESUME_ACTION_ID &&
-    action.actionId !== SCHEDULER_RUN_NOW_ACTION_ID
-  ) {
-    return false;
-  }
-  const value = parseSchedulerActionValue(action.value);
-  if (!value) return false;
-  const before = await deps.store.getSchedulerJob(value.id);
-  if (!before || before.spaceId !== action.spaceId || before.revision !== value.revision) return false;
-  const now = deps.now ?? Date.now;
-  let changed = false;
-  if (action.actionId === SCHEDULER_PAUSE_ACTION_ID) {
-    if (!before.enabled) return false;
-    const after = await deps.store.pauseSchedulerJob(before.id, value.revision);
-    await deps.audit.appendAudit({
-      space_id: after.spaceId,
-      actor: action.principal,
-      event_type: SCHEDULER_JOB_PAUSED_EVENT,
-      payload: {
-        invocation_id: `slack:${action.messageTs}:${action.actionId}:${before.id}:${value.revision}`,
-        before: schedulerJobMetadata(before),
-        after: schedulerJobMetadata(after),
+  let before: SchedulerJob | undefined;
+  return resolveBlockAction(
+    (line) => (deps.log ?? console.error)(line),
+    action,
+    {
+      // Owned scheduler controls only; other action ids are ignored silently.
+      owns: (a) =>
+        a.actionId === SCHEDULER_PAUSE_ACTION_ID ||
+        a.actionId === SCHEDULER_RESUME_ACTION_ID ||
+        a.actionId === SCHEDULER_RUN_NOW_ACTION_ID,
+      // All scheduler ignores are silent (no log line), matching the original.
+      guard: async (a) => {
+        const value = parseSchedulerActionValue(a.value);
+        if (!value) return "";
+        const job = await deps.store.getSchedulerJob(value.id);
+        if (!job || job.spaceId !== a.spaceId || job.revision !== value.revision) return "";
+        // Repeated state-change clicks are no-ops: a pause on an already
+        // paused job (or a resume on an enabled one) changes nothing.
+        if (a.actionId === SCHEDULER_PAUSE_ACTION_ID && !job.enabled) return "";
+        if (a.actionId === SCHEDULER_RESUME_ACTION_ID && job.enabled) return "";
+        before = job;
+        return null;
       },
-    });
-    changed = true;
-  } else if (action.actionId === SCHEDULER_RESUME_ACTION_ID) {
-    if (before.enabled) return false;
-    const after = await deps.store.resumeSchedulerJob(before.id, value.revision, now());
-    await deps.audit.appendAudit({
-      space_id: after.spaceId,
-      actor: action.principal,
-      event_type: SCHEDULER_JOB_RESUMED_EVENT,
-      payload: {
-        invocation_id: `slack:${action.messageTs}:${action.actionId}:${before.id}:${value.revision}`,
-        before: schedulerJobMetadata(before),
-        after: schedulerJobMetadata(after),
+      settle: async (a) => {
+        const job = before!;
+        const value = parseSchedulerActionValue(a.value)!;
+        const now = deps.now ?? Date.now;
+        let changed = false;
+        if (a.actionId === SCHEDULER_PAUSE_ACTION_ID) {
+          const after = await deps.store.pauseSchedulerJob(job.id, value.revision);
+          await deps.audit.appendAudit({
+            space_id: after.spaceId,
+            actor: a.principal,
+            event_type: SCHEDULER_JOB_PAUSED_EVENT,
+            payload: {
+              invocation_id: `slack:${a.messageTs}:${a.actionId}:${job.id}:${value.revision}`,
+              before: schedulerJobMetadata(job),
+              after: schedulerJobMetadata(after),
+            },
+          });
+          changed = true;
+        } else if (a.actionId === SCHEDULER_RESUME_ACTION_ID) {
+          const after = await deps.store.resumeSchedulerJob(job.id, value.revision, now());
+          await deps.audit.appendAudit({
+            space_id: after.spaceId,
+            actor: a.principal,
+            event_type: SCHEDULER_JOB_RESUMED_EVENT,
+            payload: {
+              invocation_id: `slack:${a.messageTs}:${a.actionId}:${job.id}:${value.revision}`,
+              before: schedulerJobMetadata(job),
+              after: schedulerJobMetadata(after),
+            },
+          });
+          changed = true;
+        } else {
+          const invocationId = `slack:${a.messageTs}:${a.actionId}:${job.id}:${value.revision}`;
+          const enqueued = await deps.store.enqueueSchedulerRunNow({
+            jobId: job.id,
+            expectedRevision: value.revision,
+            invocationId,
+            requestedAt: now(),
+          });
+          if (enqueued.created) {
+            await deps.audit.appendAudit({
+              space_id: job.spaceId,
+              actor: a.principal,
+              event_type: SCHEDULER_RUN_REQUESTED_EVENT,
+              payload: {
+                invocation_id: invocationId,
+                before: schedulerJobMetadata(job),
+                after: { ...schedulerJobMetadata(job), pending_invocation_id: invocationId },
+              },
+            });
+          }
+          changed = enqueued.created;
+        }
+        // Acknowledged even when nothing changed (a concurrent run-now that
+        // did not enqueue is still a handled click), but only a state change
+        // triggers a rewrite.
+        return { outcome: { changed } };
       },
-    });
-    changed = true;
-  } else {
-    const invocationId = `slack:${action.messageTs}:${action.actionId}:${before.id}:${value.revision}`;
-    const enqueued = await deps.store.enqueueSchedulerRunNow({
-      jobId: before.id,
-      expectedRevision: value.revision,
-      invocationId,
-      requestedAt: now(),
-    });
-    if (enqueued.created) {
-      await deps.audit.appendAudit({
-        space_id: before.spaceId,
-        actor: action.principal,
-        event_type: SCHEDULER_RUN_REQUESTED_EVENT,
-        payload: {
-          invocation_id: invocationId,
-          before: schedulerJobMetadata(before),
-          after: { ...schedulerJobMetadata(before), pending_invocation_id: invocationId },
-        },
-      });
-    }
-    changed = enqueued.created;
-  }
-
-  if (changed) {
-    const jobs = (await deps.store.listSchedulerJobs()).filter((job) => job.spaceId === action.spaceId);
-    try {
-      await deps.adapter.updateMessage(action.spaceId, action.messageTs, "Schedules", {
-        blocks: buildSchedulerBlocks(jobs),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      (deps.log ?? console.error)(`scheduler controls: state changed but Slack refresh failed: ${message}`);
-    }
-  }
-  return true;
+      // Refresh the posted control panel only when state actually changed.
+      rewrite: async (a, outcome) => {
+        if (!outcome.changed) return;
+        const jobs = (await deps.store.listSchedulerJobs()).filter((job) => job.spaceId === a.spaceId);
+        try {
+          await deps.adapter.updateMessage(a.spaceId, a.messageTs, "Schedules", {
+            blocks: buildSchedulerBlocks(jobs),
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          (deps.log ?? console.error)(`scheduler controls: state changed but Slack refresh failed: ${message}`);
+        }
+      },
+    },
+  );
 }
