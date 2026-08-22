@@ -19,21 +19,41 @@ import type { PolicyConfig } from "../policy/config";
 import type { SlackBlockPayload } from "../server/adapters/slack";
 
 /**
- * The typed action registry names (issue #86): no generic scripting, every
- * scheduled action is a statically known handler. Add a name here + a
- * handler in the registry the server builds.
+ * Single source of truth for the scheduler action names (issue #86, #341).
+ * The only runtime list of durable job actions; worker-only actions are
+ * declared separately and widen the union below without becoming createable
+ * scheduler rows. Add a durable action here + a handler in the registry the
+ * server builds.
  */
-export type SchedulerActionName =
-  | "standup_digest"
-  | "reflection"
-  | "org_pulse"
-  | "recurring_work"
-  | "ingest_poll"
-  | "kb_ingest"
-  | "send_message"
-  | "memory_consolidation"
-  | "governance_digest"
-  | "weekly_memory_review";
+export const DURABLE_ACTION_NAMES = [
+  "standup_digest",
+  "reflection",
+  "org_pulse",
+  "recurring_work",
+  "ingest_poll",
+  "kb_ingest",
+  "send_message",
+  "governance_digest",
+  "weekly_memory_review",
+] as const;
+
+/**
+ * Worker-only action (issue #272): enqueued by the server as a `scheduled`
+ * worker job, never created as a durable scheduler row. It appears in the
+ * action-name union so worker registries can register it, but is excluded
+ * from durable job creation (create/update schemas and KNOWN_ACTIONS).
+ */
+export const WORKER_ONLY_ACTION = "memory_consolidation" as const;
+
+/**
+ * The typed action registry names (issue #86): no generic scripting, every
+ * scheduled action is a statically known handler — the durable set plus any
+ * worker-only action.
+ */
+export type SchedulerActionName = (typeof DURABLE_ACTION_NAMES)[number] | typeof WORKER_ONLY_ACTION;
+
+/** Just the durable (createable) action names — the worker-only action excluded. */
+export type DurableSchedulerActionName = (typeof DURABLE_ACTION_NAMES)[number];
 
 /**
  * A durable scheduler job (issue #86). Stored in the `scheduler_jobs`

@@ -1,22 +1,17 @@
 /** Typed scheduler action registry helpers (issue #86). */
-import type {
-  SchedulerAction,
-  SchedulerActionName,
-  SchedulerActionRegistry,
+import {
+  DURABLE_ACTION_NAMES,
+  type SchedulerAction,
+  type SchedulerActionName,
+  type SchedulerActionRegistry,
 } from "./types";
 
-/** The only action names accepted by durable job creation. Handlers are wired elsewhere. */
-export const KNOWN_ACTIONS = [
-  "standup_digest",
-  "reflection",
-  "org_pulse",
-  "recurring_work",
-  "ingest_poll",
-  "kb_ingest",
-  "send_message",
-  "governance_digest",
-  "weekly_memory_review",
-] as const satisfies readonly SchedulerActionName[];
+/**
+ * The only action names accepted by durable job creation (issue #341):
+ * derived from the single source of truth in types.ts, so a new action is
+ * registered in exactly one place.
+ */
+export const KNOWN_ACTIONS: readonly SchedulerActionName[] = DURABLE_ACTION_NAMES;
 
 /** Builds a name-to-handler registry and rejects ambiguous duplicate registrations. */
 export function buildRegistry(actions: SchedulerAction[]): SchedulerActionRegistry {
