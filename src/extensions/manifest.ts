@@ -55,6 +55,42 @@ export interface CredentialSchema {
 }
 
 /**
+ * The webhook inbound scheme (issue #57 follow-up): how a registered
+ * extension's `POST /webhooks/<extension>` deliveries are authenticated.
+ * `hmac-sha256` is the provider-agnostic default (raw-body HMAC, constant
+ * time, hex OR base64). `github` and `linear` are PRESETS that map onto the
+ * same verifier machinery with their provider conventions preserved
+ * (X-Hub-Signature-256, Linear HMAC) — their schemes behave exactly as the
+ * pre-manifest hand-written verifiers did.
+ */
+export type WebhookScheme = "hmac-sha256" | "github" | "linear";
+
+/**
+ * Manifest-declared webhook authentication (issue #57 follow-up): an
+ * extension declares a `webhook` block to make its inbound deliveries
+ * receivable through the generic route. The `secretRef` is the vault /
+ * boot-secret identity the shared secret resolver looks up (e.g.
+ * `github-webhook` for GitHub). Fail closed: an extension WITHOUT this
+ * declaration refuses webhook deliveries (the route 404s).
+ */
+export interface WebhookDeclaration {
+  /** The signature scheme; `hmac-sha256` is the provider-agnostic default. */
+  scheme: WebhookScheme;
+  /**
+   * The request header carrying the signature. Defaults to the scheme's
+   * provider convention when absent (github → `x-hub-signature-256`,
+   * linear → `linear-signature`); a generic `hmac-sha256` declaration
+   * defaults to {@link DEFAULT_GENERIC_WEBHOOK_HEADER} (`x-bottega-signature`).
+   */
+  header?: string;
+  /** The vault / boot-secret identity whose value is the shared signing key. */
+  secretRef: string;
+}
+
+/** The default signature header for a generic `hmac-sha256` webhook declaration. */
+export const DEFAULT_GENERIC_WEBHOOK_HEADER = "x-bottega-signature";
+
+/**
  * A reviewed destination that may receive an extension credential.
  * `domains` controls reachability; this narrower list controls authority.
  */
@@ -125,6 +161,8 @@ export type ExtensionManifest =
       cli?: never;
       credentialSchema: CredentialSchema;
       tools?: ExtensionTool[];
+      /** Manifest-declared webhook authentication (issue #57 follow-up). */
+      webhook?: WebhookDeclaration;
       /** Egress allowlist entries (iron-proxy): hostnames, optional `*.` prefix. */
       domains: string[];
       /** Reviewed credential authority, separate from the broader egress allowlist. */
@@ -139,6 +177,8 @@ export type ExtensionManifest =
       cli: CliBinding;
       credentialSchema: CredentialSchema;
       tools?: ExtensionTool[];
+      /** Manifest-declared webhook authentication (issue #57 follow-up). */
+      webhook?: WebhookDeclaration;
       domains: string[];
       credentialTargets: CredentialTarget[];
     };
@@ -287,6 +327,25 @@ function validateCredentialSchema(value: JsonValue): CredentialSchema {
   return value["type"] === "oauth"
     ? { type: "oauth", ...(scopes !== undefined ? { scopes } : undefined) }
     : { type: "api_key" };
+}
+
+/** Validates a manifest `webhook` declaration (issue #57 follow-up). Fail closed. */
+function validateWebhookDeclaration(value: JsonValue): WebhookDeclaration {
+  if (!isRecord(value)) {
+    fail("webhook must be an object");
+  }
+  const scheme = value["scheme"];
+  if (scheme !== "hmac-sha256" && scheme !== "github" && scheme !== "linear") {
+    fail("webhook.scheme must be \"hmac-sha256\", \"github\", or \"linear\"");
+  }
+  const secretRef = optionalNonEmptyString(value["secretRef"]);
+  if (secretRef === null) {
+    fail("webhook.secretRef must be a non-empty string");
+  }
+  const header = optionalNonEmptyString(value["header"]);
+  return header === null
+    ? { scheme, secretRef }
+    : { scheme, header, secretRef };
 }
 
 function validateMcpBinding(value: JsonValue): McpBinding {
@@ -630,6 +689,9 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
     fail("kind must be \"mcp\" or \"cli\"");
   }
   const credentialSchema = validateCredentialSchema(input["credentialSchema"]);
+  // Webhook inbound auth (issue #57 follow-up): an extension MAY declare a
+  // webhook block; without it the generic route refuses its deliveries.
+  const webhook = input["webhook"] === undefined ? undefined : validateWebhookDeclaration(input["webhook"]);
   // Tools are OPTIONAL (issue #158): absent → the runtime discovers the
   // surface from the provider's tools/list; present (including `[]` — an
   // egress-only extension) → the pinned surface wins. The typed manifest
@@ -651,6 +713,7 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
       kind: "mcp",
       mcp: validateMcpBinding(input["mcp"]),
       credentialSchema,
+      ...(webhook !== undefined ? { webhook } : undefined),
       ...(tools !== undefined ? { tools } : undefined),
       domains,
       credentialTargets,
@@ -669,6 +732,7 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
     kind: "cli",
     cli: validateCliBinding(input["cli"]),
     credentialSchema,
+    ...(webhook !== undefined ? { webhook } : undefined),
     ...(tools !== undefined ? { tools } : undefined),
     domains,
     credentialTargets,

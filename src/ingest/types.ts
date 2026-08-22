@@ -18,8 +18,13 @@
  * created or posted.
  */
 export interface IngestEvent {
-  /** The extension that produced the event. */
-  provider: "github" | "linear";
+  /**
+   * The extension that produced the event. GitHub and Linear are the
+   * preset providers; a manifest-declared webhook extension's id (issue
+   * #57) is used verbatim so arbitrary registered extensions flow through
+   * the shared dispatcher.
+   */
+  provider: string;
   /** Provider-specific event kind (e.g. "mention", an issue_comment webhook). */
   eventType: string;
   /** Validated payload; shape depends on provider + eventType. */

@@ -514,12 +514,19 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           spaceId: onboardingSpaceId,
           // The webhook shared secret comes from the vault-backed boot
           // secret (issue #201 + #57): the `github-webhook` row seeds
-          // GITHUB_WEBHOOK_SECRET at boot. An unprovisioned secret fails
-          // closed per delivery (401 + rejected audit), never a no-op.
-          secretFor: (provider: string) => {
-            const boot = bootSecretForProvider(provider);
+          // GITHUB_WEBHOOK_SECRET at boot. A manifest-declared webhook
+          // extension resolves its own `secretRef`; GitHub maps to the
+          // `github-webhook` identity; anything else falls back to the
+          // provider id itself. An unprovisioned secret fails closed per
+          // delivery (401 + rejected audit), never a no-op.
+          secretFor: (secretRef: string) => {
+            const ref =
+              extensionRegistry.resolve(secretRef)?.manifest.webhook?.secretRef ??
+              (secretRef === "github" ? "github-webhook" : secretRef);
+            const boot = bootSecretForProvider(ref);
             return boot !== undefined ? process.env[boot.envName] : undefined;
           },
+          registry: extensionRegistry,
         }
       : undefined;
   if (ingestWebhooks === undefined) {

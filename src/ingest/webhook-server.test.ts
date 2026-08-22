@@ -15,6 +15,8 @@ import { createAudit } from "../policy/audit";
 import { INGEST_WEBHOOK_DISPATCH_EVENT, INGEST_WEBHOOK_REJECTED_EVENT, WORK_ITEM_CREATED_EVENT } from "../store/audit-events";
 import { createStore, type Store } from "../store/db";
 import { startOAuthCallbackServer } from "../extensions/oauth-callback";
+import { createExtensionRegistry } from "../extensions/registry";
+import type { ExtensionManifest } from "../extensions/manifest";
 import { handleWebhookRequest, type WebhookRouteDeps } from "./webhook-server";
 import { MAX_COMMENT_BODY_CHARS } from "./github/payload";
 import { verifyGitHubSignature } from "./github/webhook";
@@ -365,5 +367,122 @@ describe("the webhook route joins the OAuth callback's surface (issue #57)", () 
       if (callbackPort === undefined) delete process.env.BOTTEGA_CALLBACK_PORT;
       else process.env.BOTTEGA_CALLBACK_PORT = callbackPort;
     }
+  });
+});
+
+describe("generic manifest-declared webhook verifiers (issue #57)", () => {
+  const DRONE_SECRET = "drone-webhook-shared-secret";
+
+  /** A minimal registrable extension declaring a generic `hmac-sha256` webhook. */
+  function droneManifest(): ExtensionManifest {
+    return {
+      id: "drone",
+      label: "Drone CI",
+      vendor: "acme",
+      kind: "cli",
+      cli: { command: "drone" },
+      credentialSchema: { type: "api_key" },
+      webhook: { scheme: "hmac-sha256", secretRef: "drone-webhook", header: "x-bottega-signature" },
+      domains: [],
+      credentialTargets: [],
+    };
+  }
+
+  /** Fresh harness with a registry seeded with the drone webhook extension. */
+  function freshDroneHarness(): Harness {
+    const h = freshHarness();
+    const registry = createExtensionRegistry();
+    registry.register(droneManifest());
+    h.deps.registry = registry;
+    h.deps.secretFor = (secretRef) => {
+      if (secretRef === "github") return SECRET;
+      if (secretRef === "drone") return DRONE_SECRET;
+      return undefined;
+    };
+    return h;
+  }
+
+  /** Raw sha256 HMAC hex — the generic scheme's accepted digest. */
+  function droneSignature(rawBody: string, secret: string = DRONE_SECRET): string {
+    return createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  }
+
+  function dronePost(
+    rawBody: string,
+    opts: { path?: string; secret?: string; event?: string } = {},
+  ): Promise<Response> {
+    const path = opts.path ?? "/webhooks/drone";
+    const headers = {
+      "content-type": "application/json",
+      "x-bottega-signature": droneSignature(rawBody, opts.secret ?? DRONE_SECRET),
+      ...(opts.event !== undefined ? { "x-bottega-event": opts.event } : undefined),
+    } satisfies Record<string, string>;
+    return handleWebhookRequest(new Request(`http://127.0.0.1${path}`, { method: "POST", headers, body: rawBody }), deps());
+  }
+
+  test("a valid HMAC is acknowledged 200; the generic payload fails the dispatcher schema (fail closed, nothing dispatched)", async () => {
+    const h = freshDroneHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+
+    const res = await dronePost(JSON.stringify({ build: 42, status: "failed" }));
+    expect(res.status).toBe(200);
+    expect(h.posts).toHaveLength(0);
+    expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(0);
+    // The dispatcher rejects the generic (unknown-provider) envelope today —
+    // audited as rejected, acknowledged 200, nothing created or posted.
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
+      expect.objectContaining({
+        provider: "drone",
+        event_type: "webhook",
+        reason: "unknown provider: drone",
+      }),
+    ]);
+  });
+
+  test("a wrong signature → 401 + rejected audit, nothing dispatched", async () => {
+    const h = freshDroneHarness();
+    const res = await dronePost(JSON.stringify({ build: 1 }), { secret: "wrong-secret" });
+    expect(res.status).toBe(401);
+    expect(h.posts).toHaveLength(0);
+    expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
+      { provider: "drone", event_type: "unknown", reason: "signature_mismatch" },
+    ]);
+  });
+
+  test("an unknown provider → 404, nothing read or dispatched", async () => {
+    const h = freshDroneHarness();
+    const res = await dronePost(JSON.stringify({ build: 1 }), { path: "/webhooks/nope" });
+    expect(res.status).toBe(404);
+    expect(h.posts).toHaveLength(0);
+    expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toHaveLength(0);
+  });
+
+  test("a registered extension sharing id 'github' WITHOUT a webhook declaration falls back to the github preset", async () => {
+    const h = freshHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const registry = createExtensionRegistry();
+    registry.register({
+      id: "github",
+      label: "GitHub",
+      vendor: "github",
+      kind: "cli",
+      cli: { command: "gh" },
+      credentialSchema: { type: "api_key" },
+      domains: [],
+      credentialTargets: [],
+    });
+    h.deps.registry = registry;
+    h.deps.secretFor = (secretRef) => (secretRef === "github" ? SECRET : undefined);
+
+    // Registry-first: no webhook declaration → the preset verifier applies.
+    const res = await post(mentionBody());
+    expect(res.status).toBe(200);
+    expect(h.posts).toHaveLength(1);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(1);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toHaveLength(0);
   });
 });
