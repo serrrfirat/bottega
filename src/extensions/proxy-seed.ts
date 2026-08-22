@@ -742,7 +742,14 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
       // (boot-secrets.ts); the sync object carries it under `provider`.
       keychainServiceFor({ envName: key.envName, vaultProvider: key.provider, label: key.provider } as BootSecret),
     );
-    const value = fromVault ?? fromEnv ?? fromKeychain ?? null;
+    // Issue #343: an EMPTY credential row (an auth-broker vault row holding
+    // "", or an empty env var) is not nullish, so `fromVault ?? fromEnv ??`
+    // would let it win and shadow a valid lower-precedence source (e.g. a
+    // Keychain entry). Each source counts only when its value is non-empty
+    // after trim — pick the first non-empty of vault → env → Keychain.
+    const value = [fromVault, fromEnv, fromKeychain].find(
+      (candidate) => candidate !== null && candidate !== undefined && candidate.trim() !== "",
+    ) ?? null;
     if (value !== null && value.trim() !== "") {
       writeSecretFile(secretsDir, fileName, value);
       log(`bottega boot: proxy ${fileName} seeded (${key.provider} key)`);

@@ -97,6 +97,67 @@ describe("model gateway keys (issue #208)", () => {
     }
   });
 
+  test("an EMPTY vault row (\"\") is ignored so a valid Keychain entry seeds (issue #343)", async () => {
+    const s = tempSecretsDir();
+    try {
+      const env = {};
+      const vault = new Map([["near", ""]]);
+      const keychain = new Map([["bottega-near", "near-kc"]]);
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: () => Promise.resolve(vault),
+        readKeychain: async (service) => keychain.get(service) ?? null,
+        log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
+      });
+      expect(readFileSync(join(s.dir, "near.secret"), "utf8")).toBe("near-kc");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("an EMPTY env var is ignored so a valid Keychain entry seeds (issue #343)", async () => {
+    const s = tempSecretsDir();
+    try {
+      const env = { NEAR_API_KEY: "" };
+      const vault = new Map();
+      const keychain = new Map([["bottega-near", "near-kc"]]);
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: () => Promise.resolve(vault),
+        readKeychain: async (service) => keychain.get(service) ?? null,
+        log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
+      });
+      expect(readFileSync(join(s.dir, "near.secret"), "utf8")).toBe("near-kc");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a key empty everywhere (or absent) DELETES the file (issue #343)", async () => {
+    const s = tempSecretsDir();
+    try {
+      const env = { NEAR_API_KEY: "" };
+      const vault = new Map([["near", ""]]);
+      const stale = join(s.dir, "near.secret");
+      writeFileSync(stale, "stale-key", { mode: 0o600 });
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: () => Promise.resolve(vault),
+        readKeychain: NO_KEYCHAIN,
+        log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
+      });
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  });
+
   test("vault beats env; Keychain is the last leg (the #201 precedence)", async () => {
     const s = tempSecretsDir();
     try {
