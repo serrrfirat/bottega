@@ -557,7 +557,7 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
           if (authProvider === undefined) {
             throw new Error("surfaceTransport: expected the boot-built OAuth provider (issue #284)");
           }
-          const serverUrl = new URL(binding.serverUrl);
+          const serverUrl = new URL(binding.serverUrl ?? "");
           return new StreamableHTTPClientTransport(serverUrl, { authProvider });
         },
         mcpOAuthTokenStore: vault,
