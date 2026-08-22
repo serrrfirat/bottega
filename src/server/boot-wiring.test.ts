@@ -23,6 +23,8 @@ import { join, resolve } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
@@ -541,10 +543,23 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
       let definitions: ToolDefinition[] | undefined;
       const server = await main({
         agentDir: join(env.dir, "agent"),
-        // NO surfaceTransport seam: the production defaultMcpTransport
-        // (with the boot-built authProvider) drives the discovery through
-        // the REAL SDK streamable-http client — the strongest proof that
-        // the persisted credential authenticates tools/list.
+        // Issue #338: the PRODUCTION defaultMcpTransport refuses
+        // loopback/private destinations BEFORE a transport exists, so the
+        // boot's local HTTP stub would be rejected before an authenticated
+        // tools/list. Route discovery through main()'s explicit test-only
+        // surfaceTransport seam: the seam (injectable only via opts — never
+        // model-controlled, config-driven, or a production default) builds
+        // the SAME real SDK streamable-http client to the local stub and
+        // attaches the boot-built OAuth provider — the strongest proof that
+        // the persisted credential authenticates tools/list, while keeping
+        // the production loopback denial intact for the server process.
+        surfaceTransport: (binding: McpBinding, authProvider?: OAuthClientProvider): Transport => {
+          if (authProvider === undefined) {
+            throw new Error("surfaceTransport: expected the boot-built OAuth provider (issue #284)");
+          }
+          const serverUrl = new URL(binding.serverUrl);
+          return new StreamableHTTPClientTransport(serverUrl, { authProvider });
+        },
         mcpOAuthTokenStore: vault,
         onExtensionSurfaces: (resolved) => {
           surfaces = resolved;
