@@ -92,9 +92,11 @@ const textPartSchema = z.object({ type: z.literal("text"), text: z.string() });
 /**
  * Wire shape of one indexable transcript message. Defensively permissive:
  * non-message records and malformed lines are skipped, and a non-string
- * timestamp is treated as absent (the record stays indexable).
+ * timestamp is treated as absent (the record stays indexable). Exported so
+ * the writer→reader round-trip test (#171) sources its line from the same
+ * schema instead of a hand-rolled literal.
  */
-const messageLineSchema = z.object({
+export const messageLineSchema = z.object({
   type: z.literal("message"),
   message: z.object({
     content: z.union([z.string(), z.array(z.unknown())]),

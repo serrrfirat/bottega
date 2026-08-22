@@ -4,8 +4,10 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decidePolicyCall, parseOrgConfigYaml } from "../policy/config";
+import { sessionFilePath } from "../server/drivers/agent-driver";
 import {
   indexSessionFiles,
+  messageLineSchema,
   searchSessions,
   SessionSearchUnavailableError,
 } from "./session-search";
@@ -153,5 +155,45 @@ describe("session_search policy", () => {
       reason: "allowed by policy",
       autoApproved: false,
     });
+  });
+});
+
+// #171 writer → reader round-trip pin: a transcript line written with the
+// driver's OWN serialization (the agent-driver `sessionFilePath` naming + the
+// canonical messageLineSchema) must be found by the session-search reader with
+// its content and space id intact.
+describe("transcript writer -> reader round-trip (#171)", () => {
+  test("a driver-serialized message is indexed and searched with content + space intact", () => {
+    const { db, dir } = fixture();
+    const space = "slack:C1";
+    const timestamp = "2026-08-17T01:00:00.000Z";
+    // Source the wire line from the seam's exported schema (not a hand-rolled
+    // literal): the SDK driver persists this exact shape per message.
+    const line = messageLineSchema.parse({
+      type: "message",
+      id: timestamp,
+      parentId: null,
+      timestamp,
+      message: { role: "user", content: [{ type: "text", text: "alpha release plan post-schema" }] },
+    });
+    // Path + filename come from the driver's exported writer helper.
+    const file = sessionFilePath(dir, space);
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "title", v: 1, title: "", updatedAt: timestamp, pad: "" }),
+        JSON.stringify({ type: "session", version: 3, id: space, timestamp, cwd: "/tmp" }),
+        JSON.stringify(line),
+        "",
+      ].join("\n"),
+    );
+
+    indexSessionFiles(db, dir);
+    const hits = searchSessions(db, { query: "alpha", space });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.space).toBe(space);
+    expect(hits[0]!.file).toBe(`${space}.jsonl`);
+    expect(hits[0]!.timestamp).toBe(timestamp);
+    expect(hits[0]!.text).toBe("alpha release plan post-schema");
   });
 });

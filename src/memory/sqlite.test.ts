@@ -273,4 +273,41 @@ describe("sqlite memory backend specifics", () => {
     await p.forget({ scope: { kind: "org" }, id: first.id });
     expect(await p.countRecallable!({ kind: "org" })).toBe(1);
   });
+
+  test("writer -> reader round-trip preserves every entry field and provenance (#171)", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
+    const saved = await p.save({
+      scope: { kind: "person", principal: "alice" },
+      content: "round-trip fidelity fact for the memory seam",
+      metadata: { source: "slack", team: "platform" },
+      source: "auto_extract",
+    });
+    // The writer returned a fully-populated entry (id, key, content,
+    // metadata, createdAt, provenance).
+    expect(saved.id).toMatch(/^mem_/);
+    expect(saved.key).toEqual({ kind: "person", principal: "alice" });
+    expect(saved.metadata).toEqual({ source: "slack", team: "platform" });
+    expect(saved.provenance).toEqual({
+      source: "auto_extract",
+      spaceId: null,
+      principal: null,
+      scopeLabel: "person:alice",
+    });
+    expect(saved.createdAt).toBeGreaterThan(0);
+
+    // The reader (search) returns the entry with every field preserved.
+    const hits = await p.search({
+      scope: { kind: "person", principal: "alice" },
+      query: "round-trip fidelity",
+    });
+    expect(hits).toHaveLength(1);
+    const back = hits[0]!;
+    expect(back.id).toBe(saved.id);
+    expect(back.key).toEqual(saved.key);
+    expect(back.content).toBe(saved.content);
+    expect(back.metadata).toEqual(saved.metadata);
+    expect(back.createdAt).toBe(saved.createdAt);
+    // Provenance (#163) survives the write → search loop byte-for-byte.
+    expect(back.provenance).toEqual(saved.provenance);
+  });
 });
