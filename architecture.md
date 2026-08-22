@@ -965,8 +965,43 @@ socket dir, and (for the kinds that authorize them) per-job credential
 subdirs prepared and cleaned up by the supervisor. The git PAT (askpass) is
 present only for `git` and `github` ingest_poll jobs; the auth-broker token
 only for `extension` jobs; other kinds receive neither. HTTP(S) uses
-iron-proxy settings; the job container's egress has no direct route and must
-traverse the proxy.
+iron-proxy settings; the job container joins ONLY the internal `sandbox`
+network (issue #105), so it has no direct route out and must traverse the
+proxy.
+
+### Sandbox-vs-egress network topology (issue #105)
+
+```mermaid
+flowchart TB
+    subgraph sandboxNet["sandbox network (172.31.0.0/24, internal: true — no WAN route)"]
+        JOB["disposable job container<br/>read-only root · cap-drop ALL · no-new-privileges<br/>bounded /tmp tmpfs · pids/cpu/nofile caps"]
+        DNS["BOTTEGA_SANDBOX_DNS = proxy sandbox IP (sinkhole)"]
+        JOB -- "HTTP(S) via proxy tunnel only" --> PXY
+        JOB -. "NO_PROXY (internal names only)" .-> AUTH["auth-broker / auth-gateway / mem0"]
+    end
+    subgraph egressNet["egress network (172.30.0.0/24)"]
+        PXY["iron-proxy (dual-homed)<br/>egress 172.30.0.2 · sandbox 172.31.0.2"]
+        SRV["server"] EX["executor (supervisor)"]
+    end
+    PXY -- "allowlist → judge → secret injection" --> EXT["internet"]
+    EX -. "docker run --network <sandbox>" .-> JOB
+```
+
+The compose stack declares two networks. `egress` (172.30.0.0/24) is the only
+one with a route to the host/WAN and carries the server, executor, the auth
+services' own provider calls, and the proxy's upstream. `sandbox`
+(172.31.0.0/24, `internal: true`) has NO route out and hosts ONLY the
+disposable per-job containers, which attach via the executor supervisor's
+`docker run --network bottega_sandbox`. iron-proxy is dual-homed: its fixed
+sandbox IP (172.31.0.2) is the job containers' DNS sinkhole (`dns:`) and the
+proxy tunnel endpoint, and its fixed egress IP (172.30.0.2) keeps serving the
+server/executor. A job container therefore cannot reach a raw external IP
+directly (the internal bridge drops unroutable traffic) even though HTTP(S)
+through the proxy's allowlist continues to work. auth-broker, auth-gateway,
+and mem0 are dual-homed so job containers resolve them via NO_PROXY (internal
+vault/memory calls must bypass the allowlist) while the server/executor keep
+their egress paths. The server and executor are NOT on the sandbox network;
+the executor controls sibling job attachment purely through Docker.
 
 The deployment applies the #105 controls at the executor-container boundary
 (read-only image root, writable durable data and disposable workspace
@@ -980,16 +1015,39 @@ single bounded result JSON (all `console.*` writes are redirected to stderr).
 Timeout and lease loss deterministically remove the whole container (and its
 process tree) via `docker kill`, so no job ever leaks a container.
 
-One deployment-gated leg remains for end-to-end network isolation: the
-per-job container joins the egress network with the proxy as DNS, which the
-CI Docker job exercises with the real production image and `docker run` args
-(`BOTTEGA_RUN_INTEGRATION=1`; a printed SKIP is treated as a CI failure).
-Local non-Linux runs verify the request/result IPC, scope, RPC allowlist,
-mount scoping, and teardown boundary hermetically (injected docker/client
-seams + real RPC server/client over a temp socket) and skip the real-container
-lane only where no Docker socket is present; CI's Docker job is the required
-no-skip lane for read-only root, writable workspace, capabilities, bounded
-result IPC, container teardown, and mandatory-proxy egress.
+The per-job `docker run` args pin the profile directly: `--rm`, exact
+`--name`, `--memory <caps>m`, `--pids-limit 128`, `--cpus 1`, `--ulimit
+nofile=1024`, `--cap-drop ALL`, `--security-opt no-new-privileges:true`,
+`--read-only`, `--init`, the exact `--network <sandbox>` + `--dns <proxy
+sandbox IP>`, and a bounded writable `/tmp` tmpfs
+(`/tmp:rw,nosuid,nodev,noexec,size=64m`) — the only writable scratch outside
+the exact per-job mounts. No host Docker socket and no broad volume reach the
+job.
+
+The CI Docker job is the required no-skip lane for the real profile: it
+creates an `internal:true` sandbox network and runs the production image with
+the exact args, asserting immutable root, writable bounded `/tmp`, dropped
+capabilities, `NoNewPrivs`, seccomp, and that a raw external IP is
+unreachable (the proxy-mediated allowlist path is the only external seam).
+The `BOTTEGA_RUN_INTEGRATION=1` real-container lane in
+`src/worker/sandbox-process.test.ts` proves the same hardening plus distinct
+container identity/netns and no parent-secret leakage against a real internal
+network; a printed SKIP is treated as a CI failure. Local non-Linux runs
+verify the request/result IPC, scope, RPC allowlist, mount scoping, and
+teardown boundary hermetically (injected docker/client seams + real RPC
+server/client over a temp socket) and skip the real-container lane only where
+no Docker socket is present.
+
+**Residual boundary.** The sandbox network removes the job container's
+direct route out, but the iron-proxy allowlist/judge/secret-injection pipeline
+remains the semantic gate: whatever the proxy allowlist lets through is the
+job's reachable external surface, so any allowlisted domain (or a
+misconfigured permissive dev config) is still egress the job can traverse.
+The proxy's MITM CA is bind-mounted into job containers so HTTPS through the
+tunnel verifies — a job cannot transparently MITM the proxy's own traffic.
+Capability/escalation and filesystem hardening are defense-in-depth: a
+compromised job still must be contained by the Docker runtime, seccomp, and
+cgroup isolation.
 
 ## Persistence & audit
 
@@ -1053,7 +1111,7 @@ is never deleted: "cleanup" evicts caches, never rows.
 | Credential exposure | Per-turn principal selects the credential; omp-broker or 1Password Connect resolves it; mode-0600 files and iron-proxy inject it only at the allowlisted host. API-key onboarding can use a single-use browser upload (#196). Slack tokens stay server-only; the git PAT stays file-only |
 | Secret pasted into a typed connect/memory write | Recognized shapes are refused before broker/persistence/audit and redirected to OAuth, the configured vault, or `connect_upload_link`. This does not scrub arbitrary Slack text already received |
 | Malicious repo content | Every job runs in a dedicated disposable Docker container with its own writable workspace subdir; the server never mounts repository paths. Root is read-only, capabilities are dropped, and the job container touches only its exact subpath mounts — never the shared data root and never the SQLite store (it reaches the store only over the bounded, allowlisted job-scoped RPC socket) |
-| Exfiltration / rogue egress | Job-container env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Egress has no direct route and traverses iron-proxy default-deny allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
+| Exfiltration / rogue egress | Job-container env and credential mounts are allowlisted; Slack/webhook/provider secrets never cross. Job containers join only the internal-only `sandbox` network (issue #105), so there is NO route to a raw external IP — egress traverses only iron-proxy's default-deny allowlist, judge, secret injection, and DNS sinkhole. Dev remains permissive by design |
 | Unauthorized side effects | Policy gate on every tool call; exec and org-settings writes ask humans; unknown → deny |
 | Cross-user credential confusion | The driver binds the fresh turn's principal; steers do not replace it (#152), and one tool call dispatches once (#178) |
 | Data loss / tampering | Append-only audit, retained transcripts, delivery decisions as durable cross-process rows |

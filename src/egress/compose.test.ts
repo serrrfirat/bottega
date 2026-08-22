@@ -177,6 +177,62 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
   });
 });
 
+describe("docker-compose.yml (issue #105 sandbox-vs-egress isolation)", () => {
+  test("sandbox network is internal-only with its own subnet (no WAN route)", () => {
+    // SAFETY: the fixture's sandbox network is a map node inside `networks`.
+    const sandbox = networks["sandbox"] as Record<string, YamlNode>;
+    expect(sandbox).toBeDefined();
+    expect(sandbox["driver"]).toBe("bridge");
+    // `internal: true` is the hard guarantee: no route to the host or WAN,
+    // so a compromised job container cannot reach raw external IPs directly.
+    expect(sandbox["internal"]).toBe(true);
+    // SAFETY: ipam is a map node inside the sandbox network.
+    const ipam = sandbox["ipam"] as Record<string, YamlNode>;
+    // SAFETY: the fixture declares ipam.config as a list with one subnet entry.
+    const config = ipam["config"] as Record<string, YamlNode>[];
+    expect(config[0]["subnet"]).toBe("172.31.0.0/24");
+  });
+
+  test("iron-proxy is dual-homed with a fixed sandbox IP (the job seam)", () => {
+    const net = service("iron-proxy")["networks"] as Record<string, YamlNode>;
+    // Egress IP retained for server/executor (unchanged).
+    expect((net["egress"] as Record<string, YamlNode>)["ipv4_address"]).toBe("172.30.0.2");
+    // The sandbox IP is the job containers' DNS sinkhole + proxy endpoint.
+    expect((net["sandbox"] as Record<string, YamlNode>)["ipv4_address"]).toBe("172.31.0.2");
+  });
+
+  test("job containers are pointed at the sandbox network and its DNS (never egress)", () => {
+    const env = serviceEnv("executor");
+    // The executor supervisor launches siblings: they must join the internal
+    // sandbox network with DNS at iron-proxy's sandbox IP — NOT egress (a
+    // job container on egress could route out directly).
+    expect(env["BOTTEGA_SANDBOX_NETWORK"]).toBe("${BOTTEGA_SANDBOX_NETWORK:-bottega_sandbox}");
+    expect(env["BOTTEGA_SANDBOX_DNS"]).toBe("172.31.0.2");
+    // The proxy tunnel is the job container's only HTTP(S) seam.
+    expect(env["BOTTEGA_SANDBOX_PROXY_URL"]).toBe("http://iron-proxy:8080");
+  });
+
+  test("executor is NOT attached to the sandbox network (supervisor drives siblings over Docker)", () => {
+    // SAFETY: the fixture declares the executor's networks as the list ["egress"].
+    const executorNetworks = service("executor")["networks"] as string[];
+    expect(executorNetworks).toContain("egress");
+    expect(executorNetworks).not.toContain("sandbox");
+    // The server stays off the sandbox network too.
+    const serverNetworks = service("server")["networks"] as string[];
+    expect(serverNetworks).not.toContain("sandbox");
+  });
+
+  test("auth-broker/gateway/mem0 are dual-homed so NO_PROXY worker endpoints resolve on sandbox", () => {
+    for (const name of ["auth-broker", "auth-gateway", "mem0"]) {
+      // SAFETY: each service declares networks as a list in the fixture.
+      const nets = service(name)["networks"] as string[];
+      // Reachable on egress (server/executor flows) AND sandbox (job NO_PROXY).
+      expect(nets).toContain("egress");
+      expect(nets).toContain("sandbox");
+    }
+  });
+});
+
 describe("docker-compose.yml (issue #43 mem0 memory backend)", () => {
   test("mem0 runs the pinned OSS server image on the internal network only", () => {
     const mem0 = service("mem0");

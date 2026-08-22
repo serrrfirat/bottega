@@ -10,6 +10,16 @@
 #     local setups that resolve it as a hostname).
 # No ports are published: everything lives on the internal `egress` network.
 #
+# Per-job isolation topology (issue #105): a second, INTERNAL-only `sandbox`
+# network (172.31.0.0/24, `internal: true` — no route to the host or WAN)
+# hosts the disposable per-job job containers, which attach ONLY there, never
+# `egress`. iron-proxy is dual-homed (egress 172.30.0.2 + sandbox 172.31.0.2):
+# inside the sandbox it is the job containers' DNS sinkhole and their only
+# external seam via the HTTP(S) proxy tunnel + allowlist. Auth-broker,
+# auth-gateway, and mem0 are dual-homed so job containers can resolve them
+# over NO_PROXY while the server/executor keep their egress paths. The server
+# and executor themselves are NOT on the sandbox network.
+#
 # Credential boundary (issue #9): auth-broker is the credential vault
 # (OMP), auth-gateway fronts it for OpenAI-compatible clients. Both are
 # internal-only and keep their state on the `data` volume. Provider keys
@@ -68,6 +78,12 @@ services:
     networks:
       egress:
         ipv4_address: 172.30.0.2
+      # Dual-homed (issue #105): the sandbox network is the ONLY external
+      # seam for job containers. Its fixed sandbox IP is the job containers'
+      # DNS sinkhole + proxy tunnel endpoint, so the proxy mediates every job
+      # egress while the egress network keeps serving the server/executor.
+      sandbox:
+        ipv4_address: 172.31.0.2
 
   auth-broker:
     # Credential vault (issue #9): OMP auth-broker, the only writer of
@@ -108,6 +124,12 @@ services:
       start_period: 5s
     networks:
       - egress
+      # Dual-homed (issue #105): also reachable on the internal sandbox
+      # network so job containers can resolve it via NO_PROXY (extension
+      # credential fetches must bypass the proxy allowlist, which would 403
+      # the internal vault). Retains egress for the server/executor's own
+      # broker-mode traffic.
+      - sandbox
 
   auth-gateway:
     # Forward proxy over the broker (issue #9): OpenAI/Anthropic/pi-native
@@ -132,6 +154,10 @@ services:
       - data:/data
     networks:
       - egress
+      # Dual-homed (issue #105): job containers resolve the gateway via
+      # NO_PROXY on the internal sandbox network; the server/executor keep
+      # reaching it on egress.
+      - sandbox
 
   mem0:
     # Memory backend (issue #43): self-hosted mem0 OSS REST server. Pinned to
@@ -147,6 +173,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     networks:
       - egress
+      # Dual-homed (issue #105): job containers resolve mem0 via NO_PROXY
+      # on the internal sandbox network (memory backend calls bypass the
+      # proxy allowlist); the server keeps reaching it on egress.
+      - sandbox
 
   server:
     # App image built from the repo root (Dockerfile): the server and the
@@ -274,8 +304,11 @@ services:
       # its own workspace subdir, its own transcript subdir, the RPC socket
       # dir, the egress MITM CA, and the exact kind-authorized credential
       # subdir — NEVER the whole shared `data` volume and NEVER a SQLite file.
-      # Egress traverses iron-proxy on the `egress` network with the proxy as
-      # DNS; the CA is bind-mounted read-only.
+      # Job egress (issue #105): each job container joins ONLY the internal
+      # `sandbox` network — never egress — so direct-IP internet bypass is
+      # impossible; DNS inside the sandbox resolves through iron-proxy's
+      # sandbox IP (sinkhole) and HTTP(S) egress traverses the proxy's
+      # allowlist tunnel. The CA is bind-mounted read-only.
       BOTTEGA_SANDBOX_DATA_VOLUME: data
       # The supervisor-visible TRANSCRIPT dir: the app's default relative
       # `data/transcripts` resolves inside the /app/data volume mount, so the
@@ -290,8 +323,12 @@ services:
       # job container sees only its own subdirectories.
       BOTTEGA_SANDBOX_WORKSPACES_VOLUME_ROOT: /workspaces
       BOTTEGA_SANDBOX_STATE_VOLUME_ROOT: /app/data
-      BOTTEGA_SANDBOX_NETWORK: ${BOTTEGA_SANDBOX_NETWORK:-bottega_egress}
-      BOTTEGA_SANDBOX_DNS: 172.30.0.2
+      # The internal-only `sandbox` compose network (actual Docker name
+      # `<project>_sandbox`; `bottega` is the deployment project name) and
+      # iron-proxy's fixed sandbox IP — the job containers' DNS sinkhole and
+      # the only external seam. Job containers NEVER join `egress`.
+      BOTTEGA_SANDBOX_NETWORK: ${BOTTEGA_SANDBOX_NETWORK:-bottega_sandbox}
+      BOTTEGA_SANDBOX_DNS: 172.31.0.2
       BOTTEGA_SANDBOX_PROXY_URL: http://iron-proxy:8080
       # Host-visible path to the egress MITM CA (the executor binds ./certs
       # at /etc/iron-proxy/certs; the host sibling needs the host path so the
@@ -323,8 +360,23 @@ volumes:
     name: data
 
 networks:
+  # The only network with a route out of the host: services that need real
+  # egress (server, executor, the auth services' own provider calls, and the
+  # proxy's upstream) live here, and their DNS resolves through iron-proxy
+  # (default-deny allowlist).
   egress:
     driver: bridge
     ipam:
       config:
         - subnet: 172.30.0.0/24
+  # Per-job container isolation (issue #105): an INTERNAL-only bridge with no
+  # route to the host or the external world. Job containers attach ONLY here
+  # — never egress — so direct-IP internet bypass is impossible. DNS inside
+  # the sandbox resolves through iron-proxy's sandbox IP (sinkhole); HTTP(S)
+  # egress traverses the proxy's allowlist tunnel, the only seam out.
+  sandbox:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

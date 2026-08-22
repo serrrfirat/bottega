@@ -477,6 +477,83 @@ describe("production docker sandbox boundary (#101/#338)", () => {
       else process.env.BOTTEGA_SANDBOX_RPC_SOCKET = originalHostRpcSocket;
     }
   });
+
+  test("docker run args harden the job container (no-new-privileges, read-only root, caps dropped, caps + bounded /tmp, sandbox net/DNS)", async () => {
+    const { store, dir } = freshStore();
+    const job: WorkerJob = { id: "harden-args", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+    let runArgs: string[] = [];
+    const capturing: DockerClient = {
+      launch(args: string[]) {
+        if (args.includes("run")) {
+          runArgs = args;
+          const stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+          const stdout = new Readable({ read() {} });
+          const stderr = new Readable({ read() {} });
+          let resolveExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+          const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => { resolveExit = r; });
+          queueMicrotask(() => {
+            stdout.push(Buffer.from(JSON.stringify({ version: SANDBOX_PROTOCOL_VERSION, mode: "execute", pid: 6161, result: { exitCode: 0, signal: null, timedOut: false } }) + "\n"));
+            stdout.push(null);
+            stderr.push(null);
+            resolveExit({ code: 0, signal: null });
+          });
+          return { stdin, stdout, stderr, exit, kill: () => resolveExit({ code: null, signal: "SIGKILL" }) };
+        }
+        return new FakeProc(0, new FakeDocker());
+      },
+    };
+    const runner = createDockerSandboxRunner({
+      hostStore: store,
+      memoryProvider: memoryDenyProvider,
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: join(dir, "transcripts"),
+      network: "bottega_sandbox",
+      dns: ["172.31.0.2"],
+      proxyUrl: "http://iron-proxy:8080",
+      docker: capturing,
+    });
+    const result = await runner(job, runnerContext(store, "", dir, 5_000));
+    expect(result.exitCode).toBe(0);
+
+    const flat = runArgs.join(" ");
+    // Disposable, named, capped, immutable root, privileged-off.
+    expect(runArgs).toContain("--rm");
+    expect(runArgs[runArgs.indexOf("--name") + 1]).toMatch(/bottega-sandbox/);
+    expect(runArgs).toContain("--memory");
+    expect(runArgs[runArgs.indexOf("--memory") + 1]).toMatch(/m$/);
+    expect(runArgs).toContain("--pids-limit");
+    // No privilege escalation, ever.
+    expect(runArgs).toContain("--cap-drop");
+    expect(runArgs[runArgs.indexOf("--cap-drop") + 1]).toBe("ALL");
+    expect(runArgs).toContain("--security-opt");
+    expect(runArgs[runArgs.indexOf("--security-opt") + 1]).toBe("no-new-privileges:true");
+    // Immutable root + an init reaper for descendants.
+    expect(runArgs).toContain("--read-only");
+    expect(runArgs).toContain("--init");
+    // Minimal CPU + file-descriptor bounds (consistent with the memory/PID caps).
+    expect(runArgs).toContain("--cpus");
+    expect(runArgs[runArgs.indexOf("--cpus") + 1]).toBe("1");
+    expect(runArgs).toContain("--ulimit");
+    expect(runArgs[runArgs.indexOf("--ulimit") + 1]).toBe("nofile=1024");
+    // Bounded writable /tmp tmpfs with noexec/nosuid/nodev — the ONLY
+    // writable scratch outside the exact per-job mounts.
+    const tmpfsIndex = runArgs.indexOf("--tmpfs");
+    expect(tmpfsIndex).toBeGreaterThan(-1);
+    expect(runArgs[tmpfsIndex + 1]).toBe("/tmp:rw,nosuid,nodev,noexec,size=64m");
+    // The job container joins the internal sandbox network only, with the
+    // iron-proxy sandbox IP as DNS — never egress, so no direct route out.
+    expect(runArgs[runArgs.indexOf("--network") + 1]).toBe("bottega_sandbox");
+    const dnsIndex = runArgs.indexOf("--dns");
+    expect(dnsIndex).toBeGreaterThan(-1);
+    expect(runArgs[dnsIndex + 1]).toBe("172.31.0.2");
+    // The HTTP(S) seam is the proxy tunnel, not a direct gateway.
+    expect(flat).toContain("HTTP_PROXY=http://iron-proxy:8080");
+    expect(flat).toContain("HTTPS_PROXY=http://iron-proxy:8080");
+    // No host Docker socket and no broad mount surface reaches the job.
+    expect(flat).not.toContain("/var/run/docker.sock");
+    expect(flat).not.toMatch(/bottega\.db/);
+    expect(flat).not.toContain("-v /"); // no short-form host root bind mounts
+  });
 });
 
 // Required real-container lane (issue #101/#338). Gated on an explicit
@@ -500,6 +577,63 @@ describe.skipIf(!dockerSocketPresent || process.env.BOTTEGA_RUN_INTEGRATION !== 
     expect(probe.pid).toBeGreaterThan(0);
     expect(probe.pid).not.toBe(process.pid);
     expect(probe.forbiddenEnvNames).toEqual([]);
+  });
+
+  test("a real container on an internal sandbox network proves hardening and no direct egress (#105)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const image = process.env.BOTTEGA_SANDBOX_IMAGE ?? "bottega:local";
+    const net = `bottega-sandbox-test-${Date.now().toString(36)}`;
+    const run = (args: string[]) => spawnSync("docker", args, { encoding: "utf8" });
+    const cleanup = () => {
+      run(["network", "rm", net]);
+    };
+    // Create a REAL internal (no WAN route) sandbox network, mirroring the
+    // compose `sandbox` network. Clean it up unconditionally.
+    const created = run(["network", "create", "--internal", "--subnet", "172.31.0.0/24", net]);
+    expect(created.status).toBe(0);
+    try {
+      const probe = run([
+        "run",
+        "--rm",
+        "--network", net,
+        "--read-only",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m",
+        image,
+        "sh", "-ec",
+        // Inside the container (root filesystem mounted read-only):
+        //   1. root is immutable — a write to / must fail.
+        //   2. /tmp is writable (bounded tmpfs) — the only scratch.
+        //   3. no effective capabilities remain (cap-drop ALL).
+        //   4. no-new-privileges is active.
+        // (5. network isolation is proven separately by the egress-denied
+        //    curl: on the internal bridge a raw external IP is unreachable.)
+        "! touch /rootfs-write 2>/dev/null && " +
+        "echo scratch > /tmp/write-ok && " +
+        "test -s /tmp/write-ok && " +
+        "test \"$(awk '/^CapEff:/ {print $2}' /proc/self/status)\" = 0000000000000000 && " +
+        "test \"$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)\" = 1 && " +
+        "echo hardening-ok",
+      ]);
+      expect(probe.status).toBe(0);
+      expect(probe.stdout).toContain("hardening-ok");
+
+      // Direct egress on the INTERNAL sandbox network is denied: no route out
+      // of 172.31.0.0/24 exists (internal:true), so a raw external IP is
+      // unreachable even though the proxy-mediated path remains the seam. The
+      // tools image carries curl; fail fast with a short connect timeout.
+      const egress = run([
+        "run", "--rm", "--network", net, image,
+        "sh", "-ec",
+        "! curl --connect-timeout 2 http://8.8.8.8/ 2>/dev/null && echo egress-denied || echo unexpected-egress",
+      ]);
+      expect(egress.status).toBe(0);
+      expect(egress.stdout).toContain("egress-denied");
+      expect(egress.stdout).not.toContain("unexpected-egress");
+    } finally {
+      cleanup();
+    }
   });
 });
 

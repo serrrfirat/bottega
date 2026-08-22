@@ -218,7 +218,13 @@ export async function probeChildProcessSandbox(options: {
 //   - proxy/CA configuration for egress.
 // It receives NO Docker socket, no raw store handle beyond the scoped file,
 // no unrelated credentials, and no undeclared mounts. Root filesystem is
-// read-only; resource caps and full-container teardown are mandatory.
+// read-only (the only writable scratch is a bounded /tmp tmpfs with
+// nosuid,nodev,noexec); all capabilities are dropped, no-new-privileges and
+// an init reaper are set, and memory/PID/CPU/file-descriptor caps are
+// bounded. On its own internal-only network the container CANNOT route out
+// directly — DNS resolves through iron-proxy and HTTP(S) egress traverses
+// the proxy's allowlist, so the proxy is the only external seam. Resource
+// caps and full-container teardown are mandatory.
 // stdout carries the single bounded result JSON; stderr streams job logs.
 // ---------------------------------------------------------------------------
 
@@ -273,9 +279,9 @@ export interface DockerSandboxOptions {
   /** The supervisor's job args/request must never reveal a DB path — this is never mounted. */
   /** Job container image (defaults to the app/tools-derived image). */
   image?: string;
-  /** Docker network the job container joins (egress). "none" for hermetic. */
+  /** Docker network the job container joins (the internal-only `sandbox` network in compose). "none" for hermetic. */
   network?: string;
-  /** DNS server(s) for the container (iron-proxy default-deny). */
+  /** DNS server(s) for the container (iron-proxy sandbox IP — default-deny sinkhole). */
   dns?: string[];
   /** HTTP/HTTPS proxy URL passed into the container (iron-proxy tunnel). */
   proxyUrl?: string;
@@ -673,11 +679,23 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
     `${opts.caps.memoryMb}m`,
     "--pids-limit",
     "128",
+    "--cpus",
+    "1",
+    "--ulimit",
+    "nofile=1024",
     "--cap-drop",
     "ALL",
+    "--security-opt",
+    "no-new-privileges:true",
     "--read-only",
+    "--init",
     "--network",
     opts.network,
+    // Bounded writable /tmp: the only writable scratch outside the exact
+    // per-job mounts. noexec+nosuid+nodev keep it from becoming a
+    // privilege-escalation or execution surface; the size cap bounds disk use.
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,noexec,size=64m",
   ];
   if (opts.dns !== undefined && opts.dns.length > 0) {
     for (const dns of opts.dns) args.push("--dns", dns);
