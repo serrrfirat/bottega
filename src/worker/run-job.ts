@@ -543,7 +543,7 @@ async function launchDockerContainer(
   if (prep !== null) {
     rpcDirHost = prep.rpcDirHost;
     if (opts.hostStore !== undefined && opts.job !== undefined) {
-      rpcServer = JobStoreRpcServer.create(opts.hostStore, jobScopeFromEnvelope(opts.job), rpcDirHost, {
+      rpcServer = JobStoreRpcServer.create(opts.hostStore, opts.job, rpcDirHost, {
         memoryProvider: opts.memoryProvider,
       });
       try {

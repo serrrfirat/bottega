@@ -17,7 +17,6 @@ import {
 } from "./run-job";
 import { JOB_FAILED_EVENT } from "../store/audit-events";
 import { memoryDenyProvider, MAX_RPC_FRAME_BYTES, connectStoreRpc, JobStoreRpcServer } from "./store-rpc";
-import { jobScopeFromEnvelope } from "./scoped-store";
 import { resolveMemoryProvider, type ResolvedMemoryProvider } from "../server/memory-provider";
 
 const dirs: string[] = [];
@@ -500,13 +499,18 @@ function rawRpc(socketPath: string, frame: string | Buffer, opts: { readReply?: 
 }
 
 describe("job-scoped store RPC boundary (#101/#338)", () => {
-  function makeRpc() {
+  function makeRpc(jobOverride?: WorkerJob) {
     const { store, dir } = freshStore();
-    const job: WorkerJob = { id: "job_1", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
-    const scope = jobScopeFromEnvelope(job);
+    const job: WorkerJob = jobOverride ?? {
+      id: "job_1",
+      kind: "scheduled",
+      payload: { action: "memory_consolidation" },
+      attempts: 1,
+      status: "running",
+    };
     const rpcDir = join(dir, "rpc");
     mkdirSync(rpcDir, { recursive: true });
-    const server = JobStoreRpcServer.create(store, scope, rpcDir, {
+    const server = JobStoreRpcServer.create(store, job, rpcDir, {
       memoryProvider: resolveMemoryProvider(store.getOrgSettings(), store.getDb()),
     });
     return { store, dir, job, server };
@@ -564,13 +568,22 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
   });
 
   test("ingest-poll watermark RPC round-trips through the supervisor (store retained there)", async () => {
-    const { server } = makeRpc();
+    const { server } = makeRpc({
+      id: "job_poll",
+      kind: "ingest_poll",
+      payload: { provider: "github" },
+      attempts: 1,
+      status: "running",
+    });
     await server.listen();
     const session = connectStoreRpc(server.socketPath);
     try {
       await session.ready();
-      await session.store.setIngestWatermark("github", "cursor-1");
-      expect(await session.store.getIngestWatermark("github")).toBe("cursor-1");
+      // The job's own validated provider is the only watermark it may touch.
+      await expect(session.store.setIngestWatermark("github", "cursor-1")).resolves.toBeUndefined();
+      // A different provider proves the raw socket cannot name it.
+      await expect(session.store.getIngestWatermark("github")).resolves.toBe("cursor-1");
+      await expect(session.store.setIngestWatermark("other", "x")).rejects.toThrow(/provider/);
     } finally {
       session.close();
       server.close();
@@ -597,7 +610,6 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
   test("the resolved memory provider (readonly capabilities/backend) is observable after ready()", async () => {
     const { store, dir } = freshStore();
     const job: WorkerJob = { id: "job_mem", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
-    const scope = jobScopeFromEnvelope(job);
     const rpcDir = join(dir, "rpc");
     mkdirSync(rpcDir, { recursive: true });
     // A supervisor provider whose resolved identity differs from the client's
@@ -613,7 +625,7 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
         throw new Error("unused in this test");
       },
     };
-    const server = JobStoreRpcServer.create(store, scope, rpcDir, {
+    const server = JobStoreRpcServer.create(store, job, rpcDir, {
       memoryProvider: supervisorProvider,
     });
     await server.listen();
@@ -628,6 +640,149 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       expect(session.memoryProvider.capabilities.consolidation).toBe("on-save");
       expect(session.memoryProvider.capabilities.digestPruning).toBe("unsupported");
       expect(session.memoryProvider.save).toBeTypeOf("function");
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("cross-job outbox, audit rows, and audit queries are denied (raw frame cannot forge another job's evidence)", async () => {
+    // A scheduled job in space S with its own completion row must be the only
+    // one it can post/read; a raw socket naming another job/space fails closed.
+    const { store, job, server } = makeRpc({
+      id: "job_sched",
+      kind: "scheduled",
+      payload: { action: "memory_consolidation" },
+      spaceId: "slack:C1",
+      attempts: 1,
+      status: "running",
+    });
+    await server.listen();
+    try {
+      // A completion outbox row for ANOTHER job is refused.
+      const otherOutbox = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 1, method: "postOutboxRow", args: [{ id: "job_other", kind: "scheduled", payload: { action: "memory_consolidation" }, space: "slack:C1" }] })}\n`);
+      expect(otherOutbox).toMatch(/outbox row|ScopedStoreAccessError/);
+      // An audit row pinning ANOTHER space is refused.
+      const fakedAudit = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 2, method: "appendAudit", args: [{ space_id: "slack:C2", actor: "executor", event_type: "delivery.completed", payload: "{}" }] })}\n`);
+      expect(fakedAudit).toMatch(/audit row for space/);
+      // An audit query scoped to another space is refused.
+      const fakedQuery = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 3, method: "queryAudit", args: [{ space_id: "slack:C2" }] })}\n`);
+      expect(fakedQuery).toMatch(/audit query must be scoped/);
+      // A listAudit scoped to another space is refused.
+      const fakedList = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 4, method: "listAudit", args: [{ space: "slack:C2" }] })}\n`);
+      expect(fakedList).toMatch(/audit list must be scoped/);
+    } finally {
+      server.close();
+    }
+    void store;
+    void job;
+  });
+
+  test("space/settings reads are restricted to the job's own space; other-work-item reads denied", async () => {
+    const { store, server } = makeRpc({
+      id: "job_git",
+      kind: "git",
+      payload: { workItemId: "wi_1" },
+      spaceId: "slack:C1",
+      attempts: 1,
+      status: "running",
+    });
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const otherSpace = await store.getOrCreateSpace({ platform: "slack", channel_id: "C2" });
+    // Give the job its own work item so getSpace/transition paths exist.
+    await store.createWorkItem({ space_id: space.id, requester: "U1", description: "own" });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // Reading its OWN space succeeds.
+      await expect(session.store.getSpace(space.id)).resolves.toMatchObject({ id: space.id });
+      // Reading ANOTHER space is denied.
+      await expect(session.store.getSpace(otherSpace.id)).rejects.toThrow(/job-row access|space/);
+      // A work item it does not own is denied (work-item guard).
+      await expect(session.store.getWorkItem("wi_other")).rejects.toThrow(/work-item access/);
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("extension credential reads are extension-jobs-only; maintainMemory only for scheduled consolidation", async () => {
+    // A git job (not extension) cannot read the extension credential ladder.
+    const git = makeRpc({ id: "job_git2", kind: "git", payload: { workItemId: "wi_1" }, spaceId: "slack:C1", attempts: 1, status: "running" });
+    await git.server.listen();
+    try {
+      const credReply = await rawRpc(git.server.socketPath, `${JSON.stringify({ ns: "store", id: 1, method: "listExtensionCredentials", args: ["notion"] })}\n`);
+      expect(credReply).toMatch(/extension credential read/);
+    } finally {
+      git.server.close();
+    }
+
+    // A scheduled job that is NOT memory_consolidation cannot run maintainMemory.
+    const sched = makeRpc({ id: "job_sched2", kind: "scheduled", payload: { action: "digest" }, attempts: 1, status: "running" });
+    await sched.server.listen();
+    try {
+      const maintainReply = await rawRpc(sched.server.socketPath, `${JSON.stringify({ ns: "memory", id: 1, method: "maintainMemory", args: [] })}\n`);
+      expect(maintainReply).toMatch(/memory_consolidation/);
+    } finally {
+      sched.server.close();
+    }
+  });
+
+  test("memory writes/searches/prunes outside the job's own space are denied", async () => {
+    const { server } = makeRpc({
+      id: "job_kb",
+      kind: "git",
+      payload: { workItemId: "wi_1" },
+      spaceId: "slack:C1",
+      attempts: 1,
+      status: "running",
+    });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // An org-scope search is the shared floor — allowed.
+      await expect(session.memoryProvider.search({ query: "kb", scope: { kind: "org" } })).resolves.toEqual([]);
+      // A channel scope for ANOTHER space is denied.
+      const saveOther = { content: "x", scope: { kind: "channel", spaceId: "slack:C2" } };
+      await expect(session.memoryProvider.save(saveOther)).rejects.toThrow(/channel scope/);
+      const searchOther = { query: "kb", scope: { kind: "channel", spaceId: "slack:C2" } };
+      await expect(session.memoryProvider.search(searchOther)).rejects.toThrow(/channel scope/);
+      // pruneDigests for another space is denied.
+      await expect(session.memoryProvider.pruneDigests("slack:C2", 5)).rejects.toThrow(/pruneDigests/);
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("legitimate job-lifecycle frames succeed end-to-end (own job, own space, own provider)", async () => {
+    const { store, dir } = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "own" });
+    await store.enqueueJob({ id: "job_git3", kind: "git", payload: { workItemId: item.id }, spaceId: space.id });
+    const job: WorkerJob = { id: "job_git3", kind: "git", payload: { workItemId: item.id }, spaceId: space.id, attempts: 1, status: "running" };
+    const rpcDir = join(dir, "rpc");
+    mkdirSync(rpcDir, { recursive: true });
+    const server = JobStoreRpcServer.create(store, job, rpcDir, {
+      memoryProvider: resolveMemoryProvider(store.getOrgSettings(), store.getDb()),
+    });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // The job reads its own row and its own work item.
+      await expect(session.store.getJob("job_git3")).resolves.toMatchObject({ id: "job_git3" });
+      await expect(session.store.getWorkItem(item.id)).resolves.toMatchObject({ id: item.id });
+      // It appends an audit row in its OWN space.
+      await expect(
+        session.store.appendAudit({ space_id: space.id, actor: "executor", event_type: "delivery.completed", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      // Its own outbox completion row posts.
+      await expect(
+        session.store.postOutboxRow({ id: "job_git3", kind: "git", payload: { workItemId: item.id }, space: space.id }),
+      ).resolves.toBeUndefined();
     } finally {
       session.close();
       server.close();
