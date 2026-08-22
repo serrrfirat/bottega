@@ -1934,6 +1934,144 @@ describe("SpaceService queue-by-default (issue #219)", () => {
   });
 });
 
+describe("SpaceService durable pending-turn recovery (issue #312)", () => {
+  const durableDir = mkdtempSync(join(tmpdir(), "bottega-durable-turns-"));
+  const durableStores: Store[] = [];
+
+  /** A real SQLite store on its own temp path — the only way pending_turns actually persists (issue #312). */
+  function freshDurableStore(): Store {
+    const s = createStore(join(durableDir, `store-${durableStores.length}.db`));
+    durableStores.push(s);
+    return s;
+  }
+
+  afterAll(() => {
+    for (const s of durableStores) s.close();
+    rmSync(durableDir, { recursive: true, force: true });
+  });
+
+  test("a crash-mid-queue turn is recovered and delivered exactly once after restart; not re-delivered on a second restart", async () => {
+    const store = freshDurableStore();
+    const { adapter } = fakeAdapter();
+    const driver1 = new FakeDriver();
+    const service1 = makeSpaceService({ store, adapter, driver: driver1, onboardingChecks: () => [] });
+
+    // Turn 1 opens (streaming); an independent message QUEUES in memory AND
+    // persists to the durable pending_turns backstop (issue #312).
+    await service1.handleInboundMessage(msg({ text: "first", ts: "1.1" }));
+    const session1 = driver1.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    session1.streaming = true;
+    await service1.handleInboundMessage(msg({ text: "crash me", ts: "2.2" }));
+    expect(session1.prompts).toHaveLength(1); // queued, never prompted
+    expect((await store.listPendingTurns("slack:C1")).map((r) => r.ts)).toEqual(["2.2"]);
+
+    // Simulate a crash: stop the service WITHOUT the queued turn ever
+    // draining or settling, so the durable row is left 'pending' for a
+    // restart's recovery pass to re-serve exactly once.
+    await service1.stop();
+
+    // Restart against the SAME store: a fresh SpaceService cold-starts from
+    // the durable backstop and recovers the crash-mid-queue turn.
+    const { adapter: adapter2 } = fakeAdapter();
+    const driver2 = new FakeDriver();
+    const service2 = makeSpaceService({ store, adapter: adapter2, driver: driver2 });
+    await service2.handleInboundMessage(msg({ text: "fresh after restart", ts: "9.1" }));
+    const session2 = driver2.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+
+    // The fresh turn 9.1 ends → the drained queue serves the RECOVERED turn
+    // exactly once as its own fresh turn (arrival order, own principal).
+    session2.emit("message", { spaceId: "slack:C1", text: "nine one reply" });
+    session2.streaming = false;
+    session2.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    expect(session2.prompts[1]).toEqual({ text: "crash me", opts: { principal: "U1" } });
+    expect(session2.prompts[2]).toBeUndefined();
+
+    // The recovered turn settled → the durable row is marked done so a
+    // SECOND restart never re-delivers it (issue #312 drain persistence).
+    const rows = await store.listPendingTurns("slack:C1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ ts: "2.2", status: "done" });
+    await service2.stop();
+
+    // A SECOND restart against the SAME store must NOT re-deliver the now-
+    // done turn: its recovery pass finds nothing eligible, so the next cold
+    // start only prompts fresh messages — "crash me" is never served again.
+    const { adapter: adapter3 } = fakeAdapter();
+    const driver3 = new FakeDriver();
+    const service3 = makeSpaceService({ store, adapter: adapter3, driver: driver3 });
+    await service3.handleInboundMessage(msg({ text: "third life", ts: "19.1" }));
+    const session3 = driver3.last();
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    session3.streaming = false;
+    session3.emit("message", { spaceId: "slack:C1", text: "third reply" });
+    session3.emit("turn_end", { spaceId: "slack:C1" });
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    // Only the fresh message prompted — the recovered turn was never re-served.
+    expect(session3.prompts.map((p) => p.text)).toEqual(["third life"]);
+    await service3.stop();
+    store.close();
+  });
+
+  test("a completed turn is never re-delivered: recovery returns nothing once done", async () => {
+    const store = freshDurableStore();
+    await store.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "done already" });
+    await store.completePendingTurn("slack:C1", "1.1");
+
+    // A restart's recovery pass must not re-serve a completed turn.
+    expect(await store.recoverPendingTurns("slack:C1", 60_000)).toEqual([]);
+    expect((await store.listPendingTurns("slack:C1"))[0]?.status).toBe("done");
+    store.close();
+  });
+
+  test("two racing recoveries claim a pending turn for exactly one claimant", async () => {
+    const store = freshDurableStore();
+    await store.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "race me" });
+
+    // Two restart passes racing the same claim: the store's atomic lease
+    // must hand the row to exactly ONE claimant (the loser sees the winner's
+    // fresh 'claimed' lease and gets nothing).
+    const [first, second] = await Promise.all([
+      store.recoverPendingTurns("slack:C1", 60_000),
+      store.recoverPendingTurns("slack:C1", 60_000),
+    ]);
+    const claimants = [first, second].filter((claims) => claims.length === 1);
+    expect(claimants).toHaveLength(1);
+    expect(claimants[0]?.[0]).toMatchObject({ spaceId: "slack:C1", ts: "1.1", text: "race me" });
+    store.close();
+  });
+
+  test("a claimed-but-unfinished turn is reclaimed only after its lease expires (crash-mid-drain)", async () => {
+    const store = freshDurableStore();
+    await store.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "leased" });
+
+    // First recovery claims the turn under a lease (status 'claimed').
+    const claimed = await store.recoverPendingTurns("slack:C1", 60_000);
+    expect(claimed).toHaveLength(1);
+
+    // Within the lease window a racing/restart recovery must NOT reclaim it.
+    expect(await store.recoverPendingTurns("slack:C1", 60_000)).toEqual([]);
+
+    // Force the lease to expire, then recover: the crash-mid-drain turn is
+    // reclaimed exactly once (never lost) — but the same lease semantics
+    // still prevent a second concurrent recovery from double-claiming.
+    store
+      .getDb()
+      .query("UPDATE pending_turns SET lease_until = 1 WHERE space_id = ? AND ts = ?")
+      .run("slack:C1", "1.1");
+    const [a, b] = await Promise.all([
+      store.recoverPendingTurns("slack:C1", 60_000),
+      store.recoverPendingTurns("slack:C1", 60_000),
+    ]);
+    const claimants = [a, b].filter((claims) => claims.length === 1);
+    expect(claimants).toHaveLength(1);
+    expect(claimants[0]?.[0]).toMatchObject({ spaceId: "slack:C1", ts: "1.1", text: "leased" });
+    store.close();
+  });
+});
+
 describe("SpaceService threaded inbound turns (issue #289)", () => {
   test("two sequential requests in one Slack thread get reaction-only receipts and two distinct final replies under the same root", async () => {
     const { adapter, posts, updates, reactions, streams } = fakeAdapter();
