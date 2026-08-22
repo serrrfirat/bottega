@@ -1,6 +1,6 @@
 
 /** Complete, policy-gated lifecycle for the selected space's skill tier. */
-import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { channelFromSpaceId } from "../server/adapters/slack";
@@ -97,10 +97,6 @@ export interface SpaceSkillsToolOpts {
   mutationHook?: SkillsResolveOpts["mutationHook"];
 }
 
-function spaceIdFromContext(ctx: ExtensionContext): string | undefined {
-  return sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
-}
-
 async function ensureAuditSpace(store: Store, spaceId: string): Promise<void> {
   await store.getOrCreateSpace({ platform: "slack", channel_id: channelFromSpaceId(spaceId) });
 }
@@ -122,7 +118,7 @@ export function spaceSkillToolDefinitions(store: Store, opts: SpaceSkillsToolOpt
     parameters: listSpaceSkillsArgsSchema,
     approval: "read",
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const spaceId = spaceIdFromContext(ctx);
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("space skills require a space session");
       try {
         await ensureAuditSpace(store, spaceId);
@@ -149,7 +145,7 @@ export function spaceSkillToolDefinitions(store: Store, opts: SpaceSkillsToolOpt
     parameters: getSpaceSkillArgsSchema,
     approval: "read",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const spaceId = spaceIdFromContext(ctx);
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("space skills require a space session");
       try {
         await ensureAuditSpace(store, spaceId);
@@ -181,7 +177,7 @@ export function spaceSkillToolDefinitions(store: Store, opts: SpaceSkillsToolOpt
     parameters: createSpaceSkillArgsSchema,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const spaceId = spaceIdFromContext(ctx);
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("space skills require a space session");
       try {
         await ensureAuditSpace(store, spaceId);
@@ -214,7 +210,7 @@ export function spaceSkillToolDefinitions(store: Store, opts: SpaceSkillsToolOpt
     parameters: updateSpaceSkillArgsSchema,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const spaceId = spaceIdFromContext(ctx);
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("space skills require a space session");
       try {
         await ensureAuditSpace(store, spaceId);
@@ -266,7 +262,7 @@ export function spaceSkillToolDefinitions(store: Store, opts: SpaceSkillsToolOpt
     parameters: deleteSpaceSkillArgsSchema,
     approval: "exec",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const spaceId = spaceIdFromContext(ctx);
+      const spaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
       if (!spaceId) return toolError("space skills require a space session");
       try {
         await ensureAuditSpace(store, spaceId);

@@ -26,6 +26,7 @@ import type { MemoryProvider, MemorySaveInput, MemoryScopeKey } from "../memory/
 import { validateSaveInput } from "../memory/types";
 import type { MemoryScopeContext } from "../memory/scope";
 import { recallMemories, scopedSave } from "../memory/scope";
+import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { MEMORY_FORGET_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
@@ -140,14 +141,6 @@ function saveScopeKey(
   return { key: { kind: "channel", spaceId: ctx.spaceId } };
 }
 
-/** Resolves the invocation space id from the tool's session file (`<space>.jsonl`). */
-function spaceIdFromContext(ctx: { sessionManager?: { getSessionFile(): string | null | undefined } } | undefined): string | undefined {
-  const file = ctx?.sessionManager?.getSessionFile();
-  if (!file) return undefined;
-  const name = file.split("/").pop() ?? file;
-  return name.endsWith(".jsonl") ? name.slice(0, -".jsonl".length) : undefined;
-}
-
 export function memoryToolDefinitions(
   provider: MemoryProvider,
   opts: MemoryToolsExtensionOpts = {},
@@ -163,7 +156,7 @@ export function memoryToolDefinitions(
     parameters: memorySaveArgsSchema,
     approval: "write",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const spaceId = spaceIdFromContext(_ctx) ?? "";
+      const spaceId = sessionIdFromFilePath(_ctx?.sessionManager?.getSessionFile()) ?? "";
       const scopeCtx = opts.getScopeContext ? await opts.getScopeContext(spaceId) : undefined;
       // Derive the concrete writable scope key from the authenticated context.
       const writableKey = saveScopeKey(params.scope ?? defaultSaveKind(scopeCtx), scopeCtx);
@@ -222,7 +215,7 @@ export function memoryToolDefinitions(
     parameters: memorySearchArgsSchema,
     approval: "read",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const spaceId = spaceIdFromContext(_ctx) ?? "";
+      const spaceId = sessionIdFromFilePath(_ctx?.sessionManager?.getSessionFile()) ?? "";
       const scopeCtx = opts.getScopeContext ? await opts.getScopeContext(spaceId) : undefined;
       try {
         const entries = await recallMemories(
@@ -255,7 +248,7 @@ export function memoryToolDefinitions(
     parameters: memoryForgetArgsSchema,
     approval: "write",
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const spaceId = spaceIdFromContext(_ctx) ?? "";
+      const spaceId = sessionIdFromFilePath(_ctx?.sessionManager?.getSessionFile()) ?? "";
       const scopeCtx = opts.getScopeContext ? await opts.getScopeContext(spaceId) : undefined;
       if (provider.capabilities.forget !== "explicit") {
         return toolError(
