@@ -8,7 +8,7 @@ import { createAudit } from "../policy/audit";
 import { defaultPolicy, type ResponseMode } from "../policy/config";
 import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { createStore, type Store, type WorkItemState } from "../store/db";
-import { sha256Hex } from "../tools/memory";
+import { sha256Hex } from "../tools/helpers";
 import type { SchedulerActionContext } from "./types";
 import { standupDigestAction } from "./standup";
 

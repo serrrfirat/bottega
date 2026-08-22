@@ -21,6 +21,7 @@
  */
 import type { ExtensionFactory, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
+import { sha256Hex } from "./helpers";
 import type { MemoryProvider, MemorySaveInput, MemoryScopeKey } from "../memory/types";
 import { validateSaveInput } from "../memory/types";
 import type { MemoryScopeContext } from "../memory/scope";
@@ -239,11 +240,4 @@ export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryTools
   return (pi) => {
     for (const definition of memoryToolDefinitions(provider, opts)) pi.registerTool(definition);
   };
-}
-
-/** SHA-256 hex digest: the audit stores the hash of saved content, never the content. */
-export function sha256Hex(text: string): string {
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(text);
-  return hasher.digest("hex");
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
+import { withTimeout } from "../../tools/helpers";
 import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import { z } from "zod";
@@ -1080,7 +1081,11 @@ export class SpaceService {
       const instruction = marker
         ? `Summarize the messages in this conversation since ${marker} as a compact bulleted digest. Reply with only the digest text, no preamble.`
         : "Summarize this conversation so far as a compact bulleted digest. Reply with only the digest text, no preamble.";
-      await withTimeout(live.session.prompt(instruction, { silent: true }), this.#digestTimeoutMs);
+      await withTimeout(
+        live.session.prompt(instruction, { silent: true }),
+        this.#digestTimeoutMs,
+        `digest turn timed out after ${this.#digestTimeoutMs}ms`,
+      );
     } finally {
       offMessage();
       presenter.endDigest();
@@ -1100,22 +1105,4 @@ export class SpaceService {
       console.error(`[space-service] digest.failed audit write failed for ${spaceId}:`, err);
     }
   }
-}
-
-/** Rejects with a timeout error after `ms`; the underlying promise keeps running. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`digest turn timed out after ${ms}ms`)), ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
 }

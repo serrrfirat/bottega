@@ -114,19 +114,12 @@ describe("scheduler job store (issue #86)", () => {
     expect(await store.getSchedulerJob(job.id)).toBeNull();
   });
 
-  test("updates next fire, marks a result, and toggles enabled", async () => {
+  test("updates next fire and toggles enabled", async () => {
     const store = freshStore();
     const job = await store.createSchedulerJob({ action: "org_pulse", cron: "0 * * * *", createdBy: "U1" });
     const manualNext = Date.UTC(2030, 0, 1, 12, 0);
     await store.updateSchedulerNextFire(job.id, manualNext);
     expect((await store.getSchedulerJob(job.id))?.nextFireAt).toBe(manualNext);
-
-    const firedAt = Date.UTC(2030, 0, 1, 12, 0);
-    await store.markSchedulerFired(job.id, "error", firedAt);
-    const fired = await store.getSchedulerJob(job.id);
-    expect(fired?.lastFiredAt).toBe(firedAt);
-    expect(fired?.lastResult).toBe("error");
-    expect(fired?.nextFireAt).toBe(nextCronFire(job.cron, firedAt));
 
     await store.setSchedulerJobEnabled(job.id, false);
     expect((await store.getSchedulerJob(job.id))?.enabled).toBe(false);

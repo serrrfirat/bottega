@@ -7,8 +7,7 @@ import {
   WORK_ITEM_FAILED_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "../store/audit-events";
-import { errorMessage } from "../tools/helpers";
-import { sha256Hex } from "../tools/memory";
+import { errorMessage, sha256Hex } from "../tools/helpers";
 import { proactiveEnabled } from "./proactive-config";
 import type { SchedulerAction } from "./types";
 import { z } from "zod";

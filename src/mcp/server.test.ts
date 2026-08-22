@@ -22,7 +22,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type AuditRow, type Store, type ExtensionCredential } from "../store/db";
-import { sha256Hex } from "../tools/memory";
+import { sha256Hex } from "../tools/helpers";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import { type JsonValue } from "../memory/mem0";
 import type { JsonObject } from "../extensions/manifest";

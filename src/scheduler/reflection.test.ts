@@ -15,7 +15,7 @@ import {
   WORK_ITEM_TRANSITION_EVENT,
 } from "../store/audit-events";
 import { createStore, type Store, type WorkItemState } from "../store/db";
-import { sha256Hex } from "../tools/memory";
+import { sha256Hex } from "../tools/helpers";
 import { reflectionAction } from "./reflection";
 import type { SchedulerActionContext } from "./types";
 

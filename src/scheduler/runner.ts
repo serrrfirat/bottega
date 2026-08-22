@@ -16,7 +16,7 @@ import {
   SCHEDULER_MISSED_EVENT,
 } from "../store/audit-events";
 import type { Store } from "../store/db";
-import { errorMessage } from "../tools/helpers";
+import { errorMessage, withTimeout } from "../tools/helpers";
 import { nextCronFire } from "./cron";
 import type {
   SchedulerActionContext,
@@ -50,24 +50,6 @@ export interface SchedulerDeps extends Omit<SchedulerTickDeps, "now" | "firstTic
 export interface Scheduler {
   start(): void;
   stop(): void;
-}
-
-/** Rejects after a bounded duration; the underlying action promise cannot be cancelled. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`scheduler action timed out after ${ms}ms`)), ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
 }
 
 async function auditError(
@@ -160,9 +142,11 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
         if (invocationParams.space === undefined && invocation.spaceId !== null) {
           invocationParams.space = invocation.spaceId;
         }
+        const timeoutMs = deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS;
         await withTimeout(
           action.run(invocationParams, context),
-          deps.fireTimeoutMs ?? DEFAULT_SCHEDULER_FIRE_TIMEOUT_MS,
+          timeoutMs,
+          `scheduler action timed out after ${timeoutMs}ms`,
         );
       } catch (error) {
         fireResult = "error";

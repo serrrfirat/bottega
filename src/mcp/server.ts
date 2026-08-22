@@ -92,8 +92,8 @@ import {
 } from "../policy/config";
 import { summarizeToolArgs } from "../policy/gate";
 import { MEMORY_WRITE_EVENT, POLICY_DECISION_EVENT } from "../store/audit-events";
-import { errorMessage } from "../tools/helpers";
-import { memorySaveArgsSchema, memorySearchArgsSchema, sha256Hex } from "../tools/memory";
+import { errorMessage, sha256Hex } from "../tools/helpers";
+import { memorySaveArgsSchema, memorySearchArgsSchema } from "../tools/memory";
 import {
   connectExtension,
   connectViaAuthBroker,
