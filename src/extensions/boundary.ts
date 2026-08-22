@@ -73,6 +73,26 @@ export function proxyBoundaryControlFromEnv(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
+ * Post the extension boundary's proxy-control reload (issue #123) and return
+ * the raw Response. Callers apply their own status/error policy — the
+ * call-scoped boundary throws (fail closed), the egress/catalog writers warn
+ * and keep the regenerated config (best effort). Shared so the hand-rolled
+ * `fetch(.../v1/reload, { method: "POST", headers })` isn't duplicated at
+ * each reload site (catalog-register, egress-reconcile, boundary).
+ */
+export async function postProxyReload(
+  control: { proxyControlUrl?: string; proxyControlToken?: string },
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  return fetchImpl(`${control.proxyControlUrl}/v1/reload`, {
+    method: "POST",
+    headers: control.proxyControlToken
+      ? { Authorization: `Bearer ${control.proxyControlToken}` }
+      : undefined,
+  });
+}
+
+/**
  * The credential reference a secret resolver resolves (issue #190) —
  * metadata only, the same fields the ladder's registry row carries; the
  * secret payload never enters it.
@@ -508,12 +528,10 @@ export function createSecretFileBoundary(
     }
     let response: Response;
     try {
-      response = await fetchImpl(`${opts.proxyControlUrl}/v1/reload`, {
-        method: "POST",
-        headers: opts.proxyControlToken
-          ? { Authorization: `Bearer ${opts.proxyControlToken}` }
-          : undefined,
-      });
+      response = await postProxyReload(
+        { proxyControlUrl: opts.proxyControlUrl, proxyControlToken: opts.proxyControlToken },
+        fetchImpl,
+      );
     } catch (err) {
       throw new Error(`extension credential boundary: proxy reload failed: ${errorMessage(err)}`);
     }

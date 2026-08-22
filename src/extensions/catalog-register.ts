@@ -44,7 +44,7 @@
  */
 import type { AuditModule } from "../policy/audit";
 import { errorMessage } from "../tools/helpers";
-import { proxyBoundaryControlFromEnv } from "./boundary";
+import { postProxyReload, proxyBoundaryControlFromEnv } from "./boundary";
 import {
   buildSnapshotDraft,
   CatalogError,
@@ -505,13 +505,7 @@ export async function registerExtensionAtRuntime(
   const control = proxyBoundaryControlFromEnv();
   if (control.proxyControlUrl !== undefined) {
     try {
-      const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
-        method: "POST",
-        headers:
-          control.proxyControlToken !== undefined
-            ? { Authorization: `Bearer ${control.proxyControlToken}` }
-            : undefined,
-      });
+      const res = await postProxyReload(control);
       if (!res.ok) throw new Error(`proxy reload failed (${res.status})`);
     } catch (err) {
       warnings.push(

@@ -33,7 +33,7 @@ import {
   regenerateDevEgressConfig,
   regenerateEgressConfig,
 } from "../egress/generate";
-import { proxyBoundaryControlFromEnv } from "./boundary";
+import { postProxyReload, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { resolve } from "node:path";
 import type { Store } from "../store/db";
@@ -123,10 +123,7 @@ export function createReconcileEgress(deps: ReconcileEgressDeps): ReconcileEgres
     // 3. Reload the running proxy via the existing control boundary.
     if (proxyControl.proxyControlUrl !== undefined && proxyControl.proxyControlToken !== undefined) {
       try {
-        const res = await fetch(`${proxyControl.proxyControlUrl}/v1/reload`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${proxyControl.proxyControlToken}` },
-        });
+        const res = await postProxyReload(proxyControl);
         if (!res.ok) {
           warnings.push(`egress reconcile: proxy reload failed (${res.status})`);
         } else {
