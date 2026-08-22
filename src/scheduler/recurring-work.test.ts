@@ -13,7 +13,11 @@ type AuditInput = Parameters<AuditModule["appendAudit"]>[0];
 const stores: Store[] = [];
 
 const unusedMemory: MemoryProvider = {
-  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  capabilities: {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+    forget: "unsupported",
+  },
   async pruneDigests() {
     throw new Error("recurring work must not prune memory");
   },
@@ -22,6 +26,9 @@ const unusedMemory: MemoryProvider = {
   },
   async search() {
     return [];
+  },
+  async forget() {
+    throw new Error("fake memory provider does not support forget");
   },
 };
 

@@ -38,7 +38,11 @@ function context(overrides: { postError?: Error } = {}) {
       },
     },
     memoryProvider: {
-      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      capabilities: {
+        consolidation: "unsupported",
+        digestPruning: "unsupported",
+        forget: "unsupported",
+      },
       async pruneDigests() {
         throw new Error("send_message must not prune memory");
       },
@@ -47,6 +51,9 @@ function context(overrides: { postError?: Error } = {}) {
       },
       async search() {
         return [];
+      },
+      async forget() {
+        throw new Error("fake memory provider does not support forget");
       },
     },
     async postMessage(spaceId, text) {
@@ -104,7 +111,11 @@ describe("sendMessageAction (issue #220)", () => {
       audit,
       registry,
       memoryProvider: {
-        capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+        capabilities: {
+          consolidation: "unsupported",
+          digestPruning: "unsupported",
+          forget: "unsupported",
+        },
         async pruneDigests() {
           throw new Error("unused memory prune");
         },
@@ -113,6 +124,9 @@ describe("sendMessageAction (issue #220)", () => {
         },
         async search() {
           return [];
+        },
+        async forget() {
+          throw new Error("fake memory provider does not support forget");
         },
       },
       async postMessage(spaceId, text) {

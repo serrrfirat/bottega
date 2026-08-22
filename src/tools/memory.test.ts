@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "@oh-my-pi/pi-coding-agent";
 import type { AuditModule } from "../policy/audit";
-import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery, MemoryTombstone } from "../memory/types";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import type { MemoryScopeContext } from "../memory/scope";
 import { memoryToolsExtension } from "./memory";
@@ -19,10 +19,14 @@ class FakeProvider implements MemoryProvider {
   readonly capabilities = {
     consolidation: "unsupported",
     digestPruning: "unsupported",
+    forget: "unsupported",
   } as const;
 
   async pruneDigests(): Promise<number> {
     throw new Error("memory tool must not prune memory");
+  }
+  async forget(): Promise<MemoryTombstone> {
+    throw new Error("fake memory provider does not support forget");
   }
   saved: MemorySaveInput[] = [];
   searched: MemorySearchQuery[] = [];
@@ -30,12 +34,21 @@ class FakeProvider implements MemoryProvider {
 
   async save(input: MemorySaveInput) {
     this.saved.push(input);
+    const scopeLabel =
+      input.scope.kind === "person"
+        ? `person:${input.scope.principal}`
+        : input.scope.kind === "channel"
+          ? `channel:${input.scope.spaceId}`
+          : input.scope.kind === "team"
+            ? `team:${input.scope.teamId}`
+            : "org";
     return {
       id: `mem_${this.next++}`,
       key: input.scope,
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: 1000,
+      provenance: { source: "tool", spaceId: null, principal: null, scopeLabel },
     };
   }
 
@@ -48,6 +61,19 @@ class FakeProvider implements MemoryProvider {
         content: "found",
         metadata: {},
         createdAt: 2000,
+        provenance: {
+          source: "tool",
+          spaceId: null,
+          principal: null,
+          scopeLabel:
+            query.scope.kind === "person"
+              ? `person:${query.scope.principal}`
+              : query.scope.kind === "channel"
+                ? `channel:${query.scope.spaceId}`
+                : query.scope.kind === "team"
+                  ? `team:${query.scope.teamId}`
+                  : "org",
+        },
       },
     ];
   }
@@ -64,6 +90,8 @@ interface AuditPayload {
   scope?: string;
   id?: string;
   content_hash?: string;
+  /** `memory.forget` provenance source (issue #163). */
+  source?: string;
   /** `memory.recalled` per-scope counts (issue #137); never query or memory content. */
   scopes?: Array<{ scope: string; key: string; count: number }>;
 }
@@ -226,9 +254,12 @@ describe("memory.save", () => {
 
   test("provider failures surface as tool errors", async () => {
     const failing: MemoryProvider = {
-      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      capabilities: { consolidation: "unsupported", digestPruning: "unsupported", forget: "unsupported" },
       pruneDigests: async () => {
         throw new Error("unused memory prune");
+      },
+      forget: async () => {
+        throw new Error("fake memory provider does not support forget");
       },
       save: async () => {
         throw new Error("disk full");
@@ -328,6 +359,76 @@ describe("memory.search", () => {
       expect(resultText(res)).toMatch(/limit/);
     }
     expect(provider.searched).toHaveLength(0);
+  });
+});
+
+describe("memory.forget (#163)", () => {
+  test("forget removes an entry from recall and audits with the forget event", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-memforget-"));
+    try {
+      const db = new Database(join(dir, "memory.db"));
+      const provider = createSqliteMemoryProvider(db);
+      const { audit, rows } = fakeAudit();
+      const tools = loadTools(provider, { audit });
+      const saveTool = tools.find((t) => t.name === "memory.save")!;
+      const forgetTool = tools.find((t) => t.name === "memory.forget")!;
+
+      const saved = await saveTool.execute(
+        "tc1",
+        { content: "forget me via tool", scope: "org" },
+        undefined,
+        undefined,
+        noopCtx,
+      );
+      expect(saved.isError).not.toBe(true);
+      const { id } = JSON.parse(resultText(saved));
+
+      const res = await forgetTool.execute("tc1", { id, scope: "org" }, undefined, undefined, noopCtx);
+      expect(res.isError).not.toBe(true);
+      expect(JSON.parse(resultText(res))).toEqual({ id, scope: "org", forgotten: true });
+
+      // Not recalled anymore.
+      const searchTool = tools.find((t) => t.name === "memory.search")!;
+      const found = await searchTool.execute("tc1", { query: "forget me via tool", scope: "org" }, undefined, undefined, noopCtx);
+      expect(JSON.parse(resultText(found))).toHaveLength(0);
+
+      // Audited with the forget event: id + scope, never content.
+      const forgetRow = rows.find((r) => r.event_type === "memory.forget")!;
+      expect(forgetRow.payload).toEqual({ id, scope: "org", source: "tool" });
+      expect(JSON.stringify(rows)).not.toContain("forget me via tool");
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("forget is refused loudly when the backend cannot forget (no hard delete)", async () => {
+    const provider = new FakeProvider(); // forget: unsupported
+    const { audit, rows } = fakeAudit();
+    const forgetTool = loadTools(provider, { audit }).find((t) => t.name === "memory.forget")!;
+    const res = await forgetTool.execute("tc1", { id: "mem_1", scope: "org" }, undefined, undefined, noopCtx);
+    expect(res.isError).toBe(true);
+    expect(resultText(res)).toMatch(/not supported by the configured memory backend/);
+    // Nothing audited: a refused forget writes no row.
+    expect(rows).toHaveLength(0);
+  });
+
+  test("forget cannot target a non-writable scope kind", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-memforget-"));
+    try {
+      const db = new Database(join(dir, "memory.db"));
+      const provider = createSqliteMemoryProvider(db); // forget: explicit
+      const forgetTool = loadTools(provider, {
+        getScopeContext: () => ({ spaceId: "slack:C1", principal: "U9", directMessage: false, teamId: undefined }),
+      }).find((t) => t.name === "memory.forget")!;
+      // In a shared channel, channel is writable but person is not.
+      const res = await forgetTool.execute("tc1", { id: "mem_1", scope: "person" }, undefined, undefined, noopCtx);
+      expect(res.isError).toBe(true);
+      expect(resultText(res)).toMatch(/cannot write that scope/);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

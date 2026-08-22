@@ -39,6 +39,7 @@ import { recurringWorkAction } from "../scheduler/recurring-work";
 import { sendMessageAction } from "../scheduler/send-message";
 import { kbIngestAction } from "../scheduler/kb-ingest";
 import { governanceDigestAction } from "../scheduler/governance-digest";
+import { memoryReviewAction } from "../scheduler/memory-review";
 import { createIngestPollAction } from "../ingest/poll-action";
 import { regenerateModelsConfig } from "../models/generate";
 import { connectViaAuthBroker } from "../extensions/connect";
@@ -300,6 +301,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // "ingest_poll" job (create_scheduler_job, params.space = target).
     createIngestPollAction(),
     governanceDigestAction,
+    memoryReviewAction,
   ]);
   const kbDeps: KbToolDependencies = {
     store,

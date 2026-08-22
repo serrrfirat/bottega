@@ -68,6 +68,13 @@ export const MEMORY_WRITE_EVENT = "memory.write";
 /** Automatic memory extraction completed (payload {scope, count}; actor = system). */
 export const MEMORY_AUTO_SAVED_EVENT = "memory.auto_saved";
 /**
+ * Memory forgotten with a durable tombstone (issue #163): payload
+ * {scope, id, source} — the entry id and provenance source, never content.
+ * The tombstone itself is the durable record; this audit row joins the
+ * forget to its requester.
+ */
+export const MEMORY_FORGET_EVENT = "memory.forget";
+/**
  * Permission-aware memory recall (issue #137): payload {scopes:[{scope,key,count}]}
  * with actor = requester principal, space_id = the space — scopes only, never
  * query or memory content. Appended after every successful recall (even zero
@@ -258,3 +265,11 @@ export const OPERATOR_HOME_READ_EVENT = "operator.home_read";
 export const GOVERNANCE_DIGEST_POSTED_EVENT = "governance_digest.posted";
 /** Weekly governance digest could not be delivered (payload {reason}; audit redaction still applies). */
 export const GOVERNANCE_DIGEST_FAILED_EVENT = "governance_digest.failed";
+/**
+ * Weekly memory review delivered (issue #163): payload carries aggregate
+ * counts (recallable, forgotten) + next_review_date — never memory content
+ * and never the full review text.
+ */
+export const MEMORY_REVIEW_POSTED_EVENT = "memory.review_posted";
+/** Weekly memory review could not be delivered (payload {reason}; never content). */
+export const MEMORY_REVIEW_FAILED_EVENT = "memory.review_failed";

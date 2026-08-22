@@ -26,7 +26,7 @@ import type { MemoryProvider, MemorySaveInput, MemoryScopeKey } from "../memory/
 import { validateSaveInput } from "../memory/types";
 import type { MemoryScopeContext } from "../memory/scope";
 import { recallMemories, scopedSave } from "../memory/scope";
-import { MEMORY_WRITE_EVENT } from "../store/audit-events";
+import { MEMORY_FORGET_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { errorMessage, toolError } from "./helpers";
 import type { AuditModule } from "../policy/audit";
 
@@ -87,6 +87,16 @@ export const memorySearchArgsSchema = z.object({
   // scope kind; omitted → all derived readable scopes (org always included).
   scope: z.enum(["org", "person", "channel", "team", "all"]).optional(),
   limit: z.number().int().optional(),
+});
+/**
+ * Issue #163: forget-with-tombstone. The model names the entry id and an
+ * optional writable scope KIND; the concrete scope key is derived from the
+ * authenticated context (same policy gate as memory.save). Forgetting is a
+ * destructive write and is approval-gated accordingly.
+ */
+export const memoryForgetArgsSchema = z.object({
+  id: z.string().min(1),
+  scope: z.enum(["org", "person", "channel"]).optional(),
 });
 
 /**
@@ -233,7 +243,53 @@ export function memoryToolDefinitions(
     },
   };
 
-  return [save, search];
+  const forget: ToolDefinition<typeof memoryForgetArgsSchema> = {
+    name: "memory.forget",
+    label: "Forget memory",
+    description:
+      "Forget-with-tombstone (issue #163): removes a saved memory entry from recall and leaves a durable " +
+      "tombstone so it is never re-injected or silently hard-deleted. The entry id must belong to a writable " +
+      "scope (your own person memory in a DM, the current channel, or org-shared memory). When the configured " +
+      "memory backend cannot forget (e.g. mem0 has no delete endpoint) this tool refuses loudly. Destructive " +
+      "write: prompts for approval in non-yolo modes.",
+    parameters: memoryForgetArgsSchema,
+    approval: "write",
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const spaceId = spaceIdFromContext(_ctx) ?? "";
+      const scopeCtx = opts.getScopeContext ? await opts.getScopeContext(spaceId) : undefined;
+      if (provider.capabilities.forget !== "explicit") {
+        return toolError(
+          "memory.forget is not supported by the configured memory backend; " +
+            "the backend has no delete path and cannot leave a tombstone — refusing to hard-delete (issue #163)",
+        );
+      }
+      // Derive the concrete writable scope key (same derivation as memory.save).
+      const kind = params.scope ?? defaultSaveKind(scopeCtx);
+      const writableKey = saveScopeKey(kind, scopeCtx);
+      if (!writableKey) {
+        return toolError(
+          "memory.forget: this conversation cannot write that scope (person requires a DM; channel requires a shared channel)",
+        );
+      }
+      try {
+        await provider.forget({ scope: writableKey.key, id: params.id });
+      } catch (err) {
+        return toolError(errorMessage(err));
+      }
+      await opts.audit?.appendAudit({
+        actor: scopeCtx?.principal ?? "agent",
+        event_type: MEMORY_FORGET_EVENT,
+        payload: {
+          scope: writableKey.key.kind,
+          id: params.id,
+          source: "tool",
+        },
+      });
+      return { content: [{ type: "text", text: JSON.stringify({ id: params.id, scope: writableKey.key.kind, forgotten: true }) }] };
+    },
+  };
+
+  return [save, search, forget];
 }
 
 export function memoryToolsExtension(provider: MemoryProvider, opts: MemoryToolsExtensionOpts = {}): ExtensionFactory {

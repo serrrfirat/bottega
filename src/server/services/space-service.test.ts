@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext, Skill, TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { createStore, type Store } from "../../store/db";
-import type { MemoryProvider, MemoryProviderCapabilities, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
+import type { MemoryForgetInput, MemoryProvider, MemoryProviderCapabilities, MemorySaveInput, MemorySearchQuery } from "../../memory/types";
+import { scopeKeyLabel } from "../../memory/types";
 import { sessionFilePath, SessionModelRoleRegistry, FORBIDDEN_SPACE_HOST_TOOLS, spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type AgentTurnOptions } from "../drivers/agent-driver";
 import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE, SLACK_FORMAT_DIRECTIVE, EMPTY_TURN_LIMIT, EMPTY_RESPONSE_FALLBACK, CHURN_MESSAGE, STREAM_UPDATE_INTERVAL_MS, THINKING_PHRASES, emptyResponseFallback, churnMessageText, CorrectionClassifier, classifyCorrection, type MessageClass } from "./space-service";
 import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
@@ -229,6 +230,7 @@ class FakeMemoryProvider implements MemoryProvider {
     readonly capabilities: MemoryProviderCapabilities = {
       consolidation: "explicit",
       digestPruning: "explicit",
+      forget: "explicit",
     },
   ) {}
 
@@ -247,6 +249,7 @@ class FakeMemoryProvider implements MemoryProvider {
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: 1000,
+      provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: scopeKeyLabel(input.scope) },
     };
   }
 
@@ -262,6 +265,7 @@ class FakeMemoryProvider implements MemoryProvider {
               content: "digest",
               metadata: { kind: "digest", space: newest.space, since: newest.since, until: newest.until },
               createdAt: 1000,
+              provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: "org" },
             },
           ]
         : [];
@@ -272,6 +276,10 @@ class FakeMemoryProvider implements MemoryProvider {
   async pruneDigests(spaceId: string, keep: number): Promise<number> {
     this.prunes.push({ spaceId, keep });
     return 0;
+  }
+
+  async forget(input: MemoryForgetInput) {
+    return { id: input.id, key: input.scope, forgottenAt: Date.now() };
   }
 }
 
@@ -2418,6 +2426,7 @@ describe("SpaceService digest-on-idle", () => {
     const provider = new FakeMemoryProvider({
       consolidation: "on-save",
       digestPruning: "unsupported",
+      forget: "unsupported",
     });
     const service = makeSpaceService({ store, adapter, driver, memoryProvider: provider });
 

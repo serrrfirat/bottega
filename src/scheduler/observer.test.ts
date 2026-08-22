@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import type { AuditModule } from "../policy/audit";
-import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery, MemoryTombstone } from "../memory/types";
 import { OBSERVER_READ_EVENT } from "../store/audit-events";
 import type { Space, Store } from "../store/db";
 import type { SchedulerActionContext } from "./types";
@@ -20,6 +20,7 @@ class FakeMemoryProvider implements MemoryProvider {
   readonly capabilities = {
     consolidation: "unsupported",
     digestPruning: "unsupported",
+    forget: "unsupported",
   } as const;
 
   async pruneDigests(): Promise<number> {
@@ -31,6 +32,10 @@ class FakeMemoryProvider implements MemoryProvider {
 
   async save(_input: MemorySaveInput): Promise<MemoryEntry> {
     throw new Error("observer must not save memory");
+  }
+
+  async forget(): Promise<MemoryTombstone> {
+    throw new Error("fake memory provider does not support forget");
   }
 
   async search(query: MemorySearchQuery): Promise<MemoryEntry[]> {
@@ -60,6 +65,7 @@ function memory(
     content,
     metadata: { kind, ...metadata },
     createdAt,
+    provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: "org" },
   };
 }
 

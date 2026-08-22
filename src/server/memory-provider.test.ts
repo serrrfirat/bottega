@@ -91,6 +91,7 @@ describe("resolveMemoryProvider (issue #43)", () => {
       expect(provider.capabilities).toEqual({
         consolidation: "on-save",
         digestPruning: "unsupported",
+        forget: "unsupported",
       });
       const saved = await provider.save({ scope: { kind: "org" }, content: "selection test fact" });
       expect(saved.content).toBe("selection test fact");
@@ -133,6 +134,7 @@ describe("resolveMemoryProvider (issue #43)", () => {
     expect(provider.capabilities).toEqual({
       consolidation: "explicit",
       digestPruning: "explicit",
+      forget: "explicit",
     });
     const saved = await provider.save({ scope: { kind: "org" }, content: "sqlite fallback fact" });
     expect(saved.id).toBeTruthy();

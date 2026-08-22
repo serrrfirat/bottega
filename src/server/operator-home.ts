@@ -16,6 +16,7 @@ const RECENT_OUTCOME_EVENTS = {
   "job.failed": true,
   "outbox.failed": true,
   "governance_digest.failed": true,
+  "memory.review_failed": true,
 } satisfies Readonly<Record<string, true>>;
 
 export interface OperatorViewer {

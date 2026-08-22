@@ -33,7 +33,11 @@ function freshStore(): Store {
 }
 
 const unusedMemory: MemoryProvider = {
-  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  capabilities: {
+    consolidation: "unsupported",
+    digestPruning: "unsupported",
+    forget: "unsupported",
+  },
   pruneDigests: async () => {
     throw new Error("unused memory prune");
   },
@@ -41,6 +45,9 @@ const unusedMemory: MemoryProvider = {
     throw new Error("unused memory save");
   },
   search: async () => [],
+  forget: async () => {
+    throw new Error("fake memory provider does not support forget");
+  },
 };
 
 const jsonObjectSchema = z.record(z.string(), z.json());

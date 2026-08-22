@@ -397,10 +397,20 @@ describe("create_scheduler_job surface (issue #220)", () => {
       audit,
       registry,
       memoryProvider: {
-        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
-        save: async () => ({ id: "x", key: { kind: "org" }, content: "c", metadata: {}, createdAt: 0 }),
+        capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "explicit" },
+        save: async () => ({
+          id: "x",
+          key: { kind: "org" },
+          content: "c",
+          metadata: {},
+          createdAt: 0,
+          provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: "org" },
+        }),
         search: async () => [],
         pruneDigests: async () => 0,
+        forget: async () => {
+          throw new Error("store test provider does not support forget");
+        },
       },
       postMessage: async () => undefined,
       loadPolicy: async () => {

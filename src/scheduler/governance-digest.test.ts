@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MemoryEntry, MemoryProvider } from "../memory/types";
+import { scopeKeyLabel, type MemoryEntry, type MemoryProvider, type MemoryTombstone } from "../memory/types";
 import { createAudit } from "../policy/audit";
 import { loadSpacePolicy, parseOrgConfigYaml } from "../policy/config";
 import { createStore, type Store } from "../store/db";
@@ -23,15 +23,25 @@ function freshStore(): Store {
 }
 
 const memory: MemoryProvider = {
-  capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+  capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "explicit" },
   async save(input): Promise<MemoryEntry> {
-    return { id: "unused", key: input.scope, content: input.content, metadata: input.metadata ?? {}, createdAt: 0 };
+    return {
+      id: "unused",
+      key: input.scope,
+      content: input.content,
+      metadata: input.metadata ?? {},
+      createdAt: 0,
+      provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: scopeKeyLabel(input.scope) },
+    };
   },
   async search(): Promise<MemoryEntry[]> {
     return [];
   },
   async pruneDigests(): Promise<number> {
     return 0;
+  },
+  async forget(input): Promise<MemoryTombstone> {
+    return { id: input.id, key: input.scope, forgottenAt: Date.now() };
   },
 };
 

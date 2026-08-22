@@ -264,7 +264,11 @@ describe("reflectionAction (issue #93)", () => {
       payload: "{}",
     });
     const failingMemory: MemoryProvider = {
-      capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+      capabilities: {
+        consolidation: "unsupported",
+        digestPruning: "unsupported",
+        forget: "unsupported",
+      },
       async pruneDigests() {
         throw new Error("reflection must not prune memory");
       },
@@ -273,6 +277,9 @@ describe("reflectionAction (issue #93)", () => {
       },
       async search() {
         return [];
+      },
+      async forget() {
+        throw new Error("fake memory provider does not support forget");
       },
     };
 

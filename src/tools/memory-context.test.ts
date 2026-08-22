@@ -6,18 +6,22 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery, MemoryScopeKey, MemoryTombstone } from "../memory/types";
 import { MEMORY_INJECTION_PREFIX, memoryContextExtension, renderInjection, type MemoryContextExtensionOpts } from "./memory-context";
 
 type TestMessage = { role: "user" | "developer" | "assistant"; content: string; timestamp: number };
 
 function entry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
+  const key: MemoryScopeKey = overrides.key ?? { kind: "org" };
+  const scopeLabel =
+    key.kind === "person" ? `person:${key.principal}` : key.kind === "channel" ? `channel:${key.spaceId}` : key.kind === "team" ? `team:${key.teamId}` : "org";
   return {
     id: `mem_${Math.random()}`,
-    key: { kind: "org" },
+    key,
     content: "the org ships bottega weekly",
     metadata: {},
     createdAt: 1000,
+    provenance: { source: "tool", spaceId: null, principal: null, scopeLabel },
     ...overrides,
   };
 }
@@ -26,10 +30,14 @@ class FakeProvider implements MemoryProvider {
   readonly capabilities = {
     consolidation: "unsupported",
     digestPruning: "unsupported",
+    forget: "unsupported",
   } as const;
 
   async pruneDigests(): Promise<number> {
     throw new Error("memory context must not prune memory");
+  }
+  async forget(): Promise<MemoryTombstone> {
+    throw new Error("fake memory provider does not support forget");
   }
   searches: MemorySearchQuery[] = [];
   hits: MemoryEntry[] = [];

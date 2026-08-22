@@ -900,13 +900,16 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
     // default, so passing it through ready() is provable by observation.
     const supervisorProvider: ResolvedMemoryProvider = {
       backend: "mem0",
-      capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
+      capabilities: { consolidation: "on-save", digestPruning: "unsupported", forget: "unsupported" },
       save: async () => {
         throw new Error("unused in this test");
       },
       search: async () => [],
       pruneDigests: async () => {
         throw new Error("unused in this test");
+      },
+      forget: async () => {
+        throw new Error("fake memory provider does not support forget");
       },
     };
     const server = JobStoreRpcServer.create(store, job, rpcDir, {

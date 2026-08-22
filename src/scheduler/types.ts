@@ -32,7 +32,8 @@ export type SchedulerActionName =
   | "kb_ingest"
   | "send_message"
   | "memory_consolidation"
-  | "governance_digest";
+  | "governance_digest"
+  | "weekly_memory_review";
 
 /**
  * A durable scheduler job (issue #86). Stored in the `scheduler_jobs`

@@ -231,8 +231,9 @@ function applyActions(
 
     for (const content of adds) {
       db.query(
-        `INSERT INTO memories (id, scope, principal, content, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO memories (id, scope, principal, content, metadata_json, created_at,
+            mem_source, mem_space_id, mem_principal, mem_scope_label)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         `mem_${randomUUID()}`,
         pool.scope,
@@ -240,6 +241,12 @@ function applyActions(
         content,
         JSON.stringify(GENERATED_METADATA),
         at,
+        // Provenance (#163): consolidation-generated entries are labeled
+        // `consolidation`; the scope label is derived from the physical row.
+        "consolidation",
+        null,
+        null,
+        pool.scope === "org" ? "org" : `person:${pool.principal}`,
       );
       applied++;
     }

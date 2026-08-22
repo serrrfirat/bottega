@@ -133,13 +133,16 @@ describe("omp sdk agent driver", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-driver-"));
     try {
       const provider: MemoryProvider = {
-        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+        capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "explicit" },
         save: async () => {
           throw new Error("unused");
         },
         search: async () => [],
         pruneDigests: async () => {
           throw new Error("unused");
+        },
+        forget: async (input) => {
+          return { id: input.id, key: input.scope, forgottenAt: Date.now() };
         },
       };
       const driver = createOmpSdkDriver({

@@ -67,7 +67,7 @@ describe("memory consolidation trigger (issue #272)", () => {
     const deps: MemoryConsolidationTriggerDeps = {
       store,
       memoryProvider: {
-        capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
+        capabilities: { consolidation: "on-save", digestPruning: "unsupported", forget: "unsupported" },
       },
       log: () => {},
     };
@@ -83,7 +83,7 @@ describe("memory consolidation trigger (issue #272)", () => {
     const trigger = createMemoryConsolidationTrigger({
       store,
       memoryProvider: {
-        capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+        capabilities: { consolidation: "unsupported", digestPruning: "unsupported", forget: "unsupported" },
       },
     });
 
@@ -114,7 +114,7 @@ describe("memory consolidation trigger (issue #272)", () => {
     const trigger = createMemoryConsolidationTrigger({
       store: fakeStore,
       memoryProvider: {
-        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+        capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "explicit" },
       },
       log: () => {},
     });

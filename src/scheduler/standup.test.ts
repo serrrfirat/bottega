@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
-import type { MemoryProvider } from "../memory/types";
+import { scopeKeyLabel, type MemoryProvider } from "../memory/types";
 import { createAudit } from "../policy/audit";
 import { defaultPolicy, type ResponseMode } from "../policy/config";
 import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
@@ -280,7 +280,11 @@ describe("standupDigestAction (issue #92)", () => {
     const space = await createSpace(store, "NO_PRUNE", JSON.stringify({ proactive: { standup: true } }));
     let saves = 0;
     const unsupportedMemory: MemoryProvider = {
-      capabilities: { consolidation: "on-save", digestPruning: "unsupported" },
+      capabilities: {
+        consolidation: "on-save",
+        digestPruning: "unsupported",
+        forget: "unsupported",
+      },
       async save(input) {
         saves += 1;
         return {
@@ -289,6 +293,12 @@ describe("standupDigestAction (issue #92)", () => {
           content: input.content,
           metadata: input.metadata ?? {},
           createdAt: FIXED_NOW,
+          provenance: {
+            source: "tool",
+            spaceId: null,
+            principal: null,
+            scopeLabel: scopeKeyLabel(input.scope),
+          },
         };
       },
       async search() {
@@ -296,6 +306,9 @@ describe("standupDigestAction (issue #92)", () => {
       },
       async pruneDigests() {
         throw new Error("must not reach prune after the capability check");
+      },
+      async forget() {
+        throw new Error("fake memory provider does not support forget");
       },
     };
     const { ctx, posted } = context(store, { memoryProvider: unsupportedMemory });
@@ -317,7 +330,7 @@ describe("standupDigestAction (issue #92)", () => {
     const store = freshStore();
     const space = await createSpace(store, "FAIL", JSON.stringify({ proactive: { standup: true } }));
     const failingMemory: MemoryProvider = {
-      capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+      capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "explicit" },
       async pruneDigests() {
         return 0;
       },
@@ -326,6 +339,9 @@ describe("standupDigestAction (issue #92)", () => {
       },
       async search() {
         return [];
+      },
+      async forget(input) {
+        return { id: input.id, key: input.scope, forgottenAt: Date.now() };
       },
     };
     const { ctx } = context(store, { memoryProvider: failingMemory });

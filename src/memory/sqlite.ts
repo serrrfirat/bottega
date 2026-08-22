@@ -4,21 +4,27 @@
  * Default MemoryProvider for per-org self-hosted bottega. The provider
  * borrows the store's Database handle and keeps memories in the same SQLite
  * file (`data/bottega.db`), with zero external services. Save, search,
- * capability reporting, and derived-digest retention all stay behind the
- * MemoryProvider seam.
+ * capability reporting, derived-digest retention, and forget-with-tombstone
+ * all stay behind the MemoryProvider seam (issue #163).
  */
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
   MEMORY_LIMIT_DEFAULT,
   decodeScopeKey,
+  deriveProvenance,
   encodeScopeKey,
+  scopeKeyLabel,
+  validateForgetInput,
   validateSaveInput,
   validateSearchQuery,
   type MemoryEntry,
+  type MemoryForgetInput,
   type MemoryProvider,
   type MemorySaveInput,
+  type MemoryScopeKey,
   type MemorySearchQuery,
+  type MemoryTombstone,
 } from "./types";
 
 /** Idempotent base migration: same file as the store, provider-owned table. */
@@ -32,6 +38,45 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS memories_scope_principal ON memories (scope, principal);
+`;
+
+/**
+ * Idempotent provenance columns (#163). Existing databases created before the
+ * columns existed get them added; fresh creates already include them via the
+ * base migration. Guarded by PRAGMA table_info so it is safe to re-run.
+ */
+const PROVENANCE_COLUMNS = new Set(["mem_source", "mem_space_id", "mem_principal", "mem_scope_label"]);
+
+/** Adds any missing provenance columns (idempotent for fresh + legacy DBs). */
+function migrateProvenanceColumns(db: Database): void {
+  const existing = new Set(
+    (db.query("PRAGMA table_info(memories)").all() as { name: string }[]).map((row) => row.name),
+  );
+  const missing = [...PROVENANCE_COLUMNS].filter((column) => !existing.has(column));
+  for (const column of missing) {
+    db.exec(`ALTER TABLE memories ADD COLUMN ${column} TEXT`);
+  }
+}
+
+/**
+ * Tombstone table (#163). A forgotten entry's row is moved/duplicated here
+ * so the memory is never recalled and never silently hard-deleted — the
+ * tombstone is the durable record of the forget.
+ */
+const TOMBSTONE_MIGRATION = `
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('org', 'user')),
+  principal TEXT,
+  content TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  mem_source TEXT,
+  mem_space_id TEXT,
+  mem_principal TEXT,
+  mem_scope_label TEXT,
+  forgotten_at INTEGER NOT NULL
+);
 `;
 
 /**
@@ -93,6 +138,10 @@ type MemoryRow = {
   content: string;
   metadata_json: string;
   created_at: number;
+  mem_source: string | null;
+  mem_space_id: string | null;
+  mem_principal: string | null;
+  mem_scope_label: string | null;
 };
 
 function rowToEntry(row: MemoryRow): MemoryEntry {
@@ -106,7 +155,18 @@ function rowToEntry(row: MemoryRow): MemoryEntry {
     // SAFETY: save() writes metadata_json from the validated metadata map (string values), so parsing a stored row's JSON yields a string map.
     metadata: JSON.parse(row.metadata_json) as Record<string, string>,
     createdAt: row.created_at,
+    provenance: {
+      source: row.mem_source ?? "tool",
+      spaceId: row.mem_space_id,
+      principal: row.mem_principal,
+      scopeLabel: row.mem_scope_label ?? scopeLabelFallback(row.scope as "org" | "user", row.principal),
+    },
   };
+}
+
+/** Fallback label for legacy rows persisted before provenance columns existed. */
+function scopeLabelFallback(scope: "org" | "user", principal: string | null): string {
+  return decodeScopeKey(scope, principal).kind === "org" ? "org" : principal ?? "person";
 }
 
 /** Escapes LIKE wildcards so user input matches literally (ESCAPE '\' in SQL). */
@@ -149,6 +209,8 @@ export function createSqliteMemoryProvider(
   options: SqliteMemoryOptions = {},
 ): MemoryProvider {
   db.exec(BASE_MIGRATION);
+  migrateProvenanceColumns(db);
+  db.exec(TOMBSTONE_MIGRATION);
   const useFts = !options.forceFtsFallback && ftsAvailable();
   if (useFts) {
     db.exec(FTS_MIGRATION);
@@ -158,14 +220,16 @@ export function createSqliteMemoryProvider(
   }
 
   const insertStmt = db.query(
-    `INSERT INTO memories (id, scope, principal, content, metadata_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memories (id, scope, principal, content, metadata_json, created_at,
+        mem_source, mem_space_id, mem_principal, mem_scope_label)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const now = options.now ?? Date.now;
 
   const capabilities = {
     consolidation: "explicit",
     digestPruning: "explicit",
+    forget: "explicit",
   } as const;
 
   // NOTE: plain functions, not async — validators must throw synchronously so
@@ -176,6 +240,7 @@ export function createSqliteMemoryProvider(
     const id = `mem_${randomUUID()}`;
     const physical = encodeScopeKey(input.scope);
     const createdAt = now();
+    const provenance = deriveProvenance(input.scope, input.source, null, null);
     insertStmt.run(
       id,
       physical.scope,
@@ -183,6 +248,10 @@ export function createSqliteMemoryProvider(
       input.content,
       JSON.stringify(input.metadata ?? {}),
       createdAt,
+      provenance.source,
+      provenance.spaceId,
+      provenance.principal,
+      provenance.scopeLabel,
     );
     return Promise.resolve({
       id,
@@ -190,6 +259,7 @@ export function createSqliteMemoryProvider(
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt,
+      provenance,
     });
   }
 
@@ -229,7 +299,8 @@ export function createSqliteMemoryProvider(
     // SAFETY: the SELECT column list exactly matches MemoryRow; bun:sqlite returns plain objects with those columns.
     return db
       .query(
-        `SELECT id, scope, principal, content, metadata_json, created_at
+        `SELECT id, scope, principal, content, metadata_json, created_at,
+                mem_source, mem_space_id, mem_principal, mem_scope_label
          FROM memories
          WHERE ${clauses.join(" AND ")}
          ORDER BY created_at DESC, rowid DESC`,
@@ -256,6 +327,7 @@ export function createSqliteMemoryProvider(
     return db
       .query(
         `SELECT m.id, m.scope, m.principal, m.content, m.metadata_json, m.created_at,
+                m.mem_source, m.mem_space_id, m.mem_principal, m.mem_scope_label,
                 bm25(memories_fts) *
                   (1.0 + ? * (? / (? + MAX(? - m.created_at, 0)))) AS blended_rank
          FROM memories_fts
@@ -275,5 +347,102 @@ export function createSqliteMemoryProvider(
     return Promise.resolve(filterAndLimit(rows, query));
   }
 
-  return { capabilities, save, search, pruneDigests };
+  /**
+   * Forget-with-tombstone (#163): moves the row OUT of `memories` (so it is
+   * never recalled or re-injected) and INTO `memory_tombstones` (a durable
+   * record of the forget). Never a silent hard-delete. The entry id and its
+   * physical scope must both match for the forget to succeed — a caller can
+   * never forget another scope's entry by id alone.
+   */
+  function forget(input: MemoryForgetInput): Promise<MemoryTombstone> {
+    validateForgetInput(input);
+    const physical = encodeScopeKey(input.scope);
+    const forgottenAt = now();
+    try {
+      const tombstone = db.transaction((): MemoryTombstone => {
+        // Scope must match: a caller can never forget another scope's entry by
+        // id alone. Org rows have principal NULL; user rows match the exact
+        // physical principal composite.
+        const principalClause = physical.scope === "user" ? " AND principal = ?" : " AND principal IS NULL";
+        const params: (string | number)[] =
+          physical.scope === "user" ? [input.id, physical.scope, physical.principal ?? ""] : [input.id, physical.scope];
+        const existing = db
+          .query(
+            `SELECT id, scope, principal, content, metadata_json, created_at,
+                    mem_source, mem_space_id, mem_principal, mem_scope_label
+             FROM memories
+             WHERE id = ? AND scope = ?${principalClause}
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1`,
+          )
+          .get(...params) as MemoryRow | null;
+        if (!existing) {
+          throw new Error(
+            `memory.forget: no entry with id '${input.id}' in scope '${scopeKeyLabel(input.scope)}'`,
+          );
+        }
+        db.query(
+          `INSERT INTO memory_tombstones (
+             id, scope, principal, content, metadata_json, created_at,
+             mem_source, mem_space_id, mem_principal, mem_scope_label, forgotten_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          existing.id,
+          existing.scope,
+          existing.principal,
+          existing.content,
+          existing.metadata_json,
+          existing.created_at,
+          existing.mem_source,
+          existing.mem_space_id,
+          existing.mem_principal,
+          existing.mem_scope_label,
+          forgottenAt,
+        );
+        db.query("DELETE FROM memories WHERE id = ?").run(input.id);
+        return {
+          id: existing.id,
+          key: decodeScopeKey(existing.scope as "org" | "user", existing.principal),
+          forgottenAt,
+        };
+      })();
+      return Promise.resolve(tombstone);
+    } catch (error) {
+      // A not-found or scope-mismatch surfaces as a rejected promise (not a
+      // synchronous throw) so callers uniformly `await provider.forget(...)`.
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  function countForgotten(scope: MemoryScopeKey): Promise<number> {
+    const physical = encodeScopeKey(scope);
+    let sql: string;
+    let params: (string | number)[];
+    if (physical.scope === "org") {
+      sql = "SELECT COUNT(*) AS count FROM memory_tombstones WHERE scope = 'org' AND principal IS NULL";
+      params = [];
+    } else {
+      sql = "SELECT COUNT(*) AS count FROM memory_tombstones WHERE scope = 'user' AND principal = ?";
+      params = [physical.principal ?? ""];
+    }
+    const row = db.query(sql).get(...params) as { count: number } | null;
+    return Promise.resolve(row?.count ?? 0);
+  }
+
+  function countRecallable(scope: MemoryScopeKey): Promise<number> {
+    const physical = encodeScopeKey(scope);
+    let sql: string;
+    let params: (string | number)[];
+    if (physical.scope === "org") {
+      sql = "SELECT COUNT(*) AS count FROM memories WHERE scope = 'org' AND principal IS NULL";
+      params = [];
+    } else {
+      sql = "SELECT COUNT(*) AS count FROM memories WHERE scope = 'user' AND principal = ?";
+      params = [physical.principal ?? ""];
+    }
+    const row = db.query(sql).get(...params) as { count: number } | null;
+    return Promise.resolve(row?.count ?? 0);
+  }
+
+  return { capabilities, save, search, pruneDigests, forget, countForgotten, countRecallable };
 }

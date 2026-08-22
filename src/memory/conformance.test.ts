@@ -27,9 +27,15 @@ export function runMemoryConformanceTests(
       });
       expect(saved.id).toBeTruthy();
       expect(saved.key).toEqual({ kind: "org" });
+      // Provenance (#163): every saved entry carries a structured, derived source/label.
+      expect(saved.provenance).toBeDefined();
+      expect(saved.provenance.source).toBe("tool");
+      expect(saved.provenance.scopeLabel).toBe("org");
       const hits = await p.search({ scope: { kind: "org" }, query: "bottega" });
       expect(hits.length).toBeGreaterThanOrEqual(1);
       expect(hits[0].content).toContain("bottega");
+      expect(hits[0].provenance).toBeDefined();
+      expect(hits[0].provenance.scopeLabel).toBe("org");
     });
 
     test("org memory is shared across principals", async () => {
@@ -100,6 +106,7 @@ export function runMemoryConformanceTests(
           source: "consolidation",
           consolidated: "1",
         });
+        expect(summaries[0]!.provenance.source).toBe("consolidation");
         return;
       }
 
@@ -164,13 +171,39 @@ export function runMemoryConformanceTests(
       expect(retained).toHaveLength(3);
     });
 
-    test("has no general delete/update paths", async () => {
+    test("forget-with-tombstone removes an entry from recall without hard-delete loss (or rejects loudly)", async () => {
+      const { provider: p } = await makeHarness();
+      const saved = await p.save({ scope: { kind: "org" }, content: "forget me fact conformance" });
+      expect(["explicit", "unsupported"]).toContain(p.capabilities.forget);
+
+      if (p.capabilities.forget === "explicit") {
+        const tombstone = await p.forget({ scope: { kind: "org" }, id: saved.id });
+        expect(tombstone.id).toBe(saved.id);
+        // Not recalled anymore.
+        const after = await p.search({ scope: { kind: "org" }, query: "forget me fact" });
+        expect(after.map((e) => e.id)).not.toContain(saved.id);
+        return;
+      }
+
+      // Unsupported backends reject loudly — never a silent hard-delete.
+      await expect(p.forget({ scope: { kind: "org" }, id: saved.id })).rejects.toThrow(
+        /does not support forget/,
+      );
+      // The entry survives (nothing was deleted). A wide limit keeps mem0's
+      // scope-wide (query-agnostic) stub ranking from clipping the saved row.
+      const after = await p.search({ scope: { kind: "org" }, query: "forget me fact", limit: 20 });
+      expect(after.map((e) => e.id)).toContain(saved.id);
+    });
+
+    test("no silent general update path remains", async () => {
       const { provider: p } = await makeHarness();
       const providerKeys = Object.keys(p);
       expect(providerKeys).toContain("save");
       expect(providerKeys).toContain("search");
       expect(providerKeys).toContain("pruneDigests");
-      expect(providerKeys).not.toContain("delete");
+      expect(providerKeys).toContain("forget");
+      // The forget path is the only deletive surface; a general update mutator
+      // that rewrites content in place is not exposed.
       expect(providerKeys).not.toContain("update");
     });
   });

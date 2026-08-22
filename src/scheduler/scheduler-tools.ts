@@ -27,6 +27,7 @@ const schedulerActionSchema = z.enum([
   "kb_ingest",
   "send_message",
   "governance_digest",
+  "weekly_memory_review",
 ]);
 
 export const createSchedulerJobArgsSchema = z.object({
@@ -80,6 +81,7 @@ const SPACE_SCOPED_ACTIONS = {
   kb_ingest: true,
   send_message: true,
   governance_digest: true,
+  weekly_memory_review: true,
 };
 
 const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];

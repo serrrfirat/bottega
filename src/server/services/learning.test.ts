@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
-import type { MemoryEntry, MemoryProvider, MemorySaveInput } from "../../memory/types";
+import type { MemoryEntry, MemoryForgetInput, MemoryProvider, MemorySaveInput } from "../../memory/types";
+import { scopeKeyLabel } from "../../memory/types";
 import { createAudit } from "../../policy/audit";
 import { defaultPolicy } from "../../policy/config";
 import { createStore, type Store } from "../../store/db";
@@ -117,10 +118,14 @@ class RecordingMemory implements MemoryProvider {
   readonly capabilities = {
     consolidation: "unsupported",
     digestPruning: "unsupported",
+    forget: "unsupported",
   } as const;
 
   async pruneDigests(): Promise<number> {
     throw new Error("learning must not prune memory");
+  }
+  async forget(_input: MemoryForgetInput): Promise<never> {
+    throw new Error("fake memory provider does not support forget");
   }
   readonly saved: MemorySaveInput[] = [];
 
@@ -135,6 +140,7 @@ class RecordingMemory implements MemoryProvider {
       content: input.content,
       metadata: input.metadata ?? {},
       createdAt: Date.now(),
+      provenance: { source: "tool", spaceId: null, principal: null, scopeLabel: scopeKeyLabel(input.scope) },
     };
   }
 

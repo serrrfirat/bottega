@@ -74,7 +74,7 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "../store/audit-events";
 import { maintainMemory, type ConsolidationModelCall, type ConsolidationResult } from "../memory/consolidation";
-import { type MemoryEntry, type MemoryProvider, type MemoryProviderCapabilities, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery } from "../memory/types";
+import { type MemoryEntry, type MemoryProvider, type MemoryProviderCapabilities, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery, type MemoryTombstone } from "../memory/types";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
 import type { JsonValue } from "../memory/mem0";
 
@@ -126,6 +126,7 @@ type RpcWireValue =
   | MemoryEntry
   | MemoryEntry[]
   | MemoryProviderCapabilities
+  | MemoryTombstone
   | ConsolidationResult[]
   | undefined;
 
@@ -308,6 +309,19 @@ const memorySearchSchema = z
     ]),
     limit: z.number().int().optional(),
     metadata: z.record(z.string(), z.string()).optional(),
+  })
+  .strict();
+
+/** The validated memory-forget input (no casts from caller-supplied unknown). */
+const memoryForgetSchema = z
+  .object({
+    scope: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("org") }).strict(),
+      z.object({ kind: z.literal("person"), principal: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("channel"), spaceId: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("team"), teamId: z.string().min(1) }).strict(),
+    ]),
+    id: z.string().min(1),
   })
   .strict();
 
@@ -765,6 +779,14 @@ export class JobStoreRpcServer {
         // carries (query/scope/limit/metadata); the schema mirrors the query interface.
         return await this.memory.search(query.data as MemorySearchQuery);
       }
+      case "forget": {
+        const input = memoryForgetSchema.safeParse(args[0]);
+        if (!input.success) {
+          throw new ScopedStoreAccessError(this.job.id, `malformed memory forget: ${input.error.message}`);
+        }
+        this.authorizeMemoryScope(input.data.scope);
+        return await this.memory.forget(input.data);
+      }
       case "pruneDigests": {
         const parsed = pruneDigestsArgsSchema.safeParse(args);
         if (!parsed.success) {
@@ -897,13 +919,16 @@ export class JobStoreRpcServer {
 /** A memory provider that rejects writes — used only by the probe lane. */
 export const memoryDenyProvider: ResolvedMemoryProvider = {
   backend: "sqlite",
-  capabilities: { consolidation: "unsupported", digestPruning: "unsupported" },
+  capabilities: { consolidation: "unsupported", digestPruning: "unsupported", forget: "unsupported" },
   save: () => {
     throw new Error("job sandbox probe memory provider may only search (no shared-store writes)");
   },
   search: async () => [],
   pruneDigests: async () => {
     throw new Error("job sandbox probe memory provider cannot prune digests");
+  },
+  forget: () => {
+    throw new Error("job sandbox probe memory provider cannot forget (read-only probe axis)");
   },
 };
 /**
@@ -1065,10 +1090,11 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
   // is then built with correct readonly values — never mutated in place.
   let memoryProvider: ResolvedMemoryProvider = {
     backend: "sqlite",
-    capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+    capabilities: { consolidation: "explicit", digestPruning: "explicit", forget: "unsupported" },
     save: (input) => call<MemoryEntry>("memory", "save", [input]),
     search: (query) => call<MemoryEntry[]>("memory", "search", [query]),
     pruneDigests: (spaceId, keep) => call<number>("memory", "pruneDigests", [spaceId, keep]),
+    forget: (input) => call<MemoryTombstone>("memory", "forget", [input]),
   };
 
   return {
@@ -1091,6 +1117,7 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
           save: (input) => call<MemoryEntry>("memory", "save", [input]),
           search: (query) => call<MemoryEntry[]>("memory", "search", [query]),
           pruneDigests: (spaceId, keep) => call<number>("memory", "pruneDigests", [spaceId, keep]),
+          forget: (input) => call<MemoryTombstone>("memory", "forget", [input]),
         };
         ready.resolve();
       } catch (error) {

@@ -2,13 +2,15 @@
  * Pluggable memory contract (memory epic, issues #19, #137, #155, and #321).
  *
  * The single seam for every backend owns validated save/search behavior,
- * exact metadata filtering, capability reporting, and the one narrow
- * maintenance operation used by digest producers. There is no general
- * update/delete API.
+ * exact metadata filtering, capability reporting, the one narrow
+ * maintenance operation used by digest producers, and the forget-with-
+ * tombstone delete path (issue #163).
  *
- * Producer metadata is intentionally explicit until #163 normalizes the
- * shared provenance shape:
- *   manual/tool save → caller metadata (no reserved kind)
+ * Provenance (#163) is a first-class, structured field on every saved
+ * entry (see {@link MemoryProvenance}): source, spaceId, principal, and
+ * the logical scope label. Producer metadata remains explicit in addition
+ * to the normalized provenance shape:
+ *   manual/tool save → source=tool (or caller-supplied), caller metadata
  *   auto extraction → source=auto_extract
  *   idle + standup digest → kind=digest, space, since, until
  *   reflection → kind=reflection, space, date, topic
@@ -24,8 +26,9 @@
  * derived `kind=digest` rows beyond the per-space cap, whose source transcript
  * remains durable. A backend that cannot enforce that cap reports
  * `unsupported`, and `pruneDigests` rejects loudly instead of succeeding as a
- * no-op. Correction, redaction, tombstones, and normalized provenance belong
- * to #163, not this seam.
+ * no-op. Forget-with-tombstone (#163) is the only general delete path: a
+ * forgotten entry is never recalled, never re-injected, and never silently
+ * hard-deleted — the row becomes a durable tombstone.
  *
  * Logical scope model (#137): a memory belongs to one of four logical keys —
  * `org` (the company-wide floor), `person:<principal>` (one human), a
@@ -133,6 +136,30 @@ export interface MemoryEntry {
   content: string;
   metadata: Record<string, string>;
   createdAt: number;
+  /** Structured provenance (#163): where and by whom the entry was produced. */
+  provenance: MemoryProvenance;
+}
+
+/**
+ * Structured provenance carried on every saved entry (#163). It is derived
+ * from the invocation scope at save time and persisted (SQLite) or mapped
+ * from the backend's own identity fields (mem0). A backend without
+ * first-class provenance still fills default values (source `tool`,
+ * spaceId/principal null for org rows).
+ */
+export interface MemoryProvenance {
+  /**
+   * Producer label: `tool`, `auto_extract`, `digest`, `reflection`, `kb`,
+   * `consolidation`, or a caller-supplied value. The distinction between
+   * human/manual and generated memory.
+   */
+  source: string;
+  /** The space the entry was produced from (null for org/system turns). */
+  spaceId: string | null;
+  /** The principal that produced the entry (null for system/org turns). */
+  principal: string | null;
+  /** Human-readable logical scope label (`org`, `person:U1`, `channel:slack:C1`). */
+  scopeLabel: string;
 }
 
 export interface MemorySaveInput {
@@ -140,6 +167,30 @@ export interface MemorySaveInput {
   /** Non-empty. */
   content: string;
   metadata?: Record<string, string>;
+  /**
+   * Optional provenance source label. Absent → `tool`. spaceId/principal are
+   * not part of the save input (they are derived from the authenticated
+   * context), except where a caller knows them and passes them via
+   * `source`. See {@link MemoryProvenance}.
+   */
+  source?: string;
+}
+
+export interface MemoryForgetInput {
+  /** The logical scope key the entry belongs to (must match the entry's row). */
+  scope: MemoryScopeKey;
+  /** The entry id to forget. */
+  id: string;
+}
+
+/** The durable record left behind when an entry is forgotten (#163). */
+export interface MemoryTombstone {
+  /** The forgotten entry's id. */
+  id: string;
+  /** The logical scope key the forgotten entry belonged to. */
+  key: MemoryScopeKey;
+  /** When the forget happened (ms epoch). */
+  forgottenAt: number;
 }
 
 export interface MemorySearchQuery {
@@ -165,6 +216,12 @@ export interface MemoryProviderCapabilities {
    * `unsupported`: pruneDigests must reject without deleting content.
    */
   readonly digestPruning: "explicit" | "unsupported";
+  /**
+   * `explicit`: forget() leaves a durable tombstone and the entry is never
+   * recalled. `unsupported`: forget() rejects loudly; the backend has no
+   * delete path and must never silently hard-delete.
+   */
+  readonly forget: "explicit" | "unsupported";
 }
 
 export interface MemoryProvider {
@@ -176,6 +233,26 @@ export interface MemoryProvider {
    * reject loudly; returning zero is reserved for a supported no-deletion pass.
    */
   pruneDigests(spaceId: string, keep: number): Promise<number>;
+  /**
+   * Forget-with-tombstone (#163): removes the entry from recall and leaves a
+   * durable tombstone so it is never re-injected or silently hard-deleted.
+   * Unsupported providers reject loudly. Returns the tombstone that was left.
+   */
+  forget(input: MemoryForgetInput): Promise<MemoryTombstone>;
+  /**
+   * Counts the durable tombstones left in one logical scope (issue #163).
+   * Optional: a backend without tombstones (mem0) is undefined; callers
+   * (the weekly memory review) treat an absent method as "forgotten count
+   * unavailable" and degrade to zero/unknown rather than fail.
+   */
+  countForgotten?(scope: MemoryScopeKey): Promise<number>;
+  /**
+   * Counts ALL recallable (non-tombstoned) entries in one logical scope
+   * (issue #163). Optional: backends without a cheap count (mem0) leave it
+   * undefined; the weekly memory review treats an absent method as "count
+   * via search" and falls back to a bounded recall for the estimate.
+   */
+  countRecallable?(scope: MemoryScopeKey): Promise<number>;
 }
 
 /** Fails before a digest producer starts when the configured backend cannot enforce its cap. */
@@ -219,4 +296,33 @@ export function validateSearchQuery(query: MemorySearchQuery): void {
   if (query.scope.kind === "team" && !isValidTeamId(query.scope.teamId)) {
     throw new Error(`memory.search: invalid team id '${query.scope.teamId}'`);
   }
+}
+
+export function validateForgetInput(input: MemoryForgetInput): void {
+  if (!input.id || !input.id.trim()) {
+    throw new Error("memory.forget: id must be non-empty");
+  }
+  if (input.scope.kind === "team" && !isValidTeamId(input.scope.teamId)) {
+    throw new Error(`memory.forget: invalid team id '${input.scope.teamId}'`);
+  }
+}
+
+/**
+ * Derives the provenance of a saved entry (#163). The source label comes
+ * from the save input (default `tool`); the scope label is always derived
+ * from the logical key; spaceId/principal are supplied by the caller's
+ * authenticated context when known (null for org/system turns).
+ */
+export function deriveProvenance(
+  scope: MemoryScopeKey,
+  source: string | undefined,
+  spaceId: string | null,
+  principal: string | null,
+): MemoryProvenance {
+  return {
+    source: (source ?? "tool").trim() || "tool",
+    spaceId,
+    principal,
+    scopeLabel: scopeKeyLabel(scope),
+  };
 }

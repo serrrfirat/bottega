@@ -200,4 +200,77 @@ describe("sqlite memory backend specifics", () => {
     const hits = await p.search({ scope: { kind: "org" }, query: "pha" });
     expect(hits.map((entry) => entry.content)).toEqual(["alphabet soup"]);
   });
+
+  test("provenance lands on saved entries and round-trips through search (#163)", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
+    const saved = await p.save({
+      scope: { kind: "org" },
+      content: "provenance round-trip fact",
+      source: "auto_extract",
+    });
+    expect(saved.provenance).toEqual({
+      source: "auto_extract",
+      spaceId: null,
+      principal: null,
+      scopeLabel: "org",
+    });
+
+    const person = await p.save({ scope: { kind: "person", principal: "alice" }, content: "alice provenance fact" });
+    expect(person.provenance.scopeLabel).toBe("person:alice");
+    expect(person.provenance.source).toBe("tool"); // default when source absent
+
+    const hits = await p.search({ scope: { kind: "org" }, query: "provenance round-trip" });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.provenance).toEqual(saved.provenance);
+
+    const personHits = await p.search({ scope: { kind: "person", principal: "alice" }, query: "alice provenance" });
+    expect(personHits[0]!.provenance.scopeLabel).toBe("person:alice");
+  });
+
+  test("forget removes an entry from recall, leaves a durable tombstone, and never hard-deletes (#163)", async () => {
+    const db = freshDb();
+    const p = createSqliteMemoryProvider(db, { now: () => 1_700_000_000_000 });
+    const saved = await p.save({ scope: { kind: "org" }, content: "forget me sqlite fact" });
+    await p.save({ scope: { kind: "org" }, content: "keep me sqlite fact" });
+
+    const tombstone = await p.forget({ scope: { kind: "org" }, id: saved.id });
+    expect(tombstone.id).toBe(saved.id);
+    expect(tombstone.key).toEqual({ kind: "org" });
+    expect(tombstone.forgottenAt).toBe(1_700_000_000_000);
+
+    // Not recalled anymore; the sibling survives.
+    const after = await p.search({ scope: { kind: "org" }, query: "sqlite fact" });
+    expect(after.map((e) => e.content)).not.toContain("forget me sqlite fact");
+    expect(after.map((e) => e.content)).toContain("keep me sqlite fact");
+
+    // The tombstone is durable: a fresh provider on the same DB still counts it.
+    const reopened = createSqliteMemoryProvider(db);
+    expect(await reopened.countForgotten!({ kind: "org" })).toBe(1);
+  });
+
+  test("forget validates scope and refuses another scope's entry by id alone (#163)", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
+    const org = await p.save({ scope: { kind: "org" }, content: "org-only fact" });
+    // Forgetting the org entry as if it were a channel scope must fail.
+    await expect(
+      p.forget({ scope: { kind: "channel", spaceId: "slack:C1" }, id: org.id }),
+    ).rejects.toThrow(/no entry/);
+    // The entry survives the failed cross-scope forget.
+    const after = await p.search({ scope: { kind: "org" }, query: "org-only" });
+    expect(after.map((e) => e.id)).toContain(org.id);
+  });
+
+  test("countRecallable reflects recallable entries per scope (#163)", async () => {
+    const p = createSqliteMemoryProvider(freshDb());
+    expect(await p.countRecallable!({ kind: "org" })).toBe(0);
+    await p.save({ scope: { kind: "org" }, content: "one" });
+    await p.save({ scope: { kind: "org" }, content: "two" });
+    expect(await p.countRecallable!({ kind: "org" })).toBe(2);
+    await p.save({ scope: { kind: "person", principal: "bob" }, content: "bob fact" });
+    expect(await p.countRecallable!({ kind: "person", principal: "bob" })).toBe(1);
+    // Forgotten entries leave `memories` and no longer count as recallable.
+    const [first] = await p.search({ scope: { kind: "org" }, query: "one" });
+    await p.forget({ scope: { kind: "org" }, id: first.id });
+    expect(await p.countRecallable!({ kind: "org" })).toBe(1);
+  });
 });

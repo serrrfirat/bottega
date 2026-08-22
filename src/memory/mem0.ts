@@ -55,6 +55,7 @@ import {
   MEMORY_LIMIT_DEFAULT,
   decodeScopeKey,
   encodeScopeKey,
+  scopeKeyLabel,
   validateSaveInput,
   validateSearchQuery,
 } from "./types";
@@ -355,6 +356,12 @@ function parseEntry(result: JsonValue, scope: MemoryScopeKey): MemoryEntry {
     content: row.memory ?? "",
     metadata: meta,
     createdAt: row.created_at,
+    provenance: {
+      source: meta.source ?? "tool",
+      spaceId: null,
+      principal: key.kind === "person" ? key.principal : null,
+      scopeLabel: scopeKeyLabel(key),
+    },
   };
 }
 
@@ -408,6 +415,12 @@ async function saveToMem0(
     content: row.memory !== undefined && row.memory !== "" ? row.memory : input.content,
     metadata: stringifyMetadata(row.metadata),
     createdAt: row.created_at,
+    provenance: {
+      source: input.source ?? "tool",
+      spaceId: null,
+      principal: input.scope.kind === "person" ? input.scope.principal : null,
+      scopeLabel: scopeKeyLabel(input.scope),
+    },
   };
 }
 
@@ -464,6 +477,7 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
   const capabilities = {
     consolidation: "on-save",
     digestPruning: "unsupported",
+    forget: "unsupported",
   } as const;
 
   // NOTE: save/search are deliberately NOT async — validation must throw
@@ -485,6 +499,14 @@ export function createMem0MemoryProvider(opts: Mem0Options): MemoryProvider {
         new Error(
           "mem0 memory provider does not support required digest pruning; " +
             "the configured backend cannot enforce the per-space digest cap",
+        ),
+      );
+    },
+    forget(): ReturnType<MemoryProvider["forget"]> {
+      return Promise.reject(
+        new Error(
+          "mem0 memory provider does not support forget; the backend has no delete " +
+            "endpoint and cannot leave a tombstone — refusing to hard-delete (issue #163)",
         ),
       );
     },
