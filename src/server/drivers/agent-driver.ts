@@ -20,6 +20,7 @@ import { parseYamlSubset, type YamlNode } from "../../yaml-subset";
 import {
   DEFAULT_MODEL_CATALOG_DIR,
   listAvailableModels,
+  MODEL_ROLE_REFS,
   resolveModelPin,
   type ModelCatalogEntry,
 } from "../../models/model-pin";
@@ -141,7 +142,7 @@ export interface AgentTurnOptions {
  * - `reasoning` — the `reasoning_model` setting (falls back to `model`) at
  *   the space's `reasoning_effort` (default high).
  */
-export type ModelRole = "default" | "fast" | "reasoning";
+export type ModelRole = "default" | (typeof MODEL_ROLE_REFS)[number];
 
 /**
  * What a role switch actually applied (issue #64). `applied: false` means
@@ -299,9 +300,9 @@ export function resolveRoleTarget(
   settings: SpaceModelSettings,
 ): RoleTarget {
   switch (role) {
-    case "fast":
+    case MODEL_ROLE_REFS[0]:
       return { modelId: settings.fast_model ?? settings.model, thinkingLevel: "low" };
-    case "reasoning":
+    case MODEL_ROLE_REFS[1]:
       return { modelId: settings.reasoning_model ?? settings.model, thinkingLevel: settings.reasoning_effort ?? "high" };
     case "default":
       return { modelId: settings.model, thinkingLevel: settings.reasoning_effort };

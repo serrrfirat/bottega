@@ -80,7 +80,7 @@ const modelSettingsSchema = z.object({
 });
 
 const useModelSchema = z.object({
-  role: z.enum(["default", "fast", "reasoning"]),
+  role: z.enum(["default", ...MODEL_ROLE_REFS]),
 });
 
 /** Argument shapes of the model tools; exported for tests (mirrors memory.ts). */

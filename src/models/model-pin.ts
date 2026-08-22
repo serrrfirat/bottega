@@ -53,6 +53,14 @@ export type ModelRoleRef = (typeof MODEL_ROLE_REFS)[number];
 /** The near gateway provider id (models.yml): the WORKING deepseek provider (issue #194). */
 const NEAR_PROVIDER = "near";
 
+/** Returns the role ref a resolved pin names; undefined for a model-id/name path. */
+export function asRoleRef(value: string): ModelRoleRef | undefined {
+  // SAFETY: assertion invariant — `value` is cast to ModelRoleRef only after
+  // `.some()` confirms it equals one of MODEL_ROLE_REFS' members, so the
+  // cast never widens an unchecked value.
+  return MODEL_ROLE_REFS.some((r) => r === value) ? (value as ModelRoleRef) : undefined;
+}
+
 /** Probe bound: a slow or dead gateway never hangs the catalog build. */
 const GATEWAY_PROBE_TIMEOUT_MS = 5_000;
 
@@ -254,7 +262,8 @@ export function resolveModelPin(
 ): ModelPinResolution {
   const query = raw.trim();
   const q = query.toLowerCase();
-  if (q === "fast" || q === "reasoning") return { ok: true, pin: { kind: "role", role: q } };
+  const role = asRoleRef(q);
+  if (role) return { ok: true, pin: { kind: "role", role } };
   if (!q) return { ok: false, error: "model must not be empty" };
 
   const entries = catalog.map((model) => ({
