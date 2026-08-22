@@ -25,12 +25,14 @@ import {
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { toolError } from "./helpers";
 
-export const slackReadArgsSchema = z.object({
-  /** Read the full thread rooted at this message ts (conversations.replies, no `limit` — issue #215). */
-  thread_ts: z.string().min(1).optional(),
-  /** Cap the returned messages (history `limit`; bounds a thread read client-side). Max 100. */
-  limit: z.number().int().min(1).max(100).optional(),
-});
+export const slackReadArgsSchema = z
+  .object({
+    /** Read the full thread rooted at this message ts (conversations.replies, no `limit` — issue #215). */
+    thread_ts: z.string().min(1).optional(),
+    /** Cap the returned messages (history `limit`; bounds a thread read client-side). Max 100. */
+    limit: z.number().int().min(1).max(100).optional(),
+  })
+  .strict();
 
 export interface SlackReadToolOpts {
   /**
