@@ -183,9 +183,10 @@ describe("docker-compose.yml (issue #105 sandbox-vs-egress isolation)", () => {
     const sandbox = networks["sandbox"] as Record<string, YamlNode>;
     expect(sandbox).toBeDefined();
     expect(sandbox["driver"]).toBe("bridge");
-    // `internal: true` is the hard guarantee: no route to the host or WAN,
-    // so a compromised job container cannot reach raw external IPs directly.
-    expect(sandbox["internal"]).toBe(true);
+    // `internal: "true"` is preserved as the literal string this YAML
+    // subset parser yields; it is the hard guarantee: no route to the host
+    // or WAN, so a compromised job container cannot reach raw external IPs.
+    expect(sandbox["internal"]).toBe("true");
     // SAFETY: ipam is a map node inside the sandbox network.
     const ipam = sandbox["ipam"] as Record<string, YamlNode>;
     // SAFETY: the fixture declares ipam.config as a list with one subnet entry.
