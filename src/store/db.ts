@@ -1586,28 +1586,41 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return (db.query("SELECT * FROM upload_tokens WHERE token = ?").get(token) as UploadToken | null) ?? null;
   }
 
-  function consumeUploadToken(token: string): { ok: true; row: UploadToken } | { ok: false } {
+  // Single-use claim + stale cleanup, shared by upload tokens and OAuth flows.
+  // Table names are compile-time literals, so SQL is never parameterized by
+  // external input.
+  function consumeOnce<T>(table: "upload_tokens" | "oauth_flows", token: string): { ok: true; row: T } | { ok: false } {
     const now = Date.now();
     // Atomic single-use: only the first caller gets the row back; everyone
     // else (replay) sees nothing.
     // SAFETY: DELETE ... RETURNING * returns the consumed row, or undefined when the token is absent or expired.
     const row = db
       .query(
-        `DELETE FROM upload_tokens WHERE id = (SELECT id FROM upload_tokens WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
+        `DELETE FROM ${table} WHERE id = (SELECT id FROM ${table} WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
       )
-      .get(token, now) as UploadToken | null;
+      .get(token, now) as T | null;
     if (row) return { ok: true, row };
     // Fail closed: an expired row must not linger for a future replay.
-    db.query("DELETE FROM upload_tokens WHERE token = ?").run(token);
+    db.query(`DELETE FROM ${table} WHERE token = ?`).run(token);
     return { ok: false };
   }
 
-  function countActiveUploadTokens(actor: string): number {
+  // Active-row count, shared by upload tokens and OAuth flows. Table name is a
+  // compile-time literal (no injection).
+  function countActive(table: "upload_tokens" | "oauth_flows", actor: string): number {
     // SAFETY: COUNT(*) AS n always returns exactly one row with a numeric n.
     const row = db
-      .query("SELECT COUNT(*) AS n FROM upload_tokens WHERE actor = ? AND expires_at > ?")
+      .query(`SELECT COUNT(*) AS n FROM ${table} WHERE actor = ? AND expires_at > ?`)
       .get(actor, Date.now()) as { n: number };
     return row.n;
+  }
+
+  function consumeUploadToken(token: string): { ok: true; row: UploadToken } | { ok: false } {
+    return consumeOnce<UploadToken>("upload_tokens", token);
+  }
+
+  function countActiveUploadTokens(actor: string): number {
+    return countActive("upload_tokens", actor);
   }
 
   function createOAuthFlow(input: {
@@ -1661,27 +1674,11 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   function consumeOAuthFlow(token: string): { ok: true; row: OAuthFlow } | { ok: false } {
-    const now = Date.now();
-    // Atomic single-use: only the first caller gets the row back; everyone
-    // else (replay) sees nothing.
-    // SAFETY: DELETE ... RETURNING * returns the consumed row, or undefined when the token is absent or expired.
-    const row = db
-      .query(
-        `DELETE FROM oauth_flows WHERE id = (SELECT id FROM oauth_flows WHERE token = ?1 AND expires_at > ?2) RETURNING *`,
-      )
-      .get(token, now) as OAuthFlow | null;
-    if (row) return { ok: true, row };
-    // Fail closed: an expired row must not linger for a future replay.
-    db.query("DELETE FROM oauth_flows WHERE token = ?").run(token);
-    return { ok: false };
+    return consumeOnce<OAuthFlow>("oauth_flows", token);
   }
 
   function countActiveOAuthFlows(actor: string): number {
-    // SAFETY: COUNT(*) AS n always returns exactly one row with a numeric n.
-    const row = db
-      .query("SELECT COUNT(*) AS n FROM oauth_flows WHERE actor = ? AND expires_at > ?")
-      .get(actor, Date.now()) as { n: number };
-    return row.n;
+    return countActive("oauth_flows", actor);
   }
 
   async function createSchedulerJob(input: {
@@ -2108,23 +2105,22 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     ).run(provider, cursor, Date.now());
   }
 
+  // Joins optional audit predicate pairs (SQL fragment + bind value) with AND,
+  // prefixing " WHERE " only when at least one predicate is present.
+  function buildAuditWhere(predicates: [string, string | number][]) {
+    const clauses = predicates.map(([sql]) => sql);
+    const params = predicates.map(([, value]) => value);
+    return { sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "", params };
+  }
+
   async function listAudit(opts: ListAuditOpts = {}): Promise<AuditRow[]> {
-    const clauses: string[] = [];
-    const params: (string | number)[] = [];
-    if (opts.space !== undefined) {
-      clauses.push("space_id = ?");
-      params.push(opts.space);
-    }
-    if (opts.since !== undefined) {
-      clauses.push("ts >= ?");
-      params.push(opts.since);
-    }
-    if (opts.event_type !== undefined) {
-      clauses.push("event_type = ?");
-      params.push(opts.event_type);
-    }
-    let sql = "SELECT * FROM audit";
-    if (clauses.length > 0) sql += ` WHERE ${clauses.join(" AND ")}`;
+    const predicates: [string, string | number][] = [];
+    if (opts.space !== undefined) predicates.push(["space_id = ?", opts.space]);
+    if (opts.since !== undefined) predicates.push(["ts >= ?", opts.since]);
+    if (opts.event_type !== undefined) predicates.push(["event_type = ?", opts.event_type]);
+    const where = buildAuditWhere(predicates);
+    const params = [...where.params];
+    let sql = "SELECT * FROM audit" + where.sql;
     sql += " ORDER BY ts, id";
     if (opts.limit !== undefined) {
       sql += " LIMIT ?";
@@ -2182,10 +2178,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     const requestedLimit = opts.limit ?? 50;
     const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
-    const sql =
-      "SELECT id, ts, space_id, actor, event_type, payload FROM audit" +
-      where +
-      " ORDER BY ts DESC, id DESC LIMIT ?";
+    const sql = "SELECT id, ts, space_id, actor, event_type, payload FROM audit" + where + " ORDER BY ts DESC, id DESC LIMIT ?";
     params.push(limit + 1);
     // SAFETY: the SELECT projects exactly AuditRow's six columns.
     const matches = db.query(sql).all(...params) as AuditRow[];
