@@ -23,7 +23,7 @@ import {
   resolveModelPin,
   type ModelCatalogEntry,
 } from "../models/model-pin";
-import { errorMessage, toolError } from "./helpers";
+import { errorMessage, renderWorkItemQueue, toolError } from "./helpers";
 import { SKILL_NAME_RE } from "../server/skills";
 import type { Store } from "../store/db";
 
@@ -345,13 +345,7 @@ export function workItemToolDefinitions(
       if (!spaceId) return toolError("work items require a space session");
       try {
         const items = await store.listWorkItems({ space_id: spaceId, state: params.state });
-        const visible = items.map((item) => ({
-          id: item.id,
-          description: item.description,
-          state: item.state,
-          assignee: item.assignee,
-          created: item.created_at,
-        }));
+        const visible = items.map(renderWorkItemQueue);
         const auditPayload: WorkItemListAuditPayload = { count: visible.length };
         if (params.state !== undefined) auditPayload.state = params.state;
         await store.appendAudit({
