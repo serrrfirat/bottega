@@ -25,6 +25,7 @@ import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/au
 import type { Store } from "../../store/db";
 import type { SlackAdapter } from "../adapters/slack";
 import { buildDeliveryBlocks } from "../adapters/delivery-router";
+import { makeSingleFlightLoop } from "./single-flight-loop";
 
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -112,10 +113,6 @@ export async function pollPendingDeliveries(
 /** Background loop around {@link pollPendingDeliveries}. First pass runs immediately. */
 export function startDeliveryPoller(deps: DeliveryPollerDeps): DeliveryPoller {
   const log = deps.log ?? (() => {});
-  const intervalMs = deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let running = false;
-
   const tick = async (): Promise<void> => {
     try {
       const posted = await pollPendingDeliveries(deps.store, deps.adapter);
@@ -124,31 +121,15 @@ export function startDeliveryPoller(deps: DeliveryPollerDeps): DeliveryPoller {
       // One bad pass must not kill the loop; unposted rows retry next tick.
       log(`delivery poller: poll failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    // Chain the next pass from the END of this one: each pass re-reads the
-    // audit trail, so an overlapping pass (setInterval while postMessage is
-    // still in flight) would see the pending row unrecorded and announce it
-    // a second time. The next pass starts only after this one recorded its
-    // delivery.requested rows (issue #70).
-    if (running && timer === null) {
-      timer = setTimeout(() => {
-        timer = null;
-        void tick();
-      }, intervalMs);
-    }
   };
-
-  return {
-    start() {
-      if (running) return;
-      running = true;
-      void tick(); // announce anything pending from before boot immediately
-    },
-    stop() {
-      running = false;
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    },
-  };
+  // The cadence + in-flight guard are the single-flight loop shared with the
+  // outbox post seam (issue #341 finding 6): an immediate first pass, then one
+  // chained pass at a time scheduled from the END of the previous one, so an
+  // overlapping pass (a fixed-interval timer while postMessage is still in
+  // flight) would see the pending row unrecorded and announce it a second
+  // time (issue #70). tick must not throw — it handles its own errors above.
+  return makeSingleFlightLoop({
+    tick,
+    intervalMs: deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+  });
 }
