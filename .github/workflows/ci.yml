@@ -138,7 +138,14 @@ jobs:
               test -s /tmp/job-write
               test "$(awk "/^CapEff:/ {print \$2}" /proc/self/status)" = "0000000000000000"
               test "$(awk "/^NoNewPrivs:/ {print \$2}" /proc/self/status)" = "1"
-              test "$(awk "/^Seccomp:/ {print \$2}" /proc/self/status)" = "2"
+              # seccomp must be FILTERING (active), never disabled. Seccomp:0
+              # means the host daemon applied no filter; Seccomp:2 is the
+              # normal filter mode. Mode 1 (strict) cannot be reached by a
+              # running shell, so "!= 0" rejects exactly the same disabled
+              # state as "== 2" while not hard-coding a host-daemon-specific
+              # numeric value (the failure on hosts whose default filter
+              # reports differently — issue #337).
+              test "$(awk "/^Seccomp:/ {print \$2}" /proc/self/status)" != "0"
               ! curl --connect-timeout 2 http://8.8.8.8/ 2>/dev/null
               echo sandbox-hardened-ok
             '
