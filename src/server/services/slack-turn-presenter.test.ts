@@ -972,9 +972,15 @@ describe("Codex mint-failure surface (issue #218)", () => {
     expect(visible).toContain("restart the server");
   });
 
-  test("the 403-no-body family (a bare 403 in the message) maps to the same remedy", async () => {
+  test("the 403-no-body family (a bare 403 in the message) maps to the codex remedy when codex IS the active provider", async () => {
     const rec = recordingAdapter();
-    const presenter = plainPresenter(rec);
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store: recordingStore().store,
+      onboardingChecks: () => [],
+      provider: "openai-codex",
+    });
     presenter.onInbound(msg({ ts: "1.1" }));
     await flush();
     presenter.onMessage({ spaceId: "slack:C1", text: "", error: "Request failed with status code 403" });
@@ -983,6 +989,39 @@ describe("Codex mint-failure surface (issue #218)", () => {
     const visible = rec.updates.at(-1)!.text;
     expect(visible).toContain("codex login");
     expect(visible).toContain("restart the server");
+  });
+
+  test("a bare 403 for a NON-codex provider maps to the provider-aware remedy, not codex login (issue #342)", async () => {
+    const rec = recordingAdapter();
+    const presenter = new SlackTurnPresenter({
+      spaceId: "slack:C1",
+      adapter: rec.adapter,
+      store: recordingStore().store,
+      onboardingChecks: () => [],
+      provider: "near",
+    });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onMessage({ spaceId: "slack:C1", text: "", error: "Request failed with status code 403" });
+    await flush();
+
+    const visible = rec.updates.at(-1)!.text;
+    expect(visible).toContain("near");
+    expect(visible).toContain("NEAR_API_KEY");
+    expect(visible).toContain("restart the server");
+    expect(visible).not.toContain("codex login");
+  });
+
+  test("a bare 403 with NO provider context keeps its original text (fail-closed, never a false codex login)", async () => {
+    const rec = recordingAdapter();
+    const presenter = plainPresenter(rec);
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onError({ spaceId: "slack:C1", message: "Request failed with status code 403" });
+    await flush();
+
+    expect(rec.updates.at(-1)!.text).toBe("Request failed with status code 403");
+    expect(rec.updates.at(-1)!.text).not.toContain("codex login");
   });
 
   test("a non-mint error keeps its exact text (no false mapping)", async () => {

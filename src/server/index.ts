@@ -233,7 +233,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // session model from) so the codex auth/mint leg runs only when the
   // default is the openai-codex provider.
   const agentDir = opts.agentDir ?? OMP_AGENT_DIR;
-  await syncProxyCredentialsFromEnv({ activeDefaultModel: agentDirModelDefault(agentDir) });
+  // Issue #339: the ACTIVE DEFAULT MODEL (the agent-dir config.yml
+  // `modelRoles.default`, the same pin the SDK/agent resolves its default
+  // session model from) drives BOTH the codex mint leg at boot AND the
+  // turn-side 403→remedy attribution (#342) — one source of truth.
+  const activeDefaultModel = agentDirModelDefault(agentDir);
+  await syncProxyCredentialsFromEnv({ activeDefaultModel });
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {
@@ -911,6 +916,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // each turn's card/progress surface so a Slack user can stop the
     // in-flight turn (bottega_stop → SpaceService.stopTurn).
     stopControl: true,
+    // The active default model (issue #342): lets the turn presenter
+    // attribute a bare 403 to the Codex mint/grant family only when codex
+    // is the active provider; other providers get a provider-aware remedy.
+    activeDefaultModel,
   });
   // Executor's delivery seam (issue #11 follow-up, #12, round trip #149):
   // the executor runs in its own container and cannot post to Slack. When a

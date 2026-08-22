@@ -13,9 +13,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CODEX_AUTH_FILE_ENV,
+  CODEX_MINT_FAILURE_MARKER,
   CODEX_OAUTH_CLIENT_ID,
+  codexMintFailureText,
   decodeCodexJwtExp,
   MODEL_PROXY_KEYS,
+  providerCredentialRemedy,
+  providerFromModelRef,
   proxyKeyFileName,
   proxyOAuthBlobFileName,
   readCodexAuthTokens,
@@ -844,5 +848,58 @@ await expect(
       mgmt.stop(true);
       s.cleanup();
     }
+  });
+});
+
+describe("provider-aware error remedy (issue #342)", () => {
+  /** The proxy's actual mint 502 body (verified from iron-proxy v0.49.0). */
+  const MINT_502 = `{"error":"${CODEX_MINT_FAILURE_MARKER} an access token","grant":"refresh_token"}`;
+
+  test("the mint marker always maps to the codex remedy, regardless of provider", () => {
+    const text = codexMintFailureText(MINT_502, "near");
+    expect(text).toContain("codex login");
+    expect(text).toContain("restart the server");
+  });
+
+  test("a bare 403 maps to the codex remedy ONLY for the codex provider", () => {
+    const codex = codexMintFailureText("Request failed with status code 403", "openai-codex");
+    expect(codex).toContain("codex login");
+    expect(codex).toContain("restart the server");
+
+    const near = codexMintFailureText("Request failed with status code 403", "near");
+    expect(near).toContain("near");
+    expect(near).toContain("NEAR_API_KEY");
+    expect(near).not.toContain("codex login");
+  });
+
+  test("a bare 403 with no provider context keeps the original text (fail-closed)", () => {
+    expect(codexMintFailureText("Request failed with status code 403")).toBeNull();
+    expect(codexMintFailureText(undefined)).toBeNull();
+    expect(codexMintFailureText("")).toBeNull();
+  });
+
+  test("providerFromModelRef derives the top-level provider from a qualified ref", () => {
+    expect(providerFromModelRef("near/deepseek-ai/DeepSeek-V4-Flash")).toBe("near");
+    expect(providerFromModelRef("openai-codex/gpt-5.6-luna")).toBe("openai-codex");
+    expect(providerFromModelRef("openai-codex")).toBe("openai-codex");
+    // Unknown provider / bare id / absent → undefined (never a guess).
+    expect(providerFromModelRef("mystery-model")).toBeUndefined();
+    expect(providerFromModelRef(undefined)).toBeUndefined();
+    expect(providerFromModelRef("")).toBeUndefined();
+  });
+
+  test("providerCredentialRemedy names the provider and its env var from MODEL_PROXY_KEYS", () => {
+    expect(providerCredentialRemedy("near")).toContain("near");
+    expect(providerCredentialRemedy("near")).toContain("NEAR_API_KEY");
+    expect(providerCredentialRemedy("near")).toContain("restart the server");
+    expect(providerCredentialRemedy("openai")).toContain("OPENAI_API_KEY");
+    expect(providerCredentialRemedy("anthropic")).toContain("ANTHROPIC_API_KEY");
+    // Unknown provider → null (fail-closed, never a fabricated env name);
+    // a named-but-unknown provider still names it (no fabricated env var).
+    expect(providerCredentialRemedy(undefined)).toBeNull();
+    const mystery = providerCredentialRemedy("mystery-provider");
+    expect(mystery).not.toBeNull();
+    expect(mystery).toContain("mystery-provider");
+    expect(mystery).not.toContain("MYSTERY"); // never invents an env var
   });
 });
