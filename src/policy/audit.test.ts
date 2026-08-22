@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore } from "../store/db";
+import { WORK_ITEM_CREATED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
 import { MAX_PAYLOAD_BYTES, TRUNCATION_MARKER, createAudit, redact } from "./audit";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-audit-"));
@@ -171,6 +172,58 @@ describe("payload cap", () => {
     const text = row!.payload.slice(0, -TRUNCATION_MARKER.length);
     expect(text.includes("\uFFFD")).toBe(false); // no lone surrogates survived
     expect(text.length % 2).toBe(0); // complete surrogate pairs only
+  });
+});
+
+// #171 writer → reader round-trip pin: an event appended through the real
+// audit writer (createAudit with a real audit-events constant) must come back
+// byte-identical JSON via the store readers (listAudit + queryAudit).
+describe("audit writer -> reader round-trip (#171)", () => {
+  test("a real WORK_ITEM_CREATED_EVENT payload round-trips byte-identical through listAudit and queryAudit", async () => {
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "RT171" });
+    const payload = { id: "wi_171", requester: "U171", assignee: "U171" };
+    await audit.appendAudit({
+      space_id: space.id,
+      actor: "U171",
+      event_type: WORK_ITEM_CREATED_EVENT,
+      payload,
+    });
+
+    const byList = await audit.listAudit({ space: space.id, event_type: WORK_ITEM_CREATED_EVENT });
+    expect(byList).toHaveLength(1);
+    const row = byList[0]!;
+    expect(row.event_type).toBe(WORK_ITEM_CREATED_EVENT);
+    expect(row.space_id).toBe(space.id);
+    // Byte-identical JSON: the stored payload string equals JSON.stringify of
+    // the original (no secret-shaped value was redacted or truncated).
+    expect(row.payload).toBe(JSON.stringify(payload));
+    // And it parses back to the exact same object.
+    expect(JSON.parse(row.payload)).toEqual(payload);
+
+    const byQuery = await store.queryAudit({
+      event_type: WORK_ITEM_CREATED_EVENT,
+      space_id: space.id,
+      actor: "U171",
+    });
+    expect(byQuery.rows).toHaveLength(1);
+    expect(byQuery.rows[0]!.payload).toBe(JSON.stringify(payload));
+  });
+
+  test("a real MEMORY_WRITE_EVENT payload round-trips byte-identical through queryAudit", async () => {
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "RT171B" });
+    const payload = { scope: "org", principal: "U171", id: "mem_171", content_hash: "abc123" };
+    await audit.appendAudit({
+      ts: 1_700_000_000_000,
+      space_id: space.id,
+      actor: "U171",
+      event_type: MEMORY_WRITE_EVENT,
+      payload,
+    });
+
+    const page = await store.queryAudit({ event_type: MEMORY_WRITE_EVENT, space_id: space.id });
+    expect(page.rows).toHaveLength(1);
+    expect(page.rows[0]!.payload).toBe(JSON.stringify(payload));
+    expect(JSON.parse(page.rows[0]!.payload)).toEqual(payload);
   });
 });
 
