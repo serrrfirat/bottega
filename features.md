@@ -19,7 +19,7 @@ do, and why it matters. For how it works under the hood, see
 | **Slack delivery** | Get an immediate receipt, live progress, tool steps, and a final reply on a path that degrades safely when Slack streaming is unavailable. |
 | **Native Slack charts** | Ask the agent for a chart and it renders Slack's native pie/bar/area/line data-visualization block straight into the thread — right from CSV or tabular data it already holds. |
 | **Org settings** | Runtime configuration in the database, with approver-gated org writes and tighten-only space overlays. |
-| **Memory** | The agent remembers facts per user or per org and uses them across conversations. |
+| **Memory** | The agent remembers facts per user or per org and uses them across conversations; every entry carries provenance, and `memory.forget` removes facts from recall (never hard-deletes) with a scheduled weekly review. |
 | **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
 | **Extensions** | Connect provider-official tools from chat — any integrations.sh catalog extension registers at runtime (no config file, no commit); every agent uses them through one safe pipe. |
 | **Proactive scheduler** | Standups, reflections, weekly pulse, knowledge ingestion, and recurring connected-service work on a schedule. |
@@ -123,6 +123,17 @@ billing.
   `openai-codex.secret` (and the oauth blob), so the provider's requests
   502 until the user logs in with the Codex CLI. `dev.sh` does NOT export
   the codex token into env: the seed reads the file directly at boot.
+- **Codex is off unless it is the active default** (#339/#342) — the codex
+  auth/mint leg runs ONLY when the deployment's active default model
+  resolves to the `openai-codex` provider (the agent-dir `config.yml`
+  `modelRoles.default`, e.g. `openai-codex/gpt-5.6-luna`). Any other
+  default (near/deepseek, opencode-go, a bare id, or an unknown/absent
+  value) is NOT codex-active — the safe default is to never mint: the
+  codex boundary files are deleted fail-closed and the login remedy is
+  never surfaced. Credential errors are provider-aware: a bare 403 (or a
+  502 mint marker) is attributed to the Codex mint/grant family only when
+  the active provider really is codex; any other provider's failure names
+  that failing provider and its env var or vault row, never codex.
 - **Recovery (issue #218, remedy unchanged)** — when model calls fail with
   the proxy's mint error (`oauth_token failed to mint an access token` —
   the OAuth extensions' transform) or turns come back empty with a 403,
@@ -195,8 +206,44 @@ Digest producers fail before model, post, or save side effects when the
 configured backend cannot enforce that required cap; maintenance never
 silently succeeds against the wrong store. The provider has no general
 update/delete API. Only old derived digest summaries can be pruned, while
-their source transcripts remain durable. Provenance normalization,
-correction, and tombstones remain owned by #163.
+their source transcripts remain durable.
+
+**Every entry carries provenance (#163).** A saved memory records where it
+came from — `source` (e.g. `tool`, `auto_extract`, `consolidation`), the
+`spaceId`, the `principal`, and the logical `scopeLabel` — derived from the
+authenticated invocation at save time, never from a prompt argument. Recall
+results expose the same provenance, so the agent can see which entry a fact
+came from before acting on it.
+
+**`memory.forget` removes a fact from recall without deleting it (#163).**
+Forgetting an entry id moves it out of recall and into a durable tombstone
+(`memory_tombstones`): the entry is never recalled or re-injected, but it is
+never hard-deleted either — the tombstone is the lasting record of the
+forget. The id must belong to a scope the conversation can write (your own
+person memory in a DM, the current channel, or org-shared memory); you can
+never forget another scope's entry by id alone. `memory.forget` is a
+destructive write-tier tool, so it prompts for approval in non-yolo policy
+modes and records a `memory.forget` audit row. When the configured backend
+cannot leave a tombstone (mem0 has no delete endpoint), the tool **refuses
+loudly** rather than silently hard-deleting.
+
+**Weekly memory review (`memory_review`).** A deterministic scheduler action
+(`weekly_memory_review`) posts a compact, redacted count — recallable entries
+across the org + channel scopes, forgotten/tombstoned entries, and the next
+review date — with no model and no raw memory content. It is gated like the
+governance digest: per-space opt-in via `{"proactive":{"memory_review":true}}`
+and only when the space's `response_mode` is `always`. Successful posts audit
+`memory.review_posted`; a delivery failure is audited as
+`memory.review_failed` with the reason only, never the content. To create it
+manually:
+
+```json
+{
+  "action": "weekly_memory_review",
+  "cron": "0 9 * * 1",
+  "params": {"space": "slack:C123"}
+}
+```
 
 ## Durable objects (issue #124)
 
@@ -278,6 +325,15 @@ reactions and records reply and phrase latency.
   combined turn's final reply edits THAT phrase — never the original
   turn's older line — so the steer's author sees their own progress and
   any poller watching the steer's message sees the reply.
+- **Accepted turns survive a crash or restart** (#312). Every accepted
+  turn is persisted to the durable `pending_turns` store as it is queued.
+  If the process dies mid-turn (a crash, a restart, a container eviction),
+  the next cold start reclaims any accepted-but-unfinished turn — via a
+  lease that expires — and redelivers it exactly once, in arrival order,
+  instead of losing the pending queue forever. The messages also live in
+  Slack history, so recovery redelivers an accepted-but-unfinished turn
+  rather than fabricating a reply. A turn that finished (settled) is
+  marked done and is never re-delivered.
 
 ## Operator Home and governance visibility (issues #161, #320)
 
@@ -581,12 +637,13 @@ orchestration process; risky or credentialed work belongs in workers.
 
 | Status | Boundary |
 | --- | --- |
-| **Shipped** | The executor is a separate container/process; git and extension deliveries run as headless worker sessions. Pickup approval, the complete delivery seam (#149), shared runtime wiring (#172), proxy injection, and audit-backed state transitions are in place. |
-| **Planned** | Move every remaining risky/credentialed job kind behind the worker boundary and give jobs container-level isolation. The durable outbox needed for reliable cross-process dispatch is tracked in #187. |
+| **Shipped** | The executor is a separate container/process; git and extension deliveries run as headless worker sessions. Pickup approval, the complete delivery seam (#149), shared runtime wiring (#172), proxy injection, and audit-backed state transitions are in place. Every durable job kind runs in its own disposable, hardened Docker container with an isolated workspace, an internal-only sandbox network, a bounded job-scoped store RPC, and fail-closed timeout/lease teardown (#101/#105). |
+| **Planned** | `chat` delivery still has no worker session of its own, and the durable outbox needed for reliable cross-process dispatch is still tracked in #187. |
 
-This is architecture direction, not a claim that every job already has its
-own container. The current executor is shared, and `chat` delivery still has
-no worker.
+This is architecture direction. Per-item container isolation for the durable
+job kinds is shipped (#101/#105, see
+[architecture.md](architecture.md#worker-isolation-boundary-epic-170-101-105));
+the executor no longer serves multiple items from one shared container.
 
 ## Proactive scheduler, learning, and knowledge base (epic #111)
 
@@ -884,8 +941,10 @@ opened a DM with the bot once (or the canary opens it via
   explicit approver roles and SSO remain roadmap.
 - **Allowlisted repos only** — the executor works in the repository named
   by the conversation and refuses anything outside the settings allowlist.
-  One executor container serves multiple items; per-item container
-  isolation is part of epic #170, not shipped.
+  Each job already runs in its own disposable, hardened Docker container
+  with an isolated workspace, an internal-only sandbox network, and a
+  bounded job-scoped store RPC (#101/#105) — see
+  [architecture.md](architecture.md#worker-isolation-boundary-epic-170-101-105).
 - **Chat delivery has no worker yet** — executable `git` and `extension`
   items are claimed first; `chat` items remain open instead of entering a
   fake execution path.

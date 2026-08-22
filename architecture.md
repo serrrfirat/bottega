@@ -158,6 +158,53 @@ proxy passes everything; routing through it is harmless). `NEARAI_JUDGE_API_KEY`
 is a deployment concern only. The compose topology above still routes
 everything through the strict config/egress.yml, unchanged.
 
+### Proxy credential sync: vault → env → Keychain → fail closed (issues #208/#201/#343)
+
+`src/extensions/proxy-seed.ts` is the boot adapter that seeds iron-proxy with
+model-gateway keys (`near`, `opencode`, `openai`, `anthropic`, plus the
+`tavily` web-search key) and the codex static credential, then removes the
+provider keys from the app environment. The vault stays the source of truth.
+For each model-gateway key the sync resolves a single value with precedence
+**vault → env → Keychain (local dev, opt-in) → fail closed**, writes it
+atomically to the provider's mode-0600 `<provider>.secret` boundary file,
+then deletes the env var so the app never holds the raw key afterward:
+
+1. **Vault** — an `api_key` row for the provider in the auth-broker snapshot
+   (`OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN`). A configured-but-
+   unreachable broker logs a warning and falls through.
+2. **Env** — the value already set (`.env`, dev.sh's Keychain load).
+3. **Keychain** — macOS `security` lookup of `bottega-<provider>`, ONLY when
+   `BOTTEGA_KEYCHAIN_SEED=1` opts in (`NEAR_API_KEY` → service
+   `bottega-near`); hermetic tests and deployment never read the developer's
+   Keychain.
+4. **Fail closed** — none of the three resolves a non-empty value → the
+   existing secret file is DELETED so the egress entry's `require: true`
+   rejects the request (`bottega-proxy-placeholder` cannot reach the
+   upstream gateway).
+
+**Empty rows never shadow lower-precedence sources (#343).** An EMPTY
+credential row — an auth-broker vault row holding `""`, or an empty env var —
+is not nullish, so a naive `fromVault ?? fromEnv ?? keychain` would let it
+win and shadow a valid lower-precedence source (e.g. a Keychain entry). Each
+source counts only when its value is non-empty after trim: the sync picks the
+first non-empty of vault → env → Keychain. The same rule applies to the boot
+secrets (Slack tokens, GitHub webhook) in `src/server/boot-secrets.ts`, where
+an empty vault row or empty env value falls through rather than shadowing.
+
+**Codex gate: only when codex is the active default (#339/#342).** The codex
+auth/mint leg runs ONLY when the deployment's active default model resolves
+to the `openai-codex` provider (`isCodexActiveDefault(activeDefaultModel)`).
+The active default is the agent-dir `config.yml` `modelRoles.default` (the
+same pin the SDK/agent resolves its default from). Any other default — a
+qualified non-codex ref (`near/deepseek-ai/DeepSeek-V4-Flash`), a bare id, a
+role ref, or an unknown/absent value — is NOT codex-active: the sync deletes
+the codex boundary files (`openai-codex.secret` + the oauth blob) fail-closed
+and never surfaces the codex login remedy. Credential errors are
+provider-aware: the error mapper attributes a bare `403` (or the `502` mint
+marker) to the codex mint/grant family ONLY when the active provider is
+codex; any other provider's 403 names that failing provider and its env var
+or vault row via `providerCredentialRemedy`, never codex.
+
 ### Local development topology (#123/#143/#311)
 
 `scripts/dev.sh` is a thin path/canonical-worktree launcher. Both `bun run
@@ -683,9 +730,10 @@ supported.
 
 `MemoryProvider` (`src/memory/types.ts`) is the production boundary for
 validated saves, scoped searches, exact metadata filters, capability
-reporting, and derived-digest retention. Providers expose no general update
-or delete method. Callers must not inspect a backend name or reach into its
-storage to perform maintenance.
+reporting, derived-digest retention, and forget-with-tombstone. Providers
+expose no general update method; forget (with a durable tombstone) is the
+one allowed delete path. Callers must not inspect a backend name or reach
+into its storage to perform maintenance.
 
 The current producers and their persisted metadata are:
 
@@ -704,12 +752,16 @@ digest and reflection rows and posts a report. Every provider must preserve
 metadata values and exact-match filtering because these producer tags are
 the stable search seam.
 
-#163 owns the atomic move to normalized provenance. Its required logical
-shape is `producer`, `space`, `ts`, and `source_ref`, with an absent field
-when it does not apply. That change must migrate every producer together and
-extend both provider conformance legs; mixed producer-specific and normalized
-shapes are not a supported end state. #155 does not add correction,
-redaction, tombstones, or a user-facing forget operation.
+#163 shipped normalized provenance plus forget-with-tombstone. Every saved
+entry carries structured provenance — `source`, `spaceId`, `principal`, and
+the logical `scopeLabel` — derived from the invocation scope at save time
+(see the `MemoryProvenance` shape in `src/memory/types.ts`) and persisted
+(SQLite provenance columns, idempotently added to legacy databases) or
+mapped from the backend's own identity fields (mem0 fills defaults: `tool`,
+null spaceId/principal for org rows). Migration moved every producer to
+normalized provenance together and extended both provider conformance legs;
+mixed producer-specific and normalized shapes are not a supported end
+state.
 
 Maintenance capabilities are explicit:
 
@@ -729,20 +781,45 @@ Retention is not a general deletion authority. Saves append. KB, reflection,
 auto-extracted, and manual content is outside the digest pruner. Digest
 pruning is the narrow exception for replaceable summaries whose source
 transcript remains durable. Consolidation changes only the active fact pool
-under its declared mode. Human correction/deletion remains unavailable until
-the tombstone contract in #163.
+under its declared mode.
+
+**Forget-with-tombstone (#163) is the only general delete path.** The
+`memory.forget` tool is destructive write-tier (it prompts for approval in
+non-yolo modes) and crosses the same policy gate as `memory.save`. It
+derives the concrete writable scope from the invocation context (same as
+save) and calls `provider.forget({scope, id})`. Providers declare
+`capabilities.forget`:
+
+- **SQLite — `explicit`**: a successful forget moves the row OUT of
+  `memories` (so it is never recalled or re-injected) and INTO the durable
+  `memory_tombstones` table — carrying the entry id, scope, principal,
+  content, and `forgotten_at` — never a silent hard-delete; the tombstone is
+  the lasting record of the forget. The entry id AND its physical scope must
+  both match, so a caller can never forget another scope's entry by id alone.
+  A fresh provider on the same DB still counts the tombstone
+  (`countForgotten`).
+- **mem0 — `unsupported`**: forget REJECTS loudly (`does not support
+  forget`) because the backend has no delete endpoint and cannot leave a
+  tombstone — it refuses to hard-delete, and the entry survives.
+
+Every successful forget records a `memory.forget` audit row (scope + id,
+never content). A forgotten entry is never recalled, never re-injected, and
+never silently hard-deleted.
 
 The shared provider conformance suite uses a temporary SQLite database and a
 hermetic mem0 HTTP double. It drives representative save/search metadata,
-the declared consolidation mode, digest pruning or its loud rejection, and
-the absence of general update/delete paths. Caller tests also prove idle and
-standup digest producers check pruning capability before side effects.
+provenance round-tripping, the declared consolidation mode, digest pruning or
+its loud rejection, forget-with-tombstone (or its loud rejection when
+unsupported), and the absence of a general update path (forget is the one
+allowed deletive surface). Caller tests also prove idle and standup digest
+producers check pruning capability before side effects.
 
 ## Scheduler: durable cron (epic #111)
 
 `src/scheduler/` implements a durable, UTC-only scheduler with policy-gated
 lifecycle tools (issues #86 and #308) and typed built-in actions for
-standups, reflection, org pulse, governance digest, recurring work, messages, and ingestion.
+standups, reflection, org pulse, governance digest, memory review, recurring
+work, messages, and ingestion.
 
 ```mermaid
 flowchart LR
@@ -754,7 +831,7 @@ flowchart LR
     INV --> RUN["durable claim/fire runner — every 5 s"]
     RUN --> CRON["nextCronFire — five-field UTC cron<br/>(no DST; OR semantics; ? allowed once)"]
     RUN -- "first pass after boot: occurrences<br/>before now" --> MISS["audit 'missed', skip — no replay of backlog"]
-    RUN -- "job due" --> ACT["typed action registry<br/>standup | reflection | pulse | governance | recurring work | ingestion"]
+    RUN -- "job due" --> ACT["typed action registry<br/>standup | reflection | pulse | governance | memory review | recurring work | ingestion"]
     ACT --> POST["postMessage → Slack space"]
     ACT --> MEM["memory provider — org memories<br/>append-only save; capability-gated maintenance"]
     ACT --> WI["work_items — recurring extension work"]
@@ -784,6 +861,22 @@ The weekly `governance_digest` is model-free and opt-in at its destination
 space. It reads cursor-paged audit summaries through the canonical allowlist,
 groups approvals/denials/timeouts/credential scopes/settings changes, and
 posts once. Delivery failure is redacted and audited inside the action.
+`seedGovernanceDigestJobs` idempotently ensures ONE `governance_digest` job
+(`GOVERNANCE_DIGEST_WEEKLY_CRON = "0 9 * * 1"`, Monday 09:00 UTC) exists for
+every space whose policy enables `proactive.governance`; it never duplicates
+a job already targeting a space (an operator-edited cron is preserved).
+
+The weekly `memory_review` action (`weekly_memory_review`) is gated like the
+governance digest — a per-space proactive opt-in
+(`proactive.memory_review`) plus `response_mode: always` — and never uses a
+model. It counts recallable entries across the space's readable scopes (the
+org floor + the space's own channel, `reviewReadableScopes`) and the
+forgotten/tombstoned count when the backend exposes one, and posts a compact,
+redacted summary (recallable, forgotten, next review date) — no memory
+content leaves the action. Success audits `memory.review_posted`; a delivery
+or read failure audits `memory.review_failed` with the reason only. It is
+registered in the server's scheduler registry alongside the other built-ins
+but is NOT auto-seeded at boot — create it with `create_scheduler_job`.
 
 ## Knowledge-base ingestion (#91)
 
@@ -871,6 +964,16 @@ latest model thinking snippet, then `Thinking… Ns` (#193). Reply/progress
 updates coalesce at `STREAM_UPDATE_INTERVAL_MS = 400`; `turn_end` flushes
 the latest final text immediately and retries final delivery up to the
 bounded limit (#120).
+
+**Live-turn Stop control is org-settings-gated (#315).** The Stop button
+(*Running — do you want to stop this turn?*) is a presenter-level option
+the server mounts on active turns. It mounts ONLY when the org settings blob
+sets `turn_stop_control: true` — the org default is OFF (`?? false`), so the
+full Stop machinery stays intact in the codebase but is disabled until an
+org opts in through the `settings` tool (the knob appears in the settings
+help text). A malformed, non-boolean value fails closed and is treated as
+disabled. Enabling the flag does not require a restart; the knob is read at
+session/turn wiring time.
 
 ## Data flow: "issue shared in Slack gets implemented"
 
@@ -1068,6 +1171,22 @@ before exposing the store, and a retry resumes from the last committed ID.
 - `scheduler_invocations` — immutable-at-enqueue action snapshots for cron
   occurrences and run-now requests, with one pending/running/completed claim
   state and a caller-visible idempotency identity.
+- `pending_turns` — the crash-safe backstop for accepted-but-unfinished live
+  turns (#312). Every accepted turn is persisted here as it is queued
+  (`space_id`, `ts` — the inbound Slack message ts — `principal`, `text`,
+  `root_thread_ts`); a `UNIQUE(space_id, ts)` identity index records each
+  inbound message once. It mirrors the worker-job claim lifecycle:
+  `pending` (enqueued, never recovered) → `claimed` (a recovery pass took
+  it) → `done` (the drained turn settled). On first use per space after a
+  restart, `recoverPendingTurns` reclaims `pending` rows and `claimed` rows
+  whose `lease_until` has expired — crash-mid-drain reclaims only after the
+  lease expires (the worker-jobs lease pattern) — in arrival (`id`) order
+  and redelivers each exactly once through the ordinary drain path. Once
+  the drained turn settles (on resolve OR reject — a rejection still
+  consumes the accepted message), `completePendingTurn` marks the row
+  `done` so a restart never re-delivers it; a crash before that point
+  leaves the row `claimed` under a fresh lease for the next recovery pass.
+  Migration `014_add_durable_pending_turns`.
 - `upload_tokens` — opaque, expiring, single-use #196 browser-upload
   grants. The MCP child and server endpoint share the table; atomic delete
   makes only the first valid POST consumable.
@@ -1170,6 +1289,7 @@ src/
   kb/               deterministic document ingestion
   store/            db.ts, schema.sql, org settings
   tools/            work items/pickup, model/settings/admin, memory/KB/object tools
+  tools/helpers.ts  shared leaf helpers (withTimeout/errorMessage/sha256Hex/SKILL_NAME_RE — the #341 consolidation)
   memory/           SQLite + mem0 providers behind one interface
   mcp/              server.ts (third composition root; memory/connect/extensions)
   executor.ts       second composition root + containerized claim/delivery runner

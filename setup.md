@@ -85,11 +85,12 @@ schedules. Create a weekday standup at 09:00 UTC with the
 }
 ```
 
-Standups, reflections, and the governance digest are per-space opt-ins. Set
+Standups, reflections, the governance digest, and the memory review are
+per-space opt-ins. Set
 the destination space's `spaces.policy_json` value to include:
 
 ```json
-{"proactive":{"standup":true,"reflection":true,"governance":true}}
+{"proactive":{"standup":true,"reflection":true,"governance":true,"memory_review":true}}
 ```
 
 All flags default to `false`. A proactive action posts only when the
@@ -97,6 +98,19 @@ space's effective `response_mode` is `always`; mention and request-only
 spaces never receive unsolicited posts. On restart, the scheduler skips
 overdue occurrences instead of catching up, advances each job to its next
 future occurrence, and records `scheduler.missed` in the audit trail.
+
+The weekly memory review (`weekly_memory_review`) is gated the same way —
+per-space `proactive.memory_review` + `response_mode: always` — and posts a
+redacted count of recallable and forgotten/tombstoned memory entries (no
+memory content). Create it manually (it is NOT auto-seeded at boot) with:
+
+```json
+{
+  "action": "weekly_memory_review",
+  "cron": "0 9 * * 1",
+  "params": {"space": "slack:C123"}
+}
+```
 
 Use `list_scheduler_jobs` to see the current revision, enabled state, and
 next/last fire time. In Slack, the list renders Pause/Resume and Run now
@@ -315,7 +329,11 @@ Copy `.env.example` to `.env` and fill in:
 GitHub webhook secret remain app boot secrets. Model provider keys resolve with
 precedence **vault → env → Keychain (local dev, opt-in) → fail closed**, are
 written atomically to iron-proxy's mode-0600 secret files, and are removed from
-the app environment. `models.yml` contains only
+the app environment. An EMPTY value does not count as a source (#343): a vault
+row or env var set to `""` is treated as unset and falls through to the next
+lower-precedence source (e.g. a Keychain entry), instead of shadowing it — so an
+accidentally empty `.env` line or vault row can never blank out a valid
+fallback credential. `models.yml` contains only
 `bottega-proxy-placeholder`; iron-proxy replaces it on matching gateway hosts.
 Missing files are `require: true`, so the placeholder cannot reach an upstream
 gateway. Active OAuth extension snapshots use iron-proxy's native
@@ -337,7 +355,8 @@ fallback refuses to boot with the existing guard messages.
 `.env` carries secrets + deployment identity only (issue #67). Runtime knobs
 (approval timeouts, response mode, memory injection, extensions policy, repo
 allowlist, model defaults, workspaces dir, git/api base URLs, memory backend
-URL, and — issue #190 — the secret-vault backend `secrets_backend`:
+URL, the Slack live-turn Stop control `turn_stop_control` (default off), and
+— issue #190 — the secret-vault backend `secrets_backend`:
 `omp-broker` default, or a 1Password Connect server via `type`,
 `connect_url`, and a `"provider:identityKey" → {vault, item, field}`
 mapping) live in the org settings blob in the DB, editable via the
