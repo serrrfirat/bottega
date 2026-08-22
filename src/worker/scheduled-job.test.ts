@@ -17,7 +17,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runExecutor, type ExecutorDeps } from "../executor";
-import { inProcessSandboxRunner } from "./run-job";
+import { inProcessSandboxRunner } from "./run-job-test-fabric";
 import { createSqliteMemoryProvider } from "../memory/sqlite";
 import type { ConsolidationModelCall } from "../memory/consolidation";
 import { createAudit } from "../policy/audit";

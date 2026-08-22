@@ -28,7 +28,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { inProcessSandboxRunner } from "./worker/run-job";
+import { inProcessSandboxRunner } from "./worker/run-job-test-fabric";
 import type { McpBinding } from "./extensions/manifest";
 import { resetToolSurfaceCache } from "./extensions/surface";
 import { bootExecutorRuntime, prepareExecutor, type ExecutorDeps } from "./executor";

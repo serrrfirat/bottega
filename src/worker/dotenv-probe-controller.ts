@@ -12,7 +12,7 @@
  *
  * This is a process fixture, never part of the production boundary.
  */
-import { probeChildProcessSandbox } from "./run-job";
+import { probeChildProcessSandbox } from "./run-job-test-fabric";
 
 function argValue(name: string): string {
   const prefix = `--${name}=`;

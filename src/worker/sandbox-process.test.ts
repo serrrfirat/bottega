@@ -8,9 +8,8 @@ import { createStore, type Store } from "../store/db";
 import { z } from "zod";
 import { prepareExecutor, type ExecutorConfig, type ExecutorDeps } from "../executor";
 import type { WorkerJob } from "./envelope";
+import { createChildProcessSandboxRunner, probeChildProcessSandbox } from "./run-job-test-fabric";
 import {
-  createChildProcessSandboxRunner,
-  probeChildProcessSandbox,
   createDockerSandboxRunner,
   probeDockerSandbox,
   type DockerClient,

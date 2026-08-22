@@ -35,7 +35,8 @@ import {
 import { consumeOutboxWatermarked } from "./store/outbox";
 import type { OutboxRow } from "./store/outbox";
 import { workItemJobPayloadSchema, type WorkerJob } from "./worker/envelope";
-import { inProcessSandboxRunner, type SandboxRunner } from "./worker/run-job";
+import { inProcessSandboxRunner } from "./worker/run-job-test-fabric";
+import type { SandboxRunner } from "./worker/run-job";
 import {
   EXECUTOR_TOOLS,
   prepareExecutor,
