@@ -36,6 +36,7 @@ import {
   type WebhookRouteDeps,
 } from "../ingest/webhook-server";
 import type { UploadLinkMount } from "./upload-link";
+import { API_PATH_PREFIX, OPENAPI_PATH, type RestApiMount } from "../server/api";
 
 export const OAUTH_CALLBACK_PATH = "/oauth/callback";
 
@@ -103,6 +104,15 @@ export interface OAuthCallbackEndpointDeps {
    * browser leg; a static tunnel forwards the public base to that port.
    */
   uploadLink?: UploadLinkMount;
+  /**
+   * The token-authenticated REST API surface (issue #100): when present,
+   * this surface also serves `/api/v1/*` and `/openapi.json` — the REST
+   * surface joins the SAME inbound HTTP listener as the OAuth callback,
+   * webhook route, and upload form, so ONE ingress serves every inbound
+   * path. Every request is bearer-authenticated (BOTTEGA_API_TOKEN via the
+   * boot-secret chain) and audited with actor `api:default`.
+   */
+  restApi?: RestApiMount;
   /**
    * Local bind port override (default: `BOTTEGA_CALLBACK_PORT` when set,
    * else 0 = ephemeral). A stable port lets a static tunnel / reverse
@@ -182,11 +192,13 @@ export interface OAuthCallbackServerHandle {
  * Starts the in-process inbound HTTP surface (issue #198 + #57 + #196):
  * Bun.serve on 127.0.0.1 (loopback only — the same posture as issue #57's
  * local dev), BOTTEGA_CALLBACK_PORT when set else ephemeral. `GET
- * /oauth/callback` completes the OAuth connect flow; when the deps carry
+* `GET /oauth/callback` completes the OAuth connect flow; when the deps carry
  * `webhooks`, `POST /webhooks/<extension>` serves the ingest webhook route
  * (issue #57) on the SAME surface — and when they carry `uploadLink`, the
- * one-time upload form (`/upload/<token>`, issue #196) joins it too: ONE
- * public ingress + ONE stable local port serve every browser leg, and a
+ * one-time upload form (`/upload/<token>`, issue #196) joins it too, and
+ * `restApi` adds the token-authenticated REST surface (`/api/v1/*` +
+ * `/openapi.json`, issue #100): ONE public ingress + ONE stable local port
+ * serve every inbound path, and a
  * static tunnel forwards the public base to that port. Anything else is a
  * 404 (fail closed).
  */
@@ -211,6 +223,11 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
       // Issue #57: the webhook route joins the same inbound surface.
       if (deps.webhooks !== undefined && url.pathname.startsWith(`${WEBHOOK_PATH_PREFIX}/`)) {
         return handleWebhookRequest(req, deps.webhooks);
+      }
+      // Issue #100: the token-authenticated REST API and its OpenAPI
+      // document join the same inbound surface (one ingress, every path).
+      if (deps.restApi !== undefined && (url.pathname === OPENAPI_PATH || url.pathname.startsWith(`${API_PATH_PREFIX}/`))) {
+        return deps.restApi.fetch(req);
       }
       return new Response("not found", { status: 404 });
     },
