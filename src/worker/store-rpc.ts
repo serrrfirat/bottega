@@ -64,6 +64,15 @@ import {
 } from "../worker/envelope";
 import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } from "./scoped-store";
 import { postOutboxRow, type OutboxWrite } from "../store/outbox";
+import {
+  DELIVERY_COMPLETED_EVENT,
+  DELIVERY_PENDING_EVENT,
+  JOB_COMPLETED_EVENT,
+  JOB_FAILED_EVENT,
+  MEMORY_WRITE_EVENT,
+  WORK_ITEM_FAILED_EVENT,
+  WORK_ITEM_PIN_APPLIED_EVENT,
+} from "../store/audit-events";
 import { maintainMemory, type ConsolidationModelCall, type ConsolidationResult } from "../memory/consolidation";
 import { type MemoryEntry, type MemoryProvider, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery } from "../memory/types";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
@@ -155,6 +164,68 @@ const auditEntrySchema = z
     payload: z.string(),
   })
   .strict();
+
+/**
+ * One audit row a job KIND may legitimately write: the exact event type,
+ * the legitimate actor(s), and how its `space_id` is bound. Space "own"
+ * allows only the job's OWN space (or null when the job itself has no
+ * space); space "null" pins the row to org-level (always null) regardless
+ * of the job's space — used only by the kb `memory.write` org-scope rows.
+ * A child cannot forge another actor, an arbitrary event type, or a
+ * null-space/org-level row unless this table says the kind writes it.
+ */
+interface AuditPolicyRule {
+  eventType: string;
+  actors: readonly string[];
+  space: "own" | "null";
+}
+
+/**
+ * The real child-side audit events, enumerated from the executor's
+ * run bodies (completeSelf/failSelf/failJobSelf, processItem →
+ * extensionWorkerPath/deliver/applyWorkItemModelPin, and kb ingest). Every
+ * durable kind writes its own job.completed/job.failed lifecycle; the
+ * git/extension delivery markers and the kb org-scope memory write are
+ * bound to their owning kind. Anything else — another actor, another event,
+ * a fabricated org-level or cross-space row — is denied.
+ */
+const JOB_LIFECYCLE_RULES: readonly AuditPolicyRule[] = [
+  { eventType: JOB_COMPLETED_EVENT, actors: ["executor"], space: "own" },
+  { eventType: JOB_FAILED_EVENT, actors: ["executor"], space: "own" },
+];
+
+const AUDIT_POLICY: Record<WorkerJob["kind"], readonly AuditPolicyRule[]> = {
+  git: [
+    ...JOB_LIFECYCLE_RULES,
+    { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: DELIVERY_PENDING_EVENT, actors: ["executor"], space: "own" },
+    { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+  ],
+  extension: [
+    ...JOB_LIFECYCLE_RULES,
+    { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: DELIVERY_COMPLETED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+  ],
+  kb: [
+    ...JOB_LIFECYCLE_RULES,
+    // kb ingest writes org-scope memory rows (payload {scope:"org"...}) —
+    // always null-space regardless of the job's own (possibly null) space.
+    { eventType: MEMORY_WRITE_EVENT, actors: ["kb_ingest"], space: "null" },
+  ],
+  ingest_poll: [...JOB_LIFECYCLE_RULES],
+  scheduled: [...JOB_LIFECYCLE_RULES],
+};
+
+/** The audit policy rule matching an event/actor, or null when not legitimately writable by this kind. */
+function auditPolicyRule(kind: WorkerJob["kind"], eventType: string, actor: string): AuditPolicyRule | null {
+  for (const rule of AUDIT_POLICY[kind]) {
+    if (rule.eventType === eventType) {
+      return rule.actors.includes(actor) ? rule : null;
+    }
+  }
+  return null;
+}
 
 /** The audit-read filter the job body may pass to queryAudit (scoped to its own space). */
 const auditQuerySchema = z
@@ -248,14 +319,31 @@ export class JobStoreRpcServer {
   private readonly pollProvider: string | null;
   /** The validated scheduled action (scheduled jobs only). */
   private readonly scheduledAction: string | null;
+  /**
+   * The extension manifest/provider ids registered in the supervisor's
+   * extension registry (issue #101): the ONLY providers a job container may
+   * enumerate credentials for. Derived from the immutable runtime registry —
+   * never from a caller-supplied string — so a hostile child cannot read
+   * credential metadata for an arbitrary provider it was never authorized
+   * to call.
+   */
+  private readonly extensionProviderIds: ReadonlySet<string>;
   private readonly modelCallRequesters = new Map<number, { resolve: (v: string | undefined) => void; reject: (e: Error) => void }>();
   /** Monotonic supervisor→child model-call request id (unique across the server lifetime). */
   private modelCallNextId = 0;
 
-  private constructor(baseStore: Store, job: WorkerJob, socketPath: string, memory: MemoryProvider, storeDb: Database) {
+  private constructor(
+    baseStore: Store,
+    job: WorkerJob,
+    socketPath: string,
+    memory: MemoryProvider,
+    storeDb: Database,
+    extensionProviderIds: ReadonlySet<string>,
+  ) {
     this.socketPath = socketPath;
     this.job = job;
     this.workItemId = jobScopeFromEnvelope(job).workItemId;
+    this.extensionProviderIds = extensionProviderIds;
     // Only the job kind's OWN validated payload keys unlock the scoped read/
     // write capability. A malformed payload fails closed (null capability),
     // so a raw socket can never name a provider/action it does not own.
@@ -294,7 +382,18 @@ export class JobStoreRpcServer {
     baseStore: Store,
     job: WorkerJob,
     dir: string,
-    opts: { name?: string; memoryProvider?: ResolvedMemoryProvider } = {},
+    opts: {
+      name?: string;
+      memoryProvider?: ResolvedMemoryProvider;
+      /**
+       * The supervisor's registered extension manifest/provider ids (issue
+       * #101): the only providers this job's container may enumerate
+       * credentials for. Derived from the immutable runtime extension
+       * registry, never from the caller. Absent → an empty set, so
+       * listExtensionCredentials is denied outright (fail closed).
+       */
+      extensionProviderIds?: Iterable<string>;
+    } = {},
   ): JobStoreRpcServer {
     mkdirSync(dir, { recursive: true });
     return new JobStoreRpcServer(
@@ -303,6 +402,7 @@ export class JobStoreRpcServer {
       join(dir, opts.name ?? "store.sock"),
       opts.memoryProvider ?? memoryDenyProvider,
       baseStore.getDb(),
+      new Set(opts.extensionProviderIds ?? []),
     );
   }
 
@@ -440,16 +540,33 @@ export class JobStoreRpcServer {
       case "transitionWorkItem":
         return [ownItem(args[0]), ...args.slice(1)];
       case "appendAudit": {
-        const entry = auditEntrySchema.safeParse(args[0]);
-        if (!entry.success) {
-          deny(`malformed audit entry: ${entry.error.message}`);
+        const parsedEntry = auditEntrySchema.safeParse(args[0]);
+        if (!parsedEntry.success) {
+          deny(`malformed audit entry: ${parsedEntry.error.message}`);
         }
-        // A row may be space-less (org-level events like memory.write omit
-        // space_id) OR in the job's OWN space. A row pinning ANY other space
-        // is a forged cross-space evidence write and is refused.
-        const auditSpace = entry.data.space_id ?? null;
-        if (auditSpace !== null && auditSpace !== (this.job.spaceId ?? null)) {
-          deny(`audit row for space ${auditSpace} — not this job's space (${String(this.job.spaceId)})`);
+        // deny() never returns, so the entry is settled here; the row fields
+        // are read off a non-null handle (the repo's deny guard does not
+        // narrow the discriminated union).
+        const row = parsedEntry.data!;
+        // A child may only write the events its OWN kind legitimately emits,
+        // with the legitimate actor and the space binding that event owns
+        // (own space, or the pinned org-level null for kb memory.write). An
+        // event/actor pair not in this kind's policy, or a row pinning any
+        // other space / a fabricated org-level row, is a forged evidence
+        // write and is refused.
+        const rule = auditPolicyRule(this.job.kind, row.event_type, row.actor);
+        if (rule === null) {
+          deny(
+            `audit row (${row.event_type} by ${row.actor}) — not an event this ${this.job.kind} job legitimately writes`,
+          );
+        }
+        const boundRule = rule!;
+        const auditSpace = row.space_id ?? null;
+        const desiredSpace = boundRule.space === "null" ? null : (this.job.spaceId ?? null);
+        if (auditSpace !== desiredSpace) {
+          deny(
+            `audit row for space ${String(auditSpace)} — this ${this.job.kind} ${boundRule.eventType} row must be ${desiredSpace === null ? "org-level (null)" : `in the job's own space (${desiredSpace})`}`,
+          );
         }
         return args;
       }
@@ -535,14 +652,23 @@ export class JobStoreRpcServer {
       deny(`extension credential read — work item ${this.workItemId} is not an extension delivery`);
     }
     const provider = args[0];
-    if (typeof provider !== "string" || provider === "") {
+    if (typeof provider === "string" && provider !== "") {
+      // listExtensionCredentials(provider) is called by the extension runtime
+      // with the extension's OWN manifest.id (server-validated registry id).
+      // The child is authorized only for the providers registered in the
+      // SUPERVISOR's immutable extension registry (the same registry that
+      // built its gated toolset) — never for an arbitrary caller-supplied
+      // string. A hostile child cannot enumerate credential metadata for a
+      // provider that was never loaded for this job's environment.
+      if (!this.extensionProviderIds.has(provider)) {
+        deny(
+          `extension credential read for provider ${provider} — not a registered extension for this job's registry`,
+        );
+      }
+    } else {
       deny("extension credential read with a non-string provider");
     }
-    // listExtensionCredentials(provider) is called by the extension runtime
-    // with the extension's OWN manifest.id (server-validated registry id).
-    // The immutable envelope does not pin a provider name, so the access
-    // grant is the extension-delivery job itself; the credential rows carry
-    // metadata only (secrets stay in the vault).
+    // The credential rows carry metadata only (secrets stay in the vault).
     return args;
   }
 

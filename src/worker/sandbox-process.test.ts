@@ -662,8 +662,9 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       // A completion outbox row for ANOTHER job is refused.
       const otherOutbox = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 1, method: "postOutboxRow", args: [{ id: "job_other", kind: "scheduled", payload: { action: "memory_consolidation" }, space: "slack:C1" }] })}\n`);
       expect(otherOutbox).toMatch(/outbox row|ScopedStoreAccessError/);
-      // An audit row pinning ANOTHER space is refused.
-      const fakedAudit = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 2, method: "appendAudit", args: [{ space_id: "slack:C2", actor: "executor", event_type: "delivery.completed", payload: "{}" }] })}\n`);
+      // An audit row pinning ANOTHER space (a scheduled-legitimate event, so the
+      // space binding is what refuses it) is refused.
+      const fakedAudit = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 2, method: "appendAudit", args: [{ space_id: "slack:C2", actor: "executor", event_type: "job.completed", payload: "{}" }] })}\n`);
       expect(fakedAudit).toMatch(/audit row for space/);
       // An audit query scoped to another space is refused.
       const fakedQuery = await rawRpc(server.socketPath, `${JSON.stringify({ ns: "store", id: 3, method: "queryAudit", args: [{ space_id: "slack:C2" }] })}\n`);
@@ -729,7 +730,125 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
     }
   });
 
-  test("memory writes/searches/prunes outside the job's own space are denied", async () => {
+  test("extension credential reads are pinned to the supervisor's registered providers (arbitrary provider strings deny)", async () => {
+    // An extension-delivery job whose registry registered ONLY "notion":
+    // its own provider succeeds; an arbitrary/caller-supplied provider denies.
+    const { store, dir } = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C-ext-cred" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "ext", delivery: "extension" });
+    const job: WorkerJob = { id: "job_ext_cred", kind: "extension", payload: { workItemId: item.id }, spaceId: space.id, attempts: 1, status: "running" };
+    const rpcDir = join(dir, "rpc");
+    mkdirSync(rpcDir, { recursive: true });
+    const server = JobStoreRpcServer.create(store, job, rpcDir, {
+      memoryProvider: memoryDenyProvider,
+      extensionProviderIds: ["notion"],
+    });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      // The registered provider is enumerable.
+      await expect(session.store.listExtensionCredentials("notion")).resolves.toEqual([]);
+      // An arbitrary provider not in the supervisor's registry is denied.
+      await expect(session.store.listExtensionCredentials("slack")).rejects.toThrow(/not a registered extension/);
+      await expect(session.store.listExtensionCredentials("gmail")).rejects.toThrow(/not a registered extension/);
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("listExtensionCredentials fails closed when no extension registry is provided (empty set)", async () => {
+    // No extensionProviderIds → empty set → every provider is denied, even a
+    // plausible one, so a host can never grant credential reads by omission.
+    const { store, dir } = freshStore();
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C-ext-empty" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "ext", delivery: "extension" });
+    const job: WorkerJob = { id: "job_ext_empty", kind: "extension", payload: { workItemId: item.id }, spaceId: space.id, attempts: 1, status: "running" };
+    const rpcDir = join(dir, "rpc");
+    mkdirSync(rpcDir, { recursive: true });
+    const server = JobStoreRpcServer.create(store, job, rpcDir, { memoryProvider: memoryDenyProvider });
+    await server.listen();
+    const session = connectStoreRpc(server.socketPath);
+    try {
+      await session.ready();
+      await expect(session.store.listExtensionCredentials("notion")).rejects.toThrow(/not a registered extension/);
+    } finally {
+      session.close();
+      server.close();
+    }
+  });
+
+  test("audit writes are pinned to the job kind's events/actors/spaces; forged actor/event/null-space deny", async () => {
+    // A git job (own space) may write ONLY the git lifecycle + delivery
+    // markers as actor "executor" in its OWN space. Forging another actor,
+    // another event, or an org-level (null-space) row is refused.
+    const git = makeRpc({ id: "job_audit_git", kind: "git", payload: { workItemId: "wi_1" }, spaceId: "slack:C1", attempts: 1, status: "running" });
+    await git.server.listen();
+    const gitSession = connectStoreRpc(git.server.socketPath);
+    try {
+      await gitSession.ready();
+      // Legitimate git events in its own space succeed.
+      await expect(
+        gitSession.store.appendAudit({ space_id: "slack:C1", actor: "executor", event_type: "job.completed", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      await expect(
+        gitSession.store.appendAudit({ space_id: "slack:C1", actor: "executor", event_type: "work_item.delivery_pending", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      // Forged actor (not executor) on a git event denies.
+      await expect(
+        gitSession.store.appendAudit({ space_id: "slack:C1", actor: "kb_ingest", event_type: "job.completed", payload: "{}" }),
+      ).rejects.toThrow(/not an event this git job legitimately writes/);
+      // Forged event_type (memory.write is kb-only) denies, even with the git actor.
+      await expect(
+        gitSession.store.appendAudit({ space_id: "slack:C1", actor: "executor", event_type: "memory.write", payload: "{}" }),
+      ).rejects.toThrow(/not an event this git job legitimately writes/);
+      // Forged org-level (null-space) git lifecycle row denies (git has a space).
+      await expect(
+        gitSession.store.appendAudit({ space_id: null, actor: "executor", event_type: "job.completed", payload: "{}" }),
+      ).rejects.toThrow(/must be in the job's own space/);
+      // Forged cross-space row denies.
+      await expect(
+        gitSession.store.appendAudit({ space_id: "slack:C2", actor: "executor", event_type: "job.completed", payload: "{}" }),
+      ).rejects.toThrow(/audit row for space/);
+    } finally {
+      gitSession.close();
+      git.server.close();
+    }
+  });
+
+  test("kb jobs may write their org-scope memory.write and null-space lifecycle; other events deny", async () => {
+    // A kb job (no space) legitimately writes org-scope memory rows (actor
+    // kb_ingest, null space) and its own job.completed/job.failed lifecycle
+    // rows (null space). A git-style delivery marker or a forged actor denies.
+    const kb = makeRpc({ id: "job_audit_kb", kind: "kb", payload: { url: "https://docs.example.com" }, attempts: 1, status: "running" });
+    await kb.server.listen();
+    const kbSession = connectStoreRpc(kb.server.socketPath);
+    try {
+      await kbSession.ready();
+      // The legitimate org-scope memory.write (kb_ingest, null) succeeds.
+      await expect(
+        kbSession.store.appendAudit({ actor: "kb_ingest", event_type: "memory.write", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      // The kb job's own null-space lifecycle succeeds (kb has no space).
+      await expect(
+        kbSession.store.appendAudit({ actor: "executor", event_type: "job.completed", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      // A git-only delivery marker denies on a kb job.
+      await expect(
+        kbSession.store.appendAudit({ actor: "executor", event_type: "work_item.delivery_pending", payload: "{}" }),
+      ).rejects.toThrow(/not an event this kb job legitimately writes/);
+      // Forging the memory.write actor (executor instead of kb_ingest) denies.
+      await expect(
+        kbSession.store.appendAudit({ actor: "executor", event_type: "memory.write", payload: "{}" }),
+      ).rejects.toThrow(/not an event this kb job legitimately writes/);
+    } finally {
+      kbSession.close();
+      kb.server.close();
+    }
+  });
+
+test("memory writes/searches/prunes outside the job's own space are denied", async () => {
     const { server } = makeRpc({
       id: "job_kb",
       kind: "git",
@@ -775,9 +894,9 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       // The job reads its own row and its own work item.
       await expect(session.store.getJob("job_git3")).resolves.toMatchObject({ id: "job_git3" });
       await expect(session.store.getWorkItem(item.id)).resolves.toMatchObject({ id: item.id });
-      // It appends an audit row in its OWN space.
+      // It appends an audit row in its OWN space with a git-legitimate event.
       await expect(
-        session.store.appendAudit({ space_id: space.id, actor: "executor", event_type: "delivery.completed", payload: "{}" }),
+        session.store.appendAudit({ space_id: space.id, actor: "executor", event_type: "work_item.delivery_pending", payload: "{}" }),
       ).resolves.toBeGreaterThan(0);
       // Its own outbox completion row posts.
       await expect(
@@ -919,5 +1038,127 @@ describe("production docker mounts are per-job exact subpaths (no shared roots, 
       }
     }
     expect(volumeMounts).toBeGreaterThan(0);
+  });
+
+  test("compose-style volume mode with a RELATIVE transcript dir launches and mounts the exact per-job transcript subpath", async () => {
+    // The production compose bug (#101): BOTTEGA_SANDBOX_STATE_VOLUME_ROOT is
+    // /app/data while the executor's transcriptDir defaults to the RELATIVE
+    // data/transcripts. The runner must resolve that relative dir against the
+    // state volume root so volume-subpath computes transcripts/<itemId> and
+    // the job launches instead of failing subpath validation.
+    const { store, dir } = freshStore();
+    const pat = "ghp_ci_test_pat";
+    const tokenFile = join(dir, "secrets", "github-pat");
+    mkdirSync(join(dir, "secrets"), { recursive: true });
+    writeFileSync(tokenFile, `${pat}\n`, { mode: 0o600 });
+    const askpassScript = join(dir, "secrets", "git-askpass.sh");
+    writeFileSync(askpassScript, "#!/bin/sh\nexec cat \"$EXECUTOR_GIT_TOKEN_FILE\"\n", { mode: 0o700 });
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C-relative-transcripts" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "relative transcript mounts" });
+    await store.enqueueJob({ id: "git-rel-t", kind: "git", payload: { workItemId: item.id }, spaceId: space.id });
+    const job = (await store.claimNextJob(1_000))!;
+
+    let runArgs: string[] = [];
+    const capturing: DockerClient = {
+      launch(args: string[]) {
+        if (args.includes("run")) {
+          runArgs = args;
+          const stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+          const stdout = new Readable({ read() {} });
+          const stderr = new Readable({ read() {} });
+          let resolveExit: (v: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+          const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => { resolveExit = r; });
+          queueMicrotask(() => {
+            stdout.push(Buffer.from(JSON.stringify({ version: SANDBOX_PROTOCOL_VERSION, mode: "execute", pid: 7777, result: { exitCode: 0, signal: null, timedOut: false } }) + "\n"));
+            stdout.push(null);
+            stderr.push(null);
+            resolveExit({ code: 0, signal: null });
+          });
+          return { stdin, stdout, stderr, exit, kill: () => resolveExit({ code: null, signal: "SIGKILL" }) };
+        }
+        return new FakeProc(0, new FakeDocker());
+      },
+    };
+    const runner = createDockerSandboxRunner({
+      hostStore: store,
+      memoryProvider: memoryDenyProvider,
+      // The compose production shape: RELATIVE transcriptDir + volume roots
+      // under a single host dir (simulating data mounted at /app/data).
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: "data/transcripts",
+      volume: "data",
+      volumeWorkspacesRoot: join(dir, "workspaces"),
+      volumeStateRoot: join(dir),
+      gitTokenFile: tokenFile,
+      askpassScript,
+      docker: capturing,
+    });
+    const result = await runner(job, runnerContext(store, "", dir, 5_000));
+    expect(result.exitCode).toBe(0);
+
+    // The job launched (docker run reached) and the transcript mount pins the
+    // exact per-job subpath data/transcripts/<itemId> — never a whole root.
+    expect(runArgs.length).toBeGreaterThan(0);
+    const mountArgs = runArgs
+      .map((arg, i) => (arg === "--mount" ? runArgs[i + 1] : undefined))
+      .filter((v): v is string => v !== undefined);
+    expect(mountArgs.length).toBeGreaterThan(0);
+    const transcriptMount = mountArgs.find((m) => m.includes(`dst=/transcripts/${item.id},`)) ?? mountArgs.join(" ");
+    expect(transcriptMount).toContain(`volume-subpath=data/transcripts/${item.id}`);
+  });
+
+  test("a pre-launch subpath failure removes the staged credential dirs (no leak on a throwing dockerRunArgs)", async () => {
+    // Regression (#101): subpath validation threw AFTER per-job credential
+    // staging but BEFORE docker launch, leaking the prepared credential dir
+    // (the PAT copy). The runner must remove every staged dir on that path.
+    const { store, dir } = freshStore();
+    const pat = "ghp_ci_test_pat";
+    const tokenFile = join(dir, "secrets", "github-pat");
+    mkdirSync(join(dir, "secrets"), { recursive: true });
+    writeFileSync(tokenFile, `${pat}\n`, { mode: 0o600 });
+    const askpassScript = join(dir, "secrets", "git-askpass.sh");
+    writeFileSync(askpassScript, "#!/bin/sh\nexec cat \"$EXECUTOR_GIT_TOKEN_FILE\"\n", { mode: 0o700 });
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C-cleanup-throw" });
+    const item = await store.createWorkItem({ space_id: space.id, requester: "U1", description: "cleanup on subpath throw" });
+    await store.enqueueJob({ id: "git-cleanup", kind: "git", payload: { workItemId: item.id }, spaceId: space.id });
+    const job = (await store.claimNextJob(1_000))!;
+
+    // volumeWorkspacesRoot points at a path that does NOT contain the
+    // workspace host, so appendContainerMounts throws in relativeSubpath
+    // AFTER prepareJobMounts already staged the git credential dir.
+    const neverReached: DockerClient = {
+      launch: () => {
+        throw new Error("docker must never be launched when subpath validation fails");
+      },
+    };
+    const runner = createDockerSandboxRunner({
+      hostStore: store,
+      memoryProvider: memoryDenyProvider,
+      workspacesDir: join(dir, "workspaces"),
+      transcriptDir: join(dir, "transcripts"),
+      volume: "data",
+      volumeWorkspacesRoot: join(dir, "definitely-not-the-supervisor-workspaces-root"),
+      volumeStateRoot: join(dir),
+      gitTokenFile: tokenFile,
+      askpassScript,
+      docker: neverReached,
+    });
+    const stagingRoot = join(dir, ".omp", "sandbox");
+    const stagedGitDir = join(stagingRoot, "creds", job.id, "git");
+    const stagedPat = join(stagedGitDir, "github-pat");
+    // The staging root does not exist yet — prepareJobMounts creates it
+    // (with the per-job cred dir) only inside the runner.
+    expect(existsSync(stagingRoot)).toBe(false);
+
+    const result = await runner(job, runnerContext(store, "", dir, 5_000));
+    // Fail closed: a protocol error is returned, never a launched container.
+    expect(result.protocolError).toMatch(/not inside volume root/);
+    // prepareJobMounts ran (the staging root chain was created and left in
+    // place — only per-job leaves are removed), so the PAT copy was staged…
+    expect(existsSync(stagingRoot)).toBe(true);
+    // …and the cleanup finally removed every per-job credential dir, so no
+    // auth material leaks (the staged github-pat + its cred dir are gone).
+    expect(existsSync(stagedPat)).toBe(false);
+    expect(existsSync(stagedGitDir)).toBe(false);
   });
 });

@@ -277,6 +277,13 @@ services:
       # Egress traverses iron-proxy on the `egress` network with the proxy as
       # DNS; the CA is bind-mounted read-only.
       BOTTEGA_SANDBOX_DATA_VOLUME: data
+      # The supervisor-visible TRANSCRIPT dir: the app's default relative
+      # `data/transcripts` resolves inside the /app/data volume mount, so the
+      # absolute production path is /app/data/transcripts. It is pinned here
+      # explicitly (and the runner resolves a relative fallback against
+      # BOTTEGA_SANDBOX_STATE_VOLUME_ROOT) so volume-subpath mounts compute
+      # the exact per-job transcripts/<itemId> subpath (issue #101).
+      BOTTEGA_SANDBOX_TRANSCRIPTS_HOST: /app/data/transcripts
       # The supervisor-visible paths where the shared `data` volume root is
       # mounted for the workspaces axis (`/workspaces`) and the state axis
       # (`/app/data`) — used to compute per-job `volume-subpath` mounts so a
