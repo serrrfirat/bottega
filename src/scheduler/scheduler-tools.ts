@@ -16,19 +16,21 @@ import type { Store } from "../store/db";
 import { errorMessage, toolError } from "../tools/helpers";
 import { parseCron } from "./cron";
 import { schedulerJobMetadata } from "./store";
-import type { SchedulerActionRegistry, SchedulerJob } from "./types";
+import {
+  DURABLE_ACTION_NAMES,
+  type DurableSchedulerActionName,
+  type SchedulerActionRegistry,
+  type SchedulerJob,
+} from "./types";
 
-const schedulerActionSchema = z.enum([
-  "standup_digest",
-  "reflection",
-  "org_pulse",
-  "recurring_work",
-  "ingest_poll",
-  "kb_ingest",
-  "send_message",
-  "governance_digest",
-  "weekly_memory_review",
-]);
+/**
+ * The scheduler action-name schema (issue #341), derived from the single
+ * source of truth `DURABLE_ACTION_NAMES` in types.ts — so job-creation
+ * validation, the registry type, and the space-scoping lookup never drift
+ * from each other. Worker-only actions are deliberately not acceptable as
+ * durable job actions and are absent here.
+ */
+const schedulerActionSchema = z.enum(DURABLE_ACTION_NAMES);
 
 export const createSchedulerJobArgsSchema = z.object({
   action: schedulerActionSchema,
@@ -82,7 +84,7 @@ const SPACE_SCOPED_ACTIONS = {
   send_message: true,
   governance_digest: true,
   weekly_memory_review: true,
-};
+} satisfies Record<DurableSchedulerActionName, boolean>;
 
 const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
