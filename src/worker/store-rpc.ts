@@ -657,7 +657,10 @@ export class JobStoreRpcServer {
     // Only extension-delivery work-item jobs may read the credential ladder;
     // a git/scheduled/kb/ingest_poll job never legitimately enumerates it.
     const workItemId = this.workItemId;
-    if (this.job.kind !== "extension" || workItemId === null) {
+    if (this.job.kind !== "extension") {
+      deny("extension credential read — extension work-item jobs only");
+    }
+    if (workItemId === null) {
       deny("extension credential read — extension work-item jobs only");
     }
     const item = await this.scopedStore.getWorkItem(workItemId);
