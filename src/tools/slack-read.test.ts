@@ -39,7 +39,7 @@ interface FakeSlackApi {
   readonly historyParams?: { channel: string; limit: string | null };
   /** The fake's base URL for the adapter's clientOptions. */
   baseUrl: string;
-  server: Server;
+  server: Server<undefined>;
   stop(): void;
 }
 
@@ -51,7 +51,7 @@ interface FakeSlackApi {
  */
 function bootSlackApi(options: { messages: FakeMessage[]; missingScope?: string }): FakeSlackApi {
   const state: { repliesParams?: FakeSlackApi["repliesParams"]; historyParams?: FakeSlackApi["historyParams"] } = {};
-  const server = Bun.serve({
+  const server: Server<undefined> = Bun.serve({
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
@@ -131,12 +131,13 @@ const BOT_POST = {
 
 describe("slack_read registration (issue #340)", () => {
   test("exposes thread_ts and limit knobs and no channel selector", () => {
-    const keys = Object.keys(slackReadArgsSchema.shape);
-    expect(keys).toContain("thread_ts");
-    expect(keys).toContain("limit");
-    // Own-channel by construction: there is NO channel argument.
-    expect(keys).not.toContain("channel");
-    expect(keys).not.toContain("channel_id");
+    // slot knobs are exposed through the args schema (repo convention: assert via safeParse).
+    expect(slackReadArgsSchema.safeParse({ thread_ts: "1.1" }).success).toBe(true);
+    expect(slackReadArgsSchema.safeParse({ limit: 10 }).success).toBe(true);
+    expect(slackReadArgsSchema.safeParse({ thread_ts: "1.1", limit: 5 }).success).toBe(true);
+    // Own-channel by construction: there is NO channel argument — a channel selector is rejected.
+    expect(slackReadArgsSchema.safeParse({ channel: "C1" }).success).toBe(false);
+    expect(slackReadArgsSchema.safeParse({ channel_id: "C1" }).success).toBe(false);
   });
 });
 
