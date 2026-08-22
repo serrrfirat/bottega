@@ -33,6 +33,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { writeFileAtomic } from "../fs-atomic";
 // The broker HTTP client comes from @oh-my-pi/pi-ai (the SDK's pinned
 // transitive auth package, same 17.x release train) — no new dependency.
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
@@ -531,9 +532,7 @@ export function createSecretFileBoundary(
     const current = readFileSync(proxyConfigPath, "utf8");
     const entries = renderScopedAuthorizationEntries([...active.values()]);
     const next = replaceScopedAuthorizationBlock(current, entries);
-    const tmp = `${proxyConfigPath}.tmp`;
-    writeFileSync(tmp, next, { mode: 0o600 });
-    renameSync(tmp, proxyConfigPath);
+    writeFileAtomic(proxyConfigPath, next, 0o600);
     await reload(true);
   };
 
@@ -588,10 +587,8 @@ export function createSecretFileBoundary(
           await initialize();
           const scopedDir = join(secretsDir, "scoped");
           mkdirSync(scopedDir, { recursive: true });
-          const tmp = join(scopedDir, `${fileId}.secret.tmp`);
           const final = join(scopedDir, `${fileId}.secret`);
-          writeFileSync(tmp, secret, { mode: 0o600 });
-          renameSync(tmp, final);
+          writeFileAtomic(final, secret, 0o600);
           active.set(fileId, { fileId, placeholder, targets: request.targets });
           try {
             await apply();

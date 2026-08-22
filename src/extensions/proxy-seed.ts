@@ -21,9 +21,10 @@
  * STATIC secret file (openai-codex.secret) that the egress secrets
  * transform injects; the proxy never touches auth.openai.com for codex.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { writeFileAtomic } from "../fs-atomic";
 import { z } from "zod";
 import { DEFAULT_MODEL_CATALOG_DIR } from "../models/model-pin";
 import { parseYamlSubset } from "../yaml-subset";
@@ -341,9 +342,7 @@ export function writeCodexAuthTokens(authFilePath: string, refreshToken: string)
   // own diffs stay clean; JSON parsing is whitespace-insensitive either way.
   const pretty = /\n\s{2}/.test(raw);
   const out = (pretty ? JSON.stringify(parsed, null, 2) : JSON.stringify(parsed)) + "\n";
-  const tmpPath = `${authFilePath}.tmp`;
-  writeFileSync(tmpPath, out, { mode });
-  renameSync(tmpPath, authFilePath);
+  writeFileAtomic(authFilePath, out, mode);
 }
 
 /**
@@ -428,10 +427,7 @@ export function decodeCodexJwtExp(accessToken: string): number | null {
 /** Atomic 0600 write-temp + rename (the #53 boundary pattern). */
 function writeSecretFile(secretsDir: string, fileName: string, value: string): void {
   mkdirSync(secretsDir, { recursive: true });
-  const tmpPath = join(secretsDir, `${fileName}.tmp`);
-  const finalPath = join(secretsDir, fileName);
-  writeFileSync(tmpPath, value, { mode: 0o600 });
-  renameSync(tmpPath, finalPath);
+  writeFileAtomic(join(secretsDir, fileName), value, 0o600);
 }
 
 /** Deletes a proxy secret file (fail-closed: no stale credential). */

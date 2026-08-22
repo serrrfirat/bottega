@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
+import { MODEL_GATEWAY_KEYS } from "./generate";
+import { extensionSecretFileName, PROXY_SECRETS_MOUNT_PATH } from "../extensions/boundary";
 
 const cfg = parseYamlSubset(
   readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8"),
@@ -152,15 +154,20 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
 
     const config = asRecord(secrets["config"]);
     const entries = asRecordArray(config["secrets"]);
-    // Static secret path → the gateway hosts its entry may serve (config/egress.yml secrets stanza).
-    const expectedGatewayTargets = {
-      "/data/proxy-secrets/near.secret": ["cloud-api.near.ai"],
-      "/data/proxy-secrets/opencode.secret": ["opencode.ai"],
-      "/data/proxy-secrets/openai.secret": ["api.openai.com"],
-      "/data/proxy-secrets/anthropic.secret": ["api.anthropic.com"],
-      "/data/proxy-secrets/openai-codex.secret": ["chatgpt.com"],
-      "/data/proxy-secrets/tavily.secret": ["api.tavily.com"],
-    } satisfies Record<string, readonly string[]>;
+    // Static secret path → the gateway hosts its entry may serve
+    // (config/egress.yml secrets stanza). Derived from MODEL_GATEWAY_KEYS
+    // (src/egress/generate.ts), the single source of truth shared with the
+    // base allowlist: one edit to a gateway host updates both the allowlist
+    // and this spec. Each provider maps to exactly the hosts it serves.
+    // SAFETY: MODEL_GATEWAY_KEYS hosts are scalars, so the derived map's
+    // values are scalar arrays; Object.fromEntries yields a string→value
+    // object that the lookup-by-path below indexes.
+    const expectedGatewayTargets = Object.fromEntries(
+      MODEL_GATEWAY_KEYS.map((key) => [
+        `${PROXY_SECRETS_MOUNT_PATH}/${extensionSecretFileName(key.provider)}`,
+        [key.host],
+      ]),
+    ) as Record<string, readonly string[]>;
     const actualGatewayPaths = new Set<string>();
 
     for (const entry of entries) {
