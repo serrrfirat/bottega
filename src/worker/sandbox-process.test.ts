@@ -552,7 +552,20 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     // No host Docker socket and no broad mount surface reaches the job.
     expect(flat).not.toContain("/var/run/docker.sock");
     expect(flat).not.toMatch(/bottega\.db/);
-    expect(flat).not.toContain("-v /"); // no short-form host root bind mounts
+    // No short-form host root bind mount: every `-v` mount's host source
+    // (the part before the first `:`) must be an exact per-job path, never
+    // the filesystem root `/`. The per-job RPC socket dir legitimately
+    // mounts `-v /var/.../<job>:/rpc:rw`, so a bare substring `-v /` check
+    // would (falsely) match that — inspect each bind source structurally.
+    const bindSources = runArgs
+      .map((arg, i) => (arg === "-v" ? runArgs[i + 1] : undefined))
+      .filter((v): v is string => v !== undefined)
+      .map((v) => v.split(":")[0]);
+    expect(bindSources).not.toContain("/");
+    for (const src of bindSources) {
+      expect(src).toMatch(/^\//); // absolute per-job path, never a bare root bind
+      expect(src).not.toBe("/");
+    }
   });
 });
 
