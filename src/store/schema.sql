@@ -274,3 +274,36 @@ CREATE TABLE IF NOT EXISTS ingest_watermark (
   cursor     TEXT NOT NULL,      -- ms-epoch boundary string
   updated_at INTEGER NOT NULL
 );
+
+-- Durable pending-turn backstop (issue #312): a crash-safe record of every
+-- queued mid-turn Slack message, so a restart re-enqueues accepted-but-
+-- unfinished turns instead of losing the pending ORDER forever. The
+-- in-memory SpaceService queue remains the ordinary flow; this table is the
+-- recovery source. Identity is (space_id, ts) — the inbound Slack message —
+-- so a duplicate enqueue (re-delivery of the same message) is a no-op,
+-- exactly like worker_jobs claiming by envelope id. `status` mirrors the
+-- worker_jobs claim lifecycle: 'pending' (enqueued, never recovered),
+-- 'claimed' (a recovery pass took it; crash-mid-drain reclaims only after
+-- the lease expires — the worker_jobs lease pattern), and 'done' (the
+-- drained turn settled; never recovered again). The messages also live in
+-- Slack history — recovery never fabricates a reply, it redelivers an
+-- accepted-but-unfinished turn. Audit stays append-only; a recovered turn
+-- is audited normally through the ordinary drain path.
+CREATE TABLE IF NOT EXISTS pending_turns (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT, -- enqueue order within the space (arrival order)
+  space_id       TEXT NOT NULL,
+  ts             TEXT NOT NULL,                     -- the inbound Slack message ts (stable identity)
+  principal      TEXT NOT NULL,                     -- sender; binds the drained turn's principal (#152)
+  text           TEXT NOT NULL,                     -- full turn text (attachments already ingested)
+  root_thread_ts TEXT,                              -- conversation root for thread replies (#289)
+  status         TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','claimed','done')),
+  created_at     INTEGER NOT NULL,
+  claimed_at     INTEGER,
+  lease_until    INTEGER,                           -- crash-recovery reclaim gate (#312)
+  completed_at   INTEGER
+);
+-- Dedupe identity: the same inbound message (space + ts) is recorded once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_turns_identity ON pending_turns(space_id, ts);
+CREATE INDEX IF NOT EXISTS idx_pending_turns_recover
+  ON pending_turns(space_id, status, lease_until, id);
