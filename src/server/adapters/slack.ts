@@ -203,10 +203,9 @@ export class SlackMissingReadScopeError extends Error {
  * a missing history scope becomes a {@link SlackMissingReadScopeError}
  * (loud, actionable), anything else a generic failure with the API cause.
  */
-function readFailureError(method: "replies" | "history", channelId: string, err: unknown): Error {
-  const parsed = slackApiErrorSchema.safeParse(err);
-  const code = parsed.success ? parsed.data.data.error : undefined;
-  const needed = parsed.success ? parsed.data.data.needed : undefined;
+function readFailureError(method: "replies" | "history", channelId: string, err: SlackApiError): Error {
+  const code = err instanceof Error || err === undefined ? undefined : err.data.error;
+  const needed = err instanceof Error || err === undefined ? undefined : err.data.needed;
   if (code === "missing_scope" || code === "missing_required_scope") {
     return new SlackMissingReadScopeError(channelId, method, needed);
   }
@@ -1436,7 +1435,11 @@ export function createSlackAdapter(opts: {
         // oldest-first.
         res = await app.client.conversations.replies({ channel, ts: threadTs });
       } catch (err) {
-        throw readFailureError("replies", channel, err);
+        // Decode the thrown value at this boundary (same pattern as the
+        // streaming probe): the PlatformError payload, an Error, or nothing.
+        const parsed = slackApiErrorSchema.safeParse(err);
+        const apiError: SlackApiError = parsed.success ? parsed.data : err instanceof Error ? err : undefined;
+        throw readFailureError("replies", channel, apiError);
       }
       return normalizeReadMessages(res.messages ?? []);
     },
@@ -1447,7 +1450,9 @@ export function createSlackAdapter(opts: {
       try {
         res = await app.client.conversations.history({ channel, limit });
       } catch (err) {
-        throw readFailureError("history", channel, err);
+        const parsed = slackApiErrorSchema.safeParse(err);
+        const apiError: SlackApiError = parsed.success ? parsed.data : err instanceof Error ? err : undefined;
+        throw readFailureError("history", channel, apiError);
       }
       return normalizeReadMessages(res.messages ?? []);
     },

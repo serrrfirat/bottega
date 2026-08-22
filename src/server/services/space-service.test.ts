@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test, vi } from "bun:test";
+import { z } from "zod";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3159,6 +3160,35 @@ describe("SpaceService live todo (issue #228, caller surface)", () => {
   });
 });
 
+/**
+ * Test-domain model of the active-turn Stop control block (issue #315): a
+ * Block Kit section carrying a danger-button accessory whose `action_id`
+ * is the turn-abort control. Validated at the adapter boundary with a zod
+ * schema so the test asserts the proven wire shape instead of hand-walking
+ * an unparsed representation.
+ */
+const stopControlBlockSchema = z.object({
+  type: z.literal("section"),
+  accessory: z.object({
+    action_id: z.string(),
+    value: z.string(),
+    style: z.string(),
+  }),
+});
+type StopControlBlock = z.infer<typeof stopControlBlockSchema>;
+
+/**
+ * Decodes every stop-control block among a post's outbound blocks, parsing
+ * the unparsed `unknown[]` the fake adapter hands back at its boundary.
+ */
+function stopControlBlocksOf(p: { opts?: { blocks?: unknown[] } }): StopControlBlock[] {
+  const blocks = p.opts?.blocks ?? [];
+  return blocks.flatMap((b) => {
+    const parsed = stopControlBlockSchema.safeParse(b);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 describe("SpaceService stopTurn (issue #315, caller-level)", () => {
   /**
    * The active-turn Stop control's onAction closure — the EXACT routing the
@@ -3295,17 +3325,9 @@ describe("SpaceService stopTurn (issue #315, caller-level)", () => {
 
     // The control was mounted (a block post carrying the Stop button) and
     // cleared (an update to empty blocks on the control's own ts).
-    const isStopBlock = (b: unknown): b is { accessory: { action_id: string; value: string; style: string } } => {
-      if (b === null || typeof b !== "object") return false;
-      if (!("accessory" in b)) return false;
-      const accessory: unknown = b.accessory;
-      if (accessory === null || typeof accessory !== "object") return false;
-      if (!("action_id" in accessory) || !("value" in accessory) || !("style" in accessory)) return false;
-      return accessory.action_id === STOP_ACTION_ID;
-    };
-    const controlPosts = posts.filter((p) => (p.opts?.blocks ?? []).some(isStopBlock));
+    const controlPosts = posts.filter((p) => stopControlBlocksOf(p).length > 0);
     expect(controlPosts).toHaveLength(1);
-    const accessory = controlPosts[0]!.opts?.blocks?.find(isStopBlock)?.accessory;
+    const accessory = stopControlBlocksOf(controlPosts[0]!)[0]?.accessory;
     expect(accessory).toMatchObject({ action_id: STOP_ACTION_ID, value: "slack:C1", style: "danger" });
     expect(updates.some((u) => u.opts?.blocks && u.opts.blocks.length === 0)).toBe(true);
 
