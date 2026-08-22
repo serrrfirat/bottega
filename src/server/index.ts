@@ -916,8 +916,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     modelRoles,
     // Active-turn Stop control (issue #315): render the Stop button on
     // each turn's card/progress surface so a Slack user can stop the
-    // in-flight turn (bottega_stop → SpaceService.stopTurn).
-    stopControl: true,
+    // in-flight turn (bottega_stop → SpaceService.stopTurn). GATED BY ORG
+    // SETTINGS (default OFF): the full #315 machinery stays intact, but the
+    // control only mounts when the org sets `turn_stop_control: true`.
+    stopControl: orgSettings?.turnStopControl ?? false,
     // The active default model (issue #342): lets the turn presenter
     // attribute a bare 403 to the Codex mint/grant family only when codex
     // is the active provider; other providers get a provider-aware remedy.

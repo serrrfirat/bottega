@@ -615,9 +615,12 @@ describe("settings schemas (issue #67)", () => {
     const ok = settingsSetSchema.safeParse({
       memory_backend: { base_url: "http://mem0:8000" },
       allow_loose_pat: true,
+      turn_stop_control: true,
       models: { effort: "high" },
     });
     expect(ok.success).toBe(true);
+    const badBoolean = settingsSetSchema.safeParse({ turn_stop_control: "yes" });
+    expect(badBoolean.success).toBe(false);
     const badProactive = settingsSetSchema.safeParse({ proactive: { standup: "yes" } });
     expect(badProactive.success).toBe(false);
   });

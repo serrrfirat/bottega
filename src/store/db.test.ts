@@ -1290,6 +1290,8 @@ describe("org settings (issue #67)", () => {
       extensions: { allow: ["linear"], deny: ["attio"], org_credentials: "deny" },
       repos: ["acme/sandbox"],
       models: { default: "deepseek-v4-flash", fast: "deepseek-v4-flash", reasoning: "glm-5", effort: "medium" },
+      allow_loose_pat: true,
+      turn_stop_control: true,
     });
     expect(parsed.ok).toBe(true);
     expect(s.getOrgSettings()).toEqual({
@@ -1302,6 +1304,8 @@ describe("org settings (issue #67)", () => {
       extensions: { allow: ["linear"], deny: ["attio"], orgCredentials: "deny" },
       repos: ["acme/sandbox"],
       models: { default: "deepseek-v4-flash", fast: "deepseek-v4-flash", reasoning: "glm-5", effort: "medium" },
+      allowLoosePat: true,
+      turnStopControl: true,
     });
   });
 
@@ -1377,6 +1381,31 @@ describe("org settings (issue #67)", () => {
     expect(() => s.setOrgSettings(malformed({ onboarding: { channel: "C1" } }))).toThrow(/onboarding\.channel: unknown key/);
     expect(() => s.setOrgSettings(malformed({ onboarding: "slack:C1" }))).toThrow(/onboarding must be an object/);
     expect(s.getOrgSettings()?.onboarding).toBeUndefined();
+  });
+
+  test("turn_stop_control round-trips; absent → default off (issue #315)", () => {
+    const s = freshStore();
+    // Absent → the knob is unset (the boot's `?? false` disables the Stop).
+    expect(s.setOrgSettings({}).turnStopControl).toBeUndefined();
+    expect(s.getOrgSettings()?.turnStopControl).toBeUndefined();
+
+    // Explicit true enables the Slack live-turn Stop control.
+    const parsed = s.setOrgSettings({ turn_stop_control: true });
+    expect(parsed.ok).toBe(true);
+    expect(parsed.turnStopControl).toBe(true);
+    expect(s.getOrgSettings()?.turnStopControl).toBe(true);
+
+    // Explicit false is a stored off (distinct from unset, but the boot
+    // treats both as disabled).
+    s.setOrgSettings({ turn_stop_control: false });
+    expect(s.getOrgSettings()?.turnStopControl).toBe(false);
+
+    // Malformed values fail closed and write nothing.
+    // SAFETY: the malformed literal is deliberately outside OrgSettingsInput's
+    // type; the store's runtime validator is the boundary under test.
+    const malformed = (v: JsonValue): OrgSettingsInput => v as OrgSettingsInput;
+    expect(() => s.setOrgSettings(malformed({ turn_stop_control: "yes" }))).toThrow(/turn_stop_control/);
+    expect(s.getOrgSettings()?.turnStopControl).toBe(false);
   });
 
   test("memory.injection.max_entries over the cap is clamped with a warning", () => {

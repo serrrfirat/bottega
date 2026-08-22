@@ -3378,4 +3378,28 @@ describe("SpaceService stopTurn (issue #315, caller-level)", () => {
 
     await service.stop();
   });
+
+  test("stopControl off (the default) renders NO Stop block on an in-flight turn (org-gating, #315)", async () => {
+    const { adapter, posts } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    // Omit stopControl → `deps.stopControl ?? false` → the gated default off.
+    const service = makeSpaceService({ store, adapter, driver });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last()!;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // A live turn: turn_start would mount the Stop control when enabled.
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // NO Stop-control block was ever mounted (and nothing cleared): the
+    // turn ran fully with the control disabled.
+    const controlPosts = posts.filter((p) => stopControlBlocksOf(p).length > 0);
+    expect(controlPosts).toHaveLength(0);
+
+    await service.stop();
+  });
 });

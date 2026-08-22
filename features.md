@@ -343,6 +343,9 @@ channel. The decision internals live in
   to act only on explicit requests. The org floor sets it in `config.yml`;
   the space overlay may change it but can only tighten (`always` →
   `mention` → `request-only`).
+- **Live-turn Stop control** (issue #315) — a *Running — do you want to stop
+  this turn?* Stop button on active turns. Off by default; enable via org
+  settings `turn_stop_control: true`.
 - **Extension policy** (`extensions:`, issue #56) gates which extensions a
   space may use and whether org-scoped credentials may be used there:
 

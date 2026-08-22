@@ -111,6 +111,14 @@ export interface OrgSettings {
   apiBaseUrl?: string;
   /** Local-dev only: tolerate a PAT file mode other than 0600 (Part B). */
   allowLoosePat?: boolean;
+  /**
+   * Slack live-turn Stop control (issue #315): when true the boot wires the
+   * turn presenter to mount a "Running — do you want to stop this turn?"
+   * Stop button (bottega_stop) on each in-flight turn. DEFAULT OFF — the
+   * machinery stays intact but is disabled until an org opts in via
+   * `turn_stop_control: true`.
+   */
+  turnStopControl?: boolean;
   /** Memory backend URL (mem0); unset → SQLite memory (Part B). */
   memoryBackend?: { baseUrl?: string };
   /**
@@ -159,6 +167,8 @@ export interface OrgSettingsInput {
   git_base_url?: string;
   api_base_url?: string;
   allow_loose_pat?: boolean;
+  /** Enable the Slack live-turn Stop control (issue #315); default off. */
+  turn_stop_control?: boolean;
   memory_backend?: { base_url?: string };
   /** Proactive onboarding (issue #116): space id for the boot-time guide. */
   onboarding?: { space_id?: string };
@@ -494,6 +504,13 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
         fail("allow_loose_pat must be a boolean");
       } else {
         out.allowLoosePat = flag.data;
+      }
+    } else if (name === "turn_stop_control") {
+      const flag = z.boolean().safeParse(value);
+      if (!flag.success) {
+        fail("turn_stop_control must be a boolean");
+      } else {
+        out.turnStopControl = flag.data;
       }
     } else if (name === "memory_backend") {
       // The backend URL (mem0) — issue #67 env pruning moved the knob out

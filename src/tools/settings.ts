@@ -138,6 +138,8 @@ export const settingsSetSchema = z.object({
   git_base_url: z.string().optional(),
   api_base_url: z.string().optional(),
   allow_loose_pat: z.boolean().optional(),
+  /** Enable the Slack live-turn Stop control (issue #315); default off. */
+  turn_stop_control: z.boolean().optional(),
   memory_backend: z
     .object({
       base_url: z.string().optional(),
@@ -245,6 +247,7 @@ function mergeSettingsInput(base: OrgSettingsInput, partial: SettingsSetInput): 
   if (partial.git_base_url !== undefined) out.git_base_url = partial.git_base_url;
   if (partial.api_base_url !== undefined) out.api_base_url = partial.api_base_url;
   if (partial.allow_loose_pat !== undefined) out.allow_loose_pat = partial.allow_loose_pat;
+  if (partial.turn_stop_control !== undefined) out.turn_stop_control = partial.turn_stop_control;
   if (partial.memory_backend !== undefined) {
     out.memory_backend = { ...base.memory_backend, ...partial.memory_backend };
   }
@@ -301,6 +304,7 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   if (settings.gitBaseUrl !== undefined) input.git_base_url = settings.gitBaseUrl;
   if (settings.apiBaseUrl !== undefined) input.api_base_url = settings.apiBaseUrl;
   if (settings.allowLoosePat !== undefined) input.allow_loose_pat = settings.allowLoosePat;
+  if (settings.turnStopControl !== undefined) input.turn_stop_control = settings.turnStopControl;
   if (settings.memoryBackend?.baseUrl !== undefined) {
     input.memory_backend = { base_url: settings.memoryBackend.baseUrl };
   }
@@ -341,7 +345,8 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
-      "git_base_url, api_base_url, allow_loose_pat, memory_backend.base_url, onboarding.space_id " +
+      "git_base_url, api_base_url, allow_loose_pat, turn_stop_control (the Slack live-turn Stop " +
+      "control, default off), memory_backend.base_url, onboarding.space_id " +
       "(the space that receives the boot-time onboarding guide), secrets_backend (the credential " +
       "vault backend: type omp-broker [default] or 1password-connect with connect_url + a mapping " +
       "of \"provider:identityKey\" to {vault, item, field}; the Connect token itself stays in .env " +
