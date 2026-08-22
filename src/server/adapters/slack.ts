@@ -418,24 +418,57 @@ const slackMessageEventSchema = z.object({
 });
 
 /**
+ * Why a raw `message` event is (or is not) accepted inbound (issue #341
+ * #14). The single drop-reason encoder shared by normalizeMessage,
+ * messageDropReason, and messageDropDetail — the classification logic used
+ * to live in all three, triplicated. `ok` data is the schema-validated
+ * event; `bot-authored` is the adapter's own bot echo (issue #204, fail
+ * closed when the bot id is unknown); `unparseable` carries the detail a
+ * silent no-turn should attribute (issue #212 follow-up).
+ */
+type MessageEventClassification =
+  | { kind: "ok"; data: z.infer<typeof slackMessageEventSchema> }
+  | { kind: "bot-authored"; data: z.infer<typeof slackMessageEventSchema> }
+  | { kind: "unparseable"; detail: string };
+
+/** One drop-reason encoder: the shared classification behind the three consumers. */
+function classifyMessageEvent(
+  event: RawSlackMessageEvent | null | string | number | undefined,
+  botUserId?: string,
+): MessageEventClassification {
+  const parsed = slackMessageEventSchema.safeParse(event);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    return { kind: "unparseable", detail: issue !== undefined ? issue.path.join(".") || "unknown" : "unknown" };
+  }
+  const { text, subtype, bot_id, user, files } = parsed.data;
+  if (isBotMessage({ bot_id, subtype, user }, botUserId)) {
+    // A bot-authored event is dropped like an unparseable one — it never
+    // reaches onMessage (the drop reason "bot-authored" is what tells a
+    // self-echo from a hard failure).
+    return { kind: "bot-authored", data: parsed.data };
+  }
+  if (text === undefined && !(files !== undefined && files.length > 0)) {
+    return { kind: "unparseable", detail: "no text or files" };
+  }
+  return { kind: "ok", data: parsed.data };
+}
+
+/**
  * Normalizes a raw Slack message event into a {@link SlackMessage}.
  *
  * Returns `null` for anything unparseable (missing channel/user/ts and
  * neither text nor files, non-object payloads, bot messages) instead of
- * throwing — the caller drops and logs those.
- *
- * `botUserId` is the adapter's own bot user id (resolved at start()); a
- * real user's API-posted message carries `bot_id` but a human `user`, so
- * bot-authored is decided against this id (issue #204).
+ * throwing — the caller drops and logs those. The drop reason is left to
+ * {@link messageDropReason}, which the logging path uses for attribution.
  */
 export function normalizeMessage(
   event: RawSlackMessageEvent | null | string | number | undefined,
   botUserId?: string,
 ): SlackMessage | null {
-  const parsed = slackMessageEventSchema.safeParse(event);
-  if (!parsed.success) return null;
-  const { channel, user, text, ts, subtype, bot_id, thread_ts, files } = parsed.data;
-  if (isBotMessage({ bot_id, subtype, user }, botUserId)) return null;
+  const classified = classifyMessageEvent(event, botUserId);
+  if (classified.kind !== "ok") return null;
+  const { channel, user, text, ts, thread_ts, files } = classified.data;
   const normalizedFiles: NonNullable<SlackMessage["files"]> = [];
   if (files !== undefined) {
     for (const file of files) {
@@ -445,7 +478,6 @@ export function normalizeMessage(
       normalizedFiles.push({ id, name, mimeType: mimetype, size });
     }
   }
-  if (text === undefined && !(files !== undefined && files.length > 0)) return null;
   return {
     spaceId: spaceIdFromChannel(channel),
     principal: user,
@@ -458,35 +490,27 @@ export function normalizeMessage(
 
 /**
  * Discriminates why a message event is dropped — bot-authored vs
- * unparseable — mirroring {@link normalizeMessage}'s null logic exactly:
- * zod failure or an event with neither text nor files is "unparseable";
- * the adapter's own bot posts (echo loop protection, issue #204) are
- * "bot-authored". `null` means the event is an acceptable inbound message.
- * Pure, so the drop-reason contract is unit-testable: a silent no-turn is
- * attributable from the log line alone (issue #212 follow-up — the legacy
- * combined log could not tell a bot echo from a malformed payload).
+ * unparseable — from the shared encoder: `unparseable` for a zod failure or
+ * an event with neither text nor files, `bot-authored` for the adapter's own
+ * bot posts (echo loop protection, issue #204). `null` means the event is an
+ * acceptable inbound message. Pure, so the drop-reason contract is
+ * unit-testable: a silent no-turn is attributable from the log line alone
+ * (issue #212 follow-up — the legacy combined log could not tell a bot echo
+ * from a malformed payload).
  */
 export function messageDropReason(
   event: RawSlackMessageEvent | null | string | number | undefined,
   botUserId?: string,
 ): "bot-authored" | "unparseable" | null {
-  const parsed = slackMessageEventSchema.safeParse(event);
-  if (!parsed.success) return "unparseable";
-  const { text, subtype, bot_id, user, files } = parsed.data;
-  if (isBotMessage({ bot_id, subtype, user }, botUserId)) return "bot-authored";
-  if (text === undefined && !(files !== undefined && files.length > 0)) return "unparseable";
-  return null;
+  const classified = classifyMessageEvent(event, botUserId);
+  if (classified.kind === "ok") return null;
+  return classified.kind === "bot-authored" ? "bot-authored" : "unparseable";
 }
 
-/** The unparseable drop detail: the zod failure path, or the empty-message
- * shape when the schema passed (no text and no files). */
+/** The unparseable drop detail from the shared encoder. */
 function messageDropDetail(event: RawSlackMessageEvent | null | string | number | undefined): string {
-  const parsed = slackMessageEventSchema.safeParse(event);
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    return issue !== undefined ? issue.path.join(".") || "unknown" : "unknown";
-  }
-  return "no text or files";
+  const classified = classifyMessageEvent(event);
+  return classified.kind === "unparseable" ? classified.detail : "no text or files";
 }
 
 /** Raw Bolt block-action element — the clicked button; runtime-validated before use. */

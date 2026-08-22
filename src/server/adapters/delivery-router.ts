@@ -32,6 +32,7 @@ import {
   type SlackAdapter,
   type SlackBlockPayload,
 } from "./slack";
+import { bestEffortMessageRewrite, resolveBlockAction } from "./block-flow";
 
 /**
  * The `delivery.requested` payload as the poller writes it (all strings).
@@ -126,43 +127,60 @@ export async function resolveDeliveryAction(
   action: SlackAction,
 ): Promise<boolean> {
   const log = deps.log ?? ((line: string) => console.log(line));
-  const approved = action.actionId === DELIVERY_APPROVE_ACTION_ID;
-  if (!approved && action.actionId !== DELIVERY_DENY_ACTION_ID) {
-    log(`[delivery] ignoring non-delivery action ${action.actionId}`);
-    return false;
-  }
-  const [requested, resolved] = await Promise.all([
-    deps.store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT }),
-    deps.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT }),
-  ]);
-  const announcement = requested.find((row) => {
-    const payload = parsePayload(row.payload);
-    return payload?.id === action.value;
-  });
-  if (!announcement) {
-    log(`[delivery] ignoring action for unknown item ${action.value}`);
-    return false;
-  }
-  if (announcement.space_id !== action.spaceId) {
-    log(`[delivery] ignoring action for ${action.value} from foreign space ${action.spaceId}`);
-    return false;
-  }
-  if (resolved.some((row) => parsePayload(row.payload)?.id === action.value)) {
-    log(`[delivery] ignoring action for already-resolved item ${action.value}`);
-    return false;
-  }
-  const payload = parsePayload(announcement.payload);
-  const prUrl = payload?.pr_url ?? action.value;
-  await deps.store.appendAudit({
-    space_id: action.spaceId,
-    actor: action.principal,
-    event_type: DELIVERY_RESOLVED_EVENT,
-    payload: JSON.stringify({ id: action.value, approved, approver: action.principal }),
-  });
-  // Rewrite the prompt with the outcome. Best-effort by design: the audit
-  // row above is the decision; a failed rewrite must not lose it.
-  void deps.adapter
-    .updateMessage(action.spaceId, action.messageTs, outcomeText(prUrl, approved, action.principal))
-    .catch((err) => log(`[delivery] updateMessage failed for ${action.value}: ${String(err)}`));
-  return true;
+  let announcement:
+    | Awaited<ReturnType<Store["listAudit"]>>[number]
+    | undefined;
+  return resolveBlockAction(
+    log,
+    action,
+    {
+      // Delivery owns every block-action click that reaches it (the slack
+      // router already filters to the delivery ids); the guard below keeps
+      // the non-delivery ownership log, mirroring the original behavior.
+      owns: () => true,
+      guard: async (a) => {
+        const approved = a.actionId === DELIVERY_APPROVE_ACTION_ID;
+        if (!approved && a.actionId !== DELIVERY_DENY_ACTION_ID) {
+          return `[delivery] ignoring non-delivery action ${a.actionId}`;
+        }
+        const [requested, resolved] = await Promise.all([
+          deps.store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT }),
+          deps.store.listAudit({ event_type: DELIVERY_RESOLVED_EVENT }),
+        ]);
+        announcement = requested.find((row) => parsePayload(row.payload)?.id === a.value);
+        if (!announcement) return `[delivery] ignoring action for unknown item ${a.value}`;
+        if (announcement.space_id !== a.spaceId) {
+          return `[delivery] ignoring action for ${a.value} from foreign space ${a.spaceId}`;
+        }
+        if (resolved.some((row) => parsePayload(row.payload)?.id === a.value)) {
+          return `[delivery] ignoring action for already-resolved item ${a.value}`;
+        }
+        return null;
+      },
+      settle: async (a) => {
+        const row = announcement!;
+        const payload = parsePayload(row.payload);
+        const prUrl = payload?.pr_url ?? a.value;
+        const approved = a.actionId === DELIVERY_APPROVE_ACTION_ID;
+        await deps.store.appendAudit({
+          space_id: a.spaceId,
+          actor: a.principal,
+          event_type: DELIVERY_RESOLVED_EVENT,
+          payload: JSON.stringify({ id: a.value, approved, approver: a.principal }),
+        });
+        return { outcome: { prUrl, approved, principal: a.principal } };
+      },
+      // Rewrite the prompt with the outcome. Best-effort by design: the audit
+      // row above is the decision; a failed rewrite must not lose it.
+      rewrite: (a, outcome) =>
+        bestEffortMessageRewrite(
+          deps.adapter,
+          a.spaceId,
+          a.messageTs,
+          outcomeText(outcome.prUrl, outcome.approved, outcome.principal),
+          undefined,
+          (reason) => log(`[delivery] updateMessage failed for ${a.value}: ${reason}`),
+        ),
+    },
+  );
 }
