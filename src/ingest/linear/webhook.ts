@@ -13,6 +13,9 @@
  */
 import type { SignatureVerifier } from "../types";
 
+/** The Linear webhook signature header (lowercase — the route normalizes header keys). */
+export const LINEAR_SIGNATURE_HEADER = "linear-signature";
+
 /** The Linear verifier adapter (the registry's `linear` entry). */
 export const linearSignatureVerifier: SignatureVerifier = {
   async verify() {
