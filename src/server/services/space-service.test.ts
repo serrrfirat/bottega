@@ -1272,11 +1272,17 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     await service.stop();
   });
 
-  test("an empty reply whose cause is a bare 403 maps to the mint remedy at the churn boundary (issue #218)", async () => {
+  test("an empty reply whose cause is a bare 403 maps to the mint remedy at the churn boundary when codex is the active default (issue #218)", async () => {
     const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
-    const service = makeSpaceService({ store, adapter, driver, onboardingChecks: () => [] });
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => [],
+      activeDefaultModel: "openai-codex/gpt-5.6-luna",
+    });
 
     await service.handleInboundMessage(msg({ ts: "1.1" }));
     const session = driver.last();
@@ -1295,6 +1301,36 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     }
     expect(updates.at(-1)!.text).toContain("codex login");
     expect(updates.at(-1)!.text).not.toContain("check the model key?");
+    await service.stop();
+  });
+
+  test("a bare 403 for a NON-codex active default surfaces the provider-aware remedy, not codex login (issue #342)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      onboardingChecks: () => [],
+      activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
+    });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last();
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await Promise.resolve();
+    // The proxy 403 for an unauthenticated near gateway call (no
+    // NEAR_API_KEY): MUST name the near provider, never a false codex
+    // login remedy.
+    session.emit("message", { spaceId: "slack:C1", text: "", error: "Request failed with status code 403" });
+    await Promise.resolve();
+
+    const visible = updates.at(-1)!.text;
+    expect(visible).toContain("near");
+    expect(visible).toContain("NEAR_API_KEY");
+    expect(visible).toContain("restart the server");
+    expect(visible).not.toContain("codex login");
     await service.stop();
   });
 

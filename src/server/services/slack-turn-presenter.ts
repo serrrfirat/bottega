@@ -194,8 +194,8 @@ export const CHURN_MESSAGE = "I keep getting empty responses — check the model
  * the recovery path, never the generic retry phrase.
  * Fail closed: no cause → the exact legacy phrase.
  */
-export function emptyResponseFallback(cause: string | undefined): string {
-  const remedy = codexMintFailureText(cause);
+export function emptyResponseFallback(cause: string | undefined, provider?: string): string {
+  const remedy = codexMintFailureText(cause, provider);
   if (remedy !== null) return remedy;
   return cause && cause.trim() ? `Hmm — I got an empty response: ${cause.trim()} — retrying…` : EMPTY_RESPONSE_FALLBACK;
 }
@@ -207,8 +207,8 @@ export function emptyResponseFallback(cause: string | undefined): string {
  * the recovery path, never the guess.
  * Fail closed: no cause → the exact legacy phrase.
  */
-export function churnMessageText(cause: string | undefined): string {
-  const remedy = codexMintFailureText(cause);
+export function churnMessageText(cause: string | undefined, provider?: string): string {
+  const remedy = codexMintFailureText(cause, provider);
   if (remedy !== null) return remedy;
   return cause && cause.trim() ? `I keep getting empty responses — ${cause.trim()}` : CHURN_MESSAGE;
 }
@@ -555,6 +555,15 @@ export interface TurnPresenterDeps {
    * (the index boot) enables it via {@link SpaceServiceDeps.stopControl}.
    */
   stopControl?: boolean;
+  /**
+   * The active model PROVIDER for the space's turns (issue #342): the
+   * provider id (e.g. "near", "openai-codex") derived from the active
+   * default model. Lets the error mapper attribute a bare 403 to the Codex
+   * mint/grant family ONLY when the provider is codex; any other provider's
+   * 403 maps to a provider-aware credential remedy. Absent → a bare 403
+   * keeps its original text (fail-closed: never a false "run codex login").
+   */
+  provider?: string;
 }
 
 /**
@@ -742,6 +751,8 @@ export class SlackTurnPresenter {
   #bufferedDMReply: string | undefined;
   /** The latest buffered session error / empty-fallback during a pending top-level DM request (issue #296). */
   #bufferedDMError: string | undefined;
+  /** The active model provider (issue #342): attributes a bare 403 to Codex only when the provider is codex. */
+  readonly #provider: string | undefined;
 
   constructor(deps: TurnPresenterDeps) {
     this.spaceId = deps.spaceId;
@@ -750,6 +761,7 @@ export class SlackTurnPresenter {
     this.#onboardingChecks = deps.onboardingChecks;
     this.#phraseRotation = deps.phraseRotation ?? createPhraseRotation();
     this.#stopControlEnabled = deps.stopControl ?? false;
+    this.#provider = deps.provider;
   }
 
   /**
@@ -850,7 +862,7 @@ export class SlackTurnPresenter {
         const cause = data.error?.trim() || undefined;
         this.#emptyTurnCount = this.#emptyTurnCount + 1;
         this.#bufferedDMError =
-          this.#emptyTurnCount > EMPTY_TURN_LIMIT ? churnMessageText(cause) : emptyResponseFallback(cause);
+          this.#emptyTurnCount > EMPTY_TURN_LIMIT ? churnMessageText(cause, this.#provider) : emptyResponseFallback(cause, this.#provider);
         if (this.#emptyTurnCount > EMPTY_TURN_LIMIT) this.#churnActive = true;
         return;
       }
@@ -877,7 +889,7 @@ export class SlackTurnPresenter {
         this.#cancelProgressTimer();
         const pendingTs = this.pendingTs;
         if (pendingTs !== undefined) {
-          const fallback = emptyResponseFallback(cause);
+          const fallback = emptyResponseFallback(cause, this.#provider);
           void this.sendTextChunk(pendingTs, fallback).catch((err) => {
             console.error(`[slack-turn-presenter] failed to update empty-response phrase in ${this.spaceId}:`, err);
           });
@@ -913,7 +925,7 @@ export class SlackTurnPresenter {
     if (this.#dmTopLevel && this.#requestActive) {
       this.cancelStreamUpdate();
       this.#cancelProgressTimer();
-      const base = codexMintFailureText(data.message) ?? data.message ?? "Something went wrong while thinking.";
+      const base = codexMintFailureText(data.message, this.#provider) ?? data.message ?? "Something went wrong while thinking.";
       this.#bufferedDMError = base;
       return;
     }
@@ -926,7 +938,7 @@ export class SlackTurnPresenter {
     this.#churnActive = false;
     // A Codex mint failure (issue #218) maps to the recovery path — the raw
     // proxy error string would read as an empty-response rerun, not a fix.
-    const base = codexMintFailureText(data.message) ?? data.message ?? "Something went wrong while thinking.";
+    const base = codexMintFailureText(data.message, this.#provider) ?? data.message ?? "Something went wrong while thinking.";
     console.log(`presenter: turn error ${this.spaceId} ${base.replaceAll("\n", " ")}`);
     // A setup-blocked failure (provider/session) appends the one-line
     // onboarding pointer (issue #116) — bounded by the per-space dedupe.
@@ -1910,7 +1922,7 @@ export class SlackTurnPresenter {
     this.#emptyTurnCount = count;
     if (count <= EMPTY_TURN_LIMIT || this.#churnActive) return;
     this.#churnActive = true;
-    this.#replaceOrPost(this.#nudgeText(churnMessageText(cause)));
+    this.#replaceOrPost(this.#nudgeText(churnMessageText(cause, this.#provider)));
   }
 
   /**

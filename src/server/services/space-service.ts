@@ -16,6 +16,7 @@ import {
   type SlackMessage,
 } from "../adapters/slack";
 import { resolveSpaceSkills } from "../skills";
+import { providerFromModelRef } from "../../extensions/proxy-seed";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
@@ -108,6 +109,16 @@ export interface SpaceServiceDeps {
    * keep exact message counts; production (the index boot) enables it.
    */
   stopControl?: boolean;
+  /**
+   * The ACTIVE DEFAULT MODEL ref (issue #342): the same
+   * agent-dir `modelRoles.default` the boot passes to the proxy credential
+   * sync (issue #339). Its provider lets the turn presenter attribute a
+   * bare 403 to the Codex mint/grant family ONLY when codex is the active
+   * provider; any other provider's 403 surfaces a provider-aware remedy
+   * naming the provider and env var. Absent → a bare 403 keeps its
+   * original text (fail-closed, never a false "run codex login").
+   */
+  activeDefaultModel?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +307,8 @@ export class SpaceService {
   readonly #classifier: CorrectionClassifier;
   /** Render the active-turn Stop control (issue #315); see {@link SpaceServiceDeps.stopControl}. */
   readonly #stopControl: boolean;
+  /** The ACTIVE DEFAULT MODEL ref (issue #342); see {@link SpaceServiceDeps.activeDefaultModel}. */
+  readonly #activeDefaultModel: string | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /**
@@ -340,6 +353,7 @@ export class SpaceService {
     this.#personaDir = deps.personaDir;
     this.#classifier = deps.classifier ?? new CorrectionClassifier();
     this.#stopControl = deps.stopControl ?? false;
+    this.#activeDefaultModel = deps.activeDefaultModel;
   }
 
   /**
@@ -363,6 +377,9 @@ export class SpaceService {
       onboardingChecks: this.#onboardingChecks,
       phraseRotation: this.#phraseRotation,
       stopControl: this.#stopControl,
+      // The active model provider (issue #342): maps a bare 403 to the
+      // Codex mint/grant family only when the active provider is codex.
+      provider: providerFromModelRef(this.#activeDefaultModel),
     };
     // DMs must read as one plain message (issue #180): the stream panel
     // opens a threaded reply (chat.startStream carries thread_ts), which

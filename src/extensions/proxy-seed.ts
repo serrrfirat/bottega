@@ -152,20 +152,66 @@ export const CODEX_MINT_FAILURE_MARKER = "oauth_token failed to mint";
 export const CODEX_MINT_REMEDY = "run `codex login`, then restart the server";
 
 /**
+ * The provider id of a model ref (issue #342): the FIRST path segment of a
+ * provider-qualified ref ("near/deepseek-ai/DeepSeek-V4-Flash" → "near",
+ * "openai-codex/gpt-5.6-luna" → "openai-codex"), matched against the known
+ * model-gateway providers ({@link MODEL_PROXY_KEYS} plus the codex static
+ * entry) — the same provider ids the egress generator's MODEL_GATEWAY_KEYS
+ * seeds. A bare id, role ref, or unknown provider → undefined (the caller
+ * keeps a fail-closed text rather than guessing).
+ */
+export function providerFromModelRef(modelRef: string | undefined): string | undefined {
+  if (modelRef === undefined) return undefined;
+  const ref = modelRef.trim();
+  if (ref === "") return undefined;
+  const known = [...MODEL_PROXY_KEYS.map((k) => k.provider), "openai-codex"] as const;
+  return known.find((p) => ref === p || ref.startsWith(`${p}/`));
+}
+
+/**
+ * A provider-aware credential-failure remedy (issue #342): names the
+ * provider and its provisioning env var derived from
+ * {@link MODEL_PROXY_KEYS} (e.g. near → "set NEAR_API_KEY"), keeping the
+ * fail-closed posture (never an empty or wrong guess, never a secret). A
+ * provider absent from the table, or unknown → null, so callers keep
+ * their existing text.
+ */
+export function providerCredentialRemedy(provider: string | undefined): string | null {
+  if (provider === undefined) return null;
+  const envName = MODEL_PROXY_KEYS.find((k) => k.provider === provider)?.envName;
+  const provision = envName
+    ? `set ${envName} (or provision it in the auth-broker vault)`
+    : "provision it in the auth-broker vault";
+  return `Model call failed: no credential for provider ${provider} — ${provision}, then restart the server.`;
+}
+
+/**
  * Maps a driver/proxy error message to the user-visible Codex mint-failure
  * reply (issue #218): a dead refresh token must surface the recovery path
  * instead of an empty-response fallback. Matches the proxy's 502 body
- * string ({@link CODEX_MINT_FAILURE_MARKER}) and the 403-no-body family (a
+ * string ({@link CODEX_MINT_FAILURE_MARKER}) and — ONLY when the active
+ * provider is the codex provider (issue #342) — the 403-no-body family (a
  * standalone `403` in the message — the upstream rejecting with no body,
- * e.g. an account-plan denial). Returns null for anything else, so callers
- * keep their existing text.
+ * e.g. an account-plan denial). A bare 403 for ANY OTHER provider maps to
+ * the provider-aware credential remedy ({@link providerCredentialRemedy}),
+ * never a false "run codex login". Returns null for anything else, so
+ * callers keep their existing text.
  */
-export function codexMintFailureText(message: string | undefined): string | null {
+export function codexMintFailureText(message: string | undefined, provider?: string): string | null {
   if (message === undefined) return null;
   const trimmed = message.trim();
   if (trimmed === "") return null;
-  if (!trimmed.includes(CODEX_MINT_FAILURE_MARKER) && !/\b403\b/.test(trimmed)) return null;
-  return `Codex auth failed to mint an access token — ${CODEX_MINT_REMEDY}.`;
+  // The mint marker is codex-specific — it always maps to the Codex remedy.
+  if (trimmed.includes(CODEX_MINT_FAILURE_MARKER)) {
+    return `Codex auth failed to mint an access token — ${CODEX_MINT_REMEDY}.`;
+  }
+  if (!/\b403\b/.test(trimmed)) return null;
+  // A bare 403 is attributable to the Codex mint/grant family only when the
+  // active provider IS codex; otherwise it belongs to the failing provider.
+  if (provider === "openai-codex") {
+    return `Codex auth failed to mint an access token — ${CODEX_MINT_REMEDY}.`;
+  }
+  return providerCredentialRemedy(provider);
 }
 
 /**
