@@ -1,6 +1,37 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 
 /**
+ * The queue row both list_work_items (work-items.ts) and list_todos
+ * (list-todos.ts) render for each work item: id, description, state,
+ * assignee, and created. One source of truth for the human-facing queue
+ * shape so the two surfaces never drift.
+ */
+export interface WorkItemQueueRow {
+  id: string;
+  description: string;
+  state: string;
+  assignee: string | null;
+  created: number;
+}
+
+/**
+ * Maps a work item's store row (array from store.listWorkItems) to the
+ * shared queue rendering. The input carries the store's `created_at`
+ * column; the output exposes it as `created` on every surface.
+ */
+export function renderWorkItemQueue(
+  item: { id: string; description: string; state: string; assignee: string | null; created_at: number },
+): WorkItemQueueRow {
+  return {
+    id: item.id,
+    description: item.description,
+    state: item.state,
+    assignee: item.assignee,
+    created: item.created_at,
+  };
+}
+
+/**
  * Error result for a tool extension (issue #33): text content flagged as an
  * error. Shared by the memory and work-item tool extensions so failure
  * results carry the same shape everywhere.

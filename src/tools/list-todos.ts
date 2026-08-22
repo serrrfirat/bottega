@@ -23,7 +23,7 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { renderTodoPlan, todoProgress } from "../server/services/slack-turn-presenter";
 import type { Store } from "../store/db";
-import { errorMessage, toolError } from "./helpers";
+import { errorMessage, renderWorkItemQueue, toolError } from "./helpers";
 
 export const listTodosArgsSchema = z.object({
   /** Space id ("slack:C123") whose snapshot to read; defaults to this conversation's space. */
@@ -79,13 +79,7 @@ export function listTodosToolDefinition(store: Store, opts: ListTodosExtensionOp
         // Work items: the SAME store query list_work_items runs (issue
         // #159) — one source of truth for the space's visible queue.
         const items = await store.listWorkItems({ space_id: spaceId });
-        const workItems = items.map((item) => ({
-          id: item.id,
-          description: item.description,
-          state: item.state,
-          assignee: item.assignee,
-          created: item.created_at,
-        }));
+        const workItems = items.map(renderWorkItemQueue);
         const inProgress = items.filter((item) => item.state === "working").length;
         // Pending approvals: the router's outstanding prompts for this
         // space; absent seam → none pending (headless contexts deny fast).
