@@ -864,9 +864,9 @@ test("memory writes/searches/prunes outside the job's own space are denied", asy
       // An org-scope search is the shared floor — allowed.
       await expect(session.memoryProvider.search({ query: "kb", scope: { kind: "org" } })).resolves.toEqual([]);
       // A channel scope for ANOTHER space is denied.
-      const saveOther = { content: "x", scope: { kind: "channel", spaceId: "slack:C2" } };
+      const saveOther = { content: "x", scope: { kind: "channel", spaceId: "slack:C2" } as const };
       await expect(session.memoryProvider.save(saveOther)).rejects.toThrow(/channel scope/);
-      const searchOther = { query: "kb", scope: { kind: "channel", spaceId: "slack:C2" } };
+      const searchOther = { query: "kb", scope: { kind: "channel", spaceId: "slack:C2" } as const };
       await expect(session.memoryProvider.search(searchOther)).rejects.toThrow(/channel scope/);
       // pruneDigests for another space is denied.
       await expect(session.memoryProvider.pruneDigests("slack:C2", 5)).rejects.toThrow(/pruneDigests/);

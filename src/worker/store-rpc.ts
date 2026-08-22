@@ -347,10 +347,18 @@ export class JobStoreRpcServer {
     // Only the job kind's OWN validated payload keys unlock the scoped read/
     // write capability. A malformed payload fails closed (null capability),
     // so a raw socket can never name a provider/action it does not own.
-    const poll = job.kind === "ingest_poll" ? ingestPollJobPayloadSchema.safeParse(job.payload) : { success: false };
-    this.pollProvider = job.kind === "ingest_poll" && poll.success ? poll.data.provider : null;
-    const scheduled = job.kind === "scheduled" ? scheduledJobPayloadSchema.safeParse(job.payload) : { success: false };
-    this.scheduledAction = job.kind === "scheduled" && scheduled.success ? scheduled.data.action : null;
+    let pollProvider: string | null = null;
+    if (job.kind === "ingest_poll") {
+      const poll = ingestPollJobPayloadSchema.safeParse(job.payload);
+      pollProvider = poll.success ? poll.data.provider : null;
+    }
+    this.pollProvider = pollProvider;
+    let scheduledAction: string | null = null;
+    if (job.kind === "scheduled") {
+      const scheduled = scheduledJobPayloadSchema.safeParse(job.payload);
+      scheduledAction = scheduled.success ? scheduled.data.action : null;
+    }
+    this.scheduledAction = scheduledAction;
     this.scopedStore = createJobScopedStore(baseStore, { jobId: job.id, workItemId: this.workItemId });
     this.memory = memory;
     this.storeDb = storeDb;
@@ -582,13 +590,17 @@ export class JobStoreRpcServer {
         if (method === "queryAudit") {
           const opts = auditQuerySchema.safeParse(args[0] ?? {});
           if (!opts.success) deny(`malformed audit query: ${opts.error.message}`);
-          if (opts.data.space_id !== this.job.spaceId) {
+          // deny() never returns, so the query is settled here; the repo's deny
+          // guard does not narrow the discriminated union, so read off a non-null handle.
+          const query = opts.data!;
+          if (query.space_id !== this.job.spaceId) {
             deny(`audit query must be scoped to this job's space (${String(this.job.spaceId)})`);
           }
         } else {
           const opts = auditListSchema.safeParse(args[0] ?? {});
           if (!opts.success) deny(`malformed audit list: ${opts.error.message}`);
-          if (opts.data.space !== this.job.spaceId) {
+          const list = opts.data!;
+          if (list.space !== this.job.spaceId) {
             deny(`audit list must be scoped to this job's space (${String(this.job.spaceId)})`);
           }
         }
@@ -647,7 +659,8 @@ export class JobStoreRpcServer {
     if (this.job.kind !== "extension" || this.workItemId === null) {
       deny("extension credential read — extension work-item jobs only");
     }
-    const item = await this.scopedStore.getWorkItem(this.workItemId);
+    const workItemId = this.workItemId;
+    const item = await this.scopedStore.getWorkItem(workItemId);
     if (item === null || item.delivery !== "extension") {
       deny(`extension credential read — work item ${this.workItemId} is not an extension delivery`);
     }
