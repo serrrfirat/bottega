@@ -10,7 +10,7 @@ import { SpaceService, type SpaceServiceDeps, DIGEST_CAP, REQUEST_ONLY_DIRECTIVE
 import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter";
 import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
-import type { SlackAdapter, SlackMessage } from "../adapters/slack";
+import type { SlackAction, SlackAdapter, SlackMessage } from "../adapters/slack";
 import { STOP_ACTION_ID } from "../adapters/slack";
 import { createAudit } from "../../policy/audit";
 import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";

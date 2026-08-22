@@ -384,8 +384,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       // per-turn abort, never by the approval flow. Idempotent + fail-closed
       // by construction (stopTurn rejects non-live spaces).
       if (a.actionId === STOP_ACTION_ID) {
-        void spaceService.stopTurn(a.spaceId, a.principal);
-        return;
+        return spaceService.stopTurn(a.spaceId, a.principal).then(() => {});
       }
       return approvalRouter.handleAction(a);
     },
