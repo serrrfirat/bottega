@@ -34,7 +34,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
 import type { Store } from "../store/db";
@@ -299,6 +299,14 @@ export interface DockerSandboxOptions {
    * scheduled consolidation runs supervisor-side). Required for production.
    */
   memoryProvider?: ResolvedMemoryProvider;
+  /**
+   * The supervisor's REGISTERED extension manifest/provider ids (issue
+   * #101): the only providers any job container may enumerate credentials
+   * for. Derived from the immutable runtime extension registry that built
+   * the job's toolset; absent → an empty set, so listExtensionCredentials
+   * is denied outright (fail closed).
+   */
+  extensionProviderIds?: Iterable<string>;
   /** The supervisor's parsed org settings, serialized into the job request so the child boot needs no sync store read. */
   orgSettings?: OrgSettings | null;
   /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
@@ -441,6 +449,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       volumeStateRoot: options.volumeStateRoot,
       hostStore: options.hostStore,
       memoryProvider: options.memoryProvider,
+      extensionProviderIds: options.extensionProviderIds,
       askpassScript: options.askpassScript ?? ctx.cfg.askpassScript,
       image,
       network,
@@ -510,6 +519,7 @@ interface DockerLaunchOptions {
   /** The supervisor's real store, host-side (job-scoped RPC host). */
   hostStore?: import("../store/db").Store;
   memoryProvider?: ResolvedMemoryProvider;
+  extensionProviderIds?: Iterable<string>;
   job?: WorkerJob;
   jobId: string;
   caps: JobResourceCaps;
@@ -537,101 +547,118 @@ async function launchDockerContainer(
   }
   // Prepare the per-job RPC socket dir + credentials, then start the
   // job-scoped store RPC host (execute lane only; the probe needs no store).
+  // EVERY per-job staging dir created here is removed in the finally below —
+  // including when subpath validation (relativeSubpath), the docker launch,
+  // or any later step throws — so a pre-launch failure can never leak a
+  // prepared credential/workspace/transcript/RPC dir.
   const prep = request.mode === "execute" ? prepareJobMounts(opts) : null;
   let rpcServer: JobStoreRpcServer | null = null;
-  let rpcDirHost = "";
-  if (prep !== null) {
-    rpcDirHost = prep.rpcDirHost;
-    if (opts.hostStore !== undefined && opts.job !== undefined) {
-      rpcServer = JobStoreRpcServer.create(opts.hostStore, opts.job, rpcDirHost, {
-        memoryProvider: opts.memoryProvider,
-      });
-      try {
-        await rpcServer.listen();
-      } catch (error) {
-        cleanupJobMounts(prep);
-        return { kind: "error", protocolError: `sandbox unavailable: store RPC socket bind failed: ${error instanceof Error ? error.message : String(error)}` };
+  try {
+    let rpcDirHost = "";
+    if (prep !== null) {
+      rpcDirHost = prep.rpcDirHost;
+      if (opts.hostStore !== undefined && opts.job !== undefined) {
+        rpcServer = JobStoreRpcServer.create(opts.hostStore, opts.job, rpcDirHost, {
+          memoryProvider: opts.memoryProvider,
+          extensionProviderIds: opts.extensionProviderIds,
+        });
+        try {
+          await rpcServer.listen();
+        } catch (error) {
+          return { kind: "error", protocolError: `sandbox unavailable: store RPC socket bind failed: ${error instanceof Error ? error.message : String(error)}` };
+        }
       }
     }
-  }
-  const args = dockerRunArgs(request, opts, rpcDirHost);
-  let proc: DockerProcess;
-  try {
-    proc = docker.launch(args);
-  } catch (error) {
+    let proc: DockerProcess;
+    try {
+      const args = dockerRunArgs(request, opts, rpcDirHost);
+      try {
+        proc = docker.launch(args);
+      } catch (error) {
+        return { kind: "error", protocolError: `sandbox unavailable: docker launch failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    } catch (error) {
+      // Subpath/config validation (relativeSubpath) threw before docker was
+      // reached. The finally below still removes every staged per-job dir —
+      // this is the fail-closed, no-leak path (issue #101).
+      return { kind: "error", protocolError: `sandbox unavailable: mount/request validation failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+
+    let responseBytes: Buffer;
+    let timedOut = false;
+    let leaseLost = false;
+    const boundedResponse = readBounded(proc.stdout, MAX_SANDBOX_RESPONSE_BYTES, () => {
+      if (proc.stdin.writable) proc.stdin.destroy();
+      killDockerContainer(docker, opts.containerName);
+    });
+    // Job logs (stderr) stream to the supervisor log; never captured past a cap.
+    proc.stderr.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString("utf8").trim();
+      if (text.length > 0) console.log(`[${opts.jobId}] sandbox: ${text.slice(0, 2000)}`);
+    });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      if (proc.stdin.writable) proc.stdin.destroy();
+      killDockerContainer(docker, opts.containerName);
+    }, opts.caps.timeoutMs);
+    const abort = (): void => {
+      leaseLost = true;
+      if (proc.stdin.writable) proc.stdin.destroy();
+      killDockerContainer(docker, opts.containerName);
+    };
+    opts.signal.addEventListener("abort", abort, { once: true });
+    try {
+      proc.stdin.end(encoded);
+    } catch {
+      // stdin already closed; the container will fail closed on its own IPC read.
+    }
+    const exited = await proc.exit;
+    clearTimeout(timeout);
+    opts.signal.removeEventListener("abort", abort);
+    // Guaranteed cleanup: never leak a container after the launcher returns
+    // (--rm already removes it on exit; the net rm covers unexpected states).
+    ensureContainerRemoved(docker, opts.containerName);
+
+    if (timedOut || leaseLost) {
+      const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
+      if (leaseLost) tornDown.leaseLost = true;
+      return { kind: "result", result: tornDown };
+    }
+    try {
+      responseBytes = await boundedResponse;
+    } catch (error) {
+      return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}` } };
+    }
+    if (responseBytes.length === 0) {
+      return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: empty response" } };
+    }
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(responseBytes.toString("utf8"));
+    } catch {
+      return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" } };
+    }
+    const parsed = sandboxResponseSchema.safeParse(parsedJson);
+    if (!parsed.success || !Number.isInteger(parsed.data.pid) || parsed.data.pid <= 0) {
+      return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" } };
+    }
+    if (parsed.data.mode === "probe") {
+      return { kind: "probe", probe: { pid: parsed.data.pid, childMarker: parsed.data.childMarker, forbiddenEnvNames: parsed.data.forbiddenEnvNames } };
+    }
+    const expectedProcessExit = parsed.data.result.exitCode ?? 70;
+    if (exited.signal !== null || exited.code !== expectedProcessExit) {
+      return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" } };
+    }
+    return { kind: "result", result: parsed.data.result };
+  } finally {
+    // Guaranteed per-job teardown on EVERY path — including a throw from
+    // subpath validation (relativeSubpath), docker launch, the container
+    // run, or IPC parsing. The staged credential/workspace/transcript/RPC
+    // dirs are removed and the job-scoped RPC host is closed, so a
+    // pre-launch failure can never leak prepared credential dirs (#101).
     rpcServer?.close();
     cleanupJobMounts(prep);
-    return { kind: "error", protocolError: `sandbox unavailable: docker launch failed: ${error instanceof Error ? error.message : String(error)}` };
   }
-
-  let responseBytes: Buffer;
-  let timedOut = false;
-  let leaseLost = false;
-  const boundedResponse = readBounded(proc.stdout, MAX_SANDBOX_RESPONSE_BYTES, () => {
-    if (proc.stdin.writable) proc.stdin.destroy();
-    killDockerContainer(docker, opts.containerName);
-  });
-  // Job logs (stderr) stream to the supervisor log; never captured past a cap.
-  proc.stderr.on("data", (chunk: Buffer | string) => {
-    const text = chunk.toString("utf8").trim();
-    if (text.length > 0) console.log(`[${opts.jobId}] sandbox: ${text.slice(0, 2000)}`);
-  });
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    if (proc.stdin.writable) proc.stdin.destroy();
-    killDockerContainer(docker, opts.containerName);
-  }, opts.caps.timeoutMs);
-  const abort = (): void => {
-    leaseLost = true;
-    if (proc.stdin.writable) proc.stdin.destroy();
-    killDockerContainer(docker, opts.containerName);
-  };
-  opts.signal.addEventListener("abort", abort, { once: true });
-  try {
-    proc.stdin.end(encoded);
-  } catch {
-    // stdin already closed; the container will fail closed on its own IPC read.
-  }
-  const exited = await proc.exit;
-  clearTimeout(timeout);
-  opts.signal.removeEventListener("abort", abort);
-  // Guaranteed cleanup: never leak a container after the launcher returns
-  // (--rm already removes it on exit; the net rm covers unexpected states).
-  ensureContainerRemoved(docker, opts.containerName);
-  rpcServer?.close();
-  cleanupJobMounts(prep);
-
-  if (timedOut || leaseLost) {
-    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
-    if (leaseLost) tornDown.leaseLost = true;
-    return { kind: "result", result: tornDown };
-  }
-  try {
-    responseBytes = await boundedResponse;
-  } catch (error) {
-    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}` } };
-  }
-  if (responseBytes.length === 0) {
-    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: empty response" } };
-  }
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(responseBytes.toString("utf8"));
-  } catch {
-    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" } };
-  }
-  const parsed = sandboxResponseSchema.safeParse(parsedJson);
-  if (!parsed.success || !Number.isInteger(parsed.data.pid) || parsed.data.pid <= 0) {
-    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" } };
-  }
-  if (parsed.data.mode === "probe") {
-    return { kind: "probe", probe: { pid: parsed.data.pid, childMarker: parsed.data.childMarker, forbiddenEnvNames: parsed.data.forbiddenEnvNames } };
-  }
-  const expectedProcessExit = parsed.data.result.exitCode ?? 70;
-  if (exited.signal !== null || exited.code !== expectedProcessExit) {
-    return { kind: "result", result: { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" } };
-  }
-  return { kind: "result", result: parsed.data.result };
 }
 
 /** Builds the one `docker run --rm -i` invocation for a single job container. */
@@ -696,6 +723,10 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
 function appendContainerMounts(args: string[], request: SandboxRequest, opts: DockerLaunchOptions, rpcDirHost: string): void {
   const volumeMode = opts.volume !== undefined && opts.volume !== "";
   const itemId = request.mode === "execute" ? jobScopeFromEnvelope(request.job).workItemId : null;
+  // Volume-mode subpath root for the state axis (validated present in volume
+  // mode by stateTranscriptHost). The transcript/credential/RPC subpaths are
+  // all under this root in the supervisor's host view.
+  const stateHost = volumeMode ? stateVolumeRoot(opts) : "";
 
   // Per-job workspace subdir (git/extension only).
   if (itemId !== null) {
@@ -709,9 +740,9 @@ function appendContainerMounts(args: string[], request: SandboxRequest, opts: Do
   }
   // Per-job transcript/session subdir (git/extension only).
   if (itemId !== null) {
-    const transcriptHost = join(opts.transcriptDir, itemId);
+    const transcriptHost = join(stateTranscriptHost(opts), itemId);
     if (volumeMode) {
-      const sub = relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), transcriptHost);
+      const sub = relativeSubpath(stateHost, transcriptHost);
       args.push("--mount", `type=volume,src=${opts.volume},dst=${join(CONTAINER_TRANSCRIPTS_ROOT, itemId)},volume-subpath=${sub}`);
     } else {
       args.push("-v", `${transcriptHost}:${join(CONTAINER_TRANSCRIPTS_ROOT, itemId)}:rw`);
@@ -720,7 +751,7 @@ function appendContainerMounts(args: string[], request: SandboxRequest, opts: Do
   // Per-job RPC socket dir (execute lane only).
   if (request.mode === "execute" && rpcDirHost !== "") {
     if (volumeMode) {
-      const sub = relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), rpcDirHost);
+      const sub = relativeSubpath(stateHost, rpcDirHost);
       args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_RPC_DIR},volume-subpath=${sub}`);
     } else {
       args.push("-v", `${rpcDirHost}:${CONTAINER_RPC_DIR}:rw`);
@@ -735,7 +766,7 @@ function appendContainerMounts(args: string[], request: SandboxRequest, opts: Do
   if (request.mode === "execute") {
     if (jobNeedsGitToken(request.job) && opts.gitTokenFile !== undefined && opts.gitTokenFile !== "") {
       if (volumeMode) {
-        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_GIT_SECRETS_DIR},volume-subpath=${relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), gitCredDirHost(opts, request.job.id))}`);
+        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_GIT_SECRETS_DIR},volume-subpath=${relativeSubpath(stateHost, gitCredDirHost(opts, request.job.id))}`);
       } else {
         args.push("-v", `${opts.gitTokenFile}:${CONTAINER_GIT_TOKEN_FILE}:ro`);
         if (opts.askpassScript !== undefined && opts.askpassScript !== "") {
@@ -745,7 +776,7 @@ function appendContainerMounts(args: string[], request: SandboxRequest, opts: Do
     }
     if (request.job.kind === "extension" && opts.brokerTokenFile !== undefined && opts.brokerTokenFile !== "") {
       if (volumeMode) {
-        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_BROKER_DIR},volume-subpath=${relativeSubpath(opts.volumeStateRoot ?? dirname(opts.transcriptDir), extensionCredDirHost(opts, request.job.id))}`);
+        args.push("--mount", `type=volume,src=${opts.volume},dst=${CONTAINER_BROKER_DIR},volume-subpath=${relativeSubpath(stateHost, extensionCredDirHost(opts, request.job.id))}`);
       } else {
         args.push("-v", `${opts.brokerTokenFile}:${CONTAINER_BROKER_TOKEN_FILE}:ro`);
       }
@@ -763,9 +794,44 @@ function jobNeedsGitToken(job: WorkerJob): boolean {
   return false;
 }
 
+/**
+ * The supervisor-visible host transcript dir. In volume mode a RELATIVE
+ * transcriptDir (the executor default `data/transcripts`, which from the
+ * compose WORKDIR `/app` resolves inside the `/app/data` volume mount) is
+ * resolved against the state volume root so the host-visible path becomes
+ * `/app/data/transcripts` — compatible with `volumeStateRoot=/app/data` and
+ * the `relativeSubpath` validation that prefixes the transcript <itemId>
+ * subpath with it. In bind mode the host transcript dir is the configured
+ * host path, unchanged.
+ */
+function stateTranscriptHost(opts: DockerLaunchOptions): string {
+  if (opts.volume === undefined || opts.volume === "") return opts.transcriptDir;
+  const root = opts.volumeStateRoot;
+  if (root === undefined || root === "") {
+    throw new Error("sandbox volume mode requires a state volume root (volumeStateRoot)");
+  }
+  return isAbsolute(opts.transcriptDir) ? opts.transcriptDir : join(root, opts.transcriptDir);
+}
+
 /** The host-space sandbox staging root under the shared volume (via the state axis). */
 function sandboxStagingRoot(opts: DockerLaunchOptions): string {
-  return join(dirname(opts.transcriptDir), ".omp", "sandbox");
+  return join(dirname(stateTranscriptHost(opts)), ".omp", "sandbox");
+}
+
+/**
+ * The volume-mode host root for the state axis (transcripts/credentials/RPC):
+ * validated present when volume mode is on. Every state-axis subpath mount is
+ * computed relative to this root.
+ */
+function stateVolumeRoot(opts: DockerLaunchOptions): string {
+  if (opts.volume === undefined || opts.volume === "") {
+    throw new Error("stateVolumeRoot requires volume mode");
+  }
+  const root = opts.volumeStateRoot;
+  if (root === undefined || root === "") {
+    throw new Error("sandbox volume mode requires a state volume root (volumeStateRoot)");
+  }
+  return root;
 }
 /** Host path of the git credential subdir prepared for a job. */
 function gitCredDirHost(opts: DockerLaunchOptions, jobId: string): string {
@@ -798,7 +864,7 @@ function prepareJobMounts(opts: DockerLaunchOptions): PreparedJobMounts {
     const workspaceHost = join(opts.workspacesDir, itemId);
     mkdirSync(workspaceHost, { recursive: true });
     createdDirs.push(workspaceHost);
-    const transcriptHost = join(opts.transcriptDir, itemId);
+    const transcriptHost = join(stateTranscriptHost(opts), itemId);
     mkdirSync(transcriptHost, { recursive: true });
     createdDirs.push(transcriptHost);
   }

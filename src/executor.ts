@@ -1469,6 +1469,11 @@ if (import.meta.main) {
   const sandboxWorkspaces = process.env.BOTTEGA_SANDBOX_WORKSPACES_HOST ?? defaultWorkspaceRoot();
   const sandboxTranscripts = process.env.BOTTEGA_SANDBOX_TRANSCRIPTS_HOST ?? "data/transcripts";
   const sandboxVolume = process.env.BOTTEGA_SANDBOX_DATA_VOLUME;
+  // The immutable extension registry that built the job containers' gated
+  // toolset (issue #101): the ONLY providers any container may enumerate
+  // credentials for. A hostile child cannot name a provider that is not a
+  // registered extension for this deployment.
+  const sandboxExtensionProviderIds = boot.runtime.registry.list().map((entry) => entry.manifest.id);
   const sandboxRunner = createDockerSandboxRunner({
     workspacesDir: sandboxWorkspaces,
     transcriptDir: sandboxTranscripts,
@@ -1482,6 +1487,7 @@ if (import.meta.main) {
     volumeStateRoot: process.env.BOTTEGA_SANDBOX_STATE_VOLUME_ROOT ?? (sandboxVolume ? "/app/data" : undefined),
     hostStore: store,
     memoryProvider,
+    extensionProviderIds: sandboxExtensionProviderIds,
     orgSettings: store.getOrgSettings(),
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
