@@ -12,10 +12,12 @@ import {
 import { createStore, type Store } from "../store/db";
 import { buildRegistry } from "./actions";
 import { nextCronFire } from "./cron";
+import { tickScheduler } from "./runner";
 import {
   createSchedulerJobArgsSchema,
   deleteSchedulerJobArgsSchema,
   schedulerToolDefinitions,
+  updateSchedulerJobArgsSchema,
 } from "./scheduler-tools";
 import type { SchedulerActionRegistry, SchedulerJob } from "./types";
 
@@ -353,5 +355,67 @@ describe("create_scheduler_job surface (issue #220)", () => {
     expect(body.spaceId).toBeNull();
     expect(body.params.space).toBeUndefined();
     expect(body.summary).toBe("Mondays at 09:00 UTC → org-wide: org_pulse");
+  });
+
+  test("admits governance_digest as a space-scoped action and runs it through the runner (issue #161)", async () => {
+    // The tool's zod schema is the admission gate (create/update): governance_digest
+    // must parse through both, otherwise the MCP bridge rejects it before execute.
+    const parsedCreate = createSchedulerJobArgsSchema.parse({
+      action: "governance_digest",
+      cron: "0 9 * * 1",
+      space: "slack:CGOV",
+    });
+    expect(parsedCreate.action).toBe("governance_digest");
+    expect(updateSchedulerJobArgsSchema.parse({ id: "sj_x", expected_revision: 1, action: "governance_digest" }).action).toBe(
+      "governance_digest",
+    );
+
+    const store = freshStore();
+    const audit = createAudit(store);
+    const create = createToolFor(
+      store,
+      audit,
+      buildRegistry([{ name: "governance_digest", run: async () => {} }]),
+    );
+
+    const result = await create.execute(
+      "call-gov",
+      { action: "governance_digest", cron: "0 9 * * 1", space: "slack:CGOV" },
+      new AbortController().signal,
+      () => {},
+      ctxFor(undefined),
+    );
+
+    expect(result.isError).not.toBe(true);
+    const created = jobBody(result);
+    expect(created.action).toBe("governance_digest");
+    expect(created.spaceId).toBe("slack:CGOV");
+    expect(created.params.space).toBe("slack:CGOV");
+    expect(created.summary).toBe("Mondays at 09:00 UTC → space slack:CGOV: governance_digest");
+
+    // The durable row the tool wrote is claimable by the runner: advancing the
+    // next fire to "now" and ticking fires the registered handler exactly once.
+    const now = Date.UTC(2026, 7, 21, 12, 0);
+    let runs = 0;
+    const registry = buildRegistry([{ name: "governance_digest", run: async () => { runs += 1; } }]);
+    await store.updateSchedulerNextFire(created.id, now);
+    await tickScheduler({
+      store,
+      audit,
+      registry,
+      memoryProvider: {
+        capabilities: { consolidation: "explicit", digestPruning: "explicit" },
+        save: async () => ({ id: "x", key: "s", content: "c", metadata: {}, createdAt: 0 }),
+        search: async () => [],
+        pruneDigests: async () => 0,
+      },
+      postMessage: async () => undefined,
+      loadPolicy: async () => {
+        throw new Error("unused");
+      },
+      log: () => {},
+      now: () => now,
+    });
+    expect(runs).toBe(1);
   });
 });

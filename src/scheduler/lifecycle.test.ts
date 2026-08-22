@@ -420,4 +420,36 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
     expect(deleted.isError).toBe(true);
     expect(await store.listSchedulerInvocations({ jobId: foreign.id })).toEqual([]);
   });
+
+  test("update_scheduler_job edits a governance_digest job's cron (issue #161)", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const now = Date.UTC(2026, 7, 21, 12, 34);
+    const registry = buildRegistry([{ name: "governance_digest", run: async () => {} }]);
+    const definitions = schedulerToolDefinitions(store, audit, registry, { now: () => now });
+    const created = await store.createSchedulerJob({
+      action: "governance_digest",
+      cron: "0 9 * * 1",
+      params: { space: "slack:CGOV" },
+      spaceId: "slack:CGOV",
+      createdBy: "UADMIN",
+    });
+
+    const updatedResult = await call(
+      definitions,
+      "update_scheduler_job",
+      { id: created.id, expected_revision: created.revision, cron: "0 8 * * 2" },
+      "slack:CGOV",
+      "update-gov",
+    );
+    expect(updatedResult.isError).not.toBe(true);
+    const updated = body(updatedResult, schedulerJobResultSchema);
+    expect(updated).toMatchObject({
+      id: created.id,
+      action: "governance_digest",
+      cron: "0 8 * * 2",
+      revision: created.revision + 1,
+    });
+    expect(await audit.listAudit({ event_type: SCHEDULER_JOB_UPDATED_EVENT })).toHaveLength(1);
+  });
 });
