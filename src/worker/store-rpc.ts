@@ -26,9 +26,9 @@
  *   - git/extension claim/delivery: claimWorkItemById, getWorkItem,
  *     transitionWorkItem, getJob, completeJob, failJob, requeueJob,
  *     renewJobLease, appendAudit, queryAudit, listAudit,
- *     getEffectiveSpaceSettings, getOrgSettings, getSpace.
- *   - extension worker toolset/surfaces: listExtensionCredentials,
- *     getExtensionConnection, listRuntimeExtensions.
+ *     getEffectiveSpaceSettings, getSpaceSettings, getSpace (own space only).
+ *   - read-only org floor: getOrgSettings (shared floor the sandbox tools read).
+ *   - extension worker toolset: listExtensionCredentials (extension jobs only).
  *   - ingest_poll durable watermark: getIngestWatermark, setIngestWatermark.
  *   - every kind's self-bookkeeping writes its outbox row through
  *     `postOutboxRow` (supervisor-side; the container holds no SQL handle).
@@ -50,7 +50,6 @@ import type {
   Space,
   SpaceModelSettings,
   ExtensionCredential,
-  RuntimeExtensionRow,
   AuditEntry,
   AuditPage,
   AuditQueryOpts,
@@ -58,11 +57,15 @@ import type {
   AuditRow,
 } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
-import type { WorkerJob } from "../worker/envelope";
-import { createJobScopedStore, type JobScope } from "./scoped-store";
+import {
+  ingestPollJobPayloadSchema,
+  scheduledJobPayloadSchema,
+  type WorkerJob,
+} from "../worker/envelope";
+import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } from "./scoped-store";
 import { postOutboxRow, type OutboxWrite } from "../store/outbox";
 import { maintainMemory, type ConsolidationModelCall, type ConsolidationResult } from "../memory/consolidation";
-import type { MemoryEntry, MemoryProvider, MemorySaveInput, MemorySearchQuery } from "../memory/types";
+import { type MemoryEntry, type MemoryProvider, type MemorySaveInput, type MemoryScopeKey, type MemorySearchQuery } from "../memory/types";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
 
 /** Hard cap on any single RPC frame (request or response), bytes. */
@@ -93,14 +96,15 @@ interface RpcReply {
 /**
  * The ONLY store operations the job container may invoke. Everything the
  * git/extension/kb/ingest_poll/scheduled job bodies need for their own
- * lifecycle (scoped claim/transitions/job rows, the durable ingest
- * watermark, the self-bookkeeping outbox row), plus the read-only shared
- * infra they legitimately consult (org settings, space settings, extension
- * connection/registry reads). Anything else — policy writes, credentials,
- * scheduler rows, enqueues, upload tokens — is denied, even though the
- * scoped-store facade itself forwards those to the real store (the
- * facade's job-row firewall is not a global-write firewall). `getDb` and
- * `close` are hard-denied (the raw handle never crosses).
+ * lifecycle, plus the read-only shared infra they legitimately consult.
+ * The allowlist gates WHICH method may cross; {@link JobStoreRpcServer} then
+ * adds a per-method authorization check on every argument that names a
+ * target (its own job's envelope id/kind/space and the kind payload keys),
+ * so a raw socket can never reach another job's/space's/provider's/memory
+ * scope. A method entry alone is NOT a grant: the invoke handler validates
+ * every argument against the immutable job context before forwarding.
+ * Anything else, `getDb`, and `close` are denied — the facade's job-row
+ * firewall is not a global-write firewall.
  */
 const ALLOWED_STORE_METHODS: Record<string, true> = {
   claimWorkItemById: true,
@@ -114,18 +118,20 @@ const ALLOWED_STORE_METHODS: Record<string, true> = {
   appendAudit: true,
   queryAudit: true,
   listAudit: true,
+  // Read-only ORG-level settings (the shared floor, not another job's/space's
+  // private rows). Required by the sandbox admin/settings/model tools; the
+  // org floor is the same low-sensitivity shared resource the memory `org`
+  // scope allows. Not per-job, so it is a permitted global read (never a write).
   getOrgSettings: true,
   getSpace: true,
   getSpaceSettings: true,
   getEffectiveSpaceSettings: true,
   listExtensionCredentials: true,
-  getExtensionConnection: true,
-  listRuntimeExtensions: true,
   getIngestWatermark: true,
   setIngestWatermark: true,
   // `postOutboxRow` is handled specially: it is a module function that needs
   // the raw DB (transactional INSERT OR IGNORE), so the supervisor invokes the
-  // real outbox writer, never the child.
+  // real outbox writer, never the child. Its id/kind/space must match the job.
   postOutboxRow: true,
 };
 
@@ -139,17 +145,92 @@ const outboxWriteSchema = z
   })
   .strict();
 
+/** The append-only audit entry the job body may write (validated supervisor-side). */
+const auditEntrySchema = z
+  .object({
+    ts: z.number().optional(),
+    space_id: z.string().nullable().optional(),
+    actor: z.string().min(1),
+    event_type: z.string().min(1),
+    payload: z.string(),
+  })
+  .strict();
+
+/** The audit-read filter the job body may pass to queryAudit (scoped to its own space). */
+const auditQuerySchema = z
+  .object({
+    space_id: z.string().optional(),
+    actor: z.string().optional(),
+    event_type: z.string().optional(),
+    since: z.number().optional(),
+    until: z.number().optional(),
+    tool: z.string().optional(),
+    extension: z.string().optional(),
+    cursor: z
+      .object({ ts: z.number(), id: z.number() })
+      .strict()
+      .optional(),
+    limit: z.number().int().optional(),
+  })
+  .strict();
+
+/** The audit-list filter the job body may pass to listAudit (scoped to its own space). */
+const auditListSchema = z
+  .object({
+    space: z.string().optional(),
+    since: z.number().optional(),
+    event_type: z.string().optional(),
+    limit: z.number().optional(),
+  })
+  .strict();
+
+/** The validated memory-save input (no casts from caller-supplied unknown). */
+const memorySaveSchema = z
+  .object({
+    scope: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("org") }).strict(),
+      z.object({ kind: z.literal("person"), principal: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("channel"), spaceId: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("team"), teamId: z.string().min(1) }).strict(),
+    ]),
+    content: z.string(),
+    metadata: z.record(z.string(), z.string()).optional(),
+  })
+  .strict();
+
+/** The validated memory-search query (no casts from caller-supplied unknown). */
+const memorySearchSchema = z
+  .object({
+    query: z.string(),
+    scope: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("org") }).strict(),
+      z.object({ kind: z.literal("person"), principal: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("channel"), spaceId: z.string().min(1) }).strict(),
+      z.object({ kind: z.literal("team"), teamId: z.string().min(1) }).strict(),
+    ]),
+    limit: z.number().int().optional(),
+    metadata: z.record(z.string(), z.string()).optional(),
+  })
+  .strict();
+
+/** The ingest watermark cursor write the job body may pass (validated supervisor-side). */
+const ingestWatermarkWriteSchema = z.tuple([z.string().min(1), z.string()]);
+
 function replyFrame(id: number, ok: boolean, value?: unknown, error?: string): Buffer {
   return Buffer.from(`${JSON.stringify({ id, ok, ...(ok ? { value } : { error }) })}\n`);
 }
 
 /**
- * Supervisor-side RPC host for one job's scoped store + memory. Creates the
- * socket dir + unix socket, serves bounded frames, enforces job scope via
- * {@link createJobScopedStore} AND the store allowlist, and forwards memory
- * to the supervisor's real (SQLite/mem0) provider. Unknown/
- * global/oversized/malformed/timed-out frames fail closed. Call {@link
- * close} after the job container exits.
+ * Job-scoped store + memory RPC host. Creates the socket dir + unix socket,
+ * serves bounded frames, and enforces job scope via {@link
+ * createJobScopedStore} AND a per-method authorization context derived from
+ * the validated {@link WorkerJob} envelope (its immutable id/kind/space and
+ * kind-specific payload). A raw socket cannot cross into another job, space,
+ * provider, or memory scope: every argument that names a target is validated
+ * against the job's own envelope, never trusted from the caller. Memory is
+ * forwarded to the supervisor's real (SQLite/mem0) provider with the same
+ * scope firewall. Unknown/global/oversized/malformed/timed-out frames fail
+ * closed. Call {@link close} after the job container exits.
  */
 export class JobStoreRpcServer {
   readonly socketPath: string;
@@ -159,19 +240,30 @@ export class JobStoreRpcServer {
   private readonly scopedStore: Store;
   private readonly memory: MemoryProvider;
   private readonly storeDb: Database;
+  /** The immutable job envelope this server authorizes against (never caller-supplied). */
+  private readonly job: WorkerJob;
+  /** The job's derived work-item scope (git/extension only; null for kinds without a store item). */
+  private readonly workItemId: string | null;
+  /** The validated ingest-poll provider (ingest_poll jobs only). */
+  private readonly pollProvider: string | null;
+  /** The validated scheduled action (scheduled jobs only). */
+  private readonly scheduledAction: string | null;
   private readonly modelCallRequesters = new Map<number, { resolve: (v: string | undefined) => void; reject: (e: Error) => void }>();
   /** Monotonic supervisor→child model-call request id (unique across the server lifetime). */
   private modelCallNextId = 0;
 
-  private constructor(
-    baseStore: Store,
-    scope: JobScope,
-    socketPath: string,
-    memory: MemoryProvider,
-    storeDb: Database,
-  ) {
+  private constructor(baseStore: Store, job: WorkerJob, socketPath: string, memory: MemoryProvider, storeDb: Database) {
     this.socketPath = socketPath;
-    this.scopedStore = createJobScopedStore(baseStore, scope);
+    this.job = job;
+    this.workItemId = jobScopeFromEnvelope(job).workItemId;
+    // Only the job kind's OWN validated payload keys unlock the scoped read/
+    // write capability. A malformed payload fails closed (null capability),
+    // so a raw socket can never name a provider/action it does not own.
+    const poll = job.kind === "ingest_poll" ? ingestPollJobPayloadSchema.safeParse(job.payload) : { success: false };
+    this.pollProvider = job.kind === "ingest_poll" && poll.success ? poll.data.provider : null;
+    const scheduled = job.kind === "scheduled" ? scheduledJobPayloadSchema.safeParse(job.payload) : { success: false };
+    this.scheduledAction = job.kind === "scheduled" && scheduled.success ? scheduled.data.action : null;
+    this.scopedStore = createJobScopedStore(baseStore, { jobId: job.id, workItemId: this.workItemId });
     this.memory = memory;
     this.storeDb = storeDb;
     this.server = createServer((socket) => {
@@ -192,21 +284,22 @@ export class JobStoreRpcServer {
   /**
    * Creates the server over the supervisor's real store (wrapped in the
    * job's scope) + its real memory provider (so kb ingest can save org
-   * memories). Without a provider (probe lane, which never saves), a
-   * write-denying provider is used. The supervisor's own `db` handle is
-   * used only for `maintainMemory`/`postOutboxRow` — it never crosses the
-   * socket.
+   * memories). The validated {@link WorkerJob} envelope is the immutable
+   * authorization context every RPC method is checked against. Without a
+   * provider (probe lane, which never saves), a write-denying provider is
+   * used. The supervisor's own `db` handle is used only for
+   * `maintainMemory`/`postOutboxRow` — it never crosses the socket.
    */
   static create(
     baseStore: Store,
-    scope: JobScope,
+    job: WorkerJob,
     dir: string,
     opts: { name?: string; memoryProvider?: ResolvedMemoryProvider } = {},
   ): JobStoreRpcServer {
     mkdirSync(dir, { recursive: true });
     return new JobStoreRpcServer(
       baseStore,
-      scope,
+      job,
       join(dir, opts.name ?? "store.sock"),
       opts.memoryProvider ?? memoryDenyProvider,
       baseStore.getDb(),
@@ -285,9 +378,16 @@ export class JobStoreRpcServer {
     if (ALLOWED_STORE_METHODS[method] !== true) {
       throw new Error(`job sandbox attempted store method ${method}; not on the allowlist — denied`);
     }
+    // Every allowlisted method is validated against the immutable job
+    // envelope BEFORE it reaches the scoped-store facade, so a raw socket
+    // can never name another job, work item, space, provider, or extension.
+    const authorized = await this.authorizeStoreMethod(method, args);
     if (method === "postOutboxRow") {
       const input = outboxWriteSchema.safeParse(args[0]);
       if (!input.success) throw new Error(`job sandbox posted a malformed outbox row: ${input.error.message}`);
+      // The outbox envelope must name THIS job's id/kind/space — never a
+      // forged completion signal for another job.
+      this.authorizePostOutboxRow(input.data);
       postOutboxRow(this.scopedStore, input.data);
       return undefined;
     }
@@ -295,7 +395,155 @@ export class JobStoreRpcServer {
     if (typeof member !== "function") {
       throw new Error(`job sandbox attempted unknown store method ${method}; denied`);
     }
-    return await member.apply(this.scopedStore, args);
+    return await member.apply(this.scopedStore, authorized);
+  }
+
+  /**
+   * Per-method argument authorization against the immutable job context.
+   * Returns the (possibly transformed) arguments the store facade receives.
+   * Throws loudly on any argument that names a target outside the job's own
+   * envelope: another job id, work item, space, provider, or extension.
+   */
+  private async authorizeStoreMethod(method: string, args: unknown[]): Promise<unknown[]> {
+    const deny = (what: string): never => {
+      throw new ScopedStoreAccessError(this.job.id, what);
+    };
+    const ownJob = (id: unknown): string => (id === this.job.id ? String(id) : deny(`job-row access to ${id}`));
+    const ownItem = (id: unknown): string =>
+      this.workItemId !== null && id === this.workItemId
+        ? String(id)
+        : deny(`work-item access to ${String(id)}`);
+    const ownSpace = (id: unknown): string => {
+      if (this.job.spaceId === undefined || this.job.spaceId === null) {
+        // A job without a space (scheduled memory_consolidation) never reads
+        // a space; a job WITH a space may only read its own.
+        deny(`space read ${String(id)} — this job has no space scope`);
+      }
+      return id === this.job.spaceId ? String(id) : deny(`space access to ${String(id)}`);
+    };
+
+    switch (method) {
+      case "getJob":
+      case "completeJob":
+      case "failJob":
+      case "requeueJob":
+      case "renewJobLease":
+        // The job-row method must name this job's own envelope id.
+        return [ownJob(args[0]), ...args.slice(1)];
+      case "getSpace":
+      case "getSpaceSettings":
+      case "getEffectiveSpaceSettings":
+        // Space reads are restricted to this job's own space.
+        return [ownSpace(args[0]), ...args.slice(1)];
+      case "claimWorkItemById":
+      case "getWorkItem":
+      case "transitionWorkItem":
+        return [ownItem(args[0]), ...args.slice(1)];
+      case "appendAudit": {
+        const entry = auditEntrySchema.safeParse(args[0]);
+        if (!entry.success) {
+          deny(`malformed audit entry: ${entry.error.message}`);
+        }
+        // A row may be space-less (org-level events like memory.write omit
+        // space_id) OR in the job's OWN space. A row pinning ANY other space
+        // is a forged cross-space evidence write and is refused.
+        const auditSpace = entry.data.space_id ?? null;
+        if (auditSpace !== null && auditSpace !== (this.job.spaceId ?? null)) {
+          deny(`audit row for space ${auditSpace} — not this job's space (${String(this.job.spaceId)})`);
+        }
+        return args;
+      }
+      case "queryAudit":
+      case "listAudit": {
+        // The audit READ must be scoped to the job's own space — a filterless
+        // query would list every space's rows. Null-space jobs never legitimately
+        // read audit (memory_consolidation runs maintainMemory, not audit reads).
+        const nullSpaceJob = this.job.spaceId === undefined || this.job.spaceId === null;
+        if (nullSpaceJob) {
+          deny(`${method} — this job has no space scope to audit against`);
+        }
+        if (method === "queryAudit") {
+          const opts = auditQuerySchema.safeParse(args[0] ?? {});
+          if (!opts.success) deny(`malformed audit query: ${opts.error.message}`);
+          if (opts.data.space_id !== this.job.spaceId) {
+            deny(`audit query must be scoped to this job's space (${String(this.job.spaceId)})`);
+          }
+        } else {
+          const opts = auditListSchema.safeParse(args[0] ?? {});
+          if (!opts.success) deny(`malformed audit list: ${opts.error.message}`);
+          if (opts.data.space !== this.job.spaceId) {
+            deny(`audit list must be scoped to this job's space (${String(this.job.spaceId)})`);
+          }
+        }
+        return args;
+      }
+      case "listExtensionCredentials":
+        return this.authorizeExtensionMethod(args);
+      case "getIngestWatermark":
+      case "setIngestWatermark": {
+        if (this.job.kind !== "ingest_poll" || this.pollProvider === null) {
+          deny(`${method} — ingest_poll jobs only, and only their own validated provider`);
+        }
+        const providerArg = args[0];
+        if (providerArg !== this.pollProvider) {
+          deny(`${method} for provider ${String(providerArg)} — not this job's provider (${this.pollProvider})`);
+        }
+        if (method === "setIngestWatermark") {
+          const write = ingestWatermarkWriteSchema.safeParse(args);
+          if (!write.success) {
+            deny(`malformed ingest watermark write: ${write.error.message}`);
+          }
+          return args;
+        }
+        return args;
+      }
+      default:
+        // Own-row/work-item methods without a named-target guard rely on the
+        // scoped-store facade's own job-row firewall; nothing else is on the
+        // allowlist to reach here.
+        return args;
+    }
+  }
+
+  /** Rejects an outbox completion row that does not name THIS job's id/kind/space. */
+  private authorizePostOutboxRow(input: z.infer<typeof outboxWriteSchema>): void {
+    const mismatches: string[] = [];
+    if (input.id !== this.job.id) mismatches.push(`id ${input.id} (job is ${this.job.id})`);
+    if (input.kind !== this.job.kind) mismatches.push(`kind ${input.kind} (job is ${this.job.kind})`);
+    const space = input.space ?? null;
+    if (space !== (this.job.spaceId ?? null)) mismatches.push(`space ${String(space)} (job is ${String(this.job.spaceId)})`);
+    if (mismatches.length > 0) {
+      throw new ScopedStoreAccessError(
+        this.job.id,
+        `outbox row ${mismatches.join(", ")} — the completion signal must name this job`,
+      );
+    }
+  }
+
+  /** Extension credentials: extension jobs only, and ONLY THIS job's extension-delivery work item. */
+  private async authorizeExtensionMethod(args: unknown[]): Promise<unknown[]> {
+    const deny = (what: string): never => {
+      throw new ScopedStoreAccessError(this.job.id, what);
+    };
+    // Only extension-delivery work-item jobs may read the credential ladder;
+    // a git/scheduled/kb/ingest_poll job never legitimately enumerates it.
+    if (this.job.kind !== "extension" || this.workItemId === null) {
+      deny("extension credential read — extension work-item jobs only");
+    }
+    const item = await this.scopedStore.getWorkItem(this.workItemId);
+    if (item === null || item.delivery !== "extension") {
+      deny(`extension credential read — work item ${this.workItemId} is not an extension delivery`);
+    }
+    const provider = args[0];
+    if (typeof provider !== "string" || provider === "") {
+      deny("extension credential read with a non-string provider");
+    }
+    // listExtensionCredentials(provider) is called by the extension runtime
+    // with the extension's OWN manifest.id (server-validated registry id).
+    // The immutable envelope does not pin a provider name, so the access
+    // grant is the extension-delivery job itself; the credential rows carry
+    // metadata only (secrets stay in the vault).
+    return args;
   }
 
   private async invokeMemory(socket: Socket, method: string, args: unknown[]): Promise<unknown> {
@@ -304,13 +552,46 @@ export class JobStoreRpcServer {
         return this.memory.capabilities;
       case "backend":
         return "backend" in this.memory ? this.memory.backend : "sqlite";
-      case "save":
-        return await this.memory.save(args[0] as MemorySaveInput);
-      case "search":
-        return await this.memory.search(args[0] as MemorySearchQuery);
-      case "pruneDigests":
-        return await this.memory.pruneDigests(args[0] as string, args[1] as number);
+      case "save": {
+        const input = memorySaveSchema.safeParse(args[0]);
+        if (!input.success) {
+          throw new ScopedStoreAccessError(this.job.id, `malformed memory save: ${input.error.message}`);
+        }
+        this.authorizeMemoryScope(input.data.scope);
+        return await this.memory.save(input.data as MemorySaveInput);
+      }
+      case "search": {
+        const query = memorySearchSchema.safeParse(args[0]);
+        if (!query.success) {
+          throw new ScopedStoreAccessError(this.job.id, `malformed memory search: ${query.error.message}`);
+        }
+        this.authorizeMemoryScope(query.data.scope);
+        return await this.memory.search(query.data as MemorySearchQuery);
+      }
+      case "pruneDigests": {
+        const spaceId = args[0];
+        const keep = args[1];
+        if (typeof spaceId !== "string" || typeof keep !== "number") {
+          throw new ScopedStoreAccessError(this.job.id, "malformed memory pruneDigests");
+        }
+        const ownSpace = this.job.spaceId;
+        if (ownSpace === undefined || ownSpace === null || spaceId !== ownSpace) {
+          throw new ScopedStoreAccessError(
+            this.job.id,
+            `memory pruneDigests for space ${String(spaceId)} — not this job's space`,
+          );
+        }
+        return await this.memory.pruneDigests(spaceId, keep);
+      }
       case "maintainMemory": {
+        // Only the scheduled memory_consolidation envelope may run the
+        // supervisor's compactor. Every other kind fails closed.
+        if (this.job.kind !== "scheduled" || this.scheduledAction !== "memory_consolidation") {
+          throw new ScopedStoreAccessError(
+            this.job.id,
+            `maintainMemory — scheduled memory_consolidation jobs only (job is ${this.job.kind}/${this.scheduledAction})`,
+          );
+        }
         if (this.connection === null) throw new Error("sandbox memory maintainMemory without a live child socket");
         // The consolidation LLM leg runs in the WORKER (issue #272): the
         // supervisor issues a bounded supervisor→child model-call and awaits
@@ -321,6 +602,32 @@ export class JobStoreRpcServer {
       }
       default:
         throw new Error(`job sandbox attempted unknown memory method ${method}; denied`);
+    }
+  }
+
+  /** The one memory scope a job may touch: org (the shared floor) or its OWN channel/team. */
+  private authorizeMemoryScope(scope: MemoryScopeKey): void {
+    const deny = (what: string): never => {
+      throw new ScopedStoreAccessError(this.job.id, what);
+    };
+    switch (scope.kind) {
+      case "org":
+        // The org pool is the shared floor every worker job may read/write (#137).
+        return;
+      case "channel":
+        if (scope.spaceId !== this.job.spaceId) {
+          deny(`memory channel scope ${scope.spaceId} — not this job's space (${String(this.job.spaceId)})`);
+        }
+        return;
+      case "team":
+        if (scope.teamId !== this.job.spaceId) {
+          deny(`memory team scope ${scope.teamId} — not this job's space (${String(this.job.spaceId)})`);
+        }
+        return;
+      case "person":
+        // Worker jobs are channel/work-item executions, never a person DM;
+        // a hostile container cannot pick another user's person pool.
+        deny("memory person scope — worker jobs have no person principal");
     }
   }
 
@@ -529,8 +836,6 @@ export function connectStoreRpc(socketPath: string): RpcSessionLink {
     getSpaceSettings: (id) => call("store", "getSpaceSettings", [id]),
     getEffectiveSpaceSettings: (id) => call("store", "getEffectiveSpaceSettings", [id]),
     listExtensionCredentials: (provider) => call("store", "listExtensionCredentials", [provider]),
-    getExtensionConnection: (id) => call("store", "getExtensionConnection", [id]),
-    listRuntimeExtensions: () => call("store", "listRuntimeExtensions", []),
     getIngestWatermark: (provider) => call("store", "getIngestWatermark", [provider]),
     setIngestWatermark: (provider, cursor) => call("store", "setIngestWatermark", [provider, cursor]),
     postOutboxRow: (input) => call("store", "postOutboxRow", [input]),
@@ -609,8 +914,6 @@ export interface RpcSessionLink {
     getSpaceSettings(id: string): Promise<SpaceModelSettings>;
     getEffectiveSpaceSettings(id: string): Promise<SpaceModelSettings>;
     listExtensionCredentials(provider: string): Promise<ExtensionCredential[]>;
-    getExtensionConnection(id: string): Promise<ExtensionCredential | null>;
-    listRuntimeExtensions(): Promise<RuntimeExtensionRow[]>;
     getIngestWatermark(provider: string): Promise<string | null>;
     setIngestWatermark(provider: string, cursor: string): Promise<void>;
     postOutboxRow(input: OutboxWrite): Promise<void>;
