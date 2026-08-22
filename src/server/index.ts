@@ -30,6 +30,7 @@ import { loadKbConfig } from "../kb/config";
 import { buildRegistry } from "../scheduler/actions";
 import { startScheduler } from "../scheduler/runner";
 import { schedulerToolDefinitions } from "../scheduler/scheduler-tools";
+import { seedGovernanceDigestJobs } from "../scheduler/governance-digest-seed";
 import { standupDigestAction } from "../scheduler/standup";
 import { reflectionAction } from "../scheduler/reflection";
 import { orgPulseAction } from "../scheduler/observer";
@@ -908,6 +909,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     adapter,
     log: (line) => console.log(line),
   });
+  // Idempotent opt-in seeder (issue #161): guarantee a weekly governance_digest
+  // job for every space whose policy enables proactive.governance. A boot that
+  // fails to seed fails loudly here, before the runner starts.
+  await seedGovernanceDigestJobs(store);
   const scheduler = startScheduler({
     store,
     audit,

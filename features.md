@@ -280,7 +280,10 @@ weekly summary of human and automatic approvals, denials by safe reason code,
 approval timeouts, credential use by org/personal scope, and org-settings
 changes. It never uses a model or includes raw audit payloads. Enable it only
 in the destination space with
-`{\"proactive\":{\"governance\":true}}`.
+`{\"proactive\":{\"governance\":true}}`. Boot then idempotently seeds a
+weekly `governance_digest` job for that space, so no manual
+`create_scheduler_job` is required; remove `governance` from the `proactive`
+block (or pause/delete the job) to turn it off.
 
 ## Policy & approvals (user-facing)
 

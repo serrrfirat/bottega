@@ -127,6 +127,14 @@ It reports only aggregate approvals, denials, timeouts, credential scopes,
 and org-settings changes from the prior seven days. It never uses a model or
 posts raw audit payloads.
 
+Boot also idempotently seeds a weekly `governance_digest` job (Monday 09:00
+UTC) for every space whose policy enables `proactive.governance` — no manual
+`create_scheduler_job` needed. It never duplicates: a job already targeting a
+space is left as-is (so an operator-edited cron is preserved). To disable the
+auto-seeded digest, remove `governance` from the space's `proactive` block
+(the action honors the same gate and stops posting) or pause/delete the job
+with `pause_scheduler_job` / `delete_scheduler_job`.
+
 Knowledge-base sources live in `config/kb.yml`. After adding a source, run
 the `kb_ingest` tool with `{"source":"source-id"}`, or omit `source` to
 ingest all configured sources. Each source host must also be in

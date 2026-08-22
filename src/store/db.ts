@@ -281,6 +281,8 @@ export interface Store {
     name?: string | null;
   }): Promise<Space>;
   getSpace(id: string): Promise<Space | null>;
+  /** Every known space row, creation-ordered. Used by boot-time proactive seeders to discover opt-in destinations. */
+  listSpaces(): Promise<Space[]>;
   updatePolicy(id: string, policyJson: string): Promise<Space>;
   /** Per-space model settings (issue #64): the parsed `spaces.settings` column, {} when unset/invalid. */
   getSpaceSettings(id: string): Promise<SpaceModelSettings>;
@@ -776,6 +778,11 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   async function getSpace(id: string): Promise<Space | null> {
     // SAFETY: get() yields undefined when no row matches; undefined maps to null below.
     return (getSpaceStmt.get(id) as Space | null) ?? null;
+  }
+
+  async function listSpaces(): Promise<Space[]> {
+    // SAFETY: SELECT * returns one row per space, each with Space's column shape.
+    return db.query("SELECT * FROM spaces ORDER BY created_at, id").all() as Space[];
   }
 
   async function updatePolicy(id: string, policyJson: string): Promise<Space> {
@@ -2070,6 +2077,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   const store: Store = {
     getOrCreateSpace,
     getSpace,
+    listSpaces,
     updatePolicy,
     getSpaceSettings,
     getEffectiveSpaceSettings,
