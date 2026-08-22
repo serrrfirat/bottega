@@ -1058,14 +1058,15 @@ async function spawnSandboxChild(
   // Issue #105 (P2): the child now runs from its own EMPTY temp cwd, so the
   // natural `BOTTEGA_CONFIG_DIR ?? process.cwd()` fallback for relative
   // `config/` and knowledge-base paths would resolve against that empty dir
-  // instead of the caller's real config root. When the caller did not pin
-  // BOTTEGA_CONFIG_DIR, re-pin it to the caller's own effective config root
-  // (the coordinator cwd that the child previously inherited) so those
-  // relative paths keep resolving exactly as they did before. The child's
-  // cwd itself stays empty — only the config anchor is made explicit and
-  // absolute.
+  // instead of the caller's real config root. Preserve the caller's prior
+  // semantics: an unset value reverts to the coordinator cwd, and a relative
+  // value resolves against that same cwd — only an absolute value passes
+  // through untouched. The child's cwd itself stays empty — only the config
+  // anchor is made explicit and absolute.
   if (env.BOTTEGA_CONFIG_DIR === undefined) {
     env.BOTTEGA_CONFIG_DIR = process.cwd();
+  } else if (!isAbsolute(env.BOTTEGA_CONFIG_DIR)) {
+    env.BOTTEGA_CONFIG_DIR = join(process.cwd(), env.BOTTEGA_CONFIG_DIR);
   }
 
   // The child must NEVER run from a cwd that can carry a `.env`: Bun itself
