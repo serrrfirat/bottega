@@ -105,6 +105,14 @@ export const SCHEDULER_ERROR_EVENT = "scheduler.error";
 export const OBJECT_ATTACHED_EVENT = "object.attached";
 /** Object created by an agent tool (payload {id, name, mime, size, by}). */
 export const OBJECT_CREATED_EVENT = "object.created";
+/**
+ * A Slack voice note could not be transcribed (issue #96): payload
+ * {ts, reason} — the clip's message ts and a short failure reason (e.g.
+ * `unsupported_mime`, `too_large`, `not_configured`, `stt_error`,
+ * `empty_transcript`). WITHOUT inbox, no agent turn runs; the failure is
+ * surfaced as an explicit user-visible reply (never a silent skip).
+ */
+export const VOICE_NOTE_FAILED_EVENT = "voice_note.failed";
 /** Org/space settings changed (payload {scope, space?, actor, before, after}). */
 export const SETTINGS_CHANGED_EVENT = "settings.changed";
 /** Extension credential resolved through the scope ladder (payload {provider, scope, identity_key, credential_id, broker_credential_id}). */

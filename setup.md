@@ -339,6 +339,11 @@ Missing files are `require: true`, so the placeholder cannot reach an upstream
 gateway. Active OAuth extension snapshots use iron-proxy's native
 `oauth_token` transform for refresh, caching, and single-flight deduplication.
 
+**Slack voice notes (#96)** need no extra setup: transcription rides the same
+NEAR gateway and the existing `NEAR_API_KEY` credential as model calls
+(override the endpoint/model via the `voice.transcription` settings tool
+knobs).
+
 Provision a boot secret into the vault with the same one-time upload link
 as extensions (never a secret through chat): ask the agent for
 `connect_upload_link <provider-id>` and paste the value into the browser

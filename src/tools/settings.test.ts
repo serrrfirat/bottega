@@ -625,6 +625,21 @@ describe("settings schemas (issue #67)", () => {
     expect(badProactive.success).toBe(false);
   });
 
+  test("voice transcription defaults to the NEAR values and rejects malformed knobs (issue #96)", () => {
+    // An empty voice section collapses to the NEAR defaults (zod .default()).
+    const empty = settingsSetSchema.parse({ voice: { transcription: {} } });
+    expect(empty.voice?.transcription).toEqual({
+      base_url: "https://cloud-api.near.ai/v1",
+      model: "openai/whisper-large-v3",
+    });
+    // A single override keeps the other NEAR default.
+    const partial = settingsSetSchema.parse({ voice: { transcription: { base_url: "http://stt:8080/v1" } } });
+    expect(partial.voice?.transcription?.base_url).toBe("http://stt:8080/v1");
+    expect(partial.voice?.transcription?.model).toBe("openai/whisper-large-v3");
+    expect(settingsSetSchema.safeParse({ voice: { transcription: { base_url: 42 } } }).success).toBe(false);
+    expect(settingsSetSchema.safeParse({ voice: { transcription: { unknown: "x" } } }).success).toBe(false);
+  });
+
   test("secrets_backend schema accepts a well-formed Connect backend and rejects malformed ones (issue #190)", () => {
     const ok = settingsSetSchema.safeParse({
       secrets_backend: {

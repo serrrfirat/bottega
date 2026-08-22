@@ -2,7 +2,15 @@ import { createHash } from "node:crypto";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
 import { withTimeout } from "../../tools/helpers";
-import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";
+import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT, VOICE_NOTE_FAILED_EVENT } from "../../store/audit-events";
+import {
+  NEAR_TRANSCRIBE_BASE_URL,
+  NEAR_TRANSCRIBE_MODEL,
+  VOICE_ACCEPTED_MIME_TYPES,
+  VOICE_MAX_BYTES,
+  createNearTranscriber,
+  type NearTranscriber,
+} from "../../voice/transcriber";
 import type { Store } from "../../store/db";
 import { z } from "zod";
 import { requireDigestPruning, type MemoryProvider } from "../../memory/types";
@@ -265,6 +273,37 @@ interface LiveSession {
    */
   stopPending: boolean;
 }
+
+/**
+ * A voice-note inbound failure reason (issue #96), surfaced to the user and
+ * carried on the VOICE_NOTE_FAILED_EVENT audit payload.
+ */
+type VoiceFailureReason =
+  | "too_large"
+  | "unsupported_mime"
+  | "download_error"
+  | "not_configured"
+  | "stt_error"
+  | "empty_transcript";
+
+/** User-visible phrasing per voice-note failure reason (issue #96). */
+const VOICE_FAILURE_LABELS = {
+  too_large: "this voice note is larger than the 25MB transcription limit",
+  unsupported_mime: "this voice note's audio format is not supported",
+  download_error: "the voice note could not be downloaded",
+  not_configured: "voice notes are not configured (NEAR_API_KEY is not set)",
+  stt_error: "speech-to-text failed for this voice note",
+  empty_transcript: "nothing usable was heard in this voice note",
+} satisfies Record<VoiceFailureReason, string>;
+
+/**
+ * Disposition of the voice-note inbound leg (issue #96), emitted by
+ * {@link SpaceService.#voiceNoteTurn}. `none` = no audio file (proceed with
+ * the normal attachment path); `ok` = transcribed (run the turn with the
+ * transcript text); `failed` = a voice-note failure was already replied to
+ * and audited — the caller MUST NOT run an agent turn.
+ */
+type VoiceNoteResult = { kind: "none" } | { kind: "ok"; text: string } | { kind: "failed" };
 
 /** One queued mid-turn message waiting for its own turn (issue #219). */
 interface PendingTurn {
@@ -592,7 +631,14 @@ export class SpaceService {
       // (activates at the steer decision below).
       const midTurn = existing !== undefined && existing.session.isStreaming();
       if (!midTurn) presenter.activateInbound(msg);
-      const turnText = await this.#ingestAttachments(msg);
+      // Voice notes (issue #96): an audio/* file becomes the turn's inbound
+      // text (a transcribed transcript) instead of a generic object. Any
+      // voice-note failure is replied to, audited (VOICE_NOTE_FAILED_EVENT),
+      // and returns WITHOUT running an agent turn. A non-audio message
+      // proceeds to the existing attachment ingestion unchanged.
+      const voice = await this.#voiceNoteTurn(msg);
+      if (voice.kind === "failed") return;
+      const turnText = voice.kind === "ok" ? voice.text : await this.#ingestAttachments(msg);
       const live = await this.#sessionFor(msg.spaceId);
       if (!live) return; // unreachable: the mid-dispose pre-check handled it
       this.#learning?.recordInput(msg);
@@ -694,6 +740,9 @@ export class SpaceService {
       turnText = turnText ? `${turnText}\n${note}` : note;
     };
     for (const file of msg.files) {
+      // Audio files are the voice-note leg's domain (issue #96); they are
+      // transcribed, never attached as generic objects.
+      if (file.mimeType.startsWith("audio/")) continue;
       const limit = this.#orgPolicy.objects.maxSizeBytes;
       if (file.size > limit) {
         appendNote(`[attachment skipped: ${file.name} exceeds ${limit}B limit]`);
@@ -737,6 +786,121 @@ export class SpaceService {
       }
     }
     return turnText;
+  }
+
+  /**
+   * The inbound voice-note leg (issue #96). Finds the first `audio/*` file
+   * and either turns it into turn text (a transcript) or fails it loudly.
+   * Every failure path posts an explicit, user-visible reply (threaded
+   * under the clip in channels, a plain single message in DMs) and audits
+   * VOICE_NOTE_FAILED_EVENT, then returns `failed` so the caller skips the
+   * agent turn — a voice clip is never dropped silently and never run
+   * without a usable transcript. The NEAR key is read from
+   * `process.env.NEAR_API_KEY` (seeded post-boot), and the base URL/model
+   * come from org settings `voice.transcription` with NEAR defaults.
+   */
+  async #voiceNoteTurn(msg: SlackMessage): Promise<VoiceNoteResult> {
+    const audio = msg.files?.find((f) => f.mimeType.startsWith("audio/"));
+    if (!audio) return { kind: "none" };
+
+    // Replies thread under the clip in channels; DMs read as one plain
+    // message (issue #180 rule, reused for the voice-note surfaces).
+    const replyOpts = isDmChannel(channelFromSpaceId(msg.spaceId)) ? undefined : { threadTs: msg.ts };
+    /**
+     * Surfaces a voice-note failure to the user and audits it. Best-effort
+     * in every leg: a Slack/audit hiccup is logged, never allowed to mask
+     * the failure (or throw into the caller). Returns `{kind:"failed"}` so
+     * the caller skips the agent turn.
+     */
+    const fail = async (reason: VoiceFailureReason, detail?: string): Promise<VoiceNoteResult> => {
+      try {
+        await this.#adapter.postMessage(
+          msg.spaceId,
+          `Voice note: ${VOICE_FAILURE_LABELS[reason]}${detail ? ` (${detail})` : ""}`,
+          replyOpts,
+        );
+      } catch (err) {
+        console.error(`[space-service] voice-note failure reply failed in ${msg.spaceId}:`, err);
+      }
+      try {
+        await this.#audit.appendAudit({
+          space_id: msg.spaceId,
+          actor: msg.principal,
+          event_type: VOICE_NOTE_FAILED_EVENT,
+          payload: { ts: msg.ts, reason, file: audio.name },
+        });
+      } catch (err) {
+        console.error(`[space-service] voice-note failure audit failed in ${msg.spaceId}:`, err);
+      }
+      return { kind: "failed" };
+    };
+
+    // Receipt acknowledgment: a 🎙️ reaction marks the clip as accepted for
+    // transcription. Fire-and-forget like the 👀 receipt — a missing
+    // reactions:write scope must not drop the voice note.
+    try {
+      await this.#adapter.addReaction(msg.spaceId, msg.ts, "studio_microphone");
+    } catch (err) {
+      console.error(`[space-service] voice-note reaction failed in ${msg.spaceId}:`, err);
+    }
+
+    // Bounds first (before the network round-trip): a clip we cannot
+    // transcribe is rejected without paying for the file download.
+    if (audio.size > VOICE_MAX_BYTES) return await fail("too_large");
+    if (!VOICE_ACCEPTED_MIME_TYPES.has(audio.mimeType)) {
+      return await fail("unsupported_mime", audio.mimeType);
+    }
+
+    let download;
+    try {
+      download = await this.#adapter.downloadFile(audio.id);
+    } catch (err) {
+      return await fail("download_error", err instanceof Error ? err.message : String(err));
+    }
+
+    const settings = this.#store.getOrgSettings();
+    const transcriber: NearTranscriber = createNearTranscriber({
+      apiKey: process.env.NEAR_API_KEY ?? "",
+      baseUrl: settings?.voice?.transcription?.baseUrl ?? NEAR_TRANSCRIBE_BASE_URL,
+      model: settings?.voice?.transcription?.model ?? NEAR_TRANSCRIBE_MODEL,
+    });
+    if (!transcriber.configured) return await fail("not_configured");
+
+    let text: string;
+    try {
+      text = await transcriber.transcribe(download.bytes, download.name, download.mimeType);
+    } catch (err) {
+      return await fail("stt_error", err instanceof Error ? err.message : String(err));
+    }
+    text = text.trim();
+    if (!text) return await fail("empty_transcript");
+
+    // Surface the transcript to the user: threaded under the clip in
+    // channels, a single visible message in DMs. Best-effort — a delivery
+    // hiccup logs and still lets the turn run on the transcript text.
+    try {
+      await this.#adapter.postMessage(msg.spaceId, `🎙️ ${text}`, replyOpts);
+    } catch (err) {
+      console.error(`[space-service] voice-note transcript reply failed in ${msg.spaceId}:`, err);
+    }
+
+    // Org memory: the transcript is an org fact sourced from a voice note.
+    // Best-effort like digest retention — a memory save failure never drops
+    // the turn.
+    if (this.#memoryProvider) {
+      try {
+        await this.#memoryProvider.save({
+          scope: { kind: "org" },
+          content: text,
+          metadata: { kind: "voice-note" },
+          source: "voice",
+        });
+      } catch (err) {
+        console.error(`[space-service] voice-note memory save failed in ${msg.spaceId}:`, err);
+      }
+    }
+
+    return { kind: "ok", text };
   }
 
   async stop(): Promise<void> {

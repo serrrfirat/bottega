@@ -15,7 +15,9 @@
  *   approval timeouts, always_approve, response_mode, memory injection,
  *   extensions allow/deny/org_credentials, repo allowlist, model defaults
  *   (default/fast/reasoning + effort), workspaces dir, git/api base URLs,
- *   loose-PAT dev override, memory backend URL, onboarding space id
+ *   loose-PAT dev override, turn_stop_control (issue #315), voice note
+ *   transcription (issue #96: voice.transcription.base_url / model),
+ *   memory backend URL, onboarding space id
  *   (issue #116: the space that receives the boot-time onboarding guide),
  *   secrets_backend (issue #190: the credential vault backend — omp-broker
  *   default, or a 1Password Connect server; the Connect token stays in
@@ -140,6 +142,18 @@ export const settingsSetSchema = z.object({
   allow_loose_pat: z.boolean().optional(),
   /** Enable the Slack live-turn Stop control (issue #315); default off. */
   turn_stop_control: z.boolean().optional(),
+  /** Voice-note transcription knobs (issue #96); NEAR defaults when absent. */
+  voice: z
+    .object({
+      transcription: z
+        .object({
+          base_url: z.string().default("https://cloud-api.near.ai/v1"),
+          model: z.string().default("openai/whisper-large-v3"),
+        })
+        .strict()
+        .optional(),
+    })
+    .optional(),
   memory_backend: z
     .object({
       base_url: z.string().optional(),
@@ -248,6 +262,21 @@ function mergeSettingsInput(base: OrgSettingsInput, partial: SettingsSetInput): 
   if (partial.api_base_url !== undefined) out.api_base_url = partial.api_base_url;
   if (partial.allow_loose_pat !== undefined) out.allow_loose_pat = partial.allow_loose_pat;
   if (partial.turn_stop_control !== undefined) out.turn_stop_control = partial.turn_stop_control;
+  if (partial.voice !== undefined) {
+    // The voice section's defaulted base_url/model always carry values on a
+    // set (the zod defaults above), so a spread rebuild collapses cleanly.
+    const baseTrans = base.voice?.transcription;
+    out.voice = {
+      transcription: {
+        ...(baseTrans?.base_url !== undefined ? { base_url: baseTrans.base_url } : undefined),
+        ...(baseTrans?.model !== undefined ? { model: baseTrans.model } : undefined),
+        ...(partial.voice.transcription?.base_url !== undefined
+          ? { base_url: partial.voice.transcription.base_url }
+          : undefined),
+        ...(partial.voice.transcription?.model !== undefined ? { model: partial.voice.transcription.model } : undefined),
+      },
+    };
+  }
   if (partial.memory_backend !== undefined) {
     out.memory_backend = { ...base.memory_backend, ...partial.memory_backend };
   }
@@ -305,6 +334,16 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
   if (settings.apiBaseUrl !== undefined) input.api_base_url = settings.apiBaseUrl;
   if (settings.allowLoosePat !== undefined) input.allow_loose_pat = settings.allowLoosePat;
   if (settings.turnStopControl !== undefined) input.turn_stop_control = settings.turnStopControl;
+  if (settings.voice?.transcription !== undefined) {
+    input.voice = {
+      transcription: {
+        ...(settings.voice.transcription.baseUrl !== undefined
+          ? { base_url: settings.voice.transcription.baseUrl }
+          : undefined),
+        ...(settings.voice.transcription.model !== undefined ? { model: settings.voice.transcription.model } : undefined),
+      },
+    };
+  }
   if (settings.memoryBackend?.baseUrl !== undefined) {
     input.memory_backend = { base_url: settings.memoryBackend.baseUrl };
   }
@@ -346,7 +385,8 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
       "git_base_url, api_base_url, allow_loose_pat, turn_stop_control (the Slack live-turn Stop " +
-      "control, default off), memory_backend.base_url, onboarding.space_id " +
+      "control, default off), voice.transcription.base_url / model (Slack voice-note " +
+      "transcription; NEAR defaults), memory_backend.base_url, onboarding.space_id " +
       "(the space that receives the boot-time onboarding guide), secrets_backend (the credential " +
       "vault backend: type omp-broker [default] or 1password-connect with connect_url + a mapping " +
       "of \"provider:identityKey\" to {vault, item, field}; the Connect token itself stays in .env " +
