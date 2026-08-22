@@ -45,6 +45,7 @@ import type { ConnectionBoundary } from "../../extensions/boundary";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
 import { redact } from "../../policy/audit";
+import { extractTurnUsage, type UsageRecorder, type UsageReportingMessage } from "../../tools/usage-meter";
 import type { ApprovalRouter } from "../../policy/approval-router";
 import type { PolicyConfig } from "../../policy/config";
 import { loadSpacePolicy, resolveTier } from "../../policy/config";
@@ -1264,6 +1265,14 @@ export function createOmpSdkDriver(
      * options the driver builds without touching the SDK.
      */
     createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+    /**
+     * Usage-meter recorder (issue #103): threaded into every session this
+     * driver builds. The driver composes the turn's {space, principal,
+     * model, tokensIn, tokensOut}; the recorder appends the `usage.turn`
+     * audit row through the composition root's store. Optional — a driver
+     * without one simply doesn't meter.
+     */
+    usageRecorder?: UsageRecorder;
   } = {},
 ): AgentDriver {
   // Issue #80: the SDK's model registry reads models.yml from the
@@ -1509,6 +1518,7 @@ export function createOmpSdkDriver(
         session,
         onOutput,
         getModelSettings: opts.getModelSettings ?? getModelSettings ?? (async () => ({})),
+        usageRecorder: opts.usageRecorder,
       });
     },
   };
@@ -1549,6 +1559,7 @@ export class OmpSessionDriver implements AgentSessionDriver {
   readonly #session: AgentSession;
   readonly #onOutput: (spaceId: string, text: string) => void;
   readonly #getModelSettings: (spaceId: string) => Promise<SpaceModelSettings>;
+  readonly #usageRecorder: UsageRecorder | undefined;
   readonly #emitter = createEmitter<DriverEvent>();
   #textByIndex = new Map<number, string>();
   /**
@@ -1617,11 +1628,20 @@ export class OmpSessionDriver implements AgentSessionDriver {
     onOutput: (spaceId: string, text: string) => void;
     /** Per-space model settings (issue #64); default: no settings (role switches report applied: false). */
     getModelSettings?: (spaceId: string) => Promise<SpaceModelSettings>;
+    /**
+     * Usage-meter recorder (issue #103): called once per assistant message
+     * completion with the turn's price-bearing facts so the composition root
+     * can append a `usage.turn` audit row. Optional — sessions without one
+     * simply don't meter. The driver composes space + principal; the recorder
+     * only persists.
+     */
+    usageRecorder?: UsageRecorder;
   }) {
     this.#spaceId = deps.spaceId;
     this.#session = deps.session;
     this.#onOutput = deps.onOutput;
     this.#getModelSettings = deps.getModelSettings ?? (async () => ({}));
+    this.#usageRecorder = deps.usageRecorder;
     this.#unsubscribe = deps.session.subscribe((event) => {
       switch (event.type) {
         case "message_update": {
@@ -1704,6 +1724,29 @@ export class OmpSessionDriver implements AgentSessionDriver {
           // never deliver.
           if (isAssistant || text) {
             this.#deliver(text, isAssistant && text === "" ? this.#lastError : undefined);
+          }
+          // Usage meter (issue #103): each ASSISTANT completion consumes
+          // model tokens. Record the price-bearing facts fire-and-forget —
+          // a metering write must never fail, delay, or otherwise perturb
+          // the turn it describes. The recorder is optional (a driver
+          // without one simply doesn't meter); extraction is defensive (a
+          // provider that reported no usage skips the row, and a zero-count
+          // still records so the turn count stays accurate).
+          if (isAssistant && this.#usageRecorder) {
+            // SAFETY: `isAssistant` (role === "assistant") narrows the SDK's
+            // union to an assistant message, which carries the `model` +
+            // `usage` fields the meter's structural slice reads; any other
+            // shape yields no row (extractTurnUsage parses defensively).
+            const usage = extractTurnUsage(event.message as UsageReportingMessage);
+            if (usage !== null) {
+              void this.#usageRecorder({
+                spaceId: deps.spaceId,
+                actor: this.#turnPrincipal ?? "agent",
+                ...usage,
+              }).catch((err) => {
+                console.error(`[agent-driver] usage.turn write failed for ${deps.spaceId}:`, err);
+              });
+            }
           }
           break;
         }

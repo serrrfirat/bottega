@@ -273,3 +273,11 @@ export const GOVERNANCE_DIGEST_FAILED_EVENT = "governance_digest.failed";
 export const MEMORY_REVIEW_POSTED_EVENT = "memory.review_posted";
 /** Weekly memory review could not be delivered (payload {reason}; never content). */
 export const MEMORY_REVIEW_FAILED_EVENT = "memory.review_failed";
+/**
+ * One model completion's token usage (issue #103): the usage meter's
+ * append-only source. `space_id` = the space, `actor` = the user principal,
+ * payload {model, tokensIn, tokensOut}. Tokens are recorded nowhere else;
+ * zero-cost turns still write a row so the turn count stays accurate
+ * (payload redaction + cap still apply).
+ */
+export const USAGE_TURN_EVENT = "usage.turn";
