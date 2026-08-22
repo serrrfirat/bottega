@@ -25,6 +25,8 @@ import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } 
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { DEFAULT_MODEL_CATALOG_DIR } from "../models/model-pin";
+import { parseYamlSubset } from "../yaml-subset";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "./boundary";
 import { errorMessage } from "../tools/helpers";
 import { fetchVaultApiKeysFromEnv, keychainReaderFromEnv, keychainServiceFor } from "../server/boot-secrets";
@@ -534,6 +536,55 @@ function armCodexReRefresh(opts: {
   timer.unref?.();
 }
 
+/**
+ * The provider of a model ref (issue #339): a provider-qualified ref
+ * ("openai-codex/gpt-5.6-luna") names the PROVIDER (the segment before the
+ * last "/"); a bare id, a role ref, or a bare provider marker ("openai-codex"
+ * with no slash) carries none or is handled by the caller. Matches the
+ * canary's defaultModelProviderFor split at the last "/".
+ */
+function providerOfModelRef(modelRef: string | undefined): string | undefined {
+  if (!modelRef) return undefined;
+  const slash = modelRef.lastIndexOf("/");
+  if (slash <= 0 || slash === modelRef.length - 1) return undefined;
+  return modelRef.slice(0, slash);
+}
+
+/**
+ * Whether the ACTIVE DEFAULT MODEL is the codex provider (issue #339): the
+ * codex auth/mint leg runs ONLY when the configured default resolves to
+ * `openai-codex` — a qualified ref ("openai-codex/gpt-5.6-luna"), a bare
+ * provider marker ("openai-codex"), or a model whose provider is
+ * `openai-codex`. Any other default (near/deepseek, opencode-go, bare ids,
+ * role refs), or an UNKNOWN/absent value, is NOT codex-active — the safe
+ * default is to never mint.
+ */
+export function isCodexActiveDefault(activeDefaultModel: string | undefined): boolean {
+  if (activeDefaultModel === undefined || activeDefaultModel.trim() === "") return false;
+  const ref = activeDefaultModel.trim();
+  if (ref === "openai-codex") return true;
+  return providerOfModelRef(ref) === "openai-codex";
+}
+
+/**
+ * Reads the agent dir's config.yml `modelRoles.default` (issue #339): the
+ * same pin the SDK/agent resolves its default session model from. Absent or
+ * unreadable → undefined (the caller's safe default — never mint when
+ * unknown). The agent dir is the deployment default `data/omp-agent`, which
+ * the boot roots override with their own resolved agentDir.
+ */
+export function agentDirModelDefault(agentDir: string): string | undefined {
+  try {
+    const parsed = parseYamlSubset(readFileSync(join(agentDir, "config.yml"), "utf8"));
+    const roles = z.record(z.string(), z.unknown()).safeParse(parsed.modelRoles);
+    const defaultParsed = roles.success ? z.string().safeParse(roles.data.default) : undefined;
+    const value = defaultParsed?.success ? defaultParsed.data : undefined;
+    return value !== undefined && value.trim() !== "" ? value.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ProxyCredentialSyncOpts {
   /** The env to read; defaults to process.env. */
   env?: NodeJS.ProcessEnv;
@@ -543,6 +594,16 @@ export interface ProxyCredentialSyncOpts {
    * volume, mounted at PROXY_SECRETS_MOUNT_PATH on the proxy side).
    */
   secretsDir?: string;
+  /**
+   * The ACTIVE DEFAULT MODEL (issue #339): a resolved model-role default
+   * ref (e.g. "near/deepseek-ai/DeepSeek-V4-Flash" or
+   * "openai-codex/gpt-5.6-luna"). The codex auth/mint leg runs ONLY when
+   * this resolves to the `openai-codex` provider. When undefined, the sync
+   * derives it from the deployment agent-dir config.yml
+   * `modelRoles.default`; when that also yields nothing, codex is treated
+   * as NOT active (safe default — never mint when unknown).
+   */
+  activeDefaultModel?: string;
   /**
    * Vault fetch seam (tests): provider → api_key secret. Default: the
    * auth-broker snapshot via fetchVaultApiKeysFromEnv (the same map the
@@ -647,30 +708,46 @@ export async function syncProxyCredentialsFromEnv(opts: ProxyCredentialSyncOpts 
     changed = true;
   }
 
-  // 2. Codex static credential (issue #214 + #230): the ChatGPT
-  // subscription OAuth tokens come from the Codex CLI auth file
-  // (CODEX_AUTH_PATH, default ~/.codex/auth.json) — a FILESYSTEM
-  // credential, never env/Keychain/vault. The SEED owns the codex refresh
-  // (issue #230): it refreshes the grant when the access token is within
-  // 24h of its JWT exp, writes the ACCESS token to openai-codex.secret
-  // (the egress static secrets injection entry — the proxy never touches
+  // 2. Codex static credential (issue #214 + #230) — GATED behind the
+  // ACTIVE DEFAULT MODEL (issue #339). The ChatGPT subscription OAuth
+  // tokens come from the Codex CLI auth file (CODEX_AUTH_PATH, default
+  // ~/.codex/auth.json) — a FILESYSTEM credential, never
+  // env/Keychain/vault. The SEED owns the codex refresh (issue #230): it
+  // refreshes the grant when the access token is within 24h of its JWT
+  // exp, writes the ACCESS token to openai-codex.secret (the egress
+  // static secrets injection entry — the proxy never touches
   // auth.openai.com), and writes the rotated refresh token back to the
   // oauth blob + the CLI auth file. A missing/unparseable auth file or a
   // REJECTED grant deletes BOTH boundary files (fail closed — require:
   // true 502s the codex provider until the user logs in with the Codex
   // CLI). The boot path throws on a dead token (loud remedy); the
   // background re-refresh path deletes + logs.
-  await syncCodexCredential({
-    env,
-    secretsDir,
-    mintCodexRefreshToken: opts.mintCodexRefreshToken,
-    log,
-    throwOnRejected: true,
-  });
-  // Issue #230: the periodic re-refresh timer — a long-running deployment
-  // re-refreshes long before the ~7-day access token dies, without a
-  // restart. Armed once per process after a real (non-test) seed.
-  armCodexReRefresh({ env, secretsDir, mintCodexRefreshToken: opts.mintCodexRefreshToken, log });
+  //
+  // Issue #339: this leg runs ONLY when the ACTIVE DEFAULT MODEL is the
+  // openai-codex provider. Otherwise the seed never reads ~/.codex/auth.json,
+  // never mints/refreshes, never throws the login remedy, and never arms
+  // the hourly re-refresh timer — stale openai-codex boundary files are
+  // DELETED (fail closed) and the boot proceeds silently.
+  const activeDefaultModel = opts.activeDefaultModel ?? agentDirModelDefault(DEFAULT_MODEL_CATALOG_DIR);
+  if (!isCodexActiveDefault(activeDefaultModel)) {
+    const codexSecretFileName = proxyKeyFileName("openai-codex");
+    const codexBlobFileName = proxyOAuthBlobFileName("openai-codex");
+    deleteSecretFile(secretsDir, codexSecretFileName);
+    deleteSecretFile(secretsDir, codexBlobFileName);
+    log(`bottega boot: proxy ${codexSecretFileName} REMOVED — codex provider disabled (default is not codex)`);
+  } else {
+    await syncCodexCredential({
+      env,
+      secretsDir,
+      mintCodexRefreshToken: opts.mintCodexRefreshToken,
+      log,
+      throwOnRejected: true,
+    });
+    // Issue #230: the periodic re-refresh timer — a long-running deployment
+    // re-refreshes long before the ~7-day access token dies, without a
+    // restart. Armed once per process after a real (non-test) seed.
+    armCodexReRefresh({ env, secretsDir, mintCodexRefreshToken: opts.mintCodexRefreshToken, log });
+  }
 
   // 3. Reload: a running proxy re-reads the file sources (ttl + reload).
   //    Configured control → the reload is REQUIRED (throw on failure);

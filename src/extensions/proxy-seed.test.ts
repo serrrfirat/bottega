@@ -73,6 +73,7 @@ describe("model gateway keys (issue #208)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
       });
       const expected = new Map<string, string>([
         ["near", "near-env"],
@@ -104,6 +105,7 @@ describe("model gateway keys (issue #208)", () => {
         fetchVault: () => Promise.resolve(vault),
         readKeychain: async (service) => keychain.get(service) ?? null,
         log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
       });
       expect(readFileSync(join(s.dir, "near.secret"), "utf8")).toBe("near-vault");
       expect(readFileSync(join(s.dir, "opencode.secret"), "utf8")).toBe("opencode-kc");
@@ -125,6 +127,7 @@ describe("model gateway keys (issue #208)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
       });
       expect(existsSync(stale)).toBe(false);
     } finally {
@@ -167,6 +170,7 @@ describe("MCP extension OAuth is OUT of the proxy plane (issue #284)", () => {
       fetchVault: NO_VAULT,
       readKeychain: NO_KEYCHAIN,
       log: (line) => log.push(line),
+      activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
     });
     // Model gateway keys still seed (the sync's remaining job).
     expect(existsSync(join(s.dir, "near.secret"))).toBe(true);
@@ -207,6 +211,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
       });
       // The egress static entry reads openai-codex.secret (issue #230): the
       // access token, mode 0600, atomic.
@@ -244,6 +249,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
       });
       expect(existsSync(staleBlob)).toBe(false);
       expect(existsSync(staleSecret)).toBe(false);
@@ -265,6 +271,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
       });
       expect(existsSync(blobPath)).toBe(false);
       expect(existsSync(secretPath)).toBe(false);
@@ -279,6 +286,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
       });
       expect(existsSync(blobPath)).toBe(false);
       expect(existsSync(secretPath)).toBe(false);
@@ -305,6 +313,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: (line) => log.push(line),
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
       });
       expect(existsSync(staleBlob)).toBe(false);
       expect(existsSync(staleSecret)).toBe(false);
@@ -359,6 +368,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
         // Must never be called: the fresh token needs no refresh.
         mintCodexRefreshToken: async () => {
           probeCalls += 1;
@@ -392,6 +402,7 @@ describe("codex static credential (issue #214 + #230)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
         // The endpoint minted a fresh access token AND rotated the refresh
         // token (the seed's own refresh — the proxy no longer mints).
         mintCodexRefreshToken: async () => ({
@@ -441,6 +452,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
           fetchVault: NO_VAULT,
           readKeychain: NO_KEYCHAIN,
           log: SILENT,
+          activeDefaultModel: "openai-codex/gpt-5.6-luna",
           mintCodexRefreshToken: async () => ({ minted: false, status: 401, refreshToken: "codex-refresh-1" }),
         }),
       ).rejects.toThrow(/codex login/); // the boot error names the remedy
@@ -451,6 +463,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
           fetchVault: NO_VAULT,
           readKeychain: NO_KEYCHAIN,
           log: SILENT,
+          activeDefaultModel: "openai-codex/gpt-5.6-luna",
           mintCodexRefreshToken: async () => ({ minted: false, status: 401, refreshToken: "codex-refresh-1" }),
         }),
       ).rejects.toThrow(/restart the server/);
@@ -475,6 +488,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
         mintCodexRefreshToken: OK_PROBE("codex-refresh-1"),
       });
       // The static secret carries the (unrotated) access token — the probe
@@ -505,6 +519,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
         // The token endpoint rotated the refresh token on the probe mint.
         mintCodexRefreshToken: OK_PROBE("codex-refresh-2-rotated"),
       });
@@ -540,6 +555,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
         log: (line) => log.push(line),
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
         mintCodexRefreshToken: async () => ({ minted: false, refreshToken: "codex-refresh-1" }),
       });
       expect(existsSync(join(s.dir, proxyKeyFileName("openai-codex")))).toBe(true);
@@ -574,6 +590,177 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
   });
 });
 
+describe("codex leg is gated behind the ACTIVE DEFAULT MODEL (issue #339)", () => {
+  test("a near/DeepSeek default NEVER reads/mints from a codex auth file — the login-remedy throw is gone and stale boundary files are deleted", async () => {
+    const s = tempSecretsDir();
+    // A present-but-DEAD codex auth file (expired access token): on the OLD
+    // code this boot THREW the "run codex login" remedy unconditionally
+    // (the codex leg ran for every boot). On this branch the near/DeepSeek
+    // default means the codex leg does not run at all — the auth file is
+    // never read, never minted, never rejected.
+    const auth = codexAuthFile({
+      tokens: { access_token: jwtAccessToken(expInHours(-1)), refresh_token: "codex-refresh-dead" },
+    });
+    const staleBlob = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+    const staleSecret = join(s.dir, proxyKeyFileName("openai-codex"));
+    writeFileSync(staleBlob, "{}", { mode: 0o600 });
+    writeFileSync(staleSecret, "stale", { mode: 0o600 });
+    const log: string[] = [];
+    let probeCalls = 0;
+    try {
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: auth.path },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        log: (line) => log.push(line),
+        // The active default model is near's deepseek — the boot's real
+        // posture (#339): codex disabled, so nothing reads ~/.codex/auth.json.
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
+        mintCodexRefreshToken: async () => {
+          probeCalls += 1;
+          throw new Error("the codex mint probe must not run when codex is not the active default");
+        },
+      });
+      // No throw (no login remedy), no mint: the sync returns normally.
+      expect(probeCalls).toBe(0);
+      // Fail closed: stale codex credential files are DELETED.
+      expect(existsSync(staleBlob)).toBe(false);
+      expect(existsSync(staleSecret)).toBe(false);
+      // The single gate log line names the disable — never the login remedy.
+      const all = log.join("\n");
+      expect(all).toContain("openai-codex.secret REMOVED");
+      expect(all).toContain("codex provider disabled");
+      expect(all).not.toContain("codex login");
+      expect(all).not.toContain("refresh grant");
+      expect(all).not.toContain("seeded (Codex");
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("a bare 'openai-codex' default marker and an 'openai-codex/...' ref BOTH gate the codex leg ON", async () => {
+    // Provider marker (bare "openai-codex", no slash): still codex-active.
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: jwtAccessToken(expInHours(1)), refresh_token: "codex-refresh-1" },
+    });
+    try {
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: auth.path },
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        log: SILENT,
+        activeDefaultModel: "openai-codex",
+        mintCodexRefreshToken: async () => ({
+          minted: true,
+          accessToken: "codex-access-marker",
+          refreshToken: "codex-refresh-1",
+        }),
+      });
+      expect(readFileSync(join(s.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-marker");
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+    // Qualified ref ("openai-codex/gpt-5.6-luna"): still codex-active.
+    const s2 = tempSecretsDir();
+    const auth2 = codexAuthFile({
+      tokens: { access_token: jwtAccessToken(expInHours(1)), refresh_token: "codex-refresh-1" },
+    });
+    try {
+      await syncProxyCredentialsFromEnv({
+        env: { [CODEX_AUTH_FILE_ENV]: auth2.path },
+        secretsDir: s2.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
+        mintCodexRefreshToken: async () => ({
+          minted: true,
+          accessToken: "codex-access-qualified",
+          refreshToken: "codex-refresh-1",
+        }),
+      });
+      expect(readFileSync(join(s2.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-qualified");
+    } finally {
+      auth2.cleanup();
+      s2.cleanup();
+    }
+  });
+
+  test("a codex-active default still mints and writes the static secret + blob (issue #230 unchanged)", async () => {
+    const s = tempSecretsDir();
+    const auth = codexAuthFile({
+      tokens: { access_token: jwtAccessToken(expInHours(1)), refresh_token: "codex-refresh-1" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = { [CODEX_AUTH_FILE_ENV]: auth.path };
+      await syncProxyCredentialsFromEnv({
+        env,
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        log: SILENT,
+        activeDefaultModel: "openai-codex/gpt-5.6-luna",
+        mintCodexRefreshToken: async () => ({
+          minted: true,
+          accessToken: "codex-access-minted",
+          refreshToken: "codex-refresh-2-rotated",
+        }),
+      });
+      expect(readFileSync(join(s.dir, proxyKeyFileName("openai-codex")), "utf8")).toBe("codex-access-minted");
+      const blob = JSON.parse(readFileSync(join(s.dir, proxyOAuthBlobFileName("openai-codex")), "utf8"));
+      expect(blob).toEqual({
+        access_token: "codex-access-minted",
+        refresh_token: "codex-refresh-2-rotated",
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      });
+    } finally {
+      auth.cleanup();
+      s.cleanup();
+    }
+  });
+
+  test("an UNKNOWN active default (config.yml missing/unreadable) treats codex as NOT active — never mints, never throws", async () => {
+    const s = tempSecretsDir();
+    const cwdDir = mkdtempSync(join(tmpdir(), "bottega-codex-unknown-default-"));
+    const savedCwd = process.cwd();
+    try {
+      // A cwd with NO data/omp-agent/config.yml: the sync's fallback (read
+      // the deployment agent-dir config.yml) yields nothing → codex is
+      // treated as NOT active. Deterministic regardless of the repo's own
+      // data/omp-agent pin (the test never reads it).
+      process.chdir(cwdDir);
+      const staleBlob = join(s.dir, proxyOAuthBlobFileName("openai-codex"));
+      const staleSecret = join(s.dir, proxyKeyFileName("openai-codex"));
+      writeFileSync(staleBlob, "{}", { mode: 0o600 });
+      writeFileSync(staleSecret, "stale", { mode: 0o600 });
+      let probeCalls = 0;
+      await syncProxyCredentialsFromEnv({
+        env: {},
+        secretsDir: s.dir,
+        fetchVault: NO_VAULT,
+        readKeychain: NO_KEYCHAIN,
+        log: SILENT,
+        mintCodexRefreshToken: async () => {
+          probeCalls += 1;
+          throw new Error("must not mint when the default is unknown");
+        },
+      });
+      expect(probeCalls).toBe(0);
+      expect(existsSync(staleBlob)).toBe(false);
+      expect(existsSync(staleSecret)).toBe(false);
+    } finally {
+      process.chdir(savedCwd);
+      rmSync(cwdDir, { recursive: true, force: true });
+      s.cleanup();
+    }
+  });
+});
+
 describe("proxy reload half (issue #123/#197 seam)", () => {
   test("a configured control pair reloads the proxy once after the writes", async () => {
     const s = tempSecretsDir();
@@ -598,6 +785,7 @@ describe("proxy reload half (issue #123/#197 seam)", () => {
         secretsDir: s.dir,
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
         proxyControl: { proxyControlUrl: "http://iron-proxy:9092", proxyControlToken: "mgmt-token" },
         fetchReload,
         log: SILENT,
@@ -621,12 +809,13 @@ describe("proxy reload half (issue #123/#197 seam)", () => {
     init?: Parameters<typeof fetch>[1],
   ) => Promise<Response> = async () => new Response("denied", { status: 401 });
     try {
-      await expect(
+await expect(
         syncProxyCredentialsFromEnv({
           env: { NEAR_API_KEY: "near-env" },
           secretsDir: s.dir,
           fetchVault: NO_VAULT,
           readKeychain: NO_KEYCHAIN,
+          activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
           proxyControl: { proxyControlUrl: "http://iron-proxy:9092", proxyControlToken: "wrong" },
           fetchReload,
           log: SILENT,
@@ -646,6 +835,7 @@ describe("proxy reload half (issue #123/#197 seam)", () => {
         secretsDir: s.dir,
         fetchVault: NO_VAULT,
         readKeychain: NO_KEYCHAIN,
+        activeDefaultModel: "near/deepseek-ai/DeepSeek-V4-Flash",
         proxyControl: {},
         log: SILENT,
       });

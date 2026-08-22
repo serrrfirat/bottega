@@ -12,7 +12,7 @@ import {
   type BootstrapRuntimeDeps,
 } from "./bootstrap-runtime";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
-import { syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
+import { agentDirModelDefault, syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { listConnectionReadModel } from "../extensions/lifecycle";
 import { workItemToolDefinitions } from "../tools/work-items";
 import { spaceSkillToolDefinitions } from "../tools/space-skills";
@@ -224,8 +224,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // (model keys + OAuth refresh tokens) into iron-proxy's secret files
   // and reload it — the app process never holds them; models.yml carries
   // only the placeholder and the proxy injects the real credential at
-  // egress. Same call in the executor and MCP roots (#172 parity).
-  await syncProxyCredentialsFromEnv();
+  // egress. Same call in the executor and MCP roots (#172 parity). Issue
+  // #339: pass the ACTIVE DEFAULT MODEL (the agent-dir config.yml
+  // `modelRoles.default`, the same pin the SDK/agent resolves its default
+  // session model from) so the codex auth/mint leg runs only when the
+  // default is the openai-codex provider.
+  const agentDir = opts.agentDir ?? OMP_AGENT_DIR;
+  await syncProxyCredentialsFromEnv({ activeDefaultModel: agentDirModelDefault(agentDir) });
   const appToken = process.env.SLACK_APP_TOKEN;
   const botToken = process.env.SLACK_BOT_TOKEN;
   if (!appToken || !botToken) {
@@ -307,7 +312,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   };
   // Created at boot so the SDK agent dir exists even outside compose (local
   // dev); under compose the config/omp templates are mounted here.
-  const agentDir = opts.agentDir ?? OMP_AGENT_DIR;
   mkdirSync(agentDir, { recursive: true });
   // Boot-time generation (issue #67): the SDK reads models.yml from the
   // agent dir; the DB settings are the source of truth. Written only when

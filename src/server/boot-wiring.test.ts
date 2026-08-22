@@ -17,7 +17,7 @@
  * sessions), no live services. Same shape as onboarding-boot.test.ts (#116).
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -34,6 +34,7 @@ import type { McpBinding } from "../extensions/manifest";
 import type { ExtensionSurfaces } from "../extensions/surface";
 import type { McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import { resetToolSurfaceCache } from "../extensions/surface";
+import { proxyKeyFileName } from "../extensions/proxy-seed";
 import { opencodeSafeToolName } from "./drivers/agent-driver";
 import { main } from "./index";
 
@@ -277,6 +278,65 @@ describe("boot wiring (scheduler #111 + KB #91, caller-level)", () => {
         "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required",
       );
     } finally {
+      env.cleanup();
+    }
+  });
+
+  test("a near/DeepSeek default with a stale codex auth file boots to the model registry ready — no codex-mint throw (issue #339)", async () => {
+    const env = tempEnv();
+    // A DEAD codex auth file: on the OLD code this boot THREW the "run
+    // codex login" remedy unconditionally (the codex leg ran for every
+    // boot, and a stale grant rejects). On this branch the near/DeepSeek
+    // default means the codex leg never runs — the auth file is not read,
+    // not minted, not rejected, and the boot proceeds to registry-ready.
+    const authDir = mkdtempSync(join(tmpdir(), "bottega-boot-dead-codex-"));
+    const authPath = join(authDir, "auth.json");
+    const deadAccess = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1_000) - 3_600 })).toString("base64url")}.sig`;
+    writeFileSync(authPath, JSON.stringify({ tokens: { access_token: deadAccess, refresh_token: "codex-refresh-dead" } }));
+    const savedCodexPath = process.env.CODEX_AUTH_PATH;
+    process.env.CODEX_AUTH_PATH = authPath;
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]): void => {
+      logs.push(args.map(String).join(" "));
+    };
+    let server: Awaited<ReturnType<typeof main>> | undefined;
+    try {
+      // Ship the agent-config template so the boot-time pin sync takes the
+      // "created" path (same fixture as the scheduler boot test above).
+      mkdirSync(join(env.dir, "config", "omp"), { recursive: true });
+      writeFileSync(
+        join(env.dir, "config", "omp", "config.yml"),
+        "modelRoles:\n  default: openai-codex/gpt-5.6-luna\n",
+      );
+      // The ACTIVE agent-dir config.yml pins near/DeepSeek — the codex
+      // provider is NOT active, so the codex auth/mint leg must not run.
+      const agentDir = join(env.dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "config.yml"),
+        "modelRoles:\n  default: near/deepseek-ai/DeepSeek-V4-Flash\n",
+      );
+      server = await main({ agentDir });
+
+      // The boot completed: the model-registry guard passed and the server
+      // reached the "model registry ready" log.
+      const bootLog = logs.join("\n");
+      expect(bootLog).toContain("model registry ready");
+      // The codex leg ran its FAIL-CLOSED disable branch — a single line —
+      // and never minted or surfaced the login remedy.
+      expect(bootLog).toContain("openai-codex.secret REMOVED");
+      expect(bootLog).not.toContain("codex login");
+      // The codex credential was NOT seeded into the ephemeral proxy-secrets
+      // dir (the OLD code read the dead auth file and WROTE openai-codex.secret
+      // here — even under the test runner; this branch never writes it).
+      expect(existsSync(join(env.dir, "data", "proxy-secrets", proxyKeyFileName("openai-codex")))).toBe(false);
+    } finally {
+      await server?.stop();
+      console.log = originalLog;
+      if (savedCodexPath === undefined) delete process.env.CODEX_AUTH_PATH;
+      else process.env.CODEX_AUTH_PATH = savedCodexPath;
+      rmSync(authDir, { recursive: true, force: true });
       env.cleanup();
     }
   });

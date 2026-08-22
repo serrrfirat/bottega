@@ -99,7 +99,7 @@ import {
 } from "./server/drivers/agent-driver";
 import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runtime";
 import { seedBootSecretsFromVault } from "./server/boot-secrets";
-import { syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
+import { agentDirModelDefault, syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "./extensions/boundary";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -391,7 +391,14 @@ export async function bootExecutorRuntime(opts: {
       opts.skipBootSecretEnvNames === undefined ? undefined : { skipEnvNames: opts.skipBootSecretEnvNames },
     );
   }
-  if (opts.skipProxyCredentialSync !== true) await syncProxyCredentialsFromEnv();
+  // Issue #339: resolve the agent dir up front and gate the codex
+  // auth/mint leg on its config.yml `modelRoles.default` — the same pin
+  // the SDK resolves its default session model from, so a near/DeepSeek
+  // default never mints for codex.
+  const agentDir = opts.agentDir ?? "data/omp-agent";
+  if (opts.skipProxyCredentialSync !== true) {
+    await syncProxyCredentialsFromEnv({ activeDefaultModel: agentDirModelDefault(agentDir) });
+  }
   const runtime = await bootstrapRuntime({
     router: DenyRouter,
     ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : undefined),
@@ -403,7 +410,6 @@ export async function bootExecutorRuntime(opts: {
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
   const { store, audit, orgPolicy } = runtime;
-  const agentDir = opts.agentDir ?? "data/omp-agent";
   mkdirSync(agentDir, { recursive: true });
   // Boot-time pin sync (issue #78 recurrence, staleness #207): the SDK
   // reads modelRoles from the agent dir's config.yml; host-dev agent dirs
