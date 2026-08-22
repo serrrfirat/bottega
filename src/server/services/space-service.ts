@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent";
 import { spaceAgentToolNames, type AgentDriver, type AgentSessionDriver, type SessionModelRoleRegistry } from "../drivers/agent-driver";
-import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { DIGEST_FAILED_EVENT, MESSAGE_DROPPED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import { z } from "zod";
 import { requireDigestPruning, type MemoryProvider } from "../../memory/types";
@@ -99,6 +99,14 @@ export interface SpaceServiceDeps {
    * model seam) — ambiguous input ALWAYS queues (fail-safe).
    */
   classifier?: CorrectionClassifier;
+  /**
+   * Render the active-turn Stop control (issue #315): when true, the
+   * space's presenter mounts a Stop button on the turn's card/progress
+   * surface (turn start) and clears it on turn end, and the `bottega_stop`
+   * action aborts the in-flight turn. OPT-IN so existing turn-flow fixtures
+   * keep exact message counts; production (the index boot) enables it.
+   */
+  stopControl?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +244,14 @@ interface LiveSession {
   idleTimer: ReturnType<typeof setTimeout>;
   detachLearning: () => void;
   disposing: boolean;
+  /**
+   * True while a Slack Stop control's abort for this space is in flight
+   * (issue #315). Set synchronously before the abort awaits and cleared
+   * when it resolves, so two racing Stop clicks can never double-abort
+   * the same in-flight turn (the driver abort is idempotent, but the flag
+   * guarantees exactly one is issued per turn).
+   */
+  stopPending: boolean;
 }
 
 /** One queued mid-turn message waiting for its own turn (issue #219). */
@@ -277,6 +293,8 @@ export class SpaceService {
   readonly #onboardingChecks: () => WizardCheck[];
   readonly #personaDir: string | undefined;
   readonly #classifier: CorrectionClassifier;
+  /** Render the active-turn Stop control (issue #315); see {@link SpaceServiceDeps.stopControl}. */
+  readonly #stopControl: boolean;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /**
@@ -320,6 +338,7 @@ export class SpaceService {
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
     this.#personaDir = deps.personaDir;
     this.#classifier = deps.classifier ?? new CorrectionClassifier();
+    this.#stopControl = deps.stopControl ?? false;
   }
 
   /**
@@ -342,6 +361,7 @@ export class SpaceService {
       store: this.#store,
       onboardingChecks: this.#onboardingChecks,
       phraseRotation: this.#phraseRotation,
+      stopControl: this.#stopControl,
     };
     // DMs must read as one plain message (issue #180): the stream panel
     // opens a threaded reply (chat.startStream carries thread_ts), which
@@ -436,6 +456,74 @@ export class SpaceService {
   hasLiveSession(spaceId: string): boolean {
     const live = this.#sessions.get(spaceId);
     return live !== undefined && !live.disposing;
+  }
+
+  /**
+   * Stops the space's ACTIVE live turn (issue #315): the Slack Stop
+   * control's per-turn abort target. It force-settles the driver's
+   * in-flight run — the same `abort()` the ghost-run recovery uses (issue
+   * #183) — so the in-flight LLM/tool loop yields and the turn settles as
+   * STOPPED. The presenter finalizes through the existing settlement path:
+   * a channel turn's in-flight `prompt()` rejects when the abort lands
+   * (the SDK's abort cancels the pending run) and its `finally` →
+   * {@link #settleAndDrain} finalizes the space's presenter exactly once
+   * (onRequestSettled is idempotent); a top-level DM request settles the
+   * same way. The live session itself is NOT disposed — later turns reuse
+   * it, cold-starting the transcript only when the idle timeout or a
+   * connect-refresh disposes it.
+   *
+   * Idempotent: a second Stop while no turn is in flight (`isStreaming()`
+   * false), during a pending Stop, or for a non-live/unknown/disposing
+   * space is a no-op — it never double-aborts or double-settles. Fail
+   * closed: any Stop attempt against a space with no live session is
+   * rejected (returns false) and audited, so a foreign/stale/unknown Stop
+   * is never silently swallowed as if it stopped something. The audit
+   * payload carries only metadata (`by`, `stopped`) — never turn/message
+   * content — and rides the audit module's redaction + payload cap.
+   *
+   * @returns true when an in-flight turn was actually aborted; false for a
+   *   no-op (not live, already stopped, or no in-flight turn).
+   */
+  async stopTurn(spaceId: string, by: string): Promise<boolean> {
+    const live = this.#sessions.get(spaceId);
+    // Fail closed: no live session (unknown/foreign/stale/disposing) → reject.
+    if (!live || live.disposing) {
+      await this.#auditStop(spaceId, by, false);
+      return false;
+    }
+    // No in-flight turn → nothing to stop; idempotent no-op.
+    if (live.stopPending || !live.session.isStreaming()) {
+      await this.#auditStop(spaceId, by, false);
+      return false;
+    }
+    // Exactly one abort per in-flight turn: the flag is set synchronously
+    // before the first await so a racing second Stop cannot double-abort.
+    live.stopPending = true;
+    try {
+      await live.session.abort();
+      await this.#auditStop(spaceId, by, true);
+      return true;
+    } finally {
+      // The turn is done driving this session: a later Stop for the NEXT
+      // turn must be able to abort it, so the flag re-arms here.
+      live.stopPending = false;
+    }
+  }
+
+  /** Audits a Slack Stop control click (issue #315); fail-soft — never throws into the action path. */
+  async #auditStop(spaceId: string, by: string, stopped: boolean): Promise<void> {
+    try {
+      await this.#audit.appendAudit({
+        space_id: spaceId,
+        actor: by,
+        event_type: TURN_STOP_EVENT,
+        payload: { by, stopped },
+      });
+    } catch (err) {
+      // Never mask the Stop outcome with an audit failure: a rejected Stop
+      // still returns false; only a genuinely stopped turn returns true.
+      console.error(`[space-service] turn.stop audit write failed for ${spaceId}:`, err);
+    }
   }
 
   async handleInboundMessage(msg: SlackMessage): Promise<void> {
@@ -753,6 +841,7 @@ export class SpaceService {
       session,
       detachLearning,
       disposing: false,
+      stopPending: false,
       idleTimer: setTimeout(() => void this.#disposeSession(spaceId), this.#idleTimeoutMs),
     };
     // Unref so a long-lived idle timer never keeps the process (or test run) alive.

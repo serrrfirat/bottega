@@ -83,6 +83,14 @@ export const DELIVERY_DENY_ACTION_ID = "bottega_delivery_deny";
 export const SCHEDULER_PAUSE_ACTION_ID = "bottega_scheduler_pause";
 export const SCHEDULER_RESUME_ACTION_ID = "bottega_scheduler_resume";
 export const SCHEDULER_RUN_NOW_ACTION_ID = "bottega_scheduler_run_now";
+/**
+ * Stop the space's ACTIVE live turn (issue #315): the user-facing Stop
+ * button rendered on the turn's card/progress surface. Routing it through
+ * the action handler (never the message classifier's "stop" marker — that
+ * is a chat steer, not a control click) keeps a user Stop a first-class,
+ * audited control.
+ */
+export const STOP_ACTION_ID = "bottega_stop";
 
 /**
  * A normalized interactive-component event (issue #44): a block-action
@@ -939,18 +947,18 @@ export function registerMessageHandler(
 }
 
 /**
- * Routes approval, delivery, and scheduler lifecycle block-action clicks
- * to `onAction`. Unparseable payloads are dropped and logged, never thrown.
- * Exported so the inbound wiring is testable hermetically through the real
- * Bolt router (`App.processEvent`, issue #29); the adapter installs it on
- * its app when `onAction` is provided.
+ * Routes approval, delivery, scheduler lifecycle, and Stop block-action
+ * clicks to `onAction`. Unparseable payloads are dropped and logged, never
+ * thrown. Exported so the inbound wiring is testable hermetically through
+ * the real Bolt router (`App.processEvent`, issue #29); the adapter installs
+ * it on its app when `onAction` is provided.
  */
 export function registerActionHandler(
   app: Pick<App, "action">,
   onAction: (a: SlackAction) => Promise<void>,
 ): void {
   app.action(
-    /^bottega_(approve|deny|delivery_approve|delivery_deny|scheduler_pause|scheduler_resume|scheduler_run_now)$/,
+    /^bottega_(approve|deny|delivery_approve|delivery_deny|scheduler_pause|scheduler_resume|scheduler_run_now|stop)$/,
     async ({ action, body, ack, logger }) => {
       // Ack first: Slack retries unacked interactive payloads.
       await ack();

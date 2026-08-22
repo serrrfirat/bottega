@@ -83,6 +83,7 @@ import {
   SCHEDULER_PAUSE_ACTION_ID,
   SCHEDULER_RESUME_ACTION_ID,
   SCHEDULER_RUN_NOW_ACTION_ID,
+  STOP_ACTION_ID,
   isDmChannel,
   slackBlockPayloadSchema,
   type SlackAction,
@@ -377,6 +378,14 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         a.actionId === SCHEDULER_RUN_NOW_ACTION_ID
       ) {
         return resolveSchedulerAction({ store, audit, adapter }, a).then(() => undefined);
+      }
+      // Stop control (issue #315): a user clicking Stop on a live turn is a
+      // first-class, audited control — resolved by the space service's
+      // per-turn abort, never by the approval flow. Idempotent + fail-closed
+      // by construction (stopTurn rejects non-live spaces).
+      if (a.actionId === STOP_ACTION_ID) {
+        void spaceService.stopTurn(a.spaceId, a.principal);
+        return;
       }
       return approvalRouter.handleAction(a);
     },
@@ -899,6 +908,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     memoryProvider,
     // Live sessions register here (issue #64) so use_model can reach them.
     modelRoles,
+    // Active-turn Stop control (issue #315): render the Stop button on
+    // each turn's card/progress surface so a Slack user can stop the
+    // in-flight turn (bottega_stop → SpaceService.stopTurn).
+    stopControl: true,
   });
   // Executor's delivery seam (issue #11 follow-up, #12, round trip #149):
   // the executor runs in its own container and cannot post to Slack. When a

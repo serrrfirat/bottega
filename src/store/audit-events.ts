@@ -148,6 +148,14 @@ export const MESSAGE_RECEIVED_EVENT = "message.in";
  * and write no row (issue #119).
  */
 export const MESSAGE_REPLIED_EVENT = "message.reply";
+/**
+ * A Slack Stop control stopped the space's active live turn (issue #315):
+ * payload {by, stopped} — `by` is the Slack user who clicked Stop,
+ * `stopped` is true when an in-flight turn was actually aborted, false
+ * when the Stop was a no-op (no live/in-flight turn to stop). Payload is
+ * minimal metadata only — never message text or reasoning content.
+ */
+export const TURN_STOP_EVENT = "turn.stop";
 /** Digest-on-idle summarization failed (payload {reason}); the space still disposes. */
 export const DIGEST_FAILED_EVENT = "digest.failed";
 /** Per-space model settings changed (payload {before, after, by}). */

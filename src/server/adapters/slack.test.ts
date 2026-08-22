@@ -10,6 +10,7 @@ import {
   SCHEDULER_PAUSE_ACTION_ID,
   SCHEDULER_RESUME_ACTION_ID,
   SCHEDULER_RUN_NOW_ACTION_ID,
+  STOP_ACTION_ID,
   buildAppendTaskArgs,
   buildAppendTextArgs,
   buildPostMessageArgs,
@@ -409,6 +410,22 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
       SCHEDULER_RESUME_ACTION_ID,
       SCHEDULER_RUN_NOW_ACTION_ID,
     ]);
+  });
+
+  test("delivers a Stop click to onAction (issue #315)", async () => {
+    const received: SlackAction[] = [];
+    const { deliver } = bootApp(async (action) => { received.push(action); });
+
+    await deliver({
+      ...approveBody,
+      actions: [{ type: "button", action_id: STOP_ACTION_ID, value: "slack:C123" }],
+    });
+
+    // The control's value is the space id; the normalized action derives
+    // spaceId from the channel too, so both agree on slack:C123.
+    expect(received.map((a) => a.actionId)).toEqual([STOP_ACTION_ID]);
+    expect(received[0].value).toBe("slack:C123");
+    expect(received[0].spaceId).toBe("slack:C123");
   });
 
   test("unrelated action ids do not reach onAction", async () => {

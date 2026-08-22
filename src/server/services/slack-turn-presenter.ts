@@ -53,6 +53,7 @@ import {
   isDmChannel,
   isStreamRequestValidationError,
   slackApiErrorSchema,
+  STOP_ACTION_ID,
   type SlackAdapter,
   type SlackApiError,
   type SlackBlockPayload,
@@ -510,6 +511,27 @@ export function parseSearchResultRows(text: string): SearchResultRow[] {
 // Presenter
 // ---------------------------------------------------------------------------
 
+/**
+ * The active-turn Stop control (issue #315): a Block Kit section carrying a
+ * danger "Stop" button whose `value` is the space id. Rendered on the
+ * turn's card/progress surface while a turn is in flight; clicking it files
+ * a `bottega_stop` block action that SpaceService resolves via a per-turn
+ * abort. Pure so the surface is unit-testable without Slack.
+ */
+export function stopControlBlock(spaceId: string): SlackBlockPayload {
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: "*Running — do you want to stop this turn?*" },
+    accessory: {
+      type: "button",
+      text: { type: "plain_text", text: "Stop" },
+      action_id: STOP_ACTION_ID,
+      value: spaceId,
+      style: "danger",
+    },
+  };
+}
+
 export interface TurnPresenterDeps {
   spaceId: string;
   adapter: SlackAdapter;
@@ -525,6 +547,14 @@ export interface TurnPresenterDeps {
    * per-presenter rotation.
    */
   phraseRotation?: { next(): string };
+  /**
+   * Render the active-turn Stop control (issue #315): when true, the
+   * presenter mounts a {@link stopControlBlock} on turn start and clears it
+   * on turn end. OPT-IN: existing turn-flow fixtures construct presenters
+   * without it and their message-count assertions stay exact. Production
+   * (the index boot) enables it via {@link SpaceServiceDeps.stopControl}.
+   */
+  stopControl?: boolean;
 }
 
 /**
@@ -687,6 +717,14 @@ export class SlackTurnPresenter {
   #planPosting = false;
   /** The last rendered plan body; identical snapshots skip the edit. */
   #lastPlanText: string | undefined;
+  /** Whether the active-turn Stop control (issue #315) is enabled for this space. */
+  #stopControlEnabled: boolean;
+  /**
+   * ts of the mounted Stop-control message (issue #315); undefined until
+   * mounted on turn start, cleared on turn end. One per space, so a second
+   * turn_start never stacks a duplicate control.
+   */
+  #stopControlTs: string | undefined;
   /**
    * Requests are in flight for a TOP-LEVEL DM (issue #296): true from a
    * top-level DM turn's open (activateInbound / onQueueDrain, which are
@@ -711,6 +749,7 @@ export class SlackTurnPresenter {
     this.#store = deps.store;
     this.#onboardingChecks = deps.onboardingChecks;
     this.#phraseRotation = deps.phraseRotation ?? createPhraseRotation();
+    this.#stopControlEnabled = deps.stopControl ?? false;
   }
 
   /**
@@ -786,6 +825,7 @@ export class SlackTurnPresenter {
 
   /** turn_start: rotate the phrase in place (or, streaming, keep the stream opening). */
   onTurnStart(): void {
+    this.#mountStopControl();
     this.#postThinkingPhrase();
   }
 
@@ -931,6 +971,7 @@ export class SlackTurnPresenter {
       this.#auditReply();
     }
     this.streamingTurns = false;
+    this.#clearStopControl();
     void finalized.catch((err) => {
       console.error(`[slack-turn-presenter] turn finalize failed in ${this.spaceId}:`, err);
     });
@@ -1242,6 +1283,50 @@ export class SlackTurnPresenter {
     this.#requestActive = false;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
+    this.#clearStopControl();
+  }
+
+  /**
+   * Mounts the active-turn Stop control (issue #315): posts ONE standalone
+   * block message carrying the {@link stopControlBlock} into the turn's
+   * thread (or plainly for DMs) — the visible "Stop" affordance on the
+   * turn's card/progress surface. Fire-and-forget like {@link postChartBlock}
+   * (Slack latency must never block the turn path). Resolves the control's
+   * ts once posted so {@link #clearStopControl} can edit it away. Deduped:
+   * a second turn_start (SDK auto-retry) never stacks a duplicate control.
+   */
+  #mountStopControl(): void {
+    if (!this.#stopControlEnabled) return;
+    if (this.#stopControlTs !== undefined) return; // already mounted (auto-retry)
+    void this.adapter
+      .postMessage(this.spaceId, "", {
+        ...this.replyOpts(),
+        blocks: [stopControlBlock(this.spaceId)],
+      })
+      .then((ts) => {
+        if (ts !== undefined) this.#stopControlTs = ts;
+      })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] stop control mount failed in ${this.spaceId}:`, err);
+      });
+  }
+
+  /**
+   * Clears the mounted Stop control (issue #315): the turn settled (normal
+   * end, error, or user Stop), so the button must not linger clickable.
+   * Best-effort edit to an empty block list; on failure the button stays
+   * but is a harmless no-op (stopTurn rejects non-streaming turns). Also
+   * forgets the control ts so the next turn mounts a fresh one.
+   */
+  #clearStopControl(): void {
+    const ts = this.#stopControlTs;
+    this.#stopControlTs = undefined;
+    if (ts === undefined) return;
+    void this.adapter
+      .updateMessage(this.spaceId, ts, "", { blocks: [] })
+      .catch((err) => {
+        console.error(`[slack-turn-presenter] stop control clear failed in ${this.spaceId}:`, err);
+      });
   }
 
   // -------------------------------------------------------------------------

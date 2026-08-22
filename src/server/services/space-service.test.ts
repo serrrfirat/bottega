@@ -11,8 +11,9 @@ import { SlackTurnPresenter, StreamTurnPresenter } from "./slack-turn-presenter"
 import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAdapter, SlackMessage } from "../adapters/slack";
+import { STOP_ACTION_ID } from "../adapters/slack";
 import { createAudit } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
@@ -57,6 +58,15 @@ class FakeSession implements AgentSessionDriver {
   reapplyCalls = 0;
   /** The session's live todo plan (issue #228); tests script it for the pull seam. */
   todoPhases: TodoPhase[] = [];
+  /** Number of abort() calls (issue #315): Stop must abort an in-flight turn EXACTLY once. */
+  abortCalls = 0;
+  /**
+   * When true, abort() force-settles the in-flight run the way the SDK's
+   * abort settles a ghost run (issue #183): it clears the streaming state
+   * and resolves the parked prompt gate so the caller's `prompt` promise
+   * settles as STOPPED, and emits `turn_end` so the presenter finalizes.
+   */
+  forceSettleOnAbort = false;
 
   private readonly listeners = new Map<string, Set<(data: FakeSessionEventData) => void>>();
   private disposeGate?: { promise: Promise<void>; resolve: () => void };
@@ -103,7 +113,19 @@ class FakeSession implements AgentSessionDriver {
     this.promptGate = undefined;
   }
 
-  async abort(): Promise<void> {}
+  async abort(): Promise<void> {
+    this.abortCalls += 1;
+    // Mirror the SDK's abort: force-settle the in-flight run — clear the
+    // streaming state, resolve a parked opening prompt (the caller's
+    // prompt() settles as STOPPED), and emit turn_end so the presenter
+    // finalizes the turn exactly as a natural end would. Only when the
+    // test opted into the force-settle (the abort seam test drives it).
+    if (this.forceSettleOnAbort) {
+      this.streaming = false;
+      this.finishPrompt();
+      this.emit("turn_end", { spaceId: this.spaceId });
+    }
+  }
 
   isStreaming(): boolean {
     return this.streaming;
@@ -3134,5 +3156,159 @@ describe("SpaceService live todo (issue #228, caller surface)", () => {
     // rehydrates from the transcript (the SDK's getTodoPhases).
     await service.stop();
     expect(service.getTodoPhases("slack:C1")).toEqual([]);
+  });
+});
+
+describe("SpaceService stopTurn (issue #315, caller-level)", () => {
+  /**
+   * The active-turn Stop control's onAction closure — the EXACT routing the
+   * index boot uses for a `bottega_stop` action (issue #315): delivery and
+   * scheduler action ids have their own durable resolvers elsewhere in the
+   * boot, and every OTHER non-stop action id is not expected here, so the
+   * router forwards only what this suite drives. The closure is exercised
+   * by the routing tests below; `stopTurn` is the service-level caller
+   * surface it invokes.
+   */
+  function stopRouter(spaceService: SpaceService, rejectNonStop = false) {
+    return (a: SlackAction): void => {
+      if (a.actionId === STOP_ACTION_ID) {
+        void spaceService.stopTurn(a.spaceId, a.principal);
+        return;
+      }
+      if (rejectNonStop) throw new Error(`unexpected non-stop action: ${a.actionId}`);
+    };
+  }
+
+  /**
+   * Opens a live turn (fire-and-forget) and returns the created FakeSession,
+   * flushing microtasks until the async cold start lands so tests never race
+   * `driver.last()`. The returned `turnDone` settles when the turn's prompt
+   * settles (a Stop's abort force-settles it).
+   */
+  async function openLiveTurn(
+    service: SpaceService,
+    driver: FakeDriver,
+  ): Promise<{ turnDone: Promise<void>; session: FakeSession }> {
+    const turnDone = service.handleInboundMessage(msg({ ts: "1.1" }));
+    for (let i = 0; i < 20 && driver.created.length === 0; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return { turnDone, session: driver.last() };
+  }
+
+  test("a Stop action routed exactly once aborts an in-flight turn and settles it as stopped (audited)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, stopControl: true });
+    // A live session whose opening prompt is parked mid-run (in flight).
+    const { turnDone, session } = await openLiveTurn(service, driver);
+    session.streaming = true; // the SDK reports the run is streaming
+    session.deferPrompt = true; // the opening prompt is parked (a real run awaiting the model)
+    session.forceSettleOnAbort = true; // abort force-settles the parked run like the SDK
+    await new Promise<void>((resolve) => setImmediate(resolve)); // receipt + phrase settle; the prompt is parked
+
+    const router = stopRouter(service, true);
+    router({ actionId: STOP_ACTION_ID, value: "slack:C1", spaceId: "slack:C1", principal: "U-stop", messageTs: "1.1" });
+    // The abort is fire-and-forget from the router; flush it.
+    await turnDone;
+
+    // The turn aborted EXACTLY once and settled (the parked prompt resolved).
+    expect(session.abortCalls).toBe(1);
+    expect(session.streaming).toBe(false);
+    await expect(turnDone).resolves.toBeUndefined();
+
+    // The Stop was audited with the clicker and the stopped outcome.
+    const stopAudits = audit.filter((a) => a.event_type === TURN_STOP_EVENT);
+    expect(stopAudits).toHaveLength(1);
+    expect(stopAudits[0]).toMatchObject({ space_id: "slack:C1", actor: "U-stop" });
+    expect(JSON.parse(stopAudits[0]!.payload)).toEqual({ by: "U-stop", stopped: true });
+
+    await service.stop();
+  });
+
+  test("a second Stop does not double-settle: idempotent once the turn is no longer in flight", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, stopControl: true });
+    const { turnDone, session } = await openLiveTurn(service, driver);
+    session.streaming = true;
+    session.deferPrompt = true;
+    session.forceSettleOnAbort = true;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const router = stopRouter(service, true);
+    const action = { actionId: STOP_ACTION_ID, value: "slack:C1", spaceId: "slack:C1", principal: "U-stop", messageTs: "1.1" };
+    router(action);
+    await turnDone; // first Stop settles the turn
+    expect(session.abortCalls).toBe(1);
+
+    // Second Stop: the turn is no longer streaming → no-op, no double abort.
+    router(action);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(session.abortCalls).toBe(1);
+
+    // Both Stops audited: the first stopped, the second was a no-op.
+    const stopAudits = audit.filter((a) => a.event_type === TURN_STOP_EVENT);
+    expect(stopAudits).toHaveLength(2);
+    expect(stopAudits.map((a) => JSON.parse(a.payload))).toEqual([
+      { by: "U-stop", stopped: true },
+      { by: "U-stop", stopped: false },
+    ]);
+
+    await service.stop();
+  });
+
+  test("a Stop for a non-live space is rejected: no abort, audited as stopped=false", async () => {
+    const { adapter } = fakeAdapter();
+    const { store, audit } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, stopControl: true });
+
+    // No live session at all (never created) → Stop is a rejected no-op.
+    const router = stopRouter(service, true);
+    router({ actionId: STOP_ACTION_ID, value: "slack:C999", spaceId: "slack:C999", principal: "U-evil", messageTs: "9.9" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(driver.created).toHaveLength(0); // nobody aborted or cold-started
+    const stopAudits = audit.filter((a) => a.event_type === TURN_STOP_EVENT);
+    expect(stopAudits).toHaveLength(1);
+    expect(stopAudits[0]).toMatchObject({ space_id: "slack:C999", actor: "U-evil" });
+    expect(JSON.parse(stopAudits[0]!.payload)).toEqual({ by: "U-evil", stopped: false });
+  });
+
+  test("an in-flight Stop renders the stop control until the turn settles", async () => {
+    const { adapter, posts, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const service = makeSpaceService({ store, adapter, driver, stopControl: true });
+
+    await service.handleInboundMessage(msg({ ts: "1.1" }));
+    const session = driver.last()!;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // A live turn: turn_start mounts the Stop control; turn_end clears it.
+    session.emit("turn_start", { spaceId: "slack:C1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    session.emit("turn_end", { spaceId: "slack:C1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The control was mounted (a block post carrying the Stop button) and
+    // cleared (an update to empty blocks on the control's own ts).
+    const isStopBlock = (b: unknown): b is { accessory: { action_id: string; value: string; style: string } } => {
+      if (b === null || typeof b !== "object") return false;
+      if (!("accessory" in b)) return false;
+      const accessory: unknown = b.accessory;
+      if (accessory === null || typeof accessory !== "object") return false;
+      if (!("action_id" in accessory) || !("value" in accessory) || !("style" in accessory)) return false;
+      return accessory.action_id === STOP_ACTION_ID;
+    };
+    const controlPosts = posts.filter((p) => (p.opts?.blocks ?? []).some(isStopBlock));
+    expect(controlPosts).toHaveLength(1);
+    const accessory = controlPosts[0]!.opts?.blocks?.find(isStopBlock)?.accessory;
+    expect(accessory).toMatchObject({ action_id: STOP_ACTION_ID, value: "slack:C1", style: "danger" });
+    expect(updates.some((u) => u.opts?.blocks && u.opts.blocks.length === 0)).toBe(true);
+
+    await service.stop();
   });
 });
