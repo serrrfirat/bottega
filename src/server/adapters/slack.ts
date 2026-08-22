@@ -1303,6 +1303,23 @@ export function createSlackAdapter(opts: {
    * the workspace's, so a later valid request can still open a panel.
    */
   let streamingCapable = true;
+  /**
+   * Shared stream-failure handler (issue #181): every stream call that
+   * fails disables streaming for the rest of the boot (the per-boot cache
+   * flips), logs an operation-labeled failure, and rethrows so the caller
+   * falls back to phrase+edit immediately. The dedicated no-retry client
+   * guarantees the failure arrives fast — never a ~30-minute SDK retry
+   * storm. `label` names the failing call type in the log line (e.g.
+   * "chat.appendStream (markdown)").
+   */
+  const failStream = (label: string) => (err: SlackApiError): never => {
+    streamingCapable = false;
+    console.error(
+      `[slack] ${label} failed (${err instanceof Error ? err.message : String(err)}) — ` +
+        "disabling streaming for this boot; falling back to phrase+edit",
+    );
+    throw err;
+  };
   const resolveWorkspaceViewer = async (user: string): Promise<OperatorViewer | null> => {
     const info = await app.client.users.info({ user });
     if (!info.ok || info.user?.id !== user) return null;
@@ -1521,12 +1538,17 @@ export function createSlackAdapter(opts: {
           buildAppendTextArgs(spaceId, ts, text) as ChatAppendStreamArguments,
         );
       } catch (err) {
-        streamingCapable = false;
-        console.error(
-          `[slack] chat.appendStream (markdown) failed (${err instanceof Error ? err.message : String(err)}) — ` +
-            "disabling streaming for this boot; falling back to phrase+edit",
-        );
-        throw err;
+        // Decode at the I/O boundary (lint: no alias allowed; a real
+        // PlatformError is an Error whose message we must preserve). Prefer
+        // passing the original thrown Error through so the shared handler
+        // logs the real message and rethrows an unmodified error; only a
+        // non-Error thrown value falls back to the schema payload.
+        const apiError: SlackApiError = err instanceof Error
+          ? err
+          : slackApiErrorSchema.safeParse(err).success
+            ? slackApiErrorSchema.parse(err)
+            : undefined;
+        failStream("chat.appendStream (markdown)")(apiError);
       }
     },
     async appendTask(spaceId, ts, task) {
@@ -1538,12 +1560,17 @@ export function createSlackAdapter(opts: {
           buildAppendTaskArgs(spaceId, ts, task) as ChatAppendStreamArguments,
         );
       } catch (err) {
-        streamingCapable = false;
-        console.error(
-          `[slack] chat.appendStream (task_update) failed (${err instanceof Error ? err.message : String(err)}) — ` +
-            "disabling streaming for this boot; falling back to phrase+edit",
-        );
-        throw err;
+        // Decode at the I/O boundary (lint: no alias allowed; a real
+        // PlatformError is an Error whose message we must preserve). Prefer
+        // passing the original thrown Error through so the shared handler
+        // logs the real message and rethrows an unmodified error; only a
+        // non-Error thrown value falls back to the schema payload.
+        const apiError: SlackApiError = err instanceof Error
+          ? err
+          : slackApiErrorSchema.safeParse(err).success
+            ? slackApiErrorSchema.parse(err)
+            : undefined;
+        failStream("chat.appendStream (task_update)")(apiError);
       }
     },
     async stopStream(spaceId, ts, text) {
@@ -1553,12 +1580,17 @@ export function createSlackAdapter(opts: {
         // type adds only options this adapter leaves unset.
         await streamClient.chat.stopStream(buildStopStreamArgs(spaceId, ts, text) as ChatStopStreamArguments);
       } catch (err) {
-        streamingCapable = false;
-        console.error(
-          `[slack] chat.stopStream failed (${err instanceof Error ? err.message : String(err)}) — ` +
-            "disabling streaming for this boot; falling back to phrase+edit",
-        );
-        throw err;
+        // Decode at the I/O boundary (lint: no alias allowed; a real
+        // PlatformError is an Error whose message we must preserve). Prefer
+        // passing the original thrown Error through so the shared handler
+        // logs the real message and rethrows an unmodified error; only a
+        // non-Error thrown value falls back to the schema payload.
+        const apiError: SlackApiError = err instanceof Error
+          ? err
+          : slackApiErrorSchema.safeParse(err).success
+            ? slackApiErrorSchema.parse(err)
+            : undefined;
+        failStream("chat.stopStream")(apiError);
       }
     },
     streamingSupported: () => (opts.streamingSupported !== undefined ? opts.streamingSupported() : streamingCapable),
