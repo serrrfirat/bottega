@@ -534,6 +534,10 @@ export class SpaceService {
         // undeliverable. Guarded for protocol-only test doubles lacking the
         // new store surface.
         try {
+          // SAFETY: the new durable pending-turn surface is an OPTIONAL
+          // Store addition; the `?.` guard skips it on a protocol-only test
+          // double that lacks it, and the widened Partial<Store> never calls
+          // a member the real store does not provide.
           await (this.#store as Partial<Store>).enqueuePendingTurn?.({
             spaceId: msg.spaceId,
             ts: msg.ts,
@@ -767,6 +771,9 @@ export class SpaceService {
     // re-delivered. Fail-soft: a recovery/store hiccup must never block
     // session cold-start.
     try {
+      // SAFETY: recoverPendingTurns is an OPTIONAL Store addition; the `?.`
+      // guard skips it on a protocol-only test double that lacks it, and the
+      // widened Partial<Store> never calls a member the real store lacks.
       const recovered = await (this.#store as Partial<Store>).recoverPendingTurns?.(spaceId, RECOVERY_LEASE_MS);
       if (recovered?.length) {
         const pending = recovered.map((turn) => ({
@@ -822,6 +829,23 @@ export class SpaceService {
         // OR reject — a rejection after onError buffered the failure must
         // still finalize the drained card and drain the NEXT queued message.
         await this.#settleAndDrain(spaceId);
+        // Issue #312: the durable pending turn is now finished (its drained
+        // turn settled, on resolve OR reject — a rejection still consumed
+        // the accepted message). Mark it done so a restart never re-
+        // delivers it. A crash BEFORE this point leaves the row 'claimed'
+        // under a lease; the next restart's recovery reclaims it after the
+        // lease expires and re-serves it exactly once (never lost, never
+        // doubled on one recovery). Fail-soft: a durable-write hiccup must
+        // not mask the settlement or break the queue drain.
+        try {
+          // SAFETY: completePendingTurn is an OPTIONAL Store addition; the
+          // `?.` guard skips it on a protocol-only test double that lacks it,
+          // and the widened Partial<Store> never calls a member the real
+          // store lacks.
+          await (this.#store as Partial<Store>).completePendingTurn?.(spaceId, entry.ts);
+        } catch (err) {
+          console.error(`[space-service] pending-turn complete failed for ${spaceId} ${entry.ts}:`, err);
+        }
       }
     } catch (err) {
       console.error(`[space-service] queue drain failed in ${spaceId}:`, err);
@@ -890,8 +914,10 @@ export class SpaceService {
       this.#presenters.delete(spaceId);
       this.#sessions.delete(spaceId);
       this.#modelRoles?.delete(spaceId);
-      // Issue #219: the in-memory queue dies with the session (documented
-      // tradeoff on #queues); the messages stay in Slack history.
+      // Issue #219/#312: the in-memory queue dies with the session
+      // (documented tradeoff on #queues); the messages stay in Slack history
+      // AND in the durable pending_turns, so the next cold start's recovery
+      // pass re-enqueues any never-finished turn exactly once.
       this.#queues.delete(spaceId);
     }
   }

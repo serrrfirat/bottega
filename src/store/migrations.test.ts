@@ -188,7 +188,10 @@ describe("ordered SQLite migrations", () => {
       DROP INDEX idx_audit_event_ts;
       DROP INDEX idx_audit_space_ts;
       DROP INDEX idx_audit_actor_ts;
-      DELETE FROM schema_migrations WHERE id = '013_add_audit_search_indexes';
+      -- Roll the ledger back to a genuine PRE-013 state: drop 013 AND any
+      -- later migration (014) so the remaining ledger [001..012] can re-apply
+      -- 013..014 with no index gap (issue #312 extends the history past 013).
+      DELETE FROM schema_migrations WHERE id IN ('013_add_audit_search_indexes', '014_add_durable_pending_turns');
     `);
     store.close();
 
@@ -203,7 +206,64 @@ describe("ordered SQLite migrations", () => {
       "idx_audit_event_ts",
       "idx_audit_space_ts",
     ]);
-    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("013_add_audit_search_indexes");
+    // 013 (and the later 014) were re-applied to a ledger that ended at 012.
+    expect(ledgerIds(upgraded.getDb())).toContain("013_add_audit_search_indexes");
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("014_add_durable_pending_turns");
+    upgraded.close();
+  });
+
+  test("an existing ledger receives the durable pending_turns table (issue #312)", async () => {
+    const path = tempDb("pre-pending-turns.db");
+    const store = createStore(path);
+    const db = store.getDb();
+    db.exec(`
+      DROP TABLE pending_turns;
+      DELETE FROM schema_migrations WHERE id = '014_add_durable_pending_turns';
+    `);
+    store.close();
+
+    const upgraded = createStore(path);
+    // SAFETY: this fixed sqlite_master query returns rows with exactly one type/name column.
+    const tableNames = upgraded
+      .getDb()
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pending_turns'")
+      .all() as Array<{ name: string }>;
+    expect(tableNames.map(({ name }) => name)).toEqual(["pending_turns"]);
+    // SAFETY: PRAGMA table_info returns one row per declared column with exactly these metadata columns.
+    const columns = (
+      upgraded.getDb().query("PRAGMA table_info(pending_turns)").all() as Array<{ name: string }>
+    ).map(({ name }) => name);
+    // The durable identity + lifecycle columns all land: id, space_id, ts,
+    // principal, text, root_thread_ts, the three statuses' columns.
+    expect(columns).toEqual(
+      expect.arrayContaining([
+        "id",
+        "space_id",
+        "ts",
+        "principal",
+        "text",
+        "root_thread_ts",
+        "status",
+        "claimed_at",
+        "lease_until",
+        "completed_at",
+      ]),
+    );
+    // SAFETY: this fixed sqlite_master query returns rows with exactly one name column.
+    const indexNames = upgraded
+      .getDb()
+      .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_pending_turns_%' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    // The UNIQUE(space_id, ts) identity index (issue #312 dedupe) and the
+    // recover index both land when 014 re-runs on an older ledger.
+    expect(indexNames.map(({ name }) => name)).toEqual([
+      "idx_pending_turns_identity",
+      "idx_pending_turns_recover",
+    ]);
+    // The durable rows are usable end-to-end on the backfilled ledger.
+    await upgraded.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "backfilled" });
+    expect(await upgraded.listPendingTurns("slack:C1")).toHaveLength(1);
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("014_add_durable_pending_turns");
     upgraded.close();
   });
 
