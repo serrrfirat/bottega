@@ -177,12 +177,13 @@ function createModelStub(): ModelStub {
         tools?: Array<{ type?: unknown; function?: { name?: unknown } }>;
         stream_options?: { include_usage?: boolean };
       };
-      requests.push({
+      const seenRequest: StubRequest = {
         model: String(body.model ?? ""),
         stream: body.stream === true,
         messages: (body.messages ?? []).map((m) => ({ role: m.role, content: m.content })),
-        ...(Array.isArray(body.tools) ? { tools: body.tools } : {}),
-      });
+      };
+      if (Array.isArray(body.tools)) seenRequest.tools = body.tools;
+      requests.push(seenRequest);
       while (waiters.length > 0) waiters.shift()!();
 
       // SAFETY: the queue is only ever pushed StubTurn values (respond/push

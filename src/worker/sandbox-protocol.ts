@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { OrgSettings } from "../store/org-settings";
 import { WORKER_JOB_KINDS, WORKER_JOB_STATUSES } from "./envelope";
 
 export const SANDBOX_PROTOCOL_VERSION = 1 as const;
@@ -41,6 +42,25 @@ const capsSchema = z
     memoryMb: z.number().int().min(32).max(32 * 1024),
   })
   .strict();
+
+// Validates the supervisor-relayed org-settings blob's settings-read markers
+// (ok/errors/warnings) and carries the blob onward as the OrgSettings the
+// supervisor produced (parseOrgSettingsJson already validated the full blob);
+// a malformed/absent relay fails closed — the boot falls back to no settings.
+// The passthrough object carries the relayed blob verbatim (unknown keys
+// preserved so a settings knob is never silently dropped).
+const orgSettingsMarkersSchema = z
+  .object({
+    ok: z.boolean(),
+    errors: z.array(z.string()),
+    warnings: z.array(z.string()).optional(),
+  })
+  .passthrough();
+// SAFETY: the supervisor's validated org-settings blob is relayed into the
+// job request; this boundary re-checks only its settings-read markers and
+// carries the validated object onward as OrgSettings (issue #101).
+const orgSettingsWireSchemaImpl = orgSettingsMarkersSchema as z.ZodType<OrgSettings>;
+export const orgSettingsWireSchema = orgSettingsWireSchemaImpl;
 
 export const sandboxExecuteRequestSchema = z
   .object({

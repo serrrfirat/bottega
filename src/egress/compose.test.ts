@@ -195,10 +195,13 @@ describe("docker-compose.yml (issue #105 sandbox-vs-egress isolation)", () => {
   });
 
   test("iron-proxy is dual-homed with a fixed sandbox IP (the job seam)", () => {
+    // SAFETY: the fixture declares iron-proxy's networks as a map whose egress and sandbox entries carry the ips asserted below.
     const net = service("iron-proxy")["networks"] as Record<string, YamlNode>;
     // Egress IP retained for server/executor (unchanged).
+    // SAFETY: the fixture declares iron-proxy's egress network as a map node holding ipv4_address.
     expect((net["egress"] as Record<string, YamlNode>)["ipv4_address"]).toBe("172.30.0.2");
     // The sandbox IP is the job containers' DNS sinkhole + proxy endpoint.
+    // SAFETY: the fixture declares iron-proxy's sandbox network as a map node holding ipv4_address.
     expect((net["sandbox"] as Record<string, YamlNode>)["ipv4_address"]).toBe("172.31.0.2");
   });
 
@@ -219,6 +222,7 @@ describe("docker-compose.yml (issue #105 sandbox-vs-egress isolation)", () => {
     expect(executorNetworks).toContain("egress");
     expect(executorNetworks).not.toContain("sandbox");
     // The server stays off the sandbox network too.
+    // SAFETY: the fixture declares the server's networks as the list ["egress"].
     const serverNetworks = service("server")["networks"] as string[];
     expect(serverNetworks).not.toContain("sandbox");
   });

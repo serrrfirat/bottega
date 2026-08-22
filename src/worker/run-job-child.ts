@@ -1,7 +1,6 @@
 import { readFileSync, readSync, statSync, writeSync } from "node:fs";
 import { bootExecutorRuntime, createDefaultConsolidationModelCall, type ExecutorBoot, type ExecutorDeps } from "../executor";
 import type { AgentDriver } from "../server/drivers/agent-driver";
-import type { OrgSettings } from "../store/org-settings";
 import { buildRegistry } from "../scheduler/actions";
 import { memoryConsolidationAction } from "../scheduler/memory-consolidation";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
@@ -11,6 +10,7 @@ import { connectStoreRpc } from "./store-rpc";
 import {
   MAX_SANDBOX_REQUEST_BYTES,
   SANDBOX_PROTOCOL_VERSION,
+  orgSettingsWireSchema,
   sandboxRequestSchema,
   sandboxResponseSchema,
   type SandboxRequest,
@@ -41,19 +41,6 @@ function readRequest(): SandboxRequest {
 
 function forbiddenEnvironment(): string[] {
   return FORBIDDEN_CHILD_ENV_NAMES.filter((name) => process.env[name] !== undefined);
-}
-
-/**
- * Narrowed shape check on the supervisor-serialized org settings relayed in
- * the job request (trusted internal boundary; only the settings-read fields
- * matter). Non-null objects that at least carry the parsed-blob markers are
- * accepted; null/undefined/garbage are ignored (the child then falls back to
- * no settings, which the boot chain tolerates).
- */
-function isOrgSettingsLike(value: unknown): value is OrgSettings {
-  if (value === null || typeof value !== "object") return false;
-  const candidate = value as Partial<OrgSettings>;
-  return typeof candidate.ok === "boolean" && Array.isArray(candidate.errors);
 }
 
 /**
@@ -139,15 +126,25 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
     throw new Error("Docker lane sandbox requires the mounted store RPC socket (BOTTEGA_SANDBOX_RPC_SOCKET)");
   }
   const rpc = connectStoreRpc(socketPath);
+  // SAFETY: rpc.store is the explicit allowlisted store facade (issue #101);
+  // the job runtime only invokes the facade's allowlisted methods, and any
+  // non-allowlisted access fails closed at the socket. Widening the narrow
+  // facade to the full Store/SandboxStore boundary types needs an unknown
+  // intermediate because TypeScript sees no direct overlap between the facade
+  // and the full Store interface (the facade deliberately omits most members).
+  const bootStore: unknown = rpc.store;
   let boot: ExecutorBoot;
   try {
     await rpc.ready();
+    const relayedOrgSettings = orgSettingsWireSchema.safeParse(request.orgSettings);
     boot = await bootExecutorRuntime({
-      // RPC facade typed up to the full Store at the boot boundary (same
-      // explicit allowlist; non-allowlisted methods fail closed at the socket).
-      store: rpc.store as unknown as Store,
+      // SAFETY: bootStore is the explicit allowlisted RPC store facade,
+      // widened to the full Store at the boot boundary; the runtime only
+      // invokes facade methods, and non-allowlisted access fails closed at
+      // the socket (issue #101).
+      store: bootStore as Store,
       memoryProvider: rpc.memoryProvider,
-      orgSettings: isOrgSettingsLike(request.orgSettings) ? request.orgSettings : undefined,
+      orgSettings: relayedOrgSettings.success ? relayedOrgSettings.data : undefined,
       skipRuntimeRegistryMerge: true,
       skipBootSecretEnvNames: FORBIDDEN_CHILD_ENV_NAMES,
       skipBootSecretSeed: true,
@@ -158,12 +155,16 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
     // The scheduled consolidation DB leg is routed supervisor-side; the LLM
     // leg comes back into the worker over the RPC socket (issue #272).
     rpc.setConsolidationModelCall(consolidationModelCall);
+    // SAFETY: bootStore is the explicit allowlisted RPC store facade, widened
+    // to SandboxStore at the session boundary; the job body / scoped-store
+    // layers only invoke facade methods, and any non-allowlisted access fails
+    // closed at the socket.
     const deps: ExecutorDeps = {
       // The RPC facade exposes only the job-relevant Store subset + the
       // supervisor-routed postOutboxRow; typed up to the full SandboxStore at
       // the session boundary (the job body / scoped-store layers never invoke
       // non-allowlisted methods — those fail closed at the socket).
-      store: rpc.store as unknown as SandboxStore,
+      store: bootStore as SandboxStore,
       memoryProvider: rpc.memoryProvider,
       get driver(): AgentDriver | Promise<AgentDriver> {
         return (driver ??= boot.getDriver());
