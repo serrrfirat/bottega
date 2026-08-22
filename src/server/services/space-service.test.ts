@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "bun:test";
 import { z } from "zod";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,8 +14,9 @@ import type { ResponseMode } from "../../policy/config";
 import { defaultPolicy, parseOrgConfigYaml } from "../../policy/config";
 import type { SlackAction, SlackAdapter, SlackMessage } from "../adapters/slack";
 import { STOP_ACTION_ID } from "../adapters/slack";
+import { VOICE_MAX_BYTES, NEAR_TRANSCRIBE_MODEL } from "../../voice/transcriber";
 import { createAudit } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT } from "../../store/audit-events";
+import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT, VOICE_NOTE_FAILED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
@@ -307,7 +308,7 @@ function fakeAdapter(
   const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
   const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }> = [];
-  const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string }> = [];
+  const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string; name?: string }> = [];
   const streams: FakeStreamCall[] = [];
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
   const downloadedFileIds: string[] = [];
@@ -345,9 +346,9 @@ function fakeAdapter(
       uploads.push({ spaceId, name, mimeType, content });
       return `upload-${uploads.length}`;
     },
-    async addReaction(spaceId, ts) {
+    async addReaction(spaceId, ts, name) {
       if (failReactions) throw new Error("missing_scope: reactions:write");
-      reactions.push({ kind: "add", spaceId, ts });
+      reactions.push(name !== undefined ? { kind: "add", spaceId, ts, name } : { kind: "add", spaceId, ts });
     },
     async removeReaction(spaceId, ts) {
       reactions.push({ kind: "remove", spaceId, ts });
@@ -3401,5 +3402,267 @@ describe("SpaceService stopTurn (issue #315, caller-level)", () => {
     expect(controlPosts).toHaveLength(0);
 
     await service.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice notes (issue #96) — caller-level through handleInboundMessage.
+// Hermetic: a real HTTP server on an ephemeral port stands in for the NEAR
+// transcription endpoint, the NEAR key is supplied per test, and the
+// adapter/memory/driver are fakes that record every side effect.
+// ---------------------------------------------------------------------------
+describe("SpaceService voice notes (issue #96, caller-level)", () => {
+  let sttUrl: string;
+  let stopStt: () => void;
+  let handleStt: (h: (req: Request) => Response) => void;
+
+  beforeAll(() => {
+    let handler = (_req: Request): Response => new Response("not ready", { status: 500 });
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return handler(req);
+      },
+    });
+    sttUrl = `http://127.0.0.1:${server.port}`;
+    stopStt = () => server.stop(true);
+    handleStt = (h) => {
+      handler = h;
+    };
+  });
+  afterAll(() => stopStt());
+
+  afterEach(() => {
+    delete process.env.NEAR_API_KEY;
+  });
+
+  /** A channel space seeded with voice-transcription settings pointing at the fake STT. */
+  async function voiceStore(overrides?: { transcription?: { base_url?: string } }) {
+    const store = freshObjectStore();
+    await store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    // Point the transcriber at the in-process fake STT (and lock the model)
+    // so the harness never touches the real NEAR cloud.
+    store.setOrgSettings({
+      voice: {
+        transcription: {
+          base_url: overrides?.transcription?.base_url ?? sttUrl,
+          model: NEAR_TRANSCRIBE_MODEL,
+        },
+      },
+    });
+    return store;
+  }
+
+  /** Builds a service whose fake adapter serves a downloadable audio file. */
+  function voiceHarness(store: Store, download: FakeDownloadedFile) {
+    const { adapter, posts, reactions, downloadedFileIds } = fakeAdapter({
+      downloads: { F_AUDIO: download },
+    });
+    const driver = new FakeDriver();
+    const memory = new FakeMemoryProvider();
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      audit: createAudit(store),
+      orgPolicy: defaultPolicy(),
+      memoryProvider: memory,
+      onboardingChecks: () => [],
+    });
+    return { adapter, posts, reactions, downloadedFileIds, driver, memory, service };
+  }
+
+  const audioClip = (overrides: Partial<FakeDownloadedFile> = {}): FakeDownloadedFile => ({
+    name: "voice.m4a",
+    mimeType: "audio/mp4",
+    size: 2048,
+    bytes: new TextEncoder().encode("fake-audio-bytes"),
+    ...overrides,
+  });
+
+  test("happy path: 🎙️ reaction, threaded transcript, org memory kind=voice-note, transcript is the turn text", async () => {
+    const store = await voiceStore();
+    const download = audioClip();
+    const { posts, reactions, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    handleStt(() => new Response(JSON.stringify({ text: "  hello world  " }), { headers: { "content-type": "application/json" } }));
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    // The clip was downloaded and acked with the 🎙️ (studio_microphone) reaction.
+    expect(downloadedFileIds).toEqual(["F_AUDIO"]);
+    expect(reactions.at(-1)).toEqual({ kind: "add", spaceId: "slack:C1", ts: "9.9", name: "studio_microphone" });
+
+    // The transcript is posted threaded under the clip ts in the channel.
+    const transcriptPost = posts.find((p) => p.text === "🎙️ hello world");
+    expect(transcriptPost).toBeDefined();
+    expect(transcriptPost!.opts).toEqual({ threadTs: "9.9" });
+
+    // Org memory: provenance source=voice, metadata.kind=voice-note.
+    expect(memory.saved).toHaveLength(1);
+    expect(memory.saved[0]!.scope).toEqual({ kind: "org" });
+    expect(memory.saved[0]!.content).toBe("hello world");
+    expect(memory.saved[0]!.metadata).toEqual({ kind: "voice-note" });
+    expect(memory.saved[0]!.source).toBe("voice");
+
+    // The agent turn ran with the transcript as its effective message text.
+    expect(driver.created).toHaveLength(1);
+    expect(driver.last().prompts[0]!.text).toBe("hello world");
+  });
+
+  test("unsupported mimetype: explicit reply, audited VOICE_NOTE_FAILED_EVENT, no download, no agent turn", async () => {
+    const store = await voiceStore();
+    const download = audioClip({ mimeType: "audio/x-caf" });
+    const { posts, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/x-caf", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    expect(downloadedFileIds).toEqual([]);
+    expect(driver.created).toHaveLength(0); // never an agent turn
+    expect(memory.saved).toHaveLength(0);
+    const failurePost = posts.find((p) => p.text !== undefined && p.text.includes("audio format is not supported"));
+    expect(failurePost).toBeDefined();
+    expect(failurePost!.opts).toEqual({ threadTs: "9.9" });
+    expect(posts.some((p) => p.text === "🎙️ hello world")).toBe(false);
+
+    const rows = await store.listAudit({ space: "slack:C1", event_type: VOICE_NOTE_FAILED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ ts: "9.9", reason: "unsupported_mime", file: "voice.m4a" });
+  });
+
+  test(">25MB clip: explicit reply, audited, no download, no agent turn", async () => {
+    const store = await voiceStore();
+    const download = audioClip({ size: VOICE_MAX_BYTES + 1 });
+    const { posts, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    expect(downloadedFileIds).toEqual([]);
+    expect(driver.created).toHaveLength(0);
+    expect(memory.saved).toHaveLength(0);
+    const failurePost = posts.find((p) => p.text !== undefined && (p.text.includes("25MB transcription limit") || p.text.includes("larger than the 25MB")));
+    expect(failurePost).toBeDefined();
+
+    const rows = await store.listAudit({ space: "slack:C1", event_type: VOICE_NOTE_FAILED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ ts: "9.9", reason: "too_large", file: "voice.m4a" });
+  });
+
+  test("unconfigured (no NEAR_API_KEY): explicit reply, audited, no agent turn", async () => {
+    const store = await voiceStore();
+    const download = audioClip();
+    const { posts, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    delete process.env.NEAR_API_KEY;
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    // The download still happens (bounds and mime pass); STT is gated on the key.
+    expect(downloadedFileIds).toEqual(["F_AUDIO"]);
+    expect(driver.created).toHaveLength(0);
+    expect(memory.saved).toHaveLength(0);
+    const failurePost = posts.find((p) => p.text !== undefined && p.text.includes("not configured"));
+    expect(failurePost).toBeDefined();
+
+    const rows = await store.listAudit({ space: "slack:C1", event_type: VOICE_NOTE_FAILED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ ts: "9.9", reason: "not_configured", file: "voice.m4a" });
+  });
+
+  test("STT 500: explicit reply, audited as stt_error, no agent turn", async () => {
+    const store = await voiceStore();
+    const download = audioClip();
+    const { posts, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    handleStt(() => new Response("boom", { status: 500 }));
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    expect(downloadedFileIds).toEqual(["F_AUDIO"]);
+    expect(driver.created).toHaveLength(0);
+    expect(memory.saved).toHaveLength(0);
+    const failurePost = posts.find((p) => p.text !== undefined && p.text.includes("speech-to-text failed"));
+    expect(failurePost).toBeDefined();
+
+    const rows = await store.listAudit({ space: "slack:C1", event_type: VOICE_NOTE_FAILED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ ts: "9.9", reason: "stt_error", file: "voice.m4a" });
+  });
+
+  test("empty transcript: explicit reply, audited, no agent turn, no memory", async () => {
+    const store = await voiceStore();
+    const download = audioClip();
+    const { posts, downloadedFileIds, driver, memory, service } = voiceHarness(store, download);
+    // STT succeeds but returns only whitespace — nothing usable was heard.
+    handleStt(() => new Response(JSON.stringify({ text: "   \n  " }), { headers: { "content-type": "application/json" } }));
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+
+    await service.stop();
+
+    expect(downloadedFileIds).toEqual(["F_AUDIO"]);
+    expect(driver.created).toHaveLength(0);
+    expect(memory.saved).toHaveLength(0);
+    expect(posts.some((p) => p.text === "🎙️ hello world")).toBe(false);
+    const failurePost = posts.find((p) => p.text !== undefined && p.text.includes("nothing usable was heard"));
+    expect(failurePost).toBeDefined();
+
+    const rows = await store.listAudit({ space: "slack:C1", event_type: VOICE_NOTE_FAILED_EVENT });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ ts: "9.9", reason: "empty_transcript", file: "voice.m4a" });
   });
 });

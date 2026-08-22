@@ -17,6 +17,7 @@ do, and why it matters. For how it works under the hood, see
 | --- | --- |
 | **Model settings** | See the provider catalog, pin a model and thinking effort per space or work item, and apply changes without a restart. |
 | **Slack delivery** | Get an immediate receipt, live progress, tool steps, and a final reply on a path that degrades safely when Slack streaming is unavailable. |
+| **Slack voice notes** | Record a voice clip and the agent transcribes it (NEAR STT), confirms with a 🎙️ reaction, posts the transcript in-thread, saves it to org memory as a voice-note fact, and runs the turn on it. |
 | **Native Slack charts** | Ask the agent for a chart and it renders Slack's native pie/bar/area/line data-visualization block straight into the thread — right from CSV or tabular data it already holds. |
 | **Org settings** | Runtime configuration in the database, with approver-gated org writes and tighten-only space overlays. |
 | **Memory** | The agent remembers facts per user or per org and uses them across conversations; every entry carries provenance, and `memory.forget` removes facts from recall (never hard-deletes) with a scheduled weekly review. |
@@ -334,6 +335,27 @@ reactions and records reply and phrase latency.
   Slack history, so recovery redelivers an accepted-but-unfinished turn
   rather than fabricating a reply. A turn that finished (settled) is
   marked done and is never re-delivered.
+
+## Slack voice notes (issue #96)
+
+Recording a voice clip to an agent-bound channel or DM turns it into a
+real agent turn instead of a silent object. The agent acknowledges the
+clip with a 🎙️ reaction while it transcribes, then posts the transcript
+as a threaded reply in channels (a single visible message in DMs) and
+runs the turn on that transcript as the message text. The transcript is
+also saved to org memory with `kind=voice-note` and provenance
+`source=voice`, so the agent can recall what was said later.
+
+Transcription rides the NEAR AI Cloud OpenAI-compatible
+`audio/transcriptions` endpoint using the existing `NEAR_API_KEY`
+credential (gateway-backed, same as the agent's model calls). The
+`voice.transcription.base_url` / `model` org settings override the NEAR
+defaults when you self-host STT. Clips larger than 25 MB or outside
+`audio/mp4`/`audio/ogg`/`audio/mpeg`/`audio/wav` are rejected explicitly,
+and any transcription failure (unconfigured key, STT error, an empty
+transcript) is surfaced as an explicit reply naming the cause and audited
+as `voice_note_failed` — a voice clip is never dropped silently and never
+runs a turn without a usable transcript.
 
 ## Operator Home and governance visibility (issues #161, #320)
 

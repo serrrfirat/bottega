@@ -52,6 +52,14 @@ export interface OrgModelsSettings {
   effort?: string;
 }
 
+/** Voice-note transcription knobs (issue #96). Base URL/model override the NEAR defaults. */
+export interface OrgVoiceTranscriptionSettings {
+  /** NEAR-compatible transcriptions API base; unset → the NEAR default. */
+  baseUrl?: string;
+  /** Transcription model; unset → the NEAR default. */
+  model?: string;
+}
+
 /**
  * One 1Password location a credential's secret is served from (issue #190):
  * `secrets_backend.mapping["<provider>:<identityKey>"]` points the
@@ -119,6 +127,8 @@ export interface OrgSettings {
    * `turn_stop_control: true`.
    */
   turnStopControl?: boolean;
+  /** Voice-note transcription knobs (issue #96); unset → NEAR defaults. */
+  voice?: { transcription?: OrgVoiceTranscriptionSettings };
   /** Memory backend URL (mem0); unset → SQLite memory (Part B). */
   memoryBackend?: { baseUrl?: string };
   /**
@@ -169,6 +179,10 @@ export interface OrgSettingsInput {
   allow_loose_pat?: boolean;
   /** Enable the Slack live-turn Stop control (issue #315); default off. */
   turn_stop_control?: boolean;
+  /** Voice-note transcription knobs (issue #96); unset → NEAR defaults. */
+  voice?: {
+    transcription?: { base_url?: string; model?: string };
+  };
   memory_backend?: { base_url?: string };
   /** Proactive onboarding (issue #116): space id for the boot-time guide. */
   onboarding?: { space_id?: string };
@@ -512,6 +526,42 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       } else {
         out.turnStopControl = flag.data;
       }
+    } else if (name === "voice") {
+      // Voice-note transcription knobs (issue #96). A nested transcription
+      // section whose base_url/model are optional non-empty strings; the
+      // NEAR defaults apply when either is absent. `voice: {}` sets nothing.
+      const section = jsonObjectSchema.safeParse(value);
+      if (!section.success) {
+        fail("voice must be an object");
+        continue;
+      }
+      if (section.data["transcription"] === undefined) {
+        continue; // `voice: {}` sets nothing
+      }
+      const transResult = jsonObjectSchema.safeParse(section.data["transcription"]);
+      if (!transResult.success) {
+        fail("voice.transcription must be an object");
+        continue;
+      }
+      const parsed: OrgVoiceTranscriptionSettings = {};
+      let sectionOk = true;
+      for (const [key, raw] of Object.entries(transResult.data)) {
+        if (key === "base_url" || key === "model") {
+          const str = z.string().trim().min(1).safeParse(raw);
+          if (!str.success) {
+            sectionOk = false;
+            fail(`voice.transcription.${key} must be a non-empty string`);
+          } else if (key === "base_url") {
+            parsed.baseUrl = str.data;
+          } else {
+            parsed.model = str.data;
+          }
+        } else {
+          sectionOk = false;
+          fail(`voice.transcription.${key}: unknown key`);
+        }
+      }
+      if (sectionOk) out.voice = { transcription: parsed };
     } else if (name === "memory_backend") {
       // The backend URL (mem0) — issue #67 env pruning moved the knob out
       // of env. An EMPTY base_url clears the setting (SQLite fallback),
