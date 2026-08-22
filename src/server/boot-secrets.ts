@@ -60,6 +60,7 @@ export const BOOT_SECRETS: readonly BootSecret[] = [
   { envName: "SLACK_APP_TOKEN", vaultProvider: "slack-app", label: "Slack app-level token" },
   { envName: "SLACK_BOT_TOKEN", vaultProvider: "slack-bot", label: "Slack bot token" },
   { envName: "GITHUB_WEBHOOK_SECRET", vaultProvider: "github-webhook", label: "GitHub webhook shared secret" },
+  { envName: "BOTTEGA_API_TOKEN", vaultProvider: "bottega-api-token", label: "REST API bearer token (issue #100)" },
   { envName: "OPENCODE_API_KEY", vaultProvider: "opencode", label: "OpenCode model key", seedAtBoot: false },
   { envName: "NEAR_API_KEY", vaultProvider: "near", label: "NEAR model key", seedAtBoot: false },
   { envName: "OPENAI_API_KEY", vaultProvider: "openai", label: "OpenAI model key", seedAtBoot: false },

@@ -108,6 +108,7 @@ describe("boot secret identity table (issue #201, shrunk #208)", () => {
       "slack-app",
       "slack-bot",
       "github-webhook",
+      "bottega-api-token",
       "opencode",
       "near",
       "openai",

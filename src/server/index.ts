@@ -11,6 +11,7 @@ import {
   type BootstrapRuntime,
   type BootstrapRuntimeDeps,
 } from "./bootstrap-runtime";
+import { mountRestApi } from "./api";
 import { bootSecretForProvider, seedBootSecretsFromVault } from "./boot-secrets";
 import { agentDirModelDefault, syncProxyCredentialsFromEnv } from "../extensions/proxy-seed";
 import { listConnectionReadModel } from "../extensions/lifecycle";
@@ -543,6 +544,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // listener as the callback + webhook route — one stable port, one
     // tunnel target, one public base for every browser leg.
     uploadLink: uploadMount,
+    // Issue #100: the token-authenticated REST API + its OpenAPI document ride
+    // the SAME inbound listener — one stable port, one tunnel target, one
+    // public ingress for every inbound path (callback, upload, webhook, API).
+    restApi: mountRestApi({ store, audit }),
     // Issue #281: the browser leg is the only place that knows the connect
     // actually completed — surface the connected space so its live session
     // toolset refreshes WITHOUT a restart. Late-bound (spaceService is

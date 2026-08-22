@@ -281,3 +281,21 @@ export const MEMORY_REVIEW_FAILED_EVENT = "memory.review_failed";
  * (payload redaction + cap still apply).
  */
 export const USAGE_TURN_EVENT = "usage.turn";
+/**
+ * REST API call rejected at auth (issue #100): payload {method, path};
+ * actor api:default, space_id null. A missing or non-matching bearer token
+ * never reaches a handler — the denial is the audited record.
+ */
+export const API_AUTH_DENIED_EVENT = "api.auth_denied";
+/** REST API space list (payload {count}; actor api:default). */
+export const API_SPACES_LISTED_EVENT = "api.spaces_listed";
+/** REST API work-item list (payload {count, space?}; space_id top-level when filtered). */
+export const API_WORK_ITEMS_LISTED_EVENT = "api.work_items_listed";
+/**
+ * REST API audit read (payload {event_type?, space?, since?, limit?} — the
+ * filters, never results or a cursor). Written AFTER the query so the read
+ * never self-references its own row.
+ */
+export const API_AUDIT_READ_EVENT = "api.audit_read";
+/** REST API work-item create (payload {id, requester}; actor api:default). */
+export const API_WORK_ITEM_CREATED_EVENT = "api.work_item_created";
