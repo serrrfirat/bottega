@@ -696,13 +696,18 @@ describe.skipIf(!dockerSocketPresent || process.env.BOTTEGA_RUN_INTEGRATION !== 
         //   2. /tmp is writable (bounded tmpfs) — the only scratch.
         //   3. no effective capabilities remain (cap-drop ALL).
         //   4. no-new-privileges is active.
-        // (5. network isolation is proven separately by the egress-denied
+        //   5. seccomp filtering is active, never disabled (Seccomp != 0) —
+        //      same invariant as the CI hardening lane (issue #337). The
+        //      exact value (2 = filter) is host-daemon-dependent, so assert
+        //      the property (filtering not disabled), not a magic number.
+        // (6. network isolation is proven separately by the egress-denied
         //    curl: on the internal bridge a raw external IP is unreachable.)
         "! touch /rootfs-write 2>/dev/null && " +
         "echo scratch > /tmp/write-ok && " +
         "test -s /tmp/write-ok && " +
         "test \"$(awk '/^CapEff:/ {print $2}' /proc/self/status)\" = 0000000000000000 && " +
         "test \"$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)\" = 1 && " +
+        "test \"$(awk '/^Seccomp:/ {print $2}' /proc/self/status)\" != 0 && " +
         "echo hardening-ok",
       ]);
       expect(probe.status).toBe(0);
