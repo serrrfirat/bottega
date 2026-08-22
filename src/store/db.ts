@@ -376,6 +376,34 @@ export interface Store {
    */
   markUnclaimedJobs(ttlMs: number): Promise<WorkerJob[]>;
   /**
+   * Durable pending-turn backstop (issue #312). Persists a queued mid-turn
+   * Slack message so a restart re-enqueues accepted-but-unfinished turns.
+   * Records the message ONCE: the durable identity is the inbound Slack
+   * (space_id, ts), mirroring how worker_jobs claim by envelope id — a
+   * duplicate enqueue of the same message is a no-op.
+   */
+  enqueuePendingTurn(input: {
+    spaceId: string;
+    ts: string;
+    principal: string;
+    text: string;
+    rootThreadTs?: string;
+  }): Promise<{ created: boolean }>;
+  /**
+   * Recovery claim (issue #312): atomically claims the eligible durable
+   * rows for a space (each claimed exactly once) and returns them in arrival
+   * order to re-enqueue after a restart. "Eligible" mirrors the worker_jobs
+   * lease claim: a 'pending' row is always claimable; a 'claimed' row (a
+   * prior recovery took it but the turn never settled — crash mid-drain) is
+   * reclaimed only after its lease expires, so two racing recovery passes
+   * cannot both deliver the same turn. Empty when nothing is eligible.
+   */
+  recoverPendingTurns(spaceId: string, leaseMs: number): Promise<PendingTurnClaim[]>;
+  /** Marks a durable pending turn done after its drained turn settles, so a restart never re-delivers it. */
+  completePendingTurn(spaceId: string, ts: string): Promise<void>;
+  /** Observability/test surface: durable pending-turn rows for a space (all statuses), arrival order. */
+  listPendingTurns(spaceId?: string): Promise<Array<PendingTurnRow & { status: string }>>;
+  /**
    * Creates or reactivates the one connection for an org/provider or
    * personal provider/owner. Existing rows retain their stable id and
    * advance their revision.
@@ -732,6 +760,48 @@ function parseWorkerJob(row: WorkerJobRow): WorkerJob {
 }
 
 /**
+ * Durable pending-turn lifecycle (issue #312): the durable payload of a
+ * queued (accepted) Slack turn — space, sender, text, and conversation root
+ * for thread replies — that survives a restart as a crash-safe backstop
+ * while the accepted message also lives in Slack history. The claimed
+ * payload's shape, used by SpaceService when it re-enqueues a recovered
+ * turn, matches the in-memory PendingTurn.
+ */
+export type PendingTurnClaim = {
+  spaceId: string;
+  ts: string;
+  principal: string;
+  text: string;
+  rootThreadTs?: string;
+};
+
+/** The durable pending-turn row's full shape (issue #312). */
+export type PendingTurnRow = {
+  id: number;
+  space_id: string;
+  ts: string;
+  principal: string;
+  text: string;
+  root_thread_ts: string | null;
+  status: "pending" | "claimed" | "done";
+  created_at: number;
+  claimed_at: number | null;
+  lease_until: number | null;
+  completed_at: number | null;
+};
+
+/** Parses a durable pending-turn row into the claimed payload. */
+function pendingTurnFromRow(row: PendingTurnRow): PendingTurnClaim {
+  return {
+    spaceId: row.space_id,
+    ts: row.ts,
+    principal: row.principal,
+    text: row.text,
+    rootThreadTs: row.root_thread_ts ?? undefined,
+  };
+}
+
+/**
  * Opens (creating if needed) the SQLite store at `dbPath` and applies every
  * pending ordered migration before exposing the database.
  */
@@ -1069,6 +1139,95 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       )
       .all(now, cutoff, now) as WorkerJobRow[];
     return rows.map(parseWorkerJob);
+  }
+
+  async function enqueuePendingTurn(input: {
+    spaceId: string;
+    ts: string;
+    principal: string;
+    text: string;
+    rootThreadTs?: string;
+  }): Promise<{ created: boolean }> {
+    if (!input.spaceId || !input.ts || !input.principal) {
+      throw new Error("pending turn requires spaceId, ts, and principal");
+    }
+    const t = Date.now();
+    // INSERT OR IGNORE keyed on the unique (space_id, ts) identity: the same
+    // inbound Slack message is recorded once, so a re-delivered accepted
+    // turn can never be persisted twice (issue #312 dedupe).
+    const res = db
+      .query(
+        `INSERT OR IGNORE INTO pending_turns (space_id, ts, principal, text, root_thread_ts, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(input.spaceId, input.ts, input.principal, input.text, input.rootThreadTs ?? null, t);
+    return { created: Number(res.changes) === 1 };
+  }
+
+  async function recoverPendingTurns(spaceId: string, leaseMs: number): Promise<PendingTurnClaim[]> {
+    const now = Date.now();
+    // One atomic transaction claims ALL eligible rows for the space exactly
+    // once (issue #312): 'pending' rows always, plus 'claimed' rows whose
+    // lease expired (a prior recovery took them but their turn never
+    // settled — crash mid-drain). The per-row status re-check under the
+    // immediate transaction makes two racing recovery passes deliver each
+    // row to only ONE claimant — the loser sees the winner's freshly leased
+    // 'claimed' rows and skips them.
+    const recover = db.transaction(() => {
+      // SAFETY: SELECT id mirrors pending_turns, which always exposes the id column.
+      const ids = (
+        db
+          .query(
+            `SELECT id FROM pending_turns
+             WHERE space_id = ? AND status != 'done'
+               AND (status = 'pending' OR (status = 'claimed' AND lease_until IS NOT NULL AND lease_until < ?))
+             ORDER BY id ASC`,
+          )
+          .all(spaceId, now) as Array<{ id: number }>
+      ).map((row) => row.id);
+      const claims: PendingTurnClaim[] = [];
+      for (const id of ids) {
+        // SAFETY: UPDATE ... RETURNING * mirrors pending_turns; a row already
+        // transitioned to 'done' (or claimed under a fresh lease) by a racing
+        // recovery yields no row and is skipped.
+        const row = db
+          .query(
+            `UPDATE pending_turns
+             SET status = 'claimed', claimed_at = ?, lease_until = ?
+             WHERE id = ? AND status != 'done'
+               AND (status = 'pending' OR (status = 'claimed' AND lease_until IS NOT NULL AND lease_until < ?))
+             RETURNING *`,
+          )
+          .get(now, now + leaseMs, id, now) as PendingTurnRow | null;
+        if (row) claims.push(pendingTurnFromRow(row));
+      }
+      return claims;
+    });
+    return recover.immediate();
+  }
+
+  async function completePendingTurn(spaceId: string, ts: string): Promise<void> {
+    const now = Date.now();
+    // Marks the durable pending turn done after its drained turn settles.
+    // Idempotent: run for the exact (space_id, ts); a row already done is a
+    // no-op (never re-delivered), not an error.
+    db.query(
+      `UPDATE pending_turns
+       SET status = 'done', completed_at = ?
+       WHERE space_id = ? AND ts = ? AND status IN ('pending', 'claimed')`,
+    ).run(now, spaceId, ts);
+  }
+
+  async function listPendingTurns(spaceId?: string): Promise<Array<PendingTurnRow & { status: string }>> {
+    // SAFETY: both SELECT * branches mirror pending_turns and only add an
+    // optional space filter; the no-row case is empty.
+    const rows =
+      spaceId === undefined
+        ? (db.query("SELECT * FROM pending_turns ORDER BY id ASC").all() as Array<PendingTurnRow & { status: string }>)
+        : (db
+            .query("SELECT * FROM pending_turns WHERE space_id = ? ORDER BY id ASC")
+            .all(spaceId) as Array<PendingTurnRow & { status: string }>);
+    return rows;
   }
 
   async function transitionWorkItem(
@@ -2100,6 +2259,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     completeJob,
     failJob,
     markUnclaimedJobs,
+    enqueuePendingTurn,
+    recoverPendingTurns,
+    completePendingTurn,
+    listPendingTurns,
     upsertExtensionCredential,
     listExtensionCredentials,
     listExtensionConnections,

@@ -203,6 +203,12 @@ export class CorrectionClassifier {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_DIR = "data/sessions";
+/** Issue #312 durable recovery lease (ms): how long a recovered-but-
+ * unfinished turn stays claimed before a crash/restart reclaims it. Mirrors
+ * the worker_jobs lease — long enough that a restart in the middle of
+ * draining a recovered turn does not immediately double-deliver, but a
+ * crashed-forever recovery eventually re-serves its turn exactly once. */
+const RECOVERY_LEASE_MS = 5 * 60 * 1000;
 
 /** A session message event's text field, validated at the digest capture boundary. */
 const digestMessageSchema = z.object({ text: z.string() });
@@ -276,10 +282,13 @@ export class SpaceService {
   /**
    * Per-space pending queue (issue #219): independent mid-turn messages
    * wait here while the running turn finishes, then drain ONE per fresh
-   * turn in arrival order. IN-MEMORY by design (boring option): the
-   * messages are still in Slack history, so a crash/restart leaves them
-   * for the next cold start / a natural re-send via the transcript trail —
-   * only the pending ORDER is lost, never the messages themselves.
+   * turn in arrival order. The in-memory queue is the ORDINARY flow; issue
+   * #312 adds a durable record as the crash-safe backstop: every accepted
+   * turn is ALSO persisted to the `pending_turns` store table, and a restart
+   * re-enqueues accepted-but-unfinished turns exactly once instead of losing
+   * the pending ORDER forever. The messages live in Slack history too, so a
+   * crash/restart leaves them for a natural re-send via the transcript trail
+   * — only the pending ORDER is lost, never the messages themselves.
    */
   readonly #queues = new Map<string, PendingTurn[]>();
   /**
@@ -517,6 +526,24 @@ export class SpaceService {
         queue.push({ text: turnText, principal: msg.principal, ts: msg.ts, rootThreadTs: msg.threadTs });
         this.#queues.set(msg.spaceId, queue);
         presenter.setQueueLength(queue.length);
+        // Issue #312 durable backstop: also persist the accepted turn so a
+        // restart re-enqueues it exactly once. Best-effort-fail-soft: if the
+        // durable write throws, the in-memory queue still holds the turn and
+        // the message stays in Slack history — never drop the turn on a
+        // persistence hiccup, but also never leave a partially-queued turn
+        // undeliverable. Guarded for protocol-only test doubles lacking the
+        // new store surface.
+        try {
+          await (this.#store as Partial<Store>).enqueuePendingTurn?.({
+            spaceId: msg.spaceId,
+            ts: msg.ts,
+            principal: msg.principal,
+            text: turnText,
+            rootThreadTs: msg.threadTs,
+          });
+        } catch (err) {
+          console.error(`[space-service] durable pending-turn enqueue failed for ${msg.spaceId} ${msg.ts}:`, err);
+        }
       } else {
         // Non-streaming turn: replies update in place immediately, unbatched.
         // The principal travels WITH this turn: the driver binds it when the
@@ -730,6 +757,31 @@ export class SpaceService {
     // use_model reachability (issue #64): the live session is the switch
     // target until dispose removes it.
     this.#modelRoles?.set(spaceId, session);
+    // Issue #312: on first use per space, recover any durable pending turn
+    // that was accepted but never finished (a prior process died mid-queue
+    // or mid-drain). The reclaimed turns append to the in-memory queue in
+    // arrival order and drain normally through turn_end — each exactly once
+    // (the store's atomic claim makes concurrent recoveries deliver a row
+    // to only one claimant). A recovered turn is NOT re-delivered once its
+    // drained turn settles (marked done); a completed turn is never
+    // re-delivered. Fail-soft: a recovery/store hiccup must never block
+    // session cold-start.
+    try {
+      const recovered = await (this.#store as Partial<Store>).recoverPendingTurns?.(spaceId, RECOVERY_LEASE_MS);
+      if (recovered?.length) {
+        const pending = recovered.map((turn) => ({
+          text: turn.text,
+          principal: turn.principal,
+          ts: turn.ts,
+          rootThreadTs: turn.rootThreadTs,
+        }));
+        const queue = this.#queues.get(spaceId) ?? [];
+        this.#queues.set(spaceId, [...queue, ...pending]);
+        this.#presenterFor(spaceId).setQueueLength(queue.length + pending.length);
+      }
+    } catch (err) {
+      console.error(`[space-service] pending-turn recovery failed for ${spaceId}:`, err);
+    }
     return live;
   }
 

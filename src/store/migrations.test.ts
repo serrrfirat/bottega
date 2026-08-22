@@ -21,6 +21,7 @@ const EXPECTED_MIGRATION_IDS: string[] = [
   "011_add_scheduler_lifecycle",
   "012_add_connection_lifecycle",
   "013_add_audit_search_indexes",
+  "014_add_durable_pending_turns",
 ] as const;
 
 function tempDb(name: string): string {

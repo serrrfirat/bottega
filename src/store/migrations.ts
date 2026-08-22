@@ -232,6 +232,30 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    id: "014_add_durable_pending_turns",
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS pending_turns (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          space_id       TEXT NOT NULL,
+          ts             TEXT NOT NULL,
+          principal      TEXT NOT NULL,
+          text           TEXT NOT NULL,
+          root_thread_ts TEXT,
+          status         TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending','claimed','done')),
+          created_at     INTEGER NOT NULL,
+          claimed_at     INTEGER,
+          lease_until    INTEGER,
+          completed_at   INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_turns_identity ON pending_turns(space_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_pending_turns_recover
+          ON pending_turns(space_id, status, lease_until, id);
+      `);
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {
