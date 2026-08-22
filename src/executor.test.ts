@@ -1108,6 +1108,7 @@ describe("delivery routing (issue #129)", () => {
       expect(session.opts.allowTools).toEqual([
         "memory.save",
         "memory.search",
+        "memory.forget",
         FIXTURE_EXTENSION_TOOL,
       ]);
       expect(session.prompts[0]).toContain(`work item ${item.id}`);
