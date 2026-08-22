@@ -22,6 +22,27 @@ function digestTheme(content: string): string {
   return `${firstSentence.slice(0, THEME_MAX_LENGTH - 1).trimEnd()}…`;
 }
 
+/**
+ * Groups reflections by topic (falling back to "Other"), sorted by entry
+ * count descending then topic ascending. Shared by the text pulse and the
+ * Block Kit tables so the two surfaces never drift on grouping or order
+ * (issue #341).
+ */
+function groupedTopics(reflections: MemoryEntry[]): Array<[string, MemoryEntry[]]> {
+  const topics = new Map<string, MemoryEntry[]>();
+  for (const reflection of reflections) {
+    const topic = reflection.metadata.topic?.trim() || "Other";
+    const entries = topics.get(topic);
+    if (entries) entries.push(reflection);
+    else topics.set(topic, [reflection]);
+  }
+  return [...topics.entries()].sort(([topicA, entriesA], [topicB, entriesB]) => {
+    const countOrder = entriesB.length - entriesA.length;
+    if (countOrder !== 0) return countOrder;
+    return topicA < topicB ? -1 : topicA > topicB ? 1 : 0;
+  });
+}
+
 function weeklySummary(reflections: MemoryEntry[], digests: MemoryEntry[]): string {
   const lines = ["*Weekly company-pattern pulse*", "_Org memory from the last 7 days_", ""];
 
@@ -31,20 +52,9 @@ function weeklySummary(reflections: MemoryEntry[], digests: MemoryEntry[]): stri
   }
 
   if (reflections.length > 0) {
-    const topics = new Map<string, MemoryEntry[]>();
-    for (const reflection of reflections) {
-      const topic = reflection.metadata.topic?.trim() || "Other";
-      const entries = topics.get(topic);
-      if (entries) entries.push(reflection);
-      else topics.set(topic, [reflection]);
-    }
+    const sortedTopics = groupedTopics(reflections);
 
     lines.push("*Reflection topics*");
-    const sortedTopics = [...topics.entries()].sort(([topicA, entriesA], [topicB, entriesB]) => {
-      const countOrder = entriesB.length - entriesA.length;
-      if (countOrder !== 0) return countOrder;
-      return topicA < topicB ? -1 : topicA > topicB ? 1 : 0;
-    });
     for (const [topic, entries] of sortedTopics) {
       lines.push(`• ${topic} — ${entries.length} (${entries.map(sourceLabel).join(", ")})`);
     }
@@ -73,18 +83,7 @@ function weeklyBlocks(reflections: MemoryEntry[], digests: MemoryEntry[]): Slack
   if (reflections.length === 0 && digests.length === 0) return undefined;
   const blocks: SlackBlock[] = [];
   if (reflections.length > 0) {
-    const topics = new Map<string, MemoryEntry[]>();
-    for (const reflection of reflections) {
-      const topic = reflection.metadata.topic?.trim() || "Other";
-      const entries = topics.get(topic);
-      if (entries) entries.push(reflection);
-      else topics.set(topic, [reflection]);
-    }
-    const sortedTopics = [...topics.entries()].sort(([topicA, entriesA], [topicB, entriesB]) => {
-      const countOrder = entriesB.length - entriesA.length;
-      if (countOrder !== 0) return countOrder;
-      return topicA < topicB ? -1 : topicA > topicB ? 1 : 0;
-    });
+    const sortedTopics = groupedTopics(reflections);
     blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Reflection topics*" } });
     blocks.push(
       ...tableBlock({

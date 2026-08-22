@@ -190,6 +190,29 @@ function result(value: SchedulerToolResultPayload): AgentToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 
+/**
+ * Loads a scheduler job and asserts the caller may reach it, collapsing the
+ * getSchedulerJob + not-found + cross-space authorization prologue that every
+ * single-job tool used to repeat (issue #341). Returns the job or throws with
+ * the exact error shapes those tools surfaced, so the shared try/catch in the
+ * execute handlers turns them into identical toolError results.
+ */
+async function resolveAuthorizedJob(
+  store: Store,
+  options: SchedulerToolOptions,
+  name: string,
+  toolCallId: string,
+  spaceId: string | undefined,
+  jobId: string,
+): Promise<SchedulerJob> {
+  const before = await store.getSchedulerJob(jobId);
+  if (!before) throw new Error(`scheduler job not found: ${jobId}`);
+  if (!(await authorizeJob(options, name, toolCallId, spaceId, before.spaceId))) {
+    throw new Error("scheduler job belongs to a foreign space or org scope; org approval is required");
+  }
+  return before;
+}
+
 /** Returns the canonical custom tools for durable scheduler administration. */
 export function schedulerToolDefinitions(
   store: Store,
@@ -297,11 +320,7 @@ export function schedulerToolDefinitions(
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
-        const before = await store.getSchedulerJob(params.id);
-        if (!before) return toolError(`scheduler job not found: ${params.id}`);
-        if (!(await authorizeJob(options, update.name, toolCallId, sessionSpaceId(ctx), before.spaceId))) {
-          return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
-        }
+        const before = await resolveAuthorizedJob(store, options, update.name, toolCallId, sessionSpaceId(ctx), params.id);
         if (params.action !== undefined && !registry.has(params.action)) {
           return toolError(`scheduler action is not registered: ${params.action}`);
         }
@@ -345,11 +364,7 @@ export function schedulerToolDefinitions(
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
-        const before = await store.getSchedulerJob(params.id);
-        if (!before) return toolError(`scheduler job not found: ${params.id}`);
-        if (!(await authorizeJob(options, pause.name, toolCallId, sessionSpaceId(ctx), before.spaceId))) {
-          return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
-        }
+        const before = await resolveAuthorizedJob(store, options, pause.name, toolCallId, sessionSpaceId(ctx), params.id);
         const after = await store.pauseSchedulerJob(params.id, params.expected_revision);
         await audit.appendAudit({
           space_id: after.spaceId,
@@ -372,11 +387,7 @@ export function schedulerToolDefinitions(
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
-        const before = await store.getSchedulerJob(params.id);
-        if (!before) return toolError(`scheduler job not found: ${params.id}`);
-        if (!(await authorizeJob(options, resume.name, toolCallId, sessionSpaceId(ctx), before.spaceId))) {
-          return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
-        }
+        const before = await resolveAuthorizedJob(store, options, resume.name, toolCallId, sessionSpaceId(ctx), params.id);
         const after = await store.resumeSchedulerJob(params.id, params.expected_revision, now());
         await audit.appendAudit({
           space_id: after.spaceId,
@@ -399,11 +410,7 @@ export function schedulerToolDefinitions(
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
-        const before = await store.getSchedulerJob(params.id);
-        if (!before) return toolError(`scheduler job not found: ${params.id}`);
-        if (!(await authorizeJob(options, runNow.name, toolCallId, sessionSpaceId(ctx), before.spaceId))) {
-          return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
-        }
+        const before = await resolveAuthorizedJob(store, options, runNow.name, toolCallId, sessionSpaceId(ctx), params.id);
         if (!registry.has(before.action)) return toolError(`scheduler action is not registered: ${before.action}`);
         const invocationId = params.invocation_id?.trim() || (toolCallId !== "0" ? toolCallId : `si_${randomUUID()}`);
         const enqueued = await store.enqueueSchedulerRunNow({
@@ -444,11 +451,7 @@ export function schedulerToolDefinitions(
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
       try {
-        const before = await store.getSchedulerJob(params.id);
-        if (!before) return toolError(`scheduler job not found: ${params.id}`);
-        if (!(await authorizeJob(options, remove.name, toolCallId, sessionSpaceId(ctx), before.spaceId))) {
-          return toolError("scheduler job belongs to a foreign space or org scope; org approval is required");
-        }
+        const before = await resolveAuthorizedJob(store, options, remove.name, toolCallId, sessionSpaceId(ctx), params.id);
         const deleted = await store.deleteSchedulerJob(params.id);
         if (!deleted) return toolError(`scheduler job not found: ${params.id}`);
         await audit.appendAudit({
