@@ -30,7 +30,6 @@ import {
   FORBIDDEN_SPACE_HOST_TOOLS,
   OmpSessionDriver,
   opencodeSafeToolName,
-  opencodeToolNameMap,
   resolveRoleTarget,
   sessionIdFromFilePath,
   SPACE_AGENT_TOOLS,
@@ -2119,12 +2118,6 @@ describe("opencode tool-name transform (issue #78)", () => {
     expect(opencodeSafeToolName("attio.contacts.list")).toBe("attio_contacts_list");
     expect(opencodeSafeToolName("create_work_item")).toBe("create_work_item");
     expect(opencodeSafeToolName("read")).toBe("read");
-    expect(opencodeToolNameMap(["memory.save", "read", "memory.search"])).toEqual(
-      new Map([
-        ["memory.save", "memory_save"],
-        ["memory.search", "memory_search"],
-      ]),
-    );
   });
 
   test("the driver registers flat session names while the gate audits the canonical name", async () => {

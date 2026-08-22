@@ -719,16 +719,6 @@ export function opencodeSafeToolName(name: string): string {
   return OPENCODE_TOOL_NAME_PATTERN.test(name) ? name : name.replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
-/** Canonical → flat map for every tool whose name the gateway would reject. */
-export function opencodeToolNameMap(names: readonly string[]): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const name of names) {
-    const flat = opencodeSafeToolName(name);
-    if (flat !== name) map.set(name, flat);
-  }
-  return map;
-}
-
 /** Re-registers a tool definition under its gateway-safe name (identity when unchanged). */
 export function withOpencodeSafeName<TDef extends ToolDefinition>(def: TDef): TDef {
   const name = opencodeSafeToolName(def.name);
@@ -759,11 +749,11 @@ export function isBusySettlementError(err: Error): boolean {
  * multi-item result still parses. Unshaped results yield "".
  */
 function searchTextFromResult(result: { content?: Array<{ type?: string; text?: string }> }): string {
-  const chunks: string[] = [];
-  for (const item of result.content ?? []) {
-    if (item.type === "text" && item.text !== undefined) chunks.push(item.text);
-  }
-  return chunks.join("");
+  // Reuses the shared text-block extractor: collectTextBlocks accepts the
+  // broader `{ content?: unknown }` shape (array content is unknown), so no
+  // cast is needed, and concatenating its string[] preserves the old
+  // concatenation semantics for multi-item results.
+  return collectTextBlocks(result).join("");
 }
 
 /**
@@ -1314,6 +1304,9 @@ export function createOmpSdkDriver(
       // actor is the session's principal (personal connects record the owner).
       // The one-time upload-link mint (issue #196) rides the same path: it
       // needs the same per-session principal + space mapping.
+      // Shared per-session space mapping: every connect-family tool resolves
+      // audit space from the session's file-derived id.
+      const sessionSpaceMapping = { spaceIdFromFile: sessionIdFromFilePath };
       const sessionCustomTools = opts.connectExtension
         ? [
             ...sessionCustomToolsBase,
@@ -1334,7 +1327,7 @@ export function createOmpSdkDriver(
                 timeoutMs: opts.connectExtension.timeoutMs,
               },
               getPrincipal,
-              spaceIdFromFile: sessionIdFromFilePath,
+              ...sessionSpaceMapping,
             }),
             ...connectionLifecycleToolDefinitions({
               registry: opts.connectExtension.registry,
@@ -1350,7 +1343,7 @@ export function createOmpSdkDriver(
                 timeoutMs: opts.connectExtension.timeoutMs,
               },
               getPrincipal,
-              spaceIdFromFile: sessionIdFromFilePath,
+              ...sessionSpaceMapping,
             }),
             ...(opts.connectExtension.uploadLink
               ? [
@@ -1359,7 +1352,7 @@ export function createOmpSdkDriver(
                     store: opts.connectExtension.uploadLink.store,
                     baseUrl: opts.connectExtension.uploadLink.baseUrl,
                     getPrincipal,
-                    spaceIdFromFile: sessionIdFromFilePath,
+                    ...sessionSpaceMapping,
                   }),
                 ]
               : []),
