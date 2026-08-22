@@ -48,6 +48,7 @@ import type { SlackAdapter } from "../adapters/slack";
 import { issueCard, type SlackBlock } from "../adapters/blocks";
 import { dispatchIngestEvent } from "../../ingest/dispatch";
 import { createAudit } from "../../policy/audit";
+import { makeSingleFlightLoop } from "./single-flight-loop";
 
 /** Post-seam pass interval. Default 5000 ms — the delivery poller's cadence. */
 export const DEFAULT_OUTBOX_POST_INTERVAL_MS = 5000;
@@ -140,20 +141,32 @@ function parsePayload(raw: string): { state?: string; result?: unknown } | null 
 }
 
 /**
+ * Parses a work_item notification payload exactly once (issue #341 finding 7):
+ * the notification fields (workItemId, description) are stripped by the
+ * generic completion schema, so the raw payload is validated against the
+ * notification shape. Shared by the boundary check, the text render, and the
+ * block render so the shape is decoded at the row boundary, not re-parsed at
+ * each of the three call sites.
+ */
+function parseWorkItemNotificationPayload(
+  raw: string,
+): z.infer<typeof workItemNotificationSchema> | null {
+  try {
+    const parsed = workItemNotificationSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The payload boundary check for the post seam (issue #159): a work_item
  * row must carry the notification shape — anything else is a worker
  * contract violation and fails closed like a malformed payload.
  */
 function parseRowPayload(row: OutboxRow): { state?: string; result?: unknown } | null {
   if (row.kind === "work_item") {
-    // The notification fields are stripped by the generic completion
-    // schema, so validate the raw payload against the notification shape.
-    try {
-      const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
-      return parsed.success ? parsed.data : null;
-    } catch {
-      return null;
-    }
+    return parseWorkItemNotificationPayload(row.payload);
   }
   return parsePayload(row.payload);
 }
@@ -167,13 +180,7 @@ export function renderOutboxMessage(row: OutboxRow): string {
   if (row.kind === "work_item") {
     // The notification fields (workItemId, description) are stripped by the
     // generic completion schema, so parse the raw payload here.
-    let payload: z.infer<typeof workItemNotificationSchema> | null = null;
-    try {
-      const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
-      payload = parsed.success ? parsed.data : null;
-    } catch {
-      payload = null;
-    }
+    const payload = parseWorkItemNotificationPayload(row.payload);
     if (payload === null) return row.kind;
     const label = payload.state === "blocked" ? "Blocked" : "Review";
     const bits = [payload.description];
@@ -208,13 +215,7 @@ export function renderOutboxMessage(row: OutboxRow): string {
  */
 export function renderOutboxBlocks(row: OutboxRow): SlackBlock[] | undefined {
   if (row.kind !== "work_item") return undefined;
-  let payload: z.infer<typeof workItemNotificationSchema> | null = null;
-  try {
-    const parsed = workItemNotificationSchema.safeParse(JSON.parse(row.payload));
-    payload = parsed.success ? parsed.data : null;
-  } catch {
-    payload = null;
-  }
+  const payload = parseWorkItemNotificationPayload(row.payload);
   if (payload === null) return undefined;
   // A whitespace-only description parses the schema but cannot fill the card
   // title; drop to the text fallback rather than let issueCard throw (which
@@ -444,10 +445,6 @@ export async function nudgeUnclaimedOutboxRowsToSlack(
 /** Background loop around {@link postPendingOutboxRows}. First pass runs immediately. */
 export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
   const log = deps.log ?? (() => {});
-  const intervalMs = deps.intervalMs ?? DEFAULT_OUTBOX_POST_INTERVAL_MS;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let running = false;
-
   const tick = async (): Promise<void> => {
     try {
       const pass = await postPendingOutboxRows(deps.store, deps.adapter, {
@@ -462,30 +459,16 @@ export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
       // scratch (a fresh cursor — the row status is the dedupe).
       log(`outbox post seam: pass failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    // Chain the next pass from the END of this one, keeping the loop
-    // single-flight (issue #70 pattern): an overlapping pass would be
-    // harmless to dedupe (the consume marks rows posted atomically) but
-    // wasteful and harder to reason about.
-    if (running && timer === null) {
-      timer = setTimeout(() => {
-        timer = null;
-        void tick();
-      }, intervalMs);
-    }
   };
-
-  return {
-    start() {
-      if (running) return;
-      running = true;
-      void tick(); // post anything pending from before boot immediately
-    },
-    stop() {
-      running = false;
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    },
-  };
+  // The cadence + in-flight guard are the single-flight loop shared with the
+  // delivery poller (issue #341 finding 6): an immediate first pass, then one
+  // chained pass at a time scheduled from the END of the previous one, keeping
+  // the loop single-flight (issue #70 pattern): an overlapping pass would be
+  // harmless to dedupe (the consume marks rows posted atomically) but wasteful
+  // and harder to reason about. tick must not throw — it handles its own
+  // errors above.
+  return makeSingleFlightLoop({
+    tick,
+    intervalMs: deps.intervalMs ?? DEFAULT_OUTBOX_POST_INTERVAL_MS,
+  });
 }
