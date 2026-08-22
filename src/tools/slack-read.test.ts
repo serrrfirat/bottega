@@ -21,7 +21,7 @@ import { describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { join } from "node:path";
-import { createSlackAdapter, type SlackAdapter } from "../server/adapters/slack";
+import { createSlackAdapter, type SlackAdapter, type SlackReadMessage } from "../server/adapters/slack";
 import { slackReadArgsSchema, slackReadToolDefinition } from "./slack-read";
 
 /** A seeded message the fake Slack API returns (the bot's own prior post). */
@@ -43,6 +43,12 @@ interface FakeSlackApi {
   stop(): void;
 }
 
+/** Mutable params the fake Slack API records per call; read via the accessors above. */
+interface FakeSlackApiState {
+  repliesParams?: FakeSlackApi["repliesParams"];
+  historyParams?: FakeSlackApi["historyParams"];
+}
+
 /**
  * Boots a fake Slack Web API serving conversations.replies / .history.
  * `seed` is the message list returned for BOTH calls unless a `missingScope`
@@ -50,7 +56,7 @@ interface FakeSlackApi {
  * whose token lacks channels:history/groups:history/im:history.
  */
 function bootSlackApi(options: { messages: FakeMessage[]; missingScope?: string }): FakeSlackApi {
-  const state: { repliesParams?: FakeSlackApi["repliesParams"]; historyParams?: FakeSlackApi["historyParams"] } = {};
+  const state: FakeSlackApiState = {};
   const server: Server<undefined> = Bun.serve({
     port: 0,
     async fetch(request) {
@@ -106,13 +112,19 @@ function adapterFor(api: FakeSlackApi): SlackAdapter {
   });
 }
 
+/** The context surface the tool bridge reads from an ExtensionContext. */
+interface ToolRunContext {
+  sessionManager: { getSessionFile(): string | undefined };
+}
+
 /** Builds an ExtensionContext whose session file names the space id (issue #66 convention). */
 function ctxFor(spaceId: string): ExtensionContext {
-  const ctx = {
+  const ctx: ToolRunContext = {
     sessionManager: { getSessionFile: () => join("/tmp/sessions", `${spaceId}.jsonl`) },
   };
-  // SAFETY: slack_read resolves the space id only via sessionManager.getSessionFile().
-  return ctx as unknown as ExtensionContext;
+  // SAFETY: slack_read resolves the space id only via sessionManager.getSessionFile()
+  // (the tool bridge); ToolRunContext is exactly that surface, so the stub is sound.
+  return ctx as ExtensionContext;
 }
 
 /** The text content of a tool result (throws when it is not a text block). */
@@ -248,7 +260,9 @@ describe("slack_read execution (hermetic, fake Slack Web API)", () => {
       // only inbound Socket Mode events). Driving execute must surface it.
       const result = await tool.execute("tc6", { thread_ts: "1.000001" }, undefined, undefined, ctxFor("slack:C1"));
       expect(result.isError).not.toBe(true);
-      const messages = JSON.parse(resultText(result)) as Array<{ ts: string; text: string; user: string }>;
+      // SAFETY: the tool serializes SlackReadMessage[] verbatim (JSON.stringify of its
+      // normalized rows); parsing it back to the same shape is the exact round-trip.
+      const messages = JSON.parse(resultText(result)) as SlackReadMessage[];
       expect(messages[0]).toMatchObject({ ts: BOT_POST.ts, text: BOT_POST.text, user: "BOTA" });
     } finally {
       api.stop();
@@ -265,12 +279,15 @@ describe("slack_read execution (hermetic, fake Slack Web API)", () => {
       });
       // No session-context space → no channel to read; fails closed without
       // ever calling Slack.
+      const noSession: ToolRunContext = { sessionManager: { getSessionFile: () => undefined } };
+      // SAFETY: no session file means no resolvable space; ToolRunContext is exactly
+      // the sessionManager surface slack_read reads, so the stub is sound.
       const result = await tool.execute(
         "tc7",
         {},
         undefined,
         undefined,
-        { sessionManager: { getSessionFile: () => undefined } } as ExtensionContext,
+        noSession as ExtensionContext,
       );
       expect(result.isError).toBe(true);
       expect(resultText(result)).toContain("could not resolve this conversation's space");

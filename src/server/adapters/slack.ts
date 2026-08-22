@@ -202,11 +202,12 @@ export class SlackMissingReadScopeError extends Error {
  * Maps a failed conversations.replies/.history call onto a readable error:
  * a missing history scope becomes a {@link SlackMissingReadScopeError}
  * (loud, actionable), anything else a generic failure with the API cause.
+ * `err` is the parsed {@link SlackApiError} narrowing done by the callers at
+ * the @slack/web-api catch boundary.
  */
-function readFailureError(method: "replies" | "history", channelId: string, err: unknown): Error {
-  const parsed = slackApiErrorSchema.safeParse(err);
-  const code = parsed.success ? parsed.data.data.error : undefined;
-  const needed = parsed.success ? parsed.data.data.needed : undefined;
+function readFailureError(method: "replies" | "history", channelId: string, err: SlackApiError): Error {
+  const code = err !== undefined && !(err instanceof Error) ? err.data.error : undefined;
+  const needed = err !== undefined && !(err instanceof Error) ? err.data.needed : undefined;
   if (code === "missing_scope" || code === "missing_required_scope") {
     return new SlackMissingReadScopeError(channelId, method, needed);
   }
@@ -1436,7 +1437,16 @@ export function createSlackAdapter(opts: {
         // oldest-first.
         res = await app.client.conversations.replies({ channel, ts: threadTs });
       } catch (err) {
-        throw readFailureError("replies", channel, err);
+        // SAFETY: narrow the @slack/web-api throw at the boundary to the adapter's
+        // classified read error — a PlatformError { data: { error, needed?, provided? } },
+        // a thrown Error, or unclassifiable otherwise (matching the stream fallback).
+        const parsedError = slackApiErrorSchema.safeParse(err);
+        const apiError: SlackApiError = parsedError.success
+          ? parsedError.data
+          : err instanceof Error
+            ? err
+            : undefined;
+        throw readFailureError("replies", channel, apiError);
       }
       return normalizeReadMessages(res.messages ?? []);
     },
@@ -1447,7 +1457,15 @@ export function createSlackAdapter(opts: {
       try {
         res = await app.client.conversations.history({ channel, limit });
       } catch (err) {
-        throw readFailureError("history", channel, err);
+        // SAFETY: narrow the @slack/web-api throw at the boundary to the adapter's
+        // classified read error (PlatformError / Error / unclassifiable).
+        const parsedError = slackApiErrorSchema.safeParse(err);
+        const apiError: SlackApiError = parsedError.success
+          ? parsedError.data
+          : err instanceof Error
+            ? err
+            : undefined;
+        throw readFailureError("history", channel, apiError);
       }
       return normalizeReadMessages(res.messages ?? []);
     },
