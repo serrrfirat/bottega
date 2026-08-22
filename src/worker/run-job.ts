@@ -145,6 +145,34 @@ const SAFE_CHILD_ENV_NAMES = [
 ] as const;
 
 /**
+ * Credential/provider secrets that must NEVER cross into a sandbox child,
+ * regardless of how the child environment is assembled. This is the single
+ * source of truth shared with the checked-in child's FAIL-CLOSED self-report
+ * ({@link forbiddenEnvironment} in run-job-child.ts): the parent strips them
+ * defensively from the constructed env, and the child independently verifies
+ * none are present. Because the env is built only from {@link SAFE_CHILD_ENV_NAMES}
+ * plus job-scoped credential *file* handles, none of these can enter through
+ * normal construction — the strip is defense-in-depth against a merged
+ * environment or a future allowlist drift.
+ */
+export const FORBIDDEN_CHILD_ENV_NAMES = [
+  "SLACK_APP_TOKEN",
+  "SLACK_BOT_TOKEN",
+  "GITHUB_WEBHOOK_SECRET",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "AWS_SECRET_ACCESS_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OMP_AUTH_BROKER_TOKEN",
+] as const;
+
+/** Mutates the given child env object, dropping any forbidden credential name. */
+function sanitizeSandboxEnv(env: Record<string, string>): void {
+  for (const name of FORBIDDEN_CHILD_ENV_NAMES) delete env[name];
+}
+
+/**
  * TEST-FABRIC ONLY (never production): one strict DTO over bounded stdin, one
  * bounded reply over fd 3, an allowlisted environment, a new process group,
  * and hard timeout/lease-loss teardown of that entire group. Production uses
@@ -735,6 +763,12 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
       env.OMP_AUTH_BROKER_TOKEN_FILE = CONTAINER_BROKER_TOKEN_FILE;
     }
   }
+
+  // Defense-in-depth: every var is emitted as an explicit `--env NAME=VALUE`
+  // flag (never `--env-file` or an inherited image env), but strip forbidden
+  // credential names anyway so the container can never receive a secret that
+  // slipped into the allowlist or a merged environment.
+  sanitizeSandboxEnv(env);
   for (const [name, value] of Object.entries(env)) {
     args.push("--env", `${name}=${value}`);
   }
@@ -1014,6 +1048,12 @@ async function spawnSandboxChild(
     env.OMP_AUTH_BROKER_TOKEN_FILE = options.brokerTokenFile;
   }
 
+  // Defense-in-depth: the env is built only from SAFE_CHILD_ENV_NAMES plus
+  // job-scoped credential *file* handles — never from the coordinator's
+  // process.env — but strip any forbidden credential name regardless so the
+  // child can never inherit Slack/provider/credential secrets from the parent.
+  sanitizeSandboxEnv(env);
+
   let child: ChildProcess;
   try {
     child = spawn(command.file, command.args, {
@@ -1055,6 +1095,20 @@ async function spawnSandboxChild(
   const exited = await exitWait.promise;
   clearTimeout(timeout);
   options.signal.removeEventListener("abort", abort);
+
+  // When timeout or lease loss already tore the child down, the fd-3 reply is
+  // the wrong signal: the child was SIGKILLed, so a bounded-response EOF is
+  // racy (Bun may not emit `end` on the extra pipe after an abrupt kill) and
+  // awaiting it would hang the runner indefinitely. Return the torn-down result
+  // deterministically and destroy the stream to release its resources — the
+  // same ordering the Docker lane uses.
+  if (timedOut || leaseLost) {
+    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
+    if (leaseLost) tornDown.leaseLost = true;
+    if (!responseStream.destroyed) responseStream.destroy();
+    return tornDown;
+  }
+
   try {
     responseBytes = await boundedResponse;
   } catch (error) {
@@ -1066,11 +1120,6 @@ async function spawnSandboxChild(
     };
     if (leaseLost) invalid.leaseLost = true;
     return invalid;
-  }
-  if (timedOut || leaseLost) {
-    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
-    if (leaseLost) tornDown.leaseLost = true;
-    return tornDown;
   }
   let parsedJson: unknown;
   try {
