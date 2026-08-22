@@ -704,6 +704,11 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
     env.NODE_EXTRA_CA_CERTS = CONTAINER_CA_CERT_PATH;
   }
   if (request.mode === "execute") {
+    // The store RPC socket file is mounted inside the container at
+    // /rpc/store.sock. The child's executeViaRpc requires this exact path; it
+    // is supervisor-generated (never a host passthrough) and immutable per
+    // container so the child cannot be steered to an attacker-chosen socket.
+    env.BOTTEGA_SANDBOX_RPC_SOCKET = join(CONTAINER_RPC_DIR, "store.sock");
     const needsGitToken = jobNeedsGitToken(request.job);
     if (opts.gitTokenFile !== undefined && opts.gitTokenFile !== "" && needsGitToken) {
       env.EXECUTOR_GIT_TOKEN_FILE = CONTAINER_GIT_TOKEN_FILE;
