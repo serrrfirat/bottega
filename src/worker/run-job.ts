@@ -33,7 +33,8 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
@@ -215,6 +216,8 @@ export async function probeChildProcessSandbox(options: {
   dbPath: string;
   transcriptDir: string;
   requireOsResourceLimits?: boolean;
+  /** Launch-context directory to defend against: the sandbox never runs the child from here, so a hostile `.env` here cannot load (issue #105). */
+  cwd?: string;
 }): Promise<SandboxProbe> {
   const response = await spawnSandboxChild(
     { version: SANDBOX_PROTOCOL_VERSION, mode: "probe" },
@@ -225,6 +228,7 @@ export async function probeChildProcessSandbox(options: {
       tokenFile: "",
       brokerTokenFile: "",
       requireLimits: options.requireOsResourceLimits ?? process.platform === "linux",
+      cwd: options.cwd,
     },
   );
   if ("protocolError" in response) throw new Error(response.protocolError);
@@ -1026,6 +1030,8 @@ async function spawnSandboxChild(
     tokenFile: string;
     requireLimits: boolean;
     brokerTokenFile: string;
+    /** Launch-context directory to defend against; never the child's actual cwd (issue #105). */
+    cwd?: string;
   },
 ): Promise<SpawnChildResult> {
   const encoded = JSON.stringify(request);
@@ -1054,109 +1060,149 @@ async function spawnSandboxChild(
   // child can never inherit Slack/provider/credential secrets from the parent.
   sanitizeSandboxEnv(env);
 
-  let child: ChildProcess;
+  // The child must NEVER run from a cwd that can carry a `.env`: Bun itself
+  // eagerly auto-loads `.env`/`.env.local`/mode dotenv files from the
+  // process cwd (issue #105), and `@oh-my-pi/pi-coding-agent` additionally
+  // reads `process.cwd()/.env` at import time — both bypass `sanitizeSandboxEnv`
+  // because they happen inside the nested Bun AFTER spawn. `--no-env-file`
+  // (in `sandboxCommand`) stops Bun's implicit load, but it cannot stop the
+  // third-party cwd read. So the child is always spawned from a dedicated,
+  // fresh, EMPTY temp directory of the sandbox's own — never the coordinator
+  // cwd (`options.cwd` is only the launch context to defend against). No
+  // dotenv file can exist there, so neither loader can ever find one.
+  const childCwd = mkdtempSync(join(tmpdir(), "bottega-sandbox-child-"));
   try {
-    child = spawn(command.file, command.args, {
-      detached: process.platform !== "win32",
-      env,
-      stdio: ["pipe", "inherit", "inherit", "pipe"],
-    });
-  } catch (error) {
-    return {
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-      protocolError: `sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-  const responseStream = child.stdio[3];
-  if (!(responseStream instanceof Readable) || child.stdin === null) {
-    killProcessTree(child);
-    return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox IPC pipes unavailable" };
-  }
+    let child: ChildProcess;
+    try {
+      child = spawn(command.file, command.args, {
+        detached: process.platform !== "win32",
+        env,
+        cwd: childCwd,
+        stdio: ["pipe", "inherit", "inherit", "pipe"],
+      });
+    } catch (error) {
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        protocolError: `sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const responseStream = child.stdio[3];
+    if (!(responseStream instanceof Readable) || child.stdin === null) {
+      killProcessTree(child);
+      return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox IPC pipes unavailable" };
+    }
 
-  let responseBytes: Buffer;
-  const boundedResponse = readBounded(responseStream, MAX_SANDBOX_RESPONSE_BYTES, () => killProcessTree(child));
-  child.stdin.end(encoded);
-  let timedOut = false;
-  let leaseLost = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    killProcessTree(child);
-  }, options.caps.timeoutMs);
-  const abort = (): void => {
-    leaseLost = true;
-    killProcessTree(child);
-  };
-  options.signal.addEventListener("abort", abort, { once: true });
-  const exitWait = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
-  child.once("error", () => exitWait.resolve({ code: null, signal: null }));
-  child.once("exit", (code, signal) => exitWait.resolve({ code, signal }));
-  const exited = await exitWait.promise;
-  clearTimeout(timeout);
-  options.signal.removeEventListener("abort", abort);
-
-  // When timeout or lease loss already tore the child down, the fd-3 reply is
-  // the wrong signal: the child was SIGKILLed, so a bounded-response EOF is
-  // racy (Bun may not emit `end` on the extra pipe after an abrupt kill) and
-  // awaiting it would hang the runner indefinitely. Return the torn-down result
-  // deterministically and destroy the stream to release its resources — the
-  // same ordering the Docker lane uses.
-  if (timedOut || leaseLost) {
-    const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
-    if (leaseLost) tornDown.leaseLost = true;
-    if (!responseStream.destroyed) responseStream.destroy();
-    return tornDown;
-  }
-
-  try {
-    responseBytes = await boundedResponse;
-  } catch (error) {
-    const invalid: SandboxResult = {
-      exitCode: null,
-      signal: exited.signal,
-      timedOut,
-      protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}`,
+    let responseBytes: Buffer;
+    const boundedResponse = readBounded(responseStream, MAX_SANDBOX_RESPONSE_BYTES, () => killProcessTree(child));
+    child.stdin.end(encoded);
+    let timedOut = false;
+    let leaseLost = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child);
+    }, options.caps.timeoutMs);
+    const abort = (): void => {
+      leaseLost = true;
+      killProcessTree(child);
     };
-    if (leaseLost) invalid.leaseLost = true;
-    return invalid;
+    options.signal.addEventListener("abort", abort, { once: true });
+    const exitWait = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+    child.once("error", () => exitWait.resolve({ code: null, signal: null }));
+    child.once("exit", (code, signal) => exitWait.resolve({ code, signal }));
+    const exited = await exitWait.promise;
+    clearTimeout(timeout);
+    options.signal.removeEventListener("abort", abort);
+
+    // The child has exited, so it no longer holds any fd into the cwd dir;
+    // safe to remove it regardless of the branch below.
+    try {
+      rmSync(childCwd, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of the ephemeral cwd; never fail the run for it.
+    }
+
+    // When timeout or lease loss already tore the child down, the fd-3 reply is
+    // the wrong signal: the child was SIGKILLed, so a bounded-response EOF is
+    // racy (Bun may not emit `end` on the extra pipe after an abrupt kill) and
+    // awaiting it would hang the runner indefinitely. Return the torn-down result
+    // deterministically and destroy the stream to release its resources — the
+    // same ordering the Docker lane uses.
+    if (timedOut || leaseLost) {
+      const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
+      if (leaseLost) tornDown.leaseLost = true;
+      if (!responseStream.destroyed) responseStream.destroy();
+      return tornDown;
+    }
+
+    try {
+      responseBytes = await boundedResponse;
+    } catch (error) {
+      const invalid: SandboxResult = {
+        exitCode: null,
+        signal: exited.signal,
+        timedOut,
+        protocolError: `invalid sandbox IPC: ${error instanceof Error ? error.message : String(error)}`,
+      };
+      if (leaseLost) invalid.leaseLost = true;
+      return invalid;
+    }
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(responseBytes.toString("utf8"));
+    } catch {
+      return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" };
+    }
+    const parsed = sandboxResponseSchema.safeParse(parsedJson);
+    if (!parsed.success || parsed.data.pid !== child.pid) {
+      return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" };
+    }
+    if (parsed.data.mode === "probe") {
+      return {
+        probe: {
+          pid: parsed.data.pid,
+          childMarker: parsed.data.childMarker,
+          forbiddenEnvNames: parsed.data.forbiddenEnvNames,
+        },
+      };
+    }
+    const expectedProcessExit = parsed.data.result.exitCode ?? 70;
+    if (exited.signal !== null || exited.code !== expectedProcessExit) {
+      return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" };
+    }
+    return { result: parsed.data.result };
+  } finally {
+    // Defensive: if the child never spawned or an early return happened
+    // before exit, still remove the ephemeral cwd.
+    try {
+      rmSync(childCwd, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup only.
+    }
   }
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(responseBytes.toString("utf8"));
-  } catch {
-    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: response is not JSON" };
-  }
-  const parsed = sandboxResponseSchema.safeParse(parsedJson);
-  if (!parsed.success || parsed.data.pid !== child.pid) {
-    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: schema or PID mismatch" };
-  }
-  if (parsed.data.mode === "probe") {
-    return {
-      probe: {
-        pid: parsed.data.pid,
-        childMarker: parsed.data.childMarker,
-        forbiddenEnvNames: parsed.data.forbiddenEnvNames,
-      },
-    };
-  }
-  const expectedProcessExit = parsed.data.result.exitCode ?? 70;
-  if (exited.signal !== null || exited.code !== expectedProcessExit) {
-    return { exitCode: null, signal: exited.signal, timedOut: false, protocolError: "invalid sandbox IPC: exit mismatch" };
-  }
-  return { result: parsed.data.result };
 }
 
+/**
+ * Without `--no-env-file`, Bun eagerly auto-loads `.env`, `.env.*`, and
+ * mode-specific dotenv files from the child's cwd at startup (issue #105).
+ * The parent already strips forbidden credential names from the spawned env,
+ * but a real `.env` sitting in the runner's cwd would be re-injected by the
+ * nested Bun runtime itself — silently reintroducing Slack/provider secrets
+ * into a child that must be hermetic. This is the child-process TEST FABRIC
+ * (never the production Docker boundary), so disabling Bun's implicit dotenv
+ * loading here is safe and required; production isolation is unchanged.
+ */
 function sandboxCommand(
   entrypoint: string,
   memoryMb: number,
   requireLimits: boolean,
 ): { file: string; args: string[] } | { error: string } {
-  if (process.platform !== "linux") return { file: process.execPath, args: [entrypoint] };
+  if (process.platform !== "linux") return { file: process.execPath, args: ["--no-env-file", entrypoint] };
   const prlimit = "/usr/bin/prlimit";
   if (!existsSync(prlimit)) {
     if (requireLimits) return { error: "sandbox unavailable: /usr/bin/prlimit is required for resource caps" };
-    return { file: process.execPath, args: [entrypoint] };
+    return { file: process.execPath, args: ["--no-env-file", entrypoint] };
   }
   return {
     file: prlimit,
@@ -1166,6 +1212,7 @@ function sandboxCommand(
       "--nproc=128:128",
       "--",
       process.execPath,
+      "--no-env-file",
       entrypoint,
     ],
   };

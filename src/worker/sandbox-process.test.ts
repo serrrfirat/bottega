@@ -136,6 +136,35 @@ describe("child-process protocol lane (test fabric — NOT the production bounda
     expect(store.getOrgSettings()).toBeNull();
   });
 
+  test("a .env in the child cwd cannot re-inject Slack secrets into the nested Bun (#105)", async () => {
+    // Bun eagerly auto-loads `.env`/`.env.local`/mode dotenv files from the
+    // spawned child's cwd, and `@oh-my-pi/pi-coding-agent` also reads
+    // `process.cwd()/.env` at import time — both bypass the sanitized env
+    // because they run inside the nested Bun AFTER spawn. A developer's real
+    // `.env` in the runner cwd must never leak into the sandbox child.
+    // Arrange a hostile `.env` in the launch context (`cwd`) and prove the
+    // checked-in child self-reports neither token: the sandbox always runs
+    // the child from its own dedicated EMPTY temp cwd, so no dotenv file can
+    // ever be found there.
+    const loneDir = tempDir();
+    writeFileSync(
+      join(loneDir, ".env"),
+      "SLACK_APP_TOKEN=cwd-dotenv-app-secret\nSLACK_BOT_TOKEN=cwd-dotenv-bot-secret\n",
+    );
+    const { dbPath } = freshStore();
+    process.env.SLACK_APP_TOKEN = "parent-app-secret-must-not-cross";
+    process.env.SLACK_BOT_TOKEN = "parent-secret-must-not-cross";
+
+    const probe = await probeChildProcessSandbox({
+      dbPath,
+      transcriptDir: join(loneDir, "transcripts"),
+      cwd: loneDir,
+    });
+
+    expect(probe.pid).not.toBe(process.pid);
+    expect(probe.forbiddenEnvNames).toEqual([]);
+  });
+
   test("the real supervisor and checked-in child complete a job through temporary SQLite", async () => {
     const { store, dbPath, dir } = freshStore();
     const extensionsDir = join(dir, "extensions");
