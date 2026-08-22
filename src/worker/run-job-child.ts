@@ -1,8 +1,16 @@
 import { readFileSync, readSync, statSync, writeSync } from "node:fs";
-import { bootExecutorRuntime, createDefaultConsolidationModelCall, type ExecutorBoot, type ExecutorDeps } from "../executor";
+import {
+  bootExecutorRuntime,
+  createDefaultConsolidationModelCall,
+  type ExecutorBoot,
+  type ExecutorConfig,
+  type ExecutorDeps,
+} from "../executor";
 import type { AgentDriver } from "../server/drivers/agent-driver";
 import { buildRegistry } from "../scheduler/actions";
 import { memoryConsolidationAction } from "../scheduler/memory-consolidation";
+import type { ConsolidationModelCall, ConsolidationResult } from "../memory/consolidation";
+import type { MemoryProvider } from "../memory/types";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import type { Store } from "../store/db";
 import { runIsolatedJobBody, FORBIDDEN_CHILD_ENV_NAMES, type SandboxResult, type SandboxStore } from "./run-job";
@@ -62,6 +70,56 @@ function sendResponse(response: SandboxResponse): void {
   writeSync(3, payload);
 }
 
+/**
+ * The lane-specific fields of {@link buildJobDeps}: the two lanes differ only
+ * in where the job-scoped store, DB mount, and memory provider come from, and
+ * whether the memory-consolidation DB leg is routed supervisor-side.
+ */
+interface JobDepsLane {
+  /** The job-scoped store facade (child: scoped store; Docker: RPC facade). */
+  store: SandboxStore;
+  /** Child-lane only: the SQLite database path mounted for the child. */
+  dbPath?: string;
+  /** The org memory provider (child: boot runtime; Docker: RPC provider). */
+  memoryProvider: MemoryProvider;
+  /** Docker-lane only: routes the memory-consolidation DB leg supervisor-side (issue #272). */
+  runMemoryConsolidation?: () => Promise<ConsolidationResult[]>;
+}
+
+/** The ExecutorDeps plus the consolidation model-call it embeds (the RPC lane wires it separately). */
+interface JobDeps {
+  deps: ExecutorDeps;
+  consolidationModelCall: ConsolidationModelCall;
+}
+
+/**
+ * Assembles the job-scoped ExecutorDeps shared by BOTH sandbox lanes. The
+ * child and Docker lanes differ only in the store/db/memory seam (and the
+ * optional supervisor-routed consolidation leg); everything else — the lazy
+ * driver getter, the extension-worker toolset, the config-anchored dirs, and
+ * the consolidation registry — is identical, so one builder keeps the two
+ * from drifting apart.
+ */
+function buildJobDeps(boot: ExecutorBoot, config: ExecutorConfig, lane: JobDepsLane): JobDeps {
+  let driver: AgentDriver | Promise<AgentDriver> | undefined;
+  const consolidationModelCall = createDefaultConsolidationModelCall(boot.getDriver());
+  const deps: ExecutorDeps = {
+    store: lane.store,
+    ...(lane.dbPath !== undefined ? { dbPath: lane.dbPath } : undefined),
+    memoryProvider: lane.memoryProvider,
+    get driver(): AgentDriver | Promise<AgentDriver> {
+      return (driver ??= boot.getDriver());
+    },
+    getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
+    orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
+    transcriptDir: config.transcriptDir,
+    scheduledActions: buildRegistry([memoryConsolidationAction()]),
+    consolidationModelCall,
+    ...(lane.runMemoryConsolidation !== undefined ? { runMemoryConsolidation: lane.runMemoryConsolidation } : undefined),
+  };
+  return { deps, consolidationModelCall };
+}
+
 async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
   const forbidden = forbiddenEnvironment();
   if (forbidden.length > 0) {
@@ -92,21 +150,11 @@ async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): P
   });
   const baseStore = boot.runtime.store;
   const store = createJobScopedStore(baseStore, jobScopeFromEnvelope(request.job));
-  let driver: AgentDriver | Promise<AgentDriver> | undefined;
-  const consolidationModelCall = createDefaultConsolidationModelCall(boot.getDriver());
-  const deps: ExecutorDeps = {
+  const { deps } = buildJobDeps(boot, request.config, {
     store,
     dbPath: request.dbPath,
     memoryProvider: boot.runtime.memoryProvider,
-    get driver(): AgentDriver | Promise<AgentDriver> {
-      return (driver ??= boot.getDriver());
-    },
-    getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
-    orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
-    transcriptDir: request.config.transcriptDir,
-    scheduledActions: buildRegistry([memoryConsolidationAction()]),
-    consolidationModelCall,
-  };
+  });
   try {
     return await runIsolatedJobBody(deps, request.config, request.caps, request.job);
   } finally {
@@ -150,32 +198,18 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
       skipBootSecretSeed: true,
       skipProxyCredentialSync: true,
     });
-    let driver: AgentDriver | Promise<AgentDriver> | undefined;
-    const consolidationModelCall = createDefaultConsolidationModelCall(boot.getDriver());
+    const { deps, consolidationModelCall } = buildJobDeps(boot, request.config, {
+      // SAFETY: bootStore is the explicit allowlisted RPC store facade, widened
+      // to SandboxStore at the session boundary; the job body / scoped-store
+      // layers only invoke facade methods, and any non-allowlisted access fails
+      // closed at the socket.
+      store: bootStore as SandboxStore,
+      memoryProvider: rpc.memoryProvider,
+      runMemoryConsolidation: () => rpc.maintainMemory(),
+    });
     // The scheduled consolidation DB leg is routed supervisor-side; the LLM
     // leg comes back into the worker over the RPC socket (issue #272).
     rpc.setConsolidationModelCall(consolidationModelCall);
-    // SAFETY: bootStore is the explicit allowlisted RPC store facade, widened
-    // to SandboxStore at the session boundary; the job body / scoped-store
-    // layers only invoke facade methods, and any non-allowlisted access fails
-    // closed at the socket.
-    const deps: ExecutorDeps = {
-      // The RPC facade exposes only the job-relevant Store subset + the
-      // supervisor-routed postOutboxRow; typed up to the full SandboxStore at
-      // the session boundary (the job body / scoped-store layers never invoke
-      // non-allowlisted methods — those fail closed at the socket).
-      store: bootStore as SandboxStore,
-      memoryProvider: rpc.memoryProvider,
-      get driver(): AgentDriver | Promise<AgentDriver> {
-        return (driver ??= boot.getDriver());
-      },
-      getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
-      orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
-      transcriptDir: request.config.transcriptDir,
-      scheduledActions: buildRegistry([memoryConsolidationAction()]),
-      consolidationModelCall,
-      runMemoryConsolidation: () => rpc.maintainMemory(),
-    };
     return await runIsolatedJobBody(deps, request.config, request.caps, request.job);
   } finally {
     rpc.close();

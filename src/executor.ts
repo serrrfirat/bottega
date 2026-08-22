@@ -69,9 +69,10 @@ import {
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "./store/audit-events";
 import { postOutboxRow } from "./store/outbox";
-import { kbJobPayloadSchema, ingestPollJobPayloadSchema, scheduledJobPayloadSchema, type WorkerJob } from "./worker/envelope";
+import { kbJobPayloadSchema, ingestPollJobPayloadSchema, type WorkerJob } from "./worker/envelope";
 import {
   createDockerSandboxRunner,
+  parseScheduledJobPayload,
   probeDockerSandbox,
   runJobInSandbox,
   type SandboxRunner,
@@ -637,10 +638,10 @@ async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): 
   }
   if (job.kind !== "scheduled") return runJobInSandbox(deps, cfg, job, runner);
 
-  const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
-  if (!parsed.success) {
-    throw new Error(`scheduled job payload must be { action, ... } — failing closed: ${parsed.error.message}`);
-  }
+  // Fail closed on a malformed scheduled envelope (shared with the sandbox
+  // body's runScheduledJobBody); the parsed action never drives execution
+  // here — the body re-parses via the same helper.
+  parseScheduledJobPayload(job);
   const scheduledDeps: ExecutorDeps = {
     ...deps,
     scheduledActions: deps.scheduledActions ?? buildRegistry([memoryConsolidationAction()]),

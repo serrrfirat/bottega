@@ -16,8 +16,8 @@ import { resolveKindCaps, type JobResourceCaps } from "./caps";
 import { createJobScopedStore, jobScopeFromEnvelope, ScopedStoreAccessError } from "./scoped-store";
 import type { WorkerJob } from "./envelope";
 import type { SchedulerAction, SchedulerActionName, SchedulerActionRegistry } from "../scheduler/types";
+import { inProcessSandboxRunner } from "./run-job-test-fabric";
 import {
-  inProcessSandboxRunner,
   runJobInSandbox,
   runJobSandboxBody,
   runScheduledJobBody,

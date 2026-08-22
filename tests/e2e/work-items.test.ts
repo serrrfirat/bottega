@@ -38,7 +38,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { bootHarness, type Harness, type StubTurn } from "./harness";
 import { runExecutor, type DeliveryApproval, type DeliveryInfo } from "../../src/executor";
-import { inProcessSandboxRunner } from "../../src/worker/run-job";
+import { inProcessSandboxRunner } from "../../src/worker/run-job-test-fabric";
 import { resolveMemoryProvider } from "../../src/server/memory-provider";
 import { startDeliveryPoller } from "../../src/server/services/delivery-poller";
 import { buildApprovalBlocks } from "../../src/server/adapters/approval-router";
