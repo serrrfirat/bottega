@@ -80,6 +80,7 @@ import {
 import type { Poller } from "./ingest/types";
 import { getWatermarkedPoller } from "./ingest/registry";
 import { createAudit, redact } from "./policy/audit";
+import { recordTurnUsage } from "./tools/usage-meter";
 import { loadKbConfig } from "./kb/config";
 import { ingestSource } from "./kb/ingest";
 import type { MemoryProvider } from "./memory/types";
@@ -458,6 +459,10 @@ export async function bootExecutorRuntime(opts: {
             preApproved: true,
             tools: workerTools.memoryTools,
           },
+          // Usage meter (issue #103): every executor-driven model completion
+          // (work-item turns) lands a `usage.turn` audit row. Fire-and-forget —
+          // a metering write never fails or delays the job it records.
+          usageRecorder: async (turn) => void recordTurnUsage(audit, turn),
         });
       });
     }

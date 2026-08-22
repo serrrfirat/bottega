@@ -16,6 +16,7 @@ import {
 import * as auditEventVocabulary from "../store/audit-events";
 import { AUDIT_READ_EVENT, POLICY_EXPLAINED_EVENT } from "../store/audit-events";
 import { summarizeAuditRow, type AuditReasonCategory } from "../store/audit-read";
+import { usageSummary } from "./usage-meter";
 import type { AuditCursor, Store } from "../store/db";
 import { sessionIdFromFilePath } from "../server/drivers/agent-driver";
 import { toolError } from "./helpers";
@@ -81,6 +82,16 @@ const explainPolicyArgsSchema = z
     extension: z.string().optional(),
     provider: z.string().optional(),
     credential_scope: z.enum(["org", "me", "auto"]).optional(),
+  })
+  .strict();
+
+/** Tool args for the usage_summary read (issue #103): window + optional target space. */
+const usageSummaryArgsSchema = z
+  .object({
+    /** Aggregation window: last 7 or 30 days. Default 7d. */
+    window: z.enum(["7d", "30d"]).optional(),
+    /** Target space id; defaults to the session's own space. */
+    space: z.string().optional(),
   })
   .strict();
 
@@ -332,5 +343,39 @@ export function operatorReadToolDefinitions(store: Store, opts: OperatorReadTool
     },
   };
 
-  return [search, explain];
+  const usage: ToolDefinition<typeof usageSummaryArgsSchema> = {
+    name: "usage_summary",
+    label: "Usage summary",
+    description:
+      "Returns model-token usage aggregated by space and user over the last 7 (default) or 30 days: one bucket per (actor, model) with turn count, input tokens, and output tokens. Token counts come from the audit trail's usage.turn rows (the usage meter records one row per model completion).",
+    parameters: usageSummaryArgsSchema,
+    approval: "read",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const currentSpaceId = sessionIdFromFilePath(ctx.sessionManager.getSessionFile());
+      if (!currentSpaceId) return toolError("usage_summary requires a space session");
+      const actor = opts.actorForSpace(currentSpaceId);
+      if (!actor) return toolError("usage_summary could not resolve the authenticated viewer");
+      const target = await authorizeTarget(currentSpaceId, params.space, actor, opts.canReadSpace);
+      if (!target) return toolError("usage_summary is not authorized for the requested space");
+      const windowDays = params.window === "30d" ? 30 : 7;
+      const since = now() - windowDays * DAY_MS;
+      const rows = await usageSummary(store, { since, space: target });
+      await opts.audit.appendAudit({
+        space_id: target,
+        actor,
+        event_type: AUDIT_READ_EVENT,
+        payload: { space: target, window: params.window ?? "7d" },
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ space: target, window: params.window ?? "7d", buckets: rows }),
+          },
+        ],
+      };
+    },
+  };
+
+  return [search, explain, usage];
 }

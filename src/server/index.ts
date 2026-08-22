@@ -94,6 +94,7 @@ import { SpaceService } from "./services/space-service";
 import type { ToolStepSink } from "./services/slack-turn-presenter";
 import { createOperatorHomeService } from "./operator-home";
 import { createLearningService } from "./services/learning";
+import { recordTurnUsage } from "../tools/usage-meter";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
@@ -878,6 +879,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           enabled: orgPolicy.memory.injection.enabled,
           maxEntries: orgPolicy.memory.injection.maxEntries,
         },
+        // Usage meter (issue #103): every space-agent model completion
+        // (chat turns, steers, follow-ups) lands a `usage.turn` audit row.
+        // Fire-and-forget — a metering write never fails or delays the turn
+        // it describes.
+        usageRecorder: async (turn) => void recordTurnUsage(audit, turn),
       });
     });
   const driver = createDriver(agentDir);
