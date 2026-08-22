@@ -50,6 +50,8 @@ const PROVENANCE_COLUMNS = new Set(["mem_source", "mem_space_id", "mem_principal
 /** Adds any missing provenance columns (idempotent for fresh + legacy DBs). */
 function migrateProvenanceColumns(db: Database): void {
   const existing = new Set(
+    // SAFETY: PRAGMA table_info always returns one row per table column, and
+    // every row carries a non-null `name` field, so each row matches { name: string }.
     (db.query("PRAGMA table_info(memories)").all() as { name: string }[]).map((row) => row.name),
   );
   const missing = [...PROVENANCE_COLUMNS].filter((column) => !existing.has(column));
@@ -159,7 +161,13 @@ function rowToEntry(row: MemoryRow): MemoryEntry {
       source: row.mem_source ?? "tool",
       spaceId: row.mem_space_id,
       principal: row.mem_principal,
-      scopeLabel: row.mem_scope_label ?? scopeLabelFallback(row.scope as "org" | "user", row.principal),
+      scopeLabel: row.mem_scope_label ?? scopeLabelFallback(
+        // SAFETY: the scope column only ever stores the literal 'org' or 'user'
+        // values written by save() (via encodeScopeKey) or the migration default,
+        // so casting it to that union is safe.
+        row.scope as "org" | "user",
+        row.principal,
+      ),
     },
   };
 }
@@ -366,6 +374,10 @@ export function createSqliteMemoryProvider(
         const principalClause = physical.scope === "user" ? " AND principal = ?" : " AND principal IS NULL";
         const params: (string | number)[] =
           physical.scope === "user" ? [input.id, physical.scope, physical.principal ?? ""] : [input.id, physical.scope];
+        // SAFETY: the guarded SELECT lists id, scope, principal, content,
+        // metadata_json, created_at, mem_source, mem_space_id, mem_principal,
+        // mem_scope_label — exactly the MemoryRow fields — so each matched row
+        // satisfies the row shape (columns are non-nullable in the migrations).
         const existing = db
           .query(
             `SELECT id, scope, principal, content, metadata_json, created_at,
@@ -402,6 +414,9 @@ export function createSqliteMemoryProvider(
         db.query("DELETE FROM memories WHERE id = ?").run(input.id);
         return {
           id: existing.id,
+          // SAFETY: scope only ever holds the literal 'org' or 'user' (written by
+          // save() via encodeScopeKey or the migration default), so the cast to
+          // that union is safe.
           key: decodeScopeKey(existing.scope as "org" | "user", existing.principal),
           forgottenAt,
         };
@@ -425,6 +440,8 @@ export function createSqliteMemoryProvider(
       sql = "SELECT COUNT(*) AS count FROM memory_tombstones WHERE scope = 'user' AND principal = ?";
       params = [physical.principal ?? ""];
     }
+    // SAFETY: COUNT(*) always returns exactly one row whose `count` column is a
+    // non-negative integer, so the result matches { count: number } when present.
     const row = db.query(sql).get(...params) as { count: number } | null;
     return Promise.resolve(row?.count ?? 0);
   }
@@ -440,6 +457,8 @@ export function createSqliteMemoryProvider(
       sql = "SELECT COUNT(*) AS count FROM memories WHERE scope = 'user' AND principal = ?";
       params = [physical.principal ?? ""];
     }
+    // SAFETY: COUNT(*) always returns exactly one row whose `count` column is a
+    // non-negative integer, so the result matches { count: number } when present.
     const row = db.query(sql).get(...params) as { count: number } | null;
     return Promise.resolve(row?.count ?? 0);
   }
