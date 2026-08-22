@@ -6,7 +6,7 @@ import { buildRegistry } from "../scheduler/actions";
 import { memoryConsolidationAction } from "../scheduler/memory-consolidation";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import type { Store } from "../store/db";
-import { runIsolatedJobBody, type SandboxResult, type SandboxStore } from "./run-job";
+import { runIsolatedJobBody, FORBIDDEN_CHILD_ENV_NAMES, type SandboxResult, type SandboxStore } from "./run-job";
 import { connectStoreRpc } from "./store-rpc";
 import {
   MAX_SANDBOX_REQUEST_BYTES,
@@ -16,18 +16,6 @@ import {
   type SandboxRequest,
   type SandboxResponse,
 } from "./sandbox-protocol";
-
-const FORBIDDEN_ENV_NAMES = [
-  "SLACK_APP_TOKEN",
-  "SLACK_BOT_TOKEN",
-  "GITHUB_WEBHOOK_SECRET",
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "AWS_SECRET_ACCESS_KEY",
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
-  "OMP_AUTH_BROKER_TOKEN",
-] as const;
 
 function readRequest(): SandboxRequest {
   const chunks: Buffer[] = [];
@@ -52,7 +40,7 @@ function readRequest(): SandboxRequest {
 }
 
 function forbiddenEnvironment(): string[] {
-  return FORBIDDEN_ENV_NAMES.filter((name) => process.env[name] !== undefined);
+  return FORBIDDEN_CHILD_ENV_NAMES.filter((name) => process.env[name] !== undefined);
 }
 
 /**
@@ -111,7 +99,7 @@ async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): P
   }
   const boot = await bootExecutorRuntime({
     dbPath: request.dbPath,
-    skipBootSecretEnvNames: FORBIDDEN_ENV_NAMES,
+    skipBootSecretEnvNames: FORBIDDEN_CHILD_ENV_NAMES,
     skipBootSecretSeed: true,
     skipProxyCredentialSync: true,
   });
@@ -161,7 +149,7 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
       memoryProvider: rpc.memoryProvider,
       orgSettings: isOrgSettingsLike(request.orgSettings) ? request.orgSettings : undefined,
       skipRuntimeRegistryMerge: true,
-      skipBootSecretEnvNames: FORBIDDEN_ENV_NAMES,
+      skipBootSecretEnvNames: FORBIDDEN_CHILD_ENV_NAMES,
       skipBootSecretSeed: true,
       skipProxyCredentialSync: true,
     });

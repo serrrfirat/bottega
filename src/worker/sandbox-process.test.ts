@@ -22,6 +22,7 @@ import { resolveMemoryProvider, type ResolvedMemoryProvider } from "../server/me
 const dirs: string[] = [];
 const stores: Store[] = [];
 const originalSlackBotToken = process.env.SLACK_BOT_TOKEN;
+const originalSlackAppToken = process.env.SLACK_APP_TOKEN;
 const originalExtensionsDir = process.env.BOTTEGA_EXTENSIONS_DIR;
 
 function tempDir(): string {
@@ -105,6 +106,8 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   if (originalSlackBotToken === undefined) delete process.env.SLACK_BOT_TOKEN;
   else process.env.SLACK_BOT_TOKEN = originalSlackBotToken;
+  if (originalSlackAppToken === undefined) delete process.env.SLACK_APP_TOKEN;
+  else process.env.SLACK_APP_TOKEN = originalSlackAppToken;
   if (originalExtensionsDir === undefined) delete process.env.BOTTEGA_EXTENSIONS_DIR;
   else process.env.BOTTEGA_EXTENSIONS_DIR = originalExtensionsDir;
 });
@@ -117,6 +120,10 @@ afterEach(() => {
 describe("child-process protocol lane (test fabric — NOT the production boundary)", () => {
   test("the real child entrypoint has a distinct PID and receives no parent secret environment", async () => {
     const { store, dbPath, dir } = freshStore();
+    // The coordinator's own environment carries Slack credentials; the fabric
+    // must never let them cross into the child, no matter how the child env is
+    // assembled. Both are asserted as absent by the checked-in child itself.
+    process.env.SLACK_APP_TOKEN = "parent-app-secret-must-not-cross";
     process.env.SLACK_BOT_TOKEN = "parent-secret-must-not-cross";
     delete process.env.BOTTEGA_SANDBOX_CHILD;
 
