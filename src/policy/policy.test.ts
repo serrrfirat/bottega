@@ -82,6 +82,9 @@ describe("tier resolution", () => {
       "list_work_items",
       "list_space_skills",
       "get_space_skill",
+      "search_web",
+      "render_chart",
+      "slack_read",
     ]) {
       expect(resolveTier(t)).toBe("read");
       expect(isKnownTool(t)).toBe(true);

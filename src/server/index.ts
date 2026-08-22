@@ -25,6 +25,7 @@ import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
 import { chartToolDefinition } from "../tools/render-chart";
 import { searchWebToolDefinition } from "../tools/search-web";
+import { slackReadToolDefinition } from "../tools/slack-read";
 import { operatorReadToolDefinitions } from "../tools/operator-read";
 import { loadKbConfig } from "../kb/config";
 import { buildRegistry } from "../scheduler/actions";
@@ -712,6 +713,18 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // data/proxy-secrets/tavily.secret, injected at egress). Fail-closed
     // on a missing key — no fabricated result set.
     searchWebToolDefinition(),
+    // Owned-space Slack read (issue #340): the agent hydrates its own
+    // channel's thread/history on demand (no automatic per-turn injection
+    // — keeps the model's turn history + prefix cached). The adapter
+    // derives the channel from the session's space id, so the tool never
+    // sees a channel selector. The read surface is optional on the adapter
+    // (readThread/readHistory); when absent the tool fails closed. A
+    // missing history scope degrades to a loud diagnostic (no fabricated
+    // result). Read-tier — registered in the policy table.
+    slackReadToolDefinition({
+      readThread: adapter.readThread?.bind(adapter),
+      readHistory: adapter.readHistory?.bind(adapter),
+    }),
   ];
   opts.onSessionToolset?.(sessionToolset);
   // Issue #167: the extension half of the space agent's session toolset.

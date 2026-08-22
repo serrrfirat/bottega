@@ -1,5 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type FilesInfoResponse, type ViewsPublishArguments } from "@slack/web-api";
+import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type ConversationsHistoryResponse, type ConversationsRepliesResponse, type FilesInfoResponse, type ViewsPublishArguments } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 import type { OperatorViewer, SlackHomeRender } from "../operator-home";
 import { z } from "zod";
@@ -126,6 +126,90 @@ export const slackBlockPayloadSchema = z
   .passthrough();
 export type SlackBlockPayload = z.infer<typeof slackBlockPayloadSchema>;
 
+/**
+ * One normalized message read from the space's own channel by the
+ * own-space slack_read tool (issue #340) via conversations.replies /
+ * conversations.history. Plain text only — the tool serializes this
+ * directly. `order` is the message's position in the returned list
+ * (0-based, oldest first for replies, oldest-first for history).
+ */
+export interface SlackReadMessage {
+  ts: string;
+  /** The author's user id; falls back to the bot id for bot-authored rows. */
+  user: string;
+  /** The message text (empty when Slack reports none). */
+  text: string;
+  order: number;
+}
+
+/** A single message row from conversations.replies / conversations.history (lenient). */
+const slackReadMessageSchema = z.object({
+  ts: z.string(),
+  user: z.string().optional(),
+  bot_id: z.string().optional(),
+  text: z.string().optional(),
+});
+
+/**
+ * Normalizes raw messages from conversations.replies / .history into the
+ * readable plain-text {@link SlackReadMessage} shape. Rows that do not
+ * carry a `ts` are dropped (fail closed — never a fabricated row); bot and
+ * human rows both normalize, since the bot reads back its OWN posts (issue
+ * #305) and a real user's replies alike.
+ */
+export function normalizeReadMessages(rows: unknown[]): SlackReadMessage[] {
+  const out: SlackReadMessage[] = [];
+  for (const row of rows) {
+    const parsed = slackReadMessageSchema.safeParse(row);
+    if (!parsed.success) continue;
+    out.push({
+      ts: parsed.data.ts,
+      user: parsed.data.user ?? parsed.data.bot_id ?? "",
+      text: parsed.data.text ?? "",
+      order: out.length,
+    });
+  }
+  return out;
+}
+
+/**
+ * A read failed because the app token lacks a history scope — the loud
+ * fail-closed diagnostic for the slack_read tool (issue #340). Distinct
+ * from a transient/operational failure so callers can surface the exact
+ * scope to grant and never mistake the missing permission for "no
+ * messages".
+ */
+export class SlackMissingReadScopeError extends Error {
+  constructor(channelId: string, method: "replies" | "history", needed?: string) {
+    super(
+      `slack_read: ${method} needs a history scope for channel ${channelId} — the app token lacks ` +
+        `${needed ?? "channels:history / groups:history / im:history"}. Grant the missing scope in the ` +
+        `Slack app manifest and reinstall the app; the tool returns a diagnostic, never a fabricated result.`,
+    );
+    this.name = "SlackMissingReadScopeError";
+  }
+}
+
+/**
+ * Maps a failed conversations.replies/.history call onto a readable error:
+ * a missing history scope becomes a {@link SlackMissingReadScopeError}
+ * (loud, actionable), anything else a generic failure with the API cause.
+ */
+function readFailureError(method: "replies" | "history", channelId: string, err: unknown): Error {
+  const parsed = slackApiErrorSchema.safeParse(err);
+  const code = parsed.success ? parsed.data.data.error : undefined;
+  const needed = parsed.success ? parsed.data.data.needed : undefined;
+  if (code === "missing_scope" || code === "missing_required_scope") {
+    return new SlackMissingReadScopeError(channelId, method, needed);
+  }
+  if (err instanceof Error) {
+    return new Error(`slack: conversations.${method} failed for channel ${channelId}: ${err.message}`, {
+      cause: err,
+    });
+  }
+  return new Error(`slack: conversations.${method} failed for channel ${channelId}`, { cause: err });
+}
+
 export interface SlackAdapter {
   /**
    * Posts a message; resolves with the created message ts (undefined when the
@@ -194,6 +278,27 @@ export interface SlackAdapter {
    * thinking panel; omit it to finalize with what was already streamed.
    */
   stopStream(spaceId: string, ts: string, text?: string): Promise<void>;
+  /**
+   * Reads the full thread rooted at `threadTs` — the parent message plus
+   * every reply, oldest first (conversations.replies). Deliberately sends
+   * NO `limit`: issue #215 proved a `limit` is rejected for some app tiers,
+   * so the wire shape is exactly `{ channel, ts }`. The channel is derived
+   * from `spaceId` (own-channel by construction — the caller can never name
+   * a channel). Returns normalized plain-text messages. Fails closed: a
+   * missing history scope (`channels:history`/`groups:history`/`im:history`)
+   * throws {@link SlackMissingReadScopeError} instead of ever returning a
+   * fabricated result. Optional like `isWorkspaceAdmin` — the owned-space
+   * read surface may be absent on a legacy/custom adapter; the slack_read
+   * tool fails closed when it is.
+   */
+  readThread?(spaceId: string, threadTs: string): Promise<SlackReadMessage[]>;
+  /**
+   * Reads recent top-level messages in the space's own channel
+   * (conversations.history, `limit` default 50). Returns normalized
+   * plain-text messages newest-last. Same own-channel + fail-closed rules
+   * as readThread.
+   */
+  readHistory?(spaceId: string, opts?: { limit?: number }): Promise<SlackReadMessage[]>;
   /**
    * Whether the workspace/app supports chat streaming (issue #168).
    * Feature-detected once per boot: true until a stream call fails with a
@@ -532,6 +637,9 @@ export function buildUpdateMessageArgs(
  * truncated so a redacted args card never 400s the whole stream.
  */
 export const STREAM_TASK_OUTPUT_MAX = 256;
+
+/** The default `limit` for conversations.history reads (issue #340). */
+export const READ_HISTORY_DEFAULT_LIMIT = 50;
 
 /**
  * Retry policy for the dedicated stream client (issue #181): NO retries.
@@ -1310,6 +1418,30 @@ export function createSlackAdapter(opts: {
         name: name ?? "eyes",
         timestamp: ts,
       });
+    },
+    async readThread(spaceId, threadTs) {
+      const channel = channelFromSpaceId(spaceId);
+      let res: ConversationsRepliesResponse;
+      try {
+        // Issue #215: the proven wire shape — NO `limit` (a limit is
+        // rejected for some app tiers). The parent + every reply returns
+        // oldest-first.
+        res = await app.client.conversations.replies({ channel, ts: threadTs });
+      } catch (err) {
+        throw readFailureError("replies", channel, err);
+      }
+      return normalizeReadMessages(res.messages ?? []);
+    },
+    async readHistory(spaceId, readOpts) {
+      const channel = channelFromSpaceId(spaceId);
+      const limit = readOpts?.limit ?? READ_HISTORY_DEFAULT_LIMIT;
+      let res: ConversationsHistoryResponse;
+      try {
+        res = await app.client.conversations.history({ channel, limit });
+      } catch (err) {
+        throw readFailureError("history", channel, err);
+      }
+      return normalizeReadMessages(res.messages ?? []);
     },
     async startStream(spaceId, streamOpts) {
       // Feature-detect once per boot: a known-unsupported workspace never

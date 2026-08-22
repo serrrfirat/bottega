@@ -195,6 +195,11 @@ const TIER_BY_TOOL: ToolTiers = {
   // Web search (issue #278): read-only cited search — the proxy-injected
   // provider key never leaves the egress boundary.
   search_web: "read",
+  // Owned-space Slack read (issue #340): the agent reads its own channel's
+  // thread/history to hydrate context. The channel is always derived from
+  // the session's space id (no channel argument), and a missing history
+  // scope fails closed with a diagnostic — never a fabricated result.
+  slack_read: "read",
   // Connect capability (issue #52): org-scope connects route through the
   // exec-tier ask-human approval flow; personal connects are ungated
   // (any principal's own credential only) — see src/extensions/connect.ts.

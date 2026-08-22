@@ -222,6 +222,34 @@ rather than posted) and posts exactly one chart block per result through the
 same blocks-capable `postMessage` path the approval router uses, so charts
 land beside the reply — never per streamed chunk.
 
+## Owned-space Slack read (issue #340)
+
+The `slack_read` tool lets the agent hydrate context from the conversation's
+**own** Slack channel on demand — a thread (`thread_ts`: parent + replies,
+oldest first, via `conversations.replies`) or the recent top-level history
+(up to `limit`, default 50, via `conversations.history`). It is read-only and
+read-tier: it returns plain-text messages (timestamp, author, text) the agent
+can cite before replying, and it never mutates Slack.
+
+Two invariants:
+
+- **Own-channel by construction.** The channel is always derived from the
+  session's space id (`channelFromSpaceId(sessionIdFromFilePath(...))`); the
+  tool accepts **no channel selector**, so it can never read another channel,
+  group, or DM. No cross-space reads in this pass.
+- **No automatic hydration.** The runtime does NOT inject history into every
+  turn (the issue #305 decision: keep the model's turn history + prefix
+  cached). The agent calls `slack_read` only when it needs context, and the
+  result lands mid-turn as a tool result inside the cached region.
+
+**Required bot scopes:** `conversations.replies` needs
+`channels:history` (public), `groups:history` (private), or `im:history`
+(DM) depending on the channel type; `conversations.history` needs the same.
+These are already in `slack-app-manifest.yml`. If the installed app token
+lacks them, the tool fails closed with a **loud diagnostic** naming the
+missing scope — it never crashes, and it never returns a fabricated or
+misleading empty "no messages" result.
+
 ## Slack replies stay visible and settle (issues #119, #120, #179, #180, #181, #184, #193)
 
 An agent-bound message gets visible receipt work before attachment ingestion
