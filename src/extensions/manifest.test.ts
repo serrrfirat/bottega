@@ -117,7 +117,7 @@ describe("extension manifest validation (fail closed)", () => {
   });
 
   test("rejects an unknown kind", () => {
-    expectInvalid(mutate(fixtureManifest(), ["kind"], "http"), "kind must be \"mcp\" or \"cli\"");
+    expectInvalid(mutate(fixtureManifest(), ["kind"], "http"), 'kind must be "mcp", "cli", or "openapi"');
   });
 
   test("kind mcp requires an mcp binding and forbids a cli binding", () => {
@@ -131,6 +131,46 @@ describe("extension manifest validation (fail closed)", () => {
   test("kind cli requires a cli binding and forbids an mcp binding", () => {
     expectInvalid(mutate(cliManifest(), ["cli"], undefined), "requires a cli binding");
     expectInvalid({ ...cliManifest(), mcp: fixtureManifest().mcp }, "must not declare an mcp binding");
+  });
+
+  test("kind openapi validates the spec URL + static auth scheme (issue #345)", () => {
+    // SAFETY: object literal values are JSON domain (strings/arrays); the
+    // validator re-validates the reconstructed doc, so a JsonObject view is
+    // exact — same boundary as the mutate/asJsonDoc helpers.
+    const base: JsonObject = {
+      id: "sendgrid",
+      label: "SendGrid",
+      vendor: "SendGrid",
+      kind: "openapi",
+      openapi: { specUrl: "https://spec.example.test/openapi.json", auth: { scheme: "bearer" } },
+      credentialSchema: { type: "api_key" },
+      tools: [],
+      domains: ["api.sendgrid.test"],
+      credentialTargets: [{ host: "api.sendgrid.test" }],
+    };
+    // A valid openapi manifest round-trips through validateManifest.
+    const valid = validateManifest(asJsonDoc(base));
+    expect(valid.kind).toBe("openapi");
+    // Requires the openapi binding + a pinned tools surface.
+    expectInvalid({ ...base, openapi: undefined }, "requires an openapi binding");
+    expectInvalid({ ...base, tools: undefined }, "requires a pinned tools surface");
+    expectInvalid(
+      { ...base, openapi: { specUrl: "http://plain.test/x", auth: { scheme: "bearer" } } },
+      "must be HTTPS",
+    );
+    expectInvalid(
+      { ...base, openapi: { specUrl: "https://x.test/x", auth: { scheme: "magic" } } },
+      "bearer",
+    );
+    expectInvalid(
+      { ...base, openapi: { specUrl: "https://x.test/x", auth: { scheme: "apiKeyHeader" } } },
+      "headerName",
+    );
+    expectInvalid(
+      { ...base, openapi: { specUrl: "https://x.test/x", auth: { scheme: "bearer", headerName: "X" } } },
+      "only applies to the apiKeyHeader",
+    );
+    expectInvalid({ ...base, mcp: fixtureManifest().mcp }, "must not declare an mcp binding");
   });
 
   test("mcp binding requires exactly one of serverUrl or command", () => {

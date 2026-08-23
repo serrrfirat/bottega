@@ -14,10 +14,30 @@
 import { z } from "zod";
 import { BUILTIN_TOOLS, HIDDEN_TOOLS } from "@oh-my-pi/pi-coding-agent";
 
-export type ExtensionKind = "mcp" | "cli";
+export type ExtensionKind = "mcp" | "cli" | "openapi";
 export type ExtensionToolTier = "read" | "write" | "exec";
 export type CredentialType = "oauth" | "api_key";
 export type McpTransport = "streamable-http" | "stdio";
+/** Static credential scheme for OpenAPI extensions (issue #345 V1 scope). */
+export type OpenApiAuthScheme = "bearer" | "apiKeyHeader";
+
+/**
+ * OpenAPI extension binding (issue #345): the spec URL and the static auth
+ * scheme iron-proxy injects at egress. V1 scope is STATIC credentials only
+ * (bearer / apiKeyHeader); OAuth-protected REST APIs stay out of V1 — they
+ * are exactly what hosted MCP already covers.
+ */
+export interface OpenApiBinding {
+  /** The HTTPS OpenAPI 3.x spec URL (validated at pin time). */
+  specUrl: string;
+  auth: {
+    scheme: OpenApiAuthScheme;
+    /** The header name for the `apiKeyHeader` scheme (e.g. X-Api-Key). */
+    headerName?: string;
+    /** Human label for the credential provisioning prompt. */
+    credentialLabel?: string;
+  };
+}
 
 /**
  * MCP binding: exactly one of serverUrl (official remote server) or command
@@ -117,6 +137,21 @@ export interface ExtensionToolParam {
   description?: string;
   /** Defaults to true: a declared param is required unless marked optional. */
   required?: boolean;
+  /**
+   * Where an OpenAPI-generated param lands in the egress request (issue
+   * #345). Present ONLY for OpenAPI extensions: path/query params map to
+   * the URL, a single `body` param maps to the JSON request body. Absent
+   * for MCP/CLI params (they never rebuild an HTTP request).
+   */
+  location?: "path" | "query" | "body";
+}
+
+/** HTTP operation template for one OpenAPI tool (issue #345). */
+export interface OpenApiToolMetadata {
+  /** The HTTP method verb. */
+  method: "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "trace";
+  /** The path template (with `{param}` placeholders), e.g. `/users/{id}`. */
+  path: string;
 }
 
 /**
@@ -136,6 +171,12 @@ export interface ExtensionTool {
   tier: ExtensionToolTier;
   description: string;
   params: ExtensionToolParam[];
+  /**
+   * HTTP operation template for an OpenAPI-generated tool (issue #345).
+   * Present ONLY for openapi-kind extensions: the executor rebuilds the
+   * egress request from method+path+param locations. Absent for MCP/CLI.
+   */
+  openapi?: OpenApiToolMetadata;
 }
 
 /**
@@ -179,6 +220,24 @@ export type ExtensionManifest =
       tools?: ExtensionTool[];
       /** Manifest-declared webhook authentication (issue #57 follow-up). */
       webhook?: WebhookDeclaration;
+      domains: string[];
+      credentialTargets: CredentialTarget[];
+    }
+  | {
+      id: string;
+      label: string;
+      vendor: string;
+      kind: "openapi";
+      mcp?: never;
+      cli?: never;
+      /** The spec URL + static auth scheme (issue #345). */
+      openapi: OpenApiBinding;
+      credentialSchema: CredentialSchema;
+      /** The FROZEN tool surface generated from the spec at pin time. */
+      tools: ExtensionTool[];
+      /** Manifest-declared webhook authentication (issue #57 follow-up). */
+      webhook?: WebhookDeclaration;
+      /** Egress allowlist entries (iron-proxy) from the spec's HTTPS servers. */
       domains: string[];
       credentialTargets: CredentialTarget[];
     };
@@ -485,6 +544,73 @@ function validateCliBinding(value: JsonValue): CliBinding {
   };
 }
 
+/**
+ * Validates an OpenAPI binding (issue #345): the spec URL must be HTTPS and
+ * the auth scheme must be a static V1 scheme (`bearer` or `apiKeyHeader`).
+ * An apiKeyHeader scheme REQUIRES a header name; bearer must not carry one
+ * (it injects the standard Authorization: Bearer header).
+ */
+function validateOpenApiBinding(value: JsonValue): OpenApiBinding {
+  if (!isRecord(value)) {
+    fail("openapi binding must be an object");
+  }
+  const specUrl = requiredString(value, "specUrl");
+  let parsed: URL;
+  try {
+    parsed = new URL(specUrl);
+  } catch {
+    fail("openapi.specUrl must be a valid URL");
+  }
+  if (parsed.protocol !== "https:") {
+    fail("openapi.specUrl must be HTTPS (fail closed: no plaintext specs)");
+  }
+  const authValue = value["auth"];
+  if (!isRecord(authValue)) {
+    fail("openapi.auth must be an object");
+  }
+  const schemeRaw = z.string().safeParse(authValue["scheme"]);
+  if (!schemeRaw.success || (schemeRaw.data !== "bearer" && schemeRaw.data !== "apiKeyHeader")) {
+    fail('openapi.auth.scheme must be "bearer" or "apiKeyHeader"');
+  }
+  const scheme: OpenApiAuthScheme = schemeRaw.data;
+  let headerName: string | undefined;
+  if (scheme === "apiKeyHeader") {
+    const header = requiredString(authValue, "headerName");
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(header)) {
+      fail("openapi.auth.headerName must be a valid HTTP header name");
+    }
+    headerName = header;
+  } else if (authValue["headerName"] !== undefined) {
+    fail("openapi.auth.headerName only applies to the apiKeyHeader scheme");
+  }
+  const credentialLabel = optionalNonEmptyString(authValue["credentialLabel"]);
+  return {
+    specUrl,
+    auth: {
+      scheme,
+      ...(headerName !== undefined ? { headerName } : undefined),
+      ...(credentialLabel !== null ? { credentialLabel } : undefined),
+    },
+  };
+}
+
+const OPENAPI_METHODS = ["get", "post", "put", "delete", "patch", "options", "head", "trace"] as const;
+
+function validateOpenApiToolMetadata(value: JsonValue, toolName: string): OpenApiToolMetadata {
+  if (!isRecord(value)) {
+    fail(`tool "${toolName}" openapi metadata must be an object`);
+  }
+  const method = z.enum(OPENAPI_METHODS).safeParse(value["method"]);
+  if (!method.success) {
+    fail(`tool "${toolName}" openapi.method must be an HTTP verb`);
+  }
+  const path = requiredString(value, "path");
+  if (!path.startsWith("/")) {
+    fail(`tool "${toolName}" openapi.path must begin with "/"`);
+  }
+  return { method: method.data, path };
+}
+
 function validateTools(value: JsonValue): ExtensionTool[] {
   if (!Array.isArray(value)) {
     fail("tools must be an array");
@@ -526,12 +652,14 @@ function validateTools(value: JsonValue): ExtensionTool[] {
     }
     const description = requiredString(rawEntry, "description");
     const params = validateParams(rawEntry["params"], name);
+    const openapi = rawEntry["openapi"] === undefined ? undefined : validateOpenApiToolMetadata(rawEntry["openapi"], name);
     tools.push({
       name,
       ...(providerName !== undefined ? { providerName } : undefined),
       tier,
       description,
       params,
+      ...(openapi !== undefined ? { openapi } : undefined),
     });
   }
   return tools;
@@ -588,12 +716,21 @@ function validateParams(value: JsonValue, toolName: string): ExtensionToolParam[
       }
       required = parsed.data;
     }
+    let location: "path" | "query" | "body" | undefined;
+    if (rawEntry["location"] !== undefined) {
+      const parsed = z.enum(["path", "query", "body"]).safeParse(rawEntry["location"]);
+      if (!parsed.success) {
+        fail(`tool "${toolName}" param "${name}" location must be "path", "query", or "body"`);
+      }
+      location = parsed.data;
+    }
     params.push({
       name,
       type: type.data,
       ...(jsonType !== undefined ? { jsonType } : undefined),
       ...(description !== undefined ? { description } : undefined),
       ...(required !== undefined ? { required } : undefined),
+      ...(location !== undefined ? { location } : undefined),
     });
   }
   return params;
@@ -685,8 +822,8 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
   const label = requiredString(input, "label");
   const vendor = requiredString(input, "vendor");
   const kind = input["kind"];
-  if (kind !== "mcp" && kind !== "cli") {
-    fail("kind must be \"mcp\" or \"cli\"");
+  if (kind !== "mcp" && kind !== "cli" && kind !== "openapi") {
+    fail('kind must be "mcp", "cli", or "openapi"');
   }
   const credentialSchema = validateCredentialSchema(input["credentialSchema"]);
   // Webhook inbound auth (issue #57 follow-up): an extension MAY declare a
@@ -715,6 +852,35 @@ export function validateManifest(input: JsonValue): ExtensionManifest {
       credentialSchema,
       ...(webhook !== undefined ? { webhook } : undefined),
       ...(tools !== undefined ? { tools } : undefined),
+      domains,
+      credentialTargets,
+    };
+  }
+  if (kind === "openapi") {
+    if (input["mcp"] !== undefined) {
+      fail("an openapi extension must not declare an mcp binding");
+    }
+    if (input["cli"] !== undefined) {
+      fail("an openapi extension must not declare a cli binding");
+    }
+    if (input["openapi"] === undefined) {
+      fail("an openapi extension requires an openapi binding");
+    }
+    if (tools === undefined) {
+      // The openapi surface is ALWAYS pinned at generation time (issue #345):
+      // the runtime never re-fetches the spec, so the frozen tools are
+      // mandatory — an openapi manifest without them is malformed.
+      fail("an openapi extension requires a pinned tools surface (generated from the spec at pin)");
+    }
+    return {
+      id,
+      label,
+      vendor,
+      kind: "openapi",
+      openapi: validateOpenApiBinding(input["openapi"]),
+      credentialSchema,
+      tools,
+      ...(webhook !== undefined ? { webhook } : undefined),
       domains,
       credentialTargets,
     };

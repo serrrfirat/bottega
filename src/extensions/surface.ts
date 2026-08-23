@@ -44,6 +44,11 @@ function surfaceCacheKey(manifest: ExtensionManifest): string {
     const binding = manifest.mcp.transport === "streamable-http" ? manifest.mcp.serverUrl : manifest.mcp.command;
     return `mcp:${manifest.id}:${binding}`;
   }
+  if (manifest.kind === "openapi") {
+    // OpenAPI tools are always pinned (never discovered), so the cache key
+    // is the binding identity: the frozen surface keys by spec URL.
+    return `openapi:${manifest.id}:${manifest.openapi.specUrl}`;
+  }
   return `cli:${manifest.id}:${manifest.cli.command}`;
 }
 

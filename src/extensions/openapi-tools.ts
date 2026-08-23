@@ -248,7 +248,12 @@ function normalizeOperationId(operationId: string): string | null {
  * (array/object) travels as a JSON-serialized string with `jsonType`,
  * mirroring the MCP bridge (issue #248).
  */
-function paramFromOpenApiSchema(raw: JsonValue, name: string, required: boolean): ExtensionToolParam {
+function paramFromOpenApiSchema(
+  raw: JsonValue,
+  name: string,
+  required: boolean,
+  location: "path" | "query" | "body",
+): ExtensionToolParam {
   const schema = isRecord(raw) ? raw : {};
   const schemaType = schema["type"];
   const type: ExtensionToolParam["type"] =
@@ -261,7 +266,7 @@ function paramFromOpenApiSchema(raw: JsonValue, name: string, required: boolean)
           : "string";
   const jsonType: ExtensionToolParam["jsonType"] =
     schemaType === "array" ? "array" : schemaType === "object" ? "object" : undefined;
-  const param: ExtensionToolParam = { name, type };
+  const param: ExtensionToolParam = { name, type, location };
   if (jsonType !== undefined) param.jsonType = jsonType;
   const description = schema["description"];
   const parsedDescription = z.string().min(1).safeParse(description);
@@ -297,7 +302,7 @@ export function paramsFromOpenApiOperation(operation: JsonObject): ExtensionTool
       if (location !== "path" && location !== "query") continue;
       if (seen.has(name.data)) continue;
       seen.add(name.data);
-      params.push(paramFromOpenApiSchema(raw["schema"], name.data.trim(), raw["required"] === true));
+      params.push(paramFromOpenApiSchema(raw["schema"], name.data.trim(), raw["required"] === true, location));
     }
   }
   const requestBody = operation["requestBody"];
@@ -310,13 +315,14 @@ export function paramsFromOpenApiOperation(operation: JsonObject): ExtensionTool
         const bodySchema = jsonEntry["schema"];
         const required = requestBody["required"] === true;
         if (isRecord(bodySchema)) {
-          params.push(paramFromOpenApiSchema(bodySchema, OPENAPI_BODY_PARAM, required));
+          params.push(paramFromOpenApiSchema(bodySchema, OPENAPI_BODY_PARAM, required, "body"));
         } else {
           // A JSON body with no usable structure → an opaque object.
           const opaque: ExtensionToolParam = {
             name: OPENAPI_BODY_PARAM,
             type: "string",
             jsonType: "object",
+            location: "body",
           };
           if (!required) opaque.required = false;
           params.push(opaque);
@@ -390,6 +396,7 @@ export function generateOpenApiTools(
         tier,
         description,
         params,
+        openapi: { method, path },
       });
       operations.push({ name: toolName, operationId: normalizedId, tier, method, path });
     }

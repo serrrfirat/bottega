@@ -74,7 +74,23 @@ import {
   type CredentialBoundary,
 } from "./boundary";
 import { extensionToolSurface, type ExtensionSurfaces } from "./surface";
+import { callOpenApiTool, type OpenApiEgressSeam } from "./openapi-executor";
 import { humanizeToolName } from "../server/adapters/approval-router";
+
+/**
+ * Default OpenAPI egress seam (issue #345): no credential provisioner is
+ * wired for openapi extensions yet, so it fails closed — the executor
+ * refuses to send before any request leaves the process. A real inject
+ * provisioner (the static model-gateway inject config supporting arbitrary
+ * headers) is the documented residual; the seam is injected by deployments
+ * via `ExtensionRuntimeDeps.openapiEgress`.
+ */
+export const FAIL_CLOSED_OPENAPI_EGRESS: OpenApiEgressSeam = {
+  injectForHost: () => undefined,
+  fetchWire: async () => {
+    throw new Error("openapi egress is not provisioned — refuse to send");
+  },
+};
 import {
   emitToolStep,
   nextToolStepId,
@@ -129,6 +145,14 @@ export interface ExtensionRuntimeDeps {
    * closed until then.
    */
   boundary?: CredentialBoundary;
+  /**
+   * OpenAPI egress seam (issue #345): injects the static credential for a
+   * pinned openapi extension's host at egress (model-gateway inject mode) —
+   * the executor sends NO auth header. Defaults to a fail-closed seam that
+   * refuses to send until a real inject provisioner is wired (test seam
+   * injects a fake proxy asserting the header).
+   */
+  openapiEgress?: OpenApiEgressSeam;
   /**
    * MCP transport factory (test seam): tests inject in-memory transports so
    * tool execution is exercised hermetically. Defaults to the real
@@ -413,7 +437,11 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
                     providerArgs,
                     authorization,
                   )
-                : await callCliTool(manifest.cli, wireName, args, authorization);
+                : manifest.kind === "openapi"
+                  ? await callOpenApiTool(manifest, tool, args, {
+                      egress: deps.openapiEgress ?? FAIL_CLOSED_OPENAPI_EGRESS,
+                    })
+                  : await callCliTool(manifest.cli, wireName, args, authorization);
             if (outcome.decision !== "ask-human") {
               emitToolStep(sink, {
                 spaceId,
