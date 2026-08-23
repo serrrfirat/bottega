@@ -43,6 +43,7 @@ import { z } from "zod";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { generateManifestTools, refreshManifestTools } from "./generate-tools";
+import { generateOpenApiTools } from "./openapi-tools";
 import {
   parsePinnedSnapshot,
   SNAPSHOT_SCHEMA,
@@ -52,6 +53,7 @@ import {
 import { errorMessage } from "../tools/helpers";
 import {
   ExtensionValidationError,
+  isRecord,
   validateManifest,
   type CliBinding,
   type CredentialSchema,
@@ -59,6 +61,7 @@ import {
   type ExtensionKind,
   type ExtensionTool,
   type JsonObject,
+  type JsonValue,
   type McpBinding,
 } from "./manifest";
 
@@ -100,6 +103,22 @@ export interface CatalogEntry {
    * one.
    */
   mcpEndpoint?: string;
+  /**
+   * OpenAPI catalog metadata (issue #345): the spec URL + static auth scheme
+   * for an API-first vendor entry (kind "openapi"). Optional `operations`
+   * curation (default = all non-deprecated ops, capped); absent on mcp/cli
+   * entries.
+   */
+  openapi?: {
+    url: string;
+    /** Optional explicit operation-id curation; default = all non-deprecated. */
+    operations?: string[];
+    auth: {
+      scheme: "bearer" | "apiKeyHeader";
+      headerName?: string;
+      credentialLabel?: string;
+    };
+  };
 }
 
 export interface FetchCatalogOptions {
@@ -183,6 +202,58 @@ function optionalString(value: JsonObject[string]): string | null {
   return parsed.success ? parsed.data : null;
 }
 
+/** Parses an entry's optional OpenAPI block (issue #345). Fail closed on malformed fields. */
+function parseOptionalOpenApiBlock(
+  record: JsonObject,
+  specId: string,
+): CatalogEntry["openapi"] {
+  const value = record["openapi"];
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) {
+    throw new CatalogError(`entry "${specId}" has a non-object "openapi" block`);
+  }
+  const url = optionalString(value["url"]);
+  if (url === null || url.trim() === "") {
+    throw new CatalogError(`entry "${specId}" openapi block is missing a non-empty "url"`);
+  }
+  const authValue = value["auth"];
+  if (!isRecord(authValue)) {
+    throw new CatalogError(`entry "${specId}" openapi block is missing an "auth" object`);
+  }
+  const schemeRaw = optionalString(authValue["scheme"]);
+  if (schemeRaw !== "bearer" && schemeRaw !== "apiKeyHeader") {
+    throw new CatalogError(`entry "${specId}" openapi auth.scheme must be "bearer" or "apiKeyHeader"`);
+  }
+  let headerName: string | undefined;
+  if (schemeRaw === "apiKeyHeader") {
+    const header = optionalString(authValue["headerName"]);
+    if (header === null || header.trim() === "") {
+      throw new CatalogError(`entry "${specId}" openapi apiKeyHeader scheme requires "headerName"`);
+    }
+    headerName = header.trim();
+  }
+  const credentialLabel = optionalString(authValue["credentialLabel"]);
+  let operations: string[] | undefined;
+  if (value["operations"] !== undefined) {
+    if (!Array.isArray(value["operations"])) {
+      throw new CatalogError(`entry "${specId}" openapi.operations must be an array of operation ids`);
+    }
+    const parsed = value["operations"]
+      .map((entry) => optionalString(entry)?.trim())
+      .filter((entry): entry is string => entry !== undefined && entry !== "");
+    operations = parsed;
+  }
+  return {
+    url: url.trim(),
+    ...(operations !== undefined && operations.length > 0 ? { operations } : undefined),
+    auth: {
+      scheme: schemeRaw,
+      ...(headerName !== undefined ? { headerName } : undefined),
+      ...(credentialLabel !== null && credentialLabel.trim() !== "" ? { credentialLabel } : undefined),
+    },
+  };
+}
+
 /** Non-empty string field, failing closed with the catalog's canonical error. */
 function requireString(record: JsonObject, field: string, specId: string): string {
   const value = optionalString(record[field]);
@@ -209,6 +280,7 @@ function parseListableRecord(record: JsonObject): CatalogEntry {
   const url = optionalString(record["url"]);
   const description = optionalString(record["description"]);
   const mcpEndpoint = optionalString(record["mcpEndpoint"]);
+  const openapi = parseOptionalOpenApiBlock(record, specId);
   return {
     id,
     slug,
@@ -218,6 +290,7 @@ function parseListableRecord(record: JsonObject): CatalogEntry {
     ...(url !== null && url.trim() !== "" ? { url } : undefined),
     ...(description !== null ? { description } : undefined),
     ...(mcpEndpoint !== null && mcpEndpoint.trim() !== "" ? { mcpEndpoint } : undefined),
+    ...(openapi !== undefined ? { openapi } : undefined),
   };
 }
 
@@ -331,6 +404,87 @@ export function buildSnapshotDraft(entry: CatalogEntry, pinnedAt: string = new D
       domains: [entry.domain],
     },
   };
+}
+
+/**
+ * Builds the pinned manifest for an openapi-kind catalog entry (issue
+ * #345): generates the frozen tool surface from the already-fetched spec
+ * (honoring the entry's optional `operations` curation), derives the egress
+ * domain allowlist from the spec's HTTPS servers, and pairs them with the
+ * static bearer/apiKeyHeader auth. Fail closed on every cap: a non-openapi
+ * entry, a missing openapi block, an unknown auth scheme, a non-HTTPS spec
+ * URL, a generation cap/collision, or a curated id matching no operation —
+ * nothing partial ever pins.
+ */
+export function buildOpenApiPinnedManifest(
+  entry: CatalogEntry,
+  spec: JsonObject,
+): PinnedSnapshot["manifest"] {
+  if (entry.kind !== "openapi") {
+    throw new CatalogError(`entry "${entry.slug}" must be kind "openapi" to pin a spec surface`);
+  }
+  const openApi = entry.openapi;
+  if (openApi === undefined) {
+    throw new CatalogError(`entry "${entry.slug}" (kind openapi) is missing the "openapi" block`);
+  }
+  if (openApi.auth.scheme !== "bearer" && openApi.auth.scheme !== "apiKeyHeader") {
+    throw new CatalogError(
+      `entry "${entry.slug}" openapi auth.scheme "${openApi.auth.scheme}" is unsupported in V1 (bearer/apiKeyHeader only)`,
+    );
+  }
+  let generation;
+  try {
+    generation = generateOpenApiTools(spec, entry.slug);
+  } catch (err) {
+    if (err instanceof Error) {
+      throw new CatalogError(
+        `cannot pin openapi surface for "${entry.slug}": ${err.message}`,
+      );
+    }
+    throw err;
+  }
+  const curated = openApi.operations;
+  let tools = generation.tools;
+  if (curated !== undefined && curated.length > 0) {
+    const allowed = new Set(curated);
+    const kept = generation.operations.filter((op) => allowed.has(op.operationId));
+    for (const id of curated) {
+      if (!generation.operations.some((op) => op.operationId === id)) {
+        throw new CatalogError(
+          `entry "${entry.slug}" curates operation "${id}" but the spec declares no such operation — refuse to pin`,
+        );
+      }
+    }
+    tools = kept.map((op) => tools.find((tool) => tool.name === op.name)!);
+  }
+  const host = generation.hosts[0];
+  const credentialSchema = { type: "api_key" as const };
+  const headerName = openApi.auth.scheme === "apiKeyHeader" ? openApi.auth.headerName : undefined;
+  const manifestInput = {
+    id: entry.slug,
+    label: entry.name,
+    vendor: entry.name,
+    kind: "openapi",
+    openapi: {
+      specUrl: openApi.url,
+      auth: {
+        scheme: openApi.auth.scheme,
+        ...(headerName !== undefined ? { headerName } : undefined),
+        ...(openApi.auth.credentialLabel !== undefined
+          ? { credentialLabel: openApi.auth.credentialLabel }
+          : undefined),
+      },
+    },
+    credentialSchema,
+    tools,
+    domains: generation.hosts,
+    credentialTargets: host !== undefined ? [{ host }] : [],
+  };
+  // SAFETY: JSON round-tripping a manifest-shaped object yields a JSON
+  // document (JsonValue); validateManifest re-validates it and also
+  // guarantees deterministic byte-for-byte snapshot bytes (the pin's
+  // reviewed surface).
+  return validateManifest(JSON.parse(JSON.stringify(manifestInput)) as JsonValue);
 }
 
 function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
