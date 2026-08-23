@@ -122,6 +122,8 @@ describe("buildDeliveryBlocks", () => {
   test("escapes mrkdwn metacharacters in user-derived summary and prUrl", () => {
     // Regression for #346: summary/prUrl originate from agent/model message
     // text; without escaping they can inject mrkdwn into the delivered blocks.
+    // SAFETY: buildDeliveryBlocks is this repo's own renderer; the cast is the
+    // same narrow Block view the sibling block-shape tests use.
     const blocks = buildDeliveryBlocks("https://x.dev/pull/<script>&amp;", "closing <@U1> & <#C2> now", ITEM) as Block[];
 
     const sectionText = blocks

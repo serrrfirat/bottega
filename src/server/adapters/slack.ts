@@ -105,6 +105,55 @@ export interface SlackAction {
   messageTs: string;
 }
 
+/**
+ * Hard cap on a downloaded Slack file's raw bytes, enforced on the ACTUAL
+ * streaming read (issue #346 LOW-15). A huge Slack file must not be buffered
+ * whole into memory just because `files.info` reported a small `size` — that
+ * metadata is Slack-side and can drift/lie, so the read itself bounds memory.
+ * Generous enough for the legitimate consumers (voice clips cap at
+ * {@link VOICE_MAX_BYTES} 25 MiB; org objects default to 10 MiB) while
+ * refusing an oversized download before it is fully buffered.
+ */
+export const SLACK_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
+
+/**
+ * Reads an already-fetched download response body up to `maxBytes` bytes via
+ * a streaming reader, cancelling the stream the moment the cap is exceeded so
+ * the oversized remainder is never buffered (mirrors the webhook body cap,
+ * issue #346). Content-Length is never trusted as the bound. Throws when the
+ * body exceeds the cap.
+ */
+async function readDownloadBytes(response: Response, fileId: string, maxBytes: number): Promise<Uint8Array> {
+  if (response.body === null) throw new Error(`slack: download response for file ${fileId} has no body`);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(
+          `slack: download for file ${fileId} exceeds the ${maxBytes}-byte cap (read ${total} bytes), refusing to buffer the whole file`,
+        );
+      }
+      chunks.push(value);
+    }
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.includes("exceeds the")) throw cause;
+    throw new Error(`slack: failed to read downloaded file ${fileId}`, { cause });
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 const slackTextObjectSchema = z.object({
   type: z.enum(["mrkdwn", "plain_text"]),
   text: z.string(),
@@ -1425,11 +1474,19 @@ export function createSlackAdapter(opts: {
           `slack: download request failed for file ${fileId} (${response.status} ${response.statusText})`,
         );
       }
+      // Read the body under a hard byte cap (issue #346 LOW-15): the actual
+      // streamed read, never trusting `files.info` `size`/Content-Length.
+      // readDownloadBytes throws its own descriptive error (including the
+      // oversized-body refusal) and wraps read-level failures in a
+      // file-identified message, so it propagates untouched to the caller.
       let bytes: Uint8Array;
       try {
-        bytes = new Uint8Array(await response.arrayBuffer());
+        bytes = await readDownloadBytes(response, fileId, SLACK_DOWNLOAD_MAX_BYTES);
       } catch (cause) {
-        throw new Error(`slack: failed to read downloaded file ${fileId}`, { cause });
+        // readDownloadBytes rethrows its own errors unmodified; this guard is
+        // only a defensive normalization for a non-Error throw crossing the
+        // async boundary.
+        throw cause instanceof Error ? cause : new Error(`slack: failed to read downloaded file ${fileId}`, { cause });
       }
       return {
         name: file.name,
