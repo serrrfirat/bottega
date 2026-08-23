@@ -56,6 +56,14 @@ export type { ToolStepEvent, ToolStepSink, SearchResultRow } from "./slack-turn-
 export const DIGEST_CAP = 20;
 /** Bound on the digest summarization turn (issue #42). */
 export const DEFAULT_DIGEST_TIMEOUT_MS = 60_000;
+/**
+ * Bound on the org-scope memory write for a transcribed voice note
+ * (issue #171-security): an arbitrarily long transcript must not write
+ * unbounded content into org memory. Careful trimming keeps the fact
+ * readable while capping storage.
+ */
+const VOICE_NOTE_MEMORY_MAX_CHARS = 4000;
+const VOICE_NOTE_MEMORY_TRUNC_MARKER = "\n…[truncated]";
 
 export interface SpaceServiceDeps {
   store: Store;
@@ -886,12 +894,17 @@ export class SpaceService {
 
     // Org memory: the transcript is an org fact sourced from a voice note.
     // Best-effort like digest retention — a memory save failure never drops
-    // the turn.
+    // the turn. Bound the content (issue #171-security): an arbitrarily long
+    // transcript must not write unbounded content into org memory.
     if (this.#memoryProvider) {
       try {
+        const bounded =
+          text.length <= VOICE_NOTE_MEMORY_MAX_CHARS
+            ? text
+            : `${text.slice(0, VOICE_NOTE_MEMORY_MAX_CHARS - VOICE_NOTE_MEMORY_TRUNC_MARKER.length)}${VOICE_NOTE_MEMORY_TRUNC_MARKER}`;
         await this.#memoryProvider.save({
           scope: { kind: "org" },
-          content: text,
+          content: bounded,
           metadata: { kind: "voice-note" },
           source: "voice",
         });

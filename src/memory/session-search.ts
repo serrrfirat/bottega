@@ -272,26 +272,45 @@ export function searchSessions(db: Database, input: SessionSearchQuery): Session
   }));
 }
 
-export const sessionSearchArgsSchema = z.object({
-  query: z.string().min(1),
-  space: z.string().min(1).optional(),
-  limit: z.number().int().min(1).max(MAX_LIMIT).optional(),
-});
+export const sessionSearchArgsSchema = z
+  .object({
+    query: z.string().min(1),
+    limit: z.number().int().min(1).max(MAX_LIMIT).optional(),
+  })
+  .strict();
 
-/** SDK tool definition; the composition root supplies the shared DB and transcript directory. */
+/**
+ * SDK tool definition; the composition root supplies the shared DB and
+ * transcript directory. Own-space by construction (issue #171-security): the
+ * searched space ALWAYS derives from the calling session's context — the
+ * space id is resolved from the session file exactly like slack_read — so a
+ * caller can never read another space's transcripts by passing a `space`
+ * argument (there is none). Fail closed when the session context is missing.
+ */
 export function sessionSearchToolDefinitions(db: Database, transcriptDir: string): ToolDefinition[] {
   const search: ToolDefinition<typeof sessionSearchArgsSchema> = {
     name: "session_search",
     label: "Search session transcripts",
     description:
-      "Searches durable session transcripts with full-text ranking. Optionally filters by space. " +
-      "Returns redacted, truncated message excerpts with source file, line, and timestamp. Read-only.",
+      "Searches this conversation's own session transcripts with full-text ranking. " +
+      "Returns redacted, truncated message excerpts with source file, line, and timestamp. " +
+      "Read-only. Scope-bound to this conversation's own space — it cannot read any other space.",
     parameters: sessionSearchArgsSchema,
     approval: "read",
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // The space is ALWAYS derived from the session's context — there is no
+      // caller-supplied space argument (own-space by construction). Fail
+      // closed if the session context is missing, exactly like slack_read.
+      const space = sessionIdFromFilePath(ctx?.sessionManager?.getSessionFile?.());
+      if (!space) {
+        return toolError(
+          "session_search: could not resolve this conversation's space (no session context). " +
+            "The space is always derived from the session — there is no space argument.",
+        );
+      }
       try {
         indexSessionFiles(db, transcriptDir);
-        const results = searchSessions(db, params);
+        const results = searchSessions(db, { query: params.query, limit: params.limit, space });
         return { content: [{ type: "text", text: JSON.stringify(results) }] };
       } catch (error) {
         return toolError(errorMessage(error));

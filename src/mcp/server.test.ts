@@ -481,7 +481,7 @@ describe("MCP server conformance (spawned entrypoint)", () => {
       const sessionSearch = tools.find((t) => t.name === "session_search")!;
       // SAFETY: session_search's zod schema advertises each parameter as a JSON-schema object with optional type.
       const sessionSearchProps = sessionSearch.inputSchema.properties as Record<string, { type?: string }>;
-      expect(Object.keys(sessionSearchProps).sort()).toEqual(["limit", "query", "space"]);
+      expect(Object.keys(sessionSearchProps).sort()).toEqual(["limit", "query"]);
       expect(sessionSearchProps.query?.type).toBe("string");
       expect(sessionSearch.inputSchema.required).toEqual(["query"]);
 
@@ -502,7 +502,64 @@ describe("MCP server conformance (spawned entrypoint)", () => {
     }
   });
 
-  test("tools/call session_search indexes and searches transcript JSONL", async () => {
+  test("tools/call session_search searches ONLY the session's own space (issue #171-security)", async () => {
+    // Pin the server to space slack:C1 (policyJson seeds channel C1 -> slack:C1)
+    // and search: the tool must return only this space's hits, never another's.
+    const h = await launch({ configYaml: ALLOW_ALL, policyJson: "{}" });
+    try {
+      expect(h.spaceId).toBe("slack:C1");
+      writeFileSync(
+        join(h.dir, "sessions", "slack:C1.jsonl"),
+        `${JSON.stringify({
+          type: "message",
+          id: "m1",
+          parentId: null,
+          timestamp: "2026-08-17T01:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "release train is green" }] },
+        })}\n`,
+      );
+      // An unrelated space's transcript must stay invisible to this session.
+      writeFileSync(
+        join(h.dir, "sessions", "slack:C2.jsonl"),
+        `${JSON.stringify({
+          type: "message",
+          id: "m2",
+          parentId: null,
+          timestamp: "2026-08-17T02:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "release plans are confidential" }] },
+        })}\n`,
+      );
+      const result = await callTool(h.client, "session_search", { query: "release" });
+      expect(result.isError).not.toBe(true);
+      // SAFETY: session_search returns a JSON array of {space,file,line,timestamp,text}
+      // rows (the SessionSearchResult shape); the test asserts on space + text only.
+      const hits = JSON.parse(result.content[0]!.text!) as Array<{ space: string; text: string }>;
+      expect(hits).toHaveLength(1);
+      expect(hits[0]!.space).toBe("slack:C1");
+      expect(hits[0]!.text).toContain("green");
+      // The other space's transcript is never surfaced.
+      expect(hits.some((hit) => hit.text.includes("confidential"))).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("tools/call session_search has NO caller-supplied space argument (own-space by construction)", async () => {
+    const h = await launch({ configYaml: ALLOW_ALL, policyJson: "{}" });
+    try {
+      // A space arg is rejected at the schema boundary as an MCP protocol
+      // error — an unconstrained cross-space read is impossible (issue #171-security).
+      await expect(
+        h.client.callTool({ name: "session_search", arguments: { query: "release", space: "slack:C2" } }),
+      ).rejects.toThrow(/invalid arguments/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("tools/call session_search fails closed when no space is pinned (no unconstrained search)", async () => {
+    // No policyJson -> no seeded space -> the server boots un-pinned; the
+    // tool must refuse rather than search every space's transcripts.
     const h = await launch({ configYaml: ALLOW_ALL });
     try {
       writeFileSync(
@@ -515,17 +572,9 @@ describe("MCP server conformance (spawned entrypoint)", () => {
           message: { role: "user", content: [{ type: "text", text: "release train is green" }] },
         })}\n`,
       );
-      const result = await callTool(h.client, "session_search", { query: "release", space: "slack:C9" });
-      expect(result.isError).not.toBe(true);
-      expect(JSON.parse(result.content[0]!.text!)).toEqual([
-        {
-          space: "slack:C9",
-          file: "slack:C9.jsonl",
-          line: 1,
-          timestamp: "2026-08-17T01:00:00.000Z",
-          text: "release train is green",
-        },
-      ]);
+      await expect(
+        h.client.callTool({ name: "session_search", arguments: { query: "release" } }),
+      ).rejects.toThrow(/no session space is pinned/);
     } finally {
       await h.cleanup();
     }

@@ -3519,6 +3519,35 @@ describe("SpaceService voice notes (issue #96, caller-level)", () => {
     expect(driver.last().prompts[0]!.text).toBe("hello world");
   });
 
+  test("a long transcript is capped before the org-scope memory write (issue #171-security)", async () => {
+    const store = await voiceStore();
+    const download = audioClip();
+    const { posts, memory, service } = voiceHarness(store, download);
+    const longTranscript = "x".repeat(10_000);
+    handleStt(() => new Response(JSON.stringify({ text: longTranscript }), { headers: { "content-type": "application/json" } }));
+    process.env.NEAR_API_KEY = "near-test-key";
+
+    await service.handleInboundMessage(
+      msg({
+        spaceId: "slack:C1",
+        text: "",
+        ts: "9.9",
+        files: [{ id: "F_AUDIO", name: "voice.m4a", mimeType: "audio/mp4", size: download.size }],
+      }),
+    );
+    await service.stop();
+
+    // The transcript is posted in full to the channel, but the org memory
+    // write is bounded — an arbitrarily long clip cannot write unbounded
+    // content into org memory.
+    const transcriptPost = posts.find((p) => p.text?.startsWith("🎙️ xxxxxxxxxx"));
+    expect(transcriptPost).toBeDefined();
+    expect(memory.saved).toHaveLength(1);
+    expect(memory.saved[0]!.content.length).toBeLessThan(10_000);
+    expect(memory.saved[0]!.content).toContain("[truncated]");
+    expect(memory.saved[0]!.metadata).toEqual({ kind: "voice-note" });
+  });
+
   test("unsupported mimetype: explicit reply, audited VOICE_NOTE_FAILED_EVENT, no download, no agent turn", async () => {
     const store = await voiceStore();
     const download = audioClip({ mimeType: "audio/x-caf" });
