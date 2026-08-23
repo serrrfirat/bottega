@@ -607,6 +607,43 @@ the runtime registry like any catalog extension. The
 test-only fixture proves registration, tool surfacing, execution, and merged
 egress domains end to end.
 
+### OpenAPI extensions (issue #345): API-first vendors via a spec
+
+API-first vendors that never ship an MCP server plug in through an OpenAPI
+spec. A catalog entry with `kind: "openapi"` carries an `openapi` block
+(spec URL, optional operation curation, static bearer/apiKeyHeader auth),
+and the connect journey is the same chat flow as MCP: draft → review
+(shows the generated operations + their read/write tiers) → pin → connect
+(credential provisioning).
+
+- **Spec-driven tool surface** — at pin time the spec is fetched ONCE
+  (≤2MB, MUST be OpenAPI 3.x, HTTPS-only servers), validated, and the tool
+  surface is FROZEN into the pinned snapshot (deterministic, reviewable
+  like MCP pins; the runtime never re-fetches). Each operation becomes
+  `<extension>_<operationId>` (slug fallback from method+path), with
+  JSON-Schema-derived params (path/query scalars + a JSON body param).
+- **Tiering** — GET → read tier; POST/PUT/PATCH/DELETE → write tier
+  (existing per-space policy + approval gates unchanged; a DELETE requires
+  approval under the default policy, a GET does not).
+- **Caps fail closed** — a spec exceeding 2MB, declaring >200 operations,
+  a non-HTTPS server, a tool-name collision, or an unknown auth scheme
+  refuses to pin; deprecated operations are skipped; a curated operation
+  id matching nothing refuses to pin.
+- **Credential injection is the core property** — the agent never holds
+  the credential. Static bearer/apiKeyHeader lives in the vault/proxy
+  secret file; iron-proxy's static `inject` transform (model-gateway
+  secrets #208) adds the header for the allowlisted host at egress. The
+  executor sends NO auth header, so transcripts, audit, and agent context
+  carry zero keys. Upstream 4xx/5xx surfaces as a tool error naming the
+  status; responses are bounded to 256KB.
+- **Egress** — hosts from the spec's `servers[]` (exact HTTPS, no redirect
+  expansion) become the extension's allowlist scope at pin. Requests route
+  server → iron-proxy → upstream; the proxy enforces the allowlist and
+  injects the credential.
+- **V1 scope cuts** — static credentials only (bearer / apiKeyHeader);
+  OAuth-protected REST APIs stay out (hosted MCP already covers them).
+  Calls execute in the server process like MCP surface tools.
+
 ## Co-worker work delivery (epic #122)
 
 The work queue now supports coding and non-code operations through one

@@ -357,6 +357,20 @@ opt-in local fallback: set `BOTTEGA_KEYCHAIN_SEED=1` and store
 Fail closed stays: a secret missing from the vault, env, and enabled Keychain
 fallback refuses to boot with the existing guard messages.
 
+**OpenAPI extension credentials (issue #345)** — an API-first (openapi-kind)
+extension's static bearer/apiKeyHeader credential is provisioned through
+the same one-time upload path as any extension: `connect_upload_link
+extension=<extensionId> scope=org` stores the value in the auth-broker
+vault (opaque api-key row) — never through chat, a transcript, or the
+audit trail. At egress the credential is injected by iron-proxy's static
+`inject` transform (model-gateway secrets #208): the proxy adds the
+configured header (`Authorization: Bearer …` for a bearer scheme, or the
+declared `headerName` for `apiKeyHeader`) for the extension's allowlisted
+HTTPS host. The agent, transcript, and context hold zero keys. The
+end-to-end executor + inject contract is verified hermetically in tests
+(the executor sends no auth header; a fake proxy applies the inject rule
+and a fake upstream asserts it).
+
 `.env` carries secrets + deployment identity only (issue #67). Runtime knobs
 (approval timeouts, response mode, memory injection, extensions policy, repo
 allowlist, model defaults, workspaces dir, git/api base URLs, memory backend
