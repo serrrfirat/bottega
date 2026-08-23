@@ -7,6 +7,7 @@ import {
   BASE_EGRESS_DOMAINS,
   DEV_EGRESS_CONFIG_PATH,
   mergedEgressDomains,
+  openApiInjectEntries,
   regenerateDevEgressConfig,
   regenerateEgressConfig,
   renderDevEgressConfig,
@@ -17,6 +18,8 @@ import {
 } from "./generate";
 import { readPinnedSnapshots, SNAPSHOT_SCHEMA, type PinnedSnapshot } from "../extensions/registry";
 import { createFixtureRegistry, FIXTURE_EXTENSION_DOMAIN, FIXTURE_EXTENSION_ID } from "../extensions/fixture";
+import { buildOpenApiPinnedManifest, type CatalogEntry } from "../extensions/fetch-catalog";
+import type { JsonObject } from "../extensions/manifest";
 
 const COMMITTED_EGRESS = readFileSync(resolve(import.meta.dir, "../../config/egress.yml"), "utf8");
 
@@ -549,5 +552,122 @@ describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
     expect(yaml).not.toContain("gmail-oauth.json");
     expect(yaml).not.toContain("token_endpoint:");
     expect(yaml).not.toContain("gmail.secret");
+  });
+});
+
+describe("openapi extension static inject entries (issue #345)", () => {
+  const OPENAPI_SPEC: JsonObject = {
+    openapi: "3.0.3",
+    info: { title: "SendGrid API", version: "1.0.0" },
+    servers: [{ url: "https://api.sendgrid.test/v1" }],
+    paths: {
+      "/mail/send": { post: { operationId: "send_mail", responses: { "200": { description: "ok" } } } },
+    },
+  };
+  function openApiEntry(overrides: Partial<CatalogEntry> = {}): CatalogEntry {
+    return {
+      id: "openapi/sendgrid",
+      slug: "sendgrid",
+      name: "SendGrid",
+      kind: "openapi",
+      domain: "sendgrid.com",
+      openapi: { url: "https://raw.sendgrid.test/openapi.json", auth: { scheme: "bearer" } },
+      ...overrides,
+    };
+  }
+  function openApiSnapshot(): PinnedSnapshot {
+    const manifest = buildOpenApiPinnedManifest(openApiEntry(), OPENAPI_SPEC);
+    const snapshot: PinnedSnapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: "sendgrid",
+      pinnedAt: "2026-08-20T00:00:00.000Z",
+      source: {
+        catalog: "https://integrations.sh/api",
+        specId: "sendgrid",
+        vendorOfficial: true,
+        reviewed: true,
+      },
+      manifest,
+    };
+    return snapshot;
+  }
+
+  test("openApiInjectEntries derives a bearer inject entry from an openapi snapshot", () => {
+    const snapshot = openApiSnapshot();
+    const entries = openApiInjectEntries([snapshot]);
+    expect(entries).toEqual([
+      {
+        extensionId: "sendgrid",
+        host: "api.sendgrid.test",
+        header: "Authorization",
+        formatter: "Bearer {{ .Value }}",
+        secretFile: "sendgrid.secret",
+      },
+    ]);
+  });
+
+  test("openapi static inject entries render into the secrets transform with require:true", () => {
+    const snapshot = openApiSnapshot();
+    const yaml = renderSecretsTransform([], openApiInjectEntries([snapshot]));
+    expect(yaml).toContain('path: "/data/proxy-secrets/sendgrid.secret"');
+    expect(yaml).toContain('header: "Authorization"');
+    expect(yaml).toContain('formatter: "Bearer {{ .Value }}"');
+    expect(yaml).toContain('host: "api.sendgrid.test"');
+    expect(yaml).toContain("require: true");
+    const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
+    // The 6 model-gateway keys + 1 openapi inject entry.
+    // SAFETY: every secrets entry is a block mapping with `source`/`inject`
+    // block mappings (the shape openapi static inject entries render), so
+    // the casts only re-narrow fields the entry construction guarantees.
+    const openapiEntry = entries.find((e) =>
+      String((e["source"] as Record<string, YamlNode>)["path"]).includes("sendgrid.secret"),
+    );
+    expect(openapiEntry).toBeDefined();
+    // SAFETY: openapi inject entries render a block `inject` mapping with a
+    // `require` scalar (see renderOpenApiInjectEntries) — the cast only
+    // re-narrows that known shape.
+    expect(String((openapiEntry!["inject"] as Record<string, YamlNode>)["require"])).toBe("true");
+  });
+
+  test("an apiKeyHeader openapi entry injects its headerName with a bare formatter", () => {
+    const entry = openApiEntry({
+      openapi: {
+        url: "https://raw.sendgrid.test/openapi.json",
+        auth: { scheme: "apiKeyHeader", headerName: "X-Api-Key" },
+      },
+    });
+    const manifest = buildOpenApiPinnedManifest(entry, OPENAPI_SPEC);
+    const snapshot: PinnedSnapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: "sendgrid",
+      pinnedAt: "2026-08-20T00:00:00.000Z",
+      source: { catalog: "https://integrations.sh/api", specId: "sendgrid", vendorOfficial: true, reviewed: true },
+      manifest,
+    };
+    const entries = openApiInjectEntries([snapshot]);
+    expect(entries[0]).toMatchObject({ header: "X-Api-Key", formatter: "{{ .Value }}" });
+  });
+
+  test("MCP/CLI snapshots (including api_key OAuth-less) get NO static openapi inject entry (issue #284 call-scoped)", () => {
+    // The seed Fixture is an api_key MCP extension — it must never receive a
+    // static openapi inject entry (MCP/CLI stay call-scoped).
+    const entries = openApiInjectEntries(readPinnedSnapshots(SNAPSHOTS_DIR));
+    expect(entries).toEqual([]);
+  });
+
+  test("regenerateEgressConfig embeds an openapi static inject entry for a runtime-openapi snapshot", () => {
+    const dir = mkdtempSync(join(tmpdir(), "egress-openapi-"));
+    try {
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      mkdirSync(snapshotsDir);
+      const snapshot = openApiSnapshot();
+      const yaml = regenerateEgressConfig(snapshotsDir, egressPath, [snapshot]);
+      expect(yaml).toContain('path: "/data/proxy-secrets/sendgrid.secret"');
+      expect(readFileSync(egressPath, "utf8")).toContain('host: "api.sendgrid.test"');
+      expect(readFileSync(egressPath, "utf8")).toContain('"api.sendgrid.test"'); // allowlisted
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

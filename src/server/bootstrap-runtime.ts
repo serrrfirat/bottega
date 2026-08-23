@@ -54,6 +54,7 @@ import {
 import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/registry";
 import { mergeRuntimeRegistry } from "../extensions/runtime-registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
+import { createOpenApiEgressSeam } from "../extensions/openapi-egress";
 import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
 import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import type { ExtensionManifest, McpBinding } from "../extensions/manifest";
@@ -229,6 +230,11 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     router: { request: (request) => resolveRouter().request(request) },
     boundary,
     surfaces,
+    // OpenAPI egress (issue #345): the REAL static-inject seam, resolving
+    // the openapi extension for a host and failing closed until its static
+    // credential is provisioned (the compose/proxy env injects the key at
+    // egress — the seam never touches the secret).
+    openapiEgress: createOpenApiEgressSeam({ registry }),
     ...(deps.mcpTransport !== undefined ? { mcpTransport: deps.mcpTransport } : undefined),
     ...(deps.onToolStep !== undefined ? { onToolStep: deps.onToolStep } : undefined),
   });

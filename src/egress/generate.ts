@@ -211,6 +211,76 @@ export function credentialTargetEntries(
   }));
 }
 
+/**
+ * A static inject entry for an OPENAPI extension (issue #345): the proxy
+ * injects the extension's provisioned static credential (from its secret
+ * file) as a fixed header for its allowlisted host at egress — the agent
+ * never holds the key. This is the OpenAPI egress path: unlike MCP/CLI
+ * extensions (call-scoped, issue #284), openapi calls cannot fire a
+ * per-call proxy token through the executor seam, so the credential is a
+ * STATIC per-extension entry exactly like the model-gateway keys (#208).
+ */
+export interface OpenApiInjectEntry {
+  extensionId: string;
+  /** The allowlisted origin host the proxy injects the key for (the first spec server). */
+  host: string;
+  /** The header name (Authorization for bearer, the block's headerName for apiKeyHeader). */
+  header: string;
+  /** The Go-template formatter iron-proxy applies (`Bearer {{ .Value }}` or `{{ .Value }}`). */
+  formatter: string;
+  /** The extension's static secret file name (`<extensionId>.secret`). */
+  secretFile: string;
+}
+
+/**
+ * Derives the static inject entries from the OPENAPI-kind snapshots only
+ * (V1 static bearer/apiKeyHeader, issue #345). MCP/CLI extensions receive
+ * NO static entry — their credentials are call-scoped (issue #284). Fail
+ * closed per entry: an openapi manifest with an unknown auth scheme is
+ * surfaced loudly (it cannot be injected). Empty for a seed with no
+ * openapi snapshots, so the committed byte-pin is unchanged.
+ */
+export function openApiInjectEntries(
+  snapshots: readonly PinnedSnapshot[],
+): OpenApiInjectEntry[] {
+  const entries: OpenApiInjectEntry[] = [];
+  for (const snapshot of snapshots) {
+    const manifest = snapshot.manifest;
+    if (manifest.kind !== "openapi") continue;
+    const host = manifest.domains[0];
+    if (host === undefined) continue;
+    const scheme = manifest.openapi.auth.scheme;
+    if (scheme === "bearer") {
+      entries.push({
+        extensionId: manifest.id,
+        host,
+        header: "Authorization",
+        formatter: "Bearer {{ .Value }}",
+        secretFile: `${manifest.id}.secret`,
+      });
+    } else if (scheme === "apiKeyHeader") {
+      const headerName = manifest.openapi.auth.headerName;
+      if (headerName === undefined || headerName.trim() === "") {
+        throw new Error(
+          `egress config generation: openapi extension "${manifest.id}" declares apiKeyHeader auth without a "headerName" — cannot inject`,
+        );
+      }
+      entries.push({
+        extensionId: manifest.id,
+        host,
+        header: headerName,
+        formatter: "{{ .Value }}",
+        secretFile: `${manifest.id}.secret`,
+      });
+    } else {
+      throw new Error(
+        `egress config generation: openapi extension "${manifest.id}" has unknown auth scheme "${scheme}" — cannot inject`,
+      );
+    }
+  }
+  return entries;
+}
+
 /** Static blocks shared verbatim by the strict and dev renderers (dns, proxy, tls, management). */
 const EGRESS_STATIC_BLOCKS = `dns:
   listen: ":53"
@@ -273,6 +343,30 @@ function renderModelGatewayEntries(keys: readonly ModelGatewayKey[]): string {
 }
 
 /**
+ * The indented `- source:` entries for the OPENAPI static keys (issue
+ * #345): one per openapi extension, sourcing the static credential from the
+ * extension's secret file and injecting it as the auth scheme's header for
+ * the first spec host. `require: true` — a missing key fails the request
+ * closed (502) instead of reaching the vendor unauthenticated.
+ */
+function renderOpenApiInjectEntries(entries: readonly OpenApiInjectEntry[]): string {
+  return entries
+    .map(
+      (entry) => `        - source:
+            type: file
+            path: "${PROXY_SECRETS_MOUNT_PATH}/${entry.secretFile}"
+            ttl: "30s"
+          inject:
+            header: ${JSON.stringify(entry.header)}
+            formatter: ${JSON.stringify(entry.formatter)}
+            require: true
+          rules:
+            - host: ${JSON.stringify(entry.host)}`,
+    )
+    .join("\n");
+}
+
+/**
  * Renders the `secrets` transform (iron-proxy v0.49.0 inject mode, issue
  * #53 + #208): one entry per extension, sourcing the credential from the
  * extension's secret file (written by the runtime's boundary) and
@@ -285,20 +379,26 @@ function renderModelGatewayEntries(keys: readonly ModelGatewayKey[]): string {
  * transform runs BEFORE secrets so the LLM judge sees no real credentials
  * (iron-proxy README's recommended ordering).
  */
-export function renderSecretsTransform(_extensions: readonly ExtensionEgressEntry[] = []): string {
+export function renderSecretsTransform(
+  _extensions: readonly ExtensionEgressEntry[] = [],
+  openApiEntries: readonly OpenApiInjectEntry[] = [],
+): string {
   const gatewayEntries = renderModelGatewayEntries(MODEL_GATEWAY_KEYS);
+  const openApiSection = openApiEntries.length > 0 ? `${renderOpenApiInjectEntries(openApiEntries)}\n` : "";
   return `  # 3. Secrets: request-scoped extension authorization plus static
   #    model-gateway keys. Extension calls carry a random per-call proxy
   #    token. The credential boundary installs its token-to-secret mapping
   #    only for the call lifetime and only for reviewed credential targets,
   #    then revokes it in finally. Egress domains remain reachability policy
-  #    and never grant credential authority.
+  #    and never grant credential authority. OPENAPI extensions (issue
+  #    #345) inject a STATIC per-extension credential (bearer/apiKeyHeader)
+  #    for their allowlisted host — the agent never holds the key.
   - name: secrets
     config:
       secrets:
 ${renderScopedAuthorizationRegion()}
 ${gatewayEntries}
-`;
+${openApiSection}`;
 }
 
 /**
@@ -309,12 +409,13 @@ ${gatewayEntries}
 export function renderEgressConfig(
   domains: readonly string[],
   extensions: readonly ExtensionEgressEntry[] = [],
+  openApiEntries: readonly OpenApiInjectEntry[] = [],
 ): string {
   const domainLines = domains.map((domain) => `        - "${domain}"`).join("\n");
   // The secrets transform is always emitted: the model-gateway static-key
   // entries (issue #208) are base config — only the extension entries are
   // optional.
-  const secretsTransform = `${renderSecretsTransform(extensions)}\n`;
+  const secretsTransform = `${renderSecretsTransform(extensions, openApiEntries)}\n`;
   // Issue #284: there is NO oauth_token transform — OAuth for hosted MCP
   // extensions is owned by the MCP SDK (the runtime's OAuthClientProvider
   // sends the bearer through the allowlisted host); the proxy is
@@ -393,8 +494,11 @@ ${secretsTransform}log:
  * + the model-gateway static keys), with a dev-appropriate comment (no
  * judge precedes it in the dev pipeline).
  */
-function renderDevSecretsTransform(extensions: readonly ExtensionEgressEntry[]): string {
-  return renderSecretsTransform(extensions).replace(
+function renderDevSecretsTransform(
+  extensions: readonly ExtensionEgressEntry[],
+  openApiEntries: readonly OpenApiInjectEntry[] = [],
+): string {
+  return renderSecretsTransform(extensions, openApiEntries).replace(
     "  # 3. Secrets:",
     "  # 2. Secrets:",
   );
@@ -413,12 +517,13 @@ function renderDevSecretsTransform(extensions: readonly ExtensionEgressEntry[]):
  */
 export function renderDevEgressConfig(
   extensions: readonly ExtensionEgressEntry[] = [],
+  openApiEntries: readonly OpenApiInjectEntry[] = [],
 ): string {
   // The secrets transform is always emitted: the model-gateway static-key
   // entries (issue #208) are base config — only the extension entries are
   // optional. Issue #284: no oauth_token transform — hosted-MCP OAuth is
   // the SDK's job, the proxy never mints.
-  const secretsTransform = `${renderDevSecretsTransform(extensions)}\n`;
+  const secretsTransform = `${renderDevSecretsTransform(extensions, openApiEntries)}\n`;
   return `# iron-proxy egress policy for bottega — LOCAL DEV (permissive, issue #126).
 # Schema: ironsh/iron-proxy v0.49.0 single YAML config, loaded via
 #   iron-proxy -config /etc/iron-proxy/egress.yml
@@ -476,7 +581,8 @@ export function regenerateEgressConfig(
   // per-snapshot domains pass through as-is (order-stable).
   const extensionDomains = snapshots.flatMap((snapshot) => snapshot.manifest.domains);
   const extensionEntries = credentialTargetEntries(snapshots);
-  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries);
+  const openApiEntries = openApiInjectEntries(snapshots);
+  const yaml = renderEgressConfig(mergedEgressDomains(extensionDomains), extensionEntries, openApiEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }
@@ -497,7 +603,8 @@ export function regenerateDevEgressConfig(
 ): string {
   const snapshots = [...readPinnedSnapshots(snapshotsDir), ...runtimeSnapshots];
   const extensionEntries = credentialTargetEntries(snapshots);
-  const yaml = renderDevEgressConfig(extensionEntries);
+  const openApiEntries = openApiInjectEntries(snapshots);
+  const yaml = renderDevEgressConfig(extensionEntries, openApiEntries);
   writeFileSync(resolve(outPath), yaml);
   return yaml;
 }
