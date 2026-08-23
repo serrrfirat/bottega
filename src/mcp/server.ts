@@ -349,7 +349,6 @@ const sessionSearchJsonSchema = {
   type: "object",
   properties: {
     query: { type: "string", minLength: 1 },
-    space: { type: "string", minLength: 1 },
     limit: { type: "integer", minimum: 1, maximum: 20 },
   },
   required: ["query"],
@@ -606,9 +605,21 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
     await auditDecision(tool, gate.tier, gate.decision, gate.reason, args);
     if (gate.error) throw gate.error;
 
+    // Own-space by construction (issue #171-security): the searched space is
+    // ALWAYS the server's pinned space — there is no caller-supplied space
+    // argument. Fail closed (deny) when the server has no pinned space: an
+    // unconstrained search would leak every space's transcripts.
+    const space = opts.spaceId ?? "";
+    if (!space) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        "session_search: no session space is pinned for this MCP server — refusing an unconstrained search.",
+      );
+    }
+
     try {
       indexSessionFiles(opts.sessionSearch.db, opts.sessionSearch.transcriptDir);
-      const entries = searchSessions(opts.sessionSearch.db, args);
+      const entries = searchSessions(opts.sessionSearch.db, { query: args.query, limit: args.limit, space });
       return { content: [{ type: "text", text: JSON.stringify(entries) }] };
     } catch (error) {
       return { content: [{ type: "text", text: errorMessage(error) }], isError: true };
@@ -913,8 +924,9 @@ export function createMemoryMcpServer(opts: MemoryMcpServerOptions): Server {
       {
         name: "session_search",
         description:
-          "Searches durable session transcripts with full-text ranking and an optional exact space filter. " +
-          "Returns redacted, truncated message excerpts with source file, line, and timestamp. Read-only.",
+          "Searches this conversation's own session transcripts with full-text ranking. " +
+          "Returns redacted, truncated message excerpts with source file, line, and timestamp. " +
+          "Read-only. Scope-bound to this conversation's own space — it cannot read any other space.",
         inputSchema: sessionSearchJsonSchema,
       },
       // Issue #206: the internal tools — the SAME definitions the SDK

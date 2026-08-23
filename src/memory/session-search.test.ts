@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,8 @@ import {
   indexSessionFiles,
   messageLineSchema,
   searchSessions,
+  sessionSearchArgsSchema,
+  sessionSearchToolDefinitions,
   SessionSearchUnavailableError,
 } from "./session-search";
 
@@ -195,5 +198,55 @@ describe("transcript writer -> reader round-trip (#171)", () => {
     expect(hits[0]!.file).toBe(`${space}.jsonl`);
     expect(hits[0]!.timestamp).toBe(timestamp);
     expect(hits[0]!.text).toBe("alpha release plan post-schema");
+  });
+});
+
+/** The context surface the tool bridge reads from an ExtensionContext. */
+interface ToolRunContext {
+  sessionManager: { getSessionFile(): string | undefined };
+}
+
+/** Builds an ExtensionContext whose session file names the space id (issue #66 convention). */
+function ctxForSessionFile(file: string | undefined): ExtensionContext {
+  const ctx: ToolRunContext = { sessionManager: { getSessionFile: () => file } };
+  // SAFETY: session_search resolves the space id only via sessionManager.getSessionFile()
+  // (the tool bridge); ToolRunContext is exactly that surface, so the stub is sound.
+  return ctx as ExtensionContext;
+}
+
+describe("session_search tool execution scoping (issue #171-security)", () => {
+  test("the wire schema has NO caller-supplied space argument", () => {
+    expect(sessionSearchArgsSchema.safeParse({ query: "alpha" }).success).toBe(true);
+    expect(sessionSearchArgsSchema.safeParse({ query: "alpha", limit: 5 }).success).toBe(true);
+    // A caller must not be able to pick another space — a space arg is rejected.
+    expect(sessionSearchArgsSchema.safeParse({ query: "alpha", space: "slack:C2" }).success).toBe(false);
+  });
+
+  test("execute searches ONLY the session's own space, never another space's transcripts", async () => {
+    const { db, dir } = fixture();
+    writeSession(dir, "slack:C1", [entry("release train is green", "2026-08-17T01:00:00.000Z")]);
+    writeSession(dir, "slack:C2", [entry("release plans are confidential", "2026-08-17T02:00:00.000Z")]);
+    const [tool] = sessionSearchToolDefinitions(db, dir);
+
+    const result = await tool.execute("tc1", { query: "release" }, undefined, undefined, ctxForSessionFile(join(dir, "slack:C1.jsonl")));
+    const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
+    // SAFETY: the tool serializes SessionSearchResult rows (which include space);
+    // the test asserts on the space and text fields only.
+    const hits = JSON.parse(text) as Array<{ space: string; text: string }>;
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.space).toBe("slack:C1");
+    expect(hits.some((hit) => hit.text.includes("confidential"))).toBe(false);
+  });
+
+  test("execute fails closed (no all-space search) when session context is missing", async () => {
+    const { db, dir } = fixture();
+    writeSession(dir, "slack:C1", [entry("release train is green", "2026-08-17T01:00:00.000Z")]);
+    const [tool] = sessionSearchToolDefinitions(db, dir);
+
+    // No session file -> no resolvable space -> the tool must error, not
+    // search every space's transcripts (issue #171-security).
+    const result = await tool.execute("tc1", { query: "release" }, undefined, undefined, ctxForSessionFile(undefined));
+    const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
+    expect(text).toContain("could not resolve this conversation's space");
   });
 });
