@@ -271,6 +271,24 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     durableProof: "model.pin_applied + model switched audit rows per session",
     fixtures: ["live:SLACK_QA_REQUESTER_TOKEN", "live:SLACK_QA_MEMBER_TOKEN"],
   },
+  {
+    id: "live.scheduler-lifecycle",
+    layer: "live-api",
+    actors: ["requester"],
+    covers: ["create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "run_scheduler_job_now", "list_scheduler_jobs"],
+    visibleProof: "the QA turn drives create → pause → resume → run-now on a durable scheduler job",
+    durableProof: "SCHEDULER_FIRE_EVENT audit row (source manual) + job enabled/next-fire store state",
+    fixtures: ["live:SLACK_QA_REQUESTER_TOKEN"],
+  },
+  {
+    id: "live.operator-home",
+    layer: "live-api",
+    actors: ["requester"],
+    covers: ["explain_policy"],
+    visibleProof: "the read-tier policy explanation posts matching the effective allow list (no approval)",
+    durableProof: "policy.explained audit row; no approval.requested row from explanation",
+    fixtures: ["live:SLACK_QA_REQUESTER_TOKEN"],
+  },
 
   // ======================== Layer: browser ===============================
   {

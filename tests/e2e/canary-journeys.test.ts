@@ -34,7 +34,7 @@ import { nextCronFire } from "../../src/scheduler/cron";
 import { buildRegistry } from "../../src/scheduler/actions";
 import { tickScheduler } from "../../src/scheduler/runner";
 import { standupDigestAction } from "../../src/scheduler/standup";
-import { loadSpacePolicy } from "../../src/policy/config";
+import { decidePolicyCall, loadSpacePolicy, resolveTier } from "../../src/policy/config";
 import {
   ADMIN_CATALOG_BROWSER_EVENT,
   APPROVAL_REQUESTED_EVENT,
@@ -46,8 +46,11 @@ import {
   EXTENSION_CONNECTED_EVENT,
   MODEL_SETTINGS_CHANGED_EVENT,
   MODEL_SWITCHED_EVENT,
+  POLICY_EXPLAINED_EVENT,
+  SCHEDULER_FIRE_EVENT,
   WORK_ITEM_CREATED_EVENT,
 } from "../../src/store/audit-events";
+import { operatorReadToolDefinitions } from "../../src/tools/operator-read";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID, FIXTURE_EXTENSION_TOOL } from "../../src/extensions/fixture";
 import { createSecretFileBoundary } from "../../src/extensions/boundary";
 import { pollPendingDeliveries } from "../../src/server/services/delivery-poller";
@@ -64,6 +67,7 @@ import { modelToolsDefinitions } from "../../src/tools/model-settings";
 import { resolveModelPin, type ModelCatalogEntry } from "../../src/models/model-pin";
 import { classifyPickupIntent, buildAutoPickupDirective } from "../../src/tools/work-item-pickup";
 import type { JsonValue, McpBinding } from "../../src/extensions/manifest";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, AutoApproveRouter, type Harness, type StubTurn } from "./harness";
 import { opencodeSafeToolName } from "../../src/server/drivers/agent-driver";
 import {
@@ -88,6 +92,7 @@ import {
   standupCronFor,
   STORE_TIMEOUT_MS,
   toolCtxFor,
+  toolResultText,
   uploadLinkUrlFrom,
   waitForBotReply,
 } from "./canary";
@@ -187,6 +192,135 @@ describe("scheduled-standup journey mechanism (issue #175)", () => {
       expect(digest!.channel_id).toBe(channelId);
       const after = await h.store.getSchedulerJob(job.id);
       expect(after!.nextFireAt).toBeGreaterThan(job.nextFireAt);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("scheduler-lifecycle journey mechanism (issue #308)", () => {
+  test("a paused due job never fires; after resume, a run-now fires it and audits SCHEDULER_FIRE_EVENT (source manual)", async () => {
+    // The journey (issue #308) drives create → pause → resume → run-now in
+    // the QA space. The deterministic runner half: the runner gates cron
+    // claiming on `enabled`, so a DUE but paused job produces no fire row and
+    // keeps lastFiredAt null; after resume a manual run-now invocation is
+    // claimed and fired (source manual), writing the SCHEDULER_FIRE_EVENT.
+    const h = await bootHarness({ registry: createFixtureRegistry() });
+    try {
+      const channelId = h.slack.channelId("ops")!;
+      const spaceId = `slack:${channelId}`;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
+      const due = Date.now();
+
+      const job = await h.store.createSchedulerJob({
+        action: "standup_digest",
+        cron: standupCronFor(due),
+        params: { space: spaceId },
+        spaceId,
+        createdBy: "U-owner",
+      });
+      expect(job.enabled).toBe(true);
+
+      const tick = (now: number) =>
+        tickScheduler({
+          store: h.store,
+          audit: h.audit,
+          registry: buildRegistry([standupDigestAction]),
+          memoryProvider: h.memory,
+          postMessage: (sid, text) => h.adapter.postMessage(sid, text),
+          loadPolicy: (sid) => loadSpacePolicy(h.orgPolicy, h.store, sid),
+          log: () => {},
+          now: () => now,
+        });
+
+      // Pause → a due tick must NOT fire the job (no fire row, lastFiredAt null).
+      const paused = await h.store.pauseSchedulerJob(job.id, job.revision);
+      expect(paused.enabled).toBe(false);
+      await tick(due + 60_000);
+      const frozen = await h.store.getSchedulerJob(job.id);
+      expect(frozen!.lastFiredAt).toBeNull();
+      const pausedFires = (await h.store.listAudit({ space: spaceId, event_type: SCHEDULER_FIRE_EVENT })).filter(
+        (row) => row.payload.includes(`"id":"${job.id}"`),
+      );
+      expect(pausedFires).toHaveLength(0);
+
+      // Resume → run-now → the next tick claims + fires the manual invocation.
+      const resumed = await h.store.resumeSchedulerJob(job.id, paused.revision, due + 60_000);
+      expect(resumed.enabled).toBe(true);
+      const invocationId = `hermetic-sj-${job.id}`;
+      const enqueued = await h.store.enqueueSchedulerRunNow({
+        jobId: job.id,
+        expectedRevision: resumed.revision,
+        invocationId,
+        requestedAt: due + 60_001,
+      });
+      expect(enqueued.created).toBe(true);
+      await tick(due + 60_002);
+
+      const fires = (await h.store.listAudit({ space: spaceId, event_type: SCHEDULER_FIRE_EVENT })).filter(
+        (row) => row.payload.includes(invocationId),
+      );
+      expect(fires).toHaveLength(1);
+      expect(fires[0]!.payload).toContain('"source":"manual"');
+      expect(fires[0]!.payload).toContain(`"id":"${job.id}"`);
+      const fired = await h.store.getSchedulerJob(job.id);
+      expect(fired!.lastFiredAt).not.toBeNull();
+      expect(fired!.lastResult).toBe("ok");
+      // The run-now fired the job exactly once (no extra cron firing this window).
+      const allFires = (await h.store.listAudit({ space: spaceId, event_type: SCHEDULER_FIRE_EVENT })).filter(
+        (row) => row.payload.includes(`"id":"${job.id}"`),
+      );
+      expect(allFires).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("operator-home policy-explanation journey mechanism (issue #320)", () => {
+  test("explain_policy on a read-tier allow-list tool reports allow/no-approval matching policy state, and is audited without an approval row", async () => {
+    // The journey (issue #320) invokes the operator-home surface in a space:
+    // the read-tier allow-list tool explanation must agree with the pure
+    // decision table (allow, approval_required false) and write a
+    // policy.explained audit row — never an approval.requested row.
+    const h = await bootHarness({ registry: createFixtureRegistry(), orgConfigYaml: "tools:\n  list_scheduler_jobs: allow\n" });
+    try {
+      const channelId = h.slack.channelId("ops")!;
+      const spaceId = `slack:${channelId}`;
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
+      const [, explain] = operatorReadToolDefinitions(h.store, {
+        audit: h.audit,
+        orgPolicy: h.orgPolicy,
+        actorForSpace: () => "U-owner",
+      });
+
+      const readTierTool = "list_scheduler_jobs";
+      const run = (tool: ToolDefinition, params: { tool?: string }) =>
+        tool.execute("call-1", params, undefined, undefined, toolCtxFor(h, spaceId));
+      const runResult = await run(explain!, { tool: readTierTool });
+      // SAFETY: explain_policy returns a single text block carrying the JSON
+      // PolicyExplanation (see operator-read.ts); the boundary parse below
+      // reads exactly the four fields the journey asserts.
+      const explanation = JSON.parse(toolResultText(runResult)) as {
+        tool: string;
+        space: string;
+        tier: string;
+        decision: string;
+        approval_required: boolean;
+      };
+      const effective = await loadSpacePolicy(h.orgPolicy, h.store, spaceId);
+      expect(explanation.tool).toBe(readTierTool);
+      expect(explanation.space).toBe(spaceId);
+      expect(explanation.tier).toBe(resolveTier(readTierTool));
+      expect(explanation.tier).toBe("read");
+      expect(explanation.decision).toBe(decidePolicyCall(effective, readTierTool).decision);
+      expect(explanation.decision).toBe("allow");
+      expect(explanation.approval_required).toBe(false);
+
+      const explained = await h.store.listAudit({ space: spaceId, event_type: POLICY_EXPLAINED_EVENT });
+      expect(explained).toHaveLength(1);
+      expect(explained[0]!.payload).toContain(readTierTool);
+      expect(await h.store.listAudit({ space: spaceId, event_type: APPROVAL_REQUESTED_EVENT })).toHaveLength(0);
     } finally {
       await h.cleanup();
     }
