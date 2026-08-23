@@ -127,22 +127,36 @@ describe("resolveMemoryProvider (issue #43)", () => {
     }
   });
 
-  test("memory_backend.base_url unset → SQLite provider sharing the store database", async () => {
-    const db = freshDb();
-    const provider = resolveMemoryProvider(null, db, {});
-    expect(provider.backend).toBe("sqlite");
+  test("memory_backend.kind=mnesis selects the mnesis provider with vault token + tenant (issue #348)", () => {
+    const provider = resolveMemoryProvider(
+      { memoryBackend: { kind: "mnesis", baseUrl: "http://memory:17802/mcp", tenant: "acme-eng", embeddingUrl: "http://embed:8420" } },
+      freshDb(),
+      { MNESIS_TOKEN: "vault-minted-token", MNESIS_PRINCIPAL: "org-principal" },
+    );
+    expect(provider.backend).toBe("mnesis");
     expect(provider.capabilities).toEqual({
-      consolidation: "explicit",
-      digestPruning: "explicit",
-      forget: "explicit",
+      consolidation: "on-save",
+      digestPruning: "unsupported",
+      forget: "unsupported",
     });
-    const saved = await provider.save({ scope: { kind: "org" }, content: "sqlite fallback fact" });
-    expect(saved.id).toBeTruthy();
-    const hits = await provider.search({ scope: { kind: "org" }, query: "sqlite fallback" });
-    expect(hits.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
-    // Same database handle: a second provider sees the same rows.
-    const again = resolveMemoryProvider({}, db, {});
-    const more = await again.search({ scope: { kind: "org" }, query: "sqlite fallback" });
-    expect(more.map((e) => e.content)).toEqual(["sqlite fallback fact"]);
+  });
+
+  test("memory_backend.kind=mnesis fails closed when base_url or tenant is unconfigured", () => {
+    // No tenant → the adapter rejects at construction (fail closed).
+    expect(() =>
+      resolveMemoryProvider(
+        { memoryBackend: { kind: "mnesis", baseUrl: "http://memory:17802/mcp", embeddingUrl: "http://embed:8420" } },
+        freshDb(),
+        { MNESIS_TOKEN: "t" },
+      ),
+    ).toThrow(/tenantId|token/);
+    // kind=mnesis always wins over a mem0-shaped base_url (never a silent fallback).
+    expect(() =>
+      resolveMemoryProvider(
+        { memoryBackend: { kind: "mnesis", tenant: "acme-eng" } },
+        freshDb(),
+        {},
+      ),
+    ).toThrow(/baseUrl|tenantId/);
   });
 });

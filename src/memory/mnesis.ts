@@ -38,12 +38,12 @@
  *   - `metadata.kind`               → `event_type` (clamped to the mnesis
  *     enum; a kind outside the enum falls back to `insight` and is kept as
  *     a `neurons` tag `kind:…` so nothing is lost).
- *   - `metadata` remaining keys     → `neurons[]` tags `key:value`
- *     (structured array, searchable — mnesis tags are a first-class field).
- *   - provenance `source`/`spaceId` → `neurons` tags `source:…`/`space:…`
- *     plus a `context` line. Provenance is first-class on search results
- *     (the result `provenance` object + `authorization.ownerScope`), so it
- *     round-trips through the response rather than a content hack.
+ *   - `metadata` every key            → `neurons[]` tag `key:value`
+ *     (structured array, searchable — mnesis tags are a first-class field;
+ *     the caller metadata map round-trips verbatim through these tags).
+ *   - provenance `source`/`spaceId`   → the `context` line plus the search
+ *     result's first-class `provenance`/`authorization.ownerScope` objects
+ *     (not tags — the caller metadata map stays unambiguous).
  *   - `operation_id`                → a stable, idempotent retry identity
  *     derived from the save input (mnesis "Stable retry identity").
  *
@@ -79,7 +79,7 @@
  */
 import { z } from "zod";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type {
   CallToolResult,
   ClientResult,
@@ -184,6 +184,13 @@ function sessionScope(sessionId: string | null, fallback: MemoryScopeKey): Memor
   if (!sessionId || !sessionId.startsWith(SESSION_PREFIX)) return fallback;
   const label = sessionId.slice(SESSION_PREFIX.length);
   if (label === "org") return { kind: "org" };
+  // `person:<principal>` — the label carries the `person:` prefix that the
+  // physical principal composite does not (mirrors scopeKeyLabel vs
+  // encodeScopeKey), so strip it before decoding.
+  if (label.startsWith("person:")) {
+    return { kind: "person", principal: label.slice("person:".length) };
+  }
+  // `channel:<spaceId>` / `team:<teamId>` decode via the physical composite.
   return decodeScopeKey("user", label);
 }
 
@@ -193,33 +200,23 @@ function eventTypeForKind(kind: string | undefined): string {
   return MNESIS_DEFAULT_EVENT;
 }
 
-/** Encodes one metadata/provenance key to a mnesis `neurons` tag. */
+/** Encodes one metadata/key value to a mnesis `neurons` tag. */
 function asTag(key: string, value: string): string {
   return `${key}:${value}`;
 }
 
 /**
- * Builds the `neurons[]` tags for a save: provenance (source/space/scope)
- * plus every caller metadata key, plus the raw `kind` when it fell outside
- * the mnesis enum (so `metadata.kind` is never silently dropped).
+ * Builds the `neurons[]` tags for a save: every caller metadata key verbatim
+ * (`key:value`). Provenance does NOT ride these tags — it lives on the first
+ * class `context` field and the search result's `provenance` object, so the
+ * caller metadata map round-trips exactly (the shared conformance suite
+ * asserts arbitrary metadata, e.g. `source`, `kind`, `contract`, survives
+ * save → search).
  */
-function buildNeurons(
-  metadata: Record<string, string> | undefined,
-  source: string,
-  spaceId: string | null,
-  scopeLabel: string,
-  kind: string | undefined,
-): string[] {
+function buildNeurons(metadata: Record<string, string> | undefined): string[] {
   const neurons = new Set<string>();
-  neurons.add(asTag("source", source));
-  if (spaceId) neurons.add(asTag("space", spaceId));
-  neurons.add(asTag("scope", scopeLabel));
   for (const [key, value] of Object.entries(metadata ?? {})) {
-    if (key === "kind" && isMnesisEventType(value)) continue; // carried as event_type
     neurons.add(asTag(key, value));
-  }
-  if (kind !== undefined && !isMnesisEventType(kind)) {
-    neurons.add(asTag("kind", kind));
   }
   return [...neurons];
 }
@@ -245,6 +242,16 @@ function stableHash(text: string): string {
     h = (h * 33) ^ text.charCodeAt(i);
   }
   return (h >>> 0).toString(36);
+}
+
+/**
+ * Deterministic MemoryEntry id shared by save and search: `session-content`.
+ * mnesis consolidates identical learning within a session, so this uniquely
+ * references the active record and keeps `save(...).id` present in any
+ * later `search(...)` result — the invariant the conformance suite asserts.
+ */
+function deterministicId(sessionId: string, content: string): string {
+  return `${sessionId}-${stableHash(content)}`;
 }
 
 /** Extracts the `text` content blocks from an MCP tool result (post-format merge). */
@@ -304,7 +311,7 @@ function rowSessionId(row: z.infer<typeof MnesisSearchRowSchema>): string | null
   return row.session_id || row.sessionId || null;
 }
 
-/** Decodes `neurons[]` tag entries back into a metadata map (provenance tags excluded). */
+/** Decodes `neurons[]` tag entries back into the caller metadata map (verbatim). */
 function tagsToMetadata(row: z.infer<typeof MnesisSearchRowSchema>) {
   const out: Record<string, string> = {};
   for (const tag of row.neurons) {
@@ -312,9 +319,8 @@ function tagsToMetadata(row: z.infer<typeof MnesisSearchRowSchema>) {
     if (idx < 1) continue;
     const key = tag.slice(0, idx);
     const value = tag.slice(idx + 1);
-    // Provenance/scope tags are not caller metadata — they re-enter via
-    // {@link MemoryProvenance}, not the metadata map.
-    if (key === "source" || key === "scope" || key === "space") continue;
+    // Calls like `scope:org` may carry a colon inside the value; take the
+    // first separator. The metadata map round-trips every tag key verbatim.
     out[key] = value;
   }
   return out;
@@ -327,13 +333,14 @@ function provenanceFromRow(
 ): MemoryProvenance {
   const prov = row.provenance;
   const ownerScope = row.authorization?.ownerScope;
+  const source = prov?.source ?? tagsToMetadata(row).source ?? "tool";
   const spaceId = prov?.spaceId ?? ownerScope?.agentId ?? null;
   const principal =
     prov?.principalId ??
     ownerScope?.principalId ??
     (key.kind === "person" ? key.principal : null);
   return {
-    source: prov?.source ?? "tool",
+    source,
     spaceId,
     principal,
     scopeLabel: scopeKeyLabel(key),
@@ -402,7 +409,8 @@ async function connectClient(opts: MnesisOptions): Promise<MnesisClient> {
     await transport.close().catch(() => undefined);
     if (err instanceof MnesisError) throw err;
     const message = err instanceof Error ? err.message : String(err);
-    if (/401|Unauthorized|Invalid Request/.test(`${message} ${err}`)) {
+    const status = err instanceof StreamableHTTPError ? err.code : undefined;
+    if (status === 401 || status === 403 || /401|Unauthorized|Invalid Request/.test(`${message} ${err}`)) {
       throw new MnesisError(
         `mnesis: ${base} rejected the credential (wrong tenant or bad token) — ` +
           "the org credential's tenants allowlist must include the configured x-tenant-id",
@@ -479,9 +487,12 @@ async function saveToMnesis(
   const scopeLabel = scopeKeyLabel(input.scope);
   const spaceId = metadata.spaceId ?? (input.scope.kind === "channel" ? input.scope.spaceId : null);
   const principal = input.scope.kind === "person" ? input.scope.principal : null;
-  const source = input.source ?? "tool";
+  // `metadata.source` is the caller's provenance label; `input.source`
+  // overrides it (consistent with mem0/sqlite, where metadata.source drives
+  // provenance.source and round-trips in the metadata map).
+  const source = (input.source ?? metadata.source ?? "tool").trim() || "tool";
   const sessionId = mnesisSessionId(input.scope);
-  const neurons = buildNeurons(metadata, source, spaceId, scopeLabel, kind);
+  const neurons = buildNeurons(metadata);
   // A stable, idempotent retry identity — mnesis "Stable retry identity".
   const operationId = `${principalId}-${sessionId}-${stableHash(input.content)}`;
 
@@ -503,12 +514,10 @@ async function saveToMnesis(
   }
 
   return {
-    id: `${sessionId}-${operationId}`,
+    id: deterministicId(sessionId, input.content),
     key: input.scope,
     content: input.content,
-    metadata: Object.fromEntries(
-      Object.entries(metadata).filter(([k]) => k !== "kind" || !isMnesisEventType(k)),
-    ),
+    metadata: { ...metadata },
     createdAt: Date.now(),
     provenance: { source, spaceId, principal, scopeLabel },
   };
@@ -532,7 +541,7 @@ async function searchMnesis(client: MnesisClient, query: MemorySearchQuery): Pro
     const key = sessionScope(rowSessionId(parsed), query.scope);
     const content = rowContent(parsed);
     return {
-      id: parsed.recordId || `${keyToSession(key)}-${stableHash(content)}`,
+      id: deterministicId(mnesisSessionId(key), content),
       key,
       content,
       metadata: tagsToMetadata(parsed),
@@ -540,11 +549,6 @@ async function searchMnesis(client: MnesisClient, query: MemorySearchQuery): Pro
       provenance: provenanceFromRow(parsed, key),
     };
   });
-}
-
-/** Session id for a key (used for a fallback entry id when the row has none). */
-function keyToSession(key: MemoryScopeKey): string {
-  return mnesisSessionId(key);
 }
 
 export function createMnesisMemoryProvider(opts: MnesisOptions): MemoryProvider {

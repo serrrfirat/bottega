@@ -392,6 +392,20 @@ settings tool and give mem0 an LLM key (`OPENAI_API_KEY`, above); the switch
 applies on the next server start. `MEM0_API_KEY` stays an optional env
 secret for mem0 auth.
 
+**mnesis backend (issue #348, Part B).** To use the mnesis memory-server
+(remote MCP Streamable HTTP), set `memory_backend.kind = "mnesis"` plus
+`memory_backend.base_url` (the memory-server `/mcp` endpoint),
+`memory_backend.tenant` (the org's mnesis workspace, sent as `x-tenant-id`)
+and `memory_backend.embedding_url` (the embedding endpoint the memory-server
+writes against) via the settings tool. The mnesis org-principal credential
+rides the vault boot-secret chain as `MNESIS_TOKEN` (provision like the
+model/slack keys; optional `MNESIS_PRINCIPAL` labels the session principal).
+`kind=mnesis` always wins over a mem0-shaped `base_url` — never a silent
+fallback — and boot fails closed when base_url/tenant/embedding_url are
+unconfigured or the embedding endpoint is unreachable. The mnesis memory MCP
+surface is add-only (no delete/forget tool): `capabilities.forget` is
+`unsupported` and forget rejects loudly, never a silent hard-delete.
+
 **Permission-aware memory scopes (issue #137).** Every memory belongs to one
 logical scope derived from the authenticated conversation, never from a
 prompt/tool argument: `org` (company floor), `person:<principal>` (one human,

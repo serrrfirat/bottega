@@ -2111,6 +2111,57 @@ describe("first_run_wizard (issue #73)", () => {
       cleanup();
     }
   });
+
+  test("mnesis backend fails the wizard until base_url/tenant/embedding_url + MNESIS_TOKEN are configured (issue #348)", async () => {
+    const envBackup = backupEnv();
+    const { store, dir, cleanup } = freshStore();
+    try {
+      for (const key of ENV_KEYS) delete process.env[key];
+      const tool = findTool(
+        loadTools(store, {
+          gitTokenFile: join(dir, "nope"),
+          egressConfigPath: join(dir, "nope.yml"),
+        }),
+        "first_run_wizard",
+      );
+      const run = async () => {
+        const res = await call(tool, {});
+        // SAFETY: the wizard result serializes per-check ok/detail/fix (asserted below).
+        return JSON.parse(res.text) as {
+          checks: Array<{ name: string; ok: boolean; detail: string; fix: string }>;
+        };
+      };
+
+      // Incomplete mnesis config → fail closed, naming every missing knob.
+      store.setOrgSettings({
+        memory_backend: { kind: "mnesis", base_url: "http://memory:17802/mcp", tenant: "acme-eng" },
+      });
+      let body = await run();
+      let memory = body.checks.find((c) => c.name === "memory_backend")!;
+      expect(memory.ok).toBe(false);
+      expect(memory.detail).toContain("embedding_url");
+      expect(memory.fix).toContain("MNESIS_TOKEN");
+
+      // Complete config (embedding_url present + MNESIS_TOKEN in the boot env) → passes.
+      store.setOrgSettings({
+        memory_backend: {
+          kind: "mnesis",
+          base_url: "http://memory:17802/mcp",
+          tenant: "acme-eng",
+          embedding_url: "http://embed:8420",
+        },
+      });
+      process.env.MNESIS_TOKEN = "vault-minted-token";
+      body = await run();
+      memory = body.checks.find((c) => c.name === "memory_backend")!;
+      expect(memory.ok).toBe(true);
+      expect(memory.detail).toContain("http://memory:17802/mcp");
+      expect(memory.detail).toContain("acme-eng");
+    } finally {
+      restoreEnv(envBackup);
+      cleanup();
+    }
+  });
 });
 
 describe("runWizardChecks extraction (issue #116)", () => {
