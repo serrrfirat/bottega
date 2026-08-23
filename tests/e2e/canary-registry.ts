@@ -192,6 +192,23 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     fixtures: ["emulator:requester", "emulator:member"],
   },
   {
+    // Full-stack four-persona matrix (tests/e2e/persona-matrix.test.ts): the
+    // hermetic counterpart of live.roles.queue-ownership — REQUIRER submits a
+    // work item → APPROVER approves via an emulated action (the #44 Bolt seam)
+    // → MEMBER observes the delivery post → SECOND-MEMBER cannot approve
+    // someone else's request (fail-closed authz: settle-once + foreign-space
+    // delivery rejection) → cross-persona policy (read-tier visible, write-tier
+    // resolves with the actual clicking principal). Deterministic store/audit
+    // evidence per step under the real Slack emulator.
+    id: "roles.persona-matrix-fullstack",
+    layer: "hermetic",
+    actors: ["requester", "space-approver", "member", "second-member"],
+    covers: ["create_work_item", "list_work_items", "work_item_cancel", "model_settings"],
+    visibleProof: "approval + delivery prompts observed in the shared channel by the member; second-member's click on a settled prompt is ignored",
+    durableProof: "work_item.created + approval.{requested,resolved} + delivery.{requested,resolved} rows, each keyed by the acting persona principal",
+    fixtures: ["emulator:requester", "emulator:approver", "emulator:member", "emulator:second-member"],
+  },
+  {
     id: "operator.read-surfaces",
     layer: "hermetic",
     actors: ["requester", "member"],

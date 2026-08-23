@@ -888,14 +888,21 @@ The canary is three layers sharing stable journey ids
 (`tests/e2e/canary-registry.ts` is the source of truth for what every
 journey covers):
 
-1. **hermetic** — deterministic caller-level role/multiplayer journeys
-   through the real SpaceService/store/policy/Slack emulator path. Run on
-   every commit (these are part of the suite). The built-in-tool coverage
-   gate fails CI when a surfaced built-in tool lacks a journey or an
-   explicit exclusion.
+1. **hermetic** — deterministic role/multiplayer journeys through the real
+   SpaceService/store/policy/Slack emulator path. The caller-level matrix
+   (`canary-multiplayer.test.ts`) and the full-stack four-persona matrix
+   (`persona-matrix.test.ts` — requester submits → approver approves via an
+   emulated action → member observes the delivery post → second-member
+   cannot approve someone else's request, fail-closed authz) run on **every
+   commit** (both are part of the suite). The built-in-tool coverage gate
+   fails CI when a surfaced built-in tool lacks a journey or an explicit
+   exclusion.
 2. **live-api** — strict nightly journeys against the real Slack API with
    the four fixed QA identities (requester, space approver, member, second
-   member). Run **nightly in parallel** with the browser leg.
+   member). These `live.roles.*` journeys stay **gated on the real personas
+   for the nightly leg** — they are the same role-matrix surface the
+   hermetic layer covers without a live workspace. Run **nightly in
+   parallel** with the browser leg.
 3. **browser** — real-browser journeys on a **dedicated self-hosted
    runner** with two persistent Chrome profiles.
 
