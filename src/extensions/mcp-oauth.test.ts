@@ -1220,6 +1220,12 @@ describe("issue #257 — OAuth credential durability for every MCP integration",
   test("connect-time mint probe: a server whose refresh is DEAD fails the connect closed with 'exchange was rejected', saving nothing beyond the exchange row", async () => {
     const stub = new StubOAuthMcp();
     stub.deadRefresh = true; // the exchange succeeds, but every refresh dies
+    const errorLines: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errorLines.push(args.map(String).join(" "));
+      originalError(...args);
+    };
     try {
       const store = freshStore();
       const vault = new FakeVaultStore();
@@ -1237,8 +1243,18 @@ describe("issue #257 — OAuth credential durability for every MCP integration",
         const done = await fetch(authorize.headers.get("location")!);
         expect(done.status).toBe(500);
         const errorBody = await done.text();
-        expect(errorBody).toContain("authorization exchange was rejected");
-        expect(errorBody).toContain("cannot mint an access token");
+        // Generic error surface (#346 #5): the callback page must NOT leak the
+        // internal exchange detail to the unauthenticated caller …
+        expect(errorBody).not.toContain("authorization exchange was rejected");
+        expect(errorBody).not.toContain("cannot mint an access token");
+        // … it shows the generic retry page instead.
+        expect(errorBody).toContain("Connect failed");
+        expect(errorBody).toContain("ask the agent to try again");
+        // The concrete reason IS recorded — server-side only, via the
+        // callback's console.error (which surfaces err.message verbatim).
+        const logged = errorLines.find((line) => line.includes("authorization exchange was rejected"));
+        expect(logged).toBeTruthy();
+        expect(logged!).toContain("cannot mint an access token");
 
         // Exactly ONE vault save — the exchange row itself. The probe's
         // failed refresh never persisted, and NOTHING else (no registry
@@ -1250,6 +1266,7 @@ describe("issue #257 — OAuth credential durability for every MCP integration",
         callback.stop();
       }
     } finally {
+      console.error = originalError;
       stub.stop();
     }
   });
