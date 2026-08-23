@@ -51,6 +51,7 @@ import { EXTENSION_CONNECTED_EVENT } from "../store/audit-events";
 import { errorMessage } from "../tools/helpers";
 import { oauthIdentityKey, pickNewestBrokerEntry, type ConnectScope } from "./connect";
 import { createStaticOAuthClientStore, type StaticOAuthClient, type StaticOAuthClientStore } from "./static-oauth-client";
+import { domainCoversTarget } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 import type { ReconcileEgress } from "./egress-reconcile";
 
@@ -733,6 +734,51 @@ export function registrationCapabilityFromMetadata(registrationEndpoint: Registr
 }
 
 /**
+ * Issue #346 #11 (security): fail-closed guard on OAuth metadata discovery.
+ * The SDK's {@link discoverOAuthServerInfo} accepts ANY server URL — the
+ * manifest validation prefers https, but the discovery fetch itself would
+ * happily follow a `http://` URL to an arbitrary host. This guard refuses
+ * discovery against a server URL whose scheme is not https (plain http is
+ * accepted ONLY for a loopback host — the hermetic stubs + local-dev
+ * posture) and, when the extension's validated domains are available,
+ * whose host is not covered by them (an internal-range/arbitrary host
+ * outside the validation is refused, constraining discovery to the
+ * egress/validation superset).
+ *
+ * Throws on violation — the caller fails closed: a capability probe
+ * returns `"unknown"`, the connect mint rejects with a clear error. No
+ * discovery request is ever issued for a non-conforming server URL.
+ */
+export function assertDiscoveryServerUrlAllowed(
+  serverUrl: string,
+  allowedDomains?: readonly string[],
+): void {
+  let url: URL;
+  try {
+    url = new URL(serverUrl);
+  } catch {
+    throw new Error(`[mcp-oauth] refusing OAuth discovery: "${serverUrl}" is not a valid URL`);
+  }
+  const host = url.hostname;
+  const isLoopback = isLoopbackHostname(host);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) {
+    throw new Error(
+      `[mcp-oauth] refusing OAuth discovery for "${serverUrl}": the server URL must be https ` +
+        `(plain http is only accepted for a loopback host, and "${host}" is not loopback)`,
+    );
+  }
+  if (allowedDomains !== undefined && allowedDomains.length > 0) {
+    const covered = allowedDomains.some((domain) => domainCoversTarget(domain.toLowerCase(), host));
+    if (!covered) {
+      throw new Error(
+        `[mcp-oauth] refusing OAuth discovery for "${serverUrl}": host "${host}" is not covered by the ` +
+          `extension's validated domains (${allowedDomains.join(", ")})`,
+      );
+    }
+  }
+}
+
+/**
  * Discovery-backed dynamic-registration capability (issue #288): resolves
  * the verdict through the SAME RFC 9728/8414 discovery the connect uses.
  * `"unknown"` when discovery cannot establish the verdict — the SDK's
@@ -752,8 +798,13 @@ export function registrationCapabilityFromMetadata(registrationEndpoint: Registr
 export async function resolveMcpOAuthRegistrationCapability(
   serverUrl: string,
   timeoutMs: number = MCP_OAUTH_BASE_PROBE_TIMEOUT_MS,
+  allowedDomains?: readonly string[],
 ): Promise<McpOAuthRegistrationCapability> {
   try {
+    // Issue #346 #11: refuse discovery against a non-https / out-of-domains
+    // server URL — fail closed to "unknown" (no capability established, no
+    // mint) rather than ever probing an arbitrary host.
+    assertDiscoveryServerUrlAllowed(serverUrl, allowedDomains);
     const info = await discoverOAuthServerInfo(serverUrl, {
       // Abort the discovery fetch after the bound; a hanging server then
       // REJECTS and maps to "unknown" below. The arrow is exactly the
@@ -819,7 +870,14 @@ export async function resolveMcpOAuthRegistrationCapability(
 async function connectServerNegotiation(
   serverUrl: string,
   clientScopes: readonly string[] | undefined,
+  allowedDomains?: readonly string[],
 ): Promise<{ scope: string | undefined; tokenEndpointAuthMethod: string; dynamicRegistration: boolean }> {
+  // Issue #346 #11: refuse discovery against a non-https / out-of-domains
+  // server URL. This guard runs BEFORE the transient-failure handling below
+  // (and outside its try) so a POLICY violation fails closed with a clear
+  // connect error rather than silently degrading to the #262 fallback —
+  // auth() would otherwise re-discover the same non-conforming URL.
+  assertDiscoveryServerUrlAllowed(serverUrl, allowedDomains);
   let info: OAuthServerInfo;
   try {
     info = await discoverOAuthServerInfo(serverUrl);
@@ -916,7 +974,11 @@ export async function startMcpOAuthFlow(
   // token-endpoint auth method (client_secret_basic/post for confidential
   // AS). auth()'s own discovery succeeds from the SAME metadata, so this
   // is one extra round trip on the connect path, not a divergence.
-  const negotiation = await connectServerNegotiation(serverUrl, manifest.credentialSchema.scopes);
+  const negotiation = await connectServerNegotiation(
+    serverUrl,
+    manifest.credentialSchema.scopes,
+    manifest.domains,
+  );
   // Issue #262 instrumentation: when DEBUG is set, emit the composed authorize
   // scope + server for end-to-end connect evidence on the next live run. OFF
   // by default — no new env flags (DEBUG is the ambient Node convention).

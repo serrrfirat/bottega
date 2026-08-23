@@ -78,7 +78,13 @@ function oauthManifestAt(serverUrl: string): ExtensionManifest {
   if (manifest.kind !== "mcp" || manifest.mcp === undefined) {
     throw new Error("the oauth fixture manifest must be the mcp kind");
   }
-  return { ...manifest, mcp: { serverUrl, transport: "streamable-http" } };
+  // The manifest's validated domains must cover the bound server host
+  // (issue #346 #11: discovery is refused for a host outside the validated
+  // domains). The hermetic stub serves on loopback http, so derive the
+  // host from the bound URL rather than inheriting the fixture's nominal
+  // domain.
+  const host = new URL(serverUrl).hostname;
+  return { ...manifest, mcp: { serverUrl, transport: "streamable-http" }, domains: [host] };
 }
 
 /** A registry holding the fixture + an OAuth manifest at the given server URL. */

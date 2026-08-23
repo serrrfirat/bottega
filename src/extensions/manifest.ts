@@ -751,7 +751,7 @@ function validateDomains(value: JsonValue): string[] {
   return parsed.data;
 }
 
-function domainCoversTarget(domain: string, host: string): boolean {
+export function domainCoversTarget(domain: string, host: string): boolean {
   if (domain === host) return true;
   if (!domain.startsWith("*.") || host.startsWith("*.")) return false;
   const suffix = domain.slice(1).toLowerCase();

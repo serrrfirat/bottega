@@ -33,6 +33,7 @@ import { EXTENSION_CONNECTED_EVENT, STATIC_CLIENT_PROVISIONED_EVENT } from "../s
 import type { ExtensionManifest, JsonObject, JsonValue } from "./manifest";
 import { createExtensionRegistry, type ExtensionRegistry } from "./registry";
 import {
+  assertDiscoveryServerUrlAllowed,
   completeMcpOAuthFlow,
   createMcpOAuthConnector,
   createRuntimeMcpOAuthProvider,
@@ -2233,5 +2234,48 @@ describe("issue #288 — the mint's capability discovery is bounded (P2 review)"
     } finally {
       hanging.stop(true);
     }
+  });
+});
+
+describe("issue #346 #11 — discovery server URL is constrained to validated https hosts", () => {
+  test("https within the validated domains proceeds", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("https://mcp.linear.app/mcp", ["mcp.linear.app"])).not.toThrow();
+  });
+
+  test("https with a covered wildcard domain proceeds", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("https://api.githubcopilot.com/mcp", ["api.githubcopilot.com"])).not.toThrow();
+  });
+
+  test("plain-http LOOPBACK within the validated domains proceeds (hermetic stubs + local dev)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("http://127.0.0.1:4000/mcp", ["127.0.0.1"])).not.toThrow();
+    expect(() => assertDiscoveryServerUrlAllowed("http://localhost:4000/mcp", ["localhost"])).not.toThrow();
+  });
+
+  test("plain-http NON-loopback is refused (no http: to arbitrary hosts)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("http://mcp.linear.app/mcp", ["mcp.linear.app"])).toThrow(/must be https/);
+  });
+
+  test("https outside the validated domains is refused (fail closed)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("https://mcp.linear.app/mcp", ["notion.com"])).toThrow(/not covered by the .* validated domains/);
+  });
+
+  test("an internal-range host outside the validated domains is refused (fail closed)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("http://10.0.0.5/mcp", ["mcp.linear.app"])).toThrow(/must be https/);
+    expect(() => assertDiscoveryServerUrlAllowed("https://192.168.1.50/mcp", ["mcp.linear.app"])).toThrow(/not covered by the .* validated domains/);
+  });
+
+  test("an invalid server URL is refused (fail closed)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("not a url", ["mcp.linear.app"])).toThrow(/not a valid URL/);
+  });
+
+  test("with no domains available the scheme guard alone applies (https allowed, loopback-http allowed, non-loopback http refused)", () => {
+    expect(() => assertDiscoveryServerUrlAllowed("https://mcp.linear.app/mcp")).not.toThrow();
+    expect(() => assertDiscoveryServerUrlAllowed("http://127.0.0.1:4000/mcp")).not.toThrow();
+    expect(() => assertDiscoveryServerUrlAllowed("http://example.com/mcp")).toThrow(/must be https/);
+  });
+
+  test("a refused capability discovery fails closed to UNKNOWN — never a positive verdict", async () => {
+    const capability = await resolveMcpOAuthRegistrationCapability("http://example.com/mcp", 150, ["mcp.linear.app"]);
+    expect(capability).toBe("unknown");
   });
 });

@@ -384,7 +384,11 @@ export async function mintUploadLink(
         message: `${label} connects via OAuth — it has no secret to upload; connect it directly instead`,
       };
     }
-    const capability = await resolveMcpOAuthRegistrationCapability(serverUrl);
+    const capability = await resolveMcpOAuthRegistrationCapability(
+      serverUrl,
+      undefined,
+      resolved!.manifest.domains,
+    );
     if (capability === "no-dcr") {
       staticClientMode = true;
     } else {
