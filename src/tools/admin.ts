@@ -368,7 +368,29 @@ function gitPatCheck(tokenFile: string, allowLoosePat: boolean): WizardCheck {
 }
 
 function memoryBackendCheck(store: Store): WizardCheck {
-  const baseUrl = store.getOrgSettings()?.memoryBackend?.baseUrl?.trim();
+  const mb = store.getOrgSettings()?.memoryBackend;
+  if (mb?.kind === "mnesis") {
+    const missing: string[] = [];
+    if (!mb.baseUrl?.trim()) missing.push("memory_backend.base_url (memory-server /mcp endpoint)");
+    if (!mb.tenant?.trim()) missing.push("memory_backend.tenant (org workspace / x-tenant-id)");
+    if (!mb.embeddingUrl?.trim()) missing.push("memory_backend.embedding_url (embedding endpoint)");
+    if (!process.env.MNESIS_TOKEN) missing.push("MNESIS_TOKEN credential (vault boot-secret chain)");
+    if (missing.length > 0) {
+      return {
+        name: "memory_backend",
+        ok: false,
+        detail: `mnesis backend configured but incomplete — missing: ${missing.join(", ")}`,
+        fix: "provision the mnesis memory-server + embedding endpoint per setup.md, then set memory_backend.kind=base_url/tenant/embedding_url (settings tool) and the MNESIS_TOKEN credential",
+      };
+    }
+    return {
+      name: "memory_backend",
+      ok: true,
+      detail: `mnesis backend configured (memory_server ${mb.baseUrl}, tenant ${mb.tenant})`,
+      fix: "none",
+    };
+  }
+  const baseUrl = mb?.baseUrl?.trim();
   if (baseUrl) {
     return {
       name: "memory_backend",

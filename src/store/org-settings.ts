@@ -94,6 +94,31 @@ export interface OrgSecretsBackendSettings {
   mapping?: Record<string, SecretsBackendMappingEntry>;
 }
 
+/**
+ * Memory backend settings (Part B, issue #348). `kind` selects the backend:
+ * `mnesis` (remote memory-server over MCP Streamable HTTP — the pluggable
+ * company brain, #132), `mem0` (legacy REST), or `sqlite` (in-process).
+ * When `kind` is unset:
+ *   - `baseUrl` set → mem0 (legacy behavior)
+ *   - otherwise → SQLite (default)
+ * mnesis additionally requires:
+ *   - `tenant`: the org's mnesis workspace id (sent as `x-tenant-id`)
+ *   - `embeddingUrl`: the embedding endpoint the memory-server writes
+ *     against — a deployment prerequisite probed at boot (fails closed).
+ * The mnesis credential (org principal bearer token) is NEVER in settings:
+ * it rides the boot-secret vault chain (`MNESIS_TOKEN`, rotatable via the
+ * same provisioning/upload surface as the model/slack keys).
+ */
+export interface OrgMemoryBackendSettings {
+  kind?: "sqlite" | "mem0" | "mnesis";
+  /** Backend base URL: mem0 REST server, or the mnesis memory-server `/mcp` endpoint. */
+  baseUrl?: string;
+  /** mnesis org workspace / tenant id — sent as `x-tenant-id`. Required for mnesis. */
+  tenant?: string;
+  /** mnesis embedding endpoint URL — deployment prerequisite, boot-probed. Required for mnesis. */
+  embeddingUrl?: string;
+}
+
 export interface OrgSettings {
   /** False = at least one knob is malformed; the blob must not be used. */
   ok: boolean;
@@ -131,8 +156,13 @@ export interface OrgSettings {
   turnStopControl?: boolean;
   /** Voice-note transcription knobs (issue #96); unset → NEAR defaults. */
   voice?: { transcription?: OrgVoiceTranscriptionSettings };
-  /** Memory backend URL (mem0); unset → SQLite memory (Part B). */
-  memoryBackend?: { baseUrl?: string };
+  /**
+   * Memory backend (Part B). `kind` discriminates the backend
+   * (issue #348): `mnesis` (remote memory-server over MCP Streamable HTTP),
+   * `mem0` (legacy default when `baseUrl` is set), or `sqlite` (in-process,
+   * the default when nothing is set). Unset → SQLite memory.
+   */
+  memoryBackend?: OrgMemoryBackendSettings;
   /**
    * Proactive onboarding (issue #116): the space id (e.g. "slack:C123")
    * that receives the boot-time guided setup post. Unset → no boot post
@@ -187,7 +217,12 @@ export interface OrgSettingsInput {
   voice?: {
     transcription?: { base_url?: string; model?: string };
   };
-  memory_backend?: { base_url?: string };
+  memory_backend?: {
+    kind?: "sqlite" | "mem0" | "mnesis";
+    base_url?: string;
+    tenant?: string;
+    embedding_url?: string;
+  };
   /** Proactive onboarding (issue #116): space id for the boot-time guide. */
   onboarding?: { space_id?: string };
   /** Secret-vault backend for the extension credential boundary (issue #190). */
@@ -575,31 +610,62 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
       }
       if (sectionOk) out.voice = { transcription: parsed };
     } else if (name === "memory_backend") {
-      // The backend URL (mem0) — issue #67 env pruning moved the knob out
-      // of env. An EMPTY base_url clears the setting (SQLite fallback),
-      // mirroring the old MEM0_BASE_URL= contract; `memory_backend: {}`
-      // sets nothing.
+      // Backend selection (Part B, issue #348). An EMPTY base_url clears
+      // the whole setting (SQLite fallback), mirroring the old
+      // MEM0_BASE_URL= contract; `memory_backend: {}` sets nothing.
       const section = jsonObjectSchema.safeParse(value);
       if (!section.success) {
         fail("memory_backend must be an object");
         continue;
       }
       let sectionOk = true;
+      let parsed: OrgMemoryBackendSettings = {};
       for (const [key, raw] of Object.entries(section.data)) {
-        if (key === "base_url") {
+        if (key === "kind") {
+          const kind = z.enum(["sqlite", "mem0", "mnesis"]).safeParse(raw);
+          if (!kind.success) {
+            sectionOk = false;
+            fail("memory_backend.kind must be one of: sqlite, mem0, mnesis");
+          } else {
+            parsed = { ...parsed, kind: kind.data };
+          }
+        } else if (key === "base_url") {
           const str = z.string().safeParse(raw);
           if (!str.success) {
             sectionOk = false;
             fail("memory_backend.base_url must be a string");
-          } else if (str.data.trim() !== "") {
-            out.memoryBackend = { baseUrl: str.data.trim() };
+          } else if (str.data.trim() === "") {
+            // Empty base_url clears the setting (SQLite fallback).
+            parsed = {};
+          } else {
+            parsed = { ...parsed, baseUrl: str.data.trim() };
+          }
+        } else if (key === "tenant") {
+          const str = z.string().trim().min(1).safeParse(raw);
+          if (!str.success) {
+            sectionOk = false;
+            fail("memory_backend.tenant must be a non-empty string");
+          } else {
+            parsed = { ...parsed, tenant: str.data };
+          }
+        } else if (key === "embedding_url") {
+          const str = z.string().trim().min(1).safeParse(raw);
+          if (!str.success) {
+            sectionOk = false;
+            fail("memory_backend.embedding_url must be a non-empty string");
+          } else {
+            parsed = { ...parsed, embeddingUrl: str.data };
           }
         } else {
           sectionOk = false;
           fail(`memory_backend.${key}: unknown key`);
         }
       }
-      if (!sectionOk) out.memoryBackend = undefined;
+      if (sectionOk) {
+        if (Object.keys(parsed).length > 0) out.memoryBackend = parsed;
+      } else {
+        out.memoryBackend = undefined;
+      }
     } else if (name === "onboarding") {
       // Proactive onboarding (issue #116): the space id that receives the
       // boot-time guided setup post. An EMPTY space_id clears the setting
