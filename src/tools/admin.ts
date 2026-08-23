@@ -97,8 +97,9 @@ import {
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
 import { fetchOpenApiSpec } from "../extensions/openapi-tools";
-import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/boundary";
+import { PROXY_SECRETS_DIR } from "../extensions/boundary";
 import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
+import { registerPinnedExtension } from "../extensions/catalog-register";
 import type {
   CliBinding,
   CredentialSchema,
@@ -117,8 +118,6 @@ import {
   DEV_EGRESS_CONFIG_PATH,
   EGRESS_CONFIG_PATH,
   SNAPSHOTS_DIR,
-  regenerateDevEgressConfig,
-  regenerateEgressConfig,
 } from "../egress/generate";
 import type { Store } from "../store/db";
 import type { AuditModule } from "../policy/audit";
@@ -838,85 +837,35 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
               runtimeSetWarning = `EGRESS REGEN SKIPPED MALFORMED RUNTIME ROW — the egress config regenerated with the committed ` +
                 `pins only, so a previously runtime-registered provider may be missing from egress: ${errorMessage(err)}`;
             }
-            // regenerateEgressConfig returns the rendered YAML; the paths are
-            // what the caller and the audit trail need.
-            regenerateEgressConfig(snapshotsDir, egressPath, runtimeSet);
-            regenerateDevEgressConfig(snapshotsDir, devEgressPath, runtimeSet);
-            // HOT-RELOAD (issue #197): the registry the composition root
-            // wired is the LIVE instance the runtime resolves against (#172). Register the new snapshot into it so
-            // NEW sessions resolve the extension immediately through the
-            // per-session surface refresh (#167) — NO restart. Fail closed: a
-            // failed registration surfaces loudly in the result and the audit
-            // row, and the snapshot file already landed (never rolled back).
-            // Re-pinning an already-live extension is idempotent (resolve →
-            // already registered); absent registry → nothing to register (the
-            // catalog's "pinned" half stays list-only, like the boot).
-            let liveRegistry: "registered" | "failed" | "absent" = "absent";
-            let liveError: string | undefined;
-            if (opts.registry !== undefined) {
-              if (opts.registry.resolve(reviewed.extensionId) !== undefined) {
-                liveRegistry = "registered";
-              } else {
-                try {
-                  const manifest = validateManifest(JSON.parse(JSON.stringify(reviewed.manifest)));
-                  const snapshot: PinnedSnapshot = {
-                    schema: reviewed.schema,
-                    extensionId: reviewed.extensionId,
-                    pinnedAt: reviewed.pinnedAt,
-                    source: reviewed.source,
-                    manifest,
-                  };
-                  opts.registry.register(manifest, snapshot);
-                  liveRegistry = "registered";
-                } catch (err) {
-                  liveRegistry = "failed";
-                  liveError = errorMessage(err);
-                }
-              }
-            }
-            // HOT-RELOAD: the egress regen changed the allowlist/inject rules
-            // — trigger the proxy reload (the boundary's existing mechanism,
-            // issue #123: POST /v1/reload with the management token) so the
-            // new domains apply immediately. Unset control URL (unconfigured
-            // deployments, hermetic tests) → write-only, like the boundary.
-            const control = proxyBoundaryControlFromEnv();
-            /** The proxy reload attempt result (ok, or the error evidence). */
-            interface ProxyReloadResult {
-              ok: boolean;
-              error?: string;
-            }
-            const reload: ProxyReloadResult = { ok: false };
-            if (control.proxyControlUrl !== undefined) {
-              try {
-                const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
-                  method: "POST",
-                  headers:
-                    control.proxyControlToken !== undefined
-                      ? { Authorization: `Bearer ${control.proxyControlToken}` }
-                      : undefined,
-                });
-                if (!res.ok) throw new Error(`proxy reload failed (${res.status})`);
-                reload.ok = true;
-              } catch (err) {
-                reload.error = errorMessage(err);
-              }
-            }
-            const proxyReload: "ok" | "failed" | "unset" =
-              control.proxyControlUrl === undefined ? "unset" : reload.ok ? "ok" : "failed";
-            const hotReloadWarnings: string[] = [];
-            if (runtimeSetWarning !== undefined) hotReloadWarnings.push(runtimeSetWarning);
-            if (liveRegistry === "failed") {
-              hotReloadWarnings.push(
-                `LIVE REGISTRY REGISTRATION FAILED — the snapshot landed, but this server's runtime won't see ` +
-                  `"${params.spec.trim()}" until a restart: ${liveError}`,
-              );
-            }
-            if (proxyReload === "failed") {
-              hotReloadWarnings.push(
-                `PROXY RELOAD FAILED — the egress config regenerated, but the dev proxy is still serving the OLD ` +
-                  `allowlist until a reload/restart: ${reload.error}`,
-              );
-            }
+            // The shared register pipeline (issue #347): regenerates BOTH
+            // egress configs (prod+dev) with the merged runtime set,
+            // HOT-REGISTERS the snapshot into the LIVE registry (new
+            // sessions see the extension immediately, no restart), reloads
+            // the dev proxy, and collects every failure loudly. The snapshot
+            // file already landed (never rolled back); re-pinning an
+            // already-live extension is idempotent.
+            const pinnedSnapshot: PinnedSnapshot = {
+              schema: reviewed.schema,
+              extensionId: reviewed.extensionId,
+              pinnedAt: reviewed.pinnedAt,
+              source: reviewed.source,
+              manifest: validateManifest(JSON.parse(JSON.stringify(reviewed.manifest))),
+            };
+            const registration = await registerPinnedExtension(
+              {
+                snapshotsDir,
+                egressPath,
+                devEgressPath,
+                registry: opts.registry,
+              },
+              {
+                snapshot: pinnedSnapshot,
+                runtimeSet,
+                warnings: runtimeSetWarning !== undefined ? [runtimeSetWarning] : [],
+              },
+            );
+            const { liveRegistry, proxyReload, proxyReloadError, warnings: hotReloadWarnings } = registration;
+            const liveError = registration.liveRegistryError;
             await audit?.appendAudit({
               actor,
               event_type: ADMIN_CATALOG_BROWSER_EVENT,
@@ -931,7 +880,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 live_registry: liveRegistry,
                 ...(liveError !== undefined ? { live_error: liveError } : undefined),
                 proxy_reload: proxyReload,
-                ...(reload.error !== undefined ? { proxy_reload_error: reload.error } : undefined),
+                ...(proxyReloadError !== undefined ? { proxy_reload_error: proxyReloadError } : undefined),
               },
             });
             /** The pin result the tool reports back to the agent. */

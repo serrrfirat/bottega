@@ -510,21 +510,161 @@ export type RegisterFromCatalogResult =
   | { ok: false; message: string };
 
 /**
+ * The unified "register a pinned extension" outcome that both the
+ * catalog_browser pin action (admin.ts) and the connect path share: the
+ * egress configs regenerated with the merged runtime set, the snapshot
+ * hot-registered into the live registry, and the proxy reloaded. Failures
+ * are loud via {@link PinnedExtensionRegistration.warnings}; the approved
+ * registration/pin itself stays persisted (never rolled back).
+ */
+export interface PinnedExtensionRegistration {
+  liveRegistry: "registered" | "failed" | "absent";
+  /** Present when the live-registry registration failed (the audit's evidence). */
+  liveRegistryError?: string;
+  proxyReload: "ok" | "failed" | "unset";
+  /** Present when the proxy reload failed (the reload contract's evidence). */
+  proxyReloadError?: string;
+  warnings: string[];
+}
+
+/** What the shared register pipeline needs at call time. */
+export interface RegisterPinnedExtensionDeps {
+  /** The pinned-seed dir the egress regen reads (the committed snapshots). */
+  snapshotsDir?: string;
+  /** Strict egress output; default EGRESS_CONFIG_PATH. */
+  egressPath?: string;
+  /** Dev egress output; default DEV_EGRESS_CONFIG_PATH. */
+  devEgressPath?: string;
+  /**
+   * The LIVE registry to hot-register into (issue #197). Absent → no
+   * hot-register ("absent"), like the catalog's list-only boot.
+   */
+  registry?: Pick<ExtensionRegistry, "resolve" | "register">;
+}
+
+/** The snapshot to register + the full persisted runtime set it merges with. */
+export interface RegisterPinnedExtensionOpts {
+  snapshot: PinnedSnapshot;
+  /**
+   * The full persisted runtime set for the SUPERSET egress regen (issue
+   * #250): one pin/registration never drops another provider's allowlist
+   * entry. The caller resolves it (store read or registry seam) so each
+   * caller keeps its own load-failure posture.
+   */
+  runtimeSet: PinnedSnapshot[];
+  /** Warnings the caller already accumulated (e.g. a runtime-row read failure). */
+  warnings?: string[];
+}
+
+/**
+ * The shared register pipeline (issue #347): regenerates BOTH egress
+ * configs with the merged runtime set (byte-pinned for the seed fixtures),
+ * HOT-REGISTERS the snapshot into the live registry (new sessions see the
+ * extension immediately, no restart), triggers the proxy reload, and
+ * collects every failure as a loud warning — the registration/pin itself is
+ * never rolled back. Both the catalog_browser pin action AND the connect
+ * path call this; each caller does its own persistence first (config file
+ * vs store) and shapes its own result/audit. The proxy reload uses the
+ * `"ok" | "failed" | "unset"` contract (issue #123, the management API).
+ */
+export async function registerPinnedExtension(
+  deps: RegisterPinnedExtensionDeps,
+  opts: RegisterPinnedExtensionOpts,
+): Promise<PinnedExtensionRegistration> {
+  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
+  const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
+  const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
+  const warnings = [...(opts.warnings ?? [])];
+
+  // EGRESS REGEN (merged runtime set): byte-pinned for the seed fixtures;
+  // the runtime set is injected so one registration never drops another.
+  // A regen failure is LOUD in the result; the registration stays persisted.
+  try {
+    regenerateEgressConfig(snapshotsDir, egressPath, opts.runtimeSet);
+    regenerateDevEgressConfig(snapshotsDir, devEgressPath, opts.runtimeSet);
+  } catch (err) {
+    warnings.push(
+      `EGRESS REGEN FAILED — "${opts.snapshot.extensionId}" is registered at runtime but ${egressPath} was NOT ` +
+        `regenerated: ${errorMessage(err)}. Fix the cause and run "bun run src/egress/generate.ts" — until ` +
+        `then the new domains are NOT allowlisted.`,
+    );
+  }
+
+  // HOT-REGISTER (issue #197): the registry the composition root wired is
+  // the LIVE instance the runtime resolves against (#172). Register the new
+  // snapshot into it so NEW sessions resolve the extension immediately (no
+  // restart). Re-registering an already-live extension is idempotent
+  // (resolve → already registered); absent registry → nothing to register.
+  let liveRegistry: "registered" | "failed" | "absent" = "absent";
+  let liveRegistryError: string | undefined;
+  if (deps.registry !== undefined) {
+    if (deps.registry.resolve(opts.snapshot.extensionId) !== undefined) {
+      liveRegistry = "registered";
+    } else {
+      try {
+        deps.registry.register(opts.snapshot.manifest, opts.snapshot);
+        liveRegistry = "registered";
+      } catch (err) {
+        liveRegistry = "failed";
+        liveRegistryError = errorMessage(err);
+        warnings.push(
+          `LIVE REGISTRY REGISTRATION FAILED — "${opts.snapshot.extensionId}" is registered in the store but this ` +
+            `server's runtime won't see it until a restart: ${liveRegistryError}`,
+        );
+      }
+    }
+  }
+
+  // The proxy reload (issue #123): the egress regen changed the allowlist —
+  // trigger the boundary's reload so the new domains apply immediately.
+  // Unset control (unconfigured deployments, hermetic tests) → write-only,
+  // exactly like the boundary.
+  let proxyReload: "ok" | "failed" | "unset" = "unset";
+  let proxyReloadError: string | undefined;
+  const control = proxyBoundaryControlFromEnv();
+  if (control.proxyControlUrl !== undefined) {
+    let reloadOk = false;
+    try {
+      const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
+        method: "POST",
+        headers:
+          control.proxyControlToken !== undefined
+            ? { Authorization: `Bearer ${control.proxyControlToken}` }
+            : undefined,
+      });
+      if (!res.ok) throw new Error(`proxy reload failed (${res.status})`);
+      reloadOk = true;
+    } catch (err) {
+      proxyReloadError = errorMessage(err);
+    }
+    if (reloadOk) {
+      proxyReload = "ok";
+    } else {
+      proxyReload = "failed";
+      warnings.push(
+        `PROXY RELOAD FAILED — the egress config regenerated but the dev proxy is still serving the OLD ` +
+          `allowlist until a reload/restart: ${proxyReloadError}`,
+      );
+    }
+  }
+
+  return { liveRegistry, liveRegistryError, proxyReload, proxyReloadError, warnings };
+}
+
+/**
  * The runtime register step (issue #233): the approved/authorized draft
  * from {@link lookupCatalogExtension} persists to the STORE-backed runtime
- * registry (machine state — NO config/extensions file, NO commit), the
- * egress configs regenerate with the merged runtime set (byte-pinned for
- * the seed fixtures; the runtime set is injected), the snapshot
- * HOT-REGISTERS into the live registry, and the proxy reloads. Every
- * failure is loud; a store-write failure fails the registration closed
- * (nothing durable, no egress, no hot-register).
+ * registry (machine state — NO config/extensions file, NO commit), then
+ * delegates the egress regen + hot-register + proxy reload to the shared
+ * {@link registerPinnedExtension} pipeline. Every failure is loud; a
+ * store-write failure fails the registration closed (nothing durable, no
+ * egress, no hot-register).
  */
 export async function registerExtensionAtRuntime(
   snapshot: PinnedSnapshot,
   label: string,
   deps: CatalogRegisterRuntimeDeps,
 ): Promise<RegisterFromCatalogResult> {
-  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
   const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
   const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
 
@@ -549,8 +689,8 @@ export async function registerExtensionAtRuntime(
   }
 
   // 4. EGRESS REGEN (merged runtime set) + HOT-REGISTER (issue #197) +
-  // proxy reload — the canary's extension-pin journey mechanics. Failures
-  // are LOUD in the result; the approved registration stays persisted.
+  // proxy reload via the shared pipeline. Failures are LOUD in the result;
+  // the approved registration stays persisted.
   const warnings: string[] = [];
   let runtimeSet: PinnedSnapshot[] = [snapshot];
   if (deps.runtimeRegistry !== undefined) {
@@ -563,53 +703,15 @@ export async function registerExtensionAtRuntime(
       );
     }
   }
-  try {
-    regenerateEgressConfig(snapshotsDir, egressPath, runtimeSet);
-    regenerateDevEgressConfig(snapshotsDir, devEgressPath, runtimeSet);
-  } catch (err) {
-    warnings.push(
-      `EGRESS REGEN FAILED — "${snapshot.extensionId}" is registered at runtime but ${egressPath} was NOT ` +
-        `regenerated: ${errorMessage(err)}. Fix the cause and run "bun run src/egress/generate.ts" — until ` +
-        `then the new domains are NOT allowlisted.`,
-    );
-  }
-  let liveRegistry: "registered" | "failed" | "absent" = "absent";
-  if (deps.registry.resolve(snapshot.extensionId) !== undefined) {
-    liveRegistry = "registered";
-  } else {
-    try {
-      deps.registry.register(snapshot.manifest, snapshot);
-      liveRegistry = "registered";
-    } catch (err) {
-      liveRegistry = "failed";
-      warnings.push(
-        `LIVE REGISTRY REGISTRATION FAILED — "${snapshot.extensionId}" is registered in the store but this ` +
-          `server's runtime won't see it until a restart: ${errorMessage(err)}`,
-      );
-    }
-  }
-  // The proxy reload (issue #123): the egress regen changed the allowlist —
-  // trigger the boundary's reload so the new domains apply immediately.
-  // Unset control (unconfigured deployments, hermetic tests) → write-only,
-  // exactly like the boundary.
-  const control = proxyBoundaryControlFromEnv();
-  if (control.proxyControlUrl !== undefined) {
-    try {
-      const res = await fetch(`${control.proxyControlUrl}/v1/reload`, {
-        method: "POST",
-        headers:
-          control.proxyControlToken !== undefined
-            ? { Authorization: `Bearer ${control.proxyControlToken}` }
-            : undefined,
-      });
-      if (!res.ok) throw new Error(`proxy reload failed (${res.status})`);
-    } catch (err) {
-      warnings.push(
-        `PROXY RELOAD FAILED — the egress config regenerated but the dev proxy is still serving the OLD ` +
-          `allowlist until a reload/restart: ${errorMessage(err)}`,
-      );
-    }
-  }
+  const registration = await registerPinnedExtension(
+    {
+      snapshotsDir: deps.snapshotsDir,
+      egressPath: deps.egressPath,
+      devEgressPath: deps.devEgressPath,
+      registry: deps.registry,
+    },
+    { snapshot, runtimeSet, warnings },
+  );
 
   await deps.audit.appendAudit({
     space_id: deps.spaceId ?? null,
@@ -623,7 +725,7 @@ export async function registerExtensionAtRuntime(
       egress_config: egressPath,
       hosted_variant: true,
       vendor_official: true,
-      live_registry: liveRegistry,
+      live_registry: registration.liveRegistry,
     },
   });
 
@@ -632,12 +734,12 @@ export async function registerExtensionAtRuntime(
     `${devEgressPath}), live in the running server.`;
   return {
     ok: true,
-    message: warnings.length > 0 ? `${message} WARNING: ${warnings.join(" ")}` : message,
+    message: registration.warnings.length > 0 ? `${message} WARNING: ${registration.warnings.join(" ")}` : message,
     extensionId: snapshot.extensionId,
     label,
-    liveRegistry,
+    liveRegistry: registration.liveRegistry,
     oauthGated: snapshot.manifest.credentialSchema.type === "oauth",
     credentialType: snapshot.manifest.credentialSchema.type,
-    warnings,
+    warnings: registration.warnings,
   };
 }
