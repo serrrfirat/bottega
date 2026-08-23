@@ -35,17 +35,23 @@ import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname, isAbsolute } from "node:path";
-import { processItem, runIngestPollJob, runKbJob, type ExecutorConfig, type ExecutorDeps, type JobRunOutcome } from "../executor";
-import { z } from "zod";
+import {
+  type ExecutorConfig,
+  type ExecutorDeps,
+  type JobRunOutcome,
+  type SandboxResult,
+  type SandboxRunner,
+  SANDBOX_EXIT_COMPLETED,
+  SANDBOX_EXIT_FAILED,
+  SANDBOX_EXIT_REQUEUE,
+  unstickWorkItem,
+} from "./job-bodies";
 import type { Store } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
-import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
-import { postOutboxRow, type OutboxWrite } from "../store/outbox";
-import { createAudit, type AuditModule } from "../policy/audit";
-import type { SchedulerActionName } from "../scheduler/types";
-import { ingestPollJobPayloadSchema, scheduledJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
-import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
+import { JOB_FAILED_EVENT } from "../store/audit-events";
+import { ingestPollJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
+import { jobScopeFromEnvelope } from "./scoped-store";
 import { resolveKindCaps, type JobResourceCaps } from "./caps";
 import { JobStoreRpcServer } from "./store-rpc";
 import {
@@ -57,36 +63,6 @@ import {
 } from "./sandbox-protocol";
 
 /** What a sandbox run reported back to the boss loop. */
-export interface SandboxResult {
-  /** The child/body exit code. null when the runner died by signal or invalid IPC. */
-  exitCode: number | null;
-  /** The terminating signal, if any. */
-  signal: string | null;
-  /** True when the run was torn down by the supervisor's deadline. */
-  timedOut: boolean;
-  /** True when lease renewal proved that the parent no longer owns the job. */
-  leaseLost?: boolean;
-  /** Bounded protocol validation failure. Never contains child output beyond the cap. */
-  protocolError?: string;
-}
-
-/** Per-run context handed to the runner. */
-export interface SandboxRunnerContext {
-  deps: ExecutorDeps;
-  cfg: ExecutorConfig;
-  /** The kind's resolved resource caps (org overrides on the defaults). */
-  caps: JobResourceCaps;
-  /** Aborted by the boss loop when lease renewal fails. The runner must kill the full process tree. */
-  signal: AbortSignal;
-}
-
-/** The injectable runner seam (tests supply fakes; production supplies the Docker container). */
-export type SandboxRunner = (job: WorkerJob, ctx: SandboxRunnerContext) => Promise<SandboxResult>;
-
-/** Exit contract (see module doc). */
-export const SANDBOX_EXIT_COMPLETED = 0;
-export const SANDBOX_EXIT_FAILED = 2;
-export const SANDBOX_EXIT_REQUEUE = 3;
 
 /** Resolves the per-kind caps with the org settings `caps` overrides. */
 export function capsFor(kind: WorkerJob["kind"], store: Store): JobResourceCaps {
@@ -99,16 +75,6 @@ export function capsFor(kind: WorkerJob["kind"], store: Store): JobResourceCaps 
  * body), failing closed on a malformed envelope so a bad scheduled job is
  * ALWAYS a loud crash (the parent fails the job), never a silent no-op.
  */
-export function parseScheduledJobPayload(job: WorkerJob): z.infer<typeof scheduledJobPayloadSchema> {
-  const parsed = scheduledJobPayloadSchema.safeParse(job.payload);
-  if (!parsed.success) {
-    // Malformed envelope → loud crash (parent fails the job).
-    throw new Error(
-      `job ${job.id} (scheduled) payload must be { action, ... } — failing closed: ${parsed.error.message}`,
-    );
-  }
-  return parsed.data;
-}
 
 /**
  * The per-run sandbox probe contract (issue #101): what a boot-time probe of
@@ -987,163 +953,6 @@ export function readBounded(
 }
 
 /** Dispatches every durable worker kind inside the same real isolation boundary. */
-export async function runIsolatedJobBody(
-  deps: ExecutorDeps,
-  cfg: ExecutorConfig,
-  caps: JobResourceCaps,
-  job: WorkerJob,
-): Promise<SandboxResult> {
-  switch (job.kind) {
-    case "git":
-    case "extension":
-      return runJobSandboxBody(deps, cfg, caps, job);
-    case "scheduled":
-      return runScheduledJobBody(deps, cfg, caps, job);
-    case "kb":
-    case "ingest_poll": {
-      const store = createJobScopedStore(deps.store, jobScopeFromEnvelope(job));
-      const audit = createAudit(store);
-      try {
-        const outcome =
-          job.kind === "kb" ? await runKbJob({ ...deps, store }, job) : await runIngestPollJob({ ...deps, store }, job);
-        await completeSelf(store, audit, job, outcome);
-        return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await failJobSelf(store, audit, job, message);
-        return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
-      }
-    }
-  }
-}
-
-/**
- * One job's isolated run body: the code that runs inside the sandbox (the
- * job Docker container in production, an injected runner in tests). Re-derives the scope
- * from the envelope id (fail closed: the facade permits ONLY this job's
- * rows), claims the work item, runs the item's full delivery lifecycle, and
- * writes ITS OWN terminal lifecycle (completeJob + own outbox row + audit)
- * through the scoped facade. Never touches the claim loop's global sweep;
- * never touches another job's rows.
- */
-export async function runJobSandboxBody(
-  deps: ExecutorDeps,
-  cfg: ExecutorConfig,
-  _caps: JobResourceCaps,
-  job: WorkerJob,
-): Promise<SandboxResult> {
-  const scope = jobScopeFromEnvelope(job);
-  const store = createJobScopedStore(deps.store, scope);
-  const audit = createAudit(store);
-
-  const parsed = workItemJobPayloadSchema.safeParse(job.payload);
-  if (!parsed.success) {
-    // Malformed envelope → loud crash (parent fails the job).
-    throw new Error(`job ${job.id} (${job.kind}) payload must be { workItemId } — failing closed`);
-  }
-  const workItemId = parsed.data.workItemId;
-
-  try {
-    const item = await store.claimWorkItemById(workItemId);
-    if (item === null) {
-      const current = await store.getWorkItem(workItemId);
-      if (current === null) {
-        throw new Error(`work item ${workItemId} not found`);
-      }
-      if (current.state === "done" || current.state === "blocked" || current.state === "aborted") {
-        // Already settled elsewhere — the sandbox completes as a no-op and
-        // writes its own outbox row so the server sees the settlement.
-        await completeSelf(store, audit, job, { state: current.state, result: null });
-        return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
-      }
-      // claimed/working under a live owner (lease-reclaim race): requeue,
-      // never double-execute.
-      return { exitCode: SANDBOX_EXIT_REQUEUE, signal: null, timedOut: false };
-    }
-
-    const settled = await processItem(deps, cfg, item);
-    await completeSelf(store, audit, job, {
-      state: settled.state,
-      result: safeParseJson(settled.result),
-    });
-    return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
-  } catch (err) {
-    // Loud self-fail: the sandbox owns its failure — job.failed audit +
-    // the item lands blocked (never stuck at working).
-    const message = err instanceof Error ? err.message : String(err);
-    await failSelf(store, audit, job, workItemId, message);
-    return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
-  }
-}
-
-/**
- * One scheduled job's isolated run body (issue #272, epic #229 P2): the
- * dispatcher-dispatch leg. Re-derives the scope from the envelope id (fail
- * closed: the facade permits ONLY this job's rows), resolves the named
- * action in the executor's scheduled-action registry (an unknown action
- * fails LOUDLY naming it — never a silent no-op), runs it against the
- * job-scoped store facade with the model-call seam from the job context,
- * and writes ITS OWN terminal lifecycle (completeJob + own outbox row +
- * audit) through the scoped facade. The action's return value rides the
- * completion outbox row + audit as the result. Worker actions never post to
- * Slack — the outbox seam is the post path — and have no policy context.
- */
-export async function runScheduledJobBody(
-  deps: ExecutorDeps,
-  _cfg: ExecutorConfig,
-  _caps: JobResourceCaps,
-  job: WorkerJob,
-): Promise<SandboxResult> {
-  const scope = jobScopeFromEnvelope(job);
-  const store = createJobScopedStore(deps.store, scope);
-  const audit = createAudit(store);
-
-  const parsed = parseScheduledJobPayload(job);
-  const { action: actionName, params } = parsed;
-  // SAFETY: scheduledJobPayloadSchema types action as an arbitrary string; the
-  // registry is keyed by the statically known SchedulerActionName union, so a
-  // name outside it misses the map and the unknown-action throw below fails closed.
-  const action = deps.scheduledActions?.get(actionName as SchedulerActionName);
-  if (!action) {
-    throw new Error(`scheduled job ${job.id} failed: unknown action "${actionName}" — no silent no-op`);
-  }
-
-  try {
-    const result = await action.run(params, {
-      store,
-      audit,
-      memoryProvider: deps.memoryProvider,
-      postMessage: () => {
-        throw new Error(
-          `scheduled action ${actionName} attempted to post to Slack — the worker holds no tokens; the outbox seam is the post path`,
-        );
-      },
-      loadPolicy: async () => {
-        throw new Error(`scheduled action ${actionName} has no policy context in the worker`);
-      },
-      log: (line) => console.log(`[${job.id}] ${line}`),
-      now: Date.now,
-      consolidationModelCall: deps.consolidationModelCall,
-      ...(deps.runMemoryConsolidation !== undefined ? { runMemoryConsolidation: deps.runMemoryConsolidation } : undefined),
-    });
-    await completeSelf(store, audit, job, { state: "completed", result: result ?? null });
-    return { exitCode: SANDBOX_EXIT_COMPLETED, signal: null, timedOut: false };
-  } catch (err) {
-    // Loud self-fail: the action body owns its failure — job.failed audit,
-    // no outbox row (the job bus surfaces the failure).
-    const message = err instanceof Error ? err.message : String(err);
-    await store.failJob(job.id);
-    await audit.appendAudit({
-      ts: Date.now(),
-      space_id: job.spaceId ?? null,
-      actor: "executor",
-      event_type: JOB_FAILED_EVENT,
-      payload: JSON.stringify({ id: job.id, kind: job.kind, error: message.slice(0, 2000) }),
-    });
-    console.log(`[${job.id}] scheduled job failed (${actionName}): ${message}`);
-    return { exitCode: SANDBOX_EXIT_FAILED, signal: null, timedOut: false };
-  }
-}
 
 /** The boss-loop supervisor: map a runner result onto the job bus. */
 export async function runJobInSandbox(
@@ -1223,104 +1032,21 @@ async function failLoud(deps: ExecutorDeps, job: WorkerJob, result: SandboxResul
   await unstickWorkItem(deps.store, parsed.data.workItemId, reason);
 }
 
-/**
- * Moves the job's work item to blocked so a crash never leaves it stuck at
- * working/claimed. Uses the two-step claimed→working→blocked when the item
- * is still claimed (claimed→blocked is not a legal move) and the direct
- * working→blocked otherwise. Failures here are logged, never thrown — the
- * job already failed and the audit trail is the source of truth.
- */
-export async function unstickWorkItem(store: Store, workItemId: string, reason: string): Promise<void> {
-  const evidence = `sandbox crash: ${reason}`;
-  const current = await store.getWorkItem(workItemId);
-  if (current === null) return;
-  if (current.state === "blocked" || current.state === "aborted" || current.state === "done") return;
-  try {
-    if (current.state === "claimed") {
-      await store.transitionWorkItem(workItemId, "claimed", "working", { by: "executor" });
-    }
-    await store.transitionWorkItem(workItemId, "working", "blocked", { evidence, by: "executor" });
-  } catch (err) {
-    console.log(
-      `[${workItemId}] could not unstick work item (${err instanceof Error ? err.message : String(err)}) — job already failed loudly`,
-    );
-  }
-}
 
-/**
- * A store that may expose a job-scoped `postOutboxRow` (the container's RPC
- * store, whose outbox write is routed supervisor-side so no SQL handle is
- * needed in the container). The real / child-process / in-process stores
- * lack it and write through the module {@link postOutboxRow} directly.
- */
-export type SandboxStore = Store & { postOutboxRow?(input: OutboxWrite): Promise<void> };
-
-/** Writes one job-completion outbox row, routing through RPC when available. */
-async function writeOutboxRow(store: SandboxStore, input: OutboxWrite): Promise<void> {
-  if (store.postOutboxRow !== undefined) {
-    await store.postOutboxRow(input);
-  } else {
-    postOutboxRow(store, input);
-  }
-}
-
-/** The sandbox's own success bookkeeping: completeJob + one outbox row + audit. */
-async function completeSelf(
-  store: SandboxStore,
-  audit: AuditModule,
-  job: WorkerJob,
-  outcome: { state: string; result: unknown },
-): Promise<void> {
-  await store.completeJob(job.id);
-  await writeOutboxRow(store, {
-    id: job.id,
-    kind: job.kind,
-    payload: { state: outcome.state, result: outcome.result ?? null },
-    space: job.spaceId ?? null,
-  });
-  await audit.appendAudit({
-    ts: Date.now(),
-    space_id: job.spaceId ?? null,
-    actor: "executor",
-    event_type: JOB_COMPLETED_EVENT,
-    payload: JSON.stringify({ id: job.id, kind: job.kind, state: outcome.state, result: outcome.result ?? null }),
-  });
-}
-
-/** The sandbox's own failure bookkeeping: failJob + job.failed audit + item blocked. */
-async function failSelf(
-  store: SandboxStore,
-  audit: AuditModule,
-  job: WorkerJob,
-  workItemId: string,
-  message: string,
-): Promise<void> {
-  await failJobSelf(store, audit, job, message);
-  await unstickWorkItem(store, workItemId, message);
-}
-
-/** Failure bookkeeping for isolated kinds that do not own a work-item row. */
-async function failJobSelf(store: SandboxStore, audit: AuditModule, job: WorkerJob, message: string): Promise<void> {
-  await store.failJob(job.id);
-  await audit.appendAudit({
-    ts: Date.now(),
-    space_id: job.spaceId ?? null,
-    actor: "executor",
-    event_type: JOB_FAILED_EVENT,
-    payload: JSON.stringify({ id: job.id, kind: job.kind, error: message.slice(0, 2000) }),
-  });
-  console.log(`[${job.id}] sandbox failed the job (${job.kind}): ${message}`);
-}
-
-/** One decoded JSON document — the domain of a work item's stored result column. */
-type JsonDocument = string | number | boolean | null | JsonDocument[] | { [key: string]: JsonDocument };
-
-/** Parses a work item's result JSON column; null when absent or corrupt. */
-function safeParseJson(text: string | null): JsonDocument {
-  if (text === null) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
+// Re-export the sandbox contract + isolated bodies from the leaf for external
+// consumers (run-job-child.ts, run-job-test-fabric.ts, and the worker test
+// suites) that import them from this module — the dependency stays one-way
+// (job-bodies <- run-job) but the public surface is unchanged.
+export {
+  type SandboxResult,
+  type SandboxRunner,
+  type SandboxRunnerContext,
+  type SandboxStore,
+  SANDBOX_EXIT_COMPLETED,
+  SANDBOX_EXIT_FAILED,
+  SANDBOX_EXIT_REQUEUE,
+  runIsolatedJobBody,
+  runJobSandboxBody,
+  runScheduledJobBody,
+  unstickWorkItem,
+} from "./job-bodies";
