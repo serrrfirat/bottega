@@ -37,6 +37,7 @@ import {
   managementProbe,
   managementToken,
   proxyBootEnv,
+  spawnDocker,
   waitForManagement,
 } from "./canary-proxy-boot";
 
@@ -112,6 +113,34 @@ describe("composeCommand boots the canary proxy via base + dev override (issue #
 
   test("the file list matches the dev.sh topology (same two compose files)", () => {
     expect(COMPOSE_FILES).toEqual(["docker-compose.yml", "docker-compose.dev.yml"]);
+  });
+});
+
+describe("dockerRun passes process.env so compose interpolates repo secrets (issue #343)", () => {
+  // Regression: Bun's node:child_process spawnSync does NOT inherit the
+  // parent's process.env by default. Without `env: process.env` the docker
+  // compose step runs WITHOUT IRON_MANAGEMENT_API_KEY / BOTTEGA_DEV_*, so
+  // the proxy boots with an empty management key and crash-loops
+  // "management.api_key_env not set". This pins that every docker spawn
+  // forwards the full parent env.
+  test("forwards env: process.env to the spawn call", () => {
+    let seenEnv: unknown;
+    const result = spawnDocker("docker", ["compose", "config"], (file, args, opts) => {
+      seenEnv = opts.env;
+      return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    });
+    expect(result.status).toBe(0);
+    expect(seenEnv).toBe(process.env);
+  });
+
+  test("dockerRun yields the stderr on a failed invoke", () => {
+    const result = spawnDocker("docker", ["no-such-cmd"], () => ({
+      status: 1,
+      stdout: null,
+      stderr: Buffer.from("boom: not found"),
+    }));
+    expect(result.status).toBe(1);
+    expect(result.err).toContain("boom");
   });
 });
 

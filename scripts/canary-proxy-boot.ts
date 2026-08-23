@@ -157,12 +157,36 @@ export async function waitForManagement(
   }
 }
 
+/**
+ * The one spawnSync call site for every docker invocation, forwarding the
+ * parent's full env. Bun's node:child_process spawnSync does NOT inherit
+ * process.env by default, so without `env: process.env` the docker compose
+ * step runs WITHOUT IRON_MANAGEMENT_API_KEY / BOTTEGA_DEV_* / repo secrets —
+ * the proxy then boots with an empty management key and crash-loops
+ * "management.api_key_env not set" (issue #343). Injectable so a test can
+ * pin the env contract without shelling to docker.
+ */
+export type SpawnDocker = (
+  cmd0: string,
+  rest: string[],
+  spawn?: (file: string, args: string[], opts: { stdio: string[]; env: NodeJS.ProcessEnv }) => {
+    status: number | null;
+    stdout?: Buffer | null;
+    stderr?: Buffer | null;
+  },
+) => { status: number; out: string; err: string };
+
+export const spawnDocker: SpawnDocker = (cmd0, rest, spawn = (file, args, opts) => spawnSync(file, args, opts)) => {
+  const res = spawn(cmd0, rest, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+  return { status: res.status ?? 1, out: res.stdout?.toString() ?? "", err: res.stderr?.toString() ?? "" };
+};
+
 /** Shell to docker for a one-shot side effect (generate-ca / compose up); the tests stub this. */
 export type DockerRun = (cmd: string[]) => { status: number; error?: string };
 
 export const dockerRun: DockerRun = (cmd) => {
-  const res = spawnSync(cmd[0] ?? "docker", cmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
-  return { status: res.status ?? 1, error: res.stderr?.toString().trim().slice(0, 200) };
+  const res = spawnDocker(cmd[0] ?? "docker", cmd.slice(1));
+  return { status: res.status, error: res.err.trim().slice(0, 200) };
 };
 
 /**
@@ -173,8 +197,8 @@ export const dockerRun: DockerRun = (cmd) => {
  */
 export type ProxyLogs = (command: string[]) => string;
 export const composeLogs: ProxyLogs = (command) => {
-  const res = spawnSync(command[0] ?? "docker", command.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
-  return (res.stdout?.toString().trim() ?? "") || (res.stderr?.toString().trim() ?? "").slice(0, 400);
+  const res = spawnDocker(command[0] ?? "docker", command.slice(1));
+  return (res.out.trim() || res.err.trim()).slice(0, 400);
 };
 
 /** Generate the MITM CA with the pinned image if missing — the SAME command dev.sh uses (issue #301, no new crypto). */
