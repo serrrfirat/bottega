@@ -31,7 +31,8 @@ import { INGEST_WEBHOOK_REJECTED_EVENT } from "../store/audit-events";
 import type { IngestEvent, SignatureVerifier } from "./types";
 import { dispatchIngestEvent, type IngestDispatchContext } from "./dispatch";
 import { getVerifier } from "./registry";
-import { createWebhookVerifier } from "./webhook-scheme";
+import { createWebhookVerifier, GENERIC_TIMESTAMP_HEADER } from "./webhook-scheme";
+import { ReplayGuard } from "./replay-guard";
 import {
   githubMentionEvent,
   MAX_WEBHOOK_RAW_BODY_BYTES,
@@ -44,6 +45,22 @@ export const WEBHOOK_PATH_PREFIX = "/webhooks";
 /** The provider segment: one path segment, extension-id-shaped. */
 const WEBHOOK_PATH = /^\/webhooks\/([A-Za-z0-9_-]+)$/;
 
+/** GitHub's per-delivery id header (unique per webhook push; replay key). */
+export const GITHUB_DELIVERY_HEADER = "x-github-delivery";
+
+/**
+ * Max clock skew (ms) tolerated for the generic scheme's
+ * `x-bottega-timestamp` (issue #346 #2): ±5 minutes bounds how long a
+ * captured generic delivery can be replayed.
+ */
+export const GENERIC_TIMESTAMP_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * Process-wide shared replay guard — the inbound surface owns one, so
+ * delivery-id idempotency holds across requests without per-route stats.
+ */
+const sharedReplayGuard = new ReplayGuard();
+
 export interface WebhookRouteDeps {
   /** The shared store — the dispatch's work-item creation path. */
   store: Store;
@@ -53,6 +70,13 @@ export interface WebhookRouteDeps {
   postMessage: (spaceId: string, text: string) => Promise<string | undefined>;
   /** The org channel/DM the dispatch posts to (org settings onboarding.space_id). */
   spaceId: string;
+  /**
+   * Delivery-id replay guard (issue #346 #2): records processed
+   * provider delivery-ids so a re-delivered webhook is a no-op, not a
+   * duplicate dispatch. Defaults to a shared process-wide instance; tests
+   * inject a fresh one per harness.
+   */
+  replayGuard?: ReplayGuard;
   /**
    * Resolves a provider's webhook shared secret from its SECRET-REF
    * identity. The caller (the route) passes the provider id; the resolver
@@ -108,15 +132,38 @@ async function reject(
   }
 }
 
-/** Reads the raw body, refusing anything over the cap (bounding). */
+/**
+ * Reads the raw body with an enforced byte cap on the ACTUAL read (issue
+ * #346 #3): a streaming reader accumulates up to `maxBytes` bytes and
+ * cancels once the cap is exceeded. Content-Length is never trusted as the
+ * bound — an attacker can declare a small Content-Length and stream a huge
+ * body (a memory DoS if we held it all). Exceeding the cap is `{ ok:false }`
+ * WITHOUT holding the oversized remainder (the reader is cancelled), so a
+ * declared-small/huge-actual delivery is refused without buffering it all.
+ */
 async function readRawBody(req: Request, maxBytes: number): Promise<{ ok: true; body: string } | { ok: false }> {
-  const declared = req.headers.get("content-length");
-  if (declared !== null) {
-    const length = Number(declared);
-    if (Number.isFinite(length) && length > maxBytes) return { ok: false };
+  if (req.body === null) return { ok: false };
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        // Never hold the whole body: refuse and cancel the stream. The
+        // accumulated chunks are freed without ever decoding the tail.
+        await reader.cancel();
+        return { ok: false };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    // A stream that errors mid-read is not a usable body — refuse it.
+    return { ok: false };
   }
-  const body = await req.text();
-  if (Buffer.byteLength(body, "utf8") > maxBytes) return { ok: false };
+  const body = Buffer.concat(chunks, total).toString("utf8");
   return { ok: true, body };
 }
 
@@ -192,6 +239,21 @@ export async function handleWebhookRequest(req: Request, deps: WebhookRouteDeps)
     return new Response("unauthorized", { status: 401 });
   }
 
+  // 3b. Delivery-id replay protection (issue #346 #2). Providers that send a
+  //    per-delivery id (GitHub: `x-github-delivery`) are idempotent against
+  //    re-delivery: once a verified delivery-id is processed, a repeat of
+  //    the same delivery is a 200 no-op (audited as `replayed`), never a
+  //    duplicate dispatch. The check sits after signature verification so
+  //    only signed, verified deliveries ever mark/consume the guard.
+  const replayGuard = deps.replayGuard ?? sharedReplayGuard;
+  const deliveryId = headers[GITHUB_DELIVERY_HEADER];
+  if (deliveryId !== undefined && deliveryId.trim() !== "" && replayGuard.isReplayed(provider, deliveryId)) {
+    await reject(deps, provider, eventType, "replayed");
+    // The provider's retry budget is satisfied — acknowledge without
+    // dispatching (mirrors how non-actionable deliveries are acked 200).
+    return new Response("ok", { status: 200 });
+  }
+
   // 4/5. Dispatch. Two branches — the preset (github/linear) path and the
   //    generic manifest-declared path — both funnel through the SHARED
   //    dispatch target; both fail closed.
@@ -222,19 +284,36 @@ export async function handleWebhookRequest(req: Request, deps: WebhookRouteDeps)
     try {
       await dispatchIngestEvent(dispatchContext(deps), event);
     } catch (err) {
+      // Infra failure: report a generic 500 (GitHub retries) + a rejected
+      // row for the trail. The concrete error detail is logged server-side
+      // only — never leaked to the unauthenticated caller (issue #346 #5).
       await reject(deps, provider, eventType, "dispatch_error");
-      return new Response(`dispatch failed: ${err instanceof Error ? err.message : String(err)}`, {
-        status: 500,
-      });
+      console.error(`[webhook] ${provider}/${eventType ?? "unknown"} dispatch failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      return new Response("dispatch failed", { status: 500 });
     }
     return new Response("ok", { status: 200 });
   }
 
   // GENERIC branch (issue #57): a manifest-declared webhook extension.
+  const genericEventType = req.headers.get("x-bottega-event") ?? req.headers.get("x-github-event") ?? "webhook";
+
+  // Replay hardening (issue #346 #2): the generic scheme signs
+  // `x-bottega-timestamp` into the HMAC; the route independently enforces
+  // the ±5 min skew so a captured signature (valid only for its signed
+  // timestamp) cannot be replayed once stale. An out-of-window timestamp
+  // is a fail-closed 401 + rejected audit, nothing dispatched.
+  const rawTimestamp = headers[GENERIC_TIMESTAMP_HEADER];
+  if (rawTimestamp !== undefined) {
+    const ts = Number(rawTimestamp.trim());
+    if (Number.isFinite(ts) && Math.abs(Date.now() - ts) > GENERIC_TIMESTAMP_SKEW_MS) {
+      await reject(deps, provider, genericEventType, "stale_timestamp");
+      return new Response("unauthorized", { status: 401 });
+    }
+  }
+
   // Parse the raw JSON (malformed → 400 + rejected audit). The payload is
   // passed through untouched — the dispatcher's envelope + schema gate
   // decides what is dispatchable (acknowledged 200 on rejection).
-  const genericEventType = req.headers.get("x-bottega-event") ?? req.headers.get("x-github-event") ?? "webhook";
   let genericPayload: unknown;
   try {
     genericPayload = JSON.parse(raw.body);
@@ -255,11 +334,12 @@ export async function handleWebhookRequest(req: Request, deps: WebhookRouteDeps)
     // Store/post failure (infra, not validation) — a generic payload that
     // fails the dispatcher's schema was already audited as rejected and
     // returns normally; this catch is defense in depth for real infra
-    // errors (report 500 so the provider retries).
+    // errors (report 500 so the provider retries). The response body is a
+    // GENERIC message — the concrete error is logged server-side only and
+    // never leaked to the unauthenticated caller (issue #346 #5).
     await reject(deps, provider, genericEventType, "dispatch_error");
-    return new Response(`dispatch failed: ${err instanceof Error ? err.message : String(err)}`, {
-      status: 500,
-    });
+    console.error(`[webhook] ${provider}/${genericEventType} dispatch failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    return new Response("dispatch failed", { status: 500 });
   }
   return new Response("ok", { status: 200 });
 }

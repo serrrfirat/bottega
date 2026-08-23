@@ -85,11 +85,24 @@ export function createWebhookVerifier(decl: WebhookDeclaration): SignatureVerifi
 
 /**
  * The generic default verifier (issue #57 follow-up): the sha256 HMAC of
- * the RAW request body with the shared secret, read from `header` (default
- * `x-bottega-signature`), constant-time compared, accepting a HEX or BASE64
- * digest. Fail closed: absent header, malformed digest, length mismatch, or
- * digest mismatch → false.
+ * `x-bottega-timestamp` + the RAW request body with the shared secret,
+ * read from `header` (default `x-bottega-signature`), constant-time
+ * compared, accepting a HEX or BASE64 digest. The timestamp is REQUIRED
+ * and folded into the signed input so a captured delivery cannot be
+ * replayed by merely swapping in a fresh `x-bottega-timestamp` header — a
+ * replayed signature only ever verifies for the exact timestamp it was
+ * signed with, which the route's ±5 min skew check rejects once stale.
+ * Fail closed: absent header, absent/malformed timestamp, malformed
+ * digest, length mismatch, or digest mismatch → false.
  */
+export const GENERIC_TIMESTAMP_HEADER = "x-bottega-timestamp";
+
+/**
+ * Strictly 14-digit epoch-milliseconds (the generic scheme's timestamp
+ * shape) — anything else is malformed and fails closed.
+ */
+const EPOCH_MS = /^\d{13}$/;
+
 export function createGenericHmacVerifier(header: string): SignatureVerifier {
   return {
     async verify(
@@ -101,8 +114,13 @@ export function createGenericHmacVerifier(header: string): SignatureVerifier {
       if (provided === undefined) return false;
       const signature = provided.trim();
       if (signature === "") return false;
+      // The timestamp is part of the signed input (replay hardening #346):
+      // an absent or malformed timestamp means the signature cannot be
+      // recomputed → fail closed.
+      const timestamp = headers[GENERIC_TIMESTAMP_HEADER];
+      if (timestamp === undefined || !EPOCH_MS.test(timestamp.trim())) return false;
       const keyBytes = Buffer.from(secret, "utf8");
-      const expected = createHmac("sha256", keyBytes).update(rawBody, "utf8");
+      const expected = createHmac("sha256", keyBytes).update(`${timestamp.trim()}\n`, "utf8").update(rawBody, "utf8");
 
       // Hex OR base64 — whichever the provider sent. A digest that parses
       // as neither is malformed → false.
