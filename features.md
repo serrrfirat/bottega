@@ -640,6 +640,19 @@ and the connect journey is the same chat flow as MCP: draft → review
   expansion) become the extension's allowlist scope at pin. Requests route
   server → iron-proxy → upstream; the proxy enforces the allowlist and
   injects the credential.
+- **Deterministic catalog connect (same flow as hosted MCP)** — an
+  unregistered `openapi` entry is connectable like a hosted-MCP entry:
+  `connect sendgrid` fetches the vendor's spec ONCE, freezes the tool
+  surface, and the org approval renders the generated operations + tiers
+  before the registration lands at runtime (the connect's own
+  `connect_extension` gate; personal connects are direct). At egress the
+  static-inject seam (wired into the server's runtime, `openapiEgress`)
+  resolves the extension's host, fails closed until its key is
+  provisioned, and routes the credential-free request through the proxy env
+  — iron-proxy's generated per-extension `inject` entry (bearer →
+  `Authorization: Bearer …`, `apiKeyHeader` → the declared header) adds the
+  key. MCP/CLI extensions stay call-scoped (#284); only openapi gets the
+  static inject entry.
 - **V1 scope cuts** — static credentials only (bearer / apiKeyHeader);
   OAuth-protected REST APIs stay out (hosted MCP already covers them).
   Calls execute in the server process like MCP surface tools.
