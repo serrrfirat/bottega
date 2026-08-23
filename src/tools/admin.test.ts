@@ -2144,3 +2144,165 @@ describe("runWizardChecks extraction (issue #116)", () => {
     expect(text).toContain("first_run_wizard");
   });
 });
+
+describe("catalog_browser openapi surface (issue #345)", () => {
+  const OPENAPI_SPEC = {
+    openapi: "3.0.3",
+    info: { title: "SendGrid API", version: "1.0.0" },
+    servers: [{ url: "https://api.sendgrid.test/v1" }],
+    paths: {
+      "/mail/send": { post: { operationId: "send_mail", responses: { "200": { description: "ok" } } } },
+      "/stats": { get: { operationId: "get_stats", responses: { "200": { description: "ok" } } } },
+    },
+  };
+  const OPENAPI_SPEC_JSON = JSON.stringify(OPENAPI_SPEC);
+  const OPENAPI_CATALOG: StubCatalogDoc = {
+    version: 1,
+    data: [
+      {
+        id: "openapi/sendgrid",
+        slug: "sendgrid",
+        kind: "openapi",
+        name: "SendGrid",
+        description: "An API-first email vendor (no MCP)",
+        domain: "sendgrid.com",
+        openapi: {
+          url: "https://raw.sendgrid.test/openapi.json",
+          auth: { scheme: "bearer", credentialLabel: "SendGrid API key" },
+        },
+      },
+    ],
+  };
+  function openApiFetch(routes: StubRoute[] = []): typeof fetch {
+    const allRoutes = [...routes];
+    // SAFETY: the stub implements fetch's call contract (input, init?) => Promise<Response>;
+    // Bun's fetch also exposes fetch.preconnect, which the catalog client never calls.
+    return (async (input: string | URL | Request, _init?: RequestInit) => {
+      const url = FetchUrlSchema.parse(input);
+      if (url === "https://integrations.sh/api.json") return new Response(JSON.stringify(OPENAPI_CATALOG), { status: 200 });
+      if (url === "https://raw.sendgrid.test/openapi.json") {
+        return new Response(OPENAPI_SPEC_JSON, { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const exact = allRoutes.find((r) => r.match === url);
+      if (exact) return new Response(exact.body ?? "", { status: exact.status, headers: exact.headers });
+      return new Response(JSON.stringify(OPENAPI_CATALOG), { status: 200 });
+    }) as typeof fetch;
+  }
+
+  test("list displays kind openapi and surfaces the openapi block (spec URL + auth scheme)", async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const tools = loadTools(store, { catalog: { fetchImpl: openApiFetch() } });
+      const res = await call(tools[0], { action: "list" });
+      expect(res.isError).toBe(false);
+      // SAFETY: catalog_browser list serializes its result as JSON carrying
+      // catalog[] with kind + openapi (the exact shape asserted below).
+      const body = JSON.parse(res.text) as {
+        catalog: Array<{ kind: string; openapi: { url: string; auth: { scheme: string; credentialLabel?: string } } }>;
+      };
+      expect(body.catalog[0]!.kind).toBe("openapi");
+      expect(body.catalog[0]!.openapi).toEqual({
+        url: "https://raw.sendgrid.test/openapi.json",
+        auth: { scheme: "bearer", credentialLabel: "SendGrid API key" },
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("draft for an openapi entry preserves the kind, is not binding-missing, and notes the API-first path", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "config", "extensions", "drafts");
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalog: { fetchImpl: openApiFetch() },
+      });
+      const res = await call(tools[0], { action: "draft", spec: "sendgrid" });
+      expect(res.isError).toBe(false);
+      // SAFETY: catalog_browser draft serializes its result as JSON with
+      // binding_missing + note (the exact shape asserted below).
+      const body = JSON.parse(res.text) as {
+        binding_missing: boolean;
+        note: string;
+        draft: { manifest: { kind: string; openapi?: { specUrl: string } } };
+      };
+      expect(body.binding_missing).toBe(false);
+      expect(body.note).toContain("API-first vendor");
+      // The draft keeps the openapi kind (it does NOT collapse to mcp) and
+      // carries the binding built from the catalog's openapi block.
+      // SAFETY: the draft file JSON carries a manifest with kind + openapi
+      // (buildSnapshotDraft writes that shape for openapi entries).
+      const written = JSON.parse(readFileSync(join(draftsDir, "sendgrid.draft.json"), "utf8")) as {
+        manifest: { kind: string; openapi: { specUrl: string; auth: { scheme: string } } };
+      };
+      expect(written.manifest.kind).toBe("openapi");
+      expect(written.manifest.openapi.specUrl).toBe("https://raw.sendgrid.test/openapi.json");
+      expect(written.manifest.openapi.auth.scheme).toBe("bearer");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pin for an openapi draft surfaces the generated operations+tiers in the review gate, then pins the frozen surface on confirm", async () => {
+    const { store, dir, cleanup } = freshStore();
+    try {
+      const draftsDir = join(dir, "drafts");
+      const snapshotsDir = join(dir, "snapshots");
+      const egressPath = join(dir, "egress.yml");
+      const devEgressPath = join(dir, "egress.dev.yml");
+      // Draft the openapi entry into the drafts dir first.
+      const draftTools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalog: { fetchImpl: openApiFetch() },
+      });
+      const draftRes = await call(draftTools[0], { action: "draft", spec: "sendgrid" });
+      expect(draftRes.isError).toBe(false);
+
+      const tools = loadTools(store, {
+        catalogDraftsDir: draftsDir,
+        catalogSnapshotsDir: snapshotsDir,
+        egressConfigPath: egressPath,
+        devEgressConfigPath: devEgressPath,
+        catalog: { fetchImpl: openApiFetch() },
+      });
+      // REVIEW GATE: confirm=false → the summary lists operations + tiers.
+      const review = await call(tools[0], { action: "pin", spec: "sendgrid" });
+      expect(review.isError).toBe(true);
+      // SAFETY: catalog_browser pin serializes its result as JSON carrying
+      // confirm_required + summary (the exact shape asserted below).
+      const reviewBody = JSON.parse(review.text) as {
+        confirm_required: boolean;
+        summary: { kind: string; operations: Array<{ name: string; tier: string; operation: string; method: string; path: string }> };
+      };
+      expect(reviewBody.confirm_required).toBe(true);
+      expect(reviewBody.summary.kind).toBe("openapi");
+      const ops = reviewBody.summary.operations ?? [];
+      expect(ops.map((op) => op.name).sort()).toEqual(["sendgrid_get_stats", "sendgrid_send_mail"]);
+      expect(ops.find((op) => op.operation === "send_mail")?.tier).toBe("write");
+      expect(ops.find((op) => op.operation === "get_stats")?.tier).toBe("read");
+      expect(existsSync(join(snapshotsDir, "sendgrid.json"))).toBe(false);
+
+      // CONFIRM: the frozen surface is written + egress regenerated.
+      const pinned = await call(tools[0], { action: "pin", spec: "sendgrid", confirm: true });
+      expect(pinned.isError).toBe(false);
+      // SAFETY: catalog_browser pin serializes its result as JSON carrying
+      // action + written_to (the exact shape asserted below).
+      const pinnedBody = JSON.parse(pinned.text) as { action: string; written_to: string };
+      expect(pinnedBody.action).toBe("pin");
+      expect(existsSync(pinnedBody.written_to)).toBe(true);
+      // SAFETY: the written snapshot is this test's own pinned openapi
+      // snapshot (from buildOpenApiPinnedManifest) — JSON with a manifest
+      // carrying kind/domains/tools (the fields asserted below).
+      const snapshot = JSON.parse(readFileSync(pinnedBody.written_to, "utf8")) as {
+        manifest: { kind: string; domains: string[]; tools: Array<{ name: string; tier: string }> };
+      };
+      expect(snapshot.manifest.kind).toBe("openapi");
+      expect(snapshot.manifest.domains).toEqual(["api.sendgrid.test"]);
+      expect(snapshot.manifest.tools.map((t) => t.name).sort()).toEqual(["sendgrid_get_stats", "sendgrid_send_mail"]);
+      expect(readFileSync(egressPath, "utf8")).toContain('"api.sendgrid.test"');
+    } finally {
+      cleanup();
+    }
+  });
+});
