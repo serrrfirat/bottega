@@ -25,6 +25,8 @@ import {
   SANDBOX_EXIT_COMPLETED,
   SANDBOX_EXIT_FAILED,
   SANDBOX_EXIT_REQUEUE,
+  FORBIDDEN_CHILD_ENV_NAMES,
+  sanitizeSandboxEnv,
   type SandboxRunner,
 } from "./run-job";
 import { JOB_COMPLETED_EVENT, JOB_FAILED_EVENT } from "../store/audit-events";
@@ -55,6 +57,56 @@ function freshStore(): Store {
   stores.push(store);
   return store;
 }
+
+describe("forbidden child env denylist (issue #346)", () => {
+  test("credential/provider secrets are stripped even when present in a merged env", () => {
+    // Defense-in-depth: the child env is allowlisted, but any forbidden name
+    // that slips in (merged env, allowlist drift) must be dropped regardless.
+    // Every FORBIDDEN_CHILD_ENV_NAMES key is present so the strip is exercised.
+    const env = {
+      PATH: "/usr/bin",
+      LANG: "en_US.UTF-8",
+      BOTTEGA_CONFIG_DIR: "/cfg",
+      BOTTEGA_API_TOKEN: "btk_rest_token",
+      SLACK_APP_TOKEN: "xapp-1",
+      SLACK_BOT_TOKEN: "xoxb-123",
+      GITHUB_WEBHOOK_SECRET: "whsec_abc",
+      GITHUB_TOKEN: "ghp_1234567890abcdefghij",
+      GH_TOKEN: "ghp_1234567890abcdefghij",
+      AWS_SECRET_ACCESS_KEY: "AKIA+SECRET",
+      NEAR_API_KEY: "near_sk_abc",
+      OPENAI_API_KEY: "sk-proj-secret",
+      ANTHROPIC_API_KEY: "sk-ant-secret",
+      OPENCODE_API_KEY: "oc_api_key",
+      TAVILY_API_KEY: "tvly-abc123",
+      OMP_AUTH_BROKER_TOKEN: "broker-token",
+    } satisfies Record<string, string>;
+    sanitizeSandboxEnv(env);
+    // Every forbidden name is gone; the allowlisted names survive untouched.
+    for (const name of FORBIDDEN_CHILD_ENV_NAMES) {
+      expect(env[name]).toBeUndefined();
+    }
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.LANG).toBe("en_US.UTF-8");
+    expect(env.BOTTEGA_CONFIG_DIR).toBe("/cfg");
+  });
+
+  test("the new 346 names (BOTTEGA_API_TOKEN, NEAR_API_KEY, OPENCODE/TAVILY keys) are on the denylist", () => {
+    for (const name of [
+      "BOTTEGA_API_TOKEN",
+      "NEAR_API_KEY",
+      "OPENCODE_API_KEY",
+      "TAVILY_API_KEY",
+      "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY",
+    ] as const) {
+      expect(FORBIDDEN_CHILD_ENV_NAMES).toContain(name);
+    }
+    // A lone trust boundary must not be silently dropped by a mis-edited list.
+    expect(FORBIDDEN_CHILD_ENV_NAMES).toContain("SLACK_BOT_TOKEN");
+    expect(FORBIDDEN_CHILD_ENV_NAMES).toContain("OMP_AUTH_BROKER_TOKEN");
+  });
+});
 
 describe("job-scoped store facade (issue #101)", () => {
   test("forwards own rows and DENIES cross-job rows loudly", async () => {

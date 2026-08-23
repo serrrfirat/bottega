@@ -34,6 +34,52 @@ describe("redact", () => {
   });
 });
 
+describe("redact — broadened token families (#346)", () => {
+  test("redacts GH classic/OAuth PATs (ghp_/gho_), NEAR keys, ya29. OAuth tokens", () => {
+    const cases: [string, string][] = [
+      // GitHub classic personal access token (ghp_).
+      ["my pat is ghp_1234567890abcdefghijklmnopqrstuvwxyz", "my pat is [REDACTED]"],
+      // GitHub OAuth access token (gho_).
+      ["Authorization: token gho_1234567890abcdefghij", "Authorization: token [REDACTED]"],
+      // GitHub app token (ghu_) for git-over-http.
+      ["https://x-access-token:ghu_1234567890abcdef@github.com", "https://x-access-token:[REDACTED]@github.com"],
+      // NEAR secret key (ed25519-encoded base58, near CLI keygen).
+      ["near_key=ed25519:3J4wpPK58ZiND6Bqpt6sJ2BknHkNx8xgG4cYTWXwtGJh plain", "near_key=[REDACTED] plain"],
+      ["accounts/foo:{\"private_key\":\"ed25519:5J2BknHkNx8xgG4cYTWXwtGJh\"}", 'accounts/foo:{"private_key":"[REDACTED]"}'],
+      // Google OAuth access tokens.
+      ["Authorization: Bearer ya29.a0AfH6SMC_3dQxyz", "Authorization: Bearer [REDACTED]"],
+      // Generic HIGH-ENTROPY assignments (token= / key= / secret=, 32+ chars).
+      ["token=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdef", "token=[REDACTED]"],
+      ["secret: Zx9Yw8Xv7Uu6Tt5Ss4Rr3Qq2Pp1Oo0NnMmLiKkJjHh", "secret: [REDACTED]"],
+      ['{"key":"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1"}', '{"key":"[REDACTED]"}'],
+    ];
+    for (const [input, expected] of cases) {
+      expect(redact(input)).toBe(expected);
+    }
+  });
+
+  test("keeps the false-positive rate sane — short/ambiguous shapes pass through", () => {
+    const safe: string[] = [
+      // Short low-entropy assignments under the 32-char high-entropy floor.
+      "token=abc",
+      "key=a",
+      "secret=short",
+      "api_key=123",
+      // Words that merely contain a key-shaped substring.
+      "ask-human about the key=policy",
+      // github slashes / english words, not tokens.
+      "https://github.com/org/repo",
+      // A short identifier that is not a recognizable token family.
+      "ghp_1234",
+      // Paths and hashes are not secrets.
+      "commit=e9f6f0c4a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6f7",
+    ];
+    for (const input of safe) {
+      expect(redact(input)).toBe(input);
+    }
+  });
+});
+
 describe("appendAudit", () => {
   test("round-trips Record payloads through listAudit with filters", async () => {
     const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "A1" });
