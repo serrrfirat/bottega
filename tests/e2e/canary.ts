@@ -55,7 +55,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentToolResult, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import {
@@ -74,10 +74,13 @@ import {
   MESSAGE_RECEIVED_EVENT,
   MODEL_SETTINGS_CHANGED_EVENT,
   MODEL_SWITCHED_EVENT,
+  POLICY_EXPLAINED_EVENT,
+  SCHEDULER_FIRE_EVENT,
   WORK_ITEM_CREATED_EVENT,
 } from "../../src/store/audit-events";
 import { errorMessage } from "../../src/tools/helpers";
-import { loadSpacePolicy } from "../../src/policy/config";
+import { decidePolicyCall, loadSpacePolicy, resolveTier } from "../../src/policy/config";
+import { operatorReadToolDefinitions } from "../../src/tools/operator-read";
 import { buildRegistry } from "../../src/scheduler/actions";
 import { startScheduler, type Scheduler } from "../../src/scheduler/runner";
 import { standupDigestAction } from "../../src/scheduler/standup";
@@ -128,6 +131,7 @@ export const CANARY_ORG_CONFIG = [
   "  create_work_item: allow",
   "  use_model: allow",
   "  model_settings: prompt",
+  "  list_scheduler_jobs: allow",
   `  ${FIXTURE_EXTENSION_TOOL}: allow`,
   "approvals:",
   "  always_approve:",
@@ -583,7 +587,7 @@ export function toolCtxFor(h: Harness, spaceId: string): ExtensionContext {
 }
 
 /** The text of a tool result (the first text content block). */
-function toolResultText(res: AgentToolResult): string {
+export function toolResultText(res: AgentToolResult): string {
   // SAFETY: SDK content blocks all carry a `type` discriminator; only "text"
   // blocks are read for the reply text.
   const block = (res.content ?? []).find((b) => (b as { type?: string }).type === "text") as
@@ -2112,6 +2116,213 @@ async function journeyLiveProgress(h: Harness, channelId: string, runId: string)
 }
 
 /**
+ * The scheduled-job lifecycle journey (issue #308): drive a durable
+ * scheduler job in the QA space through create → pause → resume → run-now
+ * and verify the deterministic store/audit evidence at each step against
+ * the live scheduler (the runner the canary boots over the harness store,
+ * src/server/index.ts wiring minus the actions the canary does not drive):
+ *   - create a far-future standup job (never fires spontaneously this run),
+ *   - pause it and confirm the durable `enabled=false` signal the runner
+ *     gates cron claiming on (a paused job cannot fire),
+ *   - resume it and confirm re-enabled,
+ *   - run-now: enqueue a manual invocation the live runner claims and fires,
+ *     then wait for the SCHEDULER_FIRE_EVENT audit row with the job id and
+ *     `source:"manual"` — the execution evidence in the store.
+ * The audit rows are the durable proof (never fabricated); the far-future
+ * cron means the only fire path is the run-now under test.
+ */
+async function journeySchedulerLifecycle(h: Harness, channelId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  let jobId: string | undefined;
+  try {
+    // Create a durable standup job in the QA space. 3:00 UTC cron is far out
+    // for any live run, so the running scheduler never fires it on its own —
+    // pause-fence and run-now are the only fire paths this journey exercises.
+    const created = await h.store.createSchedulerJob({
+      action: "standup_digest",
+      cron: "0 3 * * *",
+      params: { space: spaceId },
+      spaceId,
+      createdBy: live.qaUserId,
+    });
+    jobId = created.id;
+    if (created.enabled !== true) throw new Error("created scheduler job did not start enabled");
+
+    // Pause: the runner gates cron claiming on `enabled`, so a paused job is
+    // provably incapable of firing. The durable signal is the store row.
+    const paused = await h.store.pauseSchedulerJob(created.id, created.revision);
+    if (paused.enabled !== false) throw new Error("pause did not disable the scheduler job");
+
+    // No-fire fence: the far-future cron would not fire anyway, but confirm
+    // the job has not fired through this point — lastFiredAt is still null
+    // and no SCHEDULER_FIRE_EVENT row exists for it yet.
+    const frozen = await h.store.getSchedulerJob(created.id);
+    if (frozen!.lastFiredAt !== null) throw new Error("paused scheduler job fired");
+    const firedBefore = (await h.store.listAudit({ space: spaceId, event_type: SCHEDULER_FIRE_EVENT })).filter(
+      (row) => row.payload.includes(`"id":"${created.id}"`),
+    );
+    if (firedBefore.length > 0) throw new Error("paused scheduler job produced a fire audit row");
+
+    // Resume: re-enable so the run-now invocation can be claimed and fired.
+    const resumed = await h.store.resumeSchedulerJob(created.id, paused.revision, Date.now());
+    if (resumed.enabled !== true) throw new Error("resume did not re-enable the scheduler job");
+
+    // Run-now: enqueue a manual invocation; the live runner claims it and
+    // fires the standup action, writing SCHEDULER_FIRE_EVENT (source manual).
+    const invocationId = `canary-sj-${created.id}`;
+    const enqueued = await h.store.enqueueSchedulerRunNow({
+      jobId: created.id,
+      expectedRevision: resumed.revision,
+      invocationId,
+      requestedAt: Date.now(),
+    });
+    if (!enqueued.created) throw new Error("run-now invocation was not newly enqueued");
+    const fire = await waitFor(
+      async () => {
+        const rows = await h.store.listAudit({ space: spaceId, event_type: SCHEDULER_FIRE_EVENT });
+        return rows.find((row) => row.payload.includes(invocationId));
+      },
+      JOURNEY_TIMEOUT_MS,
+      "the run-now invocation's SCHEDULER_FIRE_EVENT audit row",
+    );
+    if (!fire.payload.includes(`"id":"${created.id}"`)) throw new Error("fire row does not reference the job id");
+    const runNowJob = await h.store.getSchedulerJob(created.id);
+    if (runNowJob!.lastFiredAt === null || runNowJob!.lastResult !== "ok") {
+      throw new Error("run-now did not record a successful fire on the job");
+    }
+    return {
+      name: "scheduler-lifecycle",
+      status: "pass",
+      layer: "live-api",
+      actors: [live.qaUserId],
+      details: [
+        `job ${created.id} (${created.action}) created enabled in ${spaceId}`,
+        `pause → enabled=false (fence held: no fire audit row, lastFiredAt null)`,
+        `resume → enabled=true; run-now enqueued ${invocationId}`,
+        `SCHEDULER_FIRE_EVENT ${fire.id} (${fire.actor}) source manual → job lastFiredAt ${runNowJob!.lastFiredAt}, lastResult ${runNowJob!.lastResult}`,
+      ],
+    };
+  } catch (err) {
+    return {
+      name: "scheduler-lifecycle",
+      status: "fail",
+      layer: "live-api",
+      actors: [live.qaUserId],
+      details: [errorMessage(err)],
+    };
+  } finally {
+    if (jobId !== undefined) {
+      try {
+        await h.store.deleteSchedulerJob(jobId);
+      } catch {
+        // Cleanup never masks the journey result.
+      }
+    }
+  }
+}
+
+/**
+ * The operator-home / policy-explanation journey (issue #320): invoke the
+ * read-tier `explain_policy` surface in the QA space and assert the posted
+ * explanation matches the effective policy state — a read-tier allow-list
+ * tool resolves to decision "allow" with approval_required=false (never an
+ * ask-human, never an approval row) — and that the explanation itself is
+ * audited (POLICY_EXPLAINED_EVENT). Runs through the REAL production tool
+ * definition over the harness's real store/audit/org-policy, in the QA
+ * space, so the evidence is deterministic and never fabricated.
+ */
+async function journeyOperatorHome(h: Harness, channelId: string): Promise<JourneyResult> {
+  const live = h.liveSlack!;
+  const spaceId = `slack:${channelId}`;
+  try {
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
+    const actor = live.qaUserId;
+    const [, explain] = operatorReadToolDefinitions(h.store, {
+      audit: h.audit,
+      orgPolicy: h.orgPolicy,
+      actorForSpace: () => actor,
+    });
+    // Read-tier allow-list tool (scheduler listing is read-tier — see
+    // TIER_BY_TOOL): the explanation must agree with decidePolicyCall and
+    // must not demand approval (exec/unknown default would).
+    const readTierTool = "list_scheduler_jobs";
+    const tool = explain!;
+    const probe = await probeExplain(h, spaceId, readTierTool, tool);
+    if (probe === undefined) throw new Error("explain_policy tool definition was not matched");
+    const effective = await loadSpacePolicy(h.orgPolicy, h.store, spaceId);
+    const expected = decidePolicyCall(effective, readTierTool);
+    const tier = resolveTier(readTierTool);
+    if (probe.decision !== expected.decision) {
+      throw new Error(`explain_policy decision ${probe.decision} != policy ${expected.decision} for ${readTierTool}`);
+    }
+    if (tier !== "read") {
+      throw new Error(`scheduler listing should be read-tier but resolved to ${tier}`);
+    }
+    if (probe.decision !== "allow" || probe.approval_required !== false) {
+      throw new Error(`read-tier tool ${readTierTool} not reported allow/no-approval (tier ${tier})`);
+    }
+    const audits = await h.store.listAudit({ space: spaceId, event_type: POLICY_EXPLAINED_EVENT });
+    const explained = audits.find((row) => row.payload.includes(readTierTool));
+    if (!explained) throw new Error(`no policy.explained audit row for ${readTierTool} in ${spaceId}`);
+    if (await hasApprovalRequested(h, spaceId)) throw new Error("explain_policy produced an ask-human/approval row");
+    return {
+      name: "operator-home",
+      status: "pass",
+      layer: "live-api",
+      actors: [actor],
+      details: [
+        `explain_policy(${readTierTool}) in ${spaceId}: decision ${probe.decision}, tier ${tier}, approval_required ${probe.approval_required}`,
+        `matches policy state (decidePolicyCall → ${expected.decision}); no approval requested`,
+        `audited: policy.explained row ${explained.id} (${explained.actor})`,
+      ],
+    };
+  } catch (err) {
+    return {
+      name: "operator-home",
+      status: "fail",
+      layer: "live-api",
+      actors: [live.qaUserId],
+      details: [errorMessage(err)],
+    };
+  }
+}
+
+/** Returns the policy explanation for a read-tier tool via explain_policy (or undefined on a shape mismatch). */
+interface OperatorExplainParams {
+  tool?: string;
+  space?: string;
+  provider?: string;
+  credential_scope?: string;
+}
+async function probeExplain(
+  h: Harness,
+  spaceId: string,
+  paramsToolName: string,
+  tool: ToolDefinition,
+): Promise<{ decision: string; tier: string; approval_required: boolean } | undefined> {
+  const params: OperatorExplainParams = { tool: paramsToolName };
+  const result = await tool.execute("canary-explain-1", params, undefined, undefined, toolCtxFor(h, spaceId));
+  const text = toolResultText(result);
+  if (!text) return undefined;
+  try {
+    // SAFETY: explain_policy returns a JSON object with these three fields
+    // (see PolicyExplanation in operator-read.ts); the parse verifies each
+    // present before the caller trusts it.
+    const parsed = JSON.parse(text) as { decision?: string; tier?: string; approval_required?: boolean };
+    if (parsed.decision === undefined || parsed.tier === undefined || parsed.approval_required === undefined) return undefined;
+    return { decision: parsed.decision, tier: parsed.tier, approval_required: parsed.approval_required };
+  } catch {
+    return undefined;
+  }
+}
+
+async function hasApprovalRequested(h: Harness, spaceId: string): Promise<boolean> {
+  const rows = await h.store.listAudit({ space: spaceId, event_type: APPROVAL_REQUESTED_EVENT });
+  return rows.length > 0;
+}
+
+/**
  * The role/multiplayer live journey (issue #298): posts as the four fixed
  * identities into the shared QA channel and asserts the cross-user contract
  * through the REAL Slack API + the harness's real store/audit:
@@ -2228,6 +2439,17 @@ export const LIVE_REGISTRY_IDS: readonly string[] = JOURNEYS.filter(
   (j) => j.layer === "live-api" && j.id.startsWith("live.roles."),
 ).map((j) => j.id);
 
+/**
+ * Map a live-api registry journey id → the liveBodies `id` whose body it
+ * selects with `--journey` (issue #298, extended for issues #308/#320). The
+ * `live.roles.*` matrix shares one body; the scheduler-lifecycle and
+ * operator-home journeys each own a dedicated body.
+ */
+export const LIVE_BODY_BY_JOURNEY = {
+  "live.scheduler-lifecycle": "scheduler-lifecycle",
+  "live.operator-home": "operator-home",
+} as const satisfies Record<string, "scheduler-lifecycle" | "operator-home">;
+
 /** The registry journey a `--journey` filter refers to, or undefined. */
 export function registryJourneyLayer(id: string): string | undefined {
   return JOURNEYS.find((j) => j.id === id)?.layer;
@@ -2235,22 +2457,30 @@ export function registryJourneyLayer(id: string): string | undefined {
 
 /**
  * The `--journey` single-body selection decision, keyed by the CANONICAL
- * registry journey ids (issue #298). Pure + exported so the end-to-end
- * selector is hermetically testable through parseCanaryFilters:
- *   - a `live.roles.*` id → { runner: "roles" } (runs exactly that body);
+ * registry journey ids (issue #298, extended #308/#320). Pure + exported so
+ * the end-to-end selector is hermetically testable through parseCanaryFilters:
+ *   - a `live.roles.*` id → { runner: "roles" } (the shared matrix body);
+ *   - `live.scheduler-lifecycle` → { runner: "scheduler-lifecycle" };
+ *   - `live.operator-home` → { runner: "operator-home" };
  *   - any other registry journey id → { problem } with a precise message
  *     naming its layer (browser / hermetic / coverage — no live-API body);
  *   - an unknown id → { problem } (not a registered journey).
  * NEVER "validated then ignored".
  */
 export interface LiveJourneySelection {
-  runner: "roles" | undefined;
+  runner: "roles" | "scheduler-lifecycle" | "operator-home" | undefined;
   problem: string | undefined;
 }
 
 export function resolveLiveJourneySelection(journeyId: string): LiveJourneySelection {
   if (LIVE_REGISTRY_IDS.includes(journeyId)) {
     return { runner: "roles", problem: undefined };
+  }
+  // SAFETY: LIVE_BODY_BY_JOURNEY is a closed literal-key map; a non-key
+  // journeyId (any other registry id) falls through to the fail-closed path.
+  const dedicated = LIVE_BODY_BY_JOURNEY[journeyId as keyof typeof LIVE_BODY_BY_JOURNEY];
+  if (dedicated !== undefined) {
+    return { runner: dedicated, problem: undefined };
   }
   const layer = registryJourneyLayer(journeyId);
   const problem =
@@ -2412,6 +2642,12 @@ const standupChannel = channel ? channel.id : live.dmChannelId;
         id: "roles",
         run: () => journeyRoles(harness!, channel ? channel.id : live.dmChannelId, runId, filters.role),
       },
+      // Scheduler-lifecycle (issue #308): create → pause → resume → run-now
+      // a durable job in the QA space and verify SCHEDULER_FIRE_EVENT.
+      { id: "scheduler-lifecycle", run: () => journeySchedulerLifecycle(harness!, standupChannel) },
+      // Operator-home (issue #320): explain_policy on a read-tier allow-list
+      // tool matches policy state and is audited.
+      { id: "operator-home", run: () => journeyOperatorHome(harness!, standupChannel) },
     ];
 
     const run = (body: { id: string; run: () => Promise<JourneyResult> }) => body.run().then((r) => ({ ...r, name: body.id }));
@@ -2422,16 +2658,16 @@ const standupChannel = channel ? channel.id : live.dmChannelId;
     // browser, or coverage-exclusion journey) FAILS CLOSED with a precise
     // message — never "validated then ignored".
     if (filters.journey !== undefined) {
-      const { problem } = resolveLiveJourneySelection(filters.journey);
-      if (problem !== undefined) {
+      const { runner, problem } = resolveLiveJourneySelection(filters.journey);
+      if (problem !== undefined || runner === undefined) {
         return {
           status: "failed",
           message: `live-slack canary FAILED — --journey ${problem}; fail closed rather than ignoring the filter`,
           journeys: [],
         };
       }
-      const rolesBody = liveBodies.find((b) => b.id === "roles")!;
-      journeys.push(await run({ id: filters.journey, run: rolesBody.run }));
+      const body = liveBodies.find((b) => b.id === runner)!;
+      journeys.push(await run({ id: filters.journey, run: body.run }));
     } else {
       for (const body of liveBodies) journeys.push(await run(body));
     }

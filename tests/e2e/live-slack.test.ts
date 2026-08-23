@@ -424,4 +424,20 @@ describe("live-API focused filters (issue #298 re-review)", () => {
     expect(unk.runner).toBeUndefined();
     expect(unk.problem).toMatch(/not a registered journey/);
   });
+
+  test("--journey resolves the scheduler-lifecycle and operator-home live-API bodies (issues #308/#320)", () => {
+    // The dedicated live journey ids each select exactly their own body —
+    // never the roles matrix, and never a vacuous "validated then ignored".
+    expect(resolveLiveJourneySelection("live.scheduler-lifecycle")).toEqual({
+      runner: "scheduler-lifecycle",
+      problem: undefined,
+    });
+    expect(resolveLiveJourneySelection("live.operator-home")).toEqual({
+      runner: "operator-home",
+      problem: undefined,
+    });
+    // Both ids are registered live-api journeys (registryJourneyLayer resolves them).
+    expect(registryJourneyLayer("live.scheduler-lifecycle")).toBe("live-api");
+    expect(registryJourneyLayer("live.operator-home")).toBe("live-api");
+  });
 });

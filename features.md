@@ -785,7 +785,10 @@ bun run canary --live-slack --ci       # CI-strict (the scheduled workflow)
 Journeys: chat reply (DM + the `bottega-qa` channel, created when missing),
 memory save/search, work-item creation, the connect intent seam, scheduled
 standup, extension call through the real runtime spine, model role switch,
-and the delivery approval round-trip (#149). Each journey starts at the
+the delivery approval round-trip (#149), the scheduled-job lifecycle
+(create → pause → resume → run-now with `SCHEDULER_FIRE_EVENT` evidence,
+#308), and the operator-home policy explanation (read-tier allow list
+matching policy state + `policy.explained` audit, #320). Each journey starts at the
 human-visible surface and asserts durable store/audit evidence rather than
 only a helper result.
 
