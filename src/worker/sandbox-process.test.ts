@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,6 +249,52 @@ describe("child-process protocol lane (test fabric — NOT the production bounda
     expect(result.timedOut).toBe(true);
     expect(existsSync(pidFile)).toBe(true);
     expect(await processGone(Number(readFileSync(pidFile, "utf8")))).toBe(true);
+  });
+
+  test("killing the child group never takes down a sibling in the parent group (#344)", async () => {
+    // Regression for the runner-SIGKILL race (#344): the fabric's kill path
+    // must ONLY teardown the sandbox child's own process group. A long-running
+    // sibling shares the runner's (parent) process group; if a kill ever
+    // addressed the parent group instead of the child's, the sibling AND the
+    // runner would be SIGKILLed (bun test exits 137). The sibling is spawned
+    // with detached:false so it is NOT its own leader and therefore lives in
+    // the runner's group — the only safe teardown of the sandbox child leaves
+    // it untouched.
+    const { store, dbPath, dir } = freshStore();
+    const inTreePidFile = join(dir, "in-tree.pid");
+    const fixture = join(dir, "child-tree.ts");
+    writeFileSync(
+      fixture,
+      `import { spawn } from "node:child_process";\nimport { readFileSync, writeFileSync } from "node:fs";\nconst request = JSON.parse(readFileSync(0, "utf8"));\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: false, stdio: "ignore" });\nwriteFileSync(request.config.transcriptDir + "/../in-tree.pid", String(child.pid));\nsetInterval(() => {}, 1000);\n`,
+    );
+    const runner = createChildProcessSandboxRunner({ dbPath, entrypoint: fixture });
+    const job: WorkerJob = { id: "timeout-concurrent", kind: "scheduled", payload: { action: "memory_consolidation" }, attempts: 1, status: "running" };
+
+    // A sibling long-running interval in the runner's own (parent) process
+    // group. It must survive the child teardown below.
+    const sibling = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: false,
+      stdio: "ignore",
+    });
+    const siblingPid = sibling.pid;
+
+    try {
+      const result = await runner(job, runnerContext(store, dbPath, dir, 80));
+
+      expect(result.timedOut).toBe(true);
+      expect(existsSync(inTreePidFile)).toBe(true);
+      // The sandbox child's own tree (including its in-tree sibling, which
+      // shares the child's group) is torn down…
+      expect(await processGone(Number(readFileSync(inTreePidFile, "utf8")))).toBe(true);
+    } finally {
+      // …but the runner's sibling in the parent group is untouched. If the
+      // kill had SIGKILLed the parent group, this process would never reach
+      // here (bun test would exit 137).
+      if (siblingPid !== undefined) {
+        expect(() => process.kill(siblingPid, 0)).not.toThrow();
+        sibling.kill("SIGKILL");
+      }
+    }
   });
 
   test("malformed bounded IPC is a crash, never a successful completion", async () => {

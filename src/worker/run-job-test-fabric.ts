@@ -17,7 +17,7 @@
  * caps, and the exit-code mapping — that run-job.ts's {@link runIsolatedJobBody}
  * implements and the caller-surface tests pin.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { Readable } from "node:stream";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -357,10 +357,81 @@ function sandboxCommand(
 }
 
 function killProcessTree(child: ChildProcess): void {
-  if (child.pid === undefined) return;
+  const childPid = child.pid;
+  if (childPid === undefined) return;
   try {
-    if (process.platform === "win32") child.kill("SIGKILL");
-    else process.kill(-child.pid, "SIGKILL");
+    if (process.platform === "win32") {
+      child.kill("SIGKILL");
+      return;
+    }
+    // Exact-pid tree kill. We deliberately do NOT signal a process GROUP
+    // (`kill(-pgid)`): a negative signal addresses every member of the group,
+    // and under a concurrent multi-file `bun test` the sandbox child's pid is
+    // free to be recycled the instant it exits — the OS can hand it to a
+    // freshly-spawned sibling test worker, and `kill(-pid)` would then SIGKILL
+    // that worker (the intermittent exit-137 runner kill, #344). Instead we
+    // snapshot the live process table, walk PPID ancestry from our child to
+    // find only processes that descend from it, and SIGKILL each by its exact
+    // pid — leaf-first, re-verified against a fresh snapshot right before the
+    // signal. The runner, its parent, and sibling workers are unreachable
+    // because none of them is a descendant of the sandbox child. A grandchild
+    // a nested Bun misplaced into the worker's group is still found (its parent
+    // is the child) and reaped.
+    const snapshot = () => {
+      const childrenOf = new Map<number, number[]>();
+      let table = "";
+      try {
+        table = execFileSync("ps", ["-o", "pid=,ppid=", "-A"], { encoding: "utf8", timeout: 2_000 });
+      } catch {
+        return childrenOf;
+      }
+      for (const line of table.split("\n")) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 2) continue;
+        const pid = Number(cols[0]);
+        const ppid = Number(cols[1]);
+        if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
+        const sib = childrenOf.get(ppid) ?? [];
+        sib.push(pid);
+        childrenOf.set(ppid, sib);
+      }
+      return childrenOf;
+    };
+    const childrenOf = snapshot();
+    const descendants: number[] = [];
+    const stack = [childPid];
+    const seen = new Set<number>([childPid]);
+    while (stack.length > 0) {
+      // SAFETY: the stack only ever holds `number` pids (seeded with the
+      // numeric child pid and pushed from the numeric `childrenOf` map), so a
+      // non-empty pop is always a number. A guard avoids the type assertion.
+      const popped = stack.pop();
+      if (popped === undefined) break;
+      const pid = popped;
+      for (const kid of childrenOf.get(pid) ?? []) {
+        if (seen.has(kid)) continue;
+        seen.add(kid);
+        descendants.push(kid);
+        stack.push(kid);
+      }
+    }
+    descendants.reverse(); // deepest first
+    // Re-verify descendants against a FRESH snapshot taken right before the
+    // signal loop: only exact pids that are STILL descendants of the child at
+    // this instant are killed. Any pid recycled into an unrelated live worker
+    // (a transitively-changed PPID chain) fails the ancestry check and is left
+    // alone, so sibling workers are unreachable.
+    const freshChildren = snapshot();
+    for (const pid of descendants) {
+      if (pid === process.pid || pid === process.ppid || pid <= 1) continue;
+      if (!snapshotDescendantOf(pid, childPid, freshChildren)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already exited; safe to move on.
+      }
+    }
+    child.kill("SIGKILL");
   } catch {
     try {
       child.kill("SIGKILL");
@@ -368,4 +439,20 @@ function killProcessTree(child: ChildProcess): void {
       // The process already exited. The exit event below is the teardown proof.
     }
   }
+}
+
+/** True if `pid`'s PPID chain (in `childrenOf`) reaches `root`. */
+function snapshotDescendantOf(pid: number, root: number, childrenOf: Map<number, number[]>): boolean {
+  const parentOf = new Map<number, number>();
+  for (const [ppid, kids] of childrenOf) {
+    for (const kid of kids) parentOf.set(kid, ppid);
+  }
+  let current = pid;
+  for (let depth = 0; depth < 64; depth += 1) {
+    const parent = parentOf.get(current);
+    if (parent === undefined) return false;
+    if (parent === root) return true;
+    current = parent;
+  }
+  return false;
 }
