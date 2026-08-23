@@ -55,6 +55,32 @@ jobs:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
 
+      # Issue #304 — boot an ephemeral iron-proxy BEFORE the canary so the
+      # live leg can egress (issue #241: scripts/canary-egress.ts fails
+      # closed when the tunnel at 127.0.0.1:8080 is unreachable, so without
+      # a proxy the leg refused to run at all). Mirrors canary.yml: the
+      # proxy runs the SAME permissive dev config local dev rides
+      # (config/egress.dev.yml via docker-compose.dev.yml: allow-all + no
+      # judge, secrets kept), so the canary's model/Slack/GitHub egress
+      # passes while the credential boundary still injects the real bearer
+      # (require: true). The model gateway keys come from the WORKFLOW
+      # REPOSITORY SECRETS below and are seeded into the proxy's mode-0600
+      # secret files by the credential sync (src/extensions/proxy-seed) —
+      # never echoed, only named. Tear down happens in the always-step at
+      # the end of the job.
+      - name: Boot ephemeral iron-proxy + seed proxy credentials (issue #304)
+        id: proxy-boot
+        env:
+          # Env the credential sync reads (env → vault → Keychain → write the
+          # <provider>.secret file). NEAR_API_KEY feeds near.secret — the
+          # proxy injects it for cloud-api.near.ai, the canary's model host.
+          NEAR_API_KEY: ${{ secrets.NEAR_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: bun run scripts/canary-proxy-boot.ts
+
       # Run the live-Slack canary CI-strict (reuses canary.yml exactly: all
       # repo secrets the live leg needs). The per-journey report is teed to
       # canary-report.txt and uploaded as an artifact so even a red run is
@@ -181,3 +207,12 @@ jobs:
               });
               console.log(`Opened tracked canary-failure issue #${created.number}`);
             }
+
+      # Issue #304 — always tear down the ephemeral proxy, whether the
+      # canary passed, failed, or never got to run (the runner is
+      # ephemeral, but a clean container state keeps logs/diagnostics
+      # unambiguous and matches the "no running infra" posture of the
+      # other CI jobs). Mirrors canary.yml's teardown.
+      - name: Tear down the ephemeral iron-proxy (issue #304)
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down
