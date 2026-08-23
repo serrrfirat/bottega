@@ -28,6 +28,12 @@
  *     is worse than none, #175)
  *   - no model key (NEAR_API_KEY / OPENCODE_API_KEY) → skip locally with a
  *     pointer; FAIL in CI-strict mode
+ *   - the four fixed persona tokens (REQUESTER/APPROVER/MEMBER/SECOND_MEMBER,
+ *     issue #298) are OPTIONAL in the default single-identity run set: when
+ *     any are absent the role/multiplayer journeys are SKIPPED (`skipped:
+ *     no persona credentials`) and CI-strict does NOT fail. The weekly
+ *     full-matrix canary passes --require-personas so a missing persona
+ *     there stays a CI-strict FAIL (nightly runs single identity only).
  *
  * Tokens (env first, Keychain second):
  *   SLACK_APP_TOKEN      (service bottega-slack-app)   — Socket Mode app token
@@ -194,7 +200,15 @@ export interface ResolvedLiveTokens {
   tokens?: LiveSlackTokens;
   /** Env var names (env + Keychain both empty) that blocked the BASE run (app/bot/qa). */
   missing: string[];
-  /** Fixed-identity tokens that are missing (issue #298, finding #6/#9). */
+  /**
+   * Fixed-identity (persona) tokens that are missing (issue #298, finding
+   * #6/#9): REQUESTER / APPROVER / MEMBER / SECOND_MEMBER. Personas are
+   * OPTIONAL for the single-identity run set — when any are absent the
+   * role/multiplayer journeys are SKIPPED (`skipped: no persona
+   * credentials`) instead of failing CI-strict. Only `--require-personas`
+   * (the weekly full-matrix run) turns a missing persona back into a
+   * CI-strict FAIL.
+   */
   identityMissing: string[];
 }
 
@@ -247,7 +261,11 @@ export function resolveLiveTokens(deps: TokenDeps): ResolvedLiveTokens {  const 
 /**
  * The four fixed-identity token slots: env key + Keychain service (issue
  * #298). Used by {@link resolveLiveTokens} so CI-strict reports exactly
- * which identity tokens are missing (finding #6/#9).
+ * which identity tokens are missing (finding #6/#9). These are the OPTIONAL
+ * persona tokens: the single-identity run set (nightly canary) does not
+ * require them — when any are absent the role/multiplayer journeys are
+ * SKIPPED, and only --require-personas (the weekly full matrix) turns a
+ * missing persona back into a CI-strict FAIL.
  */
 export const IDENTITY_TOKEN_SLOTS: ReadonlyArray<{ envKey: string; service: string }> = [
   { envKey: "SLACK_QA_REQUESTER_TOKEN", service: "bottega-slack-requester" },
@@ -255,6 +273,27 @@ export const IDENTITY_TOKEN_SLOTS: ReadonlyArray<{ envKey: string; service: stri
   { envKey: "SLACK_QA_MEMBER_TOKEN", service: "bottega-slack-member" },
   { envKey: "SLACK_QA_SECOND_MEMBER_TOKEN", service: "bottega-slack-second-member" },
 ];
+
+/**
+ * The persona CI-strict FAIL message, or undefined when the run should NOT
+ * fail on missing personas. Personas are OPTIONAL in CI-strict by default
+ * (the single-identity nightly set): missing personas SKIP the multiplayer
+ * journeys instead of failing. Only `requirePersonas` (the weekly full
+ * matrix, --require-personas / CANARY_REQUIRE_PERSONAS=1) turns a missing
+ * persona into a hard FAIL. Pure, exported for the preflight regressions.
+ */
+export function personaStrictFailure(
+  ciStrict: boolean,
+  requirePersonas: boolean,
+  identityMissing: string[],
+): string | undefined {
+  if (identityMissing.length === 0 || !ciStrict || !requirePersonas) return undefined;
+  return (
+    `live-slack canary FAILED in CI-strict mode — missing fixed-identity token(s): ${identityMissing.join(", ")} ` +
+    "(the role/multiplayer matrix (issue #298) needs all four; set them as GitHub Actions repository secrets — " +
+    "SLACK_QA_REQUESTER_TOKEN / SLACK_QA_APPROVER_TOKEN / SLACK_QA_MEMBER_TOKEN / SLACK_QA_SECOND_MEMBER_TOKEN)"
+  );
+}
 
 /**
  * The real model's key (issue #71 semantics), env first then Keychain:
@@ -2494,6 +2533,14 @@ export function resolveLiveJourneySelection(journeyId: string): LiveJourneySelec
 export async function runLiveLeg(
   tokens: LiveSlackTokens,
   filters: CanaryFilters = {},
+  identity: {
+    /** True when --require-personas (weekly full-matrix) is set. */
+    requirePersonas: boolean;
+    /** True when all four persona tokens resolved. */
+    havePersonas: boolean;
+    /** Env keys of the persona tokens that did not resolve. */
+    missingPersonas: string[];
+  } = { requirePersonas: false, havePersonas: false, missingPersonas: [] },
 ): Promise<CanaryResult> {
   const journeys: JourneyResult[] = [];
   let harness: Harness | undefined;
@@ -2638,9 +2685,29 @@ const standupChannel = channel ? channel.id : live.dmChannelId;
       { id: "live-progress", run: () => journeyLiveProgress(harness!, live.dmChannelId, runId) },
       // Role/multiplayer matrix (issue #298): the four fixed identities post
       // into the shared channel. A --role filter narrows which identity runs.
+      // The persona tokens are OPTIONAL for the single-identity run set
+      // (the nightly canary): when any are absent the matrix is SKIPPED with
+      // a visible "skipped: no persona credentials" reason instead of a
+      // silent skip or a CI-strict fail (the base single-identity journeys
+      // still run). The weekly full-matrix run passes --require-personas and
+      // the gate in runCanary already failed closed above; a persona-less
+      // run there never reaches this body.
       {
         id: "roles",
-        run: () => journeyRoles(harness!, channel ? channel.id : live.dmChannelId, runId, filters.role),
+        run: () =>
+          identity.havePersonas
+            ? journeyRoles(harness!, channel ? channel.id : live.dmChannelId, runId, filters.role)
+            : Promise.resolve<JourneyResult>({
+                name: "roles",
+                status: "skip",
+                layer: "live-api",
+                actors: [],
+                details: [
+                  `skipped: no persona credentials${identity.missingPersonas.length > 0 ? ` (missing ${identity.missingPersonas.join(", ")})` : ""}`,
+                  "the role/multiplayer matrix (issue #298) needs all four fixed identity tokens; " +
+                    "the single-identity set runs the base journeys with the QA user only",
+                ],
+              }),
       },
       // Scheduler-lifecycle (issue #308): create → pause → resume → run-now
       // a durable job in the QA space and verify SCHEDULER_FIRE_EVENT.
@@ -2798,20 +2865,30 @@ export async function runCanary(
       journeys: [],
     };
   }
-  // CI-strict identity gate (findings #6/#9): the role/multiplayer matrix
-  // needs all four fixed identity tokens. Missing any → FAIL loudly in
-  // CI-strict (never a silent skip); locally it stays skip-gated.
-  if (resolved.identityMissing.length > 0 && ciStrict) {
+  // Identity/persona gate (findings #6/#9, issue #298). The four persona
+  // tokens (REQUESTER/APPROVER/MEMBER/SECOND_MEMBER) are OPTIONAL for the
+  // default single-identity run set (the nightly canary): when any are
+  // absent the role/multiplayer journeys are SKIPPED (`skipped: no persona
+  // credentials`) and CI-strict does NOT fail — the base journeys still run
+  // with the single QA identity. The weekly full-matrix canary passes
+  // --require-personas (or CANARY_REQUIRE_PERSONAS=1) to keep a missing
+  // persona a CI-strict FAIL (issue #298 no-silent-skip for the full matrix).
+  const requirePersonas =
+    argv.includes("--require-personas") || deps.env.CANARY_REQUIRE_PERSONAS === "1";
+  const personaFailure = personaStrictFailure(ciStrict, requirePersonas, resolved.identityMissing);
+  if (personaFailure !== undefined) {
     return {
       status: "failed",
-      message:
-        `live-slack canary FAILED in CI-strict mode — missing fixed-identity token(s): ${resolved.identityMissing.join(", ")} ` +
-        "(the role/multiplayer matrix (issue #298) needs all four; set them as GitHub Actions repository secrets — " +
-        "SLACK_QA_REQUESTER_TOKEN / SLACK_QA_APPROVER_TOKEN / SLACK_QA_MEMBER_TOKEN / SLACK_QA_SECOND_MEMBER_TOKEN)",
+      message: personaFailure,
       journeys: [],
     };
   }
-  return runLiveLeg(resolved.tokens, filters);
+  return runLiveLeg(resolved.tokens, filters, {
+    requirePersonas,
+    // A persona is present only when every one of the four slots resolved.
+    havePersonas: resolved.identityMissing.length === 0,
+    missingPersonas: resolved.identityMissing,
+  });
 }
 
 if (import.meta.main) {

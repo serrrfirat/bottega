@@ -4,6 +4,15 @@
 # runner, and on a RED run opens (or updates) a single tracking GitHub
 # issue labeled `canary-failure` carrying the per-journey report artifact.
 #
+# SINGLE-IDENTITY SET (user decision, 2026-08): the nightly runs with the
+# ONE fixed QA identity already provisioned (SLACK_QA_USER_TOKEN). The four
+# persona tokens (REQUESTER/APPROVER/MEMBER/SECOND_MEMBER, the #298
+# multiplayer matrix) are NOT required here — when absent the
+# role/multiplayer journeys are SKIPPED (`skipped: no persona credentials`)
+# and CI-strict does not fail. The FULL multi-persona matrix runs only in
+# the WEEKLY canary (canary.yml), which passes --require-personas so a
+# missing persona there stays a CI-strict FAIL.
+#
 # Scope deviation from the full #261 automation: this workflow ONLY
 # detects + reports failures. It does NOT autonomously fix or push to
 # main — that part stays manual until the user says otherwise. When the
@@ -82,9 +91,14 @@ jobs:
         run: bun run scripts/canary-proxy-boot.ts
 
       # Run the live-Slack canary CI-strict (reuses canary.yml exactly: all
-      # repo secrets the live leg needs). The per-journey report is teed to
-      # canary-report.txt and uploaded as an artifact so even a red run is
-      # fully diagnosable (per-journey status + Slack message permalinks).
+      # repo secrets the live leg needs). SINGLE-IDENTITY SET: the four
+      # persona envs below are passed through but NEVER required — when they
+      # are absent (only SLACK_QA_USER_TOKEN is provisioned) the
+      # role/multiplayer journeys are SKIPPED with a visible "skipped: no
+      # persona credentials" reason and CI-strict still passes. The
+      # per-journey report is teed to canary-report.txt and uploaded as an
+      # artifact so even a red run is fully diagnosable (per-journey status
+      # + Slack message permalinks).
       - name: Run the nightly live-Slack canary (CI-strict)
         id: canary
         env:

@@ -97,8 +97,12 @@ jobs:
         run: bun run scripts/canary-proxy-boot.ts
 
       # CI-strict (--ci): missing secrets fail loudly instead of skipping.
-      # The focused layer/journey/role inputs flow as ENV (never interpolated
-      # into shell source — finding #7); the canary CLI parses them itself.
+      # Full multi-persona matrix (--require-personas): this WEEKLY canary
+      # runs the four fixed identities (#298), so a missing persona is a
+      # CI-strict FAIL (the nightly canary runs single identity only and
+      # instead SKIPS the persona-less role journeys). The focused
+      # layer/journey/role inputs flow as ENV (never interpolated into shell
+      # source — finding #7); the canary CLI parses them itself.
       - name: Run the live-API canary (CI-strict)
         id: canary
         env:
@@ -124,7 +128,7 @@ jobs:
           CANARY_MODEL_REF: ${{ secrets.CANARY_MODEL_REF }}
         run: |
           set -o pipefail
-          ARGS=(--live-slack --ci)
+          ARGS=(--live-slack --ci --require-personas)
           # env-carried inputs → positional args (quoted; never evaluated as shell).
           if [[ -n "${CANARY_INPUT_LAYER:-}" ]]; then ARGS+=("--layer" "$CANARY_INPUT_LAYER"); fi
           if [[ -n "${CANARY_INPUT_JOURNEY:-}" ]]; then ARGS+=("--journey" "$CANARY_INPUT_JOURNEY"); fi
@@ -155,7 +159,7 @@ jobs:
           CANARY_MODEL_REF: ${{ secrets.CANARY_MODEL_REF }}
         run: |
           set +e
-          bun run canary --live-slack --ci 2>&1 | tee canary-rerun.txt
+          bun run canary --live-slack --ci --require-personas 2>&1 | tee canary-rerun.txt
           echo "rerun_exit=$?" >> "$GITHUB_ENV"
 
       # Machine-readable status artifact for release automation (issue #298):

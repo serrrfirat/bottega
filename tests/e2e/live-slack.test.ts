@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCanary, resolveLiveTokens, resolveModelKey, resolveRoleIdentities, LIVE_REGISTRY_IDS, registryJourneyLayer, resolveLiveJourneySelection } from "./canary";
+import { runCanary, resolveLiveTokens, resolveModelKey, resolveRoleIdentities, LIVE_REGISTRY_IDS, registryJourneyLayer, resolveLiveJourneySelection, personaStrictFailure } from "./canary";
 import { parseCanaryFilters } from "./canary-registry";
 import { bootHarness, CANARY_MODEL_REFS, pickRealModelRef } from "./harness";
 import { resolveChannelMembers, type SlackInviteApi } from "./slack-live";
@@ -35,6 +35,7 @@ const CANARY_ENV_KEYS = [
   "LIVE_SLACK",
   "CI",
   "CANARY_CI",
+  "CANARY_REQUIRE_PERSONAS",
   "NEAR_API_KEY",
   "OPENCODE_API_KEY",
   "CODEX_AUTH_PATH",
@@ -136,19 +137,49 @@ describe("live-slack canary skip gates (issue #79)", () => {
     });
   });
 
-  test("CI-strict mode fails with a clear diagnostic when the fixed-identity tokens are missing (issue #298)", async () => {
+  test("persona gate: --require-personas (weekly) FAILS CI-strict on missing personas (issue #298)", async () => {
     await withScrubbedEnv(async () => {
       process.env.CI = "true";
       process.env.SLACK_APP_TOKEN = "xapp-test";
       process.env.SLACK_BOT_TOKEN = "xoxb-test";
       process.env.SLACK_QA_USER_TOKEN = "xoxp-test";
       process.env.CANARY_MODEL_REF = "near/example/model";
-      const result = await runCanary(["--live-slack", "--ci"], { env: process.env, keychain: () => null });
+      // Weekly full-matrix mode: a missing persona must be a CI-strict FAIL.
+      const result = await runCanary(["--live-slack", "--ci", "--require-personas"], { env: process.env, keychain: () => null });
       expect(result.status).toBe("failed");
       expect(result.message).toMatch(/FAILED in CI-strict mode/);
       // The diagnostic names the missing identity token(s) (findings #6/#9).
       expect(result.message).toContain("SLACK_QA_REQUESTER_TOKEN");
       expect(result.message).toContain("fixed-identity");
+    });
+  });
+
+  test("persona gate: single-identity CI-strict does NOT fail on missing personas (nightly)", async () => {
+    await withScrubbedEnv(async () => {
+      // The nightly canary runs CI-strict WITHOUT --require-personas. Missing
+      // persona tokens must NOT make the preflight fail — the base
+      // single-identity journeys run and the role/multiplayer journeys are
+      // gated to a visible skip downstream (runLiveLeg). The preflight gate
+      // itself must pass (return undefined, i.e. proceed to the live leg)
+      // even though every persona token is absent.
+      process.env.CI = "true";
+      process.env.SLACK_APP_TOKEN = "xapp-test";
+      process.env.SLACK_BOT_TOKEN = "xoxb-test";
+      process.env.SLACK_QA_USER_TOKEN = "xoxp-test";
+      process.env.CANARY_MODEL_REF = "near/example/model";
+      // SLACK_QA_REQUESTER/APPROVER/MEMBER/SECOND_MEMBER are all absent here.
+      expect(personaStrictFailure(true, false, [])).toBeUndefined();
+      expect(personaStrictFailure(true, false, ["SLACK_QA_REQUESTER_TOKEN"])).toBeUndefined();
+      expect(personaStrictFailure(true, false, [
+        "SLACK_QA_REQUESTER_TOKEN",
+        "SLACK_QA_APPROVER_TOKEN",
+        "SLACK_QA_MEMBER_TOKEN",
+        "SLACK_QA_SECOND_MEMBER_TOKEN",
+      ])).toBeUndefined();
+      // The --require-personas / CANARY_REQUIRE_PERSONAS=1 env form flips it.
+      expect(personaStrictFailure(true, true, ["SLACK_QA_REQUESTER_TOKEN"])).toContain("fixed-identity");
+      // Locally (non-CI-strict) missing personas never fail either.
+      expect(personaStrictFailure(false, true, ["SLACK_QA_REQUESTER_TOKEN"])).toBeUndefined();
     });
   });
 
