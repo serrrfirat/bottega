@@ -438,7 +438,10 @@ credential ladder's `auto` scope skip org credentials.
 Skills are durable procedures a session can load on demand through
 `skill://<name>`. Each skill directory contains one `SKILL.md` plus its
 declared companion files. `SKILL.md` frontmatter must name the directory and
-provide the non-empty description used to claim the skill.
+provide the non-empty description used to claim the skill
+(pinned by `src/server/skills.test.ts` "SKILL.md frontmatter contract": the
+frontmatter `name` must exactly match the requested skill and the
+`description` must be a non-empty one-line string).
 
 **Tiers and reads.** Built-ins ship read-only at `skills/`
 (`BOTTEGA_BUILTIN_SKILLS_DIR` overrides). Per-space skills live at
@@ -556,7 +559,11 @@ user-facing view is in
    binds the caller from the current turn (#152), maps the provider wire
    name once, and calls `ExtensionRuntime.execute` once (#178). The manifest
    name remains the policy/audit identity. Another human steering the live
-   turn cannot replace the principal that began it.
+   turn cannot replace the principal that began it
+   (pinned by `src/server/drivers/agent-driver.test.ts` "a fresh prompt
+   binds the inbound principal; steer/followUp keep it; the opening prompt's
+   resolution drops it" and the conformance test "per-turn principal binds
+   mid-turn and clears at turn end (#152)").
 6. **One runtime spine** — `runtime.ts` resolves policy before credentials,
    then the org/me/auto ladder, the credential boundary, the provider call,
    and `extension.call` audit. Denied calls never touch the resolver.
@@ -572,8 +579,11 @@ user-facing view is in
    #198 OAuth callback reads) when configured, else the loopback URL of its
    in-process endpoint. `src/extensions/upload-link.ts` mints a 144-bit
    opaque token in
-   SQLite, limited to five live links per actor and 15 minutes by default.
-   The loopback browser endpoint atomically consumes the token, limits POST
+   SQLite, limited to five live links per actor and 15 minutes by default
+   (pinned by `src/extensions/upload-link.test.ts`: the token is 18 random
+   bytes — 144 bits — persisted in the SQLite `upload_tokens` table, and
+   the default cap of five per actor refuses a sixth). The loopback browser
+   endpoint atomically consumes the token, limits POST
    attempts per client IP, and invokes the existing `connectExtension` path
    so org approval, broker upload, registry metadata, and audit stay
    identical. Consumption precedes the vault write: a failed upload burns
@@ -582,7 +592,10 @@ user-facing view is in
    recognized credential shapes before gate/broker/audit work; this is a
    narrow guard, not a general scanner for arbitrary Slack text.
 8. **Stable connection lifecycle** — `extension_credentials.id` is the
-   operator target. The runtime reads only `status=active` rows. Replace
+   operator target. The runtime reads only `status=active` rows
+   (pinned by `src/extensions/lifecycle.test.ts`: a credential entering
+   `disconnecting_boundary` or `disconnecting_authority` is excluded from
+   `listExtensionCredentials` until it reaches `disconnected`). Replace
    uses revision compare-and-swap, a staged boundary activation, and
    post-switch retirement of the old vault row. Disconnect advances through
    `disconnecting_boundary` and `disconnecting_authority`; each phase is

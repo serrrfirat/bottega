@@ -263,3 +263,27 @@ describe("space-skill storage lifecycle", () => {
     expect((await resolveWorkItemSkills(SPACE, ["memo"], { root: skillsRoot, builtinDir }))[0]?.description).toBe("Built-in memo.");
   });
 });
+
+describe("SKILL.md frontmatter contract (architecture.md)", () => {
+  test("frontmatter name must exactly match the requested skill name", async () => {
+    const skillsRoot = root("frontmatter-name");
+    await expect(
+      createSpaceSkill(
+        SPACE,
+        { name: "review", document: document("different-name", "A description.") },
+        { root: skillsRoot },
+      ),
+    ).rejects.toThrow(/frontmatter name must exactly match/);
+    expect(existsSync(join(skillsRoot, SPACE))).toBe(false);
+  });
+
+  test("frontmatter description must be a non-empty one-line string", async () => {
+    const skillsRoot = root("frontmatter-desc");
+    for (const bad of [document("review", "   "), "---\nname: review\n---\nProcedure.\n"]) {
+      await expect(
+        createSpaceSkill(SPACE, { name: "review", document: bad }, { root: skillsRoot }),
+      ).rejects.toThrow(/description must be a non-empty one-line string/);
+    }
+    expect(existsSync(join(skillsRoot, SPACE))).toBe(false);
+  });
+});

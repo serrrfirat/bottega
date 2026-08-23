@@ -28,6 +28,7 @@ import {
   mintUploadLink,
   mintUploadLinkToolDefinition,
   startUploadLinkServer,
+  UPLOAD_LINK_MAX_OUTSTANDING_PER_ACTOR,
   UploadLinkStore,
   uploadLinkPublicBase,
   type UploadLinkEndpointDeps,
@@ -542,6 +543,56 @@ describe("upload link minting (issue #196)", () => {
     expect(second.ok).toBe(true);
     expect(third.ok).toBe(false);
     if (!third.ok) expect(third.reason).toContain("too many outstanding");
+  });
+
+  test("arch: the minted token is 144 random bits (18 bytes, 24 base64url chars)", () => {
+    // architecture.md: "mints a 144-bit opaque token". 18 random bytes →
+    // 24 base64url chars with no padding (18 % 3 == 0). Two mints must
+    // never collide — the token is the unguessable upload secret.
+    const store = new UploadLinkStore(freshStore());
+    const one = store.mint({ extension: "fixture.weather", scope: "personal", actor: "UADA", label: "Fixture Weather" });
+    const two = store.mint({ extension: "fixture.weather", scope: "personal", actor: "UADA", label: "Fixture Weather" });
+    expect(one.ok).toBe(true);
+    expect(two.ok).toBe(true);
+    if (!one.ok || !two.ok) return;
+    expect(one.token).toMatch(/^[A-Za-z0-9_-]{24}$/);
+    expect(two.token).toMatch(/^[A-Za-z0-9_-]{24}$/);
+    expect(one.token).not.toBe(two.token);
+  });
+
+  test("arch: the default cap is five live links per actor (UPLOAD_LINK_MAX_OUTSTANDING_PER_ACTOR)", () => {
+    // architecture.md: "limited to five live links per actor". The default
+    // cap (not a custom override) must refuse the sixth outstanding link.
+    expect(UPLOAD_LINK_MAX_OUTSTANDING_PER_ACTOR).toBe(5);
+    const db = freshStore();
+    const store = new UploadLinkStore(db); // default cap
+    const minted: boolean[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = store.mint({ extension: "fixture.weather", scope: "personal", actor: "UADA", label: `Weather ${i}` });
+      minted.push(r.ok);
+      if (!r.ok) expect(r.reason).toContain("too many outstanding");
+    }
+    expect(minted).toEqual([true, true, true, true, true, false]);
+    // The live-link count is tracked in the SQLite table: exactly the five
+    // successful mints are outstanding for the actor.
+    expect(db.countActiveUploadTokens("UADA")).toBe(5);
+  });
+
+  test("arch: the token lives in the SQLite upload_tokens table (durable backing, not memory)", () => {
+    // architecture.md: mint "in SQLite". The token must be queryable back
+    // through the raw store's table read (UploadLinkStore.peek is just a
+    // thin slice over it), proving the secret survives outside the
+    // upload-link process object.
+    const db = freshStore();
+    const store = new UploadLinkStore(db);
+    const minted = store.mint({ extension: "fixture.weather", scope: "personal", actor: "UADA", label: "Fixture Weather" });
+    expect(minted.ok).toBe(true);
+    if (!minted.ok) return;
+    const row = db.getUploadToken(minted.token); // the direct SQLite table read
+    expect(row).not.toBeNull();
+    expect(row?.actor).toBe("UADA");
+    expect(row?.extension).toBe("fixture.weather");
+    expect(db.countActiveUploadTokens("UADA")).toBe(1);
   });
 
   test("oauth extensions cannot mint — they have no secret to upload", async () => {
