@@ -10,6 +10,7 @@ import { errorMessage } from "../../tools/helpers";
 import { dispatchMemoryConsolidationJob } from "../../scheduler/memory-consolidation";
 import type { MemoryProvider } from "../../memory/types";
 import type { Store } from "../../store/db";
+import { makeSingleFlightLoop } from "./single-flight-loop";
 
 /** The server-side cadence, preserved from the pre-#272 in-process run. */
 export const DEFAULT_CONSOLIDATION_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -35,15 +36,18 @@ export interface MemoryConsolidationTrigger {
 
 /**
  * Builds the trigger. `start()` fires the boot pass (matching the old
- * runMemoryMaintenance() at boot) and arms the interval; the in-flight
- * guard keeps two ticks from ever enqueueing concurrently.
+ * runMemoryMaintenance() at boot) and arms the cadence. The cadence is the
+ * single-flight loop shared with the delivery poller and the outbox post
+ * seam (issue #341 finding 6): an immediate first pass, then one chained
+ * pass at a time scheduled from the END of the previous one, so an
+ * overlapping pass cannot enqueue a consolidation job a second time. A
+ * throwing pass is logged, never allowed to stop the chain.
  */
 export function createMemoryConsolidationTrigger(
   deps: MemoryConsolidationTriggerDeps,
   opts: { intervalMs?: number } = {},
 ): MemoryConsolidationTrigger {
   let inFlight: Promise<string | null> | undefined;
-  let timer: ReturnType<typeof setInterval> | null = null;
 
   const fire = async (): Promise<string | null> => {
     const mode = deps.memoryProvider.capabilities.consolidation;
@@ -68,6 +72,21 @@ export function createMemoryConsolidationTrigger(
     return inFlight;
   };
 
+  // One cadence tick is one fire; fires are themselves deduped, so a slow
+  // pass never overlaps the next tick. tick must not throw — fire's only
+  // rejection (an unsupported provider) is rejected up front by start(), but
+  // keep the chain alive anyway, exactly like the sibling loops.
+  const loop = makeSingleFlightLoop({
+    tick: async () => {
+      try {
+        await fire();
+      } catch (error) {
+        deps.log?.(`[memory-consolidation] enqueue failed: ${errorMessage(error)}`);
+      }
+    },
+    intervalMs: opts.intervalMs ?? DEFAULT_CONSOLIDATION_INTERVAL_MS,
+  });
+
   return {
     fire,
     start() {
@@ -78,18 +97,10 @@ export function createMemoryConsolidationTrigger(
         );
       }
       if (mode === "on-save") return;
-      void fire();
-      if (timer !== null) return;
-      timer = setInterval(() => {
-        void fire();
-      }, opts.intervalMs ?? DEFAULT_CONSOLIDATION_INTERVAL_MS);
-      timer.unref?.();
+      loop.start();
     },
     stop() {
-      if (timer !== null) {
-        clearInterval(timer);
-        timer = null;
-      }
+      loop.stop();
     },
   };
 }
