@@ -32,7 +32,7 @@ import {
   type SlackAdapter,
   type SlackBlockPayload,
 } from "./slack";
-import { bestEffortMessageRewrite, resolveBlockAction } from "./block-flow";
+import { bestEffortMessageRewrite, escapeMrkdwn, resolveBlockAction } from "./block-flow";
 
 /**
  * The `delivery.requested` payload as the poller writes it (all strings).
@@ -61,13 +61,18 @@ function parsePayload(raw: string): DeliveryRequestPayload | null {
  * keys on). Pure so the outbound rendering is testable without Slack.
  */
 export function buildDeliveryBlocks(prUrl: string, summary: string, id: string): SlackBlockPayload[] {
+  // summary and prUrl are user-derived (agent/model message text), so they
+  // are escaped with the shared escapeMrkdwn (mirrors scheduler-router) to
+  // stop mrkdwn injection into the delivered approval blocks.
+  const safePrUrl = escapeMrkdwn(prUrl);
+  const safeSummary = escapeMrkdwn(summary);
   const summaryBlock: SlackBlockPayload[] = summary
-    ? [{ type: "section", text: { type: "mrkdwn", text: `*Summary:* ${summary}` } }]
+    ? [{ type: "section", text: { type: "mrkdwn", text: `*Summary:* ${safeSummary}` } }]
     : [];
   return [
     {
       type: "section",
-      text: { type: "mrkdwn", text: `*Delivery approval required* — <${prUrl}|PR ready>` },
+      text: { type: "mrkdwn", text: `*Delivery approval required* — <${safePrUrl}|PR ready>` },
     },
     ...summaryBlock,
     {
@@ -95,9 +100,11 @@ export function buildDeliveryBlocks(prUrl: string, summary: string, id: string):
 
 /** Outcome line replacing the prompt message once a click settles. */
 function outcomeText(prUrl: string, approved: boolean, principal: string): string {
+  // prUrl is user-derived; escaped to keep mrkdwn out of the settled prompt.
+  const safePrUrl = escapeMrkdwn(prUrl);
   return approved
-    ? `*Delivery approved* — <${prUrl}|PR>: approved by <@${principal}>.`
-    : `*Delivery denied* — <${prUrl}|PR>: denied by <@${principal}>.`;
+    ? `*Delivery approved* — <${safePrUrl}|PR>: approved by <@${principal}>.`
+    : `*Delivery denied* — <${safePrUrl}|PR>: denied by <@${principal}>.`;
 }
 
 export interface DeliveryResolverDeps {

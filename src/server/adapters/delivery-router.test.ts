@@ -118,6 +118,25 @@ describe("buildDeliveryBlocks", () => {
     expect(btns.find((b) => b.actionId === DELIVERY_APPROVE_ACTION_ID)?.style).toBe("primary");
     expect(btns.find((b) => b.actionId === DELIVERY_DENY_ACTION_ID)?.style).toBe("danger");
   });
+
+  test("escapes mrkdwn metacharacters in user-derived summary and prUrl", () => {
+    // Regression for #346: summary/prUrl originate from agent/model message
+    // text; without escaping they can inject mrkdwn into the delivered blocks.
+    const blocks = buildDeliveryBlocks("https://x.dev/pull/<script>&amp;", "closing <@U1> & <#C2> now", ITEM) as Block[];
+
+    const sectionText = blocks
+      .filter((b) => b.type === "section")
+      .map((b) => b.text?.text ?? "")
+      .join("\n");
+
+    // Metacharacters must be rendered as literal text, not structure.
+    expect(sectionText).toContain("&lt;");
+    expect(sectionText).toContain("&gt;");
+    expect(sectionText).toContain("&amp;");
+    // The raw metacharacters must not survive unescaped.
+    expect(sectionText).not.toContain("<script>");
+    expect(sectionText).not.toContain("<@");
+  });
 });
 
 describe("resolveDeliveryAction", () => {
