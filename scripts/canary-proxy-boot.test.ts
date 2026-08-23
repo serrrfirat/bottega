@@ -301,14 +301,19 @@ describe("bootCanaryProxy orchestrates CA → compose up → readiness → crede
     }
   });
 
-  test("fails closed when the management API never becomes ready", async () => {
+  test("fails closed when the management API never becomes ready, surfacing container logs", async () => {
     const { cwd, cleanup } = freshCwd();
     try {
       mkdirSync(join(cwd, "certs"), { recursive: true });
       writeFileSync(join(cwd, "certs", "ca.crt"), "ca");
       const { run } = stubRun();
       const probe: ManagementProbe = async () => false;
-      await expect(bootCanaryProxy(cwd, { run, probe, waitTimeoutMs: 50 })).rejects.toThrow(/did not become ready/);
+      // The diagnostic seam: the thrown error must carry what the proxy
+      // actually printed (so the workflow's failure report is diagnosable).
+      const logs: (cmd: string[]) => string = () => "level=info msg=started";
+      await expect(
+        bootCanaryProxy(cwd, { run, probe, logs, waitTimeoutMs: 50 }),
+      ).rejects.toThrow(/did not become ready[\s\S]*level=info msg=started/);
     } finally {
       cleanup();
     }

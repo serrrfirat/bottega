@@ -146,7 +146,7 @@ export async function waitForManagement(
   controlUrl: string,
   token: string,
   probe: ManagementProbe = managementProbe,
-  timeoutMs = 30_000,
+  timeoutMs = 120_000,
   pollMs = 1_000,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -163,6 +163,18 @@ export type DockerRun = (cmd: string[]) => { status: number; error?: string };
 export const dockerRun: DockerRun = (cmd) => {
   const res = spawnSync(cmd[0] ?? "docker", cmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
   return { status: res.status ?? 1, error: res.stderr?.toString().trim().slice(0, 200) };
+};
+
+/**
+ * Capture the iron-proxy container's recent logs for the readiness-failure
+ * diagnostic (issue #343). Tea as stderr so the docker help/usage noise that
+ * `spawnSync` would surface on a bad argv never pollutes the report; empty
+ * when the compose invocation itself failed.
+ */
+export type ProxyLogs = (command: string[]) => string;
+export const composeLogs: ProxyLogs = (command) => {
+  const res = spawnSync(command[0] ?? "docker", command.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+  return (res.stdout?.toString().trim() ?? "") || (res.stderr?.toString().trim() ?? "").slice(0, 400);
 };
 
 /** Generate the MITM CA with the pinned image if missing — the SAME command dev.sh uses (issue #301, no new crypto). */
@@ -191,6 +203,7 @@ export async function bootCanaryProxy(
     run?: DockerRun;
     probe?: ManagementProbe;
     sync?: typeof syncProxyCredentialsFromEnv;
+    logs?: ProxyLogs;
     waitTimeoutMs?: number;
   } = {},
 ): Promise<CanaryProxyBootEnv> {
@@ -198,6 +211,7 @@ export async function bootCanaryProxy(
   const run = deps.run ?? dockerRun;
   const probe = deps.probe ?? managementProbe;
   const sync = deps.sync ?? syncProxyCredentialsFromEnv;
+  const logs = deps.logs ?? composeLogs;
 
   const token = managementToken(env.dataDir);
   env.controlToken = token;
@@ -224,11 +238,17 @@ export async function bootCanaryProxy(
     throw new Error(`canary-proxy-boot: docker compose up iron-proxy failed: ${up.error ?? "(no stderr)"}`);
   }
 
-  const ready = await waitForManagement(env.controlUrl, token, probe, deps.waitTimeoutMs ?? 30_000);
+  // The default readiness window is deliberately generous (120s, matching
+  // dev.sh's 120s compose timeout): the hosted runner cold-starts the
+  // proxy on a fresh box (image pull for the alpine init + iron-proxy,
+  // init -> config copy -> service bind), which routinely exceeds a warm
+  // local 30s. Callers that need a tight bound (tests) pass one explicitly.
+  const ready = await waitForManagement(env.controlUrl, token, probe, deps.waitTimeoutMs);
   if (!ready) {
+    const tail = logs(["docker", "compose", ...COMPOSE_FILES.flatMap((f) => ["-f", f]), "logs", "iron-proxy", "--tail", "50"]);
     throw new Error(
       "canary-proxy-boot: iron-proxy did not become ready (management API /v1/reload not answering) — " +
-        "diagnose with: docker compose -f docker-compose.yml -f docker-compose.dev.yml logs iron-proxy",
+        "container logs:\n" + (tail || "(no iron-proxy logs available on this runner)"),
     );
   }
 
