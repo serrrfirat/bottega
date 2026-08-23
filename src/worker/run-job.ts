@@ -151,14 +151,18 @@ export const SAFE_CHILD_ENV_NAMES = [
  * environment or a future allowlist drift.
  */
 export const FORBIDDEN_CHILD_ENV_NAMES = [
+  "BOTTEGA_API_TOKEN",
   "SLACK_APP_TOKEN",
   "SLACK_BOT_TOKEN",
   "GITHUB_WEBHOOK_SECRET",
   "GITHUB_TOKEN",
   "GH_TOKEN",
   "AWS_SECRET_ACCESS_KEY",
+  "NEAR_API_KEY",
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
+  "OPENCODE_API_KEY",
+  "TAVILY_API_KEY",
   "OMP_AUTH_BROKER_TOKEN",
 ] as const;
 

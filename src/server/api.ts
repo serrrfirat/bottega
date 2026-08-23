@@ -46,6 +46,15 @@ export const API_ACTOR = "api:default";
 export const OPENAPI_PATH = "/openapi.json";
 /** The fixed prefix of the API's business routes. */
 export const API_PATH_PREFIX = "/api/v1";
+/**
+ * Issue #346 defense-in-depth: a per-peer throttle over FAILED auths.
+ * Each peer (reverse-proxy `X-Forwarded-For` first hop) may burst at most
+ * {@link AUTH_THROTTLE_MAX_PER_IP} failed auths inside
+ * {@link AUTH_THROTTLE_WINDOW_MS}; beyond that the surface answers 429.
+ */
+export const AUTH_THROTTLE_WINDOW_MS = 60_000;
+export const AUTH_THROTTLE_MAX_PER_IP = 20;
+const AUTH_THROTTLE_MAX_PEERS = 1024;
 /** Every value `status` accepts on GET /api/v1/work-items (issue #100). */
 const WORK_ITEM_STATES: readonly WorkItemState[] = [
   "open",
@@ -453,6 +462,62 @@ async function recordAuthDenial(deps: RestApiDeps, req: Request): Promise<void> 
 }
 
 /**
+ * Extracts the caller's peer address from a request. The deployment exposes
+ * a single reverse-proxy ingress (TLS), so the real client is the first hop
+ * of `X-Forwarded-For`; loopback falls back to a shared `"local"` bucket.
+ */
+function peerIp(req: Request): string {
+  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "local";
+}
+
+/**
+ * Bounded, sliding-window throttle over FAILED auths keyed by peer address
+ * (issue #346): each peer may burst {@link AUTH_THROTTLE_MAX_PER_IP} failures
+ * inside {@link AUTH_THROTTLE_WINDOW_MS} before {@link record} reports
+ * over-limit (the caller answers 429). Windows are pruned on access and the
+ * peer map is capped so memory stays bounded however many addresses attack.
+ */
+interface AuthThrottle {
+  /**
+   * Accounts one failed auth for `peer`. Returns true once that peer has
+   * exceeded the per-window burst limit (the caller should respond 429);
+   * false means it is within budget (the caller answers the normal 401).
+   */
+  record(peer: string): boolean;
+}
+
+function createAuthThrottle(): AuthThrottle {
+  const byPeer = new Map<string, number[]>();
+  return {
+    record(peer) {
+      const now = Date.now();
+      const cutoff = now - AUTH_THROTTLE_WINDOW_MS;
+      const bucket = (byPeer.get(peer) ?? []).filter((t) => t > cutoff);
+      if (bucket.length >= AUTH_THROTTLE_MAX_PER_IP) {
+        byPeer.set(peer, bucket);
+        return true;
+      }
+      bucket.push(now);
+      byPeer.set(peer, bucket);
+      // Bound the map: when full, evict the peer that has been idle the longest.
+      if (byPeer.size > AUTH_THROTTLE_MAX_PEERS) {
+        let evict: string | undefined;
+        let oldest = Number.POSITIVE_INFINITY;
+        for (const [candidate, times] of byPeer) {
+          const last = times[times.length - 1] ?? 0;
+          if (last < oldest) {
+            oldest = last;
+            evict = candidate;
+          }
+        }
+        if (evict !== undefined) byPeer.delete(evict);
+      }
+      return false;
+    },
+  };
+}
+
+/**
  * Builds the REST surface: a route handler (a `fetch` mount) that authenticates
  * every known route, audits auth denials, and dispatches to the route's
  * handler. No listener of its own — the boot mounts it onto the OAuth
@@ -460,6 +525,7 @@ async function recordAuthDenial(deps: RestApiDeps, req: Request): Promise<void> 
  */
 export function mountRestApi(deps: RestApiDeps): RestApiMount {
   const resolveToken = deps.resolveToken ?? (() => process.env[REST_API_TOKEN_ENV]);
+  const authThrottle = createAuthThrottle();
   return {
     async fetch(req) {
       const url = new URL(req.url);
@@ -468,6 +534,15 @@ export function mountRestApi(deps: RestApiDeps): RestApiMount {
       const expected = resolveToken();
       const provided = bearerToken(req);
       if (expected === undefined || expected.trim() === "" || provided === null || !constantTimeEqual(expected, provided)) {
+        // Issue #346 defense-in-depth: a peer that bursts failed auths past
+        // the per-window limit is answered 429 (not 401) until its window
+        // lapses. Auth check happens first (still counts as a failed auth).
+        if (authThrottle.record(peerIp(req))) {
+          return Response.json(
+            { error: "too many requests" },
+            { status: 429, headers: { "retry-after": String(AUTH_THROTTLE_WINDOW_MS / 1000) } },
+          );
+        }
         await recordAuthDenial(deps, req);
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }

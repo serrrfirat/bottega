@@ -263,6 +263,65 @@ describe("auth — bearer BOTTEGA_API_TOKEN (issue #100)", () => {
   });
 });
 
+describe("auth throttle — per-peer failed-auth burst (issue #346)", () => {
+  test("a peer bursting past the per-window limit is answered 429; a valid token still succeeds", async () => {
+    const h = freshHarness();
+    const peer = "198.51.100.7";
+
+    // A burst of failed auths from ONE peer, over the 20/min limit. Each is
+    // a fail-closed 401 until the burst trips, then 429 with Retry-After.
+    for (let i = 0; i < 24; i++) {
+      const res = await fetch(`${h.baseUrl}/api/v1/spaces`, {
+        headers: { "x-forwarded-for": peer, authorization: "Bearer wrong-token" },
+      });
+      expect([401, 429]).toContain(res.status);
+      if (i < 20) expect(res.status).toBe(401);
+    }
+    // The 429 responses carry a Retry-After so clients back off.
+    const throttled = await fetch(`${h.baseUrl}/api/v1/spaces`, {
+      headers: { "x-forwarded-for": peer, authorization: "Bearer wrong-token" },
+    });
+    expect(throttled.status).toBe(429);
+    expect(throttled.headers.get("retry-after")).toBe("60");
+
+    // A legitimate call from the SAME peer with the real token still works
+    // (the throttle only gates failed auths, not successful ones).
+    const ok = await fetch(`${h.baseUrl}/api/v1/spaces`, {
+      headers: { "x-forwarded-for": peer, authorization: `Bearer ${TOKEN}` },
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  test("each peer is throttled independently", async () => {
+    const h = freshHarness();
+    const victim = "203.0.113.9";
+    const bystander = "203.0.113.10";
+
+    // Saturate the victim only.
+    for (let i = 0; i < 21; i++) {
+      await fetch(`${h.baseUrl}/api/v1/spaces`, {
+        headers: { "x-forwarded-for": victim, authorization: "Bearer nope" },
+      });
+    }
+    expect(
+      (
+        await fetch(`${h.baseUrl}/api/v1/spaces`, {
+          headers: { "x-forwarded-for": victim, authorization: "Bearer nope" },
+        })
+      ).status,
+    ).toBe(429);
+
+    // A different peer shares NO throttle bucket: it stays on 401.
+    expect(
+      (
+        await fetch(`${h.baseUrl}/api/v1/spaces`, {
+          headers: { "x-forwarded-for": bystander, authorization: "Bearer nope" },
+        })
+      ).status,
+    ).toBe(401);
+  });
+});
+
 describe("GET /openapi.json (issue #100)", () => {
   test("with a valid token returns OpenAPI 3.1 JSON listing every API route", async () => {
     const h = freshHarness();
