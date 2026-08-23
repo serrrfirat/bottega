@@ -100,6 +100,7 @@ export const settingsSetSchema = z.object({
   approvals: z
     .object({
       timeout_minutes: z.number().int().min(1).max(1440).optional(),
+      approval_nudge_minutes: z.number().int().min(1).max(10080).optional(),
       always_approve: z.array(z.string()).optional(),
     })
     .optional(),
@@ -297,6 +298,9 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
       ...(settings.approvals.timeoutMinutes !== undefined
         ? { timeout_minutes: settings.approvals.timeoutMinutes }
         : undefined),
+      ...(settings.approvals.approvalNudgeMinutes !== undefined
+        ? { approval_nudge_minutes: settings.approvals.approvalNudgeMinutes }
+        : undefined),
       ...(settings.approvals.alwaysApprove !== undefined ? { always_approve: settings.approvals.alwaysApprove } : undefined),
     };
   }
@@ -381,7 +385,7 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "ORG-scope writes additionally require a human approver (routed through the approval flow like " +
       "exec-tier tools); the effective policy clamps always_approve and extensions to tighten-only " +
       "relative to the config-file floor. " +
-      "Org scope knobs: approvals.timeout_minutes / always_approve, response_mode, " +
+      "Org scope knobs: approvals.timeout_minutes / approval_nudge_minutes / always_approve, response_mode, " +
       "memory.injection.enabled / max_entries, extensions.allow / deny / org_credentials, repos " +
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
       "git_base_url, api_base_url, allow_loose_pat, turn_stop_control (the Slack live-turn Stop " +

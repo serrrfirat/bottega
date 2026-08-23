@@ -1284,7 +1284,7 @@ describe("org settings (issue #67)", () => {
   test("set/get round-trips the validated camelCase shape", () => {
     const s = freshStore();
     const parsed = s.setOrgSettings({
-      approvals: { timeout_minutes: 7, always_approve: ["bash", "create_work_item"] },
+      approvals: { timeout_minutes: 7, approval_nudge_minutes: 45, always_approve: ["bash", "create_work_item"] },
       response_mode: "mention",
       memory: { injection: { enabled: false, max_entries: 3 } },
       extensions: { allow: ["linear"], deny: ["attio"], org_credentials: "deny" },
@@ -1298,7 +1298,7 @@ describe("org settings (issue #67)", () => {
       ok: true,
       errors: [],
       warnings: [],
-      approvals: { timeoutMinutes: 7, alwaysApprove: ["bash", "create_work_item"] },
+      approvals: { timeoutMinutes: 7, approvalNudgeMinutes: 45, alwaysApprove: ["bash", "create_work_item"] },
       responseMode: "mention",
       memoryInjection: { enabled: false, maxEntries: 3 },
       extensions: { allow: ["linear"], deny: ["attio"], orgCredentials: "deny" },
@@ -1307,6 +1307,30 @@ describe("org settings (issue #67)", () => {
       allowLoosePat: true,
       turnStopControl: true,
     });
+  });
+
+  test("approvals.approval_nudge_minutes round-trips; absent stays unset; malformed fails closed (issue #109)", () => {
+    const s = freshStore();
+    // Absent → the knob is unset.
+    expect(s.setOrgSettings({ approvals: { timeout_minutes: 7 } }).approvals?.approvalNudgeMinutes).toBeUndefined();
+    expect(s.getOrgSettings()?.approvals?.approvalNudgeMinutes).toBeUndefined();
+
+    // Explicit value round-trips as camelCase.
+    const parsed = s.setOrgSettings({ approvals: { approval_nudge_minutes: 45 } });
+    expect(parsed.ok).toBe(true);
+    expect(parsed.approvals?.approvalNudgeMinutes).toBe(45);
+    expect(s.getOrgSettings()?.approvals?.approvalNudgeMinutes).toBe(45);
+
+    // Deliberately malformed values: cast across the typed-input boundary so
+    // the runtime validator is exercised (the API type already rejects these).
+    // SAFETY: the malformed literals are deliberately outside OrgSettingsInput's
+    // type; the store's runtime validator is the boundary under test.
+    const malformed = (v: JsonValue): OrgSettingsInput => v as OrgSettingsInput;
+    expect(() => s.setOrgSettings(malformed({ approvals: { approval_nudge_minutes: -1 } }))).toThrow(/approval_nudge_minutes/);
+    expect(() => s.setOrgSettings(malformed({ approvals: { approval_nudge_minutes: 0 } }))).toThrow(/positive integer/);
+    // Fail-closed: the malformed writes threw and did NOT overwrite the
+    // previously-set valid value (the store is atomic on parse error).
+    expect(s.getOrgSettings()?.approvals?.approvalNudgeMinutes).toBe(45);
   });
 
   test("setOrgSettings upserts the singleton row (id=1) and the CHECK pins it", () => {

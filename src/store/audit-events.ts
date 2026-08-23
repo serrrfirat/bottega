@@ -63,6 +63,8 @@ export const POLICY_DECISION_EVENT = "policy.decision";
 export const APPROVAL_REQUESTED_EVENT = "approval.requested";
 /** Human approval resolved (payload {tool, approved, approver}). */
 export const APPROVAL_RESOLVED_EVENT = "approval.resolved";
+/** A pending approval was nudged after sitting unanswered (payload {tool, space_id}; issue #109). */
+export const APPROVAL_NUDGED_EVENT = "approval.nudged";
 /** Memory saved (payload {scope, principal, id, content_hash}). */
 export const MEMORY_WRITE_EVENT = "memory.write";
 /** Automatic memory extraction completed (payload {scope, count}; actor = system). */

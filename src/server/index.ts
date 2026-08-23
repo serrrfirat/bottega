@@ -6,6 +6,7 @@ import { createMemoryConsolidationTrigger } from "./services/memory-consolidatio
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { evaluatePolicyGate } from "../policy/gate";
+import type { AuditModule } from "../policy/audit";
 import {
   bootstrapRuntime,
   type BootstrapRuntime,
@@ -74,7 +75,7 @@ import {
 } from "./drivers/agent-driver";
 import { startDeliveryPoller } from "./services/delivery-poller";
 import { startOutboxPostSeam } from "./services/outbox-post-seam";
-import { SlackApprovalRouter } from "./adapters/approval-router";
+import { SlackApprovalRouter, DEFAULT_NUDGE_MINUTES } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
 import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
 import {
@@ -132,6 +133,10 @@ export interface BottegaServerOpts {
   createApprovalRouter?: (deps: {
     adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
     timeoutMs: number;
+    /** Nudge deadline in minutes (issue #109): a pending approval is nudged once after this. */
+    nudgeMinutes?: number;
+    /** Audit seam (issue #109): records `approval.nudged` when the router posts a nudge. */
+    audit?: AuditModule;
     /** Presenter/step path (issue #277): lets the router post confirmed-write-failure steps. */
     onToolStep?: ToolStepSink;
   }) => ApprovalRouter & { handleAction(a: SlackAction): Promise<void> };
@@ -442,6 +447,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   approvalRouter = (opts.createApprovalRouter ?? ((deps) => new SlackApprovalRouter(deps)))({
     adapter,
     timeoutMs: orgPolicy.timeoutMinutes * 60_000,
+    // Issue #109: a pending ask-human approval is nudged ONCE after
+    // `approvals.approval_nudge_minutes` (default 30). Reads the org
+    // settings blob like turn_stop_control, independent of the policy gate.
+    nudgeMinutes: orgSettings?.approvals?.approvalNudgeMinutes ?? DEFAULT_NUDGE_MINUTES,
+    // Issue #109: the nudge is audited as approval.nudged.
+    audit,
     // Issue #277: a confirmed write that fails is posted back through the
     // SAME step path tool steps use — never a parallel messaging API.
     onToolStep: (step) => spaceService.routeToolStep(step),
