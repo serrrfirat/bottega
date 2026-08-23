@@ -19,9 +19,10 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import type { ApprovalRequest, ApprovalResolution, ApprovalRouter } from "../../policy/approval-router";
-import { redact } from "../../policy/audit";
+import { redact, type AuditModule } from "../../policy/audit";
 import { summarizeToolArgs } from "../../policy/gate";
 import { DEFAULT_TIMEOUT_MINUTES } from "../../policy/config";
+import { APPROVAL_NUDGED_EVENT } from "../../store/audit-events";
 import {
   APPROVE_ACTION_ID,
   DENY_ACTION_ID,
@@ -43,6 +44,13 @@ export const ARGS_ROW_MAX = 12;
 
 /** Registry bound: at capacity the oldest pending request is evicted (denied). */
 export const MAX_PENDING_REQUESTS = 64;
+
+/**
+ * Default minutes a pending ask-human approval sits unanswered before ONE
+ * nudge is posted to the approver channel (issue #109). Overridable per
+ * org via `approvals.approval_nudge_minutes`.
+ */
+export const DEFAULT_NUDGE_MINUTES = 30;
 
 /** Cap for the confirmed-write-failure memory; the oldest entry is evicted at capacity. */
 export const FAILURE_MEMORY_MAX = 64;
@@ -67,6 +75,10 @@ interface PendingRequest {
   /** Ts of the posted prompt; "" until the post resolves. */
   messageTs: string;
   timer: ReturnType<typeof setTimeout>;
+  /** Nudge timer (issue #109): fires once at the nudge deadline to post ONE nudge. */
+  nudgeTimer: ReturnType<typeof setTimeout>;
+  /** True once the request has been nudged; a pending request is never nudged twice. */
+  nudged: boolean;
   resolve: (r: ApprovalResolution) => void;
   settled: boolean;
   /** Outcome captured at settle time, replayed onto the message once its ts lands. */
@@ -82,6 +94,17 @@ export interface SlackApprovalRouterDeps {
   maxPending?: number;
   /** Complexity cap for the confirmed-write-failure memory. Default {@link FAILURE_MEMORY_MAX}. */
   maxFailures?: number;
+  /**
+   * Minutes a pending ask-human approval sits unanswered before ONE nudge
+   * posts to the approver channel (issue #109). Default {@link DEFAULT_NUDGE_MINUTES}.
+   */
+  nudgeMinutes?: number;
+  /**
+   * Audit seam (issue #109): lets the router record `approval.nudged` when
+   * it posts a nudge. Optional — a router without an audit seam still
+   * nudges, just without the audit row.
+   */
+  audit?: AuditModule;
   /**
    * Presenter/step path (issue #277): when present, a confirmed write that
    * fails posts a failure step card through this sink — the SAME path tool
@@ -378,17 +401,21 @@ export class SlackApprovalRouter implements ApprovalRouter {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly adapter: Pick<SlackAdapter, "postMessage" | "updateMessage">;
   private readonly timeoutMs: number;
+  private readonly nudgeMinutes: number;
   private readonly maxPending: number;
   private readonly failures: ApprovalFailureMemory;
   private readonly onToolStep: ToolStepSink | undefined;
+  private readonly audit: AuditModule | undefined;
   private readonly log: (line: string) => void;
 
   constructor(deps: SlackApprovalRouterDeps) {
     this.adapter = deps.adapter;
     this.timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MINUTES * 60_000;
+    this.nudgeMinutes = deps.nudgeMinutes ?? DEFAULT_NUDGE_MINUTES;
     this.maxPending = deps.maxPending ?? MAX_PENDING_REQUESTS;
     this.failures = new ApprovalFailureMemory(deps.maxFailures ?? FAILURE_MEMORY_MAX);
     this.onToolStep = deps.onToolStep;
+    this.audit = deps.audit;
     this.log = deps.log ?? ((line) => console.log(line));
   }
 
@@ -467,11 +494,16 @@ export class SlackApprovalRouter implements ApprovalRouter {
       timer: setTimeout(() => {
         this.settle(entry, { approved: false }, "expired (no response within timeout)");
       }, this.timeoutMs),
+      nudgeTimer: setTimeout(() => {
+        this.nudge(entry, d, this.nudgeMinutes);
+      }, this.nudgeMinutes * 60_000),
+      nudged: false,
       resolve,
       settled: false,
     };
     // Never hold the process open waiting for a button that may not come.
     entry.timer.unref?.();
+    entry.nudgeTimer.unref?.();
     this.pending.set(id, entry);
     try {
       const messageTs = await this.adapter.postMessage(d.spaceId, approvalPromptText(d), {
@@ -526,6 +558,33 @@ export class SlackApprovalRouter implements ApprovalRouter {
     });
   }
 
+  /**
+   * Posts ONE nudge for a still-pending request (issue #109). Fired by the
+   * per-request nudge timer; a no-op once the request is settled or already
+   * nudged. Best-effort and never awaited: a failed post or audit is logged,
+   * never thrown into the turn path, and never settles the request. The
+   * nudge reuses the SAME posting seam as the prompt (adapter.postMessage).
+   */
+  private nudge(entry: PendingRequest, d: ApprovalRequest, pendingMinutes: number): void {
+    if (entry.settled || entry.nudged) return;
+    entry.nudged = true;
+    const text = `⏳ *Still waiting on approval* — \`${d.tool}\` has been pending for ~${pendingMinutes} minute${pendingMinutes === 1 ? "" : "s"}. Click approve or deny on the original message above to resolve it.`;
+    void this.adapter
+      .postMessage(d.spaceId, text)
+      .then(() => this.log(`[approvals] nudged pending request ${entry.id} for ${d.tool}`))
+      .catch((err) => this.log(`[approvals] nudge post failed for ${entry.id}: ${String(err)}`));
+    if (this.audit !== undefined) {
+      void this.audit
+        .appendAudit({
+          space_id: d.spaceId === "" ? null : d.spaceId,
+          actor: "system",
+          event_type: APPROVAL_NUDGED_EVENT,
+          payload: { tool: d.tool, space_id: d.spaceId, elapse_minutes: pendingMinutes },
+        })
+        .catch((err) => this.log(`[approvals] nudge audit failed for ${entry.id}: ${String(err)}`));
+    }
+  }
+
   /** Settles a request exactly once: resolve the gate, evict, rewrite the prompt. */
   private settle(entry: PendingRequest, resolution: ApprovalResolution, label: string): void {
     if (entry.settled) return;
@@ -544,6 +603,7 @@ export class SlackApprovalRouter implements ApprovalRouter {
     entry.settled = true;
     entry.outcome = { resolution, label };
     clearTimeout(entry.timer);
+    clearTimeout(entry.nudgeTimer);
     this.pending.delete(entry.id);
     entry.resolve(resolution);
   }

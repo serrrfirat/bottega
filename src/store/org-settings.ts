@@ -31,6 +31,8 @@ export const MEMORY_INJECTION_MAX_ENTRIES_CAP = 20;
 /** Validated org settings — camelCase; an absent field means "not set in the blob". */
 export interface OrgApprovalsSettings {
   timeoutMinutes?: number;
+  /** Minutes a pending ask-human approval sits before a nudge is posted (issue #109); default 30. */
+  approvalNudgeMinutes?: number;
   alwaysApprove?: string[];
 }
 
@@ -145,6 +147,8 @@ export interface OrgSettings {
 export interface OrgSettingsInput {
   approvals?: {
     timeout_minutes?: number;
+    /** Minutes a pending ask-human approval sits before a nudge posts (issue #109); default 30. */
+    approval_nudge_minutes?: number;
     always_approve?: string[];
   };
   response_mode?: ResponseMode;
@@ -315,6 +319,14 @@ export function parseOrgSettingsJson(text: string): OrgSettings {
             fail("approvals.timeout_minutes must be a positive integer");
           } else {
             parsed.timeoutMinutes = n;
+          }
+        } else if (key === "approval_nudge_minutes") {
+          const n = positiveInt(raw);
+          if (n === undefined) {
+            sectionOk = false;
+            fail("approvals.approval_nudge_minutes must be a positive integer");
+          } else {
+            parsed.approvalNudgeMinutes = n;
           }
         } else if (key === "always_approve") {
           const names = toolNameList(raw);

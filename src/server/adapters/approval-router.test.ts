@@ -4,7 +4,7 @@
  * full policy-gate loop (extension + router + buttons) runs against a real
  * store so the audit rows are asserted end to end.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import { createStore, type Space } from "../../store/db";
 import { createAudit } from "../../policy/audit";
 import { parseOrgConfigYaml } from "../../policy/config";
 import createPolicyExtension from "../../policy/extension";
+import { APPROVAL_NUDGED_EVENT } from "../../store/audit-events";
 import type { ApprovalResolution, ApprovalRouter } from "../../policy/approval-router";
 import {
   APPROVE_ACTION_ID,
@@ -353,6 +354,95 @@ describe("SlackApprovalRouter resolution", () => {
     await router.handleAction(click(APPROVE_ACTION_ID, requestIdAt(posted, 2)));
     await expect(third).resolves.toEqual({ approved: true, approver: "U42" });
     expect(router.pendingCount).toBe(0);
+  });
+});
+
+describe("SlackApprovalRouter nudge (issue #109)", () => {
+  function fakeAudit() {
+    const rows: Array<{ event_type: string; payload: string; space_id: string | null }> = [];
+    return {
+      rows,
+      async appendAudit(entry: { space_id?: string | null; actor: string; event_type: string; payload: unknown }) {
+        rows.push({ event_type: entry.event_type, payload: JSON.stringify(entry.payload), space_id: entry.space_id ?? null });
+        return 1;
+      },
+      async listAudit() {
+        return rows.map((r) => ({ id: 0, ts: 0, space_id: r.space_id, actor: "system", event_type: r.event_type, payload: r.payload }));
+      },
+    };
+  }
+
+  const flush = async (): Promise<void> => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  test("posts ONE nudge at the threshold, not before, and never repeats (fake timers)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { adapter, posted } = fakeAdapter();
+      const audit = fakeAudit();
+      const router = new SlackApprovalRouter({ adapter, timeoutMs: 120_000, nudgeMinutes: 1, audit });
+
+      const promise = router.request(REQUEST);
+      // The prompt is the first post; no nudge yet.
+      expect(posted).toHaveLength(1);
+      expect(posted[0].text).toContain("Approval required");
+
+      // Just short of the 1-minute threshold: the nudge must NOT have fired.
+      vi.advanceTimersByTime(60_000 - 1);
+      await flush();
+      expect(posted).toHaveLength(1);
+
+      // Cross the threshold: exactly ONE nudge posts, to the approver channel.
+      vi.advanceTimersByTime(1);
+      await flush();
+      expect(posted).toHaveLength(2);
+      expect(posted[1].spaceId).toBe("slack:C1");
+      expect(posted[1].text).toContain("Still waiting on approval");
+      expect(posted[1].text).toContain("create_work_item");
+
+      // Bounded: a further advance past the threshold never nudges again.
+      // Stay inside the ask-human timeout (120s) so the request is still
+      // pending and can still be approved below.
+      vi.advanceTimersByTime(30_000);
+      await flush();
+      expect(posted).toHaveLength(2);
+
+      // Audited once.
+      const nudged = audit.rows.filter((r) => r.event_type === APPROVAL_NUDGED_EVENT);
+      expect(nudged).toHaveLength(1);
+      expect(nudged[0].space_id).toBe("slack:C1");
+      expect(JSON.parse(nudged[0].payload).tool).toBe(REQUEST.tool);
+
+      await router.handleAction(click(APPROVE_ACTION_ID, requestIdFrom(posted)));
+      await expect(promise).resolves.toEqual({ approved: true, approver: "U42" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an approval resolved before the threshold is never nudged", async () => {
+    vi.useFakeTimers();
+    try {
+      const { adapter, posted } = fakeAdapter();
+      const router = new SlackApprovalRouter({ adapter, timeoutMs: 120_000, nudgeMinutes: 1 });
+
+      const promise = router.request(REQUEST);
+      expect(posted).toHaveLength(1);
+
+      await router.handleAction(click(APPROVE_ACTION_ID, requestIdFrom(posted)));
+      await expect(promise).resolves.toEqual({ approved: true, approver: "U42" });
+
+      // Advancing past the nudge threshold must not post a nudge: the
+      // request is already settled (promise resolved) and nudge won't fire twice.
+
+      vi.advanceTimersByTime(180_000);
+      await Promise.resolve();
+      expect(posted).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
