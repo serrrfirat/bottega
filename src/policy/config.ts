@@ -238,9 +238,16 @@ const TIER_BY_TOOL: ToolTiers = {
   // user-visible tool.
   register_extension: "exec",
   // Memory tools (issue #22): save mutates durable state (write — prompts
-  // in non-yolo modes), search only queries (read).
+  // in non-yolo modes), search only queries (read). forget-with-tombstone
+  // (issue #163) is a destructive write like save, so it crosses the same
+  // write-tier approval instead of denying as an unknown exec tool.
   "memory.save": "write",
   "memory.search": "read",
+  "memory.forget": "write",
+  // Operator usage read (issue #103): aggregation query over the audit
+  // trail's usage.turn rows — read-tier like slack_read, so the gate lets
+  // it through under a read: allow policy instead of denying as unknown.
+  usage_summary: "read",
   // Transcript full-text search (issue #136): indexes durable session
   // messages but never mutates the transcripts themselves.
   session_search: "read",

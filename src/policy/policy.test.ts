@@ -85,13 +85,14 @@ describe("tier resolution", () => {
       "search_web",
       "render_chart",
       "slack_read",
+      "usage_summary",
     ]) {
       expect(resolveTier(t)).toBe("read");
       expect(isKnownTool(t)).toBe(true);
     }
   });
   test("write-tier tools", () => {
-    for (const t of ["write", "edit", "memory.save", "model_settings", "use_model", "object.create", "complete_work_item"]) {
+    for (const t of ["write", "edit", "memory.save", "memory.forget", "model_settings", "use_model", "object.create", "complete_work_item"]) {
       expect(resolveTier(t)).toBe("write");
       expect(isKnownTool(t)).toBe(true);
     }
