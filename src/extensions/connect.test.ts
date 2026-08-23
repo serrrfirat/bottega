@@ -889,6 +889,81 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     expect(h.mcpOAuth.calls).toHaveLength(0);
   });
 
+  test("an org connect of an OPENAPI catalog entry crosses ONE gate whose payload lists the generated operations+tiers, then directs the key to the upload link (issue #345)", async () => {
+    const openapiRecord = {
+      id: "openapi/sendgrid",
+      slug: "sendgrid",
+      kind: "openapi",
+      name: "SendGrid",
+      description: "An API-first email vendor with no MCP server",
+      domain: "sendgrid.com",
+      openapi: { url: "https://raw.sendgrid.test/openapi.json", auth: { scheme: "bearer" } },
+    };
+    const spec = {
+      openapi: "3.0.3",
+      info: { title: "SendGrid API", version: "1.0.0" },
+      servers: [{ url: "https://api.sendgrid.test/v1" }],
+      paths: {
+        "/mail/send": { post: { operationId: "send_mail", responses: { "200": { description: "ok" } } } },
+        "/stats": { get: { operationId: "get_stats", responses: { "200": { description: "ok" } } } },
+        "/stats/campaigns": { delete: { operationId: "delete_campaign", responses: { "204": { description: "ok" } } } },
+      },
+    };
+    const h = makeCatalogHarness({
+      records: [openapiRecord],
+      routes: [
+        {
+          match: "https://raw.sendgrid.test/openapi.json",
+          status: 200,
+          body: JSON.stringify(spec),
+          headers: { "content-type": "application/json" },
+        },
+      ],
+    });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "sendgrid", "org", "UADA");
+
+    // The registration landed (api_key → the connect then points at the
+    // #196 safe upload path — never a pasted key in chat).
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok === false) {
+      expect(outcome.message).toContain('Registered "SendGrid" from the catalog at runtime');
+      expect(outcome.message).toContain("connect_upload_link");
+    }
+    // ONE org gate carries the draft facts INCLUDING the operations+tiers
+    // the review renders (issue #345).
+    expect(h.router.requests).toHaveLength(1);
+    const request = h.router.requests[0]!;
+    expect(request.tool).toBe(CONNECT_EXTENSION_TOOL);
+    expect(request.args).toMatchObject({
+      extension: "sendgrid",
+      scope: "org",
+      registering_from_catalog: true,
+      vendor: "SendGrid",
+      domains: ["api.sendgrid.test"],
+      operations: [
+        { name: "sendgrid_send_mail", tier: "write", operation: "send_mail", method: "post", path: "/mail/send" },
+        { name: "sendgrid_get_stats", tier: "read", operation: "get_stats", method: "get", path: "/stats" },
+        { name: "sendgrid_delete_campaign", tier: "write", operation: "delete_campaign", method: "delete", path: "/stats/campaigns" },
+      ],
+    });
+    // Registered AT RUNTIME (store + egress regen + hot-register, no file).
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    const persisted = h.runtimeRegistry.rows[0]!;
+    expect(persisted.manifest.kind).toBe("openapi");
+    if (persisted.manifest.kind === "openapi") {
+      expect(persisted.manifest.domains).toEqual(["api.sendgrid.test"]);
+      expect(persisted.manifest.tools.map((t) => t.name).sort()).toEqual([
+        "sendgrid_delete_campaign",
+        "sendgrid_get_stats",
+        "sendgrid_send_mail",
+      ]);
+    }
+    expect(existsSync(join(h.snapshotsDir, "sendgrid.json"))).toBe(false);
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+  });
+
   test("without the catalog seam an unknown extension keeps the fail-closed error", async () => {
     // Headless/executor contexts wire no seam: the old error stands.
     const h = makeDeps();

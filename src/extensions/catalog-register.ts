@@ -48,18 +48,25 @@ import { proxyBoundaryControlFromEnv } from "./boundary";
 import {
   buildSnapshotDraft,
   CatalogError,
+  DEFAULT_CATALOG_URL,
   fetchCatalogEntry,
+  openApiGenerationFor,
   type CatalogEntry,
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "./fetch-catalog";
 import {
+  fetchOpenApiSpec,
+  type OpenApiOperation,
+} from "./openapi-tools";
+import {
   validateManifest,
   type CredentialSchema,
   type CredentialTarget,
+  type JsonObject,
 } from "./manifest";
 import { probeMcpEndpoint } from "./mcp-endpoint-probe";
-import type { ExtensionRegistry, PinnedSnapshot } from "./registry";
+import { SNAPSHOT_SCHEMA, type ExtensionRegistry, type PinnedSnapshot } from "./registry";
 import {
   DEV_EGRESS_CONFIG_PATH,
   EGRESS_CONFIG_PATH,
@@ -271,14 +278,16 @@ export interface CatalogDraftFacts {
   extensionId: string;
   /** The catalog entry's display name (e.g. "Notion"). */
   label: string;
-  /** Catalog kind ("mcp" — the deterministic route registers hosted MCP only). */
+  /** Catalog kind ("mcp" | "openapi" — the deterministic route registers hosted MCP or API-first OpenAPI). */
   kind: string;
   /** The egress allowlist domains the registration would add. */
   domains: string[];
   /** Reviewed destinations that may receive credentials. */
   credentialTargets: CredentialTarget[];
-  /** The discovered official hosted MCP endpoint. */
-  mcpEndpoint: string;
+  /** The discovered official hosted MCP endpoint (undefined for openapi entries). */
+  mcpEndpoint?: string;
+  /** The generated operations + tiers for an openapi entry (undefined for MCP) — the review rendering. */
+  operations?: OpenApiOperation[];
   credentialSchema: CredentialSchema;
   oauthGated: boolean;
 }
@@ -321,6 +330,13 @@ export async function lookupCatalogExtension(
   // discovery resolves an official hosted MCP endpoint, which a cli/openapi
   // entry does not have. Non-MCP entries keep the human's catalog_browser
   // draft/pin flow (the agent web-searches the vendor's binding).
+  // Issue #345: an API-first vendor that publishes an `openapi` block IS
+  // deterministically connectable — the spec is fetched ONCE, validated,
+  // and the tool surface FROZEN at registration (the runtime never
+  // re-fetches), exactly like a reviewed MCP pin.
+  if (entry.kind === "openapi") {
+    return await lookupOpenApiCatalogExtension(entry, catalogOpts);
+  }
   if (entry.kind !== "mcp") {
     return {
       ok: false,
@@ -398,8 +414,82 @@ export async function lookupCatalogExtension(
       domains: manifest.domains,
       credentialTargets: manifest.credentialTargets,
       mcpEndpoint: discovered.serverUrl,
+      operations: undefined,
       credentialSchema: discovered.credentialSchema,
       oauthGated: discovered.oauthGated,
+    },
+    snapshot,
+  };
+}
+
+/**
+ * The openapi-kind catalog draft (issue #345): the spec is fetched ONCE
+ * (HTTPS-only, ≤2MB, OpenAPI 3.x) and the tool surface FROZEN into the
+ * reviewed snapshot — the runtime never re-fetches, deterministic + the
+ * review lists the generated operations + tiers. Fail closed: a non-HTTPS
+ * spec URL, an over-cap spec, an unknown scheme, or a generation
+ * cap/collision refuses the draft before anything registers.
+ */
+async function lookupOpenApiCatalogExtension(
+  entry: CatalogEntry,
+  catalogOpts: FetchCatalogOptions,
+): Promise<CatalogLookupResult> {
+  const extensionId = entry.slug;
+  const openApi = entry.openapi;
+  if (openApi === undefined) {
+    return {
+      ok: false,
+      message: `cannot register "${extensionId}" from the catalog: it is kind "openapi" but carries no "openapi" block (spec URL + auth scheme)`,
+    };
+  }
+  // The spec is fetched + validated ONCE at the draft/review step; the
+  // frozen surface below is what the runtime executes forever after.
+  let spec: JsonObject;
+  try {
+    spec = await fetchOpenApiSpec(openApi.url, catalogOpts.fetchImpl);
+  } catch (err) {
+    return {
+      ok: false,
+      message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
+    };
+  }
+  let review;
+  try {
+    review = openApiGenerationFor(entry, spec);
+  } catch (err) {
+    return {
+      ok: false,
+      message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
+    };
+  }
+  const manifest = review.manifest;
+  // The approval IS the review (issue #233): the connect's own approval
+  // (org scope) or the direct personal connect authorizes the runtime
+  // registration — the snapshot records reviewed: true and the surface came
+  // from the vendor's own published spec (vendorOfficial: true).
+  const snapshot: PinnedSnapshot = {
+    schema: SNAPSHOT_SCHEMA,
+    extensionId,
+    pinnedAt: new Date().toISOString(),
+    source: {
+      catalog: DEFAULT_CATALOG_URL,
+      specId: extensionId,
+      vendorOfficial: true,
+      reviewed: true,
+    },
+    manifest,
+  };
+  return {
+    ok: true,
+    facts: {
+      extensionId,
+      label: entry.name,
+      kind: entry.kind,
+      domains: manifest.domains,
+      credentialTargets: manifest.credentialTargets,
+      operations: review.operations,
+      credentialSchema: manifest.credentialSchema,
+      oauthGated: false,
     },
     snapshot,
   };
