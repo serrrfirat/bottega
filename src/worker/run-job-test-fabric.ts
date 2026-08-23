@@ -162,7 +162,7 @@ async function spawnSandboxChild(
   if (Buffer.byteLength(encoded) > MAX_SANDBOX_REQUEST_BYTES) {
     return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox request exceeds IPC limit" };
   }
-  const command = sandboxCommand(options.entrypoint, options.caps.memoryMb, options.requireLimits);
+  const command = sandboxCommand(options.entrypoint, options.requireLimits);
   if ("error" in command) {
     return { exitCode: null, signal: null, timedOut: false, protocolError: command.error };
   }
@@ -330,10 +330,21 @@ async function spawnSandboxChild(
  * into a child that must be hermetic. This is the child-process TEST FABRIC
  * (never the production Docker boundary), so disabling Bun's implicit dotenv
  * loading here is safe and required; production isolation is unchanged.
+ *
+ * On Linux the child is launched through `prlimit` to bound the process
+ * boundary (open fds and thread/process count). We deliberately do NOT pass
+ * `--as`/RLIMIT_AS: the sandboxed job is a nested Bun runtime, and Bun needs
+ * roughly 4 GiB of VIRTUAL address space just to boot (JIT + GC reservations),
+ * so any real per-job memory cap (128-512 MiB) would make Bun abort at startup
+ * with SIGTRAP before the child entrypoint can ever answer over fd 3 — every
+ * sandboxed job would fail as "response is not JSON". The lightweight native
+ * `--nofile`/`--nproc` process-boundary caps work fine under the much larger
+ * default AS ceiling. The actual per-job memory ceiling is enforced by the
+ * production Docker boundary via `docker run --memory` (see run-job.ts), not
+ * by this test fabric.
  */
 function sandboxCommand(
   entrypoint: string,
-  memoryMb: number,
   requireLimits: boolean,
 ): { file: string; args: string[] } | { error: string } {
   if (process.platform !== "linux") return { file: process.execPath, args: ["--no-env-file", entrypoint] };
@@ -345,7 +356,6 @@ function sandboxCommand(
   return {
     file: prlimit,
     args: [
-      `--as=${memoryMb * 1024 * 1024}`,
       "--nofile=256:256",
       "--nproc=128:128",
       "--",
