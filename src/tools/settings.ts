@@ -157,7 +157,10 @@ export const settingsSetSchema = z.object({
     .optional(),
   memory_backend: z
     .object({
+      kind: z.enum(["sqlite", "mem0", "mnesis"]).optional(),
       base_url: z.string().optional(),
+      tenant: z.string().optional(),
+      embedding_url: z.string().optional(),
     })
     .optional(),
   onboarding: z
@@ -348,8 +351,15 @@ function orgSettingsToInput(settings: OrgSettings): OrgSettingsInput {
       },
     };
   }
-  if (settings.memoryBackend?.baseUrl !== undefined) {
-    input.memory_backend = { base_url: settings.memoryBackend.baseUrl };
+  if (settings.memoryBackend !== undefined) {
+    const backend: NonNullable<OrgSettingsInput["memory_backend"]> = {};
+    if (settings.memoryBackend.kind !== undefined) backend.kind = settings.memoryBackend.kind;
+    if (settings.memoryBackend.baseUrl !== undefined) backend.base_url = settings.memoryBackend.baseUrl;
+    if (settings.memoryBackend.tenant !== undefined) backend.tenant = settings.memoryBackend.tenant;
+    if (settings.memoryBackend.embeddingUrl !== undefined) {
+      backend.embedding_url = settings.memoryBackend.embeddingUrl;
+    }
+    if (Object.keys(backend).length > 0) input.memory_backend = backend;
   }
   if (settings.onboarding?.spaceId !== undefined) {
     input.onboarding = { space_id: settings.onboarding.spaceId };
@@ -390,7 +400,9 @@ export function settingsToolDefinitions(store: Store, opts: SettingsToolsExtensi
       "(owner/repo allowlist), models.default / fast / reasoning / effort, workspaces_dir, " +
       "git_base_url, api_base_url, allow_loose_pat, turn_stop_control (the Slack live-turn Stop " +
       "control, default off), voice.transcription.base_url / model (Slack voice-note " +
-      "transcription; NEAR defaults), memory_backend.base_url, onboarding.space_id " +
+      "transcription; NEAR defaults), memory_backend.kind (sqlite | mem0 | mnesis), base_url, tenant " +
+      "(mnesis org workspace), embedding_url (mnesis embedding endpoint); the mnesis credential stays out of " +
+      "settings — it is provisioned via the vault boot-secret chain (MNESIS_TOKEN, rotatable). onboarding.space_id " +
       "(the space that receives the boot-time onboarding guide), secrets_backend (the credential " +
       "vault backend: type omp-broker [default] or 1password-connect with connect_url + a mapping " +
       "of \"provider:identityKey\" to {vault, item, field}; the Connect token itself stays in .env " +

@@ -112,6 +112,30 @@ import { join } from "node:path";
  */
 export const OMP_AGENT_DIR = "data/omp-agent";
 
+/**
+ * Boot-time reachability probe (issue #348): performs a short HTTP GET and
+ * fails closed when the endpoint is unreachable or returns a non-2xx. Used
+ * for the mnesis embedding-endpoint prerequisite at boot — same posture as
+ * the model-key guard.
+ */
+async function assertReachable(url: string, label: string, knob: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+  } catch {
+    throw new Error(
+      `bottega boot: ${label} unreachable (${url}) — configure the '${knob}' memory_backend setting ` +
+        "and start the endpoint (see setup.md)",
+    );
+  }
+  if (!res.ok) {
+    throw new Error(
+      `bottega boot: ${label} returned HTTP ${res.status} (${url}) — configure the '${knob}' ` +
+        "memory_backend setting and start the endpoint (see setup.md)",
+    );
+  }
+}
+
 export interface BottegaServer {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -370,10 +394,16 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     setupChecks: () => runWizardChecks(store),
     listConnections: (actor) => listConnectionReadModel({ actor }, { store, registry: extensionRegistry }),
     pendingApprovals: () => [...(approvalRouter.pendingPrompts?.() ?? [])],
-    memoryStatus: async () => ({
-      provider: orgSettings?.memoryBackend?.baseUrl ? "mem0" : "sqlite",
-      available: true,
-    }),
+    memoryStatus: async () => {
+      const mb = orgSettings?.memoryBackend;
+      const provider =
+        mb?.kind === "mnesis"
+          ? "mnesis"
+          : mb?.baseUrl || mb?.kind === "mem0"
+            ? "mem0"
+            : "sqlite";
+      return { provider, available: true };
+    },
   });
   let spaceService: SpaceService;
   const adapter = createSlackAdapter({
@@ -916,6 +946,44 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // model from OUR models.yml.
   const available = await assertAgentDirModelAvailable(agentDir);
   console.log(`bottega boot: model registry ready (${available} available model(s) from ${agentDir})`);
+  // Boot-time guard (issue #348, GO condition 3): when the memory backend is
+  // mnesis, the contract-compliant embedding endpoint is a deployment
+  // prerequisite — fail the boot closed (same posture as missing model keys)
+  // when base_url/tenant/embedding_url are unconfigured or the embedding
+  // endpoint is unreachable. The memory-server itself is only probed lazily
+  // (the provider fails closed per write); the embedding endpoint is the
+  // irreversible write-path dependency we assert up front.
+  const mnesisBackend = orgSettings?.memoryBackend;
+  if (mnesisBackend?.kind === "mnesis") {
+    if (!mnesisBackend.baseUrl) {
+      throw new Error(
+        "bottega boot: memory_backend.kind=mnesis requires memory_backend.base_url (the memory-server /mcp endpoint) — see setup.md",
+      );
+    }
+    if (!mnesisBackend.tenant) {
+      throw new Error(
+        "bottega boot: memory_backend.kind=mnesis requires memory_backend.tenant (the org workspace / x-tenant-id) — see setup.md",
+      );
+    }
+    if (!mnesisBackend.embeddingUrl) {
+      throw new Error(
+        "bottega boot: memory_backend.kind=mnesis requires memory_backend.embedding_url " +
+          "(the embedding endpoint the memory-server writes against) — see setup.md",
+      );
+    }
+    if (!process.env.MNESIS_TOKEN) {
+      throw new Error(
+        "bottega boot: memory_backend.kind=mnesis requires the MNESIS_TOKEN credential " +
+          "(provision the org principal credential via the vault boot-secret chain) — see setup.md",
+      );
+    }
+    await assertReachable(
+      mnesisBackend.embeddingUrl,
+      "mnesis embedding endpoint",
+      "memory_backend.embedding_url",
+    );
+    console.log("bottega boot: mnesis embedding endpoint reachable");
+  }
   // Memory consolidation trigger (issue #272, epic #229 P2): the sqlite
   // backend enqueues a `scheduled` memory_consolidation WORKER job at boot
   // and every 6 hours — the LLM leg (the side session this process used to

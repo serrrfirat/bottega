@@ -66,6 +66,11 @@ export const BOOT_SECRETS: readonly BootSecret[] = [
   { envName: "OPENAI_API_KEY", vaultProvider: "openai", label: "OpenAI model key", seedAtBoot: false },
   { envName: "ANTHROPIC_API_KEY", vaultProvider: "anthropic", label: "Anthropic model key", seedAtBoot: false },
   { envName: "TAVILY_API_KEY", vaultProvider: "tavily", label: "Tavily web search key", seedAtBoot: false },
+  {
+    envName: "MNESIS_TOKEN",
+    vaultProvider: "mnesis",
+    label: "mnesis org principal credential (issue #348)",
+  },
 ];
 
 /** The boot secret with the given vault provider identity, if any. */
