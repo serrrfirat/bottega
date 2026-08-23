@@ -92,9 +92,15 @@ export function proxyBootEnv(cwd: string): CanaryProxyBootEnv {
   };
 }
 
-/** The docker-compose invocation that boots the canary proxy (issue #304) — the same files dev.sh uses. */
+/**
+ * The docker-compose invocation that boots the canary proxy (issue #304) —
+ * the same files dev.sh uses. Each `-f` and its file are separate argv
+ * tokens: the DockerRun seam feeds these straight to spawnSync, which passes
+ * array entries verbatim (no shell splitting), so a single `"-f file.yml"`
+ * token lands at docker as one argument with a literal space in the filename.
+ */
 export function composeCommand(): string[] {
-  return ["docker", "compose", ...COMPOSE_FILES.map((f) => `-f ${f}`), "up", "-d", "iron-proxy"];
+  return ["docker", "compose", ...COMPOSE_FILES.flatMap((f) => ["-f", f]), "up", "-d", "iron-proxy"];
 }
 
 /**

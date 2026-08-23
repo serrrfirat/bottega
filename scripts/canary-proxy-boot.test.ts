@@ -102,8 +102,9 @@ describe("composeCommand boots the canary proxy via base + dev override (issue #
     const cmd = composeCommand(cwd);
     expect(cmd[0]).toBe("docker");
     expect(cmd[1]).toBe("compose");
-    expect(cmd).toContain("-f docker-compose.yml");
-    expect(cmd).toContain("-f docker-compose.dev.yml");
+    expect(cmd).toContain("-f");
+    expect(cmd).toContain("docker-compose.yml");
+    expect(cmd).toContain("docker-compose.dev.yml");
     expect(cmd).toContain("up");
     expect(cmd).toContain("-d");
     expect(cmd[cmd.length - 1]).toBe("iron-proxy");
