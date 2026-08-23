@@ -18,7 +18,7 @@ import { startOAuthCallbackServer } from "../extensions/oauth-callback";
 import { createExtensionRegistry } from "../extensions/registry";
 import type { ExtensionManifest } from "../extensions/manifest";
 import { handleWebhookRequest, type WebhookRouteDeps } from "./webhook-server";
-import { MAX_COMMENT_BODY_CHARS } from "./github/payload";
+import { MAX_COMMENT_BODY_CHARS, MAX_WEBHOOK_RAW_BODY_BYTES } from "./github/payload";
 import { verifyGitHubSignature } from "./github/webhook";
 
 const dir = mkdtempSync(join(tmpdir(), "bottega-ingest-webhook-"));
@@ -65,14 +65,14 @@ function signature(rawBody: string, secret: string = SECRET): string {
 
 function post(
   rawBody: string,
-  opts: { path?: string; secret?: string; event?: string; contentLength?: number } = {},
+  opts: { path?: string; secret?: string; event?: string; delivery?: string } = {},
 ): Promise<Response> {
   const path = opts.path ?? "/webhooks/github";
   const headers = {
     "content-type": "application/json",
     "x-hub-signature-256": signature(rawBody, opts.secret ?? SECRET),
     ...(opts.event !== undefined ? { "x-github-event": opts.event } : undefined),
-    ...(opts.contentLength !== undefined ? { "content-length": String(opts.contentLength) } : undefined),
+    ...(opts.delivery !== undefined ? { "x-github-delivery": opts.delivery } : undefined),
   } satisfies Record<string, string>;
   return handleWebhookRequest(new Request(`http://127.0.0.1${path}`, { method: "POST", headers, body: rawBody }), deps());
 }
@@ -185,6 +185,29 @@ describe("webhook route — dispatch on a valid mention (issue #57)", () => {
     expect(h.posts[0]!.text).toBe(
       "GitHub mention: Ingest framework (serrrfirat/bottega#57) — https://github.com/serrrfirat/bottega/pull/57",
     );
+  });
+
+  test("the same GitHub delivery-id delivered twice dispatches once, the repeat is a 200 no-op (issue #346 #2)", async () => {
+    const h = freshHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+    const body = mentionBody();
+
+    const first = await post(body, { delivery: "delivery-abcdef" });
+    expect(first.status).toBe(200);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(1);
+    expect(h.posts).toHaveLength(1);
+    const workItemsAfterFirst = await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT);
+
+    // A replay of the SAME delivery-id (a captured valid delivery re-sent)
+    // is acknowledged but never re-dispatched — no duplicate work item, no
+    // second post, audited as replayed.
+    const second = await post(body, { delivery: "delivery-abcdef" });
+    expect(second.status).toBe(200);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(1);
+    expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(workItemsAfterFirst.length);
+    expect(h.posts).toHaveLength(1);
+    const rejected = await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT);
+    expect(rejected.some((row) => row.reason === "replayed")).toBe(true);
   });
 
   test("GitHub's ping probe is acknowledged, never dispatched", async () => {
@@ -301,9 +324,24 @@ describe("webhook route — fail closed (issue #57)", () => {
     expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toHaveLength(0);
   });
 
-  test("an oversized body is refused with 413 + rejected", async () => {
+  test("a huge actual body is refused with 413 even when Content-Length is understated (issue #346 #3)", async () => {
     const h = freshHarness();
-    const res = await post(mentionBody(), { contentLength: 999_999_999 });
+    // Declared SMALL, actual HUGE: the route must enforce the byte cap on the
+    // ACTUAL read (a streaming reader), never trust Content-Length alone —
+    // otherwise a declared-small/huge-actual delivery is buffered whole (memory DoS).
+    const hugeBody = JSON.stringify({ blob: "x".repeat(MAX_WEBHOOK_RAW_BODY_BYTES + 1_000_000) });
+    const res = await handleWebhookRequest(
+      new Request("http://127.0.0.1/webhooks/github", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-hub-signature-256": signature(hugeBody),
+          "content-length": String(64),
+        },
+        body: hugeBody,
+      }),
+      h.deps,
+    );
     expect(res.status).toBe(413);
     expect(h.posts).toHaveLength(0);
     expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
@@ -402,19 +440,22 @@ describe("generic manifest-declared webhook verifiers (issue #57)", () => {
     return h;
   }
 
-  /** Raw sha256 HMAC hex — the generic scheme's accepted digest. */
-  function droneSignature(rawBody: string, secret: string = DRONE_SECRET): string {
-    return createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  /** Raw sha256 HMAC hex over `timestamp\nbody` — the generic scheme's signed digest (issue #346 #2). */
+  function droneSignature(rawBody: string, secret: string = DRONE_SECRET, timestamp?: string): string {
+    const ts = timestamp ?? String(Date.now());
+    return createHmac("sha256", secret).update(`${ts}\n`, "utf8").update(rawBody, "utf8").digest("hex");
   }
 
   function dronePost(
     rawBody: string,
-    opts: { path?: string; secret?: string; event?: string } = {},
+    opts: { path?: string; secret?: string; event?: string; timestamp?: string } = {},
   ): Promise<Response> {
     const path = opts.path ?? "/webhooks/drone";
+    const timestamp = opts.timestamp ?? String(Date.now());
     const headers = {
       "content-type": "application/json",
-      "x-bottega-signature": droneSignature(rawBody, opts.secret ?? DRONE_SECRET),
+      "x-bottega-signature": droneSignature(rawBody, opts.secret ?? DRONE_SECRET, timestamp),
+      "x-bottega-timestamp": timestamp,
       ...(opts.event !== undefined ? { "x-bottega-event": opts.event } : undefined),
     } satisfies Record<string, string>;
     return handleWebhookRequest(new Request(`http://127.0.0.1${path}`, { method: "POST", headers, body: rawBody }), deps());
@@ -446,6 +487,54 @@ describe("generic manifest-declared webhook verifiers (issue #57)", () => {
     expect(res.status).toBe(401);
     expect(h.posts).toHaveLength(0);
     expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
+      { provider: "drone", event_type: "unknown", reason: "signature_mismatch" },
+    ]);
+  });
+
+  test("a stale x-bottega-timestamp is refused 401 + rejected, never dispatched (issue #346 #2)", async () => {
+    const h = freshDroneHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+
+    const stale = String(Date.now() - 10 * 60 * 1000); // 10 min old — outside the ±5 min window
+    const res = await dronePost(JSON.stringify({ build: 99 }), { timestamp: stale });
+    expect(res.status).toBe(401);
+    expect(h.posts).toHaveLength(0);
+    expect(await auditPayloads(h.store, WORK_ITEM_CREATED_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(0);
+    expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
+      { provider: "drone", event_type: "webhook", reason: "stale_timestamp" },
+    ]);
+  });
+
+  test("a captured signature does not verify against a swapped timestamp (timestamp is signed, issue #346 #2)", async () => {
+    const h = freshDroneHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+
+    // Sign a body at the original (now-stale) timestamp, then replay it with
+    // a FRESH timestamp header but the ORIGINAL signature — a naive replay.
+    // Because the timestamp is folded into the HMAC input, the swapped
+    // timestamp fails signature verification (it was never signed) → 401.
+    const body = JSON.stringify({ build: 7 });
+    const originallySignedAt = String(Date.now() - 10 * 60 * 1000);
+    const capturedSignature = droneSignature(body, DRONE_SECRET, originallySignedAt);
+    const freshTimestamp = String(Date.now());
+
+    const res = await handleWebhookRequest(
+      new Request("http://127.0.0.1/webhooks/drone", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-bottega-signature": capturedSignature,
+          "x-bottega-timestamp": freshTimestamp,
+        },
+        body,
+      }),
+      h.deps,
+    );
+    expect(res.status).toBe(401);
+    expect(h.posts).toHaveLength(0);
     expect(await auditPayloads(h.store, INGEST_WEBHOOK_DISPATCH_EVENT)).toHaveLength(0);
     expect(await auditPayloads(h.store, INGEST_WEBHOOK_REJECTED_EVENT)).toEqual([
       { provider: "drone", event_type: "unknown", reason: "signature_mismatch" },
