@@ -90,10 +90,13 @@ import {
   buildSnapshotDraft,
   fetchCatalogEntry,
   listCatalogEntries,
+  openApiGenerationFor,
   pinSnapshotDraft,
+  type CatalogEntry,
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "../extensions/fetch-catalog";
+import { fetchOpenApiSpec } from "../extensions/openapi-tools";
 import { PROXY_SECRETS_DIR, proxyBoundaryControlFromEnv } from "../extensions/boundary";
 import { runtimeSnapshotsFromStore } from "../extensions/runtime-registry";
 import type {
@@ -101,8 +104,11 @@ import type {
   CredentialSchema,
   CredentialTarget,
   ExtensionKind,
+  ExtensionManifest,
   ExtensionTool,
+  JsonObject,
   McpBinding,
+  OpenApiBinding,
 } from "../extensions/manifest";
 import { validateManifest } from "../extensions/manifest";
 import { probeMcpEndpoint } from "../extensions/mcp-endpoint-probe";
@@ -260,10 +266,12 @@ interface DraftSummary {
   id: string;
   label: string;
   kind: ExtensionKind;
-  binding: McpBinding | CliBinding | undefined;
+  binding: McpBinding | CliBinding | OpenApiBinding | undefined;
   credential_schema: CredentialSchema | undefined;
   credential_targets: CredentialTarget[] | undefined;
   tools_count: number | null;
+  /** The generated operations + tiers for an openapi entry (the review rendering, issue #345). */
+  operations: Array<{ name: string; tier: string; operation: string; method: string; path: string }> | null;
   domains: string[];
   vendor_official: boolean;
   reviewed: boolean;
@@ -273,10 +281,19 @@ interface DraftSummary {
  * The review-gate summary for a completed draft: everything the human must
  * see before confirming a pin (id, label, kind, binding, credential schema,
  * credential targets, tool count, domains, provenance). One source shared by
- * required refusal and the audit trail.
+ * required refusal and the audit trail. `openApiOperations` feeds the
+ * operations+tiers rendering for an openapi draft (issue #345).
  */
-function draftSummary(draft: SnapshotDraft): DraftSummary {
-  const binding = draft.manifest.kind === "mcp" ? draft.manifest.mcp : draft.manifest.cli;
+function draftSummary(
+  draft: SnapshotDraft,
+  openApiOperations: DraftSummary["operations"] = null,
+): DraftSummary {
+  const binding =
+    draft.manifest.kind === "mcp"
+      ? draft.manifest.mcp
+      : draft.manifest.kind === "cli"
+        ? draft.manifest.cli
+        : draft.manifest.openapi;
   return {
     id: draft.manifest.id,
     label: draft.manifest.label,
@@ -285,6 +302,7 @@ function draftSummary(draft: SnapshotDraft): DraftSummary {
     credential_schema: draft.manifest.credentialSchema,
     credential_targets: draft.manifest.credentialTargets,
     tools_count: draft.manifest.tools?.length ?? null,
+    operations: openApiOperations,
     domains: draft.manifest.domains,
     vendor_official: draft.source.vendorOfficial,
     reviewed: draft.source.reviewed,
@@ -494,7 +512,15 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           const draft = buildSnapshotDraft(entry);
           // The catalog record carries no MCP/CLI binding (issue #146): the
           // agent must research the vendor's official server before completing.
-          const bindingMissing = draft.manifest.mcp === undefined && draft.manifest.cli === undefined;
+          // An OPENAPI entry's binding is self-contained (spec URL + auth
+          // scheme from the catalog's `openapi` block, issue #345), so its
+          // draft is not "binding-missing" — only the frozen surface remains
+          // to be generated at pin time.
+          const bindingMissing =
+            draft.manifest.kind === "openapi"
+              ? draft.manifest.openapi === undefined
+              : draft.manifest.mcp === undefined && draft.manifest.cli === undefined;
+          const isOpenApi = draft.manifest.kind === "openapi";
           mkdirSync(draftsDir, { recursive: true });
           const outPath = resolve(draftsDir, `${draft.extensionId}.draft.json`);
           writeFileSync(outPath, JSON.stringify(draft, null, 2) + "\n");
@@ -513,31 +539,40 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   written_to: outPath,
                   reviewed: false,
                   binding_missing: bindingMissing,
-                  note: bindingMissing
-                    ? "DRAFT — not installed. This catalog entry has NO MCP/CLI binding: research the " +
-                      "vendor's OFFICIAL MCP server via web_search before completing the draft — " +
-                      "serverUrl + transport + credentialSchema from the vendor's published MCP " +
-                      "spec; vendor-official URLs only, do NOT guess or use community URLs. PREFER the " +
-                      "official HOSTED streamable-http server with OAuth (policy #49/#195 — no binaries, " +
-                      "the broker handles the OAuth flow); stdio/API-key only when no hosted variant " +
-                      "exists. Complete the draft IN-CHANNEL: call catalog_browser action=pin spec=<id> " +
-                      "with the binding + credential_schema + credential_targets (+ optional tools) params, then " +
-                      "ASK THE HUMAN to confirm in-channel (confirm=true) — the confirmation is the review that " +
-                      "pins — then connect_extension (\"connect as me\" opens the OAuth flow). Manifest " +
-                      "tools are OPTIONAL (issue #158): omit them to pin a tools-less manifest whose " +
-                      "surface is discovered at runtime from the provider's tools/list with " +
-                      "conservative tiers (the agent then sees the provider's FULL surface), or run " +
-                      "`bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json>` to pin " +
-                      "tools explicitly."
-                    : "DRAFT — not installed. Complete the manifest binding (mcp/cli), credentialSchema, and " +
-                      "credentialTargets from the vendor docs IN-CHANNEL: call catalog_browser action=pin spec=<id> with " +
-                      "the binding + credential_schema + credential_targets (+ optional tools) params, then ASK THE HUMAN to confirm " +
-                      "in-channel (confirm=true) — the confirmation is the review that pins — then " +
-                      "connect_extension (\"connect as me\" opens the OAuth flow for oauth extensions). " +
-                      "PREFER the official HOSTED streamable-http + OAuth server (policy #49/#195); " +
-                      "stdio/API-key only when no hosted variant exists. Manifest tools are OPTIONAL " +
-                      "(issue #158) — omit them for runtime discovery of the provider's tools/list surface " +
-                      "with conservative tiers, or pin tools explicitly via fetch-catalog --generate-tools.",
+                  note: isOpenApi
+                    ? "DRAFT — not installed. This is an API-first vendor (kind openapi): its OpenAPI spec URL + " +
+                      "static auth scheme (bearer/apiKeyHeader) come from the catalog's `openapi` block, so no " +
+                      "binding research is needed. Complete the draft IN-CHANNEL: call catalog_browser action=pin " +
+                      "spec=<id> (the pin fetches the vendor's spec once, generates the tool surface, and the " +
+                      "REVIEW shows the generated operations + tiers), then ASK THE HUMAN to confirm in-channel " +
+                      "(confirm=true) — the confirmation is the review that pins — then connect_extension " +
+                      '("connect as me / as org" provisions the static API key via the one-time upload link; the ' +
+                      "key is injected at egress by iron-proxy, never held by the agent)."
+                    : bindingMissing
+                      ? "DRAFT — not installed. This catalog entry has NO MCP/CLI binding: research the " +
+                        "vendor's OFFICIAL MCP server via web_search before completing the draft — " +
+                        "serverUrl + transport + credentialSchema from the vendor's published MCP " +
+                        "spec; vendor-official URLs only, do NOT guess or use community URLs. PREFER the " +
+                        "official HOSTED streamable-http server with OAuth (policy #49/#195 — no binaries, " +
+                        "the broker handles the OAuth flow); stdio/API-key only when no hosted variant " +
+                        "exists. Complete the draft IN-CHANNEL: call catalog_browser action=pin spec=<id> " +
+                        "with the binding + credential_schema + credential_targets (+ optional tools) params, then " +
+                        "ASK THE HUMAN to confirm in-channel (confirm=true) — the confirmation is the review that " +
+                        "pins — then connect_extension (\"connect as me\" opens the OAuth flow). Manifest " +
+                        "tools are OPTIONAL (issue #158): omit them to pin a tools-less manifest whose " +
+                        "surface is discovered at runtime from the provider's tools/list with " +
+                        "conservative tiers (the agent then sees the provider's FULL surface), or run " +
+                        "`bun run src/extensions/fetch-catalog.ts --generate-tools <draft.json>` to pin " +
+                        "tools explicitly."
+                      : "DRAFT — not installed. Complete the manifest binding (mcp/cli), credentialSchema, and " +
+                        "credentialTargets from the vendor docs IN-CHANNEL: call catalog_browser action=pin spec=<id> with " +
+                        "the binding + credential_schema + credential_targets (+ optional tools) params, then ASK THE HUMAN to confirm " +
+                        "in-channel (confirm=true) — the confirmation is the review that pins — then " +
+                        "connect_extension (\"connect as me\" opens the OAuth flow for oauth extensions). " +
+                        "PREFER the official HOSTED streamable-http + OAuth server (policy #49/#195); " +
+                        "stdio/API-key only when no hosted variant exists. Manifest tools are OPTIONAL " +
+                        "(issue #158) — omit them for runtime discovery of the provider's tools/list surface " +
+                        "with conservative tiers, or pin tools explicitly via fetch-catalog --generate-tools.",
                   draft,
                 }),
               },
@@ -569,6 +604,10 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           // write/bash tools): merge the pin params into the draft's
           // provenance scaffold. The strict manifest validation below is the
           // authority on the merged shape.
+          const isOpenApi = draft.manifest.kind === "openapi";
+          // Openapi operation+tier rendering for the review gate (issue #345);
+          // null for MCP/CLI pins.
+          let openApiOperations: DraftSummary["operations"] = null;
           const manifest = { ...draft.manifest };
           if (draft.manifest.kind === "mcp") {
             if (params.binding !== undefined) {
@@ -578,6 +617,63 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
               // round-trip keeps the validator's JSON-domain contract.
               manifest.mcp = JSON.parse(JSON.stringify(params.binding)) as McpBinding;
             }
+          } else if (isOpenApi) {
+            // An openapi pin (issue #345) does NOT take a human-filled MCP/CLI
+            // binding: the spec URL + static auth scheme come from the
+            // catalog's `openapi` block (already in the draft's manifest). The
+            // frozen tool surface is generated from the vendor's spec at pin
+            // time — fetched ONCE, validated, FROZEN (the runtime never
+            // re-fetches), exactly like a reviewed MCP pin.
+            const openApi = draft.manifest.openapi;
+            if (openApi === undefined) {
+              return toolError(
+                `draft for "${draft.extensionId}" (kind openapi) is missing its "openapi" block (spec URL + auth ` +
+                  "scheme) — re-draft it from the catalog before pinning.",
+              );
+            }
+            const specUrl = openApi.specUrl;
+            if (!specUrl.toLowerCase().startsWith("https://")) {
+              return toolError(`refusing to pin "${draft.extensionId}": the OpenAPI spec URL must be HTTPS (got "${specUrl}")`);
+            }
+            // Re-fetch the catalog entry so the `openapi` block's optional
+            // operations curation is honored (the same lookup the connect
+            // path uses).
+            let entry: CatalogEntry;
+            try {
+              entry = await fetchCatalogEntry(draft.extensionId, catalogOpts);
+            } catch (err) {
+              return toolError(`refusing to pin "${draft.extensionId}": ${errorMessage(err)}`);
+            }
+            let spec: JsonObject;
+            try {
+              spec = await fetchOpenApiSpec(specUrl, catalogOpts.fetchImpl);
+            } catch (err) {
+              return toolError(`refusing to pin "${draft.extensionId}": ${errorMessage(err)}`);
+            }
+            let review;
+            try {
+              review = openApiGenerationFor(entry, spec);
+            } catch (err) {
+              return toolError(`refusing to pin "${draft.extensionId}": ${errorMessage(err)}`);
+            }
+            // SAFETY: openApiGenerationFor refuses to return (throws) for any
+            // non-openapi entry (it checks `entry.kind !== "openapi"` first),
+            // so the manifest it produced is ALWAYS the openapi-kind variant —
+            // the Extract narrowing is exact, never a guess.
+            const frozenOpenApi = review.manifest as Extract<ExtensionManifest, { kind: "openapi" }>;
+            manifest.kind = "openapi";
+            manifest.tools = frozenOpenApi.tools;
+            manifest.domains = frozenOpenApi.domains;
+            manifest.credentialSchema = frozenOpenApi.credentialSchema;
+            manifest.credentialTargets = frozenOpenApi.credentialTargets;
+            manifest.openapi = frozenOpenApi.openapi;
+            openApiOperations = review.operations.map((op) => ({
+              name: op.name,
+              tier: op.tier,
+              operation: op.operationId,
+              method: op.method,
+              path: op.path,
+            }));
           } else if (params.binding !== undefined) {
             // SAFETY: same invariant as the mcp branch — validateManifest is
             // the fail-closed authority on the binding before any side effect.
@@ -602,12 +698,19 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           }
           // The egress allowlist must include the binding host (the proxy
           // allowlists + injects credentials per domain, issue #53) — merge
-          // the MCP host in, keep the scaffold/extra domains, deduped.
+          // the MCP host in, keep the scaffold/extra domains, deduped. An
+          // openapi pin's allowlist comes from the spec's HTTPS servers
+          // (already FROZEN); only explicit `domains` extras append.
           const mergedDraft: SnapshotDraft = { ...draft, manifest };
-          const host = hostedBindingHost(mergedDraft);
-          manifest.domains = [
-            ...new Set<string>([...(params.domains ?? draft.manifest.domains), ...(host !== null ? [host] : [])]),
-          ];
+          const host = isOpenApi ? null : hostedBindingHost(mergedDraft);
+          manifest.domains = isOpenApi
+            ? [...new Set<string>([...manifest.domains, ...(params.domains ?? [])])]
+            : [
+                ...new Set<string>([
+                  ...(params.domains ?? draft.manifest.domains),
+                  ...(host !== null ? [host] : []),
+                ]),
+              ];
           const completed: SnapshotDraft = {
             ...mergedDraft,
             source: {
@@ -618,8 +721,11 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           // Fail closed BEFORE the review gate: an incomplete draft (missing
           // the binding, credentialSchema, or reviewed credentialTargets) or
           // a malformed manifest must never reach the human's confirmation.
-          const needsBinding =
-            completed.manifest.kind === "mcp"
+          // An openapi pin's binding/schema/targets come from the FROZEN
+          // manifest generated above (never the human's in-channel merge).
+          const needsBinding = isOpenApi
+            ? manifest.openapi === undefined
+            : completed.manifest.kind === "mcp"
               ? completed.manifest.mcp === undefined
               : completed.manifest.cli === undefined;
           if (
@@ -642,9 +748,11 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           // Hosted-vs-stdio policy (#49/#195): official hosted
           // streamable-http + OAuth is preferred; stdio/CLI bindings are the
           // no-hosted-variant fallback and pin only when the agent's
-          // web-search verified no official hosted server exists.
+          // web-search verified no official hosted server exists. Openapi
+          // pins (issue #345) are an API-first surface — no hosted-MCP
+          // variant policy applies (the spec's servers are the allowlist).
           const hosted = host !== null;
-          if (!hosted && params.no_hosted_variant !== true) {
+          if (!isOpenApi && !hosted && params.no_hosted_variant !== true) {
             return toolError(
               `refusing to pin "${params.spec.trim()}": the binding is NOT an official hosted streamable-http MCP ` +
                 "server (policy #195/#49 prefers hosted MCP + OAuth — no binaries, the broker handles the OAuth " +
@@ -661,7 +769,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
           // never followed, no credentials sent — a rejected endpoint is a
           // loud refusal with the probe evidence, no snapshot, no egress
           // regen, no hot-register, and an auditable pin_refused row.
-          if (hosted && completed.manifest.mcp !== undefined && completed.manifest.mcp.transport === "streamable-http") {
+          if (!isOpenApi && hosted && completed.manifest.mcp !== undefined && completed.manifest.mcp.transport === "streamable-http") {
             const mcpBinding = completed.manifest.mcp;
             const verdict = await probeMcpEndpoint(mcpBinding.serverUrl, { fetchImpl: catalogOpts.fetchImpl });
             if (!verdict.ok) {
@@ -696,7 +804,7 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                 spec: params.spec.trim(),
                 confirm_required: true,
                 hosted_variant: hosted,
-                summary: draftSummary(completed),
+                summary: draftSummary(completed, openApiOperations),
                 note:
                   `REVIEW REQUIRED — nothing was pinned. The human must confirm this draft in-channel before it ` +
                   `pins. To confirm, call catalog_browser again with action=pin spec=${params.spec.trim()} ` +
@@ -914,6 +1022,27 @@ export function adminToolDefinitions(store: Store, opts: AdminToolsOpts = {}): T
                   domain: entry.domain,
                   ...(entry.url !== undefined ? { url: entry.url } : undefined),
                   ...(entry.description !== undefined ? { description: entry.description } : undefined),
+                  // Surfacing the openapi block (spec URL + static auth scheme)
+                  // so an API-first vendor's pin facts are visible inline (issue #345).
+                  ...(entry.openapi !== undefined
+                    ? {
+                        openapi: {
+                          url: entry.openapi.url,
+                          ...(entry.openapi.operations !== undefined
+                            ? { operations: entry.openapi.operations }
+                            : undefined),
+                          auth: {
+                            scheme: entry.openapi.auth.scheme,
+                            ...(entry.openapi.auth.headerName !== undefined
+                              ? { headerName: entry.openapi.auth.headerName }
+                              : undefined),
+                            ...(entry.openapi.auth.credentialLabel !== undefined
+                              ? { credentialLabel: entry.openapi.auth.credentialLabel }
+                              : undefined),
+                          },
+                        },
+                      }
+                    : undefined),
                 })),
                 catalog_truncated: truncated,
                 // Compact skipped diagnostics: total count + up to 3 examples,
