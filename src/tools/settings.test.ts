@@ -625,6 +625,38 @@ describe("settings schemas (issue #67)", () => {
     expect(badProactive.success).toBe(false);
   });
 
+  test("memory_backend.kind=mnesis parses with tenant + embedding_url and rejects an unknown kind (issue #348)", () => {
+    const ok = settingsSetSchema.safeParse({
+      memory_backend: {
+        kind: "mnesis",
+        base_url: "http://memory:17802/mcp",
+        tenant: "acme-eng",
+        embedding_url: "http://embed:8420",
+      },
+    });
+    expect(ok.success).toBe(true);
+    // SAFETY: narrowed below — safeParse returns a discriminated union; only
+    // the success branch carries `data`.
+    if (ok.success) {
+      expect(ok.data?.memory_backend).toEqual({
+        kind: "mnesis",
+        base_url: "http://memory:17802/mcp",
+        tenant: "acme-eng",
+        embedding_url: "http://embed:8420",
+      });
+    } else {
+      throw new Error("expected memory_backend.kind=mnesis to parse");
+    }
+    // sqlite/mem0 remain valid; an unknown kind fails the section.
+    expect(settingsSetSchema.safeParse({ memory_backend: { kind: "sqlite" } }).success).toBe(true);
+    expect(settingsSetSchema.safeParse({ memory_backend: { kind: "mem0" } }).success).toBe(true);
+    expect(settingsSetSchema.safeParse({ memory_backend: { kind: "postgres" } }).success).toBe(false);
+    // tenant/embedding_url must be strings (the org-settings parser additionally
+    // requires them non-empty when kind=mnesis — enforced at boot + wizard + provider).
+    expect(settingsSetSchema.safeParse({ memory_backend: { kind: "mnesis", tenant: 42 } }).success).toBe(false);
+    expect(settingsSetSchema.safeParse({ memory_backend: { kind: "mnesis", embedding_url: 42 } }).success).toBe(false);
+  });
+
   test("voice transcription defaults to the NEAR values and rejects malformed knobs (issue #96)", () => {
     // An empty voice section collapses to the NEAR defaults (zod .default()).
     const empty = settingsSetSchema.parse({ voice: { transcription: {} } });
