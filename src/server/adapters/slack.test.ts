@@ -10,6 +10,7 @@ import {
   SCHEDULER_PAUSE_ACTION_ID,
   SCHEDULER_RESUME_ACTION_ID,
   SCHEDULER_RUN_NOW_ACTION_ID,
+  SLACK_DOWNLOAD_MAX_BYTES,
   STOP_ACTION_ID,
   buildAppendTaskArgs,
   buildAppendTextArgs,
@@ -958,6 +959,20 @@ describe("Slack file API roundtrips", () => {
         if (url.pathname === "/api/files.info") {
           const form = new URLSearchParams(await request.text());
           state.infoFile = form.get("file") ?? undefined;
+          if (state.infoFile === "F-HUGE") {
+            return Response.json({
+              ok: true,
+              file: {
+                id: "F-HUGE",
+                name: "huge.bin",
+                mimetype: "application/octet-stream",
+                // Metadata UNDERSTATES the real size: the cap must be
+                // enforced on the actual read, never trusted from files.info.
+                size: SLACK_DOWNLOAD_MAX_BYTES + 1,
+                url_private_download: `${baseUrl}/download/F-HUGE`,
+              },
+            });
+          }
           return Response.json({
             ok: true,
             file: {
@@ -972,6 +987,17 @@ describe("Slack file API roundtrips", () => {
         if (url.pathname === "/download/F123") {
           state.downloadAuth = request.headers.get("authorization");
           return new Response(DOWNLOAD_BYTES);
+        }
+        if (url.pathname === "/download/F-HUGE") {
+          // Stream one byte over the cap on the real body (a streaming body,
+          // so the adapter's reader must cancel without buffering it whole).
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(SLACK_DOWNLOAD_MAX_BYTES + 1).fill(0x61));
+              controller.close();
+            },
+          });
+          return new Response(body);
         }
         if (url.pathname === "/api/files.getUploadURLExternal") {
           const form = new URLSearchParams(await request.text());
@@ -1024,6 +1050,20 @@ describe("Slack file API roundtrips", () => {
       });
       expect(api.state.infoFile).toBe("F123");
       expect(api.state.downloadAuth).toBe(`Bearer ${BOT_TOKEN}`);
+    } finally {
+      api.server.stop(true);
+    }
+  });
+
+  test("downloadFile refuses a file whose ACTUAL body exceeds the byte cap (issue #346 LOW-15)", async () => {
+    const api = bootFilesApi();
+    try {
+      // files.info under-reports nothing here (it reports size = cap+1), but
+      // the point is the CAP is enforced on the actual streamed read, not by
+      // trusting metadata or Content-Length — the adapter cancels the reader
+      // and throws instead of buffering the whole oversized file.
+      await expect(api.adapter.downloadFile("F-HUGE")).rejects.toThrow(/exceeds the \d+-byte cap/);
+      expect(api.state.infoFile).toBe("F-HUGE");
     } finally {
       api.server.stop(true);
     }

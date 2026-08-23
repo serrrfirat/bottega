@@ -35,7 +35,7 @@
  */
 import { readFileSync } from "node:fs";
 import { z, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import { errorMessage, toolError } from "../tools/helpers";
+import { toolError } from "../tools/helpers";
 import type { Store, UploadToken } from "../store/db";
 import type { ExtensionManifest } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
@@ -674,13 +674,37 @@ export function startUploadLinkServer(deps: UploadLinkEndpointDeps, opts: Upload
   };
 }
 
+/**
+ * The upload-limit rate-limit KEY (issue #346 #5). The attempt cap must NOT
+ * be keyed on a client-controlled hop: an attacker can fake
+ * `X-Forwarded-For: <anything>` and rotate the first hop to bypass every
+ * per-IP bucket. ASSUMPTION (documented in code): the deployment's ONE
+ * public ingress is a trust-terminating reverse proxy/tunnel (Cloudflare,
+ * nginx) that APPENDS the real client peer as the FINAL `X-Forwarded-For`
+ * entry; every earlier hop is client-supplied and untrusted. So we key on
+ * the LAST non-empty entry — the hop the trusted terminating proxy actually
+ * saw. Behind no proxy (local dev) the header is absent and we fall back to
+ * a single shared key ("local"), which caps a loopback client at the same
+ * bound. The connection peer socket is not separately exposed to this
+ * handler, so the proxy-appended hop is the trust boundary we key on.
+ */
+function uploadClientKey(req: Request): string {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded === null) return "local";
+  const hops = forwarded.split(",").map((hop) => hop.trim()).filter((hop) => hop !== "");
+  // The last hop is the terminating proxy's appended peer; earlier ones are
+  // attacker-suppliable. Nothing present → the shared loopback key.
+  const last = hops[hops.length - 1];
+  return last && last.length > 0 ? last : "local";
+}
+
 async function handleUpload(
   req: Request,
   token: string,
   store: UploadLinkStore,
   deps: UploadLinkEndpointDeps,
 ): Promise<Response> {
-  if (!store.trackAttempt(req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "local")) {
+  if (!store.trackAttempt(uploadClientKey(req))) {
     return new Response("too many attempts — try again in a few minutes", { status: 429 });
   }
   const consumed = store.consume(token);
@@ -778,7 +802,10 @@ async function handleUpload(
           );
     if (!outcome.ok) return new Response(outcome.message, { status: 400 });
   } catch (err) {
-    return new Response(`saving the secret failed: ${errorMessage(err)}`, { status: 500 });
+    // Generic message to the unauthenticated caller (issue #346 #5): the
+    // concrete broker/vault/connection detail is logged server-side only.
+    console.error(`[upload-link] saving secret for ${consumed.row.extension} failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    return new Response("saving the secret failed — contact the operator", { status: 500 });
   }
   return new Response("Saved to the vault — you can close this window.", { status: 200 });
 }

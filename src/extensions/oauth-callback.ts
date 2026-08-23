@@ -25,7 +25,6 @@
  * The browser sees a success/error page; the token itself never touches
  * the endpoint's response or any log.
  */
-import { errorMessage } from "../tools/helpers";
 import type { AuditModule } from "../policy/audit";
 import type { OAuthFlow, Store } from "../store/db";
 import { completeMcpOAuthFlow, createVaultTokenStore, type McpOAuthTokenStore } from "./mcp-oauth";
@@ -177,7 +176,10 @@ async function handleCallback(
       onConnected: deps.onConnected,
     });
   } catch (err) {
-    return page(500, "Connect failed", `Connecting ${row.label} failed: ${errorMessage(err)} — ask the agent to try again.`);
+    // Generic message to the unauthenticated caller (issue #346 #5) — the
+    // concrete exchange/egress detail is logged server-side only.
+    console.error(`[oauth-callback] connecting ${row.label} failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    return page(500, "Connect failed", `Connecting ${row.label} failed — ask the agent to try again.`);
   }
   return page(200, "Connected", `${row.label} is connected — you can close this window.`);
 }
