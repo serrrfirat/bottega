@@ -1668,4 +1668,95 @@ describe("auto-pickup explicit-confirm gate (issue #245)", () => {
     expect(result.status).toBe("fail");
     expect(result.details.join(" ")).toContain("item created without confirmation draft");
   });
+
+  test(
+    "the pickup fixture match is case-insensitive (the model capitalizes the sentence start)",
+    // @ts-expect-error bun's runtime honors test(name, {timeout}, fn) even
+    // though bun 1.3.14's bundled .d.ts omits the options overload — the
+    // journey's internal explicit-confirm gate window (PICKUP_GATE_WINDOW_MS)
+    // is a fixed 5s no-op poll, so this full-success-path test needs >5s to
+    // clear the default 5000ms timeout.
+    { timeout: 30_000 },
+    async () => {
+    const spaceId = "slack:C1";
+    // The item was created correctly; the model rewrote the description with
+    // a capital-C at the sentence start — the fixture ("canary pickup fixture
+    // hermetic-case", lower-case) is STILL present, so the journey must pass
+    // (pre-fix this failed on a case-sensitive `.includes(fixture)`).
+    const createdItem: WorkItem = {
+      id: "wi-2",
+      space_id: spaceId,
+      requester: "space",
+      assignee: null,
+      description: `Canary pickup fixture hermetic-case — add a docstring to the project README explaining the canary`,
+      repo: null,
+      pr_url: null,
+      pr_branch: null,
+      base_branch: null,
+      delivery: "chat",
+      model: null,
+      reasoning_effort: null,
+      skills: "[]",
+      state: "open",
+      approvals: "[]",
+      evidence: "[]",
+      result: null,
+      created_at: 101,
+      updated_at: 101,
+    };
+    const createdRow: AuditRow = {
+      id: 2,
+      ts: 201,
+      space_id: spaceId,
+      actor: "space",
+      event_type: WORK_ITEM_CREATED_EVENT,
+      payload: JSON.stringify({ id: "wi-2", requester: "space", assignee: null }),
+    };
+    let listAudits = 0;
+    let posts = 0;
+    let confirmed = false;
+    // SAFETY: journeySemanticPickup reads only the live Slack post/history/
+    // permalink methods and store list/get methods supplied by this double.
+    const h = {
+      liveSlack: {
+        botUserId: "B-bot",
+        qaUserId: "U-qa",
+        postAsUser: async (_channelId: string, _text: string): Promise<PostedSlackMessage> => {
+          posts += 1;
+          // The human's in-channel confirmation is the SECOND post
+          // ("confirmed — create the work item now"); only after it may the
+          // store observe the created row.
+          if (posts === 2) confirmed = true;
+          return { ts: `${200 + posts}.00000${posts}` };
+        },
+        // The draft ask lands, then the human's confirmation reply lands —
+        // both bot replies drive waitForBotReply to completion.
+        history: async (_channelId: string): Promise<SlackApiMessage[]> => [
+          { ts: "201.000001", channel: "C1", user: "U-qa", text: "implement a canary pickup fixture" },
+          { ts: "202.000002", channel: "C1", bot_id: "B-bot", text: "here is the draft — confirm to create the item" },
+          { ts: "203.000003", channel: "C1", user: "U-qa", text: "confirmed — create the work item now" },
+          { ts: "204.000004", channel: "C1", bot_id: "B-bot", text: "created wi-2" },
+        ],
+        permalink: async (_channelId: string, _ts: string): Promise<string | undefined> =>
+          `https://example/p/${_ts}`,
+      },
+      store: {
+        // No created row is ever visible until the human confirms in-channel
+        // (the #245 explicit-confirm gate): the premature-gate polls during
+        // the draft window all see zero rows, and the confirm count-poll
+        // only observes the row after `confirmed` flips.
+        listAudit: async (
+          _opts?: { space?: string; event_type?: string },
+        ): Promise<AuditRow[]> => {
+          listAudits += 1;
+          return confirmed ? [createdRow] : [];
+        },
+        getWorkItem: async (_id: string): Promise<WorkItem | null> => createdItem,
+      },
+    } as Harness;
+    const result = await journeySemanticPickup(h, "C1", "hermetic-case");
+    // The capitalized (sentence-start) fixture must still match — the fix.
+    expect(result.status).toBe("pass");
+    expect(result.details.join(" ")).toContain("wi-2");
+  });
 });

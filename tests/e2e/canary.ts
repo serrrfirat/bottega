@@ -1096,8 +1096,17 @@ async function journeyStandup(h: Harness, channelId: string): Promise<JourneyRes
     // Opt the space in deterministically (the settings tool would need a
     // model turn + approval; the scheduler reads spaces.policy_json, and
     // the opt-in shape is the #150 contract being exercised).
-    const space = await h.store.getSpace(spaceId);
-    if (!space) throw new Error(`space not found: ${spaceId}`);
+    // Self-heal the space row on first contact (issue #188): the channel
+    // leg runs against a freshly ensured channel (#79) that may never have
+    // hosted a turn, so its spaces row is not yet persisted — presence is
+    // production-contractual (space rows upsert on first contact), absence
+    // is not a failure of this journey.
+    let space = await h.store.getSpace(spaceId);
+    if (!space) {
+      await h.store.getOrCreateSpace({ platform: "slack", channel_id: channelId });
+      space = await h.store.getSpace(spaceId);
+    }
+    if (!space) throw new Error(`space row missing for ${spaceId} after getOrCreateSpace`);
     // spaces.policy_json is a JSON document (outside-controlled); parse it at
     // this boundary and branch on the domain value (a non-mapping proactive
     // field means the space never opted in).
@@ -1517,7 +1526,7 @@ export async function journeySemanticPickup(h: Harness, channelId: string, runId
     const row = rows[rows.length - 1]!;
     const item = await h.store.getWorkItem(workItemIdFromRow(row));
     if (!item) throw new Error("auto-picked-up item row created but not readable");
-    if (!item.description.includes(fixture)) {
+    if (!item.description.toLowerCase().includes(fixture.toLowerCase())) {
       throw new Error(`picked-up item description does not carry the fixture: "${snippet(item.description)}"`);
     }
     const reply = await waitForBotReply(h, channelId, { afterTs: confirmTs, label: "pickup confirmation reply" });
@@ -1867,6 +1876,12 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
         vendor: "bottega-fixtures",
         kind: "mcp",
         domains: ["fixture-pin.example.com"],
+        // Issue #328 restored the requirement that a pin carry explicit
+        // credentialTargets (the reviewed credential authority, separate
+        // from the broader egress allowlist). Without them the pin hits the
+        // "incomplete" fail-closed gate and never reaches the review gate
+        // the journey exercises. The host must be covered by `domains`.
+        credentialTargets: [{ host: "fixture-pin.example.com", pathPrefix: "/mcp" }],
         mcp: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
         credentialSchema: { type: "oauth", scopes: ["read"] },
         tools: [],
@@ -1893,6 +1908,9 @@ async function journeyExtensionPin(h: Harness, channelId: string): Promise<Journ
       spec,
       binding: { serverUrl: FIXTURE_PIN_MCP_URL, transport: "streamable-http" },
       credential_schema: { type: "oauth", scopes: ["read"] },
+      // Mirror the reviewed credentialTargets from the draft manifest: the
+      // tool merges these in-channel (issue #328) before the review gate.
+      credential_targets: [{ host: "fixture-pin.example.com", pathPrefix: "/mcp" }],
       vendor_official: true,
     } as const;
     // The review gate: no human confirmation → refuse, nothing pins.
@@ -1978,7 +1996,14 @@ async function journeyMcpOAuth(h: Harness, channelId: string): Promise<JourneyRe
     });
     const permalink = await live.permalink(channelId, reply.ts);
     const url = oauthAuthorizeUrlFrom(reply.text);
-    if (!reply.text.includes("Open this link to authorize") || url === undefined) {
+    // The deterministic contract is that the minted one-time authorization
+    // URL is SHOWN in Slack with its single-use state — the model relays it
+    // (the per-session tool path, issue #52) but its surrounding wording is
+    // free-form, so only the URL's presence + a parseable state are
+    // asserted (the "Open this link to authorize" phrase is the tool's
+    // suggested template, not a relayed contract). A URL with no state, or
+    // no URL at all, is the mint failure this journey catches.
+    if (url === undefined) {
       throw new Error(`connect did not mint + show the authorization URL: "${snippet(reply.text)}"`);
     }
     const state = oauthAuthorizeStateFrom(reply.text);
