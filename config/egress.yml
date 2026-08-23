@@ -112,7 +112,9 @@ transforms:
   #    token. The credential boundary installs its token-to-secret mapping
   #    only for the call lifetime and only for reviewed credential targets,
   #    then revokes it in finally. Egress domains remain reachability policy
-  #    and never grant credential authority.
+  #    and never grant credential authority. OPENAPI extensions (issue
+  #    #345) inject a STATIC per-extension credential (bearer/apiKeyHeader)
+  #    for their allowlisted host — the agent never holds the key.
   - name: secrets
     config:
       secrets:
