@@ -851,3 +851,194 @@ describe("OAuth discovery carries no token endpoint on the record (issue #284 �
     expect("tokenEndpoint" in persisted.manifest.mcp).toBe(false);
   });
 });
+
+describe("openapi-kind catalog connect (issue #345) — fetch spec once, freeze the surface, review lists operations+tiers", () => {
+  const OPENAPI_SPEC = {
+    openapi: "3.0.3",
+    info: { title: "SendGrid API", version: "1.0.0" },
+    servers: [{ url: "https://api.sendgrid.test/v1" }],
+    paths: {
+      "/mail/send": {
+        post: {
+          operationId: "send_mail",
+          responses: { "200": { description: "ok" } },
+        },
+      },
+      "/stats": {
+        get: {
+          operationId: "get_stats",
+          responses: { "200": { description: "ok" } },
+        },
+      },
+      "/stats/campaigns": {
+        delete: {
+          operationId: "delete_campaign",
+          responses: { "204": { description: "ok" } },
+        },
+      },
+    },
+  };
+  const OPENAPI_SPEC_JSON = JSON.stringify(OPENAPI_SPEC);
+  const OPENAPI_RECORD = {
+    id: "openapi/sendgrid",
+    slug: "sendgrid",
+    kind: "openapi",
+    name: "SendGrid",
+    description: "An API-first email vendor with no MCP server",
+    domain: "sendgrid.com",
+    openapi: {
+      url: "https://raw.sendgrid.test/openapi.json",
+      auth: { scheme: "bearer", credentialLabel: "SendGrid API key" },
+    },
+  };
+
+  function openApiHarness(
+    opts: { specStatus?: number; specBody?: string; wellKnownStatus?: number } = {},
+  ): Harness {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-catalog-openapi-"));
+    const snapshotsDir = join(dir, "extensions");
+    const egressPath = join(dir, "egress.yml");
+    const devEgressPath = join(dir, "egress.dev.yml");
+    const auditRows: Harness["auditRows"] = [];
+    const audit = {
+      appendAudit: async (entry: { actor: string; event_type: string; payload: unknown }) => {
+        auditRows.push(entry);
+        return auditRows.length;
+      },
+      listAudit: async () => [],
+    };
+    const registry = createExtensionRegistry(snapshotsDir);
+    const runtimeRegistry = new MemoryRuntimeRegistry();
+    const fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
+      if (url === CATALOG_URL) return new Response(catalogDoc([OPENAPI_RECORD]), { status: 200 });
+      if (url === "https://raw.sendgrid.test/openapi.json") {
+        return new Response(opts.specBody ?? OPENAPI_SPEC_JSON, {
+          status: opts.specStatus ?? 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("", { status: opts.wellKnownStatus ?? 404 });
+    });
+    const deps: Harness["deps"] = {
+      registry,
+      audit,
+      runtimeRegistry,
+      catalog: { fetchImpl },
+      snapshotsDir,
+      egressPath,
+      devEgressPath,
+    };
+    return { deps, runtimeRegistry, egressPath, devEgressPath, registry, auditRows, dir };
+  }
+
+  test("lookup drafts an openapi manifest: spec fetched once, surface FROZEN, facts carry operations+tiers", async () => {
+    const h = openApiHarness();
+    tracked.push(h);
+    let specFetches = 0;
+    const origFetch = h.deps.catalog!.fetchImpl!;
+    // Count spec fetches to prove "fetched ONCE" (the runtime never re-fetches).
+    h.deps.catalog!.fetchImpl = withFetchContract(async (input) => {
+      if (requestUrl(input) === "https://raw.sendgrid.test/openapi.json") specFetches++;
+      return origFetch(input);
+    });
+    const result = await lookupCatalogExtension("sendgrid", h.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // KIND preserved (not collapsed to mcp), egress from the spec servers.
+    expect(result.facts.kind).toBe("openapi");
+    expect(result.snapshot.manifest.kind).toBe("openapi");
+    if (result.snapshot.manifest.kind !== "openapi") throw new Error("expected openapi manifest");
+    expect(result.snapshot.manifest.domains).toEqual(["api.sendgrid.test"]);
+    expect(result.snapshot.manifest.credentialSchema).toEqual({ type: "api_key" });
+    expect(result.snapshot.manifest.openapi).toEqual({
+      specUrl: "https://raw.sendgrid.test/openapi.json",
+      auth: { scheme: "bearer", credentialLabel: "SendGrid API key" },
+    });
+    // The FROZEN surface: generated tools with HTTP operation metadata.
+    expect(result.snapshot.manifest.tools).toHaveLength(3);
+    const toolNames = result.snapshot.manifest.tools.map((t) => t.name);
+    expect(toolNames).toContain("sendgrid_send_mail");
+    expect(toolNames).toContain("sendgrid_get_stats");
+    expect(toolNames).toContain("sendgrid_delete_campaign");
+    // Review facts list the operations + tiers.
+    const ops = result.facts.operations ?? [];
+    expect(ops.map((op) => op.operationId).sort()).toEqual(["delete_campaign", "get_stats", "send_mail"]);
+    expect(ops.find((op) => op.operationId === "send_mail")?.tier).toBe("write");
+    expect(ops.find((op) => op.operationId === "get_stats")?.tier).toBe("read");
+    // READ-ONLY: no store row, no egress, no hot-register, no audit, no spec re-fetch.
+    expect(specFetches).toBe(1);
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(existsSync(h.egressPath)).toBe(false);
+    expect(h.auditRows).toHaveLength(0);
+  });
+
+  test("a non-HTTPS spec URL fails the openapi lookup closed — nothing registers", async () => {
+    const h = openApiHarness();
+    tracked.push(h);
+    h.deps.catalog!.fetchImpl = withFetchContract(async (input) => {
+      const url = requestUrl(input);
+      if (url === CATALOG_URL) {
+        const rec = {
+          ...OPENAPI_RECORD,
+          openapi: { url: "http://raw.sendgrid.test/openapi.json", auth: { scheme: "bearer" } },
+        };
+        return new Response(catalogDoc([rec]), { status: 200 });
+      }
+      return new Response("", { status: 404 });
+    });
+    const result = await lookupCatalogExtension("sendgrid", h.deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain("HTTPS");
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(existsSync(h.egressPath)).toBe(false);
+  });
+
+  test("an over-cap spec doc fails the openapi lookup closed (≤2MB)", async () => {
+    const h = openApiHarness({ specBody: JSON.stringify(OPENAPI_SPEC).padEnd(2 * 1024 * 1024 + 1, " ") });
+    tracked.push(h);
+    const result = await lookupCatalogExtension("sendgrid", h.deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain("cap");
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+  });
+
+  test("an unreachable spec server fails the openapi lookup closed", async () => {
+    const h = openApiHarness({ specStatus: 503 });
+    tracked.push(h);
+    const result = await lookupCatalogExtension("sendgrid", h.deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain("cannot register"); // failing-closed message naming the category
+  });
+
+  test("registerExtensionAtRuntime for an openapi entry persists + merges the spec host into egress + hot-registers", async () => {
+    const h = openApiHarness();
+    tracked.push(h);
+    const lookupResult = await lookupCatalogExtension("sendgrid", h.deps);
+    if (!lookupResult.ok) throw new Error(lookupResult.message);
+    const result = await registerExtensionAtRuntime(lookupResult.snapshot, lookupResult.facts.label, {
+      ...h.deps,
+      actor: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.credentialType).toBe("api_key");
+      expect(result.liveRegistry).toBe("registered");
+      expect(result.warnings).toEqual([]);
+    }
+    // The store holds the frozen openapi snapshot (machine state, no file).
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    const persisted = parsePinnedSnapshot(JSON.stringify(h.runtimeRegistry.rows[0]!));
+    expect(persisted.manifest.kind).toBe("openapi");
+    if (persisted.manifest.kind !== "openapi") throw new Error("expected openapi");
+    expect(persisted.source.reviewed).toBe(true);
+    // Egress allowlists the spec host.
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"api.sendgrid.test"');
+    // The API-first surface is live in the registry.
+    expect(h.registry.resolve("sendgrid")).toBeDefined();
+  });
+});

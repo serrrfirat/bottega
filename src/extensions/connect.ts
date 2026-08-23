@@ -283,7 +283,23 @@ export async function connectExtension(
             vendor: lookup.facts.label,
             domains: lookup.facts.domains,
             credentialTargets: lookup.facts.credentialTargets,
-            mcpEndpoint: lookup.facts.mcpEndpoint,
+            // The MCP endpoint (hosted-MCP entries) or the generated
+            // operations + tiers (openapi entries, issue #345) — the review
+            // renders exactly what the registration will freeze.
+            ...(lookup.facts.mcpEndpoint !== undefined
+              ? { mcpEndpoint: lookup.facts.mcpEndpoint }
+              : undefined),
+            ...(lookup.facts.operations !== undefined
+              ? {
+                  operations: lookup.facts.operations.map((op) => ({
+                    name: op.name,
+                    tier: op.tier,
+                    operation: op.operationId,
+                    method: op.method,
+                    path: op.path,
+                  })),
+                }
+              : undefined),
           },
           spaceId: input.spaceId,
           actor: input.actor,

@@ -43,7 +43,7 @@ import { z } from "zod";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { generateManifestTools, refreshManifestTools } from "./generate-tools";
-import { generateOpenApiTools } from "./openapi-tools";
+import { generateOpenApiTools, type OpenApiOperation, type OpenApiToolGeneration } from "./openapi-tools";
 import {
   parsePinnedSnapshot,
   SNAPSHOT_SCHEMA,
@@ -63,6 +63,7 @@ import {
   type JsonObject,
   type JsonValue,
   type McpBinding,
+  type OpenApiBinding,
 } from "./manifest";
 
 /** The integrations.sh catalog (REST; a JSON document at /api.json). */
@@ -149,6 +150,15 @@ export interface SnapshotDraft {
     domains: string[];
     mcp?: McpBinding;
     cli?: CliBinding;
+    /**
+     * OpenAPI binding for an openapi-kind entry (issue #345). Unlike MCP/CLI
+     * bindings the human never fills this from vendor docs: the spec URL +
+     * static auth scheme come from the catalog's `openapi` block, carried
+     * verbatim into the draft so an openapi draft does not collapse to another
+     * kind and stays self-contained (the frozen tool surface is generated at
+     * pin time from the spec).
+     */
+    openapi?: OpenApiBinding;
     credentialSchema?: CredentialSchema;
     credentialTargets?: CredentialTarget[];
     tools?: ExtensionTool[];
@@ -385,7 +395,7 @@ export async function listCatalogEntries(
  * registry-valid (no binding yet) by design.
  */
 export function buildSnapshotDraft(entry: CatalogEntry, pinnedAt: string = new Date().toISOString()): SnapshotDraft {
-  const kind: ExtensionKind = entry.kind === "mcp" ? "mcp" : entry.kind === "cli" ? "cli" : "mcp";
+  const kind: ExtensionKind = entry.kind === "mcp" ? "mcp" : entry.kind === "cli" ? "cli" : entry.kind === "openapi" ? "openapi" : "mcp";
   return {
     schema: SNAPSHOT_SCHEMA,
     extensionId: entry.slug,
@@ -402,6 +412,26 @@ export function buildSnapshotDraft(entry: CatalogEntry, pinnedAt: string = new D
       vendor: entry.name,
       kind,
       domains: [entry.domain],
+      // An openapi entry's binding is self-contained: the catalog's `openapi`
+      // block carries the spec URL + static auth scheme, so the draft for an
+      // openapi kind does not collapse to another kind and is pin-ready once
+      // the spec surface is generated (issue #345).
+      ...(kind === "openapi" && entry.openapi !== undefined
+        ? {
+            openapi: {
+              specUrl: entry.openapi.url,
+              auth: {
+                scheme: entry.openapi.auth.scheme,
+                ...(entry.openapi.auth.headerName !== undefined
+                  ? { headerName: entry.openapi.auth.headerName }
+                  : undefined),
+                ...(entry.openapi.auth.credentialLabel !== undefined
+                  ? { credentialLabel: entry.openapi.auth.credentialLabel }
+                  : undefined),
+              },
+            },
+          }
+        : undefined),
     },
   };
 }
@@ -420,6 +450,37 @@ export function buildOpenApiPinnedManifest(
   entry: CatalogEntry,
   spec: JsonObject,
 ): PinnedSnapshot["manifest"] {
+  return openApiGenerationFor(entry, spec).manifest;
+}
+
+/**
+ * The review-ready outcome of pinning an openapi-kind catalog entry (issue
+ * #345): the FROZEN manifest plus the operations+tiers rendering the review
+ * step surfaces (the connect approval, the catalog_browser pin gate). One
+ * source shared by {@link buildOpenApiPinnedManifest} and every review
+ * surface, so the human sees exactly the operations that pin froze.
+ */
+export interface OpenApiPinReview {
+  manifest: PinnedSnapshot["manifest"];
+  /** The generated operations + tiers (the review rendering). */
+  operations: OpenApiOperation[];
+  /** Validated HTTPS-only origin hosts (the egress allowlist). */
+  hosts: string[];
+  /** The generator's raw output (tools + hosts + operations). */
+  generation: OpenApiToolGeneration;
+}
+
+/**
+ * Validates an openapi-kind catalog entry and generates its frozen tool
+ * surface + operations for review (issue #345). Fail closed on every cap: a
+ * non-openapi entry, a missing openapi block, an unknown auth scheme, a
+ * non-HTTPS spec URL, a generation cap/collision, or a curated id matching
+ * no operation — nothing partial ever pins.
+ */
+export function openApiGenerationFor(
+  entry: CatalogEntry,
+  spec: JsonObject,
+): OpenApiPinReview {
   if (entry.kind !== "openapi") {
     throw new CatalogError(`entry "${entry.slug}" must be kind "openapi" to pin a spec surface`);
   }
@@ -484,13 +545,21 @@ export function buildOpenApiPinnedManifest(
   // document (JsonValue); validateManifest re-validates it and also
   // guarantees deterministic byte-for-byte snapshot bytes (the pin's
   // reviewed surface).
-  return validateManifest(JSON.parse(JSON.stringify(manifestInput)) as JsonValue);
+  const manifest = validateManifest(JSON.parse(JSON.stringify(manifestInput)) as JsonValue);
+  return { manifest, operations: generation.operations, hosts: generation.hosts, generation };
 }
 
 function completeManifest(draft: SnapshotDraft): PinnedSnapshot["manifest"] {
   // Binding, credential schema, and credential authority are reviewed facts.
+  // An openapi binding is the `openapi` block (spec URL + static auth scheme),
+  // carried verbatim from the catalog — it never needs a human to fill it
+  // (issue #345).
   const needsBinding =
-    draft.manifest.kind === "mcp" ? draft.manifest.mcp === undefined : draft.manifest.cli === undefined;
+    draft.manifest.kind === "mcp"
+      ? draft.manifest.mcp === undefined
+      : draft.manifest.kind === "cli"
+        ? draft.manifest.cli === undefined
+        : draft.manifest.openapi === undefined;
   if (
     needsBinding ||
     draft.manifest.credentialSchema === undefined ||
