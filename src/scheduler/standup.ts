@@ -1,10 +1,11 @@
 import { requireDigestPruning } from "../memory/types";
-import { DIGEST_FAILED_EVENT, MEMORY_WRITE_EVENT } from "../store/audit-events";
+import { MEMORY_WRITE_EVENT } from "../store/audit-events";
 import type { WorkItemState } from "../store/db";
 import { errorMessage, sha256Hex } from "../tools/helpers";
 import { tableBlock, type SlackBlock } from "../server/adapters/blocks";
 import { DIGEST_CAP } from "../server/services/space-service";
 import { proactiveEnabled } from "./proactive-config";
+import { auditDigestFailure } from "./digest-helpers";
 import type { SchedulerAction } from "./types";
 
 const DAY_MS = 86_400_000;
@@ -138,16 +139,7 @@ export const standupDigestAction: SchedulerAction = {
       await ctx.memoryProvider.pruneDigests(spaceId, DIGEST_CAP);
     } catch (error) {
       const reason = errorMessage(error);
-      try {
-        await ctx.audit.appendAudit({
-          space_id: spaceId || null,
-          actor: "scheduler",
-          event_type: DIGEST_FAILED_EVENT,
-          payload: { reason },
-        });
-      } catch (auditError) {
-        ctx.log(`standup digest failed (${reason}); failure audit also failed: ${errorMessage(auditError)}`);
-      }
+      await auditDigestFailure(ctx, spaceId || null, reason, "standup digest");
     }
   },
 };

@@ -9,6 +9,7 @@ import {
 } from "../store/audit-events";
 import { errorMessage, sha256Hex } from "../tools/helpers";
 import { proactiveEnabled } from "./proactive-config";
+import { auditDigestFailure } from "./digest-helpers";
 import type { SchedulerAction } from "./types";
 import { z } from "zod";
 
@@ -217,16 +218,7 @@ export const reflectionAction: SchedulerAction = {
       }
     } catch (error) {
       const reason = errorMessage(error);
-      try {
-        await ctx.audit.appendAudit({
-          space_id: spaceId || null,
-          actor: "scheduler",
-          event_type: DIGEST_FAILED_EVENT,
-          payload: { reason },
-        });
-      } catch (auditError) {
-        ctx.log(`reflection failed (${reason}); failure audit also failed: ${errorMessage(auditError)}`);
-      }
+      await auditDigestFailure(ctx, spaceId || null, reason, "reflection");
     }
   },
 };

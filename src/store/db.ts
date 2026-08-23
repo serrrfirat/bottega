@@ -2106,10 +2106,18 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   // Joins optional audit predicate pairs (SQL fragment + bind value) with AND,
-  // prefixing " WHERE " only when at least one predicate is present.
-  function buildAuditWhere(predicates: [string, string | number][]) {
+  // prefixing " WHERE " only when at least one predicate is present. A
+  // predicate value may be a single scalar or an array of scalars flattened
+  // into the bind list in order (used by queryAudit's cursor key, which spans
+  // three placeholders).
+  type AuditPredicateValue = string | number | (string | number)[];
+  function buildAuditWhere(predicates: [string, AuditPredicateValue][]) {
     const clauses = predicates.map(([sql]) => sql);
-    const params = predicates.map(([, value]) => value);
+    const params: (string | number)[] = [];
+    for (const [, value] of predicates) {
+      if (Array.isArray(value)) params.push(...value);
+      else params.push(value);
+    }
     return { sql: clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "", params };
   }
 
@@ -2131,37 +2139,30 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
   }
 
   async function queryAudit(opts: AuditQueryOpts = {}): Promise<AuditPage> {
-    const clauses: string[] = [];
-    const params: (string | number)[] = [];
+    const predicates: [string, AuditPredicateValue][] = [];
     if (opts.event_type !== undefined) {
-      clauses.push("event_type = ?");
-      params.push(opts.event_type);
+      predicates.push(["event_type = ?", opts.event_type]);
     }
     if (opts.space_id !== undefined) {
-      clauses.push("space_id = ?");
-      params.push(opts.space_id);
+      predicates.push(["space_id = ?", opts.space_id]);
     }
     if (opts.actor !== undefined) {
-      clauses.push("actor = ?");
-      params.push(opts.actor);
+      predicates.push(["actor = ?", opts.actor]);
     }
     if (opts.since !== undefined) {
-      clauses.push("ts >= ?");
-      params.push(opts.since);
+      predicates.push(["ts >= ?", opts.since]);
     }
     if (opts.until !== undefined) {
-      clauses.push("ts <= ?");
-      params.push(opts.until);
+      predicates.push(["ts <= ?", opts.until]);
     }
     if (opts.tool !== undefined) {
-      clauses.push("json_valid(payload) AND json_extract(payload, '$.tool') = ?");
-      params.push(opts.tool);
+      predicates.push(["json_valid(payload) AND json_extract(payload, '$.tool') = ?", opts.tool]);
     }
     if (opts.extension !== undefined) {
-      clauses.push(
+      predicates.push([
         "json_valid(payload) AND COALESCE(json_extract(payload, '$.extension'), json_extract(payload, '$.provider')) = ?",
-      );
-      params.push(opts.extension);
+        opts.extension,
+      ]);
     }
     if (opts.cursor !== undefined) {
       if (
@@ -2172,13 +2173,13 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       ) {
         throw new Error("invalid audit cursor");
       }
-      clauses.push("(ts < ? OR (ts = ? AND id < ?))");
-      params.push(opts.cursor.ts, opts.cursor.ts, opts.cursor.id);
+      predicates.push(["(ts < ? OR (ts = ? AND id < ?))", [opts.cursor.ts, opts.cursor.ts, opts.cursor.id]]);
     }
     const requestedLimit = opts.limit ?? 50;
     const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
-    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
-    const sql = "SELECT id, ts, space_id, actor, event_type, payload FROM audit" + where + " ORDER BY ts DESC, id DESC LIMIT ?";
+    const where = buildAuditWhere(predicates);
+    const params = [...where.params];
+    const sql = "SELECT id, ts, space_id, actor, event_type, payload FROM audit" + where.sql + " ORDER BY ts DESC, id DESC LIMIT ?";
     params.push(limit + 1);
     // SAFETY: the SELECT projects exactly AuditRow's six columns.
     const matches = db.query(sql).all(...params) as AuditRow[];

@@ -6,31 +6,13 @@
  * fetches + parses the untrusted web content with egress scoped to the
  * declared source hosts; this action only enqueues (orchestration).
  */
-import { SCHEDULER_ERROR_EVENT } from "../store/audit-events";
+import { auditSchedulerError } from "./digest-helpers";
 import type { KbConfig } from "../kb/config";
 import { dispatchKbIngestJobs } from "../kb/dispatch";
-import type { SchedulerAction, SchedulerActionContext } from "./types";
+import type { SchedulerAction } from "./types";
 
 const ACTION_NAME = "kb_ingest" as const;
 const ACTOR = "scheduler:kb_ingest";
-
-async function auditError(
-  ctx: SchedulerActionContext,
-  spaceId: string | null,
-  error: string,
-): Promise<void> {
-  try {
-    await ctx.audit.appendAudit({
-      space_id: spaceId,
-      actor: ACTOR,
-      event_type: SCHEDULER_ERROR_EVENT,
-      payload: { action: ACTION_NAME, error },
-    });
-  } catch (auditFailure) {
-    const detail = auditFailure instanceof Error ? auditFailure.message : String(auditFailure);
-    ctx.log(`[${ACTION_NAME}] failed to audit error: ${detail}`);
-  }
-}
 
 /**
  * The registered scheduler action, bound to the DECLARED KB config (the
@@ -47,7 +29,7 @@ export function kbIngestAction(config: KbConfig): SchedulerAction {
         await dispatchKbIngestJobs(ctx.store, config, { source, spaceId: space ?? null });
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        await auditError(ctx, space ?? null, `failed to dispatch KB ingest: ${detail}`);
+        await auditSchedulerError(ctx, space ?? null, ACTION_NAME, ACTOR, `failed to dispatch KB ingest: ${detail}`);
       }
     },
   };
