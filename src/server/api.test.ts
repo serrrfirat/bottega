@@ -345,9 +345,19 @@ describe("GET /openapi.json (issue #100)", () => {
     expect(doc.openapi).toBe("3.1.0");
     expect(doc.info.title).toBe("Bottega REST API");
 
-    // All four API routes are listed (openapi.json itself is not an operation).
+    // All API routes are listed (openapi.json itself is not an operation);
+    // #358 adds the parameterized timeline + fork routes.
     const paths = Object.keys(doc.paths).sort();
-    expect(paths).toEqual(["/api/v1/audit", "/api/v1/graph", "/api/v1/spaces", "/api/v1/work-items"].sort());
+    expect(paths).toEqual(
+      [
+        "/api/v1/audit",
+        "/api/v1/graph",
+        "/api/v1/spaces",
+        "/api/v1/work-items",
+        "/api/v1/work-items/:id/fork",
+        "/api/v1/work-items/:id/timeline",
+      ].sort(),
+    );
     expect(doc.components.securitySchemes.bearerAuth).toEqual({
       type: "http",
       scheme: "bearer",

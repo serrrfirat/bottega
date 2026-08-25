@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
+import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_FORKED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { postOutboxRow } from "./outbox";
 import { runMigrations } from "./migrations";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -71,6 +71,21 @@ export type SpaceModelSettings = {
 };
 
 export type WorkItemState = "open" | "claimed" | "working" | "review" | "done" | "blocked" | "aborted";
+/**
+ * Fork point metadata for a forked work item (issue #358), serialized into
+ * the `fork_json` column: where in the source's timeline the fork was cut,
+ * why, and how far into the source transcript the initial context reaches.
+ */
+export type ForkMeta = {
+  note?: string;
+  /** Failure cause of the source at the fork point (rendered in the attempt preamble). */
+  cause?: string;
+  /** Exclusive transcript line bound: prior context covers source lines [0, spanEnd). */
+  spanEnd?: number;
+  /** The timeline index the fork was cut at (diagnostic round-trip). */
+  timelineIndex?: number;
+};
+
 export type WorkItemDelivery = "git" | "extension" | "chat";
 
 export type WorkItem = {
@@ -102,6 +117,10 @@ export type WorkItem = {
   approvals: string;
   evidence: string;
   result: string | null;
+  /** Forkable work items (issue #358): the source item id when this row is a fork attempt; null on originals. */
+  forked_from: string | null;
+  /** JSON {@link ForkMeta} fork point: {note?, cause?, spanEnd?, timelineIndex?, by}; null on originals. */
+  fork_json: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -329,6 +348,10 @@ export interface Store {
     evidence?: Array<{ kind: string; url: string }>;
     /** Explicit task-level skills (issues #234/#235): skill names injected into the item session at claim. */
     skills?: string[];
+    /** Forkable work items (issue #358): the source item id when this row is a fork attempt; must exist. */
+    forkedFrom?: string;
+    /** Fork point metadata serialized into `fork_json` (issue #358). */
+    forkMeta?: ForkMeta;
   }): Promise<WorkItem>;
   /** Atomic open -> claimed for a SPECIFIC item (the worker claims by the job payload). Null when the item is not open. */
   claimWorkItemById(id: string, assignee?: string): Promise<WorkItem | null>;
@@ -961,15 +984,24 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     evidence?: Array<{ kind: string; url: string }>;
     /** Explicit task-level skills (issues #234/#235): skill names injected into the item session at claim. */
     skills?: string[];
-  }): Promise<WorkItem> {
+    /** Forkable work items (issue #358): the source item id when this row is a fork attempt; must exist. */
+    forkedFrom?: string;
+    /** Fork point metadata serialized into `fork_json` (issue #358). */
+    forkMeta?: ForkMeta;
+   }): Promise<WorkItem> {
     const id = `wi_${randomUUID()}`;
     const t = Date.now();
     const delivery = input.delivery ?? "git";
+    // Forkable work items (issue #358): fail closed on an unknown source —
+    // the FK would reject the row anyway, but the explicit check names it.
+    if (input.forkedFrom !== undefined && (await getWorkItem(input.forkedFrom)) === null) {
+      throw new Error(`fork source work item not found: ${input.forkedFrom}`);
+    }
     // Ownership (issue #159): the requester owns the item at creation; the
     // executor's claim reassigns it later.
     db.query(
-      `INSERT INTO work_items (id, space_id, requester, assignee, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, skills, result, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, ?, NULL, ?, ?)`,
+      `INSERT INTO work_items (id, space_id, requester, assignee, description, repo, delivery, model, reasoning_effort, pr_url, pr_branch, base_branch, state, approvals, evidence, skills, result, forked_from, fork_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, ?, NULL, ?, ?, ?, ?)`,
     ).run(
       id,
       input.space_id,
@@ -985,6 +1017,8 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       input.base_branch ?? null,
       JSON.stringify((input.evidence ?? []).map((e) => ({ ...e, at: t }))),
       JSON.stringify(input.skills ?? []),
+      input.forkedFrom ?? null,
+      input.forkMeta === undefined ? null : JSON.stringify(input.forkMeta),
       t,
       t,
     );
@@ -999,6 +1033,16 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       event_type: WORK_ITEM_CREATED_EVENT,
       payload: JSON.stringify(createdPayload),
     });
+    // Forkable work items (issue #358): the fork edge is audited on top of
+    // the created row so the trail joins source → fork like any other event.
+    if (input.forkedFrom !== undefined) {
+      appendAudit({
+        space_id: input.space_id,
+        actor: input.requester,
+        event_type: WORK_ITEM_FORKED_EVENT,
+        payload: JSON.stringify({ id, forked_from: input.forkedFrom, note: input.forkMeta?.note, by: input.requester }),
+      });
+    }
     // Epic #170: git/extension work items enqueue a worker job with the SAME
     // id — one id across enqueue → claim → run → outbox → post. Chat items
     // have no worker (the space agent handles them in-session) and never
@@ -1267,7 +1311,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       space_id: row.space_id,
       actor: by,
       event_type: WORK_ITEM_TRANSITION_EVENT,
-      payload: JSON.stringify({ from, to, by }),
+      payload: JSON.stringify({ id, from, to, by }),
     });
     // Blocked/review landings are human-visible queue events (issue #159):
     // the executor's transition sites funnel here, so this single write
@@ -2048,7 +2092,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         space_id: row.space_id,
         actor: "system",
         event_type: WORK_ITEM_TRANSITION_EVENT,
-        payload: JSON.stringify({ from, to: "blocked", by: "system" }),
+        payload: JSON.stringify({ id: row.id, from, to: "blocked", by: "system" }),
       });
       // Stale recovery is a blocked landing too (issue #159): the boot-time
       // sweep posts the same one-line notification as any other blocked

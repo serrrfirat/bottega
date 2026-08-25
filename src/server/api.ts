@@ -36,9 +36,13 @@ import {
   API_GRAPH_PROJECTED_EVENT,
   API_SPACES_LISTED_EVENT,
   API_WORK_ITEM_CREATED_EVENT,
+  API_WORK_ITEM_FORKED_EVENT,
   API_WORK_ITEMS_LISTED_EVENT,
+  API_WORK_ITEM_TIMELINE_EVENT,
 } from "../store/audit-events";
 import { GraphBoundError, projectGraph } from "../graph/view";
+import { buildTimeline } from "../work-items/timeline";
+import { forkWorkItem } from "../work-items/fork";
 
 /** The env var (seeded via the boot-secret chain) holding the bearer token. */
 export const REST_API_TOKEN_ENV = "BOTTEGA_API_TOKEN";
@@ -89,6 +93,35 @@ const createWorkItemSchema = z.object({
   repo: z.string().trim().min(1, "repo must be non-empty").optional(),
 });
 
+/** The POST /api/v1/work-items/:id/fork body contract (issue #358). */
+const forkWorkItemSchema = z
+  .object({
+    atTimelineIndex: z.number().int().nonnegative().optional(),
+    afterKind: z.literal("failed").optional(),
+    note: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+/**
+ * True when a concrete pathname matches a route template with `:param`
+ * segments (issue #358): every segment pairs up, literals match exactly,
+ * params match any non-empty segment.
+ */
+function pathMatches(template: string, pathname: string): boolean {
+  const parts = template.split("/");
+  const actual = pathname.split("/");
+  if (parts.length !== actual.length) return false;
+  return parts.every((part, i) => (part.startsWith(":") ? actual[i] !== "" : part === actual[i]));
+}
+
+/** The first `:param` value from a matched parameterized template. */
+function pathParam(template: string, pathname: string): string {
+  const parts = template.split("/");
+  const actual = pathname.split("/");
+  const index = parts.findIndex((part) => part.startsWith(":"));
+  return index >= 0 ? decodeURIComponent(actual[index]!) : "";
+}
+
 /**
  * Maps a zod validation failure for the POST body to the REST surface's
  * documented error message. The failing field decides which message; an
@@ -128,6 +161,12 @@ export interface RestApiDeps {
    * a restart). Tests inject a resolver for hermeticity.
    */
   resolveToken?: () => string | undefined;
+  /**
+   * Directory holding the executor's per-item JSONL transcripts (issue
+   * #358): read-only source for the timeline projection. Defaults to the
+   * executor default `data/transcripts`.
+   */
+  transcriptDir?: string;
 }
 
 export interface RestApiMount {
@@ -492,6 +531,103 @@ export const REST_ROUTES: readonly RestRouteSpec[] = [
   },
   {
     method: "GET",
+    path: "/api/v1/work-items/:id/timeline",
+    summary: "Work-item run timeline",
+    description:
+      "Ordered projection of one work item's full lifecycle (issue #358), assembled read-only from the audit trail and the item's JSONL transcript spans. Entries are chronological and capped; unknown items are a 404.",
+    responses: {
+      "200": {
+        description: "The projected timeline entries.",
+        schema: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            count: { type: "integer" },
+            entries: { type: "array", items: { type: "object" } },
+          },
+        },
+      },
+      "404": { description: "Unknown work item." },
+    },
+    async handle(_req, _url, deps) {
+      const id = pathParam("/api/v1/work-items/:id/timeline", new URL(_req.url).pathname);
+      const item = await deps.store.getWorkItem(id);
+      if (item === null) return Response.json({ error: `unknown work item: ${id}` }, { status: 404 });
+      const entries = await buildTimeline(deps.store, deps.transcriptDir ?? "data/transcripts", id);
+      await deps.audit.appendAudit({
+        space_id: item.space_id,
+        actor: API_ACTOR,
+        event_type: API_WORK_ITEM_TIMELINE_EVENT,
+        payload: { id, count: entries?.length ?? 0 },
+      });
+      return Response.json({ id, count: entries?.length ?? 0, entries });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/v1/work-items/:id/fork",
+    summary: "Fork a work item at a point of its run",
+    description:
+      "Creates a NEW work item (fresh id, fresh sandbox) whose initial agent context carries the source transcript up to the chosen point plus an attempt preamble (issue #358). The original stays untouched; the fork records the `forked-from` edge and runs in the SAME space, so delivery approval requirements apply unchanged.",
+    requestBody: {
+      type: "object",
+      properties: {
+        atTimelineIndex: { type: "integer", description: "Cut at this exact timeline index (from GET .../timeline)." },
+        afterKind: { type: "string", enum: ["failed"], description: "Cut after the last failed/blocked entry." },
+        note: { type: "string", description: "Optional operator note carried on the fork." },
+      },
+    },
+    responses: {
+      "201": {
+        description: "The created fork.",
+        schema: {
+          type: "object",
+          properties: { id: { type: "string" }, state: { type: "string" }, forked_from: { type: "string" } },
+        },
+      },
+      "400": { description: "Malformed body, missing/ambiguous selector, or out-of-range index." },
+      "404": { description: "Unknown source work item." },
+    },
+    async handle(req, _url, deps) {
+      const id = pathParam("/api/v1/work-items/:id/fork", new URL(req.url).pathname);
+      if ((await deps.store.getWorkItem(id)) === null) {
+        return Response.json({ error: `unknown work item: ${id}` }, { status: 404 });
+      }
+      let raw: unknown;
+      try {
+        raw = await req.json();
+      } catch {
+        return Response.json({ error: "request body must be valid JSON" }, { status: 400 });
+      }
+      const parsed = forkWorkItemSchema.safeParse(raw);
+      if (!parsed.success) return Response.json({ error: "invalid fork request body" }, { status: 400 });
+      const selectors = [parsed.data.atTimelineIndex !== undefined, parsed.data.afterKind !== undefined].filter(Boolean).length;
+      if (selectors !== 1) {
+        return Response.json({ error: "exactly one of atTimelineIndex or afterKind is required" }, { status: 400 });
+      }
+      try {
+        const fork = await forkWorkItem(
+          { ...deps.store, transcriptDir: deps.transcriptDir ?? "data/transcripts" },
+          { sourceId: id, ...parsed.data, requester: API_ACTOR },
+        );
+        await deps.audit.appendAudit({
+          space_id: fork.space_id,
+          actor: API_ACTOR,
+          event_type: API_WORK_ITEM_FORKED_EVENT,
+          payload: { id: fork.id, forked_from: id },
+        });
+        return Response.json({ id: fork.id, state: fork.state, forked_from: fork.forked_from }, { status: 201 });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.startsWith("work item not found")) {
+          return Response.json({ error: message }, { status: 404 });
+        }
+        return Response.json({ error: message }, { status: 400 });
+      }
+    },
+  },
+  {
+    method: "GET",
     path: OPENAPI_PATH,
     summary: "OpenAPI document",
     description: "The OpenAPI 3.1 document describing every API route.",
@@ -589,7 +725,11 @@ export function mountRestApi(deps: RestApiDeps): RestApiMount {
   return {
     async fetch(req) {
       const url = new URL(req.url);
-      const route = REST_ROUTES.find((r) => r.path === url.pathname && r.method === req.method);
+      const route =
+        REST_ROUTES.find((r) => r.path === url.pathname && r.method === req.method) ??
+        REST_ROUTES.find(
+          (r) => r.path.includes(":") && r.method === req.method && pathMatches(r.path, url.pathname),
+        );
       if (route === undefined) return new Response("not found", { status: 404 });
       const expected = resolveToken();
       const provided = bearerToken(req);

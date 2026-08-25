@@ -487,9 +487,9 @@ describe("claim loop", () => {
       const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
       expect(transitions.map((t) => JSON.parse(t.payload))).toEqual(
         expect.arrayContaining([
-          { from: "claimed", to: "working", by: "executor" },
-          { from: "working", to: "review", by: "executor" },
-          { from: "review", to: "done", by: "executor" },
+          expect.objectContaining({ from: "claimed", to: "working", by: "executor" }),
+          expect.objectContaining({ from: "working", to: "review", by: "executor" }),
+          expect.objectContaining({ from: "review", to: "done", by: "executor" }),
         ]),
       );
 
@@ -1089,8 +1089,8 @@ describe("delivery routing (issue #129)", () => {
       const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
       expect(transitions.map((row) => JSON.parse(row.payload))).toEqual(
         expect.arrayContaining([
-          { from: "claimed", to: "working", by: "executor" },
-          { from: "working", to: "done", by: "executor" },
+          expect.objectContaining({ from: "claimed", to: "working", by: "executor" }),
+          expect.objectContaining({ from: "working", to: "done", by: "executor" }),
         ]),
       );
       const completed = await fx.store.listAudit({ event_type: DELIVERY_COMPLETED_EVENT });
@@ -1660,8 +1660,8 @@ describe("delivery approval round trip (issue #149)", () => {
         const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
         expect(transitions.map((row) => JSON.parse(row.payload))).toEqual(
           expect.arrayContaining([
-            { from: "working", to: "review", by: "executor" },
-            { from: "review", to: "done", by: "executor" },
+            expect.objectContaining({ from: "working", to: "review", by: "executor" }),
+            expect.objectContaining({ from: "review", to: "done", by: "executor" }),
           ]),
         );
 
@@ -1718,8 +1718,8 @@ describe("delivery approval round trip (issue #149)", () => {
         const transitions = await fx.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
         expect(transitions.map((row) => JSON.parse(row.payload))).not.toEqual(
           expect.arrayContaining([
-            { from: "working", to: "review", by: "executor" },
-            { from: "review", to: "done", by: "executor" },
+            expect.objectContaining({ from: "working", to: "review", by: "executor" }),
+            expect.objectContaining({ from: "review", to: "done", by: "executor" }),
           ]),
         );
       } finally {

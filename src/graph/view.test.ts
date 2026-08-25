@@ -154,6 +154,25 @@ describe("projectGraph (issue #357)", () => {
     }
   });
 
+  test("a forked item projects a forked-from edge to its source (issue #358)", async () => {
+    const h = harness();
+    try {
+      const seeded = await seedTwoSpaces(h.store);
+      h.db
+        .prepare("UPDATE work_items SET forked_from = ? WHERE id = ?")
+        .run(seeded.wiA1, seeded.wiA2);
+      const projection = await projectGraph(h.store);
+      expect(
+        projection.edges.some((e) => e.rel === "forked-from" && e.from.id === seeded.wiA2 && e.to.id === seeded.wiA1),
+      ).toBe(true);
+      // Neighbors traversal follows the lineage: the source is one hop away.
+      const hood = await neighbors(h.store, { kind: "work-item", id: seeded.wiA2 }, { maxDepth: 1 });
+      expect(hood.nodes.some((n) => n.kind === "work-item" && n.id === seeded.wiA1)).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("fail-closed bounds: tiny maxNodes throws instead of truncating", async () => {
     const h = harness();
     try {

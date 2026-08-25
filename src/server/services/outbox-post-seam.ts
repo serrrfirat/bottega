@@ -24,7 +24,6 @@
  * without a matching `outbox.posted` audit row (written only after a
  * successful post), and one id threads enqueue → claim → run → outbox →
  * post. The retry path is restart-safe: a requeued row is simply pending
- * again, so a crash mid-retry re-consumes it on the next boot.
  *
  * The consumer cursor: every pass consumes from a FRESH cursor (no
  * watermark state) — the Wave-1 consumer marks rows posted atomically, so
@@ -35,6 +34,7 @@
  * regardless of any cursor position.
  */
 import { z } from "zod";
+import { issueCard, retryWithContextButton, type SlackBlock } from "../adapters/blocks";
 import { OUTBOX_FAILED_EVENT, OUTBOX_POSTED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import {
@@ -45,7 +45,6 @@ import {
   type OutboxRow,
 } from "../../store/outbox";
 import type { SlackAdapter } from "../adapters/slack";
-import { issueCard, type SlackBlock } from "../adapters/blocks";
 import { dispatchIngestEvent } from "../../ingest/dispatch";
 import { createAudit } from "../../policy/audit";
 import { startReactiveCore } from "../../events/reactive";
@@ -222,13 +221,17 @@ export function renderOutboxBlocks(row: OutboxRow): SlackBlock[] | undefined {
   // title; drop to the text fallback rather than let issueCard throw (which
   // postRow would misread as a Slack post failure and retry/terminal-fail).
   if (payload.description.trim().length === 0) return undefined;
-  return issueCard({
+  const card = issueCard({
     title: payload.description,
     state: payload.state,
     // The notification payload carries no owner; evidence links when the
     // worker includes a `link` field (passthrough-preserved), else none.
     link: payload.link,
   });
+  // Retry with context (issue #358): a BLOCKED landing carries the one-click
+  // resume control — forking at the failure point — right on the card.
+  if (payload.state === "blocked") card.push(retryWithContextButton(payload.workItemId));
+  return card;
 }
 
 /**

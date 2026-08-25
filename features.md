@@ -24,7 +24,7 @@ do, and why it matters. For how it works under the hood, see
 | **Policy & approvals** | Every action is gated by rules you control; risky actions ask a human first. |
 | **Extensions** | Connect provider-official tools from chat — any integrations.sh catalog extension registers at runtime (no config file, no commit); every agent uses them through one safe pipe. |
 | **Proactive scheduler** | Standups, reflections, weekly pulse, knowledge ingestion, and recurring connected-service work on a schedule. |
-| **Work items** | One queue delivers repository, connected-extension, or in-channel work, with optional model pins and semantic pickup. |
+| **Work items** | One queue delivers repository, connected-extension, or in-channel work, with optional model pins, semantic pickup, and one-click fork-and-retry of failed runs from their event trail. |
 | **Department personas** | Give each space role guidance and a minimum visible toolset without weakening policy. |
 | **Audit trail** | Every decision, approval, and tool call is recorded, append-only, and never deleted. |
 
@@ -697,6 +697,16 @@ audited lifecycle:
   action creates one extension-delivery item per fire. Scheduled work uses
   the same queue, audits, policy gates, stale recovery, and blocked failure
   state as manually requested work.
+- **Fork any run from its event trail (#358)** — every work item's full
+  lifecycle is projected read-only at `GET /api/v1/work-items/:id/timeline`
+  (created, claimed, turns with transcript spans, tool calls, deliveries,
+  landings). A failed run can be forked into a NEW item via
+  `POST /api/v1/work-items/:id/fork` or the **Retry with context** button on
+  the blocked card in Slack: the new attempt boots with the source's prior
+  progress as bounded context plus an attempt preamble, while the original
+  stays untouched. Forks inherit the space's policy and delivery-approval
+  gates unchanged, and the graph view links attempts with `forked-from`
+  edges.
 
 Why it matters: a team can ask one co-worker to ship code, update a connected
 system, answer in channel, or repeat operational work without adding a second

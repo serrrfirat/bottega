@@ -1628,6 +1628,8 @@ describe("auto-pickup explicit-confirm gate (issue #245)", () => {
       approvals: "[]",
       evidence: "[]",
       result: null,
+      forked_from: null,
+      fork_json: null,
       created_at: 101,
       updated_at: 101,
     };
@@ -1699,6 +1701,8 @@ describe("auto-pickup explicit-confirm gate (issue #245)", () => {
       skills: "[]",
       state: "open",
       approvals: "[]",
+      forked_from: null,
+      fork_json: null,
       evidence: "[]",
       result: null,
       created_at: 101,

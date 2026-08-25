@@ -282,6 +282,16 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    id: "016_add_work_item_forks",
+    up(db) {
+      const columns = columnNames(db, "work_items");
+      if (!columns.includes("forked_from")) {
+        db.exec("ALTER TABLE work_items ADD COLUMN forked_from TEXT REFERENCES work_items(id)");
+      }
+      if (!columns.includes("fork_json")) db.exec("ALTER TABLE work_items ADD COLUMN fork_json TEXT");
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {

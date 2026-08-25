@@ -1070,7 +1070,7 @@ describe("work items", () => {
 
       const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
       expect(rows).toHaveLength(1);
-      expect(JSON.parse(rows[0]!.payload)).toEqual({ from: "claimed", to: "blocked", by: "system" });
+      expect(JSON.parse(rows[0]!.payload)).toEqual({ id: staleAudited.id, from: "claimed", to: "blocked", by: "system" });
       expect(rows[0]!.actor).toBe("system");
     } finally {
       vi.useRealTimers();
@@ -1091,9 +1091,9 @@ describe("work items", () => {
 
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
     expect(rows).toHaveLength(3);
-    expect(JSON.parse(rows[0]!.payload)).toEqual({ from: "claimed", to: "working", by: "executor:1" });
-    expect(JSON.parse(rows[1]!.payload)).toEqual({ from: "working", to: "review", by: "executor:1" });
-    expect(JSON.parse(rows[2]!.payload)).toEqual({ from: "review", to: "done", by: "executor:1" });
+    expect(JSON.parse(rows[0]!.payload)).toEqual({ id: item.id, from: "claimed", to: "working", by: "executor:1" });
+    expect(JSON.parse(rows[1]!.payload)).toEqual({ id: item.id, from: "working", to: "review", by: "executor:1" });
+    expect(JSON.parse(rows[2]!.payload)).toEqual({ id: item.id, from: "review", to: "done", by: "executor:1" });
   });
 
   test("createWorkItem writes a work_item.created audit row", async () => {

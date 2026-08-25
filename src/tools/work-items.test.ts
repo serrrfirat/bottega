@@ -687,9 +687,9 @@ describe("complete_work_item", () => {
     expect(JSON.parse(stored!.result!)).toEqual({ summary: "Shared the answer with the channel." });
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
     expect(rows.map((row) => JSON.parse(row.payload))).toEqual([
-      { from: "open", to: "claimed", by: "U7" },
-      { from: "claimed", to: "working", by: "U7" },
-      { from: "working", to: "done", by: "U7" },
+      expect.objectContaining({ from: "open", to: "claimed", by: "U7" }),
+      expect.objectContaining({ from: "claimed", to: "working", by: "U7" }),
+      expect.objectContaining({ from: "working", to: "done", by: "U7" }),
     ]);
     expect(rows.map((row) => row.actor)).toEqual(["U7", "U7", "U7"]);
   });
@@ -726,10 +726,10 @@ describe("complete_work_item", () => {
       expect(after.slice(before.length).map((row) => JSON.parse(row.payload))).toEqual(
         initialState === "claimed"
           ? [
-              { from: "claimed", to: "working", by: "agent" },
-              { from: "working", to: "done", by: "agent" },
+              expect.objectContaining({ from: "claimed", to: "working", by: "agent" }),
+              expect.objectContaining({ from: "working", to: "done", by: "agent" }),
             ]
-          : [{ from: "working", to: "done", by: "agent" }],
+          : [expect.objectContaining({ from: "working", to: "done", by: "agent" })],
       );
     }
   });
@@ -1004,7 +1004,7 @@ describe("work_item_cancel", () => {
     expect((await s.getWorkItem(id))?.state).toBe("aborted");
 
     const rows = await s.listAudit({ space: space.id, event_type: "work_item.transition" });
-    expect(JSON.parse(rows.at(-1)!.payload)).toEqual({ from: "working", to: "aborted", by: "U1" });
+    expect(JSON.parse(rows.at(-1)!.payload)).toEqual(expect.objectContaining({ from: "working", to: "aborted", by: "U1" }));
     expect(rows.at(-1)!.actor).toBe("U1");
   });
 

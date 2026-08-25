@@ -10,7 +10,38 @@
 export type SlackBlock = {
   type: string;
   text?: { type: "mrkdwn" | "plain_text"; text: string };
+  block_id?: string;
+  elements?: Array<{
+    type: "button";
+    text: { type: "plain_text"; text: string };
+    action_id: string;
+    value: string;
+  }>;
 };
+
+/**
+ * Retry-with-context action id (issue #358): the button on a BLOCKED issue
+ * card that forks the failed item at its failure point. Defined beside its
+ * renderer so the pure block module stays dependency-free; the retry router
+ * imports the SAME constant.
+ */
+export const RETRY_WITH_CONTEXT_ACTION_ID = "bottega_retry_with_context";
+
+/** The one-click resume control (issue #358); the value carries the WORK ITEM id. */
+export function retryWithContextButton(workItemId: string): SlackBlock {
+  return {
+    type: "actions",
+    block_id: "bottega_retry",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Retry with context" },
+        action_id: RETRY_WITH_CONTEXT_ACTION_ID,
+        value: workItemId,
+      },
+    ],
+  };
+}
 
 /** How many table rows render before the remainder is elided into a count note. */
 export const TABLE_ROW_CAP = 12;

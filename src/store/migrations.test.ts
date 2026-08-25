@@ -23,6 +23,7 @@ const EXPECTED_MIGRATION_IDS: string[] = [
   "013_add_audit_search_indexes",
   "014_add_durable_pending_turns",
   "015_add_reactive_core_tables",
+  "016_add_work_item_forks",
 ] as const;
 
 function tempDb(name: string): string {
@@ -190,10 +191,10 @@ describe("ordered SQLite migrations", () => {
       DROP INDEX idx_audit_space_ts;
       DROP INDEX idx_audit_actor_ts;
       -- Roll the ledger back to a genuine PRE-013 state: drop 013 AND any
-      -- later migration (014, 015) so the remaining ledger [001..012] can
-      -- re-apply 013..015 with no index gap (issue #312 extends the history
-      -- past 013; #356 past 014).
-      DELETE FROM schema_migrations WHERE id IN ('013_add_audit_search_indexes', '014_add_durable_pending_turns', '015_add_reactive_core_tables');
+      -- later migrations (014, 015, 016) so the remaining ledger [001..012]
+      -- can re-apply 013..016 with no index gap (issue #312 extends the
+      -- history past 013; #356 past 014; #358 past that).
+      DELETE FROM schema_migrations WHERE id IN ('013_add_audit_search_indexes', '014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks');
     `);
     store.close();
 
@@ -208,9 +209,10 @@ describe("ordered SQLite migrations", () => {
       "idx_audit_event_ts",
       "idx_audit_space_ts",
     ]);
-    // 013 (and the later 014) were re-applied to a ledger that ended at 012.
+    // 013 (and the later migrations) were re-applied to a ledger that ended
+    // at 012; the backfill runs through the current tail (#358's fork columns).
     expect(ledgerIds(upgraded.getDb())).toContain("013_add_audit_search_indexes");
-    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("015_add_reactive_core_tables");
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("016_add_work_item_forks");
     upgraded.close();
   });
 
@@ -220,7 +222,7 @@ describe("ordered SQLite migrations", () => {
     const db = store.getDb();
     db.exec(`
       DROP TABLE pending_turns;
-      DELETE FROM schema_migrations WHERE id IN ('014_add_durable_pending_turns', '015_add_reactive_core_tables');
+      DELETE FROM schema_migrations WHERE id IN ('014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks');
     `);
     store.close();
 
@@ -265,7 +267,7 @@ describe("ordered SQLite migrations", () => {
     // The durable rows are usable end-to-end on the backfilled ledger.
     await upgraded.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "backfilled" });
     expect(await upgraded.listPendingTurns("slack:C1")).toHaveLength(1);
-    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("015_add_reactive_core_tables");
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("016_add_work_item_forks");
     upgraded.close();
   });
 

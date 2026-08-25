@@ -27,8 +27,10 @@ export const SPACE_SKILL_CREATED_EVENT = "space_skill.created";
 export const SPACE_SKILL_UPDATED_EVENT = "space_skill.updated";
 /** Space-tier skill deleted (payload {name,revision,revealed?}); never bodies. */
 export const SPACE_SKILL_DELETED_EVENT = "space_skill.deleted";
-/** Work item state transition (payload {from, to, by}). */
+/** Work item state transition (payload {id, from, to, by}; `id` added by #358 so the trail joins per item). */
 export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
+/** Work item forked from a source attempt (issue #358): payload {id, forked_from, note?, by} — id is the NEW fork's id. */
+export const WORK_ITEM_FORKED_EVENT = "work_item.forked";
 /** Queue read (payload {state?, count}; space_id top-level). */
 export const WORK_ITEM_LIST_EVENT = "work_item.list";
 /** Executor failure landing an item in blocked (payload {id, error}). */
@@ -318,3 +320,7 @@ export const API_AUDIT_READ_EVENT = "api.audit_read";
 export const API_WORK_ITEM_CREATED_EVENT = "api.work_item_created";
 /** REST API org-graph projection read (issue #357): payload {space?, since?, nodes, edges} — counts only; node labels/contents never enter the audit trail. */
 export const API_GRAPH_PROJECTED_EVENT = "api.graph_projected";
+/** REST API work-item timeline read (issue #358; payload {id, count}; space_id top-level). */
+export const API_WORK_ITEM_TIMELINE_EVENT = "api.work_item_timeline";
+/** REST API work-item fork create (issue #358; payload {id, forked_from}; actor api:default). */
+export const API_WORK_ITEM_FORKED_EVENT = "api.work_item_forked";

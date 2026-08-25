@@ -80,6 +80,8 @@ import { outboxPostSeamBehavior } from "./services/outbox-post-seam";
 import { staleProcedureAlertBehavior } from "./services/stale-procedure-alert";
 import { SlackApprovalRouter, DEFAULT_NUDGE_MINUTES } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
+import { resolveRetryAction } from "./adapters/retry-router";
+import { RETRY_WITH_CONTEXT_ACTION_ID } from "./adapters/blocks";
 import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
 import {
   channelFromSpaceId,
@@ -409,6 +411,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     },
   });
   let spaceService: SpaceService;
+  // Issue #358: the executor's per-item transcript dir — the read-only
+  // source for the work-item timeline projection and fork prior-context.
+  const executorTranscriptDir = process.env.BOTTEGA_TRANSCRIPTS_DIR ?? "data/transcripts";
   const adapter = createSlackAdapter({
     appToken,
     botToken,
@@ -418,6 +423,11 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       // resolvers; every other click belongs to the exec-tier approval flow.
       if (a.actionId === DELIVERY_APPROVE_ACTION_ID || a.actionId === DELIVERY_DENY_ACTION_ID) {
         return deliveryActionHandler(a);
+      }
+      // Retry with context (issue #358): a click on a BLOCKED issue card
+      // forks the failed item at its failure point — one-click resume.
+      if (a.actionId === RETRY_WITH_CONTEXT_ACTION_ID) {
+        return resolveRetryAction({ store, adapter, transcriptDir: executorTranscriptDir }, a).then(() => undefined);
       }
       if (
         a.actionId === SCHEDULER_PAUSE_ACTION_ID ||
@@ -591,7 +601,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // Issue #100: the token-authenticated REST API + its OpenAPI document ride
     // the SAME inbound listener — one stable port, one tunnel target, one
     // public ingress for every inbound path (callback, upload, webhook, API).
-    restApi: mountRestApi({ store, audit }),
+    // Issue #358: the mount carries the executor transcript dir so the
+    // work-item timeline/fork routes read the real JSONL trails.
+    restApi: mountRestApi({ store, audit, transcriptDir: executorTranscriptDir }),
     // Issue #281: the browser leg is the only place that knows the connect
     // actually completed — surface the connected space so its live session
     // toolset refreshes WITHOUT a restart. Late-bound (spaceService is

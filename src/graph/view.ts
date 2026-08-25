@@ -19,10 +19,8 @@
  *   memory    --created-->      person (person scope key / provenance)
  *   memory    --mentions-->     work-item (body references the item id)
  *
- * `depends-on` (#165) and `forked-from` (#358) are part of {@link EdgeRel}
- * so the executor can land dependency/fork checks on this edge model
- * without another migration; no table writes them yet, so the projection
- * never emits them until their columns exist.
+ * `depends-on` (#165) remains reserved; `forked-from` (#358) is emitted
+ * from the work_items.forked_from column (fork → source).
  *
  * Multi-hop traversal (`neighbors`) runs as a SQLite recursive CTE — the
  * traversal never leaves the database engine. Every query is BOUNDED and
@@ -170,8 +168,10 @@ interface WorkItemRow {
   repo: string | null;
   pr_url: string | null;
   result: string | null;
-  approvals: string;
   evidence: string;
+  /** Fork lineage (issue #358): the source attempt id, null on originals. */
+  forked_from: string | null;
+  approvals: string;
   created_at: number;
 }
 
@@ -441,7 +441,7 @@ export async function projectGraph(store: Store, opts: ProjectGraphOpts = {}): P
   // strings); the selected columns map 1:1 onto WorkItemRow.
   const items = db
     .prepare(
-      `SELECT id, space_id, requester, assignee, description, repo, pr_url, result, approvals, evidence, created_at
+      `SELECT id, space_id, requester, assignee, description, repo, pr_url, result, approvals, evidence, forked_from, created_at
        FROM work_items
        WHERE (?1 IS NULL OR space_id = ?1)
          AND (?2 IS NULL OR created_at >= ?2)`,
@@ -472,6 +472,12 @@ export async function projectGraph(store: Store, opts: ProjectGraphOpts = {}): P
     for (const url of workItemPrUrls(item)) {
       addNode({ kind: "pr", id: url, label: url, createdAt: null });
       edges.push({ from: wi, to: { kind: "pr", id: url }, rel: "delivered" });
+    }
+    // Fork lineage (issue #358): the fork points at its source attempt.
+    // A source outside the projected scope still contributes the edge;
+    // neighbors traversal resolves it from the full table when queried.
+    if (item.forked_from !== null && item.forked_from !== "") {
+      edges.push({ from: wi, to: { kind: "work-item", id: item.forked_from }, rel: "forked-from" });
     }
   }
 
@@ -604,6 +610,11 @@ export async function neighbors(store: Store, start: NodeRef, opts: NeighborsOpt
            FROM work_items
           WHERE result IS NOT NULL AND json_valid(result)
             AND json_type(result, '$.pr_url') = 'text'
+            AND (?1 IS NULL OR space_id = ?1) AND (?2 IS NULL OR created_at >= ?2)
+         UNION ALL
+         SELECT 'work-item', id, 'work-item', forked_from, 'forked-from'
+           FROM work_items
+          WHERE forked_from IS NOT NULL AND forked_from != ''
             AND (?1 IS NULL OR space_id = ?1) AND (?2 IS NULL OR created_at >= ?2)
        ),
        walk(kind, id, depth) AS (

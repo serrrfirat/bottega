@@ -48,6 +48,7 @@ import type { AgentDriver, AgentSessionDriver, ModelRole } from "../server/drive
 import type { Skill, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { z } from "zod";
 import { WorkspaceLifecycle } from "./workspace-lifecycle";
+import { buildForkPreamble } from "../work-items/fork";
 import type { JobResourceCaps } from "./caps";
 
 // Shared timing/branch constants used by the job bodies.
@@ -446,9 +447,14 @@ async function extensionWorkerPath(
   });
   try {
     await applyWorkItemModelPin(deps, item, session);
+    // Forkable work items (issue #358): the same bounded preamble applies
+    // on the extension delivery leg.
+    const forkPrefix =
+      item.forked_from === null ? "" : ((await buildForkPreamble(deps.store, cfg.transcriptDir, item)) ?? "");
     await promptExtensionWorker(
       session,
       [
+        ...(forkPrefix !== "" ? [forkPrefix, ""] : []),
         `You are the bottega extension worker for work item ${item.id} in space ${item.space_id}.`,
         "Complete the task using the available tools. The task may require creating or updating an",
         "external object through the connected extensions.",
@@ -673,8 +679,13 @@ async function runAgentSession(
   });
   try {
     await applyWorkItemModelPin(deps, item, session);
+    // Forkable work items (issue #358): a fork boots with the attempt
+    // preamble + bounded prior progress ahead of the standard task prompt.
+    const forkPrefix =
+      item.forked_from === null ? "" : ((await buildForkPreamble(deps.store, cfg.transcriptDir, item)) ?? "");
     await session.prompt(
       [
+        ...(forkPrefix !== "" ? [forkPrefix, ""] : []),
         `You are an autonomous work executor for bottega (work item ${item.id}, space ${item.space_id}).`,
         "The repository is checked out at the workspace root (your working directory). Implement the work item",
         "below, then commit your changes to the current branch with a descriptive commit message.",

@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   evidence     TEXT NOT NULL DEFAULT '[]',-- JSON array of {kind, url, at}
   skills       TEXT NOT NULL DEFAULT '[]',-- JSON array of explicit task-level skill names (issues #234/#235)
   result       TEXT,                     -- JSON: {pr_url, summary}, {url, summary}, or {summary}
+  forked_from  TEXT REFERENCES work_items(id), -- forkable work items (issue #358): the source item this attempt replays
+  fork_json    TEXT,                     -- JSON fork point: {note?, cause?, spanEnd?, timelineIndex?, by}
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
