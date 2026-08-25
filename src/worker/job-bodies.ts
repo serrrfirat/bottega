@@ -199,6 +199,15 @@ export interface ExecutorDeps {
    * fallback.
    */
   sandboxRunner?: SandboxRunner;
+  /** Optional boot-time isolation-boundary proof (issue #344): awaited by
+   * runExecutor AFTER prepareExecutor, so the credential boundary (the PAT
+   * guard) stays the first fail-closed check. Production wires the Docker
+   * sandbox probe; a failed spawn must surface loudly here — the old
+   * pre-guard placement hung forever inside a bare container. Absent
+   * (tests, embedded hosts) → no live probe; an injected sandboxRunner
+   * owns its own boundary proof.
+   */
+  bootProbe?: () => Promise<void>;
   /** SQLite database path mounted for the sandbox child. Production always sets this explicitly. */
   dbPath?: string;
   /**

@@ -308,6 +308,12 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
 
 export async function runExecutor(deps: ExecutorDeps, signal?: AbortSignal): Promise<void> {
   const cfg = await prepareExecutor(deps);
+
+  // The credential boundary (the PAT guard) above stays the FIRST
+  // fail-closed check (issue #9); the isolation-boundary probe runs right
+  // after it, before any job can claim (#344).
+  await deps.bootProbe?.();
+
   // The production dependency is a lazy getter. Resolve it before the
   // model-registry guard because createOmpSdkDriver installs agentDir as
   // process-global state used by that guard.
@@ -679,13 +685,11 @@ if (import.meta.main) {
     caCertHostPath: process.env.BOTTEGA_SANDBOX_CA_CERT_HOST,
     requireDocker: true,
   });
-  await probeDockerSandbox({
-    workspacesDir: sandboxWorkspaces,
-    transcriptDir: sandboxTranscripts,
-    volume: sandboxVolume,
-    requireDocker: true,
-  });
   let driver: AgentDriver | Promise<AgentDriver> | undefined;
+  // Boot-time proof that docker + the job image are usable. Routed through
+  // deps.bootProbe so runExecutor awaits it AFTER the PAT guard (issue #9):
+  // inside a bare container a failed docker spawn must fail closed loudly
+  // — a pre-guard placement hung forever instead (#344).
   const executorDeps: ExecutorDeps = {
     store,
     dbPath,
@@ -696,6 +700,13 @@ if (import.meta.main) {
     },
     getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
     orgConfigDir: "config",
+    bootProbe: () =>
+      probeDockerSandbox({
+        workspacesDir: sandboxWorkspaces,
+        transcriptDir: sandboxTranscripts,
+        volume: sandboxVolume,
+        requireDocker: true,
+      }).then(() => undefined),
   };
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());
