@@ -284,11 +284,16 @@ export function createDockerClient(socket: string): DockerClient {
         stdio: ["pipe", "pipe", "pipe"],
       });
       let spawnError: Error | null = null;
-      const processError: Promise<{ code: null; signal: null }> = new Promise((resolve) => {
-        child.once("error", (error: Error) => {
-          spawnError = error;
-          resolve({ code: null, signal: null });
-        });
+      // Node never emits `exit` for a failed spawn (ENOENT — e.g. the
+      // supervisor itself running inside a bare container without the
+      // docker CLI), so the exit promise MUST also settle on the error
+      // event or launchDockerContainer hangs forever (#344 CI: the
+      // executor boot probe stalled before its own PAT fail-closed guard).
+      const { promise: processError, resolve: settleExit } =
+        Promise.withResolvers<{ code: null; signal: null }>();
+      child.once("error", (error: Error) => {
+        spawnError = error;
+        settleExit({ code: null, signal: null });
       });
       // A missing docker binary or unreachable socket must fail closed (never
       // hang on a dead stdout). Surface the spawn error on stdout so the
@@ -574,6 +579,16 @@ async function launchDockerContainer(
       const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
       if (leaseLost) tornDown.leaseLost = true;
       return { kind: "result", result: tornDown };
+    }
+    // A failed `docker` spawn (no CLI / no socket — e.g. the supervisor
+    // running inside a bare container) settles exit as {code:null,
+    // signal:null} WITHOUT any stdout bytes: a destroyed never-started pipe
+    // never emits `end`, so awaiting boundedResponse here would hang
+    // forever (#344 CI: the executor boot probe stalled before its own PAT
+    // fail-closed guard). The null/null sentinel with zero output is the
+    // spawn-failure signature — fail closed loudly instead.
+    if (exited.code === null && exited.signal === null && !timedOut && !leaseLost) {
+      return { kind: "error", protocolError: "sandbox unavailable: the docker CLI could not be spawned (missing binary or socket)" };
     }
     try {
       responseBytes = await boundedResponse;
