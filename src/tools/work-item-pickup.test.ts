@@ -113,6 +113,10 @@ describe("pickup directive (issue #89)", () => {
     expect(directive).toContain("CONFIRMABLE DRAFT");
     expect(directive).toContain("create_work_item");
     expect(directive).toContain("pickup_confidence=high");
+    // The nightly semantic-pickup journey matches the created item on the
+    // user's verbatim fixture wording; a paraphrasing model breaks that
+    // round-trip proof, so the directive must pin it.
+    expect(directive).toContain("verbatim");
   });
 
   test("reflects the configured threshold in the confidence-gate wording", () => {

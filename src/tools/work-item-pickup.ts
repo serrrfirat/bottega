@@ -186,7 +186,9 @@ export function buildAutoPickupDirective(threshold: PickupConfidence = "high"): 
       `${vocabulary} — treat it as a work-item request.`,
     `Confidence gate (work_items.pickup_confidence=${threshold}): ${draftsOn} → post a CONFIRMABLE DRAFT of the ` +
       "work item (description, repo when derivable, delivery kind, model/effort pin) and ask the user to confirm. " +
-      "On explicit confirmation, call create_work_item with the draft's fields. Below that confidence (hedged, " +
+      "The description must quote the user's request wording verbatim — never paraphrase, expand, or enrich it; " +
+      "downstream automation and audits match items on the original phrasing. On explicit confirmation, call " +
+      "create_work_item with the draft's fields unchanged. Below that confidence (hedged, " +
       "vague, or missing object) → ask a clarifying question first. Never create a work item without explicit " +
       "in-channel confirmation, and never silently ignore an actionable request.",
     'Model/effort derivation: when the request names a pin ("using <model> [at <effort>]"), carry the model + ' +
