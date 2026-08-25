@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
-import { SLACK_RECONNECT_MAX_DELAY_MS, watchSocketModeReconnect } from "./slack";
+import { SLACK_RECONNECT_MAX_DELAY_MS, describeError, watchSocketModeReconnect } from "./slack";
 
 /**
  * Hermetic regression for issue #237: @slack/socket-mode v3 computes its own
@@ -13,31 +13,42 @@ import { SLACK_RECONNECT_MAX_DELAY_MS, watchSocketModeReconnect } from "./slack"
  * Fake timers make the backoff schedule fully deterministic.
  */
 
+type SocketLifecycleEvent = "connected" | "disconnected";
+
 /** Records start() timestamps and the events the watchdog subscribes to. */
 class FakeSocketModeClient {
   readonly startCalls: number[] = [];
   /** start() rejects while > 0 (like a failed apps.connections.open / hello). */
   failNextStart = 0;
-  private listeners: Record<string, Set<() => void>> = {};
+  /**
+   * When `rejectWithMarkedValue` is set before a failing start(), it rejects
+   * with `markedRejectValue` — used to reproduce the SDK rejecting with NO
+   * value at all (a pre-hello websocket death under autoReconnectEnabled:
+   * false, which is what produced "boot connect failed: undefined").
+   */
+  markedRejectValue?: unknown;
+  rejectWithMarkedValue = false;
+  private listeners = new Map<SocketLifecycleEvent, Set<(reason?: Error) => void>>();
 
-  on(event: string, listener: () => void): this {
-    let set = this.listeners[event];
+  on(event: SocketLifecycleEvent, listener: (reason?: Error) => void): this {
+    let set = this.listeners.get(event);
     if (set === undefined) {
       set = new Set();
-      this.listeners[event] = set;
+      this.listeners.set(event, set);
     }
     set.add(listener);
     return this;
   }
 
-  emit(event: string): void {
-    for (const listener of this.listeners[event] ?? []) listener();
+  emit(event: SocketLifecycleEvent, reason?: Error): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(reason);
   }
 
   async start(): Promise<void> {
     this.startCalls.push(Date.now());
     if (this.failNextStart > 0) {
       this.failNextStart -= 1;
+      if (this.rejectWithMarkedValue) throw this.markedRejectValue;
       throw new Error("apps.connections.open simulated failure");
     }
   }
@@ -149,6 +160,55 @@ describe("socket-mode reconnect watchdog (issue #237)", () => {
     } finally {
       watchdog.dispose(); // idempotent
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("socket-mode boot/reconnect error surfacing (#261 nightly red)", () => {
+  test("describeError renders every rejection shape without crashing", () => {
+    expect(describeError(new Error("boom"))).toContain("boom");
+    expect(describeError("plain")).toBe("plain");
+    class Circular {
+      self?: Circular;
+    }
+    const circular = new Circular();
+    circular.self = circular;
+    expect(describeError(circular)).toBe("[object Object]");
+  });
+
+  test("a reconnect attempt rejected with NO value still logs a labeled failure", async () => {
+    vi.useFakeTimers();
+    const client = new FakeSocketModeClient();
+    client.failNextStart = 1;
+    client.markedRejectValue = undefined; // exactly what the SDK does pre-hello
+    client.rejectWithMarkedValue = true;
+    const capture = capturingLog();
+    const watchdog = watchSocketModeReconnect(client, capture.log, { baseDelayMs: 10, maxDelayMs: 40 });
+    try {
+      client.emit("connected");
+      client.emit("disconnected");
+      await tick(10);
+      expect(capture.lines.some((l) => l.includes("reconnect attempt 1 failed (undefined)"))).toBe(true);
+      // The loop stays alive after the argument-less rejection.
+      expect(client.startCalls.length).toBe(1);
+    } finally {
+      watchdog.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a disconnect carrying a reason surfaces it in the connection-lost log", () => {
+    const client = new FakeSocketModeClient();
+    const capture = capturingLog();
+    const watchdog = watchSocketModeReconnect(client, capture.log, { baseDelayMs: 10, maxDelayMs: 40 });
+    try {
+      client.emit("connected");
+      client.emit("disconnected", new Error("wss handshake refused"));
+      expect(
+        capture.lines.some((l) => l.includes("connection lost") && l.includes("reason: Error: wss handshake refused")),
+      ).toBe(true);
+    } finally {
+      watchdog.dispose();
     }
   });
 });

@@ -1124,6 +1124,29 @@ export const SLACK_RECONNECT_MAX_DELAY_MS = 60_000;
 export const SLACK_RECONNECT_BACKOFF_MULTIPLIER = 2;
 /** A boot connect must reach `connected` within this or start() fails loud. */
 export const SLACK_BOOT_CONNECT_TIMEOUT_MS = 60_000;
+/**
+ * Renders any caught rejection as human-readable text — never a bare
+ * "undefined" or "[object Object]". Error → stack (message included);
+ * primitives → String; objects → JSON (falling back to Object#toString for
+ * circular structures). The socket-mode SDK rejects start() with NO value
+ * when a websocket dies before Slack's hello handshake while auto-reconnect
+ * is off, so callers MUST pair this with context about what was attempted.
+ */
+export function describeError(cause: unknown): string {
+  if (cause instanceof Error) return cause.stack ?? `${cause.name}: ${cause.message}`;
+  if (cause === null || cause === undefined) return String(cause);
+  // Boxed-primitive check via constructor lookup (typeof narrowing is
+  // banned by lint): raw text for string/number/boolean rejections.
+  if (cause.constructor === String || cause.constructor === Number || cause.constructor === Boolean) {
+    return String(cause);
+  }
+  // Plain objects (e.g. Slack error payloads): JSON when possible.
+  try {
+    return JSON.stringify(cause) ?? Object.prototype.toString.call(cause);
+  } catch {
+    return Object.prototype.toString.call(cause);
+  }
+}
 
 /** The socket-mode client surface the watchdog drives (real value: SocketModeReceiver#client). */
 export interface SocketModeClientLike {
@@ -1196,13 +1219,18 @@ export function watchSocketModeReconnect(
     }
   };
 
-  const handleDisconnected = (): void => {
+  const handleDisconnected = (reason?: Error): void => {
     if (disposed) return;
     const attempt = attempts + 1;
     const uptime = connectedAt !== undefined ? Math.max(0, Math.round((Date.now() - connectedAt) / 1000)) : 0;
     lostAt = Date.now();
+    // The SDK usually emits `disconnected` with NO argument (auto-reconnect
+    // off); when it does carry a reason, surface it instead of dropping it.
+    const why = reason === undefined ? "" : ` — reason: ${describeError(reason)}`;
     log.failure(
-      `[slack] socket-mode connection lost after ${uptime}s of uptime — reconnecting in ${backoff(attempt) / 1000}s (attempt ${attempt})`,
+      `[slack] socket-mode connection lost after ${uptime}s of uptime${why} — reconnecting in ${
+        backoff(attempt) / 1000
+      }s (attempt ${attempt})`,
     );
     schedule(attempt);
   };
@@ -1230,7 +1258,7 @@ export function watchSocketModeReconnect(
       await client.start();
     } catch (err) {
       if (disposed) return;
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = describeError(err);
       const next = attempt + 1;
       log.failure(
         `[slack] reconnect attempt ${attempt} failed (${detail}) — retrying in ${backoff(next) / 1000}s (attempt ${next})`,
@@ -1716,8 +1744,20 @@ export function createSlackAdapter(opts: {
       // logs "[slack] socket connected" at that point. Race it against a
       // bounded timeout so a hung connect (no hello, no close) fails loud
       // instead of silently booting a dead connector for hours.
+      //
+      // With auto-reconnect disabled (above), the SDK rejects start() with NO
+      // value when the websocket errors or closes before hello — logging that
+      // raw rejection yields the useless "boot connect failed: undefined".
+      // The real cause arrives separately on the client's `error` event (an
+      // SMWebsocketError wrapping the websocket failure), so capture those
+      // during the boot window and surface them with any failure.
       let bootTimer: ReturnType<typeof setTimeout> | undefined;
       const connect = app.start();
+      const bootSocketErrors: Error[] = [];
+      const captureBootSocketError = (err: Error): void => {
+        bootSocketErrors.push(err);
+      };
+      receiver.client.on("error", captureBootSocketError);
       const bootDeadline = new Promise<never>((_, reject) => {
         bootTimer = setTimeout(
           () =>
@@ -1732,10 +1772,23 @@ export function createSlackAdapter(opts: {
       try {
         await Promise.race([connect, bootDeadline]);
       } catch (err) {
-        console.error(`[slack] boot connect failed: ${err instanceof Error ? err.message : String(err)}`);
+        // Fail loud with the REAL cause: the normalized rejection plus every
+        // underlying client error captured while connecting. An empty
+        // capture with an argument-less rejection means the websocket died
+        // pre-hello without an error event; the checklist names what to
+        // verify (token validity, Socket Mode enabled, wss reachability).
+        const causes =
+          bootSocketErrors.length > 0
+            ? ` — underlying socket-mode client error(s): ${bootSocketErrors.slice(-3).map(describeError).join("; ")}`
+            : " — no underlying client error event was captured";
+        console.error(
+          `[slack] boot connect failed: ${describeError(err)}${causes}. Checklist: SLACK_APP_TOKEN valid ` +
+            "(xapp- tokens are revoked by app re-install), Socket Mode enabled on the app config, wss endpoint reachable.",
+        );
         throw err;
       } finally {
         clearTimeout(bootTimer);
+        receiver.client.off("error", captureBootSocketError);
         // Absorb a late rejection from the raced-away connect so it never
         // surfaces as an unhandled rejection; the watchdog still owns any
         // recovery if the socket lands after we gave up on the boot.
