@@ -242,6 +242,8 @@ export type ListAuditOpts = {
   space?: string;
   since?: number;
   event_type?: string;
+  /** Strict id lower bound for tailing consumers (reactive core, #356). */
+  after_id?: number;
   limit?: number;
 };
 
@@ -2126,6 +2128,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     if (opts.space !== undefined) predicates.push(["space_id = ?", opts.space]);
     if (opts.since !== undefined) predicates.push(["ts >= ?", opts.since]);
     if (opts.event_type !== undefined) predicates.push(["event_type = ?", opts.event_type]);
+    if (opts.after_id !== undefined) predicates.push(["id > ?", opts.after_id]);
     const where = buildAuditWhere(predicates);
     const params = [...where.params];
     let sql = "SELECT * FROM audit" + where.sql;

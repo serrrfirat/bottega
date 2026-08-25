@@ -48,7 +48,8 @@ import type { SlackAdapter } from "../adapters/slack";
 import { issueCard, type SlackBlock } from "../adapters/blocks";
 import { dispatchIngestEvent } from "../../ingest/dispatch";
 import { createAudit } from "../../policy/audit";
-import { makeSingleFlightLoop } from "./single-flight-loop";
+import { startReactiveCore } from "../../events/reactive";
+import type { ReactiveBehavior } from "../../events/reactive";
 
 /** Post-seam pass interval. Default 5000 ms — the delivery poller's cadence. */
 export const DEFAULT_OUTBOX_POST_INTERVAL_MS = 5000;
@@ -441,12 +442,21 @@ export async function nudgeUnclaimedOutboxRowsToSlack(
   }
   return rows.length;
 }
-
-/** Background loop around {@link postPendingOutboxRows}. First pass runs immediately. */
-export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
+/**
+ * The outbox-post-seam behavior (issue #356): a sweep-driven registration
+ * in the reactive core. The outbox table is a status-dedupe QUEUE, not the
+ * ledger — its rows carry no audit id to tail — so the pass stays
+ * time-based (the issue's retained single-flight case) while borrowing the
+ * core's one lifecycle: cadence, immediate first pass, error isolation,
+ * stop(). Every pass drains the pending batch from a FRESH cursor and
+ * routes the unclaimed nudge leg.
+ */
+export function outboxPostSeamBehavior(deps: OutboxPostSeamDeps): ReactiveBehavior {
   const log = deps.log ?? (() => {});
-  const tick = async (): Promise<void> => {
-    try {
+  return {
+    id: "outbox-post-seam",
+    events: [],
+    sweep: async () => {
       const pass = await postPendingOutboxRows(deps.store, deps.adapter, {
         maxPostAttempts: deps.maxPostAttempts,
         olderThanMs: deps.olderThanMs,
@@ -454,21 +464,31 @@ export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
       });
       if (pass.posted > 0) log(`outbox post seam: posted ${pass.posted} result(s)`);
       if (pass.nudged > 0) log(`outbox post seam: nudged ${pass.nudged} unclaimed row(s)`);
-    } catch (err) {
+    },
+  };
+}
+
+/**
+ * Background loop around the {@link outboxPostSeamBehavior} — a
+ * single-behavior reactive core (issue #356). First pass runs immediately.
+ */
+export function startOutboxPostSeam(deps: OutboxPostSeamDeps): OutboxPostSeam {
+  const log = deps.log ?? (() => {});
+  const intervalMs = deps.intervalMs ?? DEFAULT_OUTBOX_POST_INTERVAL_MS;
+  const core = startReactiveCore(deps.store, [outboxPostSeamBehavior(deps)], {
+    intervalMs,
+    onError: ({ error }) => {
       // One bad pass must not kill the loop; the next tick retries from
       // scratch (a fresh cursor — the row status is the dedupe).
-      log(`outbox post seam: pass failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  };
-  // The cadence + in-flight guard are the single-flight loop shared with the
-  // delivery poller (issue #341 finding 6): an immediate first pass, then one
-  // chained pass at a time scheduled from the END of the previous one, keeping
-  // the loop single-flight (issue #70 pattern): an overlapping pass would be
-  // harmless to dedupe (the consume marks rows posted atomically) but wasteful
-  // and harder to reason about. tick must not throw — it handles its own
-  // errors above.
-  return makeSingleFlightLoop({
-    tick,
-    intervalMs: deps.intervalMs ?? DEFAULT_OUTBOX_POST_INTERVAL_MS,
+      log(`outbox post seam: pass failed: ${error instanceof Error ? error.message : String(error)}`);
+    },
   });
+  return {
+    start() {
+      core.start();
+    },
+    stop() {
+      core.stop();
+    },
+  };
 }

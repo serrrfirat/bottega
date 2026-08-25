@@ -1,16 +1,24 @@
 /**
- * Server-side memory consolidation trigger (issues #272, #155, and #321):
- * a provider that reports explicit consolidation gets a scheduled
+ * Server-side memory consolidation trigger (issues #272, #155, and #321),
+ * migrated onto the reactive core as a sweep behavior (issue #356): a
+ * provider that reports explicit consolidation gets a scheduled
  * memory_consolidation WORKER job at boot and every 6 hours. The LLM leg
  * runs in the executor, never in this process. A provider that consolidates
  * on save needs no scheduled pass. An unsupported configured provider fails
  * loudly instead of looking like a successful maintenance no-op.
+ *
+ * There is no MEMORY_BATCH_READY-style ledger event to react to yet — the
+ * cadence is the issue #356 retained time-based case — but the bespoke
+ * setInterval/single-flight loop is gone: the reactive core owns the
+ * lifecycle (immediate first pass, chained cadence from each pass's end,
+ * error isolation).
  */
 import { errorMessage } from "../../tools/helpers";
 import { dispatchMemoryConsolidationJob } from "../../scheduler/memory-consolidation";
 import type { MemoryProvider } from "../../memory/types";
+import type { ReactiveBehavior } from "../../events/reactive";
+import { startReactiveCore } from "../../events/reactive";
 import type { Store } from "../../store/db";
-import { makeSingleFlightLoop } from "./single-flight-loop";
 
 /** The server-side cadence, preserved from the pre-#272 in-process run. */
 export const DEFAULT_CONSOLIDATION_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -35,26 +43,19 @@ export interface MemoryConsolidationTrigger {
 }
 
 /**
- * Builds the trigger. `start()` fires the boot pass (matching the old
- * runMemoryMaintenance() at boot) and arms the cadence. The cadence is the
- * single-flight loop shared with the delivery poller and the outbox post
- * seam (issue #341 finding 6): an immediate first pass, then one chained
- * pass at a time scheduled from the END of the previous one, so an
- * overlapping pass cannot enqueue a consolidation job a second time. A
- * throwing pass is logged, never allowed to stop the chain.
+ * The shared fire logic: enqueues the scheduled consolidation job unless
+ * consolidation is provider-managed on save or another fire is still in
+ * flight (the guard exists so two cadence ticks can never enqueue a second
+ * job while the first fire is pending). An unsupported configured provider
+ * rejects instead of looking like a successful maintenance no-op.
  */
-export function createMemoryConsolidationTrigger(
-  deps: MemoryConsolidationTriggerDeps,
-  opts: { intervalMs?: number } = {},
-): MemoryConsolidationTrigger {
+function createConsolidationFire(deps: MemoryConsolidationTriggerDeps): () => Promise<string | null> {
   let inFlight: Promise<string | null> | undefined;
 
-  const fire = async (): Promise<string | null> => {
+  return async (): Promise<string | null> => {
     const mode = deps.memoryProvider.capabilities.consolidation;
     if (mode === "unsupported") {
-      throw new Error(
-        "configured memory provider does not support required consolidation",
-      );
+      throw new Error("configured memory provider does not support required consolidation");
     }
     if (mode === "on-save" || inFlight) return null;
     inFlight = (async () => {
@@ -71,36 +72,73 @@ export function createMemoryConsolidationTrigger(
     })();
     return inFlight;
   };
+}
 
-  // One cadence tick is one fire; fires are themselves deduped, so a slow
-  // pass never overlaps the next tick. tick must not throw — fire's only
-  // rejection (an unsupported provider) is rejected up front by start(), but
-  // keep the chain alive anyway, exactly like the sibling loops.
-  const loop = makeSingleFlightLoop({
-    tick: async () => {
+/**
+ * The memory-consolidation behavior (issue #356): a sweep-only registration
+ * (no ledger events to tail yet). `sweep` delegates to the shared guarded
+ * fire and never throws — a failed enqueue must not kill the cadence chain,
+ * exactly like the sibling seams.
+ */
+export function memoryConsolidationBehavior(
+  deps: MemoryConsolidationTriggerDeps,
+  fire: () => Promise<string | null> = createConsolidationFire(deps),
+): ReactiveBehavior {
+  return {
+    id: "memory-consolidation-trigger",
+    events: [],
+    sweepIntervalMs: DEFAULT_CONSOLIDATION_INTERVAL_MS,
+    sweep: async () => {
       try {
         await fire();
       } catch (error) {
         deps.log?.(`[memory-consolidation] enqueue failed: ${errorMessage(error)}`);
       }
     },
-    intervalMs: opts.intervalMs ?? DEFAULT_CONSOLIDATION_INTERVAL_MS,
-  });
+  };
+}
 
+/**
+ * Builds the trigger. `start()` fires the boot pass (matching the old
+ * runMemoryMaintenance() at boot) and arms the cadence through a
+ * single-behavior reactive core. An unsupported configured provider throws
+ * on start (and rejects on fire); an on-save provider never starts a loop.
+ */
+export function createMemoryConsolidationTrigger(
+  deps: MemoryConsolidationTriggerDeps,
+  opts: { intervalMs?: number } = {},
+): MemoryConsolidationTrigger {
+  const fire = createConsolidationFire(deps);
+  const mode = deps.memoryProvider.capabilities.consolidation;
+  if (mode === "on-save" || mode === "unsupported") {
+    return {
+      fire,
+      start() {
+        const current = deps.memoryProvider.capabilities.consolidation;
+        if (current === "unsupported") {
+          throw new Error("configured memory provider does not support required consolidation");
+        }
+      },
+      stop() {},
+    };
+  }
+
+  const behavior = memoryConsolidationBehavior(deps, fire);
+  // The production cadence default lives on the behavior; a caller-provided
+  // interval (tests, tuning) overrides it.
+  if (opts.intervalMs !== undefined) behavior.sweepIntervalMs = opts.intervalMs;
+  const core = startReactiveCore(deps.store, [behavior], {});
   return {
     fire,
     start() {
-      const mode = deps.memoryProvider.capabilities.consolidation;
-      if (mode === "unsupported") {
-        throw new Error(
-          "configured memory provider does not support required consolidation",
-        );
+      const current = deps.memoryProvider.capabilities.consolidation;
+      if (current === "unsupported") {
+        throw new Error("configured memory provider does not support required consolidation");
       }
-      if (mode === "on-save") return;
-      loop.start();
+      core.start();
     },
     stop() {
-      loop.stop();
+      core.stop();
     },
   };
 }

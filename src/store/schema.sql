@@ -307,3 +307,31 @@ CREATE TABLE IF NOT EXISTS pending_turns (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_turns_identity ON pending_turns(space_id, ts);
 CREATE INDEX IF NOT EXISTS idx_pending_turns_recover
   ON pending_turns(space_id, status, lease_until, id);
+
+-- Reactive core bookkeeping (issue #356): ONE event-reactive mechanism over
+-- the append-only audit ledger replaces the bespoke poller loops. Per
+-- behavior: the tailing watermark (last consumed audit row id), the
+-- at-least-once idempotency keys (`behaviorId` + `row.id`, recorded only
+-- after a reaction succeeds so a crash replays safely), and the fail-closed
+-- dead letter (a reaction that exhausted its bounded backoff retries —
+-- audit-visible evidence, never a silent drop). The ledger itself stays
+-- read-only to this subsystem.
+CREATE TABLE IF NOT EXISTS reactive_watermarks (
+  behavior_id TEXT PRIMARY KEY,
+  last_id     INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reactive_deliveries (
+  behavior_id TEXT NOT NULL,
+  row_id      INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (behavior_id, row_id)
+);
+CREATE TABLE IF NOT EXISTS reactive_dead_letter (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  behavior_id  TEXT NOT NULL,
+  audit_row_id INTEGER NOT NULL,
+  error        TEXT NOT NULL,
+  attempts     INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL
+);

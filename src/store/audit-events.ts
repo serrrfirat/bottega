@@ -12,6 +12,13 @@
 export const WORK_ITEM_CREATED_EVENT = "work_item.created";
 /** Space skill summaries listed (payload {skills:[{name,source_tier,revision}]}). */
 export const SPACE_SKILL_LISTED_EVENT = "space_skill.listed";
+/**
+ * M4 proactive seed (issue #356): a space skill (procedure) went stale —
+ * created/updated long ago and never read since (payload {name,
+ * age_days}; space_id top-level). One alert per procedure until its next
+ * revision; the row doubles as the dedupe marker.
+ */
+export const PROCEDURE_STALE_ALERTED_EVENT = "procedure.stale_alerted";
 /** Effective space skill read (payload {name,source_tier,revision,companion_files}); never bodies. */
 export const SPACE_SKILL_READ_EVENT = "space_skill.read";
 /** Space-tier skill created (payload {name,revision,companion_files}); never bodies. */

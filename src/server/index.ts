@@ -2,7 +2,8 @@
  * Bottega server entrypoint: Slack adapter (Socket Mode) + space service.
  */
 import { sessionSearchToolDefinitions } from "../memory/session-search";
-import { createMemoryConsolidationTrigger } from "./services/memory-consolidation-trigger";
+import { memoryConsolidationBehavior } from "./services/memory-consolidation-trigger";
+import { startReactiveCore } from "../events/reactive";
 import type { ApprovalRouter } from "../policy/approval-router";
 import { loadSpacePolicy, type ResponseMode } from "../policy/config";
 import { evaluatePolicyGate } from "../policy/gate";
@@ -73,8 +74,9 @@ import {
   sessionIdFromFilePath,
   type AgentDriver,
 } from "./drivers/agent-driver";
-import { startDeliveryPoller } from "./services/delivery-poller";
-import { startOutboxPostSeam } from "./services/outbox-post-seam";
+import { deliveryApprovalPromptBehavior } from "./services/delivery-poller";
+import { outboxPostSeamBehavior } from "./services/outbox-post-seam";
+import { staleProcedureAlertBehavior } from "./services/stale-procedure-alert";
 import { SlackApprovalRouter, DEFAULT_NUDGE_MINUTES } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
 import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
@@ -984,18 +986,30 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     );
     console.log("bottega boot: mnesis embedding endpoint reachable");
   }
-  // Memory consolidation trigger (issue #272, epic #229 P2): the sqlite
-  // backend enqueues a `scheduled` memory_consolidation WORKER job at boot
-  // and every 6 hours — the LLM leg (the side session this process used to
-  // run) moved into the executor's job-context model-call seam. The trigger
-  // semantics (sqlite backend gate + the pipeline's compaction threshold)
-  // are unchanged; this process only enqueues.
-  const memoryConsolidationTrigger = createMemoryConsolidationTrigger({
+  // Reactive core (issue #356): ONE event-reactive mechanism over the
+  // append-only audit ledger replaces the bespoke poller loops. Behaviors
+  // register here; a new proactive-brain feature is one more entry, zero
+  // new plumbing. The memory-consolidation cadence (issue #272) rides the
+  // same lifecycle as its retained time-based case; an unsupported
+  // configured provider still fails boot loudly, an on-save provider never
+  // starts a consolidation loop.
+  const consolidationMode = memoryProvider.capabilities.consolidation;
+  if (consolidationMode === "unsupported") {
+    throw new Error("configured memory provider does not support required consolidation");
+  }
+  const reactiveCore = startReactiveCore(
     store,
-    memoryProvider,
-    log: (line) => console.log(line),
-  });
-  memoryConsolidationTrigger.start();
+    [
+      deliveryApprovalPromptBehavior({ store, adapter }),
+      outboxPostSeamBehavior({ store, adapter }),
+      ...(consolidationMode === "explicit"
+        ? [memoryConsolidationBehavior({ store, memoryProvider, log: (line) => console.log(line) })]
+        : []),
+      staleProcedureAlertBehavior({ store, adapter }),
+    ],
+    { log: (line) => console.log(line) },
+  );
+  reactiveCore.start();
   spaceService = new SpaceService({
     store,
     adapter,
@@ -1022,32 +1036,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // is the active provider; other providers get a provider-aware remedy.
     activeDefaultModel,
   });
-  // Executor's delivery seam (issue #11 follow-up, #12, round trip #149):
-  // the executor runs in its own container and cannot post to Slack. When a
-  // work item's PR is opened it writes a work_item.delivery_pending audit
-  // marker; this poller watches that trail, posts the PR + an interactive
-  // approve/deny prompt to the space channel, and records
-  // delivery.requested (dedupe across restarts). A button click resolves
-  // the seam (delivery.resolved via deliveryActionHandler above) and the
-  // executor's onDelivery wait completes working -> review -> done.
-  const deliveryPoller = startDeliveryPoller({
-    store,
-    adapter,
-    log: (line) => console.log(line),
-  });
-  // Worker→server post seam (epic #170 item 3, issue #187): the worker has
-  // no Slack tokens (credential boundary, issue #9) — it signals a
-  // completed job by writing an outbox row; THIS seam consumes the rows
-  // (the Wave-1 watermarked consumer), posts each result to the row's
-  // space, audits outbox.posted, and bounded-retries post failures
-  // (outbox.failed). The same cadence routes nudgeUnclaimedOutboxRows to
-  // the Slack nudge: a completed row no consumer picked up within the TTL
-  // surfaces as job.unclaimed + a visible post (fail-loud, epic #170).
-  const outboxPostSeam = startOutboxPostSeam({
-    store,
-    adapter,
-    log: (line) => console.log(line),
-  });
   // Idempotent opt-in seeder (issue #161): guarantee a weekly governance_digest
   // job for every space whose policy enables proactive.governance. A boot that
   // fails to seed fails loudly here, before the runner starts.
@@ -1065,17 +1053,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   return {
     async start() {
       await adapter.start();
-      deliveryPoller.start();
-      outboxPostSeam.start();
       scheduler.start();
     },
     async stop() {
-      memoryConsolidationTrigger.stop();
+      reactiveCore.stop();
       // The upload-link leg has no listener of its own — it mounts onto the
       // callback's shared surface, stopped here.
       oauthCallback.stop();
-      deliveryPoller.stop();
-      outboxPostSeam.stop();
       scheduler.stop();
       await spaceService.stop();
       await adapter.stop();

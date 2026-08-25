@@ -1,13 +1,14 @@
 /**
- * Delivery approval poller (issue #12, #11 follow-up; round trip #149).
+ * Delivery approval seam (issue #12, #11 follow-up; round trip #149),
+ * migrated onto the reactive core (issue #356).
  *
  * The executor runs in its own container and cannot post to Slack: when a
  * work item's PR is opened it writes a `work_item.delivery_pending` audit
  * marker (payload {id, pr_url, summary}) and then waits on the onDelivery
- * seam. The server side of that seam is this poller: it watches the audit
- * trail, posts the PR + an interactive approve/deny prompt to the space
- * channel via the adapter, and records a `delivery.requested` audit row so
- * a restart never double-posts.
+ * seam. The server side of that seam is the `delivery-approval-prompt`
+ * behavior below: it reacts to those ledger rows, posts the PR + an
+ * interactive approve/deny prompt to the space channel via the adapter, and
+ * records a `delivery.requested` audit row so a restart never double-posts.
  *
  * `delivery.requested` is distinct from `approval.requested` (which is
  * reserved for policy-tool approvals with payload {tool, reason}) — the
@@ -22,10 +23,11 @@
  */
 import { z } from "zod";
 import { DELIVERY_PENDING_EVENT, DELIVERY_REQUESTED_EVENT } from "../../store/audit-events";
-import type { Store } from "../../store/db";
+import type { AuditRow, Store } from "../../store/db";
+import type { ReactionResult, ReactiveBehavior } from "../../events/reactive";
+import { startReactiveCore, type ReactiveCore } from "../../events/reactive";
 import type { SlackAdapter } from "../adapters/slack";
 import { buildDeliveryBlocks } from "../adapters/delivery-router";
-import { makeSingleFlightLoop } from "./single-flight-loop";
 
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -52,6 +54,9 @@ const DeliveryPayloadSchema = z.object({
 });
 type DeliveryPayload = z.infer<typeof DeliveryPayloadSchema>;
 
+/** A recognized no-op: consumed once, never retried. */
+const NO_OP: ReactionResult = { handled: false };
+
 function parsePayload(raw: string): DeliveryPayload | null {
   try {
     return DeliveryPayloadSchema.parse(JSON.parse(raw));
@@ -61,75 +66,106 @@ function parsePayload(raw: string): DeliveryPayload | null {
 }
 
 /**
- * One poll pass: for every delivery_pending marker whose item has no
- * delivery.requested row yet, post the PR + approval request to the space
- * channel and record the request. Returns the number of announcements made.
- * Idempotent across restarts — the audit row is the dedupe key.
+ * Announces one delivery_pending marker whose item has no delivery.requested
+ * row yet: posts the PR + approval request to the space channel and records
+ * the request. Returns true when an announcement was made, false for
+ * recognized no-ops. Throws on post/record failures — the reactive core
+ * retries with backoff and the audit row dedupes replays after a crash.
+ */
+async function announcePendingDelivery(
+  store: Pick<Store, "listAudit" | "appendAudit">,
+  adapter: Pick<SlackAdapter, "postMessage">,
+  row: AuditRow,
+): Promise<ReactionResult> {
+  if (!row.space_id || row.event_type !== DELIVERY_PENDING_EVENT) return NO_OP;
+  const payload = parsePayload(row.payload);
+  if (!payload || payload.id === undefined || payload.pr_url === undefined) return NO_OP;
+  const requested = await store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT });
+  for (const requestedRow of requested) {
+    const requestedPayload = parsePayload(requestedRow.payload);
+    if (requestedPayload?.id === payload.id) return NO_OP;
+  }
+  const summary = payload.summary ?? "";
+  // Interactive prompt: approve/deny buttons carry the work item id, the
+  // key the delivery router resolves on (issue #149).
+  await adapter.postMessage(
+    row.space_id,
+    `PR ready: ${payload.pr_url} — approve to finish`,
+    { blocks: buildDeliveryBlocks(payload.pr_url, summary, payload.id) },
+  );
+  await store.appendAudit({
+    space_id: row.space_id,
+    actor: "server",
+    event_type: DELIVERY_REQUESTED_EVENT,
+    payload: JSON.stringify({
+      id: payload.id,
+      pr_url: payload.pr_url,
+      summary,
+    }),
+  });
+  return { handled: true };
+}
+
+/**
+ * The delivery-approval-prompt behavior (issue #356): reacts to every
+ * `work_item.delivery_pending` ledger row exactly once per item — the
+ * `delivery.requested` audit row is the dedupe key across crash replays.
+ */
+export function deliveryApprovalPromptBehavior(deps: DeliveryPollerDeps): ReactiveBehavior {
+  return {
+    id: "delivery-approval-prompt",
+    events: [DELIVERY_PENDING_EVENT],
+    react: (row) => announcePendingDelivery(deps.store, deps.adapter, row),
+  };
+}
+
+/**
+ * One poll pass over every pending marker (the flow-level helper the
+ * behavior composes per row). Idempotent across restarts — the audit row is
+ * the dedupe key.
  */
 export async function pollPendingDeliveries(
   store: Pick<Store, "listAudit" | "appendAudit">,
   adapter: Pick<SlackAdapter, "postMessage">,
 ): Promise<number> {
-  const [pending, requested] = await Promise.all([
-    store.listAudit({ event_type: DELIVERY_PENDING_EVENT }),
-    store.listAudit({ event_type: DELIVERY_REQUESTED_EVENT }),
-  ]);
-  const announced = new Set<string>();
-  for (const row of requested) {
-    const payload = parsePayload(row.payload);
-    if (payload && payload.id !== undefined) announced.add(payload.id);
-  }
-
+  const pending = await store.listAudit({ event_type: DELIVERY_PENDING_EVENT });
   let posted = 0;
   for (const row of pending) {
-    if (!row.space_id) continue;
-    const payload = parsePayload(row.payload);
-    if (!payload || payload.id === undefined || payload.pr_url === undefined) continue;
-    if (announced.has(payload.id)) continue;
-    const summary = payload.summary ?? "";
-    // Interactive prompt: approve/deny buttons carry the work item id, the
-    // key the delivery router resolves on (issue #149).
-    await adapter.postMessage(
-      row.space_id,
-      `PR ready: ${payload.pr_url} — approve to finish`,
-      { blocks: buildDeliveryBlocks(payload.pr_url, summary, payload.id) },
-    );
-    await store.appendAudit({
-      space_id: row.space_id,
-      actor: "server",
-      event_type: DELIVERY_REQUESTED_EVENT,
-      payload: JSON.stringify({
-        id: payload.id,
-        pr_url: payload.pr_url,
-        summary,
-      }),
-    });
-    announced.add(payload.id);
-    posted += 1;
+    if ((await announcePendingDelivery(store, adapter, row)).handled) posted += 1;
   }
   return posted;
 }
 
-/** Background loop around {@link pollPendingDeliveries}. First pass runs immediately. */
+/**
+ * Background loop around the {@link deliveryApprovalPromptBehavior} — a
+ * single-behavior reactive core (issue #356). First pass runs immediately.
+ */
 export function startDeliveryPoller(deps: DeliveryPollerDeps): DeliveryPoller {
   const log = deps.log ?? (() => {});
-  const tick = async (): Promise<void> => {
-    try {
-      const posted = await pollPendingDeliveries(deps.store, deps.adapter);
-      if (posted > 0) log(`delivery poller: announced ${posted} approval request(s)`);
-    } catch (err) {
-      // One bad pass must not kill the loop; unposted rows retry next tick.
-      log(`delivery poller: poll failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  const intervalMs = deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const core: ReactiveCore = startReactiveCore(
+    deps.store,
+    [deliveryApprovalPromptBehavior(deps)],
+    {
+      intervalMs,
+      // Retry eligibility aligned with the pass cadence: the first retry
+      // runs on the next pass, later consecutive failures back off.
+      backoffMs: intervalMs,
+      onError: ({ error }) => {
+        // One bad reaction must not kill the loop; unposted rows retry next tick.
+        log(`delivery poller: poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      },
+      onPass: ({ delivered }) => {
+        if (delivered > 0) log(`delivery poller: announced ${delivered} approval request(s)`);
+      },
+    },
+  );
+  return {
+    start() {
+      core.start();
+    },
+    stop() {
+      core.stop();
+    },
   };
-  // The cadence + in-flight guard are the single-flight loop shared with the
-  // outbox post seam (issue #341 finding 6): an immediate first pass, then one
-  // chained pass at a time scheduled from the END of the previous one, so an
-  // overlapping pass (a fixed-interval timer while postMessage is still in
-  // flight) would see the pending row unrecorded and announce it a second
-  // time (issue #70). tick must not throw — it handles its own errors above.
-  return makeSingleFlightLoop({
-    tick,
-    intervalMs: deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS,
-  });
 }

@@ -256,6 +256,32 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    id: "015_add_reactive_core_tables",
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS reactive_watermarks (
+          behavior_id TEXT PRIMARY KEY,
+          last_id     INTEGER NOT NULL,
+          updated_at  INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reactive_deliveries (
+          behavior_id TEXT NOT NULL,
+          row_id      INTEGER NOT NULL,
+          created_at  INTEGER NOT NULL,
+          PRIMARY KEY (behavior_id, row_id)
+        );
+        CREATE TABLE IF NOT EXISTS reactive_dead_letter (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          behavior_id  TEXT NOT NULL,
+          audit_row_id INTEGER NOT NULL,
+          error        TEXT NOT NULL,
+          attempts     INTEGER NOT NULL,
+          created_at   INTEGER NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {
