@@ -49,7 +49,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      # The real-container lane below drives `bun test` HOST-side against the
+      # built image (the host only orchestrates; the container is the
+      # boundary), so this job needs the same pinned toolchain as `ci`
+      # (#344: without it the step died with `bun: command not found`).
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
       - name: Compose file is valid
         run: docker compose --profile executor config -q
 
