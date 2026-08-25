@@ -212,6 +212,11 @@ const TIER_BY_TOOL: ToolTiers = {
   // Web search (issue #278): read-only cited search — the proxy-injected
   // provider key never leaves the egress boundary.
   search_web: "read",
+  // Org graph view (issue #357): graph_query is a pure read-model
+  // projection over existing tables — read-tier like list_todos, so the
+  // gate lets it through under a read: allow policy instead of denying
+  // as an unknown exec tool.
+  graph_query: "read",
   // Owned-space Slack read (issue #340): the agent reads its own channel's
   // thread/history to hydrate context. The channel is always derived from
   // the session's space id (no channel argument), and a missing history

@@ -24,6 +24,7 @@ import { objectToolDefinitions } from "../tools/objects";
 import { modelToolsDefinitions } from "../tools/model-settings";
 import { settingsToolDefinitions } from "../tools/settings";
 import { adminToolDefinitions, onboardingGuideText, runWizardChecks } from "../tools/admin";
+import { graphQueryToolDefinition } from "../tools/graph-query";
 import { kbToolDefinitions, type KbToolDependencies } from "../tools/kb-tools";
 import { listTodosToolDefinition } from "../tools/list-todos";
 import { chartToolDefinition } from "../tools/render-chart";
@@ -796,6 +797,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       readThread: adapter.readThread?.bind(adapter),
       readHistory: adapter.readHistory?.bind(adapter),
     }),
+    // Org graph view (issue #357): read-tier people↔projects↔decisions
+    // queries over existing tables. Read-only projection + bounded
+    // multi-hop walks; provenance rides every match (#163 receipts).
+    graphQueryToolDefinition(store),
   ];
   opts.onSessionToolset?.(sessionToolset);
   // Issue #167: the extension half of the space agent's session toolset.

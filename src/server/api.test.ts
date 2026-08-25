@@ -18,6 +18,7 @@ import { mountRestApi } from "./api";
 import {
   API_AUDIT_READ_EVENT,
   API_AUTH_DENIED_EVENT,
+  API_GRAPH_PROJECTED_EVENT,
   API_SPACES_LISTED_EVENT,
   API_WORK_ITEM_CREATED_EVENT,
   API_WORK_ITEMS_LISTED_EVENT,
@@ -346,11 +347,44 @@ describe("GET /openapi.json (issue #100)", () => {
 
     // All four API routes are listed (openapi.json itself is not an operation).
     const paths = Object.keys(doc.paths).sort();
-    expect(paths).toEqual(["/api/v1/audit", "/api/v1/spaces", "/api/v1/work-items"].sort());
+    expect(paths).toEqual(["/api/v1/audit", "/api/v1/graph", "/api/v1/spaces", "/api/v1/work-items"].sort());
     expect(doc.components.securitySchemes.bearerAuth).toEqual({
       type: "http",
       scheme: "bearer",
       bearerFormat: "opaque",
     });
+  });
+});
+
+describe("GET /api/v1/graph (issue #357)", () => {
+  test("with a valid token returns the projected nodes+edges and audits the read", async () => {
+    const h = freshHarness();
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: "C1", name: "Billing" });
+    const item = await h.store.createWorkItem({ space_id: "slack:C1", requester: "U1", description: "fix billing" });
+    const res = await get(h, "/api/v1/graph?space=slack%3AC1");
+    expect(res.status).toBe(200);
+    // SAFETY: the graph body is the projection JSON emitted by projectGraph;
+    // node/edge shapes are asserted below, not fabricated.
+    const body = (await res.json()) as {
+      count: number;
+      nodes: Array<{ kind: string; id: string; label: string }>;
+      edges: Array<{ from: { kind: string; id: string }; to: { kind: string; id: string }; rel: string }>;
+    };
+    expect(body.count).toBe(body.nodes.length);
+    expect(body.nodes.some((n) => n.kind === "work-item" && n.id === item.id)).toBe(true);
+    expect(body.nodes.some((n) => n.kind === "space" && n.id === "slack:C1")).toBe(true);
+    expect(body.nodes.some((n) => n.kind === "person" && n.id === "U1")).toBe(true);
+    expect(body.edges.some((e) => e.rel === "created" && e.from.id === item.id && e.to.id === "U1")).toBe(true);
+
+    const rows = await auditRows(h, API_GRAPH_PROJECTED_EVENT);
+    const last = rows[rows.length - 1];
+    expect(last?.space).toBe("slack:C1");
+    expect(last?.nodes).toBe(body.nodes.length);
+  });
+
+  test("malformed since fails closed with 400", async () => {
+    const h = freshHarness();
+    const res = await get(h, "/api/v1/graph?since=abc");
+    expect(res.status).toBe(400);
   });
 });

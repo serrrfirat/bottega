@@ -275,6 +275,9 @@ describe("omp sdk agent driver", () => {
         "create_space_skill",
         "update_space_skill",
         "delete_space_skill",
+        // Org graph view (issue #357): read-tier people↔projects↔decisions
+        // queries with per-claim provenance.
+        "graph_query",
         "connect_extension",
         "memory.save",
         "memory.search",

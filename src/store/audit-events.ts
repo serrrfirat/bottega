@@ -316,3 +316,5 @@ export const API_WORK_ITEMS_LISTED_EVENT = "api.work_items_listed";
 export const API_AUDIT_READ_EVENT = "api.audit_read";
 /** REST API work-item create (payload {id, requester}; actor api:default). */
 export const API_WORK_ITEM_CREATED_EVENT = "api.work_item_created";
+/** REST API org-graph projection read (issue #357): payload {space?, since?, nodes, edges} — counts only; node labels/contents never enter the audit trail. */
+export const API_GRAPH_PROJECTED_EVENT = "api.graph_projected";

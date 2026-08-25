@@ -528,6 +528,10 @@ export const SPACE_AGENT_TOOLS = [
   // state — work items, pending approvals, scheduled jobs, in-progress
   // count, and the live "🛠 Agent's plan".
   "list_todos",
+  // Org graph view (issue #357): read-tier people↔projects↔decisions
+  // queries ("who owns X", "what happened to Y") with per-claim
+  // provenance — pure reads, no execution surface.
+  "graph_query",
   // Settings tool (issue #67): get/set the durable org/space settings.
   "settings",
   // Admin tools (issue #73): catalog browser, stack health, deploy info

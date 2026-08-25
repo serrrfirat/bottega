@@ -21,3 +21,4 @@ prep-qa-channel.ts
 
 # Deployment-local policy floor (fail-closed default when absent).
 config.yml
+node_modules

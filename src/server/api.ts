@@ -33,10 +33,12 @@ import type { AuditPage, AuditQueryOpts, Space, Store, WorkItem, WorkItemState }
 import {
   API_AUDIT_READ_EVENT,
   API_AUTH_DENIED_EVENT,
+  API_GRAPH_PROJECTED_EVENT,
   API_SPACES_LISTED_EVENT,
   API_WORK_ITEM_CREATED_EVENT,
   API_WORK_ITEMS_LISTED_EVENT,
 } from "../store/audit-events";
+import { GraphBoundError, projectGraph } from "../graph/view";
 
 /** The env var (seeded via the boot-secret chain) holding the bearer token. */
 export const REST_API_TOKEN_ENV = "BOTTEGA_API_TOKEN";
@@ -428,6 +430,64 @@ export const REST_ROUTES: readonly RestRouteSpec[] = [
         payload: { id: item.id, requester: API_ACTOR },
       });
       return Response.json({ id: item.id, state: item.state }, { status: 201 });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/v1/graph",
+    summary: "Project the org graph",
+    description:
+      "Read-model projection of the people↔projects↔decisions graph over existing tables (issue #357): " +
+      "work items, decisions/memories, scheduled jobs, spaces, repos, and PRs with their derived edges " +
+      "(created/assigned/approved-by/delivered/targets/scheduled-in/decided-in/mentions). Optionally " +
+      "narrowed by `space` and/or `since` (epoch ms). Fail-closed resource bounds — an over-large " +
+      "projection is a 400, never a silent truncation.",
+    queryParams: [
+      { name: "space", description: 'Space id to narrow to (e.g. "slack:C1").', schema: { type: "string" }, required: false },
+      { name: "since", description: "Only nodes created at/after this epoch-ms timestamp.", schema: { type: "integer" }, required: false },
+    ],
+    responses: {
+      "200": {
+        description: "The projected graph.",
+        schema: {
+          type: "object",
+          properties: {
+            count: { type: "integer" },
+            nodes: { type: "array", items: { type: "object" } },
+            edges: { type: "array", items: { type: "object" } },
+          },
+        },
+      },
+      "400": { description: "`since` is not a non-negative integer, or the projection exceeded its fail-closed bounds." },
+    },
+    async handle(_req, url, deps) {
+      let since: number | null;
+      try {
+        since = intParam(url, "since");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return Response.json({ error: message }, { status: 400 });
+      }
+      const space = url.searchParams.get("space")?.trim() || undefined;
+      try {
+        const projection = await projectGraph(deps.store, { spaceId: space, since: since ?? undefined });
+        const readEntries: Array<[string, JsonValue]> = [["nodes", projection.nodes.length], ["edges", projection.edges.length]];
+        if (space !== undefined) readEntries.push(["space", space]);
+        if (since !== null) readEntries.push(["since", since]);
+        await deps.audit.appendAudit({
+          space_id: space ?? null,
+          actor: API_ACTOR,
+          event_type: API_GRAPH_PROJECTED_EVENT,
+          // Counts only — node labels/contents never enter the audit trail.
+          payload: Object.fromEntries(readEntries),
+        });
+        return Response.json({ count: projection.nodes.length, nodes: projection.nodes, edges: projection.edges });
+      } catch (err) {
+        if (err instanceof GraphBoundError) {
+          return Response.json({ error: err.message }, { status: 400 });
+        }
+        throw err;
+      }
     },
   },
   {
