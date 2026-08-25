@@ -162,7 +162,7 @@ async function spawnSandboxChild(
   if (Buffer.byteLength(encoded) > MAX_SANDBOX_REQUEST_BYTES) {
     return { exitCode: null, signal: null, timedOut: false, protocolError: "sandbox request exceeds IPC limit" };
   }
-  const command = sandboxCommand(options.entrypoint, options.caps.memoryMb, options.requireLimits);
+  const command = sandboxCommand(options.entrypoint, options.requireLimits);
   if ("error" in command) {
     return { exitCode: null, signal: null, timedOut: false, protocolError: command.error };
   }
@@ -330,12 +330,18 @@ async function spawnSandboxChild(
  * into a child that must be hermetic. This is the child-process TEST FABRIC
  * (never the production Docker boundary), so disabling Bun's implicit dotenv
  * loading here is safe and required; production isolation is unchanged.
+ *
+ * On Linux the child additionally runs under `/usr/bin/prlimit` for
+ * process-count and file-descriptor caps. Deliberately NO `--as`/RLIMIT_AS:
+ * that limit caps *virtual address space*, not resident memory, and the
+ * Bun/JSC runtime reserves well over 3 GiB of address space at startup
+ * (verified empirically: a 3 GiB cap SIGTRAPs the runtime before main(),
+ * 4 GiB boots). Any job-realistic `memoryMb` ceiling (32–512 MiB) therefore
+ * killed the child before it could ever write its IPC response. Real memory
+ * enforcement belongs to the production Docker lane's cgroup
+ * `--memory ${caps.memoryMb}m`, which bounds RSS properly.
  */
-function sandboxCommand(
-  entrypoint: string,
-  memoryMb: number,
-  requireLimits: boolean,
-): { file: string; args: string[] } | { error: string } {
+function sandboxCommand(entrypoint: string, requireLimits: boolean): { file: string; args: string[] } | { error: string } {
   if (process.platform !== "linux") return { file: process.execPath, args: ["--no-env-file", entrypoint] };
   const prlimit = "/usr/bin/prlimit";
   if (!existsSync(prlimit)) {
@@ -345,7 +351,6 @@ function sandboxCommand(
   return {
     file: prlimit,
     args: [
-      `--as=${memoryMb * 1024 * 1024}`,
       "--nofile=256:256",
       "--nproc=128:128",
       "--",
