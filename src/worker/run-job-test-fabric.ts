@@ -261,13 +261,18 @@ async function spawnSandboxChild(
       // Best-effort cleanup of the ephemeral cwd; never fail the run for it.
     }
 
-    // When timeout or lease loss already tore the child down, the fd-3 reply is
-    // the wrong signal: the child was SIGKILLed, so a bounded-response EOF is
-    // racy (Bun may not emit `end` on the extra pipe after an abrupt kill) and
-    // awaiting it would hang the runner indefinitely. Return the torn-down result
-    // deterministically and destroy the stream to release its resources — the
-    // same ordering the Docker lane uses.
-    if (timedOut || leaseLost) {
+    // A late lease-loss abort that lands AFTER the child already exited
+    // cleanly must not discard the child's terminal IPC reply: the
+    // supervisor's renew tick fires every half-lease and sees
+    // `status != 'running'` the moment the child has self-completed the job,
+    // so the exact success path this fabric verifies would be torn down as
+    // lease_lost on fast hosts (#344 CI). For a clean exit the PID-checked
+    // response below is authoritative — the job bus transitions stay
+    // serialized by the store's status-guarded writes. A genuine mid-flight
+    // loss still kills the child (signal exit), keeps `exitedCleanly` false,
+    // and returns the torn-down result here.
+    const exitedCleanly = exited.signal === null && exited.code !== null;
+    if (timedOut || (leaseLost && !exitedCleanly)) {
       const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
       if (leaseLost) tornDown.leaseLost = true;
       if (!responseStream.destroyed) responseStream.destroy();

@@ -151,8 +151,12 @@ describe("e2e journey 1: chat + memory", () => {
         expect(h.messages(h.slack.dmChannelId).length).toBe(1); // phrase replaced by "first reply"
 
         // Idle timer fires → dispose runs a silent summary turn (request 2)
-        // and saves it as an org digest memory.
-        await h.modelStub.waitForRequests(2, 10_000);
+        // and saves it as an org digest memory. The window is deliberately
+        // generous: under coverage instrumentation this leg measured ~11.5s
+        // wall against a 10s cap (#344 coverage lane) while the same
+        // uninstrumented journey clears in ~1.5s — the timeout was the
+        // bottleneck, not the harness.
+        await h.modelStub.waitForRequests(2, 30_000);
         const digests = await waitFor(async () => {
           const entries = await h.memory.search({
             query: "",
@@ -180,7 +184,9 @@ describe("e2e journey 1: chat + memory", () => {
         await h.cleanup();
       }
     },
-    30_000,
+    // 30s was sized for uninstrumented hosts; the coverage lane needs
+    // headroom for the same instrumentation slowdown documented above (#344).
+    90_000,
   );
 
   test(

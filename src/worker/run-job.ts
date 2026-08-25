@@ -560,7 +560,17 @@ async function launchDockerContainer(
     // (--rm already removes it on exit; the net rm covers unexpected states).
     ensureContainerRemoved(docker, opts.containerName);
 
-    if (timedOut || leaseLost) {
+    // A late lease-loss abort that lands AFTER the container already exited
+    // cleanly must not discard the terminal IPC reply: the supervisor's
+    // renew tick fires every half-lease and sees `status != 'running'` the
+    // moment the child has self-completed the job, so the exact success path
+    // would be torn down as lease_lost on fast hosts (#344 CI). For a clean
+    // exit the PID-checked response below is authoritative — the job bus
+    // transitions stay serialized by the store's status-guarded writes. A
+    // genuine mid-flight loss still kills the container (signal exit),
+    // keeps `exitedCleanly` false, and returns the torn-down result here.
+    const exitedCleanly = exited.signal === null && exited.code !== null;
+    if (timedOut || (leaseLost && !exitedCleanly)) {
       const tornDown: SandboxResult = { exitCode: null, signal: exited.signal ?? "SIGKILL", timedOut };
       if (leaseLost) tornDown.leaseLost = true;
       return { kind: "result", result: tornDown };
