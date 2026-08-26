@@ -243,9 +243,14 @@ export const MCP_DISCOVERY_TIMEOUT_MS = 10_000;
  * Calls the provider's MCP server through the transport seam and returns
  * every tool (following nextCursor pagination). Fail closed: an
  * unreachable provider, a malformed tools/list, or runaway pagination
- * throws a clear error — no tools are ever fabricated. Every request is
- * bounded by {@link MCP_DISCOVERY_TIMEOUT_MS} (overridable for hermetic
- * tests) so a dead server fails fast instead of hanging the caller.
+ * throws a clear error — no tools are ever fabricated. The WHOLE
+ * discovery (connect + every tools/list page) is bounded by ONE
+ * wall-clock deadline, {@link MCP_DISCOVERY_TIMEOUT_MS} (overridable for
+ * hermetic tests): the SDK's per-request `timeout` options cannot cover
+ * transport-level hangs (a stdio spawn that never settles, an
+ * InMemory pair wedged under instrumentation), so a Promise.race
+ * deadline is the backstop — 2026-08-26 CI hung here for 1085s inside
+ * this file until the gate killed the run.
  */
 export async function listProviderTools(
   binding: McpBinding,
@@ -253,43 +258,64 @@ export async function listProviderTools(
   opts: { timeoutMs?: number; authProvider?: OAuthClientProvider } = {},
 ): Promise<ProviderTool[]> {
   const timeoutMs = opts.timeoutMs ?? MCP_DISCOVERY_TIMEOUT_MS;
-  const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
+  const discover = async (): Promise<ProviderTool[]> => {
+    const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
+    try {
+      const transport = mcpTransport(binding, opts.authProvider);
+      // Contain a misbehaving stdio server's stderr (issue #205): the boot log
+      // must never carry a child's exec noise, and an unbounded pipe would
+      // stall the child on backpressure. Drain up to a bounded prefix for
+      // diagnostics, then detach.
+      drainBoundedStderr(transport);
+      await client.connect(transport, { timeout: timeoutMs });
+      const tools: ProviderTool[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < MAX_TOOLS_LIST_PAGES; page++) {
+        // The SDK validates every response against ListToolsResultSchema
+        // before resolving; a malformed response throws here.
+        const result = await client.listTools(cursor === undefined ? undefined : { cursor }, { timeout: timeoutMs });
+        tools.push(
+          ...result.tools.map((tool) => ({
+            ...tool,
+            // The SDK validated the response against ListToolsResultSchema
+            // (JSON by the MCP wire contract); the round-trip yields the
+            // JSON domain ProviderTool.inputSchema declares.
+            inputSchema: JSON.parse(JSON.stringify(tool.inputSchema)),
+          })),
+        );
+        cursor = result.nextCursor;
+        if (cursor === undefined) break;
+      }
+      if (cursor !== undefined) {
+        throw new Error(`tools/list paginated past ${MAX_TOOLS_LIST_PAGES} pages — refusing to guess the rest`);
+      }
+      return tools;
+    } finally {
+      // Never let a close() rejection mask the discovery result/error.
+      await client.close().catch(() => {});
+    }
+  };
   try {
-    const transport = mcpTransport(binding, opts.authProvider);
-    // Contain a misbehaving stdio server's stderr (issue #205): the boot log
-    // must never carry a child's exec noise, and an unbounded pipe would
-    // stall the child on backpressure. Drain up to a bounded prefix for
-    // diagnostics, then detach.
-    drainBoundedStderr(transport);
-    await client.connect(transport, { timeout: timeoutMs });
-    const tools: ProviderTool[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < MAX_TOOLS_LIST_PAGES; page++) {
-      // The SDK validates every response against ListToolsResultSchema
-      // before resolving; a malformed response throws here.
-      const result = await client.listTools(cursor === undefined ? undefined : { cursor }, { timeout: timeoutMs });
-      tools.push(
-        ...result.tools.map((tool) => ({
-          ...tool,
-          // The SDK validated the response against ListToolsResultSchema
-          // (JSON by the MCP wire contract); the round-trip yields the
-          // JSON domain ProviderTool.inputSchema declares.
-          inputSchema: JSON.parse(JSON.stringify(tool.inputSchema)),
-        })),
-      );
-      cursor = result.nextCursor;
-      if (cursor === undefined) break;
-    }
-    if (cursor !== undefined) {
-      throw new Error(`tools/list paginated past ${MAX_TOOLS_LIST_PAGES} pages — refusing to guess the rest`);
-    }
-    return tools;
+    return await withDeadline(discover(), timeoutMs);
   } catch (err) {
     const target = binding.transport === "streamable-http" ? binding.serverUrl : binding.command;
     throw new Error(`tools/list failed for ${target}: ${errorMessage(err)}`);
-  } finally {
-    await client.close();
   }
+}
+
+/**
+ * Rejects when {@link promise} outlives {@link timeoutMs} — the wall-clock
+ * backstop the SDK's per-request timeouts cannot provide (they bound each
+ * RPC, not the transport lifecycle around them). On expiry the loser keeps
+ * running unobserved; callers own killing any child process behind it.
+ */
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`discovery exceeded its ${timeoutMs}ms wall-clock bound`)), timeoutMs);
+    // The loser's eventual rejection is unobserved by design (the deadline
+    // already decided); a settled-loser handler only clears the timer.
+    promise.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
 }
 
 /** How much of a stdio server's stderr to surface as diagnostics. */

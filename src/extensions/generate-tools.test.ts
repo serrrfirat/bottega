@@ -42,7 +42,14 @@ class SilentTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
-  async start(): Promise<void> {}
+  /** Test seam: override start() (e.g. a promise that never settles). */
+  private readonly startImpl: () => Promise<void>;
+  constructor(startImpl: () => Promise<void> = async () => {}) {
+    this.startImpl = startImpl;
+  }
+  async start(): Promise<void> {
+    await this.startImpl();
+  }
   async send(_message: JSONRPCMessage): Promise<void> {}
   async close(): Promise<void> {
     this.onclose?.();
@@ -234,6 +241,22 @@ describe("generateManifestTools: fake tools/list over the in-memory transport se
         timeoutMs: 150,
       }),
     ).rejects.toThrow(/tools\/list failed/);
+    expect(Date.now() - start).toBeLessThan(5_000);
+  });
+  test("a transport whose start() NEVER settles still fails at the wall-clock bound (2026-08-26 CI hang)", async () => {
+    // Regression for the 2026-08-26 coverage-job hang: on the Linux runner
+    // this file went silent for 1085s inside the SDK's connect path — the
+    // SDK's per-request `timeout` options bound each RPC but NOT the
+    // transport lifecycle around them, so a start() that never settles
+    // (a wedged stdio spawn, an instrumented InMemory pair) hung the whole
+    // suite. The wrapper's Promise.race deadline is the backstop: the
+    // discovery must reject at ~timeoutMs even when the transport's own
+    // promise never resolves and never rejects.
+    const neverSettles = (): Transport => new SilentTransport(() => new Promise<void>(() => {}));
+    const start = Date.now();
+    await expect(
+      listProviderTools({ command: "wedged-server", transport: "stdio" }, neverSettles, { timeoutMs: 150 }),
+    ).rejects.toThrow(/wall-clock bound/);
     expect(Date.now() - start).toBeLessThan(5_000);
   });
 });
