@@ -128,7 +128,7 @@ describe("work review credentials (issue #359)", () => {
 
   test("redeemWorkReviewToken ignores a token that was never issued", async () => {
     const store = freshStore();
-    const { identity } = await fixture(store);
+    await fixture(store);
     const now = Date.now();
     const result = store.redeemWorkReviewToken({
       rawToken: "never-minted-token",
