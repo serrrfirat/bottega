@@ -121,7 +121,6 @@ describe("projectWorkReview (issue #359)", () => {
   });
 
   test("keeps unrelated categories empty when the item has no such evidence", async () => {
-    const h = await fixture();
     const dir = mkdtempSync(join(root, "minimal-"));
     const store = createStore(join(dir, "minimal.db"));
     stores.push(store);
