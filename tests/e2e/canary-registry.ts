@@ -390,6 +390,16 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     exclusionReason: "the scheduler + KB tools are exercised by the existing scheduler/work-item journeys; no dedicated journey needed",
   },
   {
+    id: "coverage.graph-query-surface",
+    layer: "hermetic",
+    actors: [],
+    covers: ["graph_query"],
+    visibleProof: "the org-graph read surface is exercised through the graph-query harness",
+    durableProof: "graph-query unit + driver tests over the existing org tables",
+    fixtures: ["registry:fixture"],
+    exclusionReason: "graph_query (issue #357) is covered by its hermetic unit suite (src/tools/graph-query.test.ts) and the agent-driver session tests; pure reads with no vendor surface, so no dedicated journey is needed",
+  },
+  {
     id: "coverage.mcp-transport",
     layer: "hermetic",
     actors: [],
