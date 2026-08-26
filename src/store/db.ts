@@ -605,6 +605,11 @@ export interface Store {
    */
   getAndTouchWorkReviewSession(rawSession: string, now: number): WorkReviewSession | null;
   /**
+   * Rotates the CSRF verifier for a live session. The raw form value is
+   * supplied by the route and only its SHA-256 digest is written.
+   */
+  rotateWorkReviewCsrf(rawSession: string, csrfHash: string, now: number): boolean;
+  /**
    * Org settings singleton (issue #67): the validated settings blob, or
    * null when no row exists. Sync (bun:sqlite is synchronous, like getDb).
    * Throws OrgSettingsParseError on a malformed blob — fail closed, never
@@ -1938,6 +1943,19 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       expiresAt: row.expires_at,
     };
   }
+  function rotateWorkReviewCsrf(rawSession: string, csrfHash: string, now: number): boolean {
+    if (!rawSession || csrfHash.length !== 64 || !Number.isSafeInteger(now)) {
+      throw new Error("work review CSRF rotation input is invalid");
+    }
+    const result = db
+      .query(
+        `UPDATE work_review_sessions
+            SET csrf_hash = ?2, last_seen_at = ?3
+          WHERE session_hash = ?1 AND expires_at > ?3`,
+      )
+      .run(sha256(rawSession), csrfHash, now);
+    return result.changes === 1;
+  }
 
   async function createSchedulerJob(input: {
     action: string;
@@ -2523,6 +2541,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     createWorkReviewToken,
     redeemWorkReviewToken,
     getAndTouchWorkReviewSession,
+    rotateWorkReviewCsrf,
     getOrgSettings,
     setOrgSettings,
     createSchedulerJob,

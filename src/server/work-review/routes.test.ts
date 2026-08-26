@@ -42,7 +42,7 @@ function cookieFrom(response: Response): string {
 
 describe("authenticated work-review routes", () => {
   test("redeems once, sets a protected cookie, renders plain sections, and continues", async () => {
-    const { routes, token, posts } = await fixture();
+    const { store, routes, token, posts } = await fixture();
     const redeem = await routes.fetch(new Request(`http://127.0.0.1/work-review/redeem/${token}`));
     expect(redeem.status).toBe(303);
     expect(redeem.headers.get("location")).toBe("/work-review");
@@ -50,7 +50,18 @@ describe("authenticated work-review routes", () => {
     expect(redeem.headers.get("set-cookie")).toMatch(/HttpOnly/);
     expect(redeem.headers.get("set-cookie")).toMatch(/SameSite=Lax/);
     const cookie = cookieFrom(redeem);
-    const page = await routes.fetch(new Request("http://127.0.0.1/work-review", { headers: { cookie } }));
+    // A fresh route mount represents a process restart: the persisted session
+    // remains usable and the page rotates its CSRF verifier.
+    const restarted = mountWorkReviewRoutes({
+      store,
+      transcriptDir: join(root, "transcripts"),
+      adapter: {
+        isChannelMember: async () => true,
+        postMessage: async (_space, text) => { posts.push(text); return undefined; },
+      },
+      log: console.error,
+    });
+    const page = await restarted.fetch(new Request("http://127.0.0.1/work-review", { headers: { cookie } }));
     const html = await page.text();
     expect(page.status).toBe(200);
     expect(html).toContain("What happened");
@@ -61,7 +72,7 @@ describe("authenticated work-review routes", () => {
     const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
     expect(csrf).toBeString();
     const form = new URLSearchParams({ csrf: csrf!, guidance: "Use the retention schedule attached by Procurement." });
-    const continued = await routes.fetch(new Request("http://127.0.0.1/work-review/continue", { method: "POST", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: form }));
+    const continued = await restarted.fetch(new Request("http://127.0.0.1/work-review/continue", { method: "POST", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: form }));
     expect(continued.status).toBe(200);
     expect(await continued.text()).toContain("This work was continued");
     expect(posts).toHaveLength(1);

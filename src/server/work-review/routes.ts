@@ -115,7 +115,6 @@ async function redeem(deps: WorkReviewRouteDeps, token: string): Promise<Respons
     await audit(deps, EVENT_DENIED, session.identity.slackUserId, spaceId, { reason: "membership_unavailable" });
     return genericDenied();
   }
-  deps.csrfTokens?.set(rawSession, rawCsrf);
   await audit(deps, EVENT_REDEEMED, session.identity.slackUserId, spaceId, { work_item_id_present: true });
   const response = new Response(null, { status: 303, headers: { location: "/work-review", "cache-control": "no-store" } });
   response.headers.set("set-cookie", `${WORK_REVIEW_COOKIE}=${rawSession}; Max-Age=${Math.floor(WORK_REVIEW_SESSION_TTL_MS / 1000)}; Secure; HttpOnly; SameSite=Lax; Path=/work-review`);
@@ -127,8 +126,8 @@ async function readReview(deps: WorkReviewRouteDeps, req: Request): Promise<Resp
   if (current === null) return cookieValue(req) === null ? genericSession() : genericDenied();
   const review = await projectWorkReview(deps, current.source.id);
   if (review === null) return genericDenied();
-  const csrfToken = deps.csrfTokens?.get(current.raw);
-  if (csrfToken === undefined) return genericSession();
+  const csrfToken = randomBytes(32).toString("base64url");
+  if (!deps.store.rotateWorkReviewCsrf(current.raw, digest(csrfToken), (deps.now ?? Date.now)())) return genericSession();
   await audit(deps, EVENT_READ, current.session.identity.slackUserId, current.spaceId, { work_item_id_present: true });
   const html = renderWorkReview(review, { csrfToken, showForm: true });
   return new Response(html, { headers: htmlHeaders() });
@@ -137,8 +136,6 @@ async function readReview(deps: WorkReviewRouteDeps, req: Request): Promise<Resp
 async function continueReview(deps: WorkReviewRouteDeps, req: Request): Promise<Response> {
   const current = await liveSession(deps, req);
   if (current === null) return cookieValue(req) === null ? genericSession() : genericDenied();
-  const csrfToken = deps.csrfTokens?.get(current.raw);
-  if (csrfToken === undefined) return genericSession();
   const form = await req.formData().catch(() => null);
   if (form === null) return renderReviewMessage("Could not continue", "Please try again.", 400);
   const csrf = form.get(WORK_REVIEW_CSRF_FIELD);
@@ -160,7 +157,7 @@ async function continueReview(deps: WorkReviewRouteDeps, req: Request): Promise<
     const review = await projectWorkReview(deps, current.source.id);
     if (review === null) return genericDenied();
     const message = result.existed ? "This work was already continued." : "This work was continued using the completed work so far.";
-    return new Response(renderWorkReview(review, { csrfToken, message, showForm: false }), { headers: htmlHeaders() });
+    return new Response(renderWorkReview(review, { message, showForm: false }), { headers: htmlHeaders() });
   } catch (err) {
     await audit(deps, EVENT_CONTINUATION_FAILED, current.session.identity.slackUserId, current.spaceId, { work_item_id_present: true });
     deps.log?.(`[work-review] continuation failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -169,7 +166,6 @@ async function continueReview(deps: WorkReviewRouteDeps, req: Request): Promise<
 }
 
 export function mountWorkReviewRoutes(deps: WorkReviewRouteDeps): WorkReviewRoutes {
-  const routeDeps: WorkReviewRouteDeps = { ...deps, csrfTokens: new Map<string, string>() };
   return {
     async fetch(req) {
       const url = new URL(req.url);
@@ -178,10 +174,10 @@ export function mountWorkReviewRoutes(deps: WorkReviewRouteDeps): WorkReviewRout
         if (encoded.length === 0 || encoded.includes("/")) return renderReviewMessage("Review link unavailable", "This review link is no longer valid.", 404);
         let token: string;
         try { token = decodeURIComponent(encoded); } catch { return renderReviewMessage("Review link unavailable", "This review link is no longer valid.", 404); }
-        return redeem(routeDeps, token);
+        return redeem(deps, token);
       }
-      if (url.pathname === "/work-review" && req.method === "GET") return readReview(routeDeps, req);
-      if (url.pathname === "/work-review/continue" && req.method === "POST") return continueReview(routeDeps, req);
+      if (url.pathname === "/work-review" && req.method === "GET") return readReview(deps, req);
+      if (url.pathname === "/work-review/continue" && req.method === "POST") return continueReview(deps, req);
       return new Response("not found", { status: 404 });
     },
   };
