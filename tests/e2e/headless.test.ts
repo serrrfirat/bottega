@@ -122,7 +122,7 @@ describe("headless lane (issue #360): conversation functionality via the API sea
     const turns: StubTurn[] = [
       {
         type: "tool_calls",
-        calls: [{ name: "memory.save", args: { scope: "org", content: "the build runs with bun test" } }],
+        calls: [{ name: "memory_save", args: { scope: "org", content: "the build runs with bun test" } }],
       },
       { type: "text", text: "saved it" },
     ];
@@ -139,7 +139,7 @@ describe("headless lane (issue #360): conversation functionality via the API sea
       await h.modelStub.waitForRequests(2);
 
       // The tool call executed through the real provider + policy gate.
-      const found = await h.memory.search({ query: "build", scope: "org" });
+      const found = await h.memory.search({ query: "build", scope: { kind: "org" } });
       expect(found.map((e) => e.content)).toContain("the build runs with bun test");
       const audit = await h.audit.listAudit({});
       expect(audit.filter((r) => r.event_type === "policy.decision").length).toBeGreaterThanOrEqual(1);

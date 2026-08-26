@@ -574,6 +574,29 @@ export function createHeadlessAdapter(): HeadlessAdapter {
       const rec = posts.find((p) => p.ts === ts && p.channel_id === channelFromSpaceId(spaceId));
       if (rec) rec.text = text;
     },
+    async downloadFile() {
+      throw new Error("headless adapter has no file storage");
+    },
+    async uploadFile() {
+      throw new Error("headless adapter cannot upload files");
+    },
+    // Receipt reactions (issue #119) are quiet no-ops: callers treat
+    // reaction failures as non-fatal by contract.
+    async addReaction() {},
+    async removeReaction() {},
+    // Streaming stays off in headless mode (issue #360): the space service
+    // falls back to the phrase + edit path, which this fake records like
+    // any other message. A stray stream call fails loudly instead of
+    // silently mutating nothing.
+    streamingSupported() {
+      return false;
+    },
+    async startStream() {
+      throw new Error("headless adapter: streaming not supported");
+    },
+    async appendText() {},
+    async appendTask() {},
+    async stopStream() {},
     async start() {},
     async stop() {},
   };
