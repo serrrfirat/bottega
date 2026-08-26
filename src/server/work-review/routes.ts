@@ -4,6 +4,7 @@ import type { Store } from "../../store/db";
 import type { SlackAdapter } from "../adapters/slack";
 import { continueWork, CONTINUATION_GUIDANCE_MAX_CHARS } from "./continuation";
 import { projectWorkReview } from "./project";
+import { z } from "zod";
 import { renderReviewMessage, renderWorkReview } from "./render";
 
 export const WORK_REVIEW_COOKIE = "bottega_work_review";
@@ -138,11 +139,20 @@ async function continueReview(deps: WorkReviewRouteDeps, req: Request): Promise<
   if (current === null) return cookieValue(req) === null ? genericSession() : genericDenied();
   const form = await req.formData().catch(() => null);
   if (form === null) return renderReviewMessage("Could not continue", "Please try again.", 400);
-  const csrf = form.get(WORK_REVIEW_CSRF_FIELD);
-  if (typeof csrf !== "string" || !equalDigest(csrf, current.session.csrfHash)) return genericDenied();
-  const guidanceValue = form.get("guidance");
-  if (guidanceValue !== null && typeof guidanceValue !== "string") return renderReviewMessage("Could not continue", "Please try again.", 400);
-  const guidance = typeof guidanceValue === "string" ? guidanceValue : undefined;
+  // The boundary parse: form fields arrive as FormDataEntryValue (string |
+  // File); the schema accepts string-or-absent and rejects anything else.
+  const continueFormSchema = z.object({
+    [WORK_REVIEW_CSRF_FIELD]: z.string().min(1),
+    guidance: z.string().max(CONTINUATION_GUIDANCE_MAX_CHARS).optional(),
+  });
+  // A form entry value is a string or a File; a File field violates the
+  // expected wire shape, so it is dropped before the schema runs.
+  const textEntries = [...form.entries()]
+    .filter((entry): entry is [string, string] => !(entry[1] instanceof File))
+    .map(([key, value]) => [key, value]);
+  const parsed = continueFormSchema.safeParse(Object.fromEntries(textEntries));
+  if (!parsed.success || !equalDigest(parsed.data[WORK_REVIEW_CSRF_FIELD], current.session.csrfHash)) return genericDenied();
+  const guidance = parsed.data.guidance;
   if (guidance !== undefined && guidance.trim().length > CONTINUATION_GUIDANCE_MAX_CHARS) {
     return renderReviewMessage("Could not continue", "Your guidance is too long.", 400);
   }
