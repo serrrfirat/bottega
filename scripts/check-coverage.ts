@@ -28,7 +28,7 @@
  *
  * Usage: bun run scripts/check-coverage.ts
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 /** Aggregate floor, in PERCENT units — the same unit bun prints. */
 export const FLOOR = { lines: 85, functions: 85 } as const;
@@ -202,7 +202,7 @@ export function wasKilledByBudget(
   return error?.code === "ETIMEDOUT" || error?.code === "ABORT_ERR" || signal === "SIGTERM";
 }
 
-function main(): number {
+async function main(): Promise<number> {
   // Whole suite, serial (--parallel=1): issue #260's e2e harness windows
   // hold by construction (nothing runs concurrently), and the one "All
   // files" row IS the honest whole-suite aggregate.
@@ -215,21 +215,80 @@ function main(): number {
   // 20 minutes (a green coverage job historically needs ~3-4; the
   // headroom absorbs slower runners) and a timeout kill is reported AS a
   // kill — never laundered into per-test failure summaries.
-  const run = spawnSync("bun", ["test", "--coverage", "--parallel=1"], { encoding: "utf8", timeout: SUITE_TIMEOUT_MS });
-  if (wasKilledByBudget(run.error, run.signal)) {
-    console.error(`coverage gate: the suite exceeded its ${SUITE_TIMEOUT_MS / 1000}s budget and was killed — not a test verdict`);
-    return 1;
-  }
-  const report = `${run.stdout ?? ""}\n${run.stderr ?? ""}`;
-  const verdict = decideGate(report, run.status, FLOOR);
-  if (!verdict.ok) {
-    console.error(`coverage gate: ${verdict.message}`);
-    return 1;
-  }
-  console.log(`coverage gate: ${verdict.message}`);
-  return 0;
+  //
+  // bun prints its per-file progress headers ("src/x.test.ts:", pass/fail
+  // anchors, the coverage table) on STDERR, so the suite streams through a
+  // timestamping tee instead of a spawnSync buffer: a killed or hung run
+  // leaves the LAST file it entered + a silence clock in the CI log —
+  // diagnosis from CI output alone (2026-08-26: the budget raise alone
+  // still timed out at 1200s with zero visibility into where).
+  const child = spawn("bun", ["test", "--coverage", "--parallel=1"], { env: process.env });
+  const reportParts: string[] = [];
+  let lastFile = "(suite start)";
+  let lastLineAt = Date.now();
+  const started = lastLineAt;
+  const stamp = (line: string): void => {
+    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+    reportParts.push(`[${elapsed}s] ${line}`);
+    lastLineAt = Date.now();
+    const file = /^(\S+\.test\.ts):$/.exec(line.trim());
+    if (file !== null) {
+      lastFile = file[1]!;
+      console.log(`coverage gate: [${elapsed}s] suite entered ${lastFile}`);
+    }
+  };
+  const tee = (stream: NodeJS.ReadableStream): void => {
+    let buf = "";
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk: string) => {
+      buf += chunk;
+      for (;;) {
+        const nl = buf.indexOf("\n");
+        if (nl === -1) break;
+        stamp(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+      }
+    });
+    stream.on("end", () => {
+      if (buf !== "") stamp(buf);
+    });
+  };
+  tee(child.stdout);
+  tee(child.stderr);
+  const silence = setInterval(() => {
+    const quietFor = Math.round((Date.now() - lastLineAt) / 1000);
+    if (quietFor >= 30 && quietFor % 30 === 0) {
+      console.log(
+        `coverage gate: [${((Date.now() - started) / 1000).toFixed(0)}s] no suite output for ${quietFor}s — last file: ${lastFile}`,
+      );
+    }
+  }, 1_000);
+
+  return await new Promise<number>((resolveGate) => {
+    const budget = setTimeout(() => {
+      console.error(
+        `coverage gate: the suite exceeded its ${SUITE_TIMEOUT_MS / 1000}s budget and was killed — not a test verdict ` +
+          `(last file entered: ${lastFile})`,
+      );
+      child.kill("SIGKILL");
+      resolveGate(1);
+    }, SUITE_TIMEOUT_MS);
+    child.on("exit", (code) => {
+      clearTimeout(budget);
+      clearInterval(silence);
+      const report = reportParts.join("\n");
+      const verdict = decideGate(report, code, FLOOR);
+      if (!verdict.ok) {
+        console.error(`coverage gate: ${verdict.message}`);
+        resolveGate(1);
+        return;
+      }
+      console.log(`coverage gate: ${verdict.message}`);
+      resolveGate(0);
+    });
+  });
 }
 
 if (import.meta.main) {
-  process.exit(main());
+  process.exit(await main());
 }
