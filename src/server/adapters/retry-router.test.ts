@@ -139,6 +139,6 @@ describe("Retry with context router (issue #358)", () => {
     const element = block.elements![0]!;
     expect(element.action_id).toBe(RETRY_WITH_CONTEXT_ACTION_ID);
     expect(element.value).toBe("wi_123");
-    expect(element.text.text).toBe("Retry with context");
+    expect(element.text.text).toBe("Continue using work so far");
   });
 });

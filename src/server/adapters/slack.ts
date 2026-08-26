@@ -1,5 +1,5 @@
 import { App, SocketModeReceiver, type AppOptions } from "@slack/bolt";
-import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type ConversationsHistoryResponse, type ConversationsRepliesResponse, type FilesInfoResponse, type ViewsPublishArguments } from "@slack/web-api";
+import { WebClient, type ChatAppendStreamArguments, type ChatPostMessageArguments, type ChatStartStreamArguments, type ChatStopStreamArguments, type ConversationsHistoryResponse, type ConversationsMembersResponse, type ConversationsRepliesResponse, type FilesInfoResponse, type ViewsPublishArguments } from "@slack/web-api";
 import type { ResponseMode } from "../../policy/config";
 import type { OperatorViewer, SlackHomeRender } from "../operator-home";
 import { z } from "zod";
@@ -355,6 +355,27 @@ export interface SlackAdapter {
    * as readThread.
    */
   readHistory?(spaceId: string, opts?: { limit?: number }): Promise<SlackReadMessage[]>;
+  /**
+   * Whether `userId` is CURRENTLY a member of the space's own channel
+   * (conversations.members, issue #359) — the live authorization gate for a
+   * plain-language work review. NEVER cached: every call asks Slack, so
+   * removing the actor between render and submit fails closed. FAILS CLOSED:
+   * an API error (or a members shape that cannot be trusted) THROWS instead
+   * of ever returning a membership verdict, so an unavailable membership
+   * lookup denies access rather than granting it. Optional like
+   * `isWorkspaceAdmin` — absent on a legacy/custom adapter; the work-review
+   * surface fails closed when it is.
+   */
+  isChannelMember?(spaceId: string, userId: string): Promise<boolean>;
+  /**
+   * Sends `userId` an ephemeral message in the space's own channel
+   * (chat.postEphemeral, issue #359) — the delivery surface for the
+   * actor-bound private review link. Ephemeral messages are only visible to
+   * `userId`; forwarding one grants no other Slack identity authority.
+   * Optional on the interface like `isChannelMember` — the real adapter
+   * implements it; legacy/custom doubles may omit it.
+   */
+  postEphemeral?(spaceId: string, userId: string, text: string): Promise<void>;
   /**
    * Whether the workspace/app supports chat streaming (issue #168).
    * Feature-detected once per boot: true until a stream call fails with a
@@ -1030,7 +1051,7 @@ export function registerActionHandler(
   onAction: (a: SlackAction) => Promise<void>,
 ): void {
   app.action(
-    /^bottega_(approve|deny|delivery_approve|delivery_deny|scheduler_pause|scheduler_resume|scheduler_run_now|stop)$/,
+    /^bottega_(approve|deny|delivery_approve|delivery_deny|scheduler_pause|scheduler_resume|scheduler_run_now|stop|open_work_review)$/,
     async ({ action, body, ack, logger }) => {
       // Ack first: Slack retries unacked interactive payloads.
       await ack();
@@ -1581,6 +1602,41 @@ export function createSlackAdapter(opts: {
         throw readFailureError("history", channel, apiError);
       }
       return normalizeReadMessages(res.messages ?? []);
+    },
+    async isChannelMember(spaceId, userId) {
+      const channel = channelFromSpaceId(spaceId);
+      // Paginate conversations.members (issue #359 page limit): Slack
+      // returns up to 100 members per page; `response_metadata.next_cursor`
+      // continues. A member found on any page is a member; every page
+      // exhausted without the user means non-member. NEVER cached — the
+      // caller's live authorization gate depends on a fresh read.
+      let cursor: string | undefined;
+      for (;;) {
+        let res: ConversationsMembersResponse;
+        try {
+          res = await app.client.conversations.members(
+            cursor === undefined ? { channel } : { channel, cursor },
+          );
+        } catch (err) {
+          // Fail closed on any API failure: an unreachable/erroring
+          // membership lookup must DENY, never grant. Wrap the raw thrown
+          // value in a channel-identified message so the caller sees WHERE
+          // the lookup failed without leaking a raw Slack error body.
+          throw new Error(`slack: conversations.members failed for channel ${channel}`, {
+            cause: err,
+          });
+        }
+        if (res.members?.includes(userId) === true) return true;
+        cursor = res.response_metadata?.next_cursor;
+        if (!cursor) return false;
+      }
+    },
+    async postEphemeral(spaceId, userId, text) {
+      await app.client.chat.postEphemeral({
+        channel: channelFromSpaceId(spaceId),
+        user: userId,
+        text: renderSlackText(text),
+      });
     },
     async startStream(spaceId, streamOpts) {
       // Feature-detect once per boot: a known-unsupported workspace never

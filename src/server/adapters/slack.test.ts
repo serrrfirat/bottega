@@ -923,6 +923,137 @@ describe("channel stream recipient (issue #287)", () => {
   });
 });
 
+describe("work review primitives (issue #359)", () => {
+  const BOT_TOKEN = "xoxb-work-review-test-token";
+
+  /**
+   * Boots the real adapter against a mock Web API driving
+   * conversations.members / chat.postEphemeral. `onMembers` returns the
+   * body for each members call; the channel form field and postEphemeral
+   * payloads are captured for exact-wire assertions.
+   */
+  function bootMembershipApi(onMembers: (page: number, channel: string | null, cursor: string | null) => Response) {
+    const seen: Array<{ channel: string | null; cursor: string | null }> = [];
+    const ephemerals: Array<{ channel: string | null; user: string | null; text: string | null }> = [];
+    let page = 0;
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const method = url.pathname.replace("/api/", "");
+        if (method === "conversations.members") {
+          page += 1;
+          const form = new URLSearchParams(await request.text());
+          seen.push({ channel: form.get("channel"), cursor: form.get("cursor") });
+          return onMembers(page, form.get("channel"), form.get("cursor"));
+        }
+        if (method === "chat.postEphemeral") {
+          const form = new URLSearchParams(await request.text());
+          ephemerals.push({
+            channel: form.get("channel"),
+            user: form.get("user"),
+            text: form.get("text"),
+          });
+          return Response.json({ ok: true, ts: "1.000009" });
+        }
+        return Response.json({ ok: false, error: "not_found" });
+      },
+    });
+    const adapter = createSlackAdapter({
+      appToken: "xapp-work-review-test-token",
+      botToken: BOT_TOKEN,
+      onMessage: async () => {},
+      clientOptions: { slackApiUrl: `http://127.0.0.1:${server.port}/api` },
+    });
+    // The real adapter always implements both work-review primitives; narrow
+    // the optional interface members to their concrete forms for the tests.
+    return {
+      adapter,
+      isChannelMember: adapter.isChannelMember!,
+      postEphemeral: adapter.postEphemeral!,
+      seen,
+      ephemerals,
+      server,
+    };
+  }
+
+  test("isChannelMember: the space channel derives to slack:C123 and a current member resolves true", async () => {
+    const { isChannelMember, seen, server } = bootMembershipApi(() =>
+      Response.json({ ok: true, members: ["U1", "U456", "U3"] }),
+    );
+    try {
+      await expect(isChannelMember("slack:C123", "U456")).resolves.toBe(true);
+      expect(seen).toEqual([{ channel: "C123", cursor: null }]);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("isChannelMember: a non-member resolves false", async () => {
+    const { isChannelMember, server } = bootMembershipApi(() => Response.json({ ok: true, members: ["U1", "U2"] }));
+    try {
+      await expect(isChannelMember("slack:C123", "U999")).resolves.toBe(false);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("isChannelMember: an API error rejects (fail closed — never cached, never a false grant)", async () => {
+    const { isChannelMember, server } = bootMembershipApi((page) =>
+      page === 1 ? Response.json({ ok: false, error: "not_in_channel" }) : Response.json({ ok: true, members: [] }),
+    );
+    try {
+      await expect(isChannelMember("slack:C123", "U456")).rejects.toThrow(/conversations\.members failed/);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("isChannelMember: pagination follows next_cursor and a member on a later page still resolves true", async () => {
+    const { isChannelMember, seen, server } = bootMembershipApi((page) =>
+      page === 1
+        ? Response.json({ ok: true, members: ["U1", "U2"], response_metadata: { next_cursor: "abc123" } })
+        : Response.json({ ok: true, members: ["U456"] }),
+    );
+    try {
+      await expect(isChannelMember("slack:C123", "U456")).resolves.toBe(true);
+      expect(seen).toEqual([
+        { channel: "C123", cursor: null },
+        { channel: "C123", cursor: "abc123" },
+      ]);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("isChannelMember: membership is re-checked on every call (no cache across calls)", async () => {
+    const { isChannelMember, seen, server } = bootMembershipApi((page) =>
+      Response.json({ ok: true, members: page === 1 ? ["U1"] : ["U456"] }),
+    );
+    try {
+      expect(await isChannelMember("slack:C123", "U456")).toBe(false);
+      await expect(isChannelMember("slack:C123", "U456")).resolves.toBe(true);
+      expect(seen).toHaveLength(2); // two independent Slack lookups, no cache
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("postEphemeral: exact channel, user and text reach chat.postEphemeral", async () => {
+    const { postEphemeral, ephemerals, server } = bootMembershipApi(() => Response.json({ ok: true, members: [] }));
+    try {
+      await expect(
+        postEphemeral("slack:C123", "U456", "Open the review: <https://example.com/review>"),
+      ).resolves.toBeUndefined();
+      expect(ephemerals).toEqual([
+        { channel: "C123", user: "U456", text: "Open the review: <https://example.com/review>" },
+      ]);
+    } finally {
+      server.stop();
+    }
+  });
+});
+
 describe("Slack file API roundtrips", () => {
   const BOT_TOKEN = "xoxb-file-test-token";
   const DOWNLOAD_BYTES = new TextEncoder().encode("attachment body");

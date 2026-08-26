@@ -27,7 +27,11 @@ export type SlackBlock = {
  */
 export const RETRY_WITH_CONTEXT_ACTION_ID = "bottega_retry_with_context";
 
-/** The one-click resume control (issue #358); the value carries the WORK ITEM id. */
+/**
+ * The one-click resume control (issue #358): continue from the last failure
+ * without optional guidance. The value carries the WORK ITEM id. Copy is the
+ * plain-language fast action on a blocked review card (issue #359).
+ */
 export function retryWithContextButton(workItemId: string): SlackBlock {
   return {
     type: "actions",
@@ -35,8 +39,33 @@ export function retryWithContextButton(workItemId: string): SlackBlock {
     elements: [
       {
         type: "button",
-        text: { type: "plain_text", text: "Retry with context" },
+        text: { type: "plain_text", text: "Continue using work so far" },
         action_id: RETRY_WITH_CONTEXT_ACTION_ID,
+        value: workItemId,
+      },
+    ],
+  };
+}
+
+/**
+ * Open-review action id (issue #359): the button on a BLOCKED issue card that
+ * opens the plain-language review page. Defined beside its renderer so the
+ * pure block module stays dependency-free; the Slack action router matches
+ * the SAME id and the outbox seam renders this button next to the retry
+ * control. The value carries the WORK ITEM id.
+ */
+export const OPEN_WORK_REVIEW_ACTION_ID = "bottega_open_work_review";
+
+/** The one-click review control (issue #359); the value carries the WORK ITEM id. */
+export function openWorkReviewButton(workItemId: string): SlackBlock {
+  return {
+    type: "actions",
+    block_id: "bottega_open_work_review",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Open review" },
+        action_id: OPEN_WORK_REVIEW_ACTION_ID,
         value: workItemId,
       },
     ],

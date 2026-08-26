@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { issueCard, TABLE_ROW_CAP, tableBlock, type SlackBlock } from "./blocks";
+import { issueCard, OPEN_WORK_REVIEW_ACTION_ID, openWorkReviewButton, RETRY_WITH_CONTEXT_ACTION_ID, retryWithContextButton, TABLE_ROW_CAP, tableBlock, type SlackBlock } from "./blocks";
 
 /** Asserts a Slack section block carries the given mrkdwn text. */
 function sectionText(blocks: SlackBlock[], index: number): string {
@@ -93,5 +93,27 @@ describe("tableBlock", () => {
 
   test("fails closed on empty headers", () => {
     expect(() => tableBlock({ headers: [], rows: [] })).toThrowError(/tableBlock: headers must not be empty/);
+  });
+});
+
+describe("openWorkReviewButton (issue #359)", () => {
+  test("renders the Open review action with the shared action id carrying the work-item id", () => {
+    const block = openWorkReviewButton("wi_123");
+    expect(block.type).toBe("actions");
+    const element = block.elements![0]!;
+    expect(element.action_id).toBe(OPEN_WORK_REVIEW_ACTION_ID);
+    expect(element.value).toBe("wi_123");
+    expect(element.text.text).toBe("Open review");
+  });
+
+  test("uses the exact bottega action id for the Slack action router", () => {
+    expect(OPEN_WORK_REVIEW_ACTION_ID).toBe("bottega_open_work_review");
+  });
+
+  test("the retry control keeps its shared id and now reads the plain-language fast action", () => {
+    const block = retryWithContextButton("wi_9");
+    const element = block.elements![0]!;
+    expect(element.action_id).toBe(RETRY_WITH_CONTEXT_ACTION_ID);
+    expect(element.text.text).toBe("Continue using work so far");
   });
 });
