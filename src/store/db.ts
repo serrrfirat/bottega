@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { WORK_ITEM_CREATED_EVENT, WORK_ITEM_FORKED_EVENT, WORK_ITEM_TRANSITION_EVENT } from "./audit-events";
 import { postOutboxRow } from "./outbox";
 import { runMigrations } from "./migrations";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { WorkerJob, WorkerJobKind, WorkerJobStatus } from "../worker/envelope";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -201,6 +201,43 @@ export type UploadToken = {
   created_at: number;
   expires_at: number;
 };
+
+/**
+ * Work review credentials (issue #359, task 2): the identity that a one-time
+ * redeem token is bound to and a resulting browser session exposes, at the
+ * camelCase API boundary. Maps 1:1 onto the snake_case identity columns of
+ * `work_review_tokens` / `work_review_sessions`.
+ */
+export type WorkReviewIdentity = {
+  workItemId: string;
+  slackTeamId: string;
+  slackUserId: string;
+  slackChannelId: string;
+};
+
+/**
+ * A validated work review browser session (issue #359, task 2): the identity
+ * its holder is bound to, the SHA-256 of the raw CSRF form-field value (so
+ * every POST back is cross-checked), and the absolute-ms expiry. The raw
+ * session cookie value never leaves the caller — only its hash is stored.
+ */
+export type WorkReviewSession = {
+  identity: WorkReviewIdentity;
+  csrfHash: string;
+  expiresAt: number;
+};
+
+/**
+ * Digest of a work review credential (issue #359, task 2): high-entropy raw
+ * values (one-time token, session cookie, CSRF form-field value) are hashed
+ * with SHA-256 so only the digest ever reaches SQLite. Callers hold the raw
+ * values in the ephemeral link, a Secure/HttpOnly cookie, and a hidden form
+ * field respectively. Shared by every credential-hashing call site so the
+ * exact same algorithm and hex encoding is used end to end.
+ */
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
 
 /**
  * Pending generic MCP OAuth flow row (issue #198): the connect mint writes
@@ -540,6 +577,33 @@ export interface Store {
   consumeOAuthFlow(token: string): { ok: true; row: OAuthFlow } | { ok: false };
   /** Unexpired flows for an actor — the mint path's per-actor rate limit. */
   countActiveOAuthFlows(actor: string): number;
+  /**
+   * Mints a one-time work review redeem token (issue #359): stores ONLY the
+   * SHA-256 of the raw link credential, never the raw value, and returns the
+   * random token the caller embeds in the ephemeral review link.
+   */
+  createWorkReviewToken(identity: WorkReviewIdentity, expiresAt: number): string;
+  /**
+   * Atomically redeems a one-time work review token: on the FIRST call with an
+   * unexpired, unconsumed token it marks the token consumed and inserts exactly
+   * one session (hash-keyed by the raw session value) in a single SQLite
+   * transaction, returning the session. Anything else — replay, unknown, or
+   * expired token — returns null and mints no session (fail closed).
+   */
+  redeemWorkReviewToken(input: {
+    rawToken: string;
+    rawSession: string;
+    csrfHash: string;
+    sessionExpiresAt: number;
+    now: number;
+  }): WorkReviewSession | null;
+  /**
+   * Validates a live work review session (issue #359): returns it (with its
+   * identity and CSRF hash) when the raw session value is known and
+   * unexpired, and advances its `last_seen_at` to `now`; null when unknown or
+   * expired. The raw session value is never stored — only its hash.
+   */
+  getAndTouchWorkReviewSession(rawSession: string, now: number): WorkReviewSession | null;
   /**
    * Org settings singleton (issue #67): the validated settings blob, or
    * null when no row exists. Sync (bun:sqlite is synchronous, like getDb).
@@ -1727,6 +1791,151 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     return countActive("oauth_flows", actor);
   }
 
+  /**
+   * Mints a one-time work review redeem token (issue #359): stores ONLY the
+   * SHA-256 of the raw token, never the raw value, and returns a fresh random
+   * token the caller embeds in the ephemeral review link.
+   */
+  function createWorkReviewToken(identity: WorkReviewIdentity, expiresAt: number): string {
+    if (!Number.isSafeInteger(expiresAt)) throw new Error("work review token expiresAt must be a safe integer");
+    if (!identity.workItemId || !identity.slackTeamId || !identity.slackUserId || !identity.slackChannelId) {
+      throw new Error("work review token needs a complete identity");
+    }
+    const rawToken = randomBytes(24).toString("base64url"); // 192 bits, unguessable
+    db.query(
+      `INSERT INTO work_review_tokens
+         (token_hash, work_item_id, slack_team_id, slack_user_id, slack_channel_id, expires_at, consumed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+    ).run(
+      sha256(rawToken),
+      identity.workItemId,
+      identity.slackTeamId,
+      identity.slackUserId,
+      identity.slackChannelId,
+      expiresAt,
+      Date.now(),
+    );
+    return rawToken;
+  }
+
+  /**
+   * Atomically redeems a one-time work review token (issue #359): in a single
+   * SQLite transaction it marks the token consumed and mints exactly one
+   * session on the FIRST redeem with an unexpired, unconsumed token; a replay,
+   * unknown token, or expired token returns null and mints nothing (fail
+   * closed). Only hashes of the raw token/session are ever stored.
+   */
+  function redeemWorkReviewToken(input: {
+    rawToken: string;
+    rawSession: string;
+    csrfHash: string;
+    sessionExpiresAt: number;
+    now: number;
+  }): WorkReviewSession | null {
+    if (!Number.isSafeInteger(input.sessionExpiresAt) || !Number.isSafeInteger(input.now)) {
+      throw new Error("work review redemption times must be safe integers");
+    }
+    if (!input.rawToken || !input.rawSession || !input.csrfHash) {
+      throw new Error("work review redemption needs a raw token, raw session, and csrf hash");
+    }
+    const tokenHash = sha256(input.rawToken);
+    const sessionHash = sha256(input.rawSession);
+    const now = input.now;
+
+    // SAFETY: txn is defensive about the mid-call state and runs the consume +
+    // insert as one atomic unit, so a concurrent replay observes either the
+    // full redemption or none of it — never a consumed token without a session.
+    const txn = db.transaction((): WorkReviewSession | null => {
+      // A one-time claim: only a row that is not yet consumed AND not expired
+      // is claimed; setting consumed_at here makes every later caller collide
+      // with the PRIMARY KEY change semantics of the WHERE below (they see no
+      // row). Fail closed: an expired, unconsumed token is also consumed so it
+      // cannot be replayed after the TTL.
+      const claimed = db
+        .query(
+          `UPDATE work_review_tokens
+              SET consumed_at = ?2
+            WHERE token_hash = ?1 AND consumed_at IS NULL AND expires_at > ?2
+           RETURNING work_item_id, slack_team_id, slack_user_id, slack_channel_id`,
+        )
+        .get(tokenHash, now) as
+        | { work_item_id: string; slack_team_id: string; slack_user_id: string; slack_channel_id: string }
+        | null;
+      if (!claimed) {
+        // Expired but unconsumed rows must not linger for a future replay.
+        db.query("DELETE FROM work_review_tokens WHERE token_hash = ?").run(tokenHash);
+        return null;
+      }
+      db.query(
+        `INSERT INTO work_review_sessions
+           (session_hash, csrf_hash, work_item_id, slack_team_id, slack_user_id, slack_channel_id, expires_at, created_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        sessionHash,
+        input.csrfHash,
+        claimed.work_item_id,
+        claimed.slack_team_id,
+        claimed.slack_user_id,
+        claimed.slack_channel_id,
+        input.sessionExpiresAt,
+        now,
+        now,
+      );
+      return {
+        identity: {
+          workItemId: claimed.work_item_id,
+          slackTeamId: claimed.slack_team_id,
+          slackUserId: claimed.slack_user_id,
+          slackChannelId: claimed.slack_channel_id,
+        },
+        csrfHash: input.csrfHash,
+        expiresAt: input.sessionExpiresAt,
+      };
+    });
+    return txn();
+  }
+
+  /**
+   * Validates a live work review session (issue #359): returns it when the raw
+   * session value is known and unexpired, advancing its `last_seen_at` to
+   * `now`; null when unknown or expired. Only the hash of the session value is
+   * stored.
+   */
+  function getAndTouchWorkReviewSession(rawSession: string, now: number): WorkReviewSession | null {
+    if (!Number.isSafeInteger(now)) throw new Error("work review touch time must be a safe integer");
+    if (!rawSession) return null;
+    const sessionHash = sha256(rawSession);
+    // SAFETY: UPDATE ... RETURNING * advances last_seen_at on the live row and
+    // returns it, or nothing when the session is unknown or expired.
+    const row = db
+      .query(
+        `UPDATE work_review_sessions SET last_seen_at = ?2
+          WHERE session_hash = ?1 AND expires_at > ?2
+         RETURNING csrf_hash, work_item_id, slack_team_id, slack_user_id, slack_channel_id, expires_at`,
+      )
+      .get(sessionHash, now) as
+      | {
+          csrf_hash: string;
+          work_item_id: string;
+          slack_team_id: string;
+          slack_user_id: string;
+          slack_channel_id: string;
+          expires_at: number;
+        }
+      | null;
+    if (!row) return null;
+    return {
+      identity: {
+        workItemId: row.work_item_id,
+        slackTeamId: row.slack_team_id,
+        slackUserId: row.slack_user_id,
+        slackChannelId: row.slack_channel_id,
+      },
+      csrfHash: row.csrf_hash,
+      expiresAt: row.expires_at,
+    };
+  }
+
   async function createSchedulerJob(input: {
     action: string;
     cron: string;
@@ -2308,6 +2517,9 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     getOAuthFlow,
     consumeOAuthFlow,
     countActiveOAuthFlows,
+    createWorkReviewToken,
+    redeemWorkReviewToken,
+    getAndTouchWorkReviewSession,
     getOrgSettings,
     setOrgSettings,
     createSchedulerJob,
