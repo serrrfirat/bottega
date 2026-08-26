@@ -16,11 +16,13 @@ import {
   FLOOR,
   MAX_FAILURES,
   MAX_SNIPPET_LINES,
+  SUITE_TIMEOUT_MS,
   decideGate,
   meetsFloor,
   parseAllFilesRow,
   scrubSecrets,
   summarizeSuiteFailure,
+  wasKilledByBudget,
 } from "./check-coverage";
 
 /** A realistic `bun test --coverage` table, with the given percentages. */
@@ -245,5 +247,35 @@ describe("decideGate failure diagnostics (issue #300)", () => {
     const result = decideGate("bun test v1.3.14\n 0 pass\n 1 fail\n", 1);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/suite itself failed/);
+  });
+});
+describe("suite-budget kill detection (2026-08-25 CI)", () => {
+  test("a SIGTERM'd child is a budget kill, not a suite verdict", () => {
+    // The regression: the wrapper's 600s spawnSync timeout SIGTERM'd the
+    // serial+coverage suite mid-flight (exit 143 on the coverage job), bun
+    // reported the in-progress tests as sub-4ms "(fail)" anchors with no
+    // error detail, and decideGate laundered that kill into five fake
+    // mcp-oauth failures. A kill must never reach the per-test summarizer.
+    expect(wasKilledByBudget({ code: "ETIMEDOUT" }, "SIGTERM")).toBe(true);
+    expect(wasKilledByBudget(null, "SIGTERM")).toBe(true);
+  });
+
+  test("Bun's SystemError ETIMEDOUT shape is recognized", () => {
+    // Bun 1.3.x reports a spawnSync timeout as { name: "SystemError",
+    // code: "ETIMEDOUT" }; Node uses ABORT_ERR. Both are kills.
+    expect(wasKilledByBudget({ code: "ABORT_ERR" }, null)).toBe(true);
+    expect(wasKilledByBudget({ code: undefined }, null)).toBe(false);
+  });
+
+  test("a normal completion is not a kill", () => {
+    expect(wasKilledByBudget(null, null)).toBe(false);
+    expect(wasKilledByBudget(undefined, null)).toBe(false);
+  });
+
+  test("the budget leaves real headroom over the historical green duration", () => {
+    // A green coverage job needed ~3-4 minutes when last measured green
+    // (2026-08-21); the budget must stay well above any plausible run so a
+    // slow runner degrades instead of being killed into fake failures.
+    expect(SUITE_TIMEOUT_MS).toBeGreaterThanOrEqual(900_000);
   });
 });
