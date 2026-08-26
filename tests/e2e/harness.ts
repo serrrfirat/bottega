@@ -528,6 +528,91 @@ function bootSlackEmulator(extraUserNames: string[] = []): SlackEmulatorHandle {
   };
 }
 
+/**
+ * Headless in-process adapter (issue #360): implements {@link SlackAdapter}
+ * with NO Slack — outbound posts/updates are recorded in memory, inbound is
+ * driven by {@link Harness.deliverMessage}/{@link Harness.deliverAction} which
+ * invoke the REAL space-service handlers directly. start/stop are no-ops.
+ * The same normalized SlackMessage / SlackAction shapes and injected
+ * ApprovalRouter as the emulator mode — minus the Bolt transport, so a
+ * full conversation journey runs with zero Slack surface (the #29 seam).
+ */
+export interface HeadlessAdapter extends SlackAdapter {
+  /** Outbound posts, in arrival order (the assertion surface behind messages()). */
+  posts: EmulatorMessage[];
+  /** Monotonic synthetic message ts. */
+  nextTs(): string;
+}
+
+/** Headless identities (issue #360): deterministic principals, Slack-shaped. */
+export const HEADLESS_BOT = "U-headless-bot";
+export const HEADLESS_HUMAN = "U-headless-human";
+
+export function createHeadlessAdapter(): HeadlessAdapter {
+  const posts: EmulatorMessage[] = [];
+  let counter = 0;
+  const BASE = Math.floor(Date.now() / 1000);
+  const nextTs = () => {
+    counter += 1;
+    return `${BASE}.${String(counter).padStart(6, "0")}`;
+  };
+  return {
+    posts,
+    nextTs,
+    async postMessage(spaceId, text, postOpts) {
+      const ts = nextTs();
+      posts.push({
+        ts,
+        channel_id: channelFromSpaceId(spaceId),
+        user: HEADLESS_BOT,
+        text,
+        ...(postOpts?.threadTs !== undefined ? { thread_ts: postOpts.threadTs } : {}),
+      });
+      return ts;
+    },
+    async updateMessage(spaceId, ts, text) {
+      const rec = posts.find((p) => p.ts === ts && p.channel_id === channelFromSpaceId(spaceId));
+      if (rec) rec.text = text;
+    },
+    async start() {},
+    async stop() {},
+  };
+}
+
+/**
+ * Headless SlackHandle (issue #360): mirrors the headless adapter's posts
+ * and resolves a small set of seeded channel/user names so space-policy
+ * overlays and deliver calls share deterministic ids with NO emulator.
+ */
+function headlessSlackHandle(adapter: HeadlessAdapter): SlackHandle {
+  const namesToIds: Record<string, string> = {
+    [HUMAN_USER_NAME]: HEADLESS_HUMAN,
+    [BOT_USER_NAME]: HEADLESS_BOT,
+  };
+  const channelsToIds: Record<string, string> = {
+    ops: "C-HEADLESSOPS",
+    general: "C-HEADLESSGENERAL",
+  };
+  return {
+    baseUrl: "",
+    store: {
+      messages: { all: () => [...adapter.posts] },
+      users: { findOneBy: (_field, value) => (namesToIds[value] ? { user_id: namesToIds[value] } : undefined) },
+      channels: {
+        findOneBy: (_field, value) => (channelsToIds[value] ? { channel_id: channelsToIds[value] } : undefined),
+      },
+    },
+    dmChannelId: "D-HEADLESSDM",
+    channelId(name) {
+      return channelsToIds[name];
+    },
+    user(name) {
+      return namesToIds[name];
+    },
+    stop() {},
+  };
+}
+
 const QUIET_LOGGER: Logger = {
   info: () => {},
   debug: () => {},
@@ -657,6 +742,17 @@ export interface HarnessConfig {
   /** Workspace tokens for {@link realSlack}; required when realSlack is set. */
   slackTokens?: LiveSlackTokens;
   /**
+   * Headless lane (issue #360): drive the REAL stack through the normalized
+   * inbound seam (spaceService.handleInboundMessage / ApprovalRouter) with a
+   * fake in-process SlackAdapter — NO Slack emulator, NO Bolt app, NO Socket
+   * Mode, NO tokens. Outbound replies are captured by the headless adapter's
+   * in-memory store (read via {@link Harness.messages}); inbound is driven
+   * by {@link Harness.deliverMessage}/{@link Harness.deliverAction}. Use
+   * `slack:<channel_id>` space keys in {@link spacePolicy}. Mutually
+   * exclusive with {@link realSlack}.
+   */
+  headless?: boolean;
+  /**
    * Live canary connect wiring (issue #79): like {@link connect} but the
    * harness supplies its own store/audit/registry — only the broker seam is
    * caller's (defaults to the production connectViaAuthBroker). The generic
@@ -679,8 +775,9 @@ export interface Harness {
   driver: AgentDriver;
   spaceService: SpaceService;
   adapter: SlackAdapter;
-  /** The real Bolt app with the message + action handlers installed. */
-  app: App;
+  /** The real Bolt app with the message + action handlers installed.
+   *  Undefined in headless mode (issue #360): the headless lane has no Slack. */
+  app?: App;
   modelStub: ModelStub;
   slack: SlackHandle;
   /** Defined in realSlack mode: the live handle (fresh API reads, QA user identity). */
@@ -737,6 +834,10 @@ function nextTs(): string {
  */
 export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const realSlack = cfg.realSlack === true;
+  const headless = cfg.headless === true;
+  if (realSlack && headless) {
+    throw new Error("bootHarness: realSlack and headless are mutually exclusive (issue #360)");
+  }
   if (realSlack && !cfg.slackTokens) {
     throw new Error(
       "bootHarness({ realSlack: true }) requires slackTokens — the live leg never runs without " +
@@ -815,14 +916,21 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const orgPolicy = loadOrgConfig(configDir);
   const memoryProvider = createSqliteMemoryProvider(store.getDb());
 
-  // --- Slack: emulator (outbound) + adapter + Bolt app (inbound, #29) ------
-  // realSlack mode (issue #79) replaces the emulator boundary with the REAL
-  // Socket Mode adapter: inbound arrives over the socket from the workspace,
-  // outbound posts to it. Everything downstream (space service, driver,
-  // policy) is identical either way.
+  // --- Slack boundary (issue #360): three transport modes -------------------
+  // `realSlack` (issue #79): the REAL Socket Mode adapter — inbound arrives
+  //    over the socket from the workspace, outbound posts to it.
+  // `headless`: a fake in-process adapter, NO Slack anywhere — inbound is
+  //    driven by deliverMessage/deliverAction calling the real space-service
+  //    handlers directly, outbound replies are captured in memory.
+  // default: the @emulators/slack HTTP emulator + the real Bolt app via the
+  //    #29 processEvent seam. Everything downstream (space service, driver,
+  //    policy) is identical across the three modes.
+  const headlessAdapter: HeadlessAdapter | undefined = headless ? createHeadlessAdapter() : undefined;
   const slack: SlackHandle = realSlack
     ? await bootLiveSlack(cfg.slackTokens!)
-    : bootSlackEmulator(cfg.slackUsers);
+    : headless
+      ? headlessSlackHandle(headlessAdapter!)
+      : bootSlackEmulator(cfg.slackUsers);
   // SAFETY: in realSlack mode the slack handle IS the live handle (the
   // boot branch above constructs it via bootLiveSlack); the emulator branch
   // leaves liveSlack undefined.
@@ -841,9 +949,11 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const botUserId = realSlack ? liveSlack!.botUserId : slack.user(BOT_USER_NAME)!;
   let spaceService: SpaceService;
   let approvalRouter: HarnessApprovalRouter;
-  const adapter = createSlackAdapter(
-    realSlack
-      ? {
+  const adapter = headless
+    ? headlessAdapter!
+    : createSlackAdapter(
+        realSlack
+          ? {
           appToken: cfg.slackTokens!.appToken,
           botToken: cfg.slackTokens!.botToken,
           onMessage: (m) => spaceService.handleInboundMessage(m),
@@ -1025,21 +1135,24 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // events (never started). Live mode: the ADAPTER's app owns the Socket
   // Mode receiver — inbound arrives from the real workspace over the
   // socket — so this app is inert and no handlers are installed on it.
-  const app = new App({
-    appToken: realSlack ? cfg.slackTokens!.appToken : APP_TOKEN,
-    // The default HTTP receiver requires a signing secret at construction;
-    // it is never started, so nothing listens or talks to Slack.
-    signingSecret: "test-signing-secret",
-    tokenVerificationEnabled: false,
-    authorize: async () => ({ botToken: realSlack ? cfg.slackTokens!.botToken : BOT_TOKEN }),
-    logger: QUIET_LOGGER,
-  });
-  if (!realSlack) {
-    registerMessageHandler(app, (m) => spaceService.handleInboundMessage(m), {
+  // Headless mode (issue #360): NO Bolt app at all — the lane has zero Slack.
+  const app = headless
+    ? undefined
+    : new App({
+        appToken: realSlack ? cfg.slackTokens!.appToken : APP_TOKEN,
+        // The default HTTP receiver requires a signing secret at construction;
+        // it is never started, so nothing listens or talks to Slack.
+        signingSecret: "test-signing-secret",
+        tokenVerificationEnabled: false,
+        authorize: async () => ({ botToken: realSlack ? cfg.slackTokens!.botToken : BOT_TOKEN }),
+        logger: QUIET_LOGGER,
+      });
+  if (!realSlack && !headless) {
+    registerMessageHandler(app!, (m) => spaceService.handleInboundMessage(m), {
       responseModeFor,
       botUserId: () => botUserId,
     });
-    registerActionHandler(app, async (a) => {
+    registerActionHandler(app!, async (a) => {
       await approvalRouter.handleAction?.(a);
     });
   }
@@ -1083,6 +1196,19 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
     configDir,
     transcriptDir,
     async deliverMessage(channelId, text, extra = {}, user) {
+      if (headless) {
+        // Headless lane (issue #360): call the REAL space-service handler
+        // directly with the normalized SlackMessage shape — no Slack. The
+        // principal honors the caller's user override like the other modes.
+        await spaceService.handleInboundMessage({
+          spaceId: `slack:${channelId}`,
+          principal: user ?? humanUserId,
+          text,
+          ts: nextTs(),
+          ...extra,
+        });
+        return;
+      }
       if (realSlack) {
         // Live mode: post through the REAL API as the QA user; the message
         // event then arrives over the Socket Mode websocket exactly like a
@@ -1108,7 +1234,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
         type: "message",
         reactions: [],
       });
-      await app.processEvent({
+      // Emulator path only — headless and realSlack return above, so app is set.
+      await app!.processEvent({
         body: {
           type: "event_callback",
           event: { type: "message", channel: channelId, user: principal, text, ts, ...extra },
@@ -1117,6 +1244,18 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       });
     },
     async deliverAction({ actionId, value, channelId, messageTs, user = humanUserId }) {
+      if (headless) {
+        // Headless lane (issue #360): resolve the click through the approval
+        // router directly with the normalized SlackAction shape — no Slack.
+        await approvalRouter.handleAction?.({
+          actionId,
+          value,
+          spaceId: `slack:${channelId}`,
+          principal: user,
+          messageTs,
+        });
+        return;
+      }
       if (realSlack) {
         // Slack buttons cannot be clicked through the API — live journeys
         // use the always-approve router instead (issue #79).
@@ -1125,7 +1264,8 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
             "clicked via the API; use the always-approve router (issue #79)",
         );
       }
-      await app.processEvent({
+      // Emulator path only — headless and realSlack return above, so app is set.
+      await app!.processEvent({
         body: {
           type: "block_actions",
           team: { id: "T1" },
