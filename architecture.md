@@ -1378,6 +1378,7 @@ src/
   tools/            work items/pickup, model/settings/admin, memory/KB/object tools
   tools/helpers.ts  shared leaf helpers (withTimeout/errorMessage/sha256Hex/SKILL_NAME_RE — the #341 consolidation)
   work-items/       fork.ts, timeline.ts (#358): run forks + read-only timelines
+  server/work-review/ routes.ts + project.ts + continuation.ts (#359): the authenticated plain-language review surface — live Slack-membership gate, one-time hashed tokens, and idempotent continue via the fork core
   memory/           SQLite + mem0 providers behind one interface
   mcp/              server.ts (third composition root; memory/connect/extensions)
   executor.ts       second composition root + containerized claim/delivery runner

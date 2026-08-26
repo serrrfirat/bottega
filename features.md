@@ -29,6 +29,7 @@ do, and why it matters. For how it works under the hood, see
 | **Audit trail** | Every decision, approval, and tool call is recorded, append-only, and never deleted. |
 | **Org graph** | Ask "who owns X?" or "what happened to Y?" — the agent answers from one projected people↔projects↔decisions view, with provenance on every claim; the same read model serves `graph_query` in chat and `GET /api/v1/graph`. |
 | **Work-item timeline & retry** | See any run's full lifecycle as a read-only timeline, and restart a failed run with its prior progress carried over — via API or one **Retry with context** click on the blocked card. |
+| **Plain-language work review** | A blocked work item's Slack card carries **Open review** (a private, one-time link) and **Continue using work so far**. The linked page explains the work — what happened, what completed, what is still needed, and related people, matters, documents, and decisions — in non-technical language; any current channel member can add optional guidance and continue it, with technical activity collapsed by default. |
 
 ## Model settings, catalog, and task pins (issues #64, #185, #189, #192, #194)
 
