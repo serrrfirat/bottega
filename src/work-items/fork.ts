@@ -236,6 +236,7 @@ export async function forkWorkItem(
     reasoning_effort: source.reasoning_effort ?? undefined,
     pr_url: source.pr_url ?? undefined,
     pr_branch: source.pr_branch ?? undefined,
+    base_branch: source.base_branch ?? undefined,
     // SAFETY: skills is written by createWorkItem as JSON.stringify of the
     // validated string[] input; the parse restores that array.
     skills: JSON.parse(source.skills) as string[],

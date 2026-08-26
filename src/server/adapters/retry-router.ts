@@ -13,11 +13,10 @@
  * the existing fork. No in-memory state, restart-safe by construction.
  */
 import type { Store } from "../../store/db";
-import { WORK_ITEM_FORKED_EVENT } from "../../store/audit-events";
 import { RETRY_WITH_CONTEXT_ACTION_ID } from "./blocks";
 import type { SlackAction, SlackAdapter } from "./slack";
 import { resolveBlockAction } from "./block-flow";
-import { forkWorkItem } from "../../work-items/fork";
+import { continueWork, type ContinueResult } from "../work-review/continuation";
 
 export interface RetryRouterDeps {
   /** Full store satisfies the picks (timeline walk + fork creation + audit dedupe). */
@@ -30,16 +29,6 @@ export interface RetryRouterDeps {
   log?: (line: string) => void;
 }
 
-/** True when a `work_item.forked` payload records a fork OF `sourceId`. */
-function isForkOf(payloadText: string, sourceId: string): boolean {
-  try {
-    // SAFETY: forked payloads are appended by createWorkItem via
-    // JSON.stringify({id, forked_from, ...}); a malformed row is not a match.
-    return (JSON.parse(payloadText) as { forked_from?: unknown }).forked_from === sourceId;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * One block-action click on a Retry-with-context button (issue #358).
@@ -49,46 +38,25 @@ function isForkOf(payloadText: string, sourceId: string): boolean {
  */
 export async function resolveRetryAction(deps: RetryRouterDeps, action: SlackAction): Promise<boolean> {
   const log = deps.log ?? ((line: string) => console.log(line));
-  let forkId: string | null = null;
-  let alreadyForked = false;
-  return resolveBlockAction(log, action, {
+  return resolveBlockAction<ContinueResult>(log, action, {
     owns: (a) => a.actionId === RETRY_WITH_CONTEXT_ACTION_ID,
     guard: async (a) => {
       if (a.value.trim().length === 0) return "[retry] ignoring click with empty work-item id";
       const source = await deps.store.getWorkItem(a.value);
       if (source === null) return `[retry] ignoring action for unknown item ${a.value}`;
       if (source.space_id !== a.spaceId) return `[retry] ignoring action for ${a.value} from foreign space ${a.spaceId}`;
-      // Settle-once across restarts: the fork's own audit row is the record.
-      const page = await deps.store.queryAudit({ event_type: WORK_ITEM_FORKED_EVENT });
-      const existing = page.rows.find((row) => isForkOf(row.payload, a.value));
-      if (existing !== undefined) {
-        try {
-          // SAFETY: the payload was written by createWorkItem via
-          // JSON.stringify with a string `id`; an unreadable record is
-          // reported, never crash-wrapped into a fork.
-          forkId = (JSON.parse(existing.payload) as { id?: unknown }).id as string;
-          alreadyForked = true;
-          return null;
-        } catch {
-          return `[retry] ignoring action for ${a.value}: unreadable fork record`;
-        }
-      }
       return null;
     },
-    settle: async (a) => {
-      if (alreadyForked) return { outcome: { forkId: forkId!, existed: true } };
-      const fork = await forkWorkItem(
-        { ...deps.store, transcriptDir: deps.transcriptDir ?? "data/transcripts" },
+    settle: async (a) => ({
+      outcome: await continueWork(
+        { store: deps.store, transcriptDir: deps.transcriptDir ?? "data/transcripts" },
         {
           sourceId: a.value,
-          afterKind: "failed",
           requester: a.principal,
-          note: `retried from chat by ${a.principal}`,
+          spaceId: a.spaceId,
         },
-      );
-      forkId = fork.id;
-      return { outcome: { forkId: fork.id, existed: false } };
-    },
+      ),
+    }),
     rewrite: async (a, outcome) => {
       // A fresh confirmation post (never a rewrite of the failure card): the
       // blocked landing stays visible history; the fork announces itself.

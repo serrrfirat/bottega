@@ -31,6 +31,10 @@ export const SPACE_SKILL_DELETED_EVENT = "space_skill.deleted";
 export const WORK_ITEM_TRANSITION_EVENT = "work_item.transition";
 /** Work item forked from a source attempt (issue #358): payload {id, forked_from, note?, by} — id is the NEW fork's id. */
 export const WORK_ITEM_FORKED_EVENT = "work_item.forked";
+/** A plain-language work-review continuation was requested (issue #359): payload {source_id, by, guided}. */
+export const WORK_REVIEW_CONTINUATION_REQUESTED_EVENT = "work_review.continuation_requested";
+/** A work-review continuation resolved to an existing or fresh fork (issue #359): payload {source_id, fork_id, existed}. */
+export const WORK_REVIEW_CONTINUATION_RESOLVED_EVENT = "work_review.continuation_resolved";
 /** Queue read (payload {state?, count}; space_id top-level). */
 export const WORK_ITEM_LIST_EVENT = "work_item.list";
 /** Executor failure landing an item in blocked (payload {id, error}). */
