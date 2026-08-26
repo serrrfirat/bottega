@@ -891,6 +891,73 @@ or read failure audits `memory.review_failed` with the reason only. It is
 registered in the server's scheduler registry alongside the other built-ins
 but is NOT auto-seeded at boot — create it with `create_scheduler_job`.
 
+## The reactive core: one event-reactive mechanism (#356)
+
+`src/events/reactive.ts` replaces N bespoke "react to state" pollers with
+ONE mechanism that every such loop subscribes to. The trusted substrate is
+the append-only audit ledger: each `ReactiveBehavior` declares the audit
+event types it reacts to, and a single tailing loop (`SELECT … WHERE id >
+watermark`) delivers new rows to behaviors.
+
+- **At-least-once, exactly-consumed** — a row is consumed (idempotency key
+  recorded + watermark advanced, atomically) only AFTER its reaction
+  succeeds; a crash between effects and consume replays the row on
+  recovery. `reactive_deliveries` keeps the durable per-behavior proof of
+  what already ran.
+- **Fail-closed errors** — a throwing reaction retries with exponential
+  backoff (bounded attempts), then dead-letters into `reactive_dead_letter`
+  — audit-visible, never silently dropped — and the loop continues with
+  later rows. A failing row pins the watermark frontier so overflow
+  re-queues instead of dropping.
+- **Backpressure** — reactions run bounded in-flight per behavior (default
+  1, strictly ordered); sweeps ride the same lifecycle via an optional
+  `sweep` for time-based reactions that have no ledger event.
+- **Read-only substrate** — the core only SELECTs from `audit`; behaviors
+  append their own audit markers as reaction effects, like every other seam.
+
+Watermarks, deliveries, and dead letters persist in SQLite (migration
+`015_add_reactive_core_tables`: `reactive_watermarks`,
+`reactive_deliveries`, `reactive_dead_letter`), so recovery survives
+restarts. The server boot registers the migrated behaviors — the delivery
+approval prompt (`delivery-poller.ts`), the outbox sweep
+(`outbox-post-seam.ts`), and the memory-consolidation cadence
+(`memory-consolidation-trigger.ts`) — plus the M4 seed
+`stale-procedure-alert.ts`, whose whole feature is ONE behavior registration:
+no poller, no lifecycle, no new plumbing.
+
+## Org graph view (#357)
+
+`src/graph/view.ts` is a READ-MODEL people↔projects↔decisions projection
+assembled by querying tables that already exist — zero new storage, zero
+new dependencies. It is a view, not a migration: work items, principals,
+spaces, repos, scheduler jobs, durable memories, and forks already carry
+every edge the org needs; what was missing was one queryable shape over them.
+
+- **Node kinds** — `work-item`, `person`, `space`, `repo`, `job`,
+  `memory` (decision/memory nodes).
+- **Edge vocabulary** — derived from existing columns/JSON blobs:
+  `created` (requester / job creator / memory principal), `assigned`
+  (assignee), `approved-by` (approvals JSON array), `delivered` (pr_url /
+  result.pr_url / evidence URLs), `targets` (repo column),
+  `scheduled-in` (job space), `decided-in` and `mentions` (memory scope +
+  body references). `depends-on` remains RESERVED (#165); `forked-from`
+  is emitted from the `work_items.forked_from` column (#358).
+- **Traversal never leaves SQLite** — multi-hop `neighbors` runs as a
+  recursive CTE over the union of edges; every query is bounded and
+  fail-closed (depth ≤ 2 hops by default, hard 500-node ceiling; exceeding
+  either throws `GraphBoundError` rather than truncating silently).
+- **Surfaces** — the read-tier chat tool `graph_query`
+  (`src/tools/graph-query.ts`, registered on the space session toolset)
+  matches natural-language terms against node labels/ids and decision/memory
+  bodies, walks up to two hops per match, and returns provenance (producer,
+  space, principal) so claims are traceable. The REST twin is
+  `GET /api/v1/graph` in the `REST_ROUTES` table (`src/server/api.ts`),
+  served by the same `projectGraph`.
+- **Memory backends** — the default SQLite provider shares the store
+  database, so memory nodes are plain reads; remote backends (mnesis)
+  stitch in ONLY through the term-driven `GraphMemoryRecall` seam — never a
+  bulk dump.
+
 ## Knowledge-base ingestion (#91)
 
 Knowledge-base ingestion is an explicit write path, not a scheduler action.
@@ -1176,7 +1243,9 @@ before exposing the store, and a retry resumes from the last committed ID.
 - `spaces` — registry + per-space policy/model settings. First contact uses
   an idempotent upsert that never overwrites an existing overlay (#188).
 - `work_items` — the queue and legal state machine below, including optional
-  per-task model and reasoning-effort pins (#185). `done` requires delivery
+  per-task model and reasoning-effort pins (#185) and fork lineage
+  (`forked_from` → source id, `fork_json` fork point; migration
+  `016_add_work_item_forks`, issue #358). `done` requires delivery
   evidence, `blocked` requires evidence, and git `review` requires a recorded
   human approval. Stale claimed/working rows recover to `blocked`.
 - `scheduler_jobs` — durable cron rows (id, action, cron, params, space id,
@@ -1200,6 +1269,10 @@ before exposing the store, and a retry resumes from the last committed ID.
   `done` so a restart never re-delivers it; a crash before that point
   leaves the row `claimed` under a fresh lease for the next recovery pass.
   Migration `014_add_durable_pending_turns`.
+- `reactive_watermarks` / `reactive_deliveries` / `reactive_dead_letter`
+  (#356) — the reactive core's durable bookkeeping: per-behavior watermark,
+  consumed-row idempotency keys, and audit-visible dead letters (migration
+  `015_add_reactive_core_tables`).
 - `upload_tokens` — opaque, expiring, single-use #196 browser-upload
   grants. The MCP child and server endpoint share the table; atomic delete
   makes only the first valid POST consumable.
@@ -1292,17 +1365,19 @@ The highest-risk external boundaries also have explicit legs:
 ```
 src/
   server/           index.ts (Slack composition root), bootstrap-runtime.ts (shared chain)
-  server/adapters/  slack.ts, approval-router.ts, delivery-router.ts
+  server/adapters/  slack.ts, approval-router.ts, delivery-router.ts, retry-router.ts (#358)
   server/drivers/   agent-driver.ts (OMP), conformance suite
   server/services/  space-service.ts, slack-turn-presenter.ts, delivery-poller.ts
-  policy/           config.ts, extension.ts, approval-router.ts, audit.ts
   extensions/       manifest/registry, discovery/generation, tool bridge, runtime/boundary, upload-link
   models/           model-pin.ts (declared + probed catalog, friendly-name resolution)
   scheduler/        cron, store, runner, actions (standup/reflection/pulse/recurring work)
   kb/               deterministic document ingestion
+  graph/            view.ts (#357): projectGraph/neighbors read-model + graph_query surface
+  events/           reactive.ts (#356): the audit-ledger reactive core; single-flight loops
   store/            db.ts, schema.sql, org settings
   tools/            work items/pickup, model/settings/admin, memory/KB/object tools
   tools/helpers.ts  shared leaf helpers (withTimeout/errorMessage/sha256Hex/SKILL_NAME_RE — the #341 consolidation)
+  work-items/       fork.ts, timeline.ts (#358): run forks + read-only timelines
   memory/           SQLite + mem0 providers behind one interface
   mcp/              server.ts (third composition root; memory/connect/extensions)
   executor.ts       second composition root + containerized claim/delivery runner

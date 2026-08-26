@@ -27,6 +27,8 @@ do, and why it matters. For how it works under the hood, see
 | **Work items** | One queue delivers repository, connected-extension, or in-channel work, with optional model pins, semantic pickup, and one-click fork-and-retry of failed runs from their event trail. |
 | **Department personas** | Give each space role guidance and a minimum visible toolset without weakening policy. |
 | **Audit trail** | Every decision, approval, and tool call is recorded, append-only, and never deleted. |
+| **Org graph** | Ask "who owns X?" or "what happened to Y?" — the agent answers from one projected people↔projects↔decisions view, with provenance on every claim; the same read model serves `graph_query` in chat and `GET /api/v1/graph`. |
+| **Work-item timeline & retry** | See any run's full lifecycle as a read-only timeline, and restart a failed run with its prior progress carried over — via API or one **Retry with context** click on the blocked card. |
 
 ## Model settings, catalog, and task pins (issues #64, #185, #189, #192, #194)
 
@@ -391,6 +393,28 @@ weekly `governance_digest` job for that space, so no manual
 `create_scheduler_job` is required; remove `governance` from the `proactive`
 block (or pause/delete the job) to turn it off.
 
+## Org graph view (#357)
+
+Ask the agent "who owns the billing webhook?" or "what happened to that
+checkout fix?" and it answers from the **org graph** — one projected view of
+the people, projects, decisions, spaces, repos, and jobs the platform
+already tracks. Nothing new is stored: the graph is assembled on demand
+(a read-only projection over existing tables), so it is always current.
+
+- **`graph_query` in chat** — a read-tier tool (no approval under an
+  `allow` policy): the agent matches your question's terms against node
+  labels, ids, and decision/memory bodies, then walks each match's
+  relationships up to two hops. Every match carries provenance — source,
+  space, principal — so answers can be traced instead of guessed.
+- **`GET /api/v1/graph`** — the same projection over REST for scripts and
+  dashboards; `projectGraph` returns nodes + edges, bounded fail-closed
+  rather than silently truncated.
+- **What connects to what** — work items carry created/assigned/approved-by
+  edges to people, delivered edges to pull requests, and targets edges to
+  repos; memories record decided-in and mentions; scheduler jobs link their
+  creator and space. Failed runs link to their retry attempts with
+  forked-from edges (#358), so lineage survives restarts and re-runs.
+
 ## Policy & approvals (user-facing)
 
 Every agent action is policy-gated; here is what that looks like from the
@@ -697,16 +721,21 @@ audited lifecycle:
   action creates one extension-delivery item per fire. Scheduled work uses
   the same queue, audits, policy gates, stale recovery, and blocked failure
   state as manually requested work.
-- **Fork any run from its event trail (#358)** — every work item's full
-  lifecycle is projected read-only at `GET /api/v1/work-items/:id/timeline`
-  (created, claimed, turns with transcript spans, tool calls, deliveries,
-  landings). A failed run can be forked into a NEW item via
-  `POST /api/v1/work-items/:id/fork` or the **Retry with context** button on
-  the blocked card in Slack: the new attempt boots with the source's prior
-  progress as bounded context plus an attempt preamble, while the original
-  stays untouched. Forks inherit the space's policy and delivery-approval
-  gates unchanged, and the graph view links attempts with `forked-from`
-  edges.
+- **Run timelines (#358)** — every work item's full lifecycle is projected
+  read-only at `GET /api/v1/work-items/:id/timeline`: created, claimed,
+  turns with transcript spans, tool calls, deliveries, and terminal
+  landings — assembled from the audit trail plus the run's own transcript,
+  no new storage.
+- **Fork any run from its event trail (#358)** — a failed or blocked run
+  can be forked into a NEW item via `POST /api/v1/work-items/:id/fork`
+  (cut at an exact timeline index or after the last failure — exactly one
+  selector) or the **Retry with context** button on the blocked card in
+  Slack: the new attempt boots with the source's prior progress as bounded
+  context plus an attempt preamble, while the original stays untouched.
+  Forks inherit the space's policy and delivery-approval gates unchanged,
+  and each fork records a `work_item.forked` audit edge that the graph view
+  projects as `forked-from` lineage (#357). The first click on Retry wins;
+  later clicks answer with a pointer to the existing attempt.
 
 Why it matters: a team can ask one co-worker to ship code, update a connected
 system, answer in channel, or repeat operational work without adding a second
@@ -1068,6 +1097,10 @@ opened a DM with the bot once (or the canary opens it via
   standard connect path regardless of requested scope (`offline_access`
   included; live capture in issue #263). Nothing is silently saved; a
   Notion-specific consumer OAuth integration is roadmap, not shipped.
+- **The graph is read-only and bounded** — `graph_query` projects what the
+  tables already record (depth ≤ 2 hops, hard node cap); there are no
+  write-back edges yet, and `depends-on` (#165) stays reserved until that
+  epic lands.
 
 ## Roadmap
 
