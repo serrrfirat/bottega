@@ -112,6 +112,8 @@ export interface OAuthCallbackEndpointDeps {
    * boot-secret chain) and audited with actor `api:default`.
    */
   restApi?: RestApiMount;
+  /** Server-rendered authenticated work-review routes (issue #359). */
+  workReview?: { fetch(req: Request): Promise<Response> };
   /**
    * Local bind port override (default: `BOTTEGA_CALLBACK_PORT` when set,
    * else 0 = ephemeral). A stable port lets a static tunnel / reverse
@@ -226,8 +228,9 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
       if (deps.webhooks !== undefined && url.pathname.startsWith(`${WEBHOOK_PATH_PREFIX}/`)) {
         return handleWebhookRequest(req, deps.webhooks);
       }
-      // Issue #100: the token-authenticated REST API and its OpenAPI
-      // document join the same inbound surface (one ingress, every path).
+      if (deps.workReview !== undefined && (url.pathname === "/work-review" || url.pathname.startsWith("/work-review/"))) {
+        return deps.workReview.fetch(req);
+      }
       if (deps.restApi !== undefined && (url.pathname === OPENAPI_PATH || url.pathname.startsWith(`${API_PATH_PREFIX}/`))) {
         return deps.restApi.fetch(req);
       }

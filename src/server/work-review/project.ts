@@ -5,6 +5,7 @@
  * the sources of truth. Rendering callers can choose how to collapse the raw
  * activity trail without losing evidence here.
  */
+import { z } from "zod";
 import type { Store, WorkItem, WorkItemState } from "../../store/db";
 import { projectGraph, type GraphNode, type GraphProjection } from "../../graph/view";
 import { buildTimeline, type TimelineEntry } from "../../work-items/timeline";
@@ -75,19 +76,19 @@ function pauseReason(entry: Extract<TimelineEntry, { kind: "failed" | "blocked" 
   return plainText(entry.cause);
 }
 
+const evidenceSchema = z.array(z.object({ url: z.string().min(1) }).passthrough());
+
 function evidenceNotes(item: WorkItem): string[] {
+  // SAFETY: the evidence blob is written by the worker's completion path;
+  // the schema parse drops malformed rows instead of trusting the shape.
   let decoded: unknown;
   try {
     decoded = JSON.parse(item.evidence);
   } catch {
     return [];
   }
-  if (!Array.isArray(decoded)) return [];
-  return decoded.flatMap((value) => {
-    if (typeof value !== "object" || value === null || !("url" in value)) return [];
-    const url = (value as { url?: unknown }).url;
-    return typeof url === "string" ? [plainText(url)] : [];
-  });
+  const parsed = evidenceSchema.safeParse(decoded);
+  return parsed.success ? parsed.data.map((entry) => plainText(entry.url)) : [];
 }
 
 function asksForHumanInput(note: string): boolean {

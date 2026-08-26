@@ -2,6 +2,7 @@
  * Shared work-review continuation service (issue #359): continue a blocked
  * item from its latest failure, once per source and space.
  */
+import { z } from "zod";
 import { forkWorkItem } from "../../work-items/fork";
 import type { AuditCursor, Store } from "../../store/db";
 import {
@@ -25,10 +26,15 @@ type ContinuationInput = {
 // in one process from both passing the read-before-create check.
 const locks = new WeakMap<Store, Map<string, Promise<void>>>();
 
+const forkedPayloadSchema = z.object({ id: z.string().min(1), forked_from: z.string().min(1) });
+
 function isForkOf(payloadText: string, sourceId: string): { forkId: string } | null {
+  // SAFETY: audit payloads are appended only by createWorkItem via
+  // JSON.stringify; the schema parse rejects malformed rows instead of
+  // trusting an unchecked shape.
   try {
-    const payload = JSON.parse(payloadText) as { id?: unknown; forked_from?: unknown };
-    return payload.forked_from === sourceId && typeof payload.id === "string" ? { forkId: payload.id } : null;
+    const payload = forkedPayloadSchema.safeParse(JSON.parse(payloadText));
+    return payload.success && payload.data.forked_from === sourceId ? { forkId: payload.data.id } : null;
   } catch {
     return null;
   }

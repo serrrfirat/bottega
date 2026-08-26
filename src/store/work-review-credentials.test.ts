@@ -49,6 +49,8 @@ describe("work review credentials (issue #359)", () => {
     expect(rawToken.length).toBeGreaterThan(16);
 
     // The row holds only the digested token; the raw value never touches SQLite.
+    // SAFETY: the queried columns are written only by createWorkReviewToken,
+    // so the decoded shape is the store's own contract.
     const row = store
       .getDb()
       .query("SELECT token_hash, consumed_at FROM work_review_tokens WHERE work_item_id = ?")
@@ -97,6 +99,8 @@ describe("work review credentials (issue #359)", () => {
     expect(replay).toBeNull();
 
     // Exactly one session row exists, keyed by the hash of the raw session value.
+    // SAFETY: these columns are written only by redeemWorkReviewToken inside
+    // the redemption transaction; the shape is the store's own.
     const sessions = store
       .getDb()
       .query("SELECT session_hash, csrf_hash, work_item_id FROM work_review_sessions")
@@ -122,7 +126,9 @@ describe("work review credentials (issue #359)", () => {
       sessionExpiresAt: now + 300_000,
       now: now + 120_000,
     });
+
     expect(result).toBeNull();
+    // SAFETY: `n` is a plain COUNT(*) column from the store's own table.
     expect(store.getDb().query("SELECT COUNT(*) AS n FROM work_review_sessions").get() as { n: number }).toEqual({ n: 0 });
   });
 
@@ -137,7 +143,9 @@ describe("work review credentials (issue #359)", () => {
       sessionExpiresAt: now + 300_000,
       now,
     });
+
     expect(result).toBeNull();
+    // SAFETY: `n` is a plain COUNT(*) column from the store's own table.
     expect(store.getDb().query("SELECT COUNT(*) AS n FROM work_review_sessions").get() as { n: number }).toEqual({ n: 0 });
   });
 
@@ -186,6 +194,8 @@ describe("work review credentials (issue #359)", () => {
     // A later touch advances last_seen_at but never stores the raw session value.
     const later = now + 5000;
     store.getAndTouchWorkReviewSession(rawSession, later);
+    // SAFETY: session rows are written only by the store's own redemption;
+    // the queried columns come straight from that insert.
     const row = store
       .getDb()
       .query("SELECT session_hash, last_seen_at FROM work_review_sessions WHERE session_hash = ?")

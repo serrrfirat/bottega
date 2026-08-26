@@ -34,7 +34,7 @@
  * regardless of any cursor position.
  */
 import { z } from "zod";
-import { issueCard, retryWithContextButton, type SlackBlock } from "../adapters/blocks";
+import { issueCard, openWorkReviewButton, retryWithContextButton, type SlackBlock } from "../adapters/blocks";
 import { OUTBOX_FAILED_EVENT, OUTBOX_POSTED_EVENT } from "../../store/audit-events";
 import type { Store } from "../../store/db";
 import {
@@ -228,9 +228,13 @@ export function renderOutboxBlocks(row: OutboxRow): SlackBlock[] | undefined {
     // worker includes a `link` field (passthrough-preserved), else none.
     link: payload.link,
   });
-  // Retry with context (issue #358): a BLOCKED landing carries the one-click
-  // resume control — forking at the failure point — right on the card.
-  if (payload.state === "blocked") card.push(retryWithContextButton(payload.workItemId));
+  // A BLOCKED landing carries BOTH issue-#359 controls: "Open review"
+  // (ephemeral private review link) and the #358 fast resume. Plain copy
+  // only — no event kinds, ids stay inside the button values.
+  if (payload.state === "blocked") {
+    card.push(openWorkReviewButton(payload.workItemId));
+    card.push(retryWithContextButton(payload.workItemId));
+  }
   return card;
 }
 

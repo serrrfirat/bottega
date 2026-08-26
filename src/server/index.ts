@@ -81,7 +81,9 @@ import { staleProcedureAlertBehavior } from "./services/stale-procedure-alert";
 import { SlackApprovalRouter, DEFAULT_NUDGE_MINUTES } from "./adapters/approval-router";
 import { resolveDeliveryAction } from "./adapters/delivery-router";
 import { resolveRetryAction } from "./adapters/retry-router";
+import { resolveOpenReviewAction } from "./adapters/work-review-router";
 import { RETRY_WITH_CONTEXT_ACTION_ID } from "./adapters/blocks";
+import { mountWorkReviewRoutes } from "./work-review/routes";
 import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
 import {
   channelFromSpaceId,
@@ -293,6 +295,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // seam; late-bound like approvalRouter — assigned after the adapter and
   // store are available, before main() returns.
   let deliveryActionHandler: (a: SlackAction) => Promise<void>;
+  let workReviewPublicBase = "";
   const bootstrapDeps: BootstrapRuntimeDeps = {
     router: () => approvalRouter,
     // Issue #193: extension-tool steps reach the space's turn presenter
@@ -423,6 +426,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       // resolvers; every other click belongs to the exec-tier approval flow.
       if (a.actionId === DELIVERY_APPROVE_ACTION_ID || a.actionId === DELIVERY_DENY_ACTION_ID) {
         return deliveryActionHandler(a);
+      }
+      if (a.actionId === "bottega_open_work_review") {
+        return resolveOpenReviewAction(
+          { store, adapter, publicBaseUrl: () => uploadLinkPublicBase() ?? workReviewPublicBase },
+          a,
+        ).then(() => undefined);
       }
       // Retry with context (issue #358): a click on a BLOCKED issue card
       // forks the failed item at its failure point — one-click resume.
@@ -590,6 +599,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       "bottega boot: ingest webhook leg not mounted — no org channel (onboarding.space_id) configured",
     );
   }
+  const workReviewRoutes = mountWorkReviewRoutes({
+    store,
+    adapter,
+    transcriptDir: executorTranscriptDir,
+    audit,
+  });
   const callbackDeps: OAuthCallbackEndpointDeps = {
     store,
     audit,
@@ -603,6 +618,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // public ingress for every inbound path (callback, upload, webhook, API).
     // Issue #358: the mount carries the executor transcript dir so the
     // work-item timeline/fork routes read the real JSONL trails.
+    workReview: workReviewRoutes,
     restApi: mountRestApi({ store, audit, transcriptDir: executorTranscriptDir }),
     // Issue #281: the browser leg is the only place that knows the connect
     // actually completed — surface the connected space so its live session
@@ -625,6 +641,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // listener only when the org channel exists; omission keeps the route 404.
   if (ingestWebhooks !== undefined) callbackDeps.webhooks = ingestWebhooks;
   const oauthCallback = startOAuthCallbackServer(callbackDeps);
+  workReviewPublicBase = oauthCallback.baseUrl;
 
   // The connect seam's generic MCP OAuth connector (issue #198): shared by
   // the space-service connect path and the per-session connect tool. The

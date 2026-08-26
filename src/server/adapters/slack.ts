@@ -103,6 +103,13 @@ export interface SlackAction {
   spaceId: string;
   principal: string;
   messageTs: string;
+  /**
+   * The workspace id from the verified payload (`body.team.id`), when the
+   * interactive payload carries one (issue #359): the actor-bound work
+   * review identity needs it; legacy callers omit it and the work-review
+   * router denies such clicks (fail closed).
+   */
+  teamId?: string;
 }
 
 /**
@@ -582,30 +589,29 @@ function messageDropDetail(event: RawSlackMessageEvent | null | string | number 
   return classified.kind === "unparseable" ? classified.detail : "no text or files";
 }
 
-/** Raw Bolt block-action element — the clicked button; runtime-validated before use. */
-interface RawSlackActionElement {
-  type?: unknown;
-  action_id?: unknown;
-  value?: unknown;
-}
+/**
+ * Block-action normalization validates the raw Bolt payload shapes with the
+ * zod schemas below — the runtime contract, not an unchecked interface. The
+ * parameters are `unknown` on purpose: Bolt's payload types are structural
+ * unions that cannot name this raw wire shape; the schema parse IS the
+ * boundary.
+ */
+/** The clicked-button wire shape `normalizeActionEvent` accepts. */
+type SlackActionElementWire = { action_id?: unknown; value?: unknown };
 
-/** Raw Bolt block_actions payload — the click context; runtime-validated before use. */
-interface RawSlackActionBody {
-  type?: unknown;
-  channel?: { id?: unknown };
-  user?: { id?: unknown };
-  message?: { ts?: unknown };
-}
-
-const slackActionElementSchema = z.object({
-  action_id: z.string(),
-  value: z.string(),
-});
+/** The click-context wire shape `normalizeActionEvent` accepts. */
+type SlackActionBodyWire = { channel?: unknown; user?: unknown; message?: unknown; team?: unknown };
 
 const slackActionBodySchema = z.object({
   channel: z.object({ id: z.string() }),
   user: z.object({ id: z.string() }),
   message: z.object({ ts: z.string() }),
+  team: z.object({ id: z.string() }).optional(),
+});
+
+const slackActionElementSchema = z.object({
+  action_id: z.string(),
+  value: z.string(),
 });
 
 /**
@@ -616,10 +622,7 @@ const slackActionBodySchema = z.object({
  * Returns `null` for anything unparseable instead of throwing — the caller
  * drops and logs those.
  */
-export function normalizeActionEvent(
-  action: RawSlackActionElement | null,
-  body: RawSlackActionBody | null,
-): SlackAction | null {
+export function normalizeActionEvent(action: SlackActionElementWire | unknown, body: SlackActionBodyWire | unknown): SlackAction | null {
   const element = slackActionElementSchema.safeParse(action);
   if (!element.success) return null;
   const context = slackActionBodySchema.safeParse(body);
@@ -630,6 +633,7 @@ export function normalizeActionEvent(
     spaceId: spaceIdFromChannel(context.data.channel.id),
     principal: context.data.user.id,
     messageTs: context.data.message.ts,
+    teamId: context.data.team?.id,
   };
 }
 

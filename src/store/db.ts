@@ -1851,6 +1851,9 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
       // with the PRIMARY KEY change semantics of the WHERE below (they see no
       // row). Fail closed: an expired, unconsumed token is also consumed so it
       // cannot be replayed after the TTL.
+      // SAFETY: the UPDATE above guarantees a claimed row carries exactly
+      // the identity columns inserted by createWorkReviewToken; the shape is
+      // the store's own, not external input.
       const claimed = db
         .query(
           `UPDATE work_review_tokens

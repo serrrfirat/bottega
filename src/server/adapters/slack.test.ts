@@ -283,6 +283,7 @@ describe("normalizeActionEvent", () => {
       spaceId: "slack:C123ABC",
       principal: "U456",
       messageTs: "1723700000.000100",
+      teamId: undefined,
     });
   });
 
@@ -361,6 +362,7 @@ describe("inbound block-action routing through the real Bolt router (issue #44)"
         spaceId: "slack:C123",
         principal: "U1",
         messageTs: "1723700000.000100",
+        teamId: "T1",
       },
     ]);
   });
