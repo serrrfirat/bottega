@@ -337,3 +337,39 @@ CREATE TABLE IF NOT EXISTS reactive_dead_letter (
   attempts     INTEGER NOT NULL,
   created_at   INTEGER NOT NULL
 );
+
+-- Plain-language work review credentials (issue #359): ONE-TIME redeem tokens
+-- and short-lived browser sessions for the non-technical Slack review flow.
+-- ONLY SHA-256 hashes are stored — the raw token, session, and CSRF values
+-- are high-entropy random bytes that live only in the ephemeral review link,
+-- a `Secure; HttpOnly; SameSite=Lax; Path=/work-review` cookie, and a hidden
+-- form field respectively (never in SQLite). Redemption validates
+-- unexpired/unconsumed, marks consumed, and creates one session atomically.
+-- Expired rows remain inert; cleanup may evict expired credential rows but
+-- NEVER deletes the append-only audit or transcript data these credentials
+-- only authorize reads of.
+CREATE TABLE IF NOT EXISTS work_review_tokens (
+  token_hash       TEXT PRIMARY KEY,      -- sha256(raw token)
+  work_item_id     TEXT NOT NULL REFERENCES work_items(id), -- the item the link unlocks
+  slack_team_id    TEXT NOT NULL,         -- originating Slack workspace
+  slack_user_id    TEXT NOT NULL,         -- the member the link is bound to
+  slack_channel_id TEXT NOT NULL,         -- originating channel
+  expires_at       INTEGER NOT NULL,      -- short TTL; redemption after this fails
+  consumed_at      INTEGER,               -- set once by the atomic redemption
+  created_at       INTEGER NOT NULL
+);
+-- Redemption + eviction look up tokens by expiry; keep the sweeps cheap.
+CREATE INDEX IF NOT EXISTS idx_work_review_tokens_expiry ON work_review_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS work_review_sessions (
+  session_hash     TEXT PRIMARY KEY,      -- sha256(raw session cookie value)
+  csrf_hash        TEXT NOT NULL,         -- sha256(raw CSRF form-field value)
+  work_item_id     TEXT NOT NULL REFERENCES work_items(id),
+  slack_team_id    TEXT NOT NULL,
+  slack_user_id    TEXT NOT NULL,         -- membership is re-checked on every request
+  slack_channel_id TEXT NOT NULL,         -- must match the work item's space
+  expires_at       INTEGER NOT NULL,      -- short fixed maximum lifetime
+  created_at       INTEGER NOT NULL,
+  last_seen_at     INTEGER NOT NULL       -- advanced by get-and-touch as the user continues
+);
+CREATE INDEX IF NOT EXISTS idx_work_review_sessions_expiry ON work_review_sessions(expires_at);

@@ -292,6 +292,45 @@ export const MIGRATIONS: readonly Migration[] = [
       if (!columns.includes("fork_json")) db.exec("ALTER TABLE work_items ADD COLUMN fork_json TEXT");
     },
   },
+  {
+    id: "017_add_work_review_credentials",
+    up(db) {
+      // Additive-only. Only SHA-256 hashes are ever written here (raw token,
+      // session, and CSRF values stay in Slack messages / cookies / forms),
+      // so the tables never hold secrets. Foreign keys bind a token/session to
+      // the work item it unlocks; expiry indexes make the redemption and
+      // session-touch lookups cheap. No down migration: expiry cleanup may
+      // evict expired credential rows, but it NEVER deletes the append-only
+      // audit or transcript data these credentials only authorize reads of.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS work_review_tokens (
+          token_hash      TEXT PRIMARY KEY,
+          work_item_id    TEXT NOT NULL REFERENCES work_items(id),
+          slack_team_id   TEXT NOT NULL,
+          slack_user_id   TEXT NOT NULL,
+          slack_channel_id TEXT NOT NULL,
+          expires_at      INTEGER NOT NULL,
+          consumed_at     INTEGER,
+          created_at      INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS work_review_sessions (
+          session_hash    TEXT PRIMARY KEY,
+          csrf_hash       TEXT NOT NULL,
+          work_item_id    TEXT NOT NULL REFERENCES work_items(id),
+          slack_team_id   TEXT NOT NULL,
+          slack_user_id   TEXT NOT NULL,
+          slack_channel_id TEXT NOT NULL,
+          expires_at      INTEGER NOT NULL,
+          created_at      INTEGER NOT NULL,
+          last_seen_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_review_tokens_expiry
+          ON work_review_tokens(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_work_review_sessions_expiry
+          ON work_review_sessions(expires_at);
+      `);
+    },
+  },
 ];
 
 function assertValidRegistry(migrations: readonly Migration[]): void {

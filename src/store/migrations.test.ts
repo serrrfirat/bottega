@@ -24,6 +24,7 @@ const EXPECTED_MIGRATION_IDS: string[] = [
   "014_add_durable_pending_turns",
   "015_add_reactive_core_tables",
   "016_add_work_item_forks",
+  "017_add_work_review_credentials",
 ] as const;
 
 function tempDb(name: string): string {
@@ -191,10 +192,12 @@ describe("ordered SQLite migrations", () => {
       DROP INDEX idx_audit_space_ts;
       DROP INDEX idx_audit_actor_ts;
       -- Roll the ledger back to a genuine PRE-013 state: drop 013 AND any
-      -- later migrations (014, 015, 016) so the remaining ledger [001..012]
-      -- can re-apply 013..016 with no index gap (issue #312 extends the
-      -- history past 013; #356 past 014; #358 past that).
-      DELETE FROM schema_migrations WHERE id IN ('013_add_audit_search_indexes', '014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks');
+      -- later migrations (014, 015, 016, 017) so the remaining ledger [001..012]
+      -- can re-apply 013..017 with no index gap (#312 extends the history past
+      -- 013; #356 past 014; #358 past that; #359 past 016). Migration 017 is a
+      -- pure additive table pair, so replaying it on a backfilled ledger still
+      -- converges deterministically.
+      DELETE FROM schema_migrations WHERE id IN ('013_add_audit_search_indexes', '014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks', '017_add_work_review_credentials');
     `);
     store.close();
 
@@ -212,7 +215,7 @@ describe("ordered SQLite migrations", () => {
     // 013 (and the later migrations) were re-applied to a ledger that ended
     // at 012; the backfill runs through the current tail (#358's fork columns).
     expect(ledgerIds(upgraded.getDb())).toContain("013_add_audit_search_indexes");
-    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("016_add_work_item_forks");
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("017_add_work_review_credentials");
     upgraded.close();
   });
 
@@ -222,7 +225,7 @@ describe("ordered SQLite migrations", () => {
     const db = store.getDb();
     db.exec(`
       DROP TABLE pending_turns;
-      DELETE FROM schema_migrations WHERE id IN ('014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks');
+      DELETE FROM schema_migrations WHERE id IN ('014_add_durable_pending_turns', '015_add_reactive_core_tables', '016_add_work_item_forks', '017_add_work_review_credentials');
     `);
     store.close();
 
@@ -267,8 +270,47 @@ describe("ordered SQLite migrations", () => {
     // The durable rows are usable end-to-end on the backfilled ledger.
     await upgraded.enqueuePendingTurn({ spaceId: "slack:C1", ts: "1.1", principal: "U1", text: "backfilled" });
     expect(await upgraded.listPendingTurns("slack:C1")).toHaveLength(1);
-    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("016_add_work_item_forks");
+    expect(ledgerIds(upgraded.getDb()).at(-1)).toBe("017_add_work_review_credentials");
     upgraded.close();
+  });
+
+  test("fresh creation ends with the work review credential tables (issue #359)", () => {
+    const store = createStore(tempDb("work-review-credentials.db"));
+    // The ledger's tail is the new one-time token + browser session pair, so
+    // task 2's redemption store can rely on it being the newest migration.
+    expect(ledgerIds(store.getDb()).at(-1)).toBe("017_add_work_review_credentials");
+    // The one-time redeem token: hash PK, the work item it unlocks, the Slack
+    // identity that may redeem it, expiry, a nullable consume marker, created_at.
+    // SAFETY: PRAGMA table_info returns one row per declared column in order.
+    expect(
+      (store.getDb().query("PRAGMA table_info(work_review_tokens)").all() as Array<{ name: string }>).map(({ name }) => name),
+    ).toEqual([
+      "token_hash",
+      "work_item_id",
+      "slack_team_id",
+      "slack_user_id",
+      "slack_channel_id",
+      "expires_at",
+      "consumed_at",
+      "created_at",
+    ]);
+    // The browser session: session/csrf hash PK pair, the same Slack identity,
+    // expiry, created_at, and a last_seen_at touched as the user continues.
+    // SAFETY: PRAGMA table_info returns one row per declared column in order.
+    expect(
+      (store.getDb().query("PRAGMA table_info(work_review_sessions)").all() as Array<{ name: string }>).map(({ name }) => name),
+    ).toEqual([
+      "session_hash",
+      "csrf_hash",
+      "work_item_id",
+      "slack_team_id",
+      "slack_user_id",
+      "slack_channel_id",
+      "expires_at",
+      "created_at",
+      "last_seen_at",
+    ]);
+    store.close();
   });
 
   test("a failed migration rolls back its schema, data, and version row, then retries safely", () => {
