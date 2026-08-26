@@ -21,4 +21,11 @@ coveragePathIgnorePatterns = [
   # are never covered by the hermetic suite (they would drag the aggregate).
   "tests/e2e/slack-live.ts",
   "tests/e2e/canary.ts",
+  # SDK-transport-leg tests (2026-08-26): under `bun test --coverage
+  # --parallel=1` on Linux CI the InMemoryTransport/SDK legs went silent for
+  # ~1085s inside generate-tools.test.ts and the gate had to kill the whole
+  # suite. The legs now live in their own file, still run by `bun run test`
+  # with per-test runner timeouts, but excluded from the serial+coverage
+  # invocation — a wedged leg can never again stall the aggregate gate.
+  "src/extensions/generate-tools.transport.test.ts",
 ]
