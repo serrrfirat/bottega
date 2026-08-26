@@ -299,6 +299,10 @@ function chartAdapter(): ChartAdapter {
     async appendText() {},
     async appendTask() {},
     async stopStream() {},
+    async isChannelMember() {
+      return true;
+    },
+    async postEphemeral() {},
     streamingSupported: () => false,
     async start() {},
     async stop() {},

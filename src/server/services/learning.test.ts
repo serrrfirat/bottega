@@ -88,6 +88,10 @@ class RecordingAdapter implements SlackAdapter {
   async appendText(): Promise<void> {}
   async appendTask(): Promise<void> {}
   async stopStream(): Promise<void> {}
+  async isChannelMember(): Promise<boolean> {
+    return true;
+  }
+  async postEphemeral(): Promise<void> {}
   streamingSupported(): boolean {
     return false;
   }

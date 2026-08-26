@@ -303,9 +303,11 @@ function fakeAdapter(
     failReactions?: boolean;
     downloads?: Record<string, FakeDownloadedFile | Error>;
     streaming?: boolean;
+    /** Users allowed by isChannelMember; undefined admits everyone. */
+    members?: readonly string[];
   } = {},
 ) {
-  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false } = opts;
+  const { deferPost = false, failUpdateCalls = 0, failReactions = false, downloads = {}, streaming = false, members } = opts;
   const posts: Array<{ spaceId: string; text?: string; opts?: { threadTs?: string; blocks?: unknown[] } }> = [];
   const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }> = [];
   const reactions: Array<{ kind: "add" | "remove"; spaceId: string; ts: string; name?: string }> = [];
@@ -313,6 +315,7 @@ function fakeAdapter(
   const stops: Array<{ spaceId: string; ts: string; text?: string }> = [];
   const downloadedFileIds: string[] = [];
   const uploads: Array<{ spaceId: string; name: string; mimeType: string; content: Uint8Array }> = [];
+  const ephemerals: Array<{ spaceId: string; userId: string; text: string }> = [];
   let releasePost = () => {};
   /** updateMessage calls still to reject (issue #120 429 simulation); fail-soft means the service must cope. */
   let failuresLeft = failUpdateCalls;
@@ -362,6 +365,12 @@ function fakeAdapter(
     async stopStream(spaceId, ts, text) {
       stops.push({ spaceId, ts, text });
     },
+    async isChannelMember(_spaceId, userId) {
+      return members === undefined ? true : members.includes(userId);
+    },
+    async postEphemeral(spaceId, userId, text) {
+      ephemerals.push({ spaceId, userId, text });
+    },
     streamingSupported: () => streaming,
     async start() {},
     async stop() {},
@@ -375,6 +384,7 @@ function fakeAdapter(
     stops,
     downloadedFileIds,
     uploads,
+    ephemerals,
     releasePost: () => releasePost(),
   };
 }

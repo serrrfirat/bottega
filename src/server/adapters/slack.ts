@@ -362,20 +362,19 @@ export interface SlackAdapter {
    * removing the actor between render and submit fails closed. FAILS CLOSED:
    * an API error (or a members shape that cannot be trusted) THROWS instead
    * of ever returning a membership verdict, so an unavailable membership
-   * lookup denies access rather than granting it. Optional like
-   * `isWorkspaceAdmin` — absent on a legacy/custom adapter; the work-review
-   * surface fails closed when it is.
+   * lookup denies access rather than granting it. Required: the work-review
+   * authorization gate must never depend on consumer discipline to exist.
    */
-  isChannelMember?(spaceId: string, userId: string): Promise<boolean>;
+  isChannelMember(spaceId: string, userId: string): Promise<boolean>;
   /**
    * Sends `userId` an ephemeral message in the space's own channel
    * (chat.postEphemeral, issue #359) — the delivery surface for the
    * actor-bound private review link. Ephemeral messages are only visible to
    * `userId`; forwarding one grants no other Slack identity authority.
-   * Optional on the interface like `isChannelMember` — the real adapter
-   * implements it; legacy/custom doubles may omit it.
+   * Required: the caller must be able to rely on the delivery surface being
+   * present rather than branching on an optional.
    */
-  postEphemeral?(spaceId: string, userId: string, text: string): Promise<void>;
+  postEphemeral(spaceId: string, userId: string, text: string): Promise<void>;
   /**
    * Whether the workspace/app supports chat streaming (issue #168).
    * Feature-detected once per boot: true until a stream call fails with a

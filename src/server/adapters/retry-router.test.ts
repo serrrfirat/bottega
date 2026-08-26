@@ -28,14 +28,32 @@ function freshFixture() {
   stores.push(store);
   const transcriptDir = join(dir, "transcripts");
   const posts: Array<{ spaceId: string; text: string }> = [];
-  // SAFETY: the double implements the single method this router consumes;
-  // the assertion adapts the pick to the full adapter type for DI.
+  // The DI seam expects a full SlackAdapter; the router only consumes
+  // postMessage, so the unused members are deterministic no-throw stubs.
   const adapter = {
     postMessage: async (spaceId: string, text: string): Promise<string | undefined> => {
       posts.push({ spaceId, text });
       return "1700.1";
     },
-  } satisfies Pick<SlackAdapter, "postMessage"> as SlackAdapter;
+    updateMessage: async () => {},
+    downloadFile: async () => {
+      throw new Error("not used");
+    },
+    uploadFile: async () => undefined,
+    addReaction: async () => {},
+    removeReaction: async () => {},
+    startStream: async () => {
+      throw new Error("not used");
+    },
+    appendText: async () => {},
+    appendTask: async () => {},
+    stopStream: async () => {},
+    isChannelMember: async () => true,
+    postEphemeral: async () => {},
+    streamingSupported: () => false,
+    start: async () => {},
+    stop: async () => {},
+  } satisfies SlackAdapter;
   return { store, transcriptDir, posts, adapter };
 }
 

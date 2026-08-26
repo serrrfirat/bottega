@@ -49,6 +49,8 @@ function adapter() {
     appendText: async () => {},
     appendTask: async () => {},
     stopStream: async () => {},
+    isChannelMember: async () => true,
+    postEphemeral: async () => {},
     streamingSupported: () => false,
     start: async () => {},
     stop: async () => {},

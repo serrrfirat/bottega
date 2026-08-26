@@ -1452,6 +1452,10 @@ describe("empty completions surface at the presenter (issue #226)", () => {
       async appendText() {},
       async appendTask() {},
       async stopStream() {},
+      async isChannelMember() {
+        return true;
+      },
+      async postEphemeral() {},
       streamingSupported: () => false,
       async start() {},
       async stop() {},

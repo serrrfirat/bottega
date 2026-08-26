@@ -128,6 +128,10 @@ function recordingAdapter(
       if (opts.failStop) throw new Error("invalid_stream_arguments: Agents feature not enabled");
     },
     streamingSupported: () => opts.streaming ?? true,
+    async isChannelMember() {
+      return true;
+    },
+    async postEphemeral() {},
     async start() {},
     async stop() {},
   };
