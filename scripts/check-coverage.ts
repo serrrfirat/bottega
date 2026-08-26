@@ -186,11 +186,40 @@ export function decideGate(report: string, status: number | null, floor: Coverag
   };
 }
 
+/** The suite budget, in milliseconds (see {@link main}). */
+export const SUITE_TIMEOUT_MS = 1_200_000;
+
+/**
+ * True when the child was killed by the wrapper's budget rather than
+ * finishing a run: Node reports a `spawnSync` timeout as an ETIMEDOUT /
+ * ABORT_ERR error, and as a SIGTERM'd child. Bun 1.3.x sets
+ * `{ name: "SystemError", code: "ETIMEDOUT" }` with signal "SIGTERM".
+ */
+export function wasKilledByBudget(
+  error: { code?: string } | null | undefined,
+  signal: NodeJS.Signals | null,
+): boolean {
+  return error?.code === "ETIMEDOUT" || error?.code === "ABORT_ERR" || signal === "SIGTERM";
+}
+
 function main(): number {
   // Whole suite, serial (--parallel=1): issue #260's e2e harness windows
   // hold by construction (nothing runs concurrently), and the one "All
   // files" row IS the honest whole-suite aggregate.
-  const run = spawnSync("bun", ["test", "--coverage", "--parallel=1"], { encoding: "utf8", timeout: 600_000 });
+  //
+  // The budget must track the SUITE, not the wrapper's own patience: on
+  // CI (2026-08-25) the serial+coverage suite outgrew 600s and this
+  // spawnSync killed it mid-flight — bun then reported the in-progress
+  // tests as failures (sub-4ms "(fail)" anchors with no error detail),
+  // which read as five real mcp-oauth regressions. The gate now budgets
+  // 20 minutes (a green coverage job historically needs ~3-4; the
+  // headroom absorbs slower runners) and a timeout kill is reported AS a
+  // kill — never laundered into per-test failure summaries.
+  const run = spawnSync("bun", ["test", "--coverage", "--parallel=1"], { encoding: "utf8", timeout: SUITE_TIMEOUT_MS });
+  if (wasKilledByBudget(run.error, run.signal)) {
+    console.error(`coverage gate: the suite exceeded its ${SUITE_TIMEOUT_MS / 1000}s budget and was killed — not a test verdict`);
+    return 1;
+  }
   const report = `${run.stdout ?? ""}\n${run.stderr ?? ""}`;
   const verdict = decideGate(report, run.status, FLOOR);
   if (!verdict.ok) {
