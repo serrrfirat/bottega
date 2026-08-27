@@ -310,7 +310,7 @@ export const JOURNEYS: readonly CanaryJourney[] = [
     id: "live.work-review.continue-from-blocked",
     layer: "live-api",
     actors: ["requester"],
-    covers: ["create_work_item"],
+    covers: ["create_work_item", "graph_query"],
     visibleProof: "a blocked item's card offers Open review + Continue using work so far; the review link redeems once and the continuation lands as a new attempt",
     durableProof: "work_item.forked + work_review.redeemed audit rows keyed by the Slack actor; source row stays blocked",
     fixtures: ["live:SLACK_QA_REQUESTER_TOKEN"],
