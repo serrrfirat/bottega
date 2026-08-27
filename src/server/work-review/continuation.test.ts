@@ -9,6 +9,7 @@ import {
   WORK_REVIEW_CONTINUATION_RESOLVED_EVENT,
 } from "../../store/audit-events";
 import { continueWork, CONTINUATION_GUIDANCE_MAX_CHARS } from "./continuation";
+import { forkWorkItem } from "../../work-items/fork";
 
 const dirs: string[] = [];
 const stores: Store[] = [];
@@ -109,6 +110,35 @@ describe("continueWork (issue #359)", () => {
     expect(results.filter((result) => !result.existed)).toHaveLength(1);
     expect(results.filter((result) => result.existed)).toHaveLength(3);
     expect((await store.listAudit({ event_type: WORK_ITEM_FORKED_EVENT })).filter((row) => JSON.parse(row.payload).forked_from === source.id)).toHaveLength(1);
+  });
+
+  test("generic fork does not suppress continuation; repeat continuation resolves to the continuation fork", async () => {
+    const { store, transcriptDir } = fixture();
+    const { source, space } = await blockedSource(store, transcriptDir);
+
+    // An unrelated #358 timeline fork of the same source, no continuation intent.
+    const generic = await forkWorkItem(
+      { ...store, transcriptDir },
+      { sourceId: source.id, atTimelineIndex: 1, requester: "U0" },
+    );
+    expect(JSON.parse(generic.fork_json!)).not.toHaveProperty("intent");
+
+    const first = await continueWork({ store, transcriptDir }, { sourceId: source.id, requester: "U2", spaceId: space.id });
+    expect(first.existed).toBe(false);
+    expect(first.forkId).not.toBe(generic.id);
+    const continuation = await store.getWorkItem(first.forkId);
+    expect(continuation).not.toBeNull();
+    expect(JSON.parse(continuation!.fork_json!)).toMatchObject({ intent: "continuation" });
+
+    const second = await continueWork({ store, transcriptDir }, { sourceId: source.id, requester: "U3", spaceId: space.id });
+    expect(second.existed).toBe(true);
+    expect(second.forkId).toBe(first.forkId);
+
+    const forks = (await store.listAudit({ event_type: WORK_ITEM_FORKED_EVENT }))
+      .map((row) => JSON.parse(row.payload))
+      .filter((payload) => payload.forked_from === source.id);
+    expect(forks.filter((payload) => payload.intent === "continuation")).toHaveLength(1);
+    expect(forks.filter((payload) => payload.intent === undefined)).toHaveLength(1);
   });
 
   test("rejects unknown, foreign-space, and overlong guidance", async () => {
