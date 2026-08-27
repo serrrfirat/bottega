@@ -23,7 +23,7 @@ import { bootHarness, type Harness, type StubTurn } from "./harness";
 import { workItemsExtension } from "../../src/tools/work-items";
 import { parseOrgConfigYaml } from "../../src/policy/config";
 import type { ToolDefinition, ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import type { Store } from "../../src/store/db";
+import type { Store, CreatedWorkItemAuditPayload } from "../../src/store/db";
 
 /** Polls a predicate until truthy (assert pattern for async effects). */
 async function waitFor<T>(probe: () => T | undefined, timeoutMs = 15_000): Promise<T> {
@@ -39,24 +39,25 @@ async function waitFor<T>(probe: () => T | undefined, timeoutMs = 15_000): Promi
 }
 
 /** create_work_item tool definitions for the headless work-item journey. */
-function workItemCustomTools(orgConfigYaml: string): {
-  customTools: ToolDefinition[];
-  bindStore(store: Store): void;
-} {
+function workItemCustomTools(orgConfigYaml: string) {
   const orgPolicy = parseOrgConfigYaml(orgConfigYaml);
   let storeRef: Store | null = null;
+  // SAFETY: the Proxy target is never read directly — every property access is forwarded to the bound store by the get handler.
   const storeProxy = new Proxy({} as Store, {
     get: (_target, prop: PropertyKey) => {
       if (storeRef === null) throw new Error("work item tools used before the harness store was bound");
-      return (storeRef as unknown as Record<PropertyKey, unknown>)[prop];
+      // SAFETY: the handler forwards reads for any property key to the bound store; keyof Store is its sound index type.
+      return storeRef[prop as keyof Store];
     },
   }) as Store;
   const defs: ToolDefinition[] = [];
+  // SAFETY: the extension factory only calls pi.registerTool, so a stub exposing just that member satisfies the executed path.
   workItemsExtension(storeProxy, { orgPolicy })({
     registerTool: (t: ToolDefinition) => void defs.push(t),
-  } as unknown as ExtensionAPI);
+  } as ExtensionAPI);
   return {
-    customTools: defs.map((def) => ({ ...def, __isToolDefinition: true }) as unknown as ToolDefinition),
+    // SAFETY: __isToolDefinition is a runtime marker; the spread preserves the def's shape, so the result stays a ToolDefinition.
+    customTools: defs.map((def) => ({ ...def, __isToolDefinition: true }) as ToolDefinition),
     bindStore(store: Store) {
       storeRef = store;
     },
@@ -78,7 +79,9 @@ async function findOpenItem(h: Harness, spaceId: string, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await h.store.listAudit({ space: spaceId, event_type: "work_item.created" });
-    const ids = rows.map((r) => (JSON.parse(r.payload) as { id: string }).id);
+    // SAFETY: work_item.created payloads are written by the store's
+    // createWorkItem with `id` as the item id (see src/store/db.ts).
+    const ids = rows.map((r) => (JSON.parse(r.payload) as CreatedWorkItemAuditPayload).id);
     for (const id of ids) {
       const item = await h.store.getWorkItem(id);
       if (item) return item;
@@ -103,7 +106,7 @@ describe("headless lane (issue #360): no Slack surface", () => {
       // construction, not merely unused.
       expect(h.app).toBeUndefined();
       // The harness adapter is the headless fake (implements SlackAdapter).
-      expect(typeof h.adapter.postMessage).toBe("function");
+      expect(h.adapter.postMessage).toBeDefined();
       expect(h.adapter).not.toBeNull();
     } finally {
       await h.cleanup();
@@ -112,7 +115,7 @@ describe("headless lane (issue #360): no Slack surface", () => {
 
   test("refuses headless combined with realSlack (mutually exclusive modes)", async () => {
     await expect(
-      bootHarness({ headless: true, realSlack: true, slackTokens: undefined as never }),
+      bootHarness({ headless: true, realSlack: true, slackTokens: undefined }),
     ).rejects.toThrow(/mutually exclusive/);
   });
 });

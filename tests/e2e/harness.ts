@@ -548,6 +548,14 @@ export interface HeadlessAdapter extends SlackAdapter {
 export const HEADLESS_BOT = "U-headless-bot";
 export const HEADLESS_HUMAN = "U-headless-human";
 
+/**
+ * Seeded name → deterministic headless id map (issue #360). An open map so
+ * lookups accept any string and return undefined for unknown seeded names.
+ */
+interface SeededNameMap {
+  [name: string]: string;
+}
+
 export function createHeadlessAdapter(): HeadlessAdapter {
   const posts: EmulatorMessage[] = [];
   let counter = 0;
@@ -561,13 +569,14 @@ export function createHeadlessAdapter(): HeadlessAdapter {
     nextTs,
     async postMessage(spaceId, text, postOpts) {
       const ts = nextTs();
-      posts.push({
+      const rec: EmulatorMessage = {
         ts,
         channel_id: channelFromSpaceId(spaceId),
         user: HEADLESS_BOT,
         text,
-        ...(postOpts?.threadTs !== undefined ? { thread_ts: postOpts.threadTs } : {}),
-      });
+      };
+      if (postOpts?.threadTs !== undefined) rec.thread_ts = postOpts.threadTs;
+      posts.push(rec);
       return ts;
     },
     async isChannelMember() {
@@ -619,11 +628,13 @@ export function createHeadlessAdapter(): HeadlessAdapter {
  * overlays and deliver calls share deterministic ids with NO emulator.
  */
 function headlessSlackHandle(adapter: HeadlessAdapter): SlackHandle {
-  const namesToIds: Record<string, string> = {
+  // Known seeded names map to deterministic headless ids (issue #360); the
+  // lookup below accepts any string and returns undefined for unknown names.
+  const namesToIds: SeededNameMap = {
     [HUMAN_USER_NAME]: HEADLESS_HUMAN,
     [BOT_USER_NAME]: HEADLESS_BOT,
   };
-  const channelsToIds: Record<string, string> = {
+  const channelsToIds: SeededNameMap = {
     ops: "C-HEADLESSOPS",
     general: "C-HEADLESSGENERAL",
   };
