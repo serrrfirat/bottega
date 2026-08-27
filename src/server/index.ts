@@ -315,6 +315,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     runtime: extensionRuntime,
     surfaces: extensionSurfaces,
     surfaceAuthProvider,
+    surfaceAuthorization,
     memoryProvider,
   } = wiring;
   opts.onRuntimeWiring?.(wiring);
@@ -898,6 +899,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const refreshExtensionToolset = async (): Promise<ToolDefinition[]> => {
     const refreshOpts: NonNullable<Parameters<typeof refreshMissingExtensionSurfaces>[2]> = {
       authProvider: surfaceAuthProvider,
+      authorize: surfaceAuthorization,
     };
     if (opts.surfaceTransport !== undefined) refreshOpts.mcpTransport = opts.surfaceTransport;
     const surfaces = await refreshMissingExtensionSurfaces(

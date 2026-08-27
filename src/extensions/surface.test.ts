@@ -10,6 +10,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { AuthorizationContext } from "./boundary";
 import { createExtensionRegistry } from "./registry";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
 import {
@@ -108,6 +109,35 @@ describe("extensionToolSurface (issue #158 runtime discovery)", () => {
     expect(surface.map((tool) => tool.tier)).toEqual(["read", "write", "exec", "read", "write"]);
     // Params come from the server's inputSchema.
     expect(surface[0]!.params).toEqual([{ name: "query", type: "string" }]);
+  });
+
+  test("authorized discovery forwards only the boundary placeholder to tools/list transport", async () => {
+    const seen: AuthorizationContext[] = [];
+    const manifest = toolsLessManifest({ id: "authorized.me" });
+    const transport = (
+      _binding: McpBinding,
+      _authProvider: unknown,
+      authorization?: AuthorizationContext,
+    ): Transport => {
+      if (authorization === undefined) throw new Error("discovery authorization was not wired");
+      seen.push(authorization);
+      return fakeToolsServer(FAKE_WIRE_TOOLS, { count: 0 })(_binding);
+    };
+
+    const surfaces = await resolveExtensionSurfaces([{ manifest }], {
+      mcpTransport: transport,
+      authorize: async (_manifest, invoke) =>
+        invoke({
+          callId: "surface-discovery",
+          placeholder: "bottega-call-placeholder",
+          signal: new AbortController().signal,
+        }),
+    });
+
+    expect(surfaces.get(manifest.id)).toHaveLength(FAKE_WIRE_TOOLS.length);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.placeholder).toBe("bottega-call-placeholder");
+    expect(seen[0]?.placeholder).not.toContain("super-secret");
   });
 
   test("pinned tools win: no discovery happens for a manifest WITH tools (backward compatible)", async () => {

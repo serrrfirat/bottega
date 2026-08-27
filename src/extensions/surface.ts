@@ -32,8 +32,15 @@ import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { errorMessage } from "../tools/helpers";
 import { listProviderTools, toolsFromMcpList } from "./generate-tools";
+import type { AuthorizationContext } from "./boundary";
 import type { ExtensionManifest, ExtensionTool, McpBinding } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
+
+/** Wraps one discovery operation in a caller-scoped authorization boundary. */
+export type SurfaceAuthorization = <T>(
+  manifest: ExtensionManifest,
+  invoke: (authorization?: AuthorizationContext) => Promise<T>,
+) => Promise<T>;
 
 /** The effective tool surface of every extension, keyed by extension id. */
 export type ExtensionSurfaces = ReadonlyMap<string, readonly ExtensionTool[]>;
@@ -64,8 +71,13 @@ const discoveryCache = new Map<string, Promise<ExtensionTool[]>>();
  */
 export async function extensionToolSurface(
   manifest: ExtensionManifest,
-  mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport,
+  mcpTransport?: (
+    binding: McpBinding,
+    authProvider?: OAuthClientProvider,
+    authorization?: AuthorizationContext,
+  ) => Transport,
   authProvider?: OAuthClientProvider,
+  authorize?: SurfaceAuthorization,
 ): Promise<ExtensionTool[]> {
   if (manifest.tools !== undefined) return manifest.tools;
   if (manifest.kind !== "mcp") return [];
@@ -73,7 +85,9 @@ export async function extensionToolSurface(
   const cached = discoveryCache.get(key);
   if (cached !== undefined) return cached;
   const pending = (async () => {
-    const wire = await listProviderTools(manifest.mcp, mcpTransport, { authProvider });
+    const discover = (authorization?: AuthorizationContext) =>
+      listProviderTools(manifest.mcp, mcpTransport, { authProvider, authorization });
+    const wire = await (authorize === undefined ? discover() : authorize(manifest, discover));
     return toolsFromMcpList(wire, manifest.id).tools;
   })();
   discoveryCache.set(key, pending);
@@ -103,8 +117,13 @@ export async function extensionToolSurface(
 export async function resolveExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
   opts: {
-    mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
+    mcpTransport?: (
+      binding: McpBinding,
+      authProvider?: OAuthClientProvider,
+      authorization?: AuthorizationContext,
+    ) => Transport;
     authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
+    authorize?: SurfaceAuthorization;
     /**
      * Issue #257 connectedness probe: given an extension id, is it
      * CONNECTED (a valid vault credential row exists)? Checked ONLY for a
@@ -123,7 +142,7 @@ export async function resolveExtensionSurfaces(
     extensions.map(async ({ manifest }) => {
       try {
         const authProvider = await opts.authProvider?.(manifest);
-        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport, authProvider)] as const;
+        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport, authProvider, opts.authorize)] as const;
       } catch (err) {
         // Issue #166: a tools-less manifest whose provider is unreachable /
         // auth-gated must never fail the boot. Skip it (the map carries
@@ -204,8 +223,13 @@ export async function refreshMissingExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
   current: ExtensionSurfaces,
   opts: {
-    mcpTransport?: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport;
+    mcpTransport?: (
+      binding: McpBinding,
+      authProvider?: OAuthClientProvider,
+      authorization?: AuthorizationContext,
+    ) => Transport;
     authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
+    authorize?: SurfaceAuthorization;
   } = {},
 ): Promise<ExtensionSurfaces> {
   const missing = extensions.filter(

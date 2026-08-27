@@ -48,6 +48,7 @@ import {
   createSecretFileBoundary,
   proxyBoundaryControlFromEnv,
   secretResolverFromSettings,
+  type AuthorizationContext,
   type CredentialBoundary,
   type SecretFileBoundaryOpts,
 } from "../extensions/boundary";
@@ -55,7 +56,12 @@ import { createExtensionRegistry, type ExtensionRegistry } from "../extensions/r
 import { mergeRuntimeRegistry } from "../extensions/runtime-registry";
 import { createExtensionRuntime, type ExtensionRuntime } from "../extensions/runtime";
 import { createOpenApiEgressSeam } from "../extensions/openapi-egress";
-import { resolveExtensionSurfaces, type ExtensionSurfaces } from "../extensions/surface";
+import { MCP_DISCOVERY_TIMEOUT_MS } from "../extensions/generate-tools";
+import {
+  resolveExtensionSurfaces,
+  type ExtensionSurfaces,
+  type SurfaceAuthorization,
+} from "../extensions/surface";
 import { createRuntimeMcpOAuthProvider, type McpOAuthTokenStore } from "../extensions/mcp-oauth";
 import type { ExtensionManifest, McpBinding } from "../extensions/manifest";
 import type { ToolStepSink } from "./services/slack-turn-presenter";
@@ -121,7 +127,11 @@ export interface BootstrapRuntimeDeps {
    */
   skipRuntimeRegistryMerge?: boolean;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
-  mcpTransport?: (binding: McpBinding) => Transport;
+  mcpTransport?: (
+    binding: McpBinding,
+    authProvider?: OAuthClientProvider,
+    authorization?: AuthorizationContext,
+  ) => Transport;
   /**
    * Vault token store seam for the authenticated tools/list discovery
    * provider (issue #284 test seam, mirroring the runtime's
@@ -147,6 +157,8 @@ export interface BootstrapRuntimeDeps {
 export interface BootstrapRuntime {
   store: Store;
   audit: AuditModule;
+  /** Authorization wrapper shared by boot discovery and session refresh. */
+  surfaceAuthorization: SurfaceAuthorization;
   orgPolicy: PolicyConfig;
   registry: ExtensionRegistry;
   runtime: ExtensionRuntime;
@@ -187,20 +199,6 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     if (credential === undefined) return undefined;
     return createRuntimeMcpOAuthProvider({ credential, tokenStore: deps.mcpOAuthTokenStore });
   };
-  // Effective tool surfaces (issues #158/#166), resolved once: pinned
-  // manifest tools, or the provider's tools/list for tools-less manifests
-  // (a per-provider failure is skipped — the runtime's lazy per-call path
-  // fails closed instead of the boot dying).
-  const surfaceOptions: NonNullable<Parameters<typeof resolveExtensionSurfaces>[1]> = {
-    authProvider: surfaceAuthProvider,
-    // Issue #257: a boot discovery failure on a provider that HAS a
-    // credential row is a loud fail-closed warning, never the silent skip.
-    isConnected:
-      deps.isConnected ??
-      (async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0),
-  };
-  if (deps.mcpTransport !== undefined) surfaceOptions.mcpTransport = deps.mcpTransport;
-  const surfaces = await resolveExtensionSurfaces(registry.list(), surfaceOptions);
   // Credential boundary (issues #53/#123/#190): the resolver is the
   // deployment's configured secrets backend (issue #190) — omp-broker by
   // default (the #54/#143 behavior, byte-identical), 1password-connect
@@ -217,6 +215,37 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     boundaryOpts.resolver = secretResolverFromSettings(deps.orgSettings ?? store.getOrgSettings());
   }
   const boundary = createSecretFileBoundary(boundaryOpts);
+  // API-key MCP discovery runs through the same call-scoped boundary as
+  // execution. OAuth remains owned by the MCP SDK's auth provider above.
+  const surfaceAuthorization: SurfaceAuthorization = async (manifest, invoke) => {
+    if (manifest.kind !== "mcp" || manifest.credentialSchema.type !== "api_key") return invoke();
+    const credential = (await store.listExtensionCredentials(manifest.id)).at(-1);
+    if (credential === undefined) return invoke();
+    return boundary.runWithAuthorization(
+      {
+        credential,
+        targets: manifest.credentialTargets,
+        callId: `surface:${manifest.id}:tools-list`,
+        timeoutMs: MCP_DISCOVERY_TIMEOUT_MS,
+      },
+      invoke,
+    );
+  };
+  // Effective tool surfaces (issues #158/#166), resolved once: pinned
+  // manifest tools, or the provider's tools/list for tools-less manifests
+  // (a per-provider failure is skipped — the runtime's lazy per-call path
+  // fails closed instead of the boot dying).
+  const surfaceOptions: NonNullable<Parameters<typeof resolveExtensionSurfaces>[1]> = {
+    authProvider: surfaceAuthProvider,
+    authorize: surfaceAuthorization,
+    // Issue #257: a boot discovery failure on a provider that HAS a
+    // credential row is a loud fail-closed warning, never the silent skip.
+    isConnected:
+      deps.isConnected ??
+      (async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0),
+  };
+  if (deps.mcpTransport !== undefined) surfaceOptions.mcpTransport = deps.mcpTransport;
+  const surfaces = await resolveExtensionSurfaces(registry.list(), surfaceOptions);
   // The runtime's router is a per-call dependency: resolve the supplier at
   // construction when a plain object was given, otherwise forward per call
   // so the server's mid-boot router assignment is observed live.
@@ -252,5 +281,5 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
           );
         })()
       : resolveMemoryProvider(store.getOrgSettings(), store.getDb()));
-  return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary, surfaceAuthProvider };
+  return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary, surfaceAuthProvider, surfaceAuthorization };
 }

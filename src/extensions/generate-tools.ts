@@ -36,7 +36,7 @@ import { z } from "@oh-my-pi/pi-coding-agent";
 import { errorMessage } from "../tools/helpers";
 import { EXTENSION_ID_RE, isRecord, type ExtensionTool, type ExtensionToolParam, type ExtensionToolTier, type JsonObject, type JsonValue, type McpBinding } from "./manifest";
 import { defaultMcpTransport } from "./runtime";
-
+import type { AuthorizationContext } from "./boundary";
 /**
  * The wire shape of one MCP tool as returned by tools/list (structural —
  * defensively permissive where servers misbehave; the SDK's ListToolsResult
@@ -254,14 +254,18 @@ export const MCP_DISCOVERY_TIMEOUT_MS = 10_000;
  */
 export async function listProviderTools(
   binding: McpBinding,
-  mcpTransport: (binding: McpBinding, authProvider?: OAuthClientProvider) => Transport = defaultMcpTransport,
-  opts: { timeoutMs?: number; authProvider?: OAuthClientProvider } = {},
+  mcpTransport: (
+    binding: McpBinding,
+    authProvider?: OAuthClientProvider,
+    authorization?: AuthorizationContext,
+  ) => Transport = defaultMcpTransport,
+  opts: { timeoutMs?: number; authProvider?: OAuthClientProvider; authorization?: AuthorizationContext } = {},
 ): Promise<ProviderTool[]> {
   const timeoutMs = opts.timeoutMs ?? MCP_DISCOVERY_TIMEOUT_MS;
   const discover = async (): Promise<ProviderTool[]> => {
     const client = new Client({ name: "bottega-extensions", version: "1.0.0" });
     try {
-      const transport = mcpTransport(binding, opts.authProvider);
+      const transport = mcpTransport(binding, opts.authProvider, opts.authorization);
       // Contain a misbehaving stdio server's stderr (issue #205): the boot log
       // must never carry a child's exec noise, and an unbounded pipe would
       // stall the child on backpressure. Drain up to a bounded prefix for
