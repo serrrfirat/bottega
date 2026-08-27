@@ -202,6 +202,13 @@ export function wasKilledByBudget(
   return error?.code === "ETIMEDOUT" || error?.code === "ABORT_ERR" || signal === "SIGTERM";
 }
 
+export const COVERAGE_PATH_IGNORE_PATTERNS = [
+  "src/extensions/generate-tools.transport.test.ts",
+  "src/extensions/mcp-endpoint-probe.test.ts",
+] as const;
+
+const coveragePathIgnoreArgs = COVERAGE_PATH_IGNORE_PATTERNS.flatMap((pattern) => ["--path-ignore-patterns", pattern]);
+
 async function main(): Promise<number> {
   // Whole suite, serial (--parallel=1): issue #260's e2e harness windows
   // hold by construction (nothing runs concurrently), and the one "All
@@ -234,9 +241,11 @@ async function main(): Promise<number> {
   // this file; excluding its (covered) source from instrumentation can
   // only move the aggregate UP for src/extensions/generate-tools.ts is
   // still exercised by generate-tools.test.ts.
+ 
+
   const child = spawn(
     "bun",
-    ["test", "--coverage", "--parallel=1", "--path-ignore-patterns", "src/extensions/generate-tools.transport.test.ts"],
+    ["test", "--coverage", "--parallel=1", ...coveragePathIgnoreArgs],
     { env: process.env },
   );
   const reportParts: string[] = [];

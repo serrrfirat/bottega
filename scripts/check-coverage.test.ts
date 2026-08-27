@@ -13,6 +13,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  COVERAGE_PATH_IGNORE_PATTERNS,
   FLOOR,
   MAX_FAILURES,
   MAX_SNIPPET_LINES,
@@ -249,6 +250,15 @@ describe("decideGate failure diagnostics (issue #300)", () => {
     expect(result.message).toMatch(/suite itself failed/);
   });
 });
+describe("coverage discovery exclusions", () => {
+  test("excludes SDK transport legs while leaving them in the package test suite", () => {
+    expect(COVERAGE_PATH_IGNORE_PATTERNS).toEqual([
+      "src/extensions/generate-tools.transport.test.ts",
+      "src/extensions/mcp-endpoint-probe.test.ts",
+    ]);
+  });
+});
+
 describe("suite-budget kill detection (2026-08-25 CI)", () => {
   test("a SIGTERM'd child is a budget kill, not a suite verdict", () => {
     // The regression: the wrapper's 600s spawnSync timeout SIGTERM'd the
