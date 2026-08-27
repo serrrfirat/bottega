@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { JUDGED_HOSTS } from "./generate";
 import { resolve } from "node:path";
 import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 import { MODEL_GATEWAY_KEYS } from "./generate";
@@ -115,16 +116,26 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(cb["cooldown"]).toMatch(/^[0-9]+(m|s)$/);
   });
 
-  test("judge rules cover all traffic that passes the allowlist", () => {
-    const rules = asRecordArray(judgeCfg["rules"]);
-    expect(rules).toHaveLength(1);
-    expect(rules[0]["host"]).toBe("*");
+  test("judge rules cover content-bearing hosts only (#364)", () => {
+    // #364: infra hosts (model gateways, Slack, api.github.com) are
+    // code-pathed + allowlisted + audited; judging them denies 100% of
+    // legit traffic (a URL-only verdict can never see task context).
+    const rules = asRecordArray(judgeCfg["rules"]).map((r) => r["host"]);
+    for (const host of JUDGED_HOSTS) expect(rules).toContain(host);
+    const judged = new Set(rules.map(String));
+    expect(judged.has("*")).toBe(false);
+    expect(judged.has("slack.com")).toBe(false);
+    expect(judged.has("*.slack.com")).toBe(false);
+    expect(judged.has("cloud-api.near.ai")).toBe(false);
   });
 
   test("judge LLM backend points at a NEAR.ai OpenAI-compatible endpoint", () => {
     const provider = asRecord(judgeCfg["provider"]);
     expect(provider["type"]).toBe("openai");
-    expect(asString(provider["base_url"])).toMatch(/^https:\/\/[a-z0-9-]+\.completions\.near\.ai\/v1$/);
+    // cloud-api.near.ai serves the non-reasoning judge model (#364): a
+    // reasoning model starves content and fallback-deny fires on every call.
+    expect(asString(provider["base_url"])).toMatch(/^https:\/\/[a-z0-9.-]+\.near\.ai\/v1$/);
+    expect(asString(provider["model"])).toBe("google/gemini-2.5-flash-lite");
     expect(provider["api_key_env"]).toBe("NEARAI_JUDGE_API_KEY");
     expect(Number(provider["max_tokens"])).toBeGreaterThan(0);
   });

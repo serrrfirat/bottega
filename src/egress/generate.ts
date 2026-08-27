@@ -110,6 +110,22 @@ export function gatewayHost(provider: string): string {
  * the GitHub API for the ingest poller (issue #57, mentions search), and
  * the Tavily web-search gateway (issue #278 — the search_web tool's
  * provider host, api.tavily.com). */
+/**
+ * Hosts the judge transform evaluates (#364): content-bearing traffic where
+ * an LLM verdict adds signal. Infrastructure hosts (model gateways, Slack,
+ * api.github.com) are allowlist+secrets+audit gated and deliberately NOT
+ * judged — a URL-only LLM verdict on protocol traffic denies 100% of it.
+ */
+export const JUDGED_HOSTS = [
+  "api.tavily.com",
+  "raw.githubusercontent.com",
+  "mcp.attio.com",
+  "api.githubcopilot.com",
+  "gmail.googleapis.com",
+  "gmailmcp.googleapis.com",
+  "mcp.linear.app",
+] as const;
+
 export const BASE_EGRESS_DOMAINS = [
   gatewayHost("near"),
   "*.completions.near.ai",
@@ -412,6 +428,7 @@ export function renderEgressConfig(
   openApiEntries: readonly OpenApiInjectEntry[] = [],
 ): string {
   const domainLines = domains.map((domain) => `        - "${domain}"`).join("\n");
+  const judgeRuleLines = JUDGED_HOSTS.map((host) => `        - host: "${host}"`).join("\n");
   // The secrets transform is always emitted: the model-gateway static-key
   // entries (issue #208) are base config — only the extension entries are
   // optional.
@@ -431,10 +448,16 @@ export function renderEgressConfig(
 # (compose \`dns:\`), so every name answers with \`proxy_ip\` — the proxy is the
 # only path out of the container network. The transform pipeline then gates:
 #   1. allowlist  — model endpoints pass without an LLM round-trip.
-#   2. judge      — everything that passed the allowlist is policy-judged by
-#                   an LLM ("deny unless clearly required by the task and
-#                   safe"). Fallback deny keeps egress closed when the judge
-#                   LLM is down or the circuit breaker is open.
+#   2. judge      — content-bearing hosts (search, KB fetch, extension MCP)
+#                   are policy-judged by an LLM ("deny unless clearly
+#                   required by the task and safe"). Fallback deny keeps
+#                   egress closed when the judge LLM is down or the circuit
+#                   breaker is open. Infrastructure hosts (model gateways,
+#                   Slack, GitHub API) are code-pathed, allowlisted, and
+#                   audited — an LLM URL-only verdict on them is always
+#                   noise (verified live in #361/#364: a working judge
+#                   denied 100% of legit infra requests), so they are
+#                   judged no more.
 # iron-proxy's DNS always answers with proxy_ip (it does not refuse lookups);
 # enforcement is at the HTTP layer, so a non-allowlisted host gets a 403.
 ${EGRESS_STATIC_BLOCKS}
@@ -453,8 +476,9 @@ transforms:
       domains:
 ${domainLines}
 
-  # 2. Judge: LLM policy gate. Fires on every request that passed the
-  #    allowlist. Independent circuit breaker + timeout per instance.
+  # 2. Judge: LLM policy gate on content-bearing traffic only (search, KB
+  #    fetch, extension MCP). Infrastructure hosts (model gateways, Slack,
+  #    GitHub API) are exempt — see the design note above (#364).
   - name: judge
     config:
       name: "egress-policy"
@@ -465,11 +489,14 @@ ${domainLines}
         consecutive_failures: 5
         cooldown: "10s"
       rules:
-        - host: "*"
+${judgeRuleLines}
       provider:
         type: "openai" # NEAR.ai OpenAI-compatible Chat Completions API
-        base_url: "https://qwen35-122b.completions.near.ai/v1"
-        model: "qwen35-122b"
+        base_url: "https://cloud-api.near.ai/v1"
+        model: "google/gemini-2.5-flash-lite"
+        # Non-reasoning model REQUIRED (#364): a reasoning model burns the
+        # whole token budget on reasoning_content and content stays null ->
+        # fallback deny on every request.
         # Judge key is separate from the agents' key (issue #8: "separate key
         # if preferred"). Model id is org-chosen; this example is from
         # https://docs.near.ai/cloud/models.
