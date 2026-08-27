@@ -121,13 +121,18 @@ describe("extension registry", () => {
     expect(registry.list()).toEqual([]);
   });
 
-  test("the committed seed resolves the pinned providers (github/linear/attio) — notion is NOT pinned (issue #233)", () => {
-    // Issue #233: the notion pin is removed — notion registers at RUNTIME
-    // (the store-backed runtime registry, merged at boot) like any other
-    // catalog connect. The committed seed stays github/linear/attio (the
-    // providers with live credentials).
+  test("the committed seed resolves the pinned providers (github/linear/attio/notion) — notion re-pinned (issue #361)", () => {
+    // Issue #233 removed the notion pin in favor of runtime connects — but
+    // the connect flow's MCP validation probe runs BEFORE registration, and
+    // on a strict deployment the probe 403s at the egress gate until the
+    // domain is allowlisted. Runtime-only connects were unreachable there
+    // (#361), so the reviewed seed pin is back; the runtime connect still
+    // owns the credential.
     const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
-    expect(registry.resolve("notion")).toBeUndefined();
+    const notion = registry.resolve("notion");
+    expect(notion).toBeDefined();
+    expect(notion!.manifest.credentialSchema.type).toBe("oauth");
+    expect(notion!.snapshot?.source.reviewed).toBe(true);
     const linear = registry.resolve("linear");
     expect(linear).toBeDefined();
     expect(linear!.manifest.kind).toBe("mcp");
@@ -147,8 +152,8 @@ describe("extension registry", () => {
     // (issue #286 §7).
     const registry = createExtensionRegistry(resolve(import.meta.dir, "../../config/extensions"));
     const ids = registry.list().map((entry) => entry.manifest.id);
-    // Filename sort order: "github" < "gmail-googleapis-com" (i < m).
-    expect(ids).toEqual(["attio", "github", "gmail-googleapis-com", "linear"]);
+    // Filename sort order: "github" < "gmail-googleapis-com" (i < m) < notion.
+    expect(ids).toEqual(["attio", "github", "gmail-googleapis-com", "linear", "notion"]);
     for (const id of ids) {
       expect(registry.resolve(id)).toBeDefined();
     }

@@ -83,6 +83,8 @@ transforms:
         - "gmail.googleapis.com"
         - "gmailmcp.googleapis.com"
         - "mcp.linear.app"
+        - "notion.com"
+        - "*.notion.com"
 
   # 2. Judge: LLM policy gate on content-bearing traffic only (search, KB
   #    fetch, extension MCP). Infrastructure hosts (model gateways, Slack,

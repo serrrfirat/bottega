@@ -49,7 +49,7 @@ import { resetToolSurfaceCache, resolveExtensionSurfaces, type ExtensionSurfaces
 
 const SNAPSHOTS_DIR = resolve(import.meta.dir, "../../config/extensions");
 
-const PROVIDERS = ["linear", "github", "attio", "gmail-googleapis-com"] as const;
+const PROVIDERS = ["linear", "github", "attio", "gmail-googleapis-com", "notion"] as const;
 
 /** The WIRE tool surface per provider (issue #148): the names the hosted
  * servers expose (github live-verified; attio per official docs; linear
@@ -60,6 +60,10 @@ const WIRE_SURFACE = {
   github: ["search_issues", "issue_write", "add_issue_comment"],
   attio: ["search-records", "create-record", "update-record"],
   "gmail-googleapis-com": ["get_profile", "search_messages", "send_message"],
+  // Notion's official hosted server prefixes EVERY wire name with
+  // "notion-" (per official docs); the discovery heuristic classifies
+  // fetch/search as read, create/update as write.
+  notion: ["notion-fetch", "notion-search", "notion-create-pages", "notion-update-pages"],
 } as const;
 
 /** The conservative tiers the #157 heuristic assigns each provider's wire
@@ -71,6 +75,9 @@ const WIRE_TIERS = {
   attio: ["read", "write", "write"],
   // get_/search_ are read verbs; send_ mutates → write (approval).
   "gmail-googleapis-com": ["read", "read", "write"],
+  // fetch/search read; create/update write (the #157 heuristic on the
+  // prefixed wire names).
+  notion: ["read", "read", "write", "write"],
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
@@ -104,6 +111,12 @@ function stubMcpTransport(provider: (typeof PROVIDERS)[number], seen?: { tool: s
         name: wire,
         description: `${provider} ${wire}`,
         inputSchema: wireInputSchema(wire),
+        // Notion's hosted server publishes readOnlyHint on its read tools —
+        // and its "notion-" prefix defeats the first-token verb heuristic,
+        // so the annotation is what the #157 classifier keys on (#361).
+        ...(wire.startsWith("notion-")
+          ? { annotations: { readOnlyHint: /search|fetch/.test(wire), destructiveHint: false } }
+          : {}),
       })),
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -125,6 +138,7 @@ function stubTransports(seen?: { tool: string[] }) {
     if (url.includes("linear.app")) return stubMcpTransport("linear", seen)(binding);
     if (url.includes("attio.com")) return stubMcpTransport("attio", seen)(binding);
     if (url.includes("gmailmcp.googleapis.com")) return stubMcpTransport("gmail-googleapis-com", seen)(binding);
+    if (url.includes("notion.com")) return stubMcpTransport("notion", seen)(binding);
     return stubMcpTransport("github", seen)(binding);
   };
 }
@@ -259,17 +273,20 @@ describe("issue #54 pinned providers", () => {
   test("the egress allowlist contains the pinned providers' domains", () => {
     const registry = createExtensionRegistry(SNAPSHOTS_DIR);
     // Snapshot files load in sorted order (attio, github,
-    // gmail-googleapis-com, linear — "github" < "gmail-" lexicographically)
-    // — the committed SEED (issue #233: notion's pin is gone; its domains
-    // land via the runtime registry when a connect registers it; issue
-    // #286: the reviewed Gmail override allowlists both gmail.googleapis.com
-    // and the validated mcp host).
+    // gmail-googleapis-com, linear, notion — "github" < "gmail-" < "notion"
+    // lexicographically) — the committed SEED (issue #286: the reviewed
+    // Gmail override allowlists both gmail.googleapis.com and the validated
+    // mcp host; #361: notion re-pinned as a reviewed seed — strict
+    // deployments need the domain allowlisted before the connect probe,
+    // probe-before-registration made runtime-only unreachable there).
     expect(registry.egressDomains()).toEqual([
       "mcp.attio.com",
       "api.githubcopilot.com",
       "gmail.googleapis.com",
       "gmailmcp.googleapis.com",
       "mcp.linear.app",
+      "notion.com",
+      "*.notion.com",
     ]);
   });
 

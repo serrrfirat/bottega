@@ -75,17 +75,20 @@ describe("egress config generation", () => {
   test("the committed allowlist contains model, KB, and provider domains", () => {
     expect(allowlistDomains(COMMITTED_EGRESS)).toEqual(mergedEgressDomains(EXTENSION_DOMAINS));
     // The committed SEED fixtures (issue #233 + #286): github/linear/attio
-    // pins plus the reviewed Gmail override — notion is gone (its
-    // registration is a runtime connect, merged into the egress only when
-    // registered at runtime). Copy before sorting: EXTENSION_DOMAINS is a
-    // module-level constant later byte-pin tests render with (in-place sort
-    // would corrupt the registration order).
+    // pins plus the reviewed Gmail override — and notion re-pinned (#361:
+    // strict deployments need the domain allowlisted before the connect
+    // probe; probe-before-registration made runtime-only unreachable
+    // there). Copy before sorting: EXTENSION_DOMAINS is a module-level
+    // constant later byte-pin tests render with (in-place sort would
+    // corrupt the registration order).
     expect([...EXTENSION_DOMAINS].sort()).toEqual([
+      "*.notion.com",
       "api.githubcopilot.com",
       "gmail.googleapis.com",
       "gmailmcp.googleapis.com",
       "mcp.attio.com",
       "mcp.linear.app",
+      "notion.com",
     ]);
   });
 

@@ -1,0 +1,35 @@
+{
+  "schema": "bottega.extension-snapshot.v1",
+  "extensionId": "notion",
+  "pinnedAt": "2026-08-27T18:09:44.590Z",
+  "source": {
+    "catalog": "https://integrations.sh/api.json",
+    "specId": "notion",
+    "vendorOfficial": true,
+    "reviewed": true,
+    "reviewNote": "mcp.notion.com is Notion's official hosted MCP (docs.notion.com/docs/mcp); verified live: RFC 8414 WWW-Authenticate Bearer challenge on unauthenticated GET"
+  },
+  "manifest": {
+    "id": "notion",
+    "label": "Notion",
+    "vendor": "Notion",
+    "kind": "mcp",
+    "mcp": {
+      "serverUrl": "https://mcp.notion.com/mcp",
+      "transport": "streamable-http"
+    },
+    "credentialSchema": {
+      "type": "oauth"
+    },
+    "domains": [
+      "notion.com",
+      "*.notion.com"
+    ],
+    "credentialTargets": [
+      {
+        "host": "mcp.notion.com",
+        "pathPrefix": "/mcp"
+      }
+    ]
+  }
+}
