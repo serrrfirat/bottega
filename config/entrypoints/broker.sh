@@ -2,11 +2,12 @@
 # Bottega auth-broker bootstrap (issue #9).
 #
 # Ensures the broker bearer token exists on the shared data volume BEFORE
-# the vault starts, then execs the omp CLI. The token file (mode 0600) is
-# the single source of truth for the auth boundary:
-#   - the gateway resolves it automatically (same PI_CONFIG_DIR on the
-#     shared volume),
-#   - ops copies it into .env as OMP_AUTH_BROKER_TOKEN for server/executor.
+# the vault starts, then execs the packaged omp CLI. The token file (mode
+# 0600) is the single source of truth for the auth boundary; it is never
+# copied into this process environment:
+#   - the broker CLI reads it from PI_CONFIG_DIR,
+#   - the gateway resolves it from the same shared volume,
+#   - server/executor resolve it through OMP_AUTH_BROKER_TOKEN_FILE.
 #
 # Runs unattended: first boot generates the token, later boots reuse it.
 set -eu
@@ -27,9 +28,9 @@ if [ ! -f "$TOKEN_FILE" ]; then
   fi
 fi
 chmod 600 "$TOKEN_FILE"
-
-# Export so any child process (and the vault itself) sees the same token.
-OMP_AUTH_BROKER_TOKEN="$(cat "$TOKEN_FILE")"
-export OMP_AUTH_BROKER_TOKEN
-
+# Run the packaged CLI from the app image. The PATH fallback keeps this
+# entrypoint hermetic in local tests and older development images.
+if [ -x /app/node_modules/.bin/omp ]; then
+  exec /app/node_modules/.bin/omp "$@"
+fi
 exec omp "$@"

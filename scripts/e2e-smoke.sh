@@ -13,10 +13,8 @@
 #   - iron-proxy runs without restarts (egress config + CA loaded)
 #   - data volume holds bottega.db with the store tables (queried in-container)
 #   - auth-broker healthy with its bearer token bootstrapped on the data
-#     volume (/data/.omp/auth-broker.token) — asserted only when the
-#     oh-my-pi/pi:dev image is pullable; that image is a private Docker Hub
-#     repo, so without Hub access the broker asserts skip with evidence
-#     (integration-leg convention: skip when the service/image can't run).
+#     volume (/data/.omp/auth-broker.token) from the packaged bottega image
+#     built below; no private external broker image is required.
 # Then tears the stack down (down -v) and removes the temp env file.
 #
 # No real credentials anywhere: the leg uses a temp env file of placeholders
@@ -110,20 +108,6 @@ docker image inspect ironsh/iron-proxy:0.49.0 >/dev/null 2>&1 \
   || deadline 60 docker pull ironsh/iron-proxy:0.49.0 >/dev/null \
   || skip "iron-proxy image unavailable (pull failed or timed out) — see output above"
 
-# The broker image (oh-my-pi/pi:dev) is a private Docker Hub repo: probe it;
-# when unavailable, the broker/gateway services and their asserts are skipped
-# with evidence and the rest of the stack is still exercised.
-BROKER=0
-if docker image inspect oh-my-pi/pi:dev >/dev/null 2>&1 \
-  || deadline 30 docker pull oh-my-pi/pi:dev >/dev/null 2>&1; then
-  BROKER=1
-else
-  echo "  skip: auth-broker/auth-gateway not asserted — oh-my-pi/pi:dev is not pullable"
-  echo "        (private Docker Hub repo, no Hub login, or registry unreachable);"
-  echo "        broker token + vault wiring stays the credentialed manual path (scripts/smoke.sh)."
-fi
-
-echo "==> generating iron-proxy MITM CA (gitignored certs/)"
 mkdir -p certs
 if [ ! -f certs/ca.crt ]; then
   docker run --rm -v "$PWD/certs:/certs" ironsh/iron-proxy:0.49.0 generate-ca -outdir /certs >/dev/null \
@@ -135,10 +119,8 @@ deadline 300 compose --profile executor build \
   || skip "app image build failed or timed out — see output above; CI's docker job still covers build + fail-closed boots"
 
 echo "==> booting the stack (executor profile)"
-SERVICES="iron-proxy server executor"
-[ "$BROKER" = 1 ] && SERVICES="iron-proxy auth-broker auth-gateway server executor"
+SERVICES="iron-proxy auth-broker auth-gateway server executor"
 deadline 120 compose --profile executor up -d $SERVICES || fail "compose up failed"
-
 echo "==> asserting fail-closed boots + service wiring"
 server_guarded()   { compose logs server | grep -q "SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required"; }
 executor_guarded() { compose logs executor | grep -q "git token file not found"; }
@@ -148,13 +130,11 @@ wait_for "server fail-closed Slack-token guard" 120 server_guarded
 wait_for "executor fail-closed PAT guard" 120 executor_guarded
 wait_for "iron-proxy running, zero restarts (config loaded)" 90 proxy_ok
 
-if [ "$BROKER" = 1 ]; then
-  broker_healthy() { compose ps --format json auth-broker | grep -q '"Health":"healthy"'; }
-  wait_for "auth-broker healthy" 120 broker_healthy
-  compose exec -T auth-broker test -f /data/.omp/auth-broker.token \
-    || fail "auth-broker token file missing on the data volume"
-  echo "  ok: broker bearer token bootstrapped (/data/.omp/auth-broker.token)"
-fi
+broker_healthy() { compose ps --format json auth-broker | grep -q '"Health":"healthy"'; }
+wait_for "auth-broker healthy" 120 broker_healthy
+compose exec -T auth-broker test -f /data/.omp/auth-broker.token \
+  || fail "auth-broker token file missing on the data volume"
+echo "  ok: broker bearer token bootstrapped (/data/.omp/auth-broker.token)"
 
 echo "==> asserting SQLite schema on the data volume"
 deadline 120 compose run --rm --no-deps --entrypoint bun server -e '
@@ -168,8 +148,5 @@ for (const t of ["spaces", "work_items", "audit"]) {
 }
 ' || fail "bottega.db missing the store schema on the data volume"
 
-echo "==> PASS: compose e2e smoke (fail-closed boots, SQLite schema, egress config)"
-if [ "$BROKER" = 1 ]; then
-  echo "      (auth-broker token + health asserted)"
-fi
+echo "==> PASS: compose e2e smoke (fail-closed boots, SQLite schema, egress config, auth-broker)"
 exit 0

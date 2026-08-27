@@ -149,7 +149,7 @@ describe("Dockerfile + .dockerignore (issue #12)", () => {
     expect(dockerfile).toContain("USER bun");
     // Named volumes inherit image ownership on first mount: the writable
     // dirs must exist and be owned by the runtime user before USER bun.
-    expect(dockerfile).toContain("mkdir -p /app/data /workspaces");
+    expect(dockerfile).toContain("mkdir -p /app/data /data /workspaces");
     expect(dockerfile).toContain("chown -R bun:bun");
   });
 

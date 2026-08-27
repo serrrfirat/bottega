@@ -40,8 +40,8 @@ COPY . .
 # workspaces there. /transcripts and /rpc are per-job mount targets the job
 # containers receive; pre-creating them keeps the read-only root mountable
 # (Docker mounts land on existing parents, never a denied read-only mkdir).
-RUN mkdir -p /app/data /workspaces /transcripts /rpc \
-    && chown -R bun:bun /app /workspaces /transcripts /rpc
+RUN mkdir -p /app/data /data /workspaces /transcripts /rpc \
+    && chown -R bun:bun /app /data /workspaces /transcripts /rpc
 USER bun
 
 # No CMD: compose sets the entrypoint per service (server vs executor).

@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   brokerSecretResolverFromEnv,
+  resolveBrokerToken,
   createSecretFileBoundary,
   onePasswordConnectResolver,
   proxyBoundaryControlFromEnv,
@@ -386,6 +387,48 @@ describe("brokerSecretResolverFromEnv (issue #54 wiring, #143)", () => {
   test("empty-string values are treated as unset (fail closed)", async () => {
     const resolve = brokerSecretResolverFromEnv({ OMP_AUTH_BROKER_URL: "", OMP_AUTH_BROKER_TOKEN: "" });
     await expect(resolve(BROKER_CREDENTIAL)).rejects.toThrow(/OMP_AUTH_BROKER_URL/);
+  });
+
+  test("falls back to the token file and trims its contents at resolution time", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-broker-token-"));
+    try {
+      const tokenFile = join(dir, "auth-broker.token");
+      writeFileSync(tokenFile, "  file-token\n");
+      expect(resolveBrokerToken({ OMP_AUTH_BROKER_TOKEN_FILE: tokenFile })).toBe("file-token");
+      writeFileSync(tokenFile, "rotated-token\n");
+      expect(resolveBrokerToken({ OMP_AUTH_BROKER_TOKEN_FILE: tokenFile })).toBe("rotated-token");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit broker token takes priority over the token file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-broker-token-"));
+    try {
+      const tokenFile = join(dir, "auth-broker.token");
+      writeFileSync(tokenFile, "file-token\n");
+      expect(resolveBrokerToken({ OMP_AUTH_BROKER_TOKEN: "env-token", OMP_AUTH_BROKER_TOKEN_FILE: tokenFile })).toBe(
+        "env-token",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("unreadable token file fails closed without exposing token bytes", () => {
+    const tokenFile = join(tmpdir(), `bottega-missing-broker-${Date.now()}.token`);
+    expect(() => resolveBrokerToken({ OMP_AUTH_BROKER_TOKEN_FILE: tokenFile })).toThrow(/OMP_AUTH_BROKER_TOKEN_FILE/);
+  });
+
+  test("empty token file fails closed without exposing token bytes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-broker-token-"));
+    try {
+      const tokenFile = join(dir, "auth-broker.token");
+      writeFileSync(tokenFile, " \n\t");
+      expect(() => resolveBrokerToken({ OMP_AUTH_BROKER_TOKEN_FILE: tokenFile })).toThrow(/empty/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("wiring the resolver does not throw without broker env (the server boots fail-closed)", () => {

@@ -58,14 +58,14 @@ describe("config/omp templates (issue #9 secrets & models)", () => {
 describe(".env.example (issue #9 environment contract)", () => {
   const envExample = readFileSync(resolve(SRC_DIR, ".env.example"), "utf8");
 
-  test("declares every credential the deployment needs", () => {
+  test("declares every credential and broker file path the deployment needs", () => {
     for (const varName of [
       "SLACK_APP_TOKEN",
       "SLACK_BOT_TOKEN",
       "OPENCODE_API_KEY",
       "NEAR_API_KEY",
       "OMP_AUTH_BROKER_URL",
-      "OMP_AUTH_BROKER_TOKEN",
+      "OMP_AUTH_BROKER_TOKEN_FILE",
       "NEARAI_JUDGE_API_KEY",
       "GITHUB_PAT",
       "EXECUTOR_GIT_TOKEN_FILE",
@@ -73,6 +73,7 @@ describe(".env.example (issue #9 environment contract)", () => {
     ]) {
       expect(envExample).toContain(varName);
     }
+    expect(envExample).not.toContain("OMP_AUTH_BROKER_TOKEN=...");
   });
 
   test("runtime knobs are settings, not env vars (issue #67)", () => {

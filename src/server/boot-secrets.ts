@@ -38,6 +38,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
+import { resolveBrokerToken } from "../extensions/boundary";
 import { errorMessage } from "../tools/helpers";
 
 /** One boot secret: the env name the SDK/adapter reads + the vault row identity. */
@@ -94,10 +95,10 @@ const BOOT_VAULT_FETCH_TIMEOUT_MS = 5_000;
  * remain the fail-closed arbiter per secret.
  */
 export async function fetchVaultApiKeysFromEnv(env: NodeJS.ProcessEnv): Promise<Map<string, string>> {
-  const url = env.OMP_AUTH_BROKER_URL;
-  const token = env.OMP_AUTH_BROKER_TOKEN;
-  if (!url || !token) return new Map();
+  const url = env.OMP_AUTH_BROKER_URL?.trim();
+  if (!url) return new Map();
   try {
+    const token = resolveBrokerToken(env);
     const client = new AuthBrokerClient({ url, token, timeoutMs: BOOT_VAULT_FETCH_TIMEOUT_MS });
     const result = await client.fetchSnapshot();
     if (result.status !== 200) {

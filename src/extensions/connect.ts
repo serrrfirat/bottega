@@ -69,6 +69,7 @@ import {
   type CatalogRegisterDeps,
 } from "./catalog-register";
 import { createReconcileEgress, type ReconcileEgress } from "./egress-reconcile";
+import { resolveBrokerToken } from "./boundary";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -686,7 +687,11 @@ export async function connectViaAuthBroker(input: {
     throw new Error(`connect ${input.provider} needs its API key (api_key extensions require the key)`);
   }
   const vaultProvider = input.vaultProvider ?? input.provider;
-  const brokerConfig = await resolveAuthBrokerConfig();
+  const brokerUrl = process.env.OMP_AUTH_BROKER_URL?.trim();
+  const brokerConfig =
+    brokerUrl && process.env.OMP_AUTH_BROKER_TOKEN_FILE
+      ? { url: brokerUrl, token: resolveBrokerToken() }
+      : await resolveAuthBrokerConfig();
   if (brokerConfig) {
     const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
     const res = await client.uploadCredential(vaultProvider, { type: "api_key", key: apiKey });

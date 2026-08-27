@@ -118,6 +118,35 @@ function toSecretResolverRef(credential: ExtensionCredential): SecretResolverRef
 }
 
 /**
+ * Resolve the auth-broker bearer without putting a file-backed token in the
+ * process environment. The file is read for every call so rotations apply
+ * without restarting the server.
+ */
+export function resolveBrokerToken(env: NodeJS.ProcessEnv = process.env): string {
+  const envToken = env.OMP_AUTH_BROKER_TOKEN?.trim();
+  if (envToken) return envToken;
+
+  const tokenFile = env.OMP_AUTH_BROKER_TOKEN_FILE?.trim();
+  if (!tokenFile) {
+    throw new Error(
+      "extension credential boundary: broker token is not configured — set OMP_AUTH_BROKER_TOKEN or OMP_AUTH_BROKER_TOKEN_FILE",
+    );
+  }
+  let token: string;
+  try {
+    token = readFileSync(tokenFile, "utf8").trim();
+  } catch (err) {
+    throw new Error(
+      `extension credential boundary: OMP_AUTH_BROKER_TOKEN_FILE is unreadable (${tokenFile}): ${errorMessage(err)}`,
+    );
+  }
+  if (!token) {
+    throw new Error(`extension credential boundary: broker token file is empty (${tokenFile})`);
+  }
+  return token;
+}
+
+/**
  * The omp-broker secret resolution core (the boundary's fetch half, issue
  * #54 wiring shipped with #143): given the ladder's resolved registry
  * credential, returns the SECRET PAYLOAD (+ its kind) from the OMP
@@ -126,9 +155,9 @@ function toSecretResolverRef(credential: ExtensionCredential): SecretResolverRef
  *
  * Env contract (set by scripts/dev.sh locally, by docker-compose.yml in
  * deployment): `OMP_AUTH_BROKER_URL` (broker base, e.g.
- * http://127.0.0.1:8765 or http://auth-broker:8765) and
- * `OMP_AUTH_BROKER_TOKEN` (the vault's bearer token, bootstrapped to
- * /data/.omp/auth-broker.token on the shared data volume).
+ * http://127.0.0.1:8765 or http://auth-broker:8765), plus either the
+ * explicit `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE` pointing
+ * at a mode-0600 token file on the shared data volume.
  *
  * Fail closed: URL or token missing → the resolved call throws before any
  * fetch (an unauthenticated provider call must never proceed); the vault
@@ -140,15 +169,14 @@ function toSecretResolverRef(credential: ExtensionCredential): SecretResolverRef
  * audit.
  */
 async function resolveBrokerSecret(env: NodeJS.ProcessEnv, ref: SecretResolverRef): Promise<SecretResolution> {
-  const brokerUrl = env.OMP_AUTH_BROKER_URL;
-  const brokerToken = env.OMP_AUTH_BROKER_TOKEN;
-  if (!brokerUrl || !brokerToken) {
+  const brokerUrl = env.OMP_AUTH_BROKER_URL?.trim();
+  if (!brokerUrl) {
     throw new Error(
-      "extension credential boundary: broker secret resolution is not configured — set OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN " +
-        "(local dev: `bun run dev` starts the auth-broker vault and exports both; deployment: copy the token from the data volume " +
-        "`docker compose exec auth-broker cat /data/.omp/auth-broker.token` into .env)",
+      "extension credential boundary: broker secret resolution is not configured — set OMP_AUTH_BROKER_URL and a broker token " +
+        "via OMP_AUTH_BROKER_TOKEN or OMP_AUTH_BROKER_TOKEN_FILE",
     );
   }
+  const brokerToken = resolveBrokerToken(env);
   if (ref.brokerCredentialId === undefined) {
     throw new Error(
       `extension credential boundary: the omp-broker resolver needs the registry row's broker credential id for "${ref.provider}" — none was recorded`,

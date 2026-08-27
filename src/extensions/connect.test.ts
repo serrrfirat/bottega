@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAudit } from "../policy/audit";
@@ -1189,6 +1189,45 @@ describe("connectViaAuthBroker fail-closed guards (issue #52/#247)", () => {
     await expect(
       connectViaAuthBroker({ provider: "fixture.weather", credentialType: "api_key", apiKey: "   " }),
     ).rejects.toThrow(/needs its API key/);
+  });
+
+  test("api_key connect resolves the broker bearer from OMP_AUTH_BROKER_TOKEN_FILE", async () => {
+    const previous = {
+      url: process.env.OMP_AUTH_BROKER_URL,
+      token: process.env.OMP_AUTH_BROKER_TOKEN,
+      tokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
+    };
+    const dir = mkdtempSync(join(tmpdir(), "bottega-connect-token-"));
+    const tokenFile = join(dir, "auth-broker.token");
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (req.headers.get("authorization") !== "Bearer file-token") return new Response("unauthorized", { status: 401 });
+        return new Response(
+          JSON.stringify({
+            entries: [{ id: 1, provider: "fixture.weather", credential: { type: "api_key", key: "uploaded" }, identityKey: null }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    try {
+      writeFileSync(tokenFile, " file-token\n");
+      process.env.OMP_AUTH_BROKER_URL = `http://127.0.0.1:${server.port}`;
+      delete process.env.OMP_AUTH_BROKER_TOKEN;
+      process.env.OMP_AUTH_BROKER_TOKEN_FILE = tokenFile;
+      const result = await connectViaAuthBroker({ provider: "fixture.weather", credentialType: "api_key", apiKey: "api-key" });
+      expect(result).toMatchObject({ brokerCredentialId: 1 });
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+      if (previous.url === undefined) delete process.env.OMP_AUTH_BROKER_URL;
+      else process.env.OMP_AUTH_BROKER_URL = previous.url;
+      if (previous.token === undefined) delete process.env.OMP_AUTH_BROKER_TOKEN;
+      else process.env.OMP_AUTH_BROKER_TOKEN = previous.token;
+      if (previous.tokenFile === undefined) delete process.env.OMP_AUTH_BROKER_TOKEN_FILE;
+      else process.env.OMP_AUTH_BROKER_TOKEN_FILE = previous.tokenFile;
+    }
   });
 });
 

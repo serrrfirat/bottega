@@ -11,21 +11,20 @@
  *   1. policy gate + credential ladder resolve the caller's personal
  *      `github` credential (store row -> broker_credential_id);
  *   2. the boundary's broker secret resolver (issue #54 wiring) fetches the
- *      secret payload from the vault over OMP_AUTH_BROKER_URL/TOKEN;
+ *      secret payload from the vault over OMP_AUTH_BROKER_URL plus the
+ *      mode-0600 OMP_AUTH_BROKER_TOKEN_FILE (or explicit token override);
  *   3. the boundary writes data/proxy-secrets/github.secret (0600) and
  *      reloads the dev proxy (POST /v1/reload);
  *   4. the dev proxy injects `Authorization: Bearer <secret>` for
- *      api.githubcopilot.com, so a credential-less initialize to the HOSTED
  *      GitHub MCP (https://api.githubcopilot.com/mcp/, issue #145 — the
  *      github extension's streamable-http binding, no local binary)
  *      AUTHENTICATES (non-401 with a JSON-RPC result).
  *
- * The vault is the REAL omp auth-broker server (`omp auth-broker serve`,
- * the same CLI the oh-my-pi/pi:dev compose image runs) started against the
- * repo's gitignored data/.omp — the image itself is a private Docker Hub
- * repo not pullable here (scripts/e2e-smoke.sh skips the broker for the
- * same reason). The vault is seeded with the user's REAL GitHub credential
- * via the REAL connect path (`connectViaAuthBroker` -> broker upload) using
+ * The vault is the REAL omp auth-broker server (`omp auth-broker serve`)
+ * started against the repo's gitignored data/.omp. In compose, the same
+ * packaged bottega image supplies the CLI and no external broker image is
+ * pulled. It is seeded via the REAL connect path
+ * (`connectViaAuthBroker` -> broker upload) using
  * `gh auth token` from the keyring; the vault entry the store row
  * references must exist and carry an api_key, and the token is NEVER
  * printed — the leg only proves the API call's success (authenticated

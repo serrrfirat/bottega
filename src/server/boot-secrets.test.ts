@@ -323,4 +323,42 @@ describe("fetchVaultApiKeysFromEnv error legs (issue #201)", () => {
     const keys = await fetchVaultApiKeysFromEnv({});
     expect(keys.size).toBe(0);
   });
+
+  test("resolves the broker token from a file at each boot fetch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bottega-boot-token-"));
+    const tokenFile = join(dir, "auth-broker.token");
+    const seenAuth: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: (req) => {
+        seenAuth.push(req.headers.get("authorization") ?? "");
+        return new Response(
+          JSON.stringify({
+            generation: 1,
+            generatedAt: Date.now(),
+            serverNowMs: Date.now(),
+            refresher: { enabled: false, intervalMs: 60000, skewMs: 0, nextSweepInMs: 0 },
+            credentials: [],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    try {
+      writeFileSync(tokenFile, " first-token\n");
+      await fetchVaultApiKeysFromEnv({
+        OMP_AUTH_BROKER_URL: `http://127.0.0.1:${server.port}`,
+        OMP_AUTH_BROKER_TOKEN_FILE: tokenFile,
+      });
+      writeFileSync(tokenFile, "second-token\n");
+      await fetchVaultApiKeysFromEnv({
+        OMP_AUTH_BROKER_URL: `http://127.0.0.1:${server.port}`,
+        OMP_AUTH_BROKER_TOKEN_FILE: tokenFile,
+      });
+      expect(seenAuth).toEqual(["Bearer first-token", "Bearer second-token"]);
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

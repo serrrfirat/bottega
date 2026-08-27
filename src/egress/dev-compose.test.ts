@@ -143,8 +143,9 @@ describe("local development bootstrap wiring (#143/#301/#311)", () => {
     expect(devSh).toContain('export BOTTEGA_DEV_CERTS_DIR="$(shared_certs_dir)"');
   });
 
-  test("the shared module preserves broker fallback, token readiness, and fail-closed HOME handling", () => {
-    expect(bootstrap).toContain('"oh-my-pi/pi:dev"');
+  test("the shared module preserves the packaged broker fallback, token readiness, and fail-closed HOME handling", () => {
+    expect(bootstrap).toContain("bottega:");
+    expect(bootstrap).toContain("BOTTEGA_IMAGE_TAG");
     expect(bootstrap).toContain('["omp", "auth-broker", "serve", "--bind=0.0.0.0:8765"]');
     expect(bootstrap).toContain("brokerTokenReady");
     expect(bootstrap).toContain("is outside HOME");

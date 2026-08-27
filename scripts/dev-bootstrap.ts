@@ -473,7 +473,7 @@ async function startBroker(
 ): Promise<string | null> {
   if (!initialProbe?.ok) {
     const image = await deps.commands.run(
-      ["docker", "image", "inspect", "oh-my-pi/pi:dev"],
+      ["docker", "image", "inspect", `bottega:${env.BOTTEGA_IMAGE_TAG ?? "local"}`],
       commandOptions(config, env, 10_000),
     );
     if (image.exitCode === 0) {
@@ -484,7 +484,7 @@ async function startBroker(
       if (result.exitCode !== 0) return `auth-broker compose start failed: ${result.stderr.trim() || `exit ${result.exitCode}`}`;
     } else {
       if (config.dataDir !== config.home && !config.dataDir.startsWith(`${config.home}/`)) {
-        return `canonical data dir (${config.dataDir}) is outside HOME (${config.home}); the local omp broker requires a HOME-relative PI_CONFIG_DIR. Pull oh-my-pi/pi:dev and retry`;
+        return `canonical data dir (${config.dataDir}) is outside HOME (${config.home}); the local omp broker requires a HOME-relative PI_CONFIG_DIR. Build bottega:local and retry`;
       }
       deps.fs.mkdir(join(config.dataDir, ".omp"), 0o700);
       if (deps.fs.stat(config.brokerTokenFile) === null) {
