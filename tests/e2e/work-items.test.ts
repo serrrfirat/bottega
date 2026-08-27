@@ -453,9 +453,9 @@ describe("journey 2: work items + approvals + executor", () => {
         const transitions = await harness.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT });
         expect(transitions.map((t) => JSON.parse(t.payload))).toEqual(
           expect.arrayContaining([
-            { from: "claimed", to: "working", by: "executor" },
-            { from: "working", to: "review", by: "executor" },
-            { from: "review", to: "done", by: "executor" },
+            { id: item.id, from: "claimed", to: "working", by: "executor" },
+            { id: item.id, from: "working", to: "review", by: "executor" },
+            { id: item.id, from: "review", to: "done", by: "executor" },
           ]),
         );
 
