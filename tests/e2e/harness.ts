@@ -568,7 +568,8 @@ interface SeededNameMap {
   [name: string]: string;
 }
 
-export function createHeadlessAdapter(): HeadlessAdapter {
+export function createHeadlessAdapter(opts: { streaming?: boolean } = {}): HeadlessAdapter {
+  const streaming = opts.streaming === true;
   const posts: EmulatorMessage[] = [];
   let counter = 0;
   const streams: HeadlessStreamEvent[] = [];
