@@ -107,7 +107,7 @@ import { recordTurnUsage } from "../tools/usage-meter";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
-import { createPreProbeEgressEnsure } from "../extensions/egress-reconcile";
+import { createPreProbeEgressEnsure, createReconcileEgress } from "../extensions/egress-reconcile";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -606,6 +606,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     transcriptDir: executorTranscriptDir,
     audit,
   });
+  // One runtime-path reconcile for EVERY connect leg (#366): pre-probe,
+  // post-registration, OAuth preparation, and callback completion. A
+  // container's /app/config is the immutable image layer; the proxy-visible
+  // config lives on the shared data volume.
+  const runtimeEgressPath = process.env.BOTTEGA_PROXY_CONFIG_PATH;
+  const runtimeReconcileEgress = createReconcileEgress({
+    store,
+    ...(runtimeEgressPath !== undefined
+      ? { egressPath: runtimeEgressPath, devEgressPath: `${runtimeEgressPath}.dev` }
+      : {}),
+  });
   const callbackDeps: OAuthCallbackEndpointDeps = {
     store,
     audit,
@@ -621,6 +632,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // work-item timeline/fork routes read the real JSONL trails.
     workReview: workReviewRoutes,
     restApi: mountRestApi({ store, audit, transcriptDir: executorTranscriptDir }),
+    reconcileEgress: runtimeReconcileEgress,
     // Issue #281: the browser leg is the only place that knows the connect
     // actually completed — surface the connected space so its live session
     // toolset refreshes WITHOUT a restart. Late-bound (spaceService is
@@ -680,23 +692,22 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // proxy-visible config (the shared data volume) so the reload picks the
   // candidate hosts up. Unset (local non-container runs) → the probe
   // proceeds unadjusted, exactly like hermetic tests.
-  const preProbeEgressPath = process.env.BOTTEGA_PROXY_CONFIG_PATH;
   const catalogRegisterDeps: CatalogRegisterDeps = {
     snapshotsDir: process.env.BOTTEGA_EXTENSIONS_DIR ?? SNAPSHOTS_DIR,
     runtimeRegistry: storeRuntimeRegistrySeam(store),
-    ...(preProbeEgressPath !== undefined
+    ...(runtimeEgressPath !== undefined
       ? {
           // The post-registration regen must target the SAME shared,
           // proxy-visible file as the pre-probe ensure (#366). Falling back
           // to config/egress.yml writes the immutable image layer in a
           // hardened deployment (EROFS) and would not update the running
           // proxy even if the root were writable.
-          egressPath: preProbeEgressPath,
-          devEgressPath: `${preProbeEgressPath}.dev`,
+          egressPath: runtimeEgressPath,
+          devEgressPath: `${runtimeEgressPath}.dev`,
           ensureEgressHosts: createPreProbeEgressEnsure({
             store,
-            egressPath: preProbeEgressPath,
-            devEgressPath: `${preProbeEgressPath}.dev`,
+            egressPath: runtimeEgressPath,
+            devEgressPath: `${runtimeEgressPath}.dev`,
           }),
         }
       : {}),
@@ -961,6 +972,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
           // OAuth flow (mint → browser callback → vault via the broker
           // upload path — no broker provider registration).
           mcpOAuth: mcpOAuthConnector,
+          reconcileEgress: runtimeReconcileEgress,
           // Issue #232/#233: the per-session connect tool gets the
           // deterministic catalog fallback too — the agent path ("connect
           // my notion") drives lookup → draft → register at runtime →

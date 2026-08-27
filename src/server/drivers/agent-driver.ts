@@ -103,6 +103,8 @@ export interface ConnectExtensionDriverOpts {
    * closed (never falls through to the broker's provider-registry login).
    */
   mcpOAuth?: McpOAuthConnector;
+  /** Runtime-path egress reconcile shared with registration/OAuth (#366). */
+  reconcileEgress?: ConnectExtensionDeps["reconcileEgress"];
   /**
    * One-time upload link (issue #196): when wired, sessions also get the
    * `connect_upload_link` mint tool — the store must be the one the upload
@@ -1324,6 +1326,9 @@ export function createOmpSdkDriver(
                 : undefined),
               ...(opts.connectExtension.mcpOAuth !== undefined
                 ? { mcpOAuth: opts.connectExtension.mcpOAuth }
+                : undefined),
+              ...(opts.connectExtension.reconcileEgress !== undefined
+                ? { reconcileEgress: opts.connectExtension.reconcileEgress }
                 : undefined),
               gate: {
                 loadPolicy: opts.connectExtension.loadPolicy,
