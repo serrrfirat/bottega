@@ -129,6 +129,25 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(judged.has("cloud-api.near.ai")).toBe(false);
   });
 
+  test("reviewed MCP transport hosts are allowlisted but bypass the judge", () => {
+    const mcpHosts = [
+      "api.githubcopilot.com",
+      "mcp.linear.app",
+      "mcp.attio.com",
+      "gmail.googleapis.com",
+      "gmailmcp.googleapis.com",
+    ];
+    const domains = asStringArray(allowlistCfg["domains"]);
+    const rules = asRecordArray(judgeCfg["rules"]).map((r) => String(r["host"]));
+
+    for (const host of mcpHosts) {
+      expect(domains).toContain(host);
+      expect(rules).not.toContain(host);
+    }
+    expect(rules).toContain("api.tavily.com");
+    expect(rules).toContain("raw.githubusercontent.com");
+  });
+
   test("judge LLM backend points at a NEAR.ai OpenAI-compatible endpoint", () => {
     const provider = asRecord(judgeCfg["provider"]);
     expect(provider["type"]).toBe("openai");

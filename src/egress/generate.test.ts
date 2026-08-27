@@ -119,6 +119,25 @@ describe("egress config generation", () => {
     expect(COMMITTED_EGRESS).toContain('path: "/data/proxy-secrets/tavily.secret"');
   });
 
+  test("reviewed MCP transport hosts remain allowlisted but are not judge-scoped", () => {
+    const mcpHosts = [
+      "api.githubcopilot.com",
+      "mcp.linear.app",
+      "mcp.attio.com",
+      "gmail.googleapis.com",
+      "gmailmcp.googleapis.com",
+    ];
+    const rendered = renderEgressConfig(mergedEgressDomains(EXTENSION_DOMAINS));
+    const judgeSection = rendered.split("- name: judge\n")[1]?.split("- name: secrets\n")[0] ?? "";
+    const rules = [...judgeSection.matchAll(/host: "([^"]+)"/g)].map((match) => match[1]);
+    for (const host of mcpHosts) {
+      expect(allowlistDomains(rendered)).toContain(host);
+      expect(rules).not.toContain(host);
+    }
+    expect(rules).toContain("api.tavily.com");
+    expect(rules).toContain("raw.githubusercontent.com");
+  });
+
   test("the base allowlist permits Slack file downloads", () => {
     expect(BASE_EGRESS_DOMAINS).toContain("files.slack.com");
   });
