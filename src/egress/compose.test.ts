@@ -120,8 +120,10 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     // auth-broker/auth-gateway joined in issue #9: broker-mode traffic is
     // internal and must bypass the proxy (the allowlist would 403 it).
     // mem0 joined in issue #43: the memory backend is internal too, so the
-    // server bypasses the proxy for it as well. The executor has no memory
-    // tools and keeps the original list.
+    // server bypasses the proxy for it as well. iron-proxy joined with
+    // issue #361: the boundary reload (POST :9092) proxied through the
+    // tunnel hits its own allowlist and dies with a bare 403 — both boots
+    // seed credentials through it.
     // SAFETY: the fixture declares NO_PROXY as a comma-joined string on the server.
     const serverNoProxy = serviceEnv("server")["NO_PROXY"] as string;
     expect(serverNoProxy.split(",")).toEqual([
@@ -131,6 +133,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       "auth-broker",
       "auth-gateway",
       "mem0",
+      "iron-proxy",
     ]);
     // SAFETY: the fixture declares NO_PROXY as a comma-joined string on the executor.
     const executorNoProxy = serviceEnv("executor")["NO_PROXY"] as string;
@@ -140,6 +143,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       "data",
       "auth-broker",
       "auth-gateway",
+      "iron-proxy",
     ]);
   });
 
