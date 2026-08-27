@@ -1116,6 +1116,56 @@ describe("SpaceService output routing", () => {
     expect(dmFinal!.text).toBe("dm answer");
   });
 
+  test("an in-flight thinking-ticker update lands before the final DM reply (#365)", async () => {
+    const base = fakeAdapter();
+    const { store } = fakeStore();
+    const updates: Array<{ spaceId: string; ts: string; text?: string; opts?: { blocks?: unknown[] } }> = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let first = true;
+    const adapter = Object.assign({}, base.adapter, {
+      updateMessage: (
+        spaceId: string,
+        ts: string,
+        text: string,
+        opts?: { blocks?: unknown[] },
+      ): Promise<void> => {
+        updates.push({ spaceId, ts, text, opts });
+        if (first) {
+          first = false;
+          return held; // the progress flush is on the wire, unresolved
+        }
+        return Promise.resolve();
+      },
+    });
+
+    // The progress line renders through the protected seam; drive it via a
+    // subclass so the coalesced flush is reachable deterministically.
+    class TestPresenter extends SlackTurnPresenter {
+      tickNow(): void {
+        this.renderToolStep({ taskId: "t1", status: "in_progress", title: "step" });
+      }
+    }
+    const dm = new TestPresenter({ spaceId: "slack:D1", adapter, store, onboardingChecks: () => [] });
+    dm.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    dm.tickNow();
+    await new Promise((r) => setTimeout(r, STREAM_UPDATE_INTERVAL_MS + 150));
+    expect(updates).toHaveLength(1); // the flush started and is held
+
+    dm.onMessage({ spaceId: "slack:D1", text: "the answer" });
+    dm.onRequestSettled();
+    await Promise.resolve();
+    await Promise.resolve();
+    // The final edit must NOT go out while the stale progress line is still
+    // on the wire — same-message updates apply in arrival order (#365).
+    expect(updates).toHaveLength(1);
+
+    release();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(updates.map((u) => u.text)).toEqual(["⚙️ step", "the answer"]);
+  });
+
   test("a DM with streaming support still takes the plain phrase path (no stream, no thread); a channel turn opens the thinking stream (issue #180)", async () => {
     const { adapter, posts, updates, streams, stops } = fakeAdapter({ streaming: true });
     const { store } = fakeStore();

@@ -657,6 +657,10 @@ export class SlackTurnPresenter {
   protected streamingTurns = false;
   /** Pending coalesced streaming update (issue #120). */
   #streamUpdate: PendingStreamUpdate | undefined;
+  /** In-flight progress flush (#365): the settle edit queues behind it —
+   *  Slack applies same-message updates in arrival order, so a stale
+   *  progress line already on the wire would overwrite the reply. */
+  #streamInflight: Promise<void> | null = null;
   /** True while a digest turn runs: its output must not reach the channel (#42). */
   protected digesting = false;
   /** Date.now() of the latest inbound message — the receipt→reply latency base (#119). */
@@ -1072,8 +1076,11 @@ export class SlackTurnPresenter {
       // Settle the SAME timestamp: one message per accepted top-level DM
       // request, updated in place across every internal round.
       console.log(`presenter: final reply posted/edited ${this.spaceId} ${pendingTs}`);
-      void this.adapter
-        .updateMessage(this.spaceId, pendingTs, text)
+      // Issue #365: a progress flush already on the wire must LAND before
+      // the final edit — same-message updates apply in arrival order.
+      const inflight = this.#streamInflight ?? Promise.resolve();
+      void inflight
+        .then(() => this.adapter.updateMessage(this.spaceId, pendingTs, text))
         .catch((err) => {
           console.error(`[slack-turn-presenter] failed to update DM reply in ${this.spaceId}:`, err);
         });
@@ -1862,19 +1869,27 @@ export class SlackTurnPresenter {
       clearTimeout(entry.timer);
       entry.timer = null;
     }
-    try {
-      // Plain text everywhere: a top-level DM's live progress and a
-      // channel's streamed text are the SAME in-place plain-text edit (no
-      // attachment card; owner veto #296-reopened).
-      await this.sendTextChunk(entry.ts, entry.text);
-    } catch (err) {
+    const flight = (async () => {
+      try {
+        // Plain text everywhere: a top-level DM's live progress and a
+        // channel's streamed text are the SAME in-place plain-text edit (no
+        // attachment card; owner veto #296-reopened).
+        await this.sendTextChunk(entry.ts, entry.text);
+      } catch (err) {
       console.error(
         `[slack-turn-presenter] streaming phrase update failed in ${this.spaceId} (${err instanceof Error ? err.message : String(err)}); keeping for the next attempt`,
       );
-      if (entry.final && entry.retries >= STREAM_FINAL_RETRY_LIMIT) return; // logged; give up
-      const kept: PendingStreamUpdate = { ...entry, retries: entry.retries + 1, timer: null };
-      this.#streamUpdate = kept;
-      if (entry.final) this.#armStreamTimer(kept); // retry the final until it lands
+        if (entry.final && entry.retries >= STREAM_FINAL_RETRY_LIMIT) return; // logged; give up
+        const kept: PendingStreamUpdate = { ...entry, retries: entry.retries + 1, timer: null };
+        this.#streamUpdate = kept;
+        if (entry.final) this.#armStreamTimer(kept); // retry the final until it lands
+      }
+    })();
+    this.#streamInflight = flight;
+    try {
+      await flight;
+    } finally {
+      if (this.#streamInflight === flight) this.#streamInflight = null;
     }
   }
 
