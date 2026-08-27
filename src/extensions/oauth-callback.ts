@@ -212,8 +212,14 @@ export function startOAuthCallbackServer(deps: OAuthCallbackEndpointDeps): OAuth
   // runtime half of the egress superset) so the callback reconciles the
   // proxy plane with zero composition-root wiring.
   const reconcileEgress = deps.reconcileEgress ?? createReconcileEgress({ store: deps.store });
+  // Bind hostname (issue #366): loopback by default — the tunnel/reverse
+  // proxy terminates the public base on the HOST and forwards to this port,
+  // so the container deployment needs the bind widened to 0.0.0.0 there
+  // (BOTTEGA_CALLBACK_HOST=0.0.0.0 + a loopback-only docker port publish).
+  // Loopback remains the default: local dev exposes nothing.
+  const hostname = process.env.BOTTEGA_CALLBACK_HOST ?? "127.0.0.1";
   const server = Bun.serve({
-    hostname: "127.0.0.1",
+    hostname,
     port: deps.port ?? callbackPort(),
     async fetch(req) {
       const url = new URL(req.url);
