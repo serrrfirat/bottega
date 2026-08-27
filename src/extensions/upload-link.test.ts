@@ -163,11 +163,13 @@ class RecordingRouter implements ApprovalRouter {
 class RecordingBroker {
   readonly calls: Array<{ provider: string; credentialType: string; apiKey?: string }> = [];
   result: BrokerConnectResult;
+  error?: Error;
   constructor(result: BrokerConnectResult = { identityKey: null, brokerCredentialId: 9 }) {
     this.result = result;
   }
   async connect(input: { provider: string; credentialType: string; apiKey?: string }): Promise<BrokerConnectResult> {
     this.calls.push(input);
+    if (this.error !== undefined) throw this.error;
     return this.result;
   }
 }
@@ -185,6 +187,11 @@ interface Harness {
   store: Store;
   router: RecordingRouter;
   broker: RecordingBroker;
+}
+type UploadCompletion = (info: { provider: string; spaceId: string | null }) => void | Promise<void>;
+
+function setCompletionHook(h: Harness, hook: UploadCompletion): void {
+  h.deps.onConnected = hook;
 }
 
 function makeDeps(overrides: { policy?: PolicyConfig; router?: RecordingRouter; broker?: RecordingBroker; registry?: ExtensionRegistry } = {}): Harness {
@@ -270,6 +277,116 @@ describe("one-time upload link — mint → upload → vault (issue #196)", () =
         scope: "personal",
         owner: "UADA",
       });
+    } finally {
+      endpoint.stop();
+    }
+  });
+  test("successful API-key upload invokes completion with provider and space", async () => {
+    const h = makeDeps();
+    const completions: Array<{ provider: string; spaceId: string | null }> = [];
+    setCompletionHook(h, (info) => {
+      completions.push(info);
+    });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "fixture.weather",
+        scope: "personal",
+        actor: "UADA",
+        spaceId: "slack:C1",
+        label: "Fixture Weather",
+      });
+      expect(minted.ok).toBe(true);
+      const response = await postSecret(
+        `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`,
+        "attio-secret-key",
+      );
+      expect(response.status).toBe(200);
+      expect(completions).toEqual([{ provider: "fixture.weather", spaceId: "slack:C1" }]);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("successful API-key upload without a space invokes completion with null space", async () => {
+    const h = makeDeps();
+    const completions: Array<{ provider: string; spaceId: string | null }> = [];
+    setCompletionHook(h, (info) => {
+      completions.push(info);
+    });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "fixture.weather",
+        scope: "personal",
+        actor: "UADA",
+        label: "Fixture Weather",
+      });
+      expect(minted.ok).toBe(true);
+      const response = await postSecret(
+        `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`,
+        "attio-secret-key",
+      );
+      expect(response.status).toBe(200);
+      expect(completions).toEqual([{ provider: "fixture.weather", spaceId: null }]);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("failed API-key connect does not invoke completion", async () => {
+    const h = makeDeps();
+    h.broker.error = new Error("vault unavailable");
+    const completions: Array<{ provider: string; spaceId: string | null }> = [];
+    setCompletionHook(h, (info) => {
+      completions.push(info);
+    });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "fixture.weather",
+        scope: "personal",
+        actor: "UADA",
+        spaceId: "slack:C1",
+        label: "Fixture Weather",
+      });
+      expect(minted.ok).toBe(true);
+      const response = await postSecret(
+        `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`,
+        "attio-secret-key",
+      );
+      expect(response.status).toBe(400);
+      expect(completions).toHaveLength(0);
+    } finally {
+      endpoint.stop();
+    }
+  });
+
+  test("completion rejection does not change successful upload response", async () => {
+    const h = makeDeps();
+    let completionCalls = 0;
+    setCompletionHook(h, () => {
+      completionCalls++;
+      throw new Error("refresh failed");
+    });
+    const endpoint = startUploadLinkServer(h.deps);
+    try {
+      const minted = endpoint.store.mint({
+        extension: "fixture.weather",
+        scope: "personal",
+        actor: "UADA",
+        spaceId: "slack:C1",
+        label: "Fixture Weather",
+      });
+      expect(minted.ok).toBe(true);
+      const response = await postSecret(
+        `${endpoint.baseUrl}/upload/${minted.ok ? minted.token : ""}`,
+        "attio-secret-key",
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("Saved to the vault");
+      expect(completionCalls).toBe(1);
+      expect(await rowsFor(h.store, "fixture.weather")).toHaveLength(1);
     } finally {
       endpoint.stop();
     }
@@ -458,6 +575,10 @@ describe("boot-secret provisioning via the upload link (issue #201)", () => {
 
   test("a boot-secret upload stores the api_key row in the vault — no registry row", async () => {
     const h = makeDeps();
+    const completionCalls: Array<{ provider: string; spaceId: string | null }> = [];
+    setCompletionHook(h, (info) => {
+      completionCalls.push(info);
+    });
     const endpoint = startUploadLinkServer(h.deps);
     try {
       const minted = endpoint.store.mint({
@@ -473,6 +594,7 @@ describe("boot-secret provisioning via the upload link (issue #201)", () => {
       const upload = await postSecret(url, secret);
       expect(upload.status).toBe(200);
       expect(await upload.text()).toContain("Saved to the vault");
+      expect(completionCalls).toHaveLength(0);
 
       // The broker saw the value under the boot secret's provider identity…
       expect(h.broker.calls).toEqual([{ provider: "near", credentialType: "api_key", apiKey: secret }]);
@@ -1099,6 +1221,10 @@ describe("static OAuth client provisioning via the upload link (issue #288)", ()
     stub.registrationEndpoint = false; // the Gmail-class no-DCR shape
     try {
       const h = makeDeps({ registry: registryWithOauthAt(stub.mcpUrl), policy: allowedPolicy() });
+      const completionCalls: Array<{ provider: string; spaceId: string | null }> = [];
+      setCompletionHook(h, (info) => {
+        completionCalls.push(info);
+      });
       const endpoint = startUploadLinkServer(h.deps);
       try {
         const minted = await mintUploadLink(
@@ -1128,6 +1254,7 @@ describe("static OAuth client provisioning via the upload link (issue #288)", ()
         const upload = await postStaticClient(url, STATIC_CLIENT_ID, STATIC_CLIENT_SECRET);
         expect(upload.status).toBe(200);
         expect(await upload.text()).toContain("Saved to the vault");
+        expect(completionCalls).toHaveLength(0);
         expect(h.router.requests).toHaveLength(1);
         expect(h.router.requests[0]!.tool).toBe(CONNECT_EXTENSION_TOOL);
         expect(h.router.requests[0]!.spaceId).toBe("slack:C1");

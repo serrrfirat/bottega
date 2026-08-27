@@ -546,6 +546,17 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // connect mint (lookup): the broker's opaque api-key vault rows under
   // the extension's synthetic provider key.
   const staticOAuthClientStore = createStaticOAuthClientStore();
+  // Browser completion hook shared by upload-link API-key connects and the
+  // hosted OAuth callback: refresh only a live space session, and keep the
+  // successful credential write/callback response independent of refresh.
+  const onExtensionConnected = ({ provider, spaceId }: { provider: string; spaceId: string | null }) => {
+    if (spaceId === null) return;
+    void spaceService.refreshExtensionTools(spaceId, provider).catch((err) => {
+      console.error(
+        `[extensions] ${provider} connected, but refreshing tools for ${spaceId} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  };
   const uploadMount = mountUploadLink({
     registry: extensionRegistry,
     store,
@@ -557,6 +568,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       router: approvalRouter,
       timeoutMs: orgPolicy.timeoutMinutes * 60_000,
     },
+    onConnected: onExtensionConnected,
   });
   // Generic MCP OAuth callback (issue #198): completes the browser leg of
   // hosted-OAuth-MCP connects: it receives the authorization code redirect,
@@ -633,22 +645,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     workReview: workReviewRoutes,
     restApi: mountRestApi({ store, audit, transcriptDir: executorTranscriptDir }),
     reconcileEgress: runtimeReconcileEgress,
-    // Issue #281: the browser leg is the only place that knows the connect
-    // actually completed — surface the connected space so its live session
-    // toolset refreshes WITHOUT a restart. Late-bound (spaceService is
-    // constructed below this listener) and read at callback time, exactly
-    // like the other cross-layer closures in this root. Null spaceId (a
-    // connect not tied to a space, e.g. the MCP surface) → no session to
-    // refresh; refreshExtensionTools no-ops. A refresh failure is surfaced
-    // as a receivable warning, never a callback failure.
-    onConnected: ({ provider, spaceId }) => {
-      if (spaceId === null) return;
-      void spaceService.refreshExtensionTools(spaceId, provider).catch((err) => {
-        console.error(
-          `[extensions] ${provider} connected, but refreshing tools for ${spaceId} failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
-    },
+    // Issue #281: share the same late-bound completion hook as upload-link
+    // so both browser legs refresh the connected space's live tools.
+    onConnected: onExtensionConnected,
   };
   // Issue #57: the ingest webhook route joins the same inbound HTTP
   // listener only when the org channel exists; omission keeps the route 404.

@@ -607,6 +607,11 @@ export type UploadLinkEndpointDeps = Omit<ConnectExtensionDeps, "store"> & {
     >;
   connectionBoundary?: ConnectionBoundary;
   /**
+   * Called after a normal API-key connect or replacement has succeeded.
+   * Carries only the extension identity and the nullable space binding.
+   */
+  onConnected?: (info: { provider: string; spaceId: string | null }) => void | Promise<void>;
+  /**
    * The static-client vault seam (issue #288): the POST of an org-scoped
    * hosted-OAuth link stores the pre-registered client here.
    */
@@ -810,6 +815,22 @@ async function handleUpload(
     // concrete broker/vault/connection detail is logged server-side only.
     console.error(`[upload-link] saving secret for ${consumed.row.extension} failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
     return new Response("saving the secret failed — contact the operator", { status: 500 });
+  }
+  if (boot === undefined && deps.onConnected !== undefined) {
+    try {
+      await deps.onConnected({
+        provider: consumed.row.extension,
+        spaceId: consumed.row.space_id,
+      });
+    } catch (err) {
+      // The vault write already succeeded: a live-session refresh is
+      // best-effort and must never turn the browser success into an error.
+      console.error(
+        `[upload-link] ${consumed.row.extension} connected, but refreshing tools for ${consumed.row.space_id ?? "no space"} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
   return new Response("Saved to the vault — you can close this window.", { status: 200 });
 }
