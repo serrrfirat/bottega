@@ -570,6 +570,17 @@ export function createHeadlessAdapter(): HeadlessAdapter {
       });
       return ts;
     },
+    async isChannelMember() {
+      return true;
+    },
+    async postEphemeral(_spaceId, userId, text) {
+      posts.push({
+        ts: nextTs(),
+        channel_id: channelFromSpaceId(_spaceId),
+        user: userId,
+        text,
+      });
+    },
     async updateMessage(spaceId, ts, text) {
       const rec = posts.find((p) => p.ts === ts && p.channel_id === channelFromSpaceId(spaceId));
       if (rec) rec.text = text;
