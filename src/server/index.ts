@@ -686,6 +686,13 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     runtimeRegistry: storeRuntimeRegistrySeam(store),
     ...(preProbeEgressPath !== undefined
       ? {
+          // The post-registration regen must target the SAME shared,
+          // proxy-visible file as the pre-probe ensure (#366). Falling back
+          // to config/egress.yml writes the immutable image layer in a
+          // hardened deployment (EROFS) and would not update the running
+          // proxy even if the root were writable.
+          egressPath: preProbeEgressPath,
+          devEgressPath: `${preProbeEgressPath}.dev`,
           ensureEgressHosts: createPreProbeEgressEnsure({
             store,
             egressPath: preProbeEgressPath,
