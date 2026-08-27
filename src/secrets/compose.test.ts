@@ -19,7 +19,9 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     expect(readFileSync(resolve(import.meta.dir, "../../config/entrypoints/broker.sh"), "utf8")).toContain(
       "exec /app/node_modules/.bin/omp",
     );
-    expect(serviceEnv("auth-broker")["PI_CONFIG_DIR"]).toBe("/data/.omp");
+    // OMP joins PI_CONFIG_DIR under HOME (/home/bun), so deployment paths
+    // are HOME-relative; absolute-looking values become /home/bun/data.
+    expect(serviceEnv("auth-broker")["PI_CONFIG_DIR"]).toBe("../../data/.omp");
     // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const volumes = broker["volumes"] as string[];
     expect(volumes).toContain("./config/entrypoints:/entrypoints:ro");
@@ -58,7 +60,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     expect(env["OMP_AUTH_BROKER_URL"]).toBe("http://auth-broker:8765");
     // The gateway resolves the token from the shared file, never an env bearer.
     expect(env["OMP_AUTH_BROKER_TOKEN"]).toBeUndefined();
-    expect(env["PI_CONFIG_DIR"]).toBe("/data/.omp");
+    expect(env["PI_CONFIG_DIR"]).toBe("../../data/.omp");
     // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const volumes = gateway["volumes"] as string[];
     expect(volumes).toContain("data:/data");
@@ -68,7 +70,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("server and executor use the broker URL plus shared token file, never a bearer env", () => {
     for (const name of ["server", "executor"]) {
       const env = serviceEnv(name);
-      expect(env["PI_CONFIG_DIR"]).toBe("/app/data/.omp");
+      expect(env["PI_CONFIG_DIR"]).toBe("../../app/data/.omp");
       expect(env["OMP_AUTH_BROKER_URL"]).toBe("${OMP_AUTH_BROKER_URL:-http://auth-broker:8765}");
       expect(env["OMP_AUTH_BROKER_TOKEN_FILE"]).toBe("/app/data/.omp/auth-broker.token");
       expect(env["OMP_AUTH_BROKER_TOKEN"]).toBeUndefined();
