@@ -24,7 +24,7 @@
  * Reconcile NEVER throws: every step folds into the returned `warnings`,
  * so a connect stays successful — the gap is receivable, never fatal.
  */
-import { readPinnedSnapshots, type PinnedSnapshot } from "./registry";
+import { SNAPSHOT_SCHEMA, readPinnedSnapshots, type PinnedSnapshot } from "./registry";
 import { runtimeSnapshotsFromStore } from "./runtime-registry";
 import {
   DEV_EGRESS_CONFIG_PATH,
@@ -140,5 +140,100 @@ export function createReconcileEgress(deps: ReconcileEgressDeps): ReconcileEgres
     }
 
     return { warnings };
+  };
+}
+
+/**
+ * Pre-probe egress ensure (issue #366): the connect flow's MCP validation
+ * probe runs BEFORE registration, and on a strict deployment the egress
+ * gate 403s an unlisted candidate host — probe-before-registration made
+ * runtime connects unreachable there. This synthesizes a candidate
+ * snapshot for the probed hosts, regenerates the superset (committed pins
+ * ∪ runtime rows ∪ candidate), and reloads the running proxy.
+ *
+ * Transient by design: the candidate entry persists only via a successful
+ * connect (the runtime row upsert) or a reviewed pin — a failed/aborted
+ * connect leaves nothing behind but an allowlisted read-only host until
+ * the next regen.
+ */
+export interface PreProbeEgressEnsureDeps {
+  store: Pick<Store, "listRuntimeExtensions">;
+  snapshotsDir?: string;
+  egressPath?: string;
+  devEgressPath?: string;
+  proxyControl?: { proxyControlUrl?: string; proxyControlToken?: string };
+  log?: (line: string) => void;
+}
+
+export function createPreProbeEgressEnsure(
+  deps: PreProbeEgressEnsureDeps,
+): (hosts: string[], provider: string) => Promise<{ ok: boolean; warnings: string[] }> {
+  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
+  const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
+  const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
+  const proxyControl = deps.proxyControl ?? proxyBoundaryControlFromEnv();
+  const log = deps.log ?? ((line: string) => console.log(line));
+
+  return async (hosts: string[], provider: string): Promise<{ ok: boolean; warnings: string[] }> => {
+    const warnings: string[] = [];
+    const clean = [...new Set(hosts.map((h) => h.trim()).filter(Boolean))];
+    if (clean.length === 0) return { ok: true, warnings };
+
+    const candidate: PinnedSnapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      extensionId: provider,
+      pinnedAt: new Date().toISOString(),
+      source: {
+        catalog: "https://integrations.sh/api.json",
+        specId: provider,
+        vendorOfficial: false,
+        reviewed: false,
+      },
+      manifest: {
+        id: provider,
+        label: provider,
+        vendor: provider,
+        kind: "mcp",
+        mcp: { serverUrl: `https://${clean[0]}/mcp`, transport: "streamable-http" },
+        credentialSchema: { type: "oauth" },
+        domains: clean,
+        credentialTargets: clean.map((host) => ({ host })),
+      },
+    };
+
+    let runtimeSet: PinnedSnapshot[] = [];
+    try {
+      runtimeSet = await runtimeSnapshotsFromStore(deps.store);
+    } catch (err) {
+      warnings.push(`runtime rows unavailable (${errorMessage(err)}) — regenerating with committed pins only`);
+    }
+
+    try {
+      regenerateEgressConfig(snapshotsDir, egressPath, [candidate, ...runtimeSet]);
+      regenerateDevEgressConfig(snapshotsDir, devEgressPath, [candidate, ...runtimeSet]);
+    } catch (err) {
+      warnings.push(`pre-probe egress regen failed for ${provider}: ${errorMessage(err)}`);
+      return { ok: false, warnings };
+    }
+
+    if (proxyControl.proxyControlUrl !== undefined && proxyControl.proxyControlToken !== undefined) {
+      try {
+        const res = await fetch(`${proxyControl.proxyControlUrl}/v1/reload`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${proxyControl.proxyControlToken}` },
+        });
+        if (!res.ok) {
+          warnings.push(`proxy reload failed (${res.status})`);
+          return { ok: false, warnings };
+        }
+      } catch (err) {
+        warnings.push(`proxy reload failed: ${errorMessage(err)}`);
+        return { ok: false, warnings };
+      }
+      log(`pre-probe egress ensure: proxy reloaded with the candidate hosts for ${provider}`);
+    } else {
+      warnings.push("no proxy control configured — the regenerated allowlist is not live until a proxy restart");
+    }
+    return { ok: warnings.length === 0, warnings };
   };
 }

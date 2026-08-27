@@ -107,6 +107,7 @@ import { recordTurnUsage } from "../tools/usage-meter";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
+import { createPreProbeEgressEnsure } from "../extensions/egress-reconcile";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -673,9 +674,25 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // (BOTTEGA_EXTENSIONS_DIR, matching bootstrapRuntime's seed) merged with
   // the persisted runtime set (the store — machine state, never a repo
   // file).
+  // Issue #366: runtime connects must reconcile egress BEFORE the MCP
+  // validation probe — the gate 403s an unlisted candidate host, and the
+  // domains only merge after a successful connect. The regen targets the
+  // proxy-visible config (the shared data volume) so the reload picks the
+  // candidate hosts up. Unset (local non-container runs) → the probe
+  // proceeds unadjusted, exactly like hermetic tests.
+  const preProbeEgressPath = process.env.BOTTEGA_PROXY_CONFIG_PATH;
   const catalogRegisterDeps: CatalogRegisterDeps = {
     snapshotsDir: process.env.BOTTEGA_EXTENSIONS_DIR ?? SNAPSHOTS_DIR,
     runtimeRegistry: storeRuntimeRegistrySeam(store),
+    ...(preProbeEgressPath !== undefined
+      ? {
+          ensureEgressHosts: createPreProbeEgressEnsure({
+            store,
+            egressPath: preProbeEgressPath,
+            devEgressPath: `${preProbeEgressPath}.dev`,
+          }),
+        }
+      : {}),
   };
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built

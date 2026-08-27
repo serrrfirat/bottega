@@ -436,6 +436,47 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
     expect(h.auditRows).toHaveLength(0);
   });
 
+  test("the candidate hosts are allowlisted BEFORE the validation probe (issue #366)", async () => {
+    const h = harness({ records: [NOTION_RECORD] });
+    const events: string[] = [];
+    h.deps.ensureEgressHosts = async (hosts) => {
+      events.push(`ensure:${hosts.join(",")}`);
+      return { ok: true };
+    };
+    h.deps.discoverMcp = async () => {
+      events.push("probe");
+      return {
+        serverUrl: "https://mcp.notion.com/mcp",
+        host: "mcp.notion.com",
+        transport: "streamable-http" as const,
+        credentialSchema: { type: "oauth" } as const,
+        oauthGated: true,
+      };
+    };
+    const result = await lookupCatalogExtension("notion", h.deps);
+    expect(result.ok).toBe(true);
+    // Strict deployments 403 the probe for an unlisted host — the ensure
+    // must reconcile egress BEFORE the probe ever fires (#361 finding).
+    expect(events).toEqual(["ensure:mcp.notion.com", "probe"]);
+  });
+
+  test("an ensure failure is tolerated — the probe still runs and fails loudly, not silently (#366)", async () => {
+    const h = harness({ records: [NOTION_RECORD] });
+    const events: string[] = [];
+    h.deps.ensureEgressHosts = async () => {
+      events.push("ensure:failed");
+      throw new Error("regen exploded");
+    };
+    h.deps.discoverMcp = async () => {
+      events.push("probe");
+      throw new Error("HTTP 403 — no WWW-Authenticate challenge");
+    };
+    const result = await lookupCatalogExtension("notion", h.deps);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain("HTTP 403");
+    expect(events).toEqual(["ensure:failed", "probe"]);
+  });
+
   test("semantic lookup resolves by NAME and ALIASES, not just exact ids (issue #233)", async () => {
     // "connect my docs" → the intent token is "docs" → the catalog entry
     // named "Google Docs" (or carrying the "docs" alias) must resolve.

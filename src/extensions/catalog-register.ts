@@ -251,6 +251,14 @@ export interface CatalogRegisterDeps {
    * hot-registers, but nothing persists across a restart.
    */
   runtimeRegistry?: RuntimeRegistrySeam;
+  /**
+   * Pre-probe egress ensure (issue #366): called with the candidate MCP
+   * hosts BEFORE the validation probe — a strict deployment 403s an
+   * unlisted host at the gate, making runtime connects unreachable.
+   * Absent (headless/hermetic contexts) → the probe proceeds unadjusted.
+   * Failures are tolerated: the probe then fails loudly with its evidence.
+   */
+  ensureEgressHosts?: (hosts: string[], provider: string) => Promise<{ ok: boolean }>;
 }
 
 /** The store-backed runtime registry persistence seam (issue #233). */
@@ -345,6 +353,34 @@ export async function lookupCatalogExtension(
         "registers hosted MCP extensions only. Use catalog_browser (action=draft/pin) to register a " +
         "non-MCP extension with the vendor binding facts.",
     };
+  }
+
+  // Pre-probe egress ensure (issue #366): the candidate hosts must be
+  // allowlisted BEFORE the validation probe — the gate 403s an unlisted
+  // host, and the domains only merge after a successful connect. The
+  // connect approval covers exactly this add (its payload renders the
+  // draft domains); a failure is tolerated — the probe then fails loudly.
+  if (deps.ensureEgressHosts !== undefined) {
+    const hosts = mcpCandidates(entry)
+      .map((candidate) => {
+        try {
+          return new URL(candidate).host;
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean)
+      .map((host, index, all) => all.indexOf(host) === index ? host : "")
+      .filter(Boolean);
+    if (hosts.length > 0) {
+      try {
+        await deps.ensureEgressHosts(hosts, extensionId);
+      } catch (err) {
+        // Tolerated (#366): the reconcile is best-effort — the probe then
+        // fails loudly with its evidence instead of a swallowed regen error.
+        console.log(`pre-probe egress ensure failed for ${extensionId}: ${errorMessage(err)}`);
+      }
+    }
   }
 
   // 2. DRAFT — the catalog scaffold + the discovered official endpoint +
