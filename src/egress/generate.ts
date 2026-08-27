@@ -136,6 +136,7 @@ export const BASE_EGRESS_DOMAINS = [
   gatewayHost("tavily"),
   "raw.githubusercontent.com",
   "files.slack.com",
+  "integrations.sh", // extension catalog browse (issue #54; egress gap found #361)
   "slack.com",
   "api.slack.com",
   "*.slack.com",

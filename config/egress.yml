@@ -73,6 +73,7 @@ transforms:
         - "api.tavily.com"
         - "raw.githubusercontent.com"
         - "files.slack.com"
+        - "integrations.sh"
         - "slack.com"
         - "api.slack.com"
         - "*.slack.com"
