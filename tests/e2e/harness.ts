@@ -63,6 +63,7 @@ import { resolveExtensionSurfaces } from "../../src/extensions/surface";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
 import { connectViaAuthBroker, type BrokerConnector, type ConnectExtensionDeps } from "../../src/extensions/connect";
 import type { McpOAuthConnector } from "../../src/extensions/mcp-oauth";
+import { createOmpSdkDriver, SessionModelRoleRegistry, sessionIdFromFilePath } from "../../src/server/drivers/agent-driver";
 import type { UploadLinkStore } from "../../src/extensions/upload-link";
 import type { CredentialBoundary } from "../../src/extensions/boundary";
 import { codexAuthFilePathFromEnv, readCodexAuthTokens } from "../../src/extensions/proxy-seed";
@@ -71,7 +72,6 @@ import type { JsonObject, McpBinding } from "../../src/extensions/manifest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { AgentDriver } from "../../src/server/drivers/agent-driver";
-import { createOmpSdkDriver, SessionModelRoleRegistry } from "../../src/server/drivers/agent-driver";
 import {
   channelFromSpaceId,
   createSlackAdapter,
@@ -81,6 +81,7 @@ import {
   type SlackAction,
   type SlackAdapter,
 } from "../../src/server/adapters/slack";
+import { mountRestApi } from "../../src/server/api";
 import { SpaceService } from "../../src/server/services/space-service";
 
 /** Bot token seeded into the Slack emulator; the adapter authenticates with it. */
@@ -537,9 +538,20 @@ function bootSlackEmulator(extraUserNames: string[] = []): SlackEmulatorHandle {
  * ApprovalRouter as the emulator mode — minus the Bolt transport, so a
  * full conversation journey runs with zero Slack surface (the #29 seam).
  */
+/** One recorded stream-panel operation (#168 surface) when headless streaming is enabled. */
+export interface HeadlessStreamEvent {
+  op: "start" | "append" | "task" | "stop";
+  spaceId: string;
+  ts: string;
+  /** Panel opening text (start), appended markdown chunk (append), task label (task), final text if supplied (stop). */
+  text?: string;
+  recipientUserId?: string;
+}
 export interface HeadlessAdapter extends SlackAdapter {
   /** Outbound posts, in arrival order (the assertion surface behind messages()). */
   posts: EmulatorMessage[];
+  /** Recorded stream-panel operations, arrival order — defined when the adapter is constructed with `streaming: true`; empty otherwise. */
+  streams: HeadlessStreamEvent[];
   /** Monotonic synthetic message ts. */
   nextTs(): string;
 }
@@ -548,9 +560,11 @@ export interface HeadlessAdapter extends SlackAdapter {
 export const HEADLESS_BOT = "U-headless-bot";
 export const HEADLESS_HUMAN = "U-headless-human";
 
-export function createHeadlessAdapter(): HeadlessAdapter {
+export function createHeadlessAdapter(opts: { streaming?: boolean } = {}): HeadlessAdapter {
+  const streaming = opts.streaming === true;
   const posts: EmulatorMessage[] = [];
   let counter = 0;
+  const streams: HeadlessStreamEvent[] = [];
   const BASE = Math.floor(Date.now() / 1000);
   const nextTs = () => {
     counter += 1;
@@ -558,6 +572,7 @@ export function createHeadlessAdapter(): HeadlessAdapter {
   };
   return {
     posts,
+    streams,
     nextTs,
     async postMessage(spaceId, text, postOpts) {
       const ts = nextTs();
@@ -595,19 +610,34 @@ export function createHeadlessAdapter(): HeadlessAdapter {
     // reaction failures as non-fatal by contract.
     async addReaction() {},
     async removeReaction() {},
-    // Streaming stays off in headless mode (issue #360): the space service
-    // falls back to the phrase + edit path, which this fake records like
-    // any other message. A stray stream call fails loudly instead of
-    // silently mutating nothing.
+    // Streaming panels (#168): off by default — the space service falls
+    // back to the phrase + edit path this fake records like any message.
+    // With `streaming: true` the lane renders through the REAL
+    // StreamTurnPresenter path; every panel operation is recorded verbatim.
     streamingSupported() {
-      return false;
+      return streaming;
     },
-    async startStream() {
-      throw new Error("headless adapter: streaming not supported");
+    async startStream(spaceId, sOpts) {
+      if (!streaming) throw new Error("headless adapter: streaming not enabled");
+      const ts = nextTs();
+      streams.push({
+        op: "start",
+        spaceId,
+        ts,
+        ...(sOpts.openingText !== undefined ? { text: sOpts.openingText } : {}),
+        ...(sOpts.recipientUserId !== undefined ? { recipientUserId: sOpts.recipientUserId } : {}),
+      });
+      return ts;
     },
-    async appendText() {},
-    async appendTask() {},
-    async stopStream() {},
+    async appendText(spaceId, ts, text) {
+      streams.push({ op: "append", spaceId, ts, text });
+    },
+    async appendTask(spaceId, ts, task) {
+      streams.push({ op: "task", spaceId, ts, text: task.title });
+    },
+    async stopStream(spaceId, ts, text) {
+      streams.push({ op: "stop", spaceId, ts, ...(text !== undefined ? { text } : {}) });
+    },
     async start() {},
     async stop() {},
   };
@@ -647,6 +677,19 @@ function headlessSlackHandle(adapter: HeadlessAdapter): SlackHandle {
   };
 }
 
+
+/**
+ * Handle for the production REST API surface optionally mounted by the
+ * harness (issue #363): the REAL /api/v1 routes served over an ephemeral
+ * port against the harness's own store + audit. Bearer auth uses the
+ * injected token — no env, no secrets chain.
+ */
+export interface RestApiHarnessHandle {
+  /** Base URL of the ephemeral listener, e.g. http://127.0.0.1:53111 */
+  url: string;
+  /** Authenticated request to an API path (/api/v1/..., /openapi.json). Extra headers merge over the bearer header. */
+  request(path: string, init?: RequestInit): Promise<Response>;
+}
 const QUIET_LOGGER: Logger = {
   info: () => {},
   debug: () => {},
@@ -787,6 +830,20 @@ export interface HarnessConfig {
    */
   headless?: boolean;
   /**
+   * Headless streaming panels (#168): when true, the fake adapter reports
+   * streaming as supported so turns render through the REAL
+   * StreamTurnPresenter path; every panel operation is recorded on
+   * {@link HeadlessAdapter.streams}. Requires {@link headless}.
+   */
+  headlessStreaming?: boolean;
+  /**
+   * Mount the production REST API (/api/v1 + /openapi.json) over this
+   * boot's store + audit (issue #363): exposes {@link Harness.rest} for
+   * Slack-free data-plane journeys. The bearer token is caller-chosen and
+   * injected — the boot-secret env chain is never touched.
+   */
+  rest?: { token: string };
+  /**
    * Live canary connect wiring (issue #79): like {@link connect} but the
    * harness supplies its own store/audit/registry — only the broker seam is
    * caller's (defaults to the production connectViaAuthBroker). The generic
@@ -816,6 +873,8 @@ export interface Harness {
   slack: SlackHandle;
   /** Defined in realSlack mode: the live handle (fresh API reads, QA user identity). */
   liveSlack?: LiveSlackHandle;
+  /** Defined when {@link HarnessConfig.rest} is set: ephemeral /api/v1 mount (issue #363). */
+  rest?: RestApiHarnessHandle;
   extensionRegistry: ExtensionRegistry;
   orgPolicy: PolicyConfig;
   /** The model ref pinned as the session default role (stub ref, or the real ref in canary mode). */
@@ -877,6 +936,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       "bootHarness({ realSlack: true }) requires slackTokens — the live leg never runs without " +
         "workspace tokens (issue #79); use tests/e2e/canary.ts, which skip-gates on them",
     );
+  }
+  if (cfg.headlessStreaming === true && !headless) {
+    throw new Error("bootHarness: headlessStreaming requires the headless lane (issue #363)");
   }
   const tempDir = mkdtempSync(join(tmpdir(), "bottega-e2e-"));
   const configDir = join(tempDir, "config");
@@ -950,6 +1012,28 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   const orgPolicy = loadOrgConfig(configDir);
   const memoryProvider = createSqliteMemoryProvider(store.getDb());
 
+  // --- REST API lane (issue #363): the PRODUCTION token-authenticated ------
+  // surface mounted over this boot's real store + audit on an ephemeral
+  // port. resolveToken injection keeps it hermetic (no env chain).
+  let restHandle: RestApiHarnessHandle | undefined;
+  let restStop: (() => void) | undefined;
+  if (cfg.rest !== undefined) {
+    const api = mountRestApi({ store, audit, resolveToken: () => cfg.rest!.token });
+    const server = Bun.serve({ port: 0, fetch: (req) => api.fetch(req) });
+    const base = `http://127.0.0.1:${server.port}`;
+    const token = cfg.rest!.token;
+    restHandle = {
+      url: base,
+      request(path, init) {
+        return fetch(`${base}${path}`, {
+          ...init,
+          headers: { authorization: `Bearer ${token}`, ...(init?.headers ?? {}) },
+        });
+      },
+    };
+    restStop = () => server.stop(true);
+  }
+
   // --- Slack boundary (issue #360): three transport modes -------------------
   // `realSlack` (issue #79): the REAL Socket Mode adapter — inbound arrives
   //    over the socket from the workspace, outbound posts to it.
@@ -959,7 +1043,9 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   // default: the @emulators/slack HTTP emulator + the real Bolt app via the
   //    #29 processEvent seam. Everything downstream (space service, driver,
   //    policy) is identical across the three modes.
-  const headlessAdapter: HeadlessAdapter | undefined = headless ? createHeadlessAdapter() : undefined;
+  const headlessAdapter: HeadlessAdapter | undefined = headless
+    ? createHeadlessAdapter({ streaming: cfg.headlessStreaming === true })
+    : undefined;
   const slack: SlackHandle = realSlack
     ? await bootLiveSlack(cfg.slackTokens!)
     : headless
@@ -1101,12 +1187,21 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       : cfg.gatedTools({ store, audit, registry: extensionRegistry });
   const driver = createOmpSdkDriver({
     agentDir,
-    customTools: [
+    // Production parity (issue #167): restricted SDK sessions build custom
+    // tools through the async resolver at session creation.
+    customTools: async () => [
       ...(cfg.customTools ?? []),
       ...modelTools,
       ...extensionToolDefinitions(extensionRegistry.list(), {
         runtime: extensionRuntime,
         surfaces: extensionSurfaces,
+        // Production parity (issue #152): the #51 ladder's personal scope
+        // resolves against the TURN principal, read late-bound (spaceService
+        // is constructed after the driver).
+        getCaller: (ctx) => {
+          const spaceId = sessionIdFromFilePath(ctx.sessionManager?.getSessionFile());
+          return spaceId ? spaceService.getTurnPrincipal(spaceId) : undefined;
+        },
       }),
     ],
     // Policy gate on the custom-tools bridge (issue #69): the extension
@@ -1207,6 +1302,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       // adapter's app was never started, so there is nothing to stop.
       if (realSlack) await adapter.stop();
       slack.stop();
+      if (restStop !== undefined) restStop();
       modelStub.stop();
       store.close();
       rmSync(tempDir, { recursive: true, force: true });
@@ -1321,6 +1417,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       return channelId ? all.filter((m) => m.channel_id === channelId) : all;
     },
     ...(liveSlack !== undefined ? { liveSlack } : undefined),
+    ...(restHandle !== undefined ? { rest: restHandle } : undefined),
     cleanup,
   };
 }

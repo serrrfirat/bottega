@@ -120,3 +120,25 @@ inbound path it would exercise is now covered via `processEvent`, and boot
 wiring via `smoke.test.ts` + `agent-dir.test.ts`); direct
 `memory/types.ts` validator file (indirect coverage complete);
 SpaceService-via-real-store lifecycle (optional per the table).
+
+## Headless lane feature matrix (issue #363)
+
+Every user-visible behavior is reachable Slack-free via `bootHarness({ headless: true })` —
+`deliverMessage`/`deliverAction` drive the real `SpaceService`/approval seams; outbound lands in an
+in-process fake adapter; `cfg.rest` mounts the production `/api/v1` over the same store.
+
+| Feature family | Journey file | Journeys |
+|---|---|---|
+| Boot posture / no-Slack guarantee / mode exclusivity | `headless.test.ts` | 4 |
+| Conversation: presenter phrase+edit, threading, response-mode directive + overlay clamp, streaming panels (#168), digest-on-idle, connect_extension tool | `headless-conversation.test.ts` | 6 |
+| Work items: ask-human pickup approval through production `SlackApprovalRouter` (+ rewrite), timeout deny, cancel permissions, chat completion, fork | `headless-work-items.test.ts` | 5 |
+| Agent tool surface: memory×3, model_settings/use_model, settings(+org exec gate), operator-read×3, objects×3, space-skills lifecycle, kb_ingest job enqueue, search_web fail-closed, render_chart block sink, graph_query+list_todos, admin deploy_info, unknown-name fail-closed | `headless-tools.test.ts` | 11 |
+| Extensions: runtime spine incl. boundary isolation, credential ladder org/me/auto + org_credentials clamp, deny/allow overlays, connect + connection lifecycle | `headless-extensions.test.ts` | 3 |
+| Scheduler/outbox: cron send_message, unknown-action disable, handler-failure resumability, admin lifecycle (run_now/pause/resume/delete), outbox post idempotence, reactive sweep | `headless-scheduler.test.ts` | 6 |
+| REST API: all `/api/v1` routes + openapi.json, bearer auth fail-closed + throttle (#346), audit actors | `headless-rest-api.test.ts` | route-matrix in one journey |
+
+**Deliberately outside this lane** (each has a dedicated suite): adapter-level mention/bot filters and
+Socket-Mode transport details (`slack*.test.ts`); live-Slack canary surfaces (`canary.ts`, NEVER CI);
+Docker skip-gated legs (mem0 OSS server, iron-proxy enforcement); worker sandbox spawn behavior
+(hangs without container runtime — phase-2 hang reproduced on clean main); MCP-server spawn surface
+(`mcp/server.test.ts`).
