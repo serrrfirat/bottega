@@ -35,6 +35,8 @@ export interface ForkInput {
   /** Cut after the LAST entry of this kind — today only "failed" (the retry button's shape). */
   afterKind?: "failed";
   note?: string;
+  /** Why this fork exists; "continuation" scopes #359 dedupe to retry forks. */
+  intent?: "continuation";
   /** Principal recorded as the fork's requester and audit actor. */
   requester: string;
 }
@@ -221,6 +223,7 @@ export async function forkWorkItem(
   // The failure marker refines the preamble cause when the cut itself is
   // not a terminal landing (e.g. an index cut right before the failure).
   let meta: ForkMeta = { ...point.meta };
+  if (input.intent !== undefined) meta.intent = input.intent;
   if (meta.cause === undefined) {
     const failed = await latestFailureCause(deps, input.sourceId);
     if (failed !== undefined) meta = { ...meta, cause: failed };

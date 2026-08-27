@@ -84,6 +84,8 @@ export type ForkMeta = {
   spanEnd?: number;
   /** The timeline index the fork was cut at (diagnostic round-trip). */
   timelineIndex?: number;
+  /** Why the fork was created; continuation scopes dedupe to retry forks (issue #359). */
+  intent?: "continuation";
 };
 
 export type WorkItemDelivery = "git" | "extension" | "chat";
@@ -1109,7 +1111,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
         space_id: input.space_id,
         actor: input.requester,
         event_type: WORK_ITEM_FORKED_EVENT,
-        payload: JSON.stringify({ id, forked_from: input.forkedFrom, note: input.forkMeta?.note, by: input.requester }),
+        payload: JSON.stringify({ id, forked_from: input.forkedFrom, note: input.forkMeta?.note, intent: input.forkMeta?.intent, by: input.requester }),
       });
     }
     // Epic #170: git/extension work items enqueue a worker job with the SAME

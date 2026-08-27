@@ -26,12 +26,18 @@ type ContinuationInput = {
 // in one process from both passing the read-before-create check.
 const locks = new WeakMap<Store, Map<string, Promise<void>>>();
 
-const forkedPayloadSchema = z.object({ id: z.string().min(1), forked_from: z.string().min(1) });
+const forkedPayloadSchema = z.object({
+  id: z.string().min(1),
+  forked_from: z.string().min(1),
+  intent: z.literal("continuation"),
+});
 
 function isForkOf(payloadText: string, sourceId: string): { forkId: string } | null {
   // SAFETY: audit payloads are appended only by createWorkItem via
   // JSON.stringify; the schema parse rejects malformed rows instead of
-  // trusting an unchecked shape.
+  // trusting an unchecked shape. Only continuation-intent forks (issue #359)
+  // are deduped — a generic #358 timeline fork of the same source must NOT
+  // suppress a later blocked continuation.
   try {
     const payload = forkedPayloadSchema.safeParse(JSON.parse(payloadText));
     return payload.success && payload.data.forked_from === sourceId ? { forkId: payload.data.id } : null;
@@ -111,7 +117,7 @@ export async function continueWork(
 
     const fork = await forkWorkItem(
       { ...deps.store, transcriptDir: deps.transcriptDir },
-      { sourceId: input.sourceId, afterKind: "failed", requester: input.requester, note },
+      { sourceId: input.sourceId, afterKind: "failed", requester: input.requester, note, intent: "continuation" },
     );
     const result = { forkId: fork.id, existed: false } satisfies ContinueResult;
     await deps.store.appendAudit({
