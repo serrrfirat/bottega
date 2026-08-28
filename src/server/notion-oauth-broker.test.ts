@@ -123,7 +123,7 @@ describe("Notion auth-broker OAuth provider", () => {
     console.error = (...args: unknown[]) => logs.push(args);
     try {
       await expect(refreshNotionToken(credential("none"), malformed.fetchImpl)).rejects.toThrow();
-      await expect(refreshNotionToken(credential("none"), non2xx.fetchImpl)).rejects.toThrow();
+      await expect(refreshNotionToken(credential("none"), non2xx.fetchImpl)).rejects.toThrow(/invalid_grant/);
     } finally {
       console.log = original.log;
       console.warn = original.warn;

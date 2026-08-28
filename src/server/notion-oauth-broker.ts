@@ -72,7 +72,20 @@ export async function refreshNotionToken(
   } catch {
     throw new Error("Notion OAuth token refresh request failed");
   }
-  if (!response.ok) throw new Error("Notion OAuth token refresh returned a non-success response");
+  if (!response.ok) {
+    let code: string | undefined;
+    try {
+      const value = (await response.json()) as Record<string, unknown>;
+      if (typeof value.error === "string" && /^[a-z0-9_]{1,64}$/.test(value.error)) code = value.error;
+    } catch {
+      // Status-only error below: response bodies can contain credential data.
+    }
+    throw new Error(
+      code
+        ? `Notion OAuth token refresh failed: ${code}`
+        : `Notion OAuth token refresh failed (status ${response.status})`,
+    );
+  }
 
   let parsed: TokenResponse | null;
   try {
