@@ -181,8 +181,8 @@ function makeDeps(overrides: {
   };
 }
 
-async function connect(h: Harness, extension: string, scope: ConnectScope, actor: string, extra: { spaceId?: string; apiKey?: string } = {}) {
-  return connectExtension({ extension, scope, actor, spaceId: extra.spaceId, apiKey: extra.apiKey }, h.deps);
+async function connect(h: Harness, extension: string, scope: ConnectScope, actor: string, extra: { spaceId?: string; apiKey?: string; fromUpload?: boolean } = {}) {
+  return connectExtension({ extension, scope, actor, spaceId: extra.spaceId, apiKey: extra.apiKey, fromUpload: extra.fromUpload }, h.deps);
 }
 
 function rowsFor(store: Store, provider: string) {
