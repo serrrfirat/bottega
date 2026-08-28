@@ -317,6 +317,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     surfaceAuthProvider,
     surfaceAuthorization,
     extensionReauthDirective,
+    extensionAuthFailures,
     surfaceFailureObserver,
     memoryProvider,
   } = wiring;
@@ -1112,6 +1113,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // The active default model (issue #342): lets the turn presenter
     activeDefaultModel,
     extensionReauthDirective,
+    extensionAuthFailures: () => [...extensionAuthFailures.values()],
   });
   // Idempotent opt-in seeder (issue #161): guarantee a weekly governance_digest
   // job for every space whose policy enables proactive.governance. A boot that

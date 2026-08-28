@@ -2743,16 +2743,22 @@ describe("response mode → session prompt directive (issue #55)", () => {
   });
 
   test("cold sessions tell users to reauthorize expired connected extensions (#376)", async () => {
-    const { adapter } = fakeAdapter();
+    const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();
     const driver = new FakeDriver();
+    const failures = [{ providerId: "notion", label: "Notion" }];
+    let failureReads = 0;
+    const extensionAuthFailures = () => {
+      failureReads++;
+      return failures;
+    };
     const extensionReauthDirective = () =>
       [
         "Some connected extension providers need reauthorization:",
         '- Notion (notion): reconnect/reauthorize it by running "connect notion".',
         "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reconnect.",
       ].join("\n");
-    const deps = { store, adapter, driver, extensionReauthDirective };
+    const deps = { store, adapter, driver, extensionReauthDirective, extensionAuthFailures };
     const service = makeSpaceService(deps);
     await service.handleInboundMessage(msg());
 
@@ -2761,6 +2767,16 @@ describe("response mode → session prompt directive (issue #55)", () => {
     expect(prompt).toContain('connect notion');
     expect(prompt).toContain("Do not describe these providers as merely tool-not-found");
     expect(prompt).not.toContain("raw-detail");
+
+    driver.last().emit("message", {
+      spaceId: "slack:C1",
+      text: "Notion search tool not found this run, so this is GitHub-only.",
+    });
+    await Promise.resolve();
+    expect(failureReads).toBeGreaterThan(0);
+    expect(updates.at(-1)?.text).toStartWith(
+      'Your Notion authorization expired or was revoked. Reconnect Notion by running "connect notion".',
+    );
     await service.stop();
   });
 });

@@ -25,6 +25,7 @@ import {
 } from "../adapters/slack";
 import { resolveSpaceSkills } from "../skills";
 import { providerFromModelRef } from "../../extensions/proxy-seed";
+import type { ExtensionAuthFailure } from "../../extensions/surface";
 import { runWizardChecks, type WizardCheck } from "../../tools/admin";
 import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
@@ -136,6 +137,8 @@ export interface SpaceServiceDeps {
    */
   /** Lazy connected-extension reauthorization guidance for cold sessions. */
   extensionReauthDirective?: () => string;
+  /** Current sanitized auth failures for deterministic reply guidance. */
+  extensionAuthFailures?: () => readonly ExtensionAuthFailure[];
   activeDefaultModel?: string;
 }
 
@@ -359,6 +362,7 @@ export class SpaceService {
   /** The ACTIVE DEFAULT MODEL ref (issue #342); see {@link SpaceServiceDeps.activeDefaultModel}. */
   readonly #activeDefaultModel: string | undefined;
   readonly #extensionReauthDirective: (() => string) | undefined;
+  readonly #extensionAuthFailures: (() => readonly ExtensionAuthFailure[]) | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /**
@@ -403,6 +407,7 @@ export class SpaceService {
     this.#personaDir = deps.personaDir;
     this.#classifier = deps.classifier ?? new CorrectionClassifier();
     this.#extensionReauthDirective = deps.extensionReauthDirective;
+    this.#extensionAuthFailures = deps.extensionAuthFailures;
     this.#stopControl = deps.stopControl ?? false;
     this.#activeDefaultModel = deps.activeDefaultModel;
   }
@@ -1009,7 +1014,31 @@ export class SpaceService {
       console.log(`[space-service] turn_start ${spaceId}`);
       this.#presenterFor(spaceId).onTurnStart();
     });
-    session.on("message", (data) => this.#presenterFor(spaceId).onMessage(data));
+    session.on("message", (data) => {
+      if (typeof data.text !== "string") {
+        this.#presenterFor(spaceId).onMessage(data);
+        return;
+      }
+      const lower = data.text.toLowerCase();
+      const failures = (this.#extensionAuthFailures?.() ?? []).filter(({ providerId, label }) => {
+        const mentioned =
+          lower.includes(providerId.toLowerCase()) || lower.includes(label.toLowerCase());
+        const alreadyActionable =
+          lower.includes(`reconnect ${providerId.toLowerCase()}`) ||
+          lower.includes(`reconnect ${label.toLowerCase()}`);
+        return mentioned && !alreadyActionable;
+      });
+      const notice = failures
+        .map(
+          ({ providerId, label }) =>
+            `Your ${label} authorization expired or was revoked. Reconnect ${label} by running "connect ${providerId}".`,
+        )
+        .join("\n");
+      this.#presenterFor(spaceId).onMessage({
+        ...data,
+        text: notice === "" ? data.text : `${notice}\n\n${data.text}`,
+      });
+    });
     session.on("error", (data) => this.#presenterFor(spaceId).onError(data));
     session.on("turn_end", (data) => {
       console.log(`[space-service] turn_end ${spaceId}`);
