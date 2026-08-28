@@ -316,6 +316,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     surfaces: extensionSurfaces,
     surfaceAuthProvider,
     surfaceAuthorization,
+    extensionReauthDirective,
+    surfaceFailureObserver,
     memoryProvider,
   } = wiring;
   opts.onRuntimeWiring?.(wiring);
@@ -551,6 +553,9 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // hosted OAuth callback: refresh only a live space session, and keep the
   // successful credential write/callback response independent of refresh.
   const onExtensionConnected = ({ provider, spaceId }: { provider: string; spaceId: string | null }) => {
+    // A successful credential exchange makes any prior auth-expiry prompt
+    // stale before the replacement session is created.
+    surfaceFailureObserver.onResolved(provider);
     if (spaceId === null) return;
     void spaceService.refreshExtensionTools(spaceId, provider).catch((err) => {
       console.error(
@@ -900,6 +905,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     const refreshOpts: NonNullable<Parameters<typeof refreshMissingExtensionSurfaces>[2]> = {
       authProvider: surfaceAuthProvider,
       authorize: surfaceAuthorization,
+      failureObserver: surfaceFailureObserver,
+      isConnected: async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0,
     };
     if (opts.surfaceTransport !== undefined) refreshOpts.mcpTransport = opts.surfaceTransport;
     const surfaces = await refreshMissingExtensionSurfaces(
@@ -1103,9 +1110,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     // control only mounts when the org sets `turn_stop_control: true`.
     stopControl: orgSettings?.turnStopControl ?? false,
     // The active default model (issue #342): lets the turn presenter
-    // attribute a bare 403 to the Codex mint/grant family only when codex
-    // is the active provider; other providers get a provider-aware remedy.
     activeDefaultModel,
+    extensionReauthDirective,
   });
   // Idempotent opt-in seeder (issue #161): guarantee a weekly governance_digest
   // job for every space whose policy enables proactive.governance. A boot that

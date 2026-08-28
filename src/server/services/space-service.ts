@@ -134,6 +134,8 @@ export interface SpaceServiceDeps {
    * naming the provider and env var. Absent → a bare 403 keeps its
    * original text (fail-closed, never a false "run codex login").
    */
+  /** Lazy connected-extension reauthorization guidance for cold sessions. */
+  extensionReauthDirective?: () => string;
   activeDefaultModel?: string;
 }
 
@@ -356,6 +358,7 @@ export class SpaceService {
   readonly #stopControl: boolean;
   /** The ACTIVE DEFAULT MODEL ref (issue #342); see {@link SpaceServiceDeps.activeDefaultModel}. */
   readonly #activeDefaultModel: string | undefined;
+  readonly #extensionReauthDirective: (() => string) | undefined;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #creating = new Map<string, Promise<LiveSession>>();
   /**
@@ -399,6 +402,7 @@ export class SpaceService {
     this.#onboardingChecks = deps.onboardingChecks ?? (() => runWizardChecks(this.#store));
     this.#personaDir = deps.personaDir;
     this.#classifier = deps.classifier ?? new CorrectionClassifier();
+    this.#extensionReauthDirective = deps.extensionReauthDirective;
     this.#stopControl = deps.stopControl ?? false;
     this.#activeDefaultModel = deps.activeDefaultModel;
   }
@@ -961,9 +965,8 @@ export class SpaceService {
       ? await Promise.all([modePromise, getSpace.call(this.#store, spaceId)])
       : [await modePromise, undefined];
     const persona = space ? loadPersona(space.policy_json, this.#personaDir) : undefined;
-    // Persona guidance is additive (#130): Slack formatting and response-mode
-    // directives remain part of every cold-start prompt.
-    const directives = [persona?.prompt ?? "", SLACK_FORMAT_DIRECTIVE];
+    const reauthDirective = this.#extensionReauthDirective?.() ?? "";
+    const directives = [persona?.prompt ?? "", SLACK_FORMAT_DIRECTIVE, reauthDirective];
     if (mode === "request-only") directives.push(REQUEST_ONLY_DIRECTIVE);
     // Semantic auto-pickup (issue #89): opt-in org-floor flag; the pickup
     // directive is evaluated at session creation like the response mode, so

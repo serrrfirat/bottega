@@ -354,6 +354,70 @@ describe("resolveExtensionSurfaces (the server boot step)", () => {
     expect(silent).toContain("resolves it lazily per call");
     expect(bootLines.some((line) => line.includes("CONNECTED provider") && line.includes("never.connected"))).toBe(false);
   });
+
+  test("records only connected auth failures and clears the sanitized state after recovery (#376)", async () => {
+    const manifest = toolsLessManifest({ id: "notion", label: "Notion" });
+    const failures = new Map<string, { providerId: string; label: string }>();
+    const failureObserver = {
+      onAuthFailure: (failure: { providerId: string; label: string }) =>
+        failures.set(failure.providerId, failure),
+      onResolved: (providerId: string) => failures.delete(providerId),
+    };
+    let expired = true;
+    const transport = (binding: McpBinding): Transport => {
+      if (expired) {
+        throw new Error(
+          "the notion OAuth session expired or was revoked — re-run connect notion; raw-detail-must-not-leak",
+        );
+      }
+      return fakeToolsServer(FAKE_WIRE_TOOLS, { count: 0 })(binding);
+    };
+
+    await resolveExtensionSurfaces([{ manifest }], {
+      mcpTransport: transport,
+      isConnected: async () => true,
+      failureObserver,
+    });
+    expect(failures.get("notion")).toEqual({ providerId: "notion", label: "Notion" });
+    expect(JSON.stringify([...failures.values()])).not.toContain("raw-detail-must-not-leak");
+
+    expired = false;
+    resetToolSurfaceCache();
+    await resolveExtensionSurfaces([{ manifest }], {
+      mcpTransport: transport,
+      isConnected: async () => true,
+      failureObserver,
+    });
+    expect(failures.size).toBe(0);
+  });
+
+  test("does not label network or unconnected failures as reauthorization", async () => {
+    const failures: string[] = [];
+    const failureObserver = {
+      onAuthFailure: (failure: { providerId: string }) => failures.push(failure.providerId),
+      onResolved: () => {},
+    };
+    const network = toolsLessManifest({
+      id: "network.down",
+      mcp: { serverUrl: "https://network.down.test/mcp", transport: "streamable-http" },
+    });
+    const unconnected = toolsLessManifest({
+      id: "not.connected",
+      mcp: { serverUrl: "https://not.connected.test/mcp", transport: "streamable-http" },
+    });
+
+    await resolveExtensionSurfaces([{ manifest: network }, { manifest: unconnected }], {
+      mcpTransport: (binding) => {
+        if (binding.transport === "streamable-http" && binding.serverUrl.includes("network")) {
+          throw new Error("connection timed out");
+        }
+        throw new Error("OAuth token expired or revoked");
+      },
+      isConnected: async (providerId) => providerId === "network.down",
+      failureObserver,
+    });
+    expect(failures).toEqual([]);
+  });
 });
 
 describe("toolOwnerExtensionId (the MCP surface's name→extension seam)", () => {

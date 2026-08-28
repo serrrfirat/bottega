@@ -59,6 +59,7 @@ import { createOpenApiEgressSeam } from "../extensions/openapi-egress";
 import { MCP_DISCOVERY_TIMEOUT_MS } from "../extensions/generate-tools";
 import {
   resolveExtensionSurfaces,
+  type ExtensionAuthFailure,
   type ExtensionSurfaces,
   type SurfaceAuthorization,
 } from "../extensions/surface";
@@ -163,7 +164,15 @@ export interface BootstrapRuntime {
   registry: ExtensionRegistry;
   runtime: ExtensionRuntime;
   memoryProvider: ResolvedMemoryProvider;
-  /** Effective tool surfaces resolved at boot (issue #166: failing providers are skipped, not fatal). */
+  /** Current sanitized failures for connected extensions. */
+  extensionAuthFailures: ReadonlyMap<string, ExtensionAuthFailure>;
+  /** Sanitized failure observer shared with lazy discovery refresh. */
+  surfaceFailureObserver: {
+    onAuthFailure: (failure: ExtensionAuthFailure) => void;
+    onResolved: (providerId: string) => void;
+  };
+  /** Builds the current reauthorization directive lazily for cold sessions. */
+  extensionReauthDirective: () => string;
   surfaces: ExtensionSurfaces;
   /** The credential boundary wired into the runtime — always carries the configured secret resolver (#172/#190). */
   boundary: CredentialBoundary;
@@ -178,6 +187,11 @@ export interface BootstrapRuntime {
  */
 export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<BootstrapRuntime> {
   const store = deps.store ?? createStore(deps.dbPath);
+  const extensionAuthFailures = new Map<string, ExtensionAuthFailure>();
+  const failureObserver = {
+    onAuthFailure: (failure: ExtensionAuthFailure) => extensionAuthFailures.set(failure.providerId, failure),
+    onResolved: (providerId: string) => extensionAuthFailures.delete(providerId),
+  };
   const audit = createAudit(store);
   const orgPolicy = loadOrgPolicy(store, deps.configDir, deps.orgSettings);
   const registry = createExtensionRegistry(
@@ -238,15 +252,13 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
   const surfaceOptions: NonNullable<Parameters<typeof resolveExtensionSurfaces>[1]> = {
     authProvider: surfaceAuthProvider,
     authorize: surfaceAuthorization,
-    // Issue #257: a boot discovery failure on a provider that HAS a
-    // credential row is a loud fail-closed warning, never the silent skip.
     isConnected:
       deps.isConnected ??
       (async (providerId: string) => (await store.listExtensionCredentials(providerId)).length > 0),
+    failureObserver,
   };
   if (deps.mcpTransport !== undefined) surfaceOptions.mcpTransport = deps.mcpTransport;
   const surfaces = await resolveExtensionSurfaces(registry.list(), surfaceOptions);
-  // The runtime's router is a per-call dependency: resolve the supplier at
   // construction when a plain object was given, otherwise forward per call
   // so the server's mid-boot router assignment is observed live.
   const resolveRouter = (): ApprovalRouter =>
@@ -281,5 +293,28 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
           );
         })()
       : resolveMemoryProvider(store.getOrgSettings(), store.getDb()));
-  return { store, audit, orgPolicy, registry, runtime, memoryProvider, surfaces, boundary, surfaceAuthProvider, surfaceAuthorization };
+  const extensionReauthDirective = (): string => {
+    const failures = [...extensionAuthFailures.values()];
+    if (failures.length === 0) return "";
+    return [
+      "Some connected extension providers need reauthorization:",
+      ...failures.map(({ providerId, label }) => `- ${label} (${providerId}): reconnect/reauthorize it by running "connect ${providerId}".`),
+      "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reconnect.",
+    ].join("\n");
+  };
+  return {
+    store,
+    audit,
+    orgPolicy,
+    registry,
+    runtime,
+    memoryProvider,
+    surfaces,
+    boundary,
+    surfaceAuthProvider,
+    surfaceAuthorization,
+    extensionAuthFailures,
+    extensionReauthDirective,
+    surfaceFailureObserver: failureObserver,
+  };
 }

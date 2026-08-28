@@ -2741,6 +2741,28 @@ describe("response mode → session prompt directive (issue #55)", () => {
     );
     await service.stop();
   });
+
+  test("cold sessions tell users to reauthorize expired connected extensions (#376)", async () => {
+    const { adapter } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const extensionReauthDirective = () =>
+      [
+        "Some connected extension providers need reauthorization:",
+        '- Notion (notion): reconnect/reauthorize it by running "connect notion".',
+        "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reconnect.",
+      ].join("\n");
+    const deps = { store, adapter, driver, extensionReauthDirective };
+    const service = makeSpaceService(deps);
+    await service.handleInboundMessage(msg());
+
+    const prompt = driver.created[0].opts.appendSystemPrompt;
+    expect(prompt).toContain("Notion (notion)");
+    expect(prompt).toContain('connect notion');
+    expect(prompt).toContain("Do not describe these providers as merely tool-not-found");
+    expect(prompt).not.toContain("raw-detail");
+    await service.stop();
+  });
 });
 
 describe("work-items auto-pickup → session prompt directive (issue #89)", () => {

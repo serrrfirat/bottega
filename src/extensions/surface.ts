@@ -41,10 +41,27 @@ export type SurfaceAuthorization = <T>(
   manifest: ExtensionManifest,
   invoke: (authorization?: AuthorizationContext) => Promise<T>,
 ) => Promise<T>;
+export interface ExtensionAuthFailure {
+  providerId: string;
+  label: string;
+}
+
+/** Observes provider auth failures/successes during eager or lazy discovery. */
+export interface SurfaceFailureObserver {
+  onAuthFailure?: (failure: ExtensionAuthFailure) => void;
+  onResolved?: (providerId: string) => void;
+}
 
 /** The effective tool surface of every extension, keyed by extension id. */
 export type ExtensionSurfaces = ReadonlyMap<string, readonly ExtensionTool[]>;
-
+function clearlyAuthRelatedFailure(err: unknown): boolean {
+  const message = errorMessage(err).toLowerCase();
+  return (
+    /\b(expired|revoked|invalid[_ -]?token|invalid[_ -]?grant)\b/.test(message) ||
+    /\bre-?auth(orize|entication)?\b/.test(message) ||
+    /\bre-?run\s+connect\b/.test(message)
+  );
+}
 /** Cache key: kind + manifest id + binding identity (serverUrl or command). */
 function surfaceCacheKey(manifest: ExtensionManifest): string {
   if (manifest.kind === "mcp") {
@@ -105,14 +122,10 @@ export async function extensionToolSurface(
 
 /**
  * Resolves the effective surface of every registered extension ONCE (the
- * server boot step). Pinned manifests resolve without any I/O; tools-less
- * manifests hit the provider's tools/list (in parallel, through the shared
- * cache). Issue #166: a per-provider discovery failure (an unreachable or
- * auth-gated provider) SKIPS that provider at boot — logged with evidence
- * (provider + error) — and defers it to the runtime's lazy per-call path,
- * which fails closed ("tool surface unavailable"). The returned map holds
- * only the surfaces that resolved; providers that resolve keep resolving
- * eagerly (github stays). This function never rejects.
+ * server boot step). Pinned manifests resolve without I/O; tools-less
+ * manifests hit provider tools/list in parallel through the shared cache.
+ * A per-provider failure is logged and skipped, never fatal to the boot;
+ * connected auth failures also feed the sanitized reauthorization observer.
  */
 export async function resolveExtensionSurfaces(
   extensions: readonly { manifest: ExtensionManifest }[],
@@ -124,50 +137,34 @@ export async function resolveExtensionSurfaces(
     ) => Transport;
     authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
     authorize?: SurfaceAuthorization;
-    /**
-     * Issue #257 connectedness probe: given an extension id, is it
-     * CONNECTED (a valid vault credential row exists)? Checked ONLY for a
-     * provider whose boot discovery just failed. `true` → the boot emits
-     * the LOUD fail-closed warning (a provider the user connected whose
-     * tools/list now cannot mint is an incident-in-waiting — every later
-     * call fails closed invisibly); `false`/absent → a provider that was
-     * never connected keeps the silent skip. Defaults to false (no probe),
-     * which is exactly the pre-#257 boot behavior; the composition root
-     * (bootstrap-runtime) wires the real store-backed probe.
-     */
     isConnected?: (providerId: string) => boolean | Promise<boolean>;
+    failureObserver?: SurfaceFailureObserver;
   } = {},
 ): Promise<ExtensionSurfaces> {
   const entries = await Promise.all(
     extensions.map(async ({ manifest }) => {
       try {
         const authProvider = await opts.authProvider?.(manifest);
-        return [manifest.id, await extensionToolSurface(manifest, opts.mcpTransport, authProvider, opts.authorize)] as const;
+        const surface = await extensionToolSurface(manifest, opts.mcpTransport, authProvider, opts.authorize);
+        opts.failureObserver?.onResolved?.(manifest.id);
+        return [manifest.id, surface] as const;
       } catch (err) {
-        // Issue #166: a tools-less manifest whose provider is unreachable /
-        // auth-gated must never fail the boot. Skip it (the map carries
-        // only RESOLVED surfaces) and let the runtime's lazy per-call path
-        // fail closed if a call is attempted while the provider is down.
-        //
-        // Issue #257: distinguish the SILENT skip (never connected — no
-        // credential row, e.g. linear/attio) from the LOUD failed-closed
-        // warning (CONNECTED — the user authorized it, but tools/list can
-        // no longer mint). The connected case must never look "fine" at
-        // boot: name the provider + the recovery action.
         let connected = false;
         if (opts.isConnected !== undefined) {
           try {
             connected = (await opts.isConnected(manifest.id)) === true;
           } catch {
-            connected = false; // the probe itself failed — degrade to the silent path
+            connected = false;
           }
+        }
+        if (connected && clearlyAuthRelatedFailure(err)) {
+          opts.failureObserver?.onAuthFailure?.({ providerId: manifest.id, label: manifest.label });
         }
         if (connected) {
           console.error(
             `[surface] boot: CONNECTED provider "${manifest.id}" is unreachable or auth-gated — ` +
               `tools/list failed (${errorMessage(err)}); it has a saved credential but can no longer mint. ` +
-              `Re-run "connect ${manifest.id}" (or revoke/refresh its credential) — ` +
-              `every call to it stays fail-closed until then.`,
+              `Re-run "connect ${manifest.id}" (or revoke/refresh its credential) — every call to it stays fail-closed until then.`,
           );
         } else {
           console.error(
@@ -187,10 +184,9 @@ export async function resolveExtensionSurfaces(
 }
 
 /**
- * The extension id that owns a tool name across the EFFECTIVE surface
- * (pinned tools first — the sync fast path — then discovered surfaces).
- * Used by surfaces that resolve extension tools by name (the MCP server's
- * callTool path, issue #61). Returns undefined for unknown tools.
+ * The extension id that owns a tool name across the effective surface
+ * (pinned tools first, then discovered surfaces). Unknown tools return
+ * undefined.
  */
 export async function toolOwnerExtensionId(
   registry: Pick<ExtensionRegistry, "list">,
@@ -230,6 +226,8 @@ export async function refreshMissingExtensionSurfaces(
     ) => Transport;
     authProvider?: (manifest: ExtensionManifest) => Promise<OAuthClientProvider | undefined>;
     authorize?: SurfaceAuthorization;
+    isConnected?: (providerId: string) => boolean | Promise<boolean>;
+    failureObserver?: SurfaceFailureObserver;
   } = {},
 ): Promise<ExtensionSurfaces> {
   const missing = extensions.filter(
