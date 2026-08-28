@@ -931,6 +931,95 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     expect(denied.mcpOAuth.calls).toHaveLength(0);
     expect(denied.deps.registry.resolve("notion")).toBeUndefined();
   });
+  test("custom hosted MCP URL uses the same approval card facts and persists only after approval", async () => {
+    const endpoint = "https://custom.example.test/mcp";
+    const h = makeCatalogHarness({
+      routes: [{ match: endpoint, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } }],
+      records: [],
+      wellKnownStatus: 200,
+    });
+    catalogDirs.push(h.dir);
+    const outcome = await connect(h, endpoint, "org", "UADA");
+    expect(outcome.ok).toBe(true);
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.router.requests[0]!.args).toMatchObject({
+      extension: endpoint,
+      scope: "org",
+      registering_from_catalog: false,
+      custom_source: true,
+      domains: ["custom.example.test"],
+      credentialTargets: [{ host: "custom.example.test", pathPrefix: "/mcp" }],
+      mcpEndpoint: endpoint,
+    });
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(existsSync(join(h.snapshotsDir, "custom-custom-example-test-mcp.json"))).toBe(true);
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+  });
+  test("denying a custom endpoint approval registers nothing", async () => {
+    const endpoint = "https://denied.example.test/mcp";
+    const h = makeCatalogHarness({
+      router: new RecordingRouter({ approved: false }),
+      routes: [{ match: endpoint, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } }],
+      records: [],
+      wellKnownStatus: 404,
+    });
+    catalogDirs.push(h.dir);
+    const outcome = await connect(h, endpoint, "org", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(existsSync(join(h.snapshotsDir, "custom-denied-example-test-mcp.json"))).toBe(false);
+    expect(h.deps.registry.resolve("custom-denied-example-test-mcp")).toBeUndefined();
+    expect(h.mcpOAuth.calls).toHaveLength(0);
+  });
+
+  test("a custom endpoint cannot register when its extension mount is not writable", async () => {
+    const endpoint = "https://readonly.example.test/mcp";
+    const h = makeCatalogHarness({
+      routes: [{ match: endpoint, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } }],
+      records: [],
+      wellKnownStatus: 404,
+    });
+    catalogDirs.push(h.dir);
+    const mountPath = join(h.dir, "readonly-mount");
+    writeFileSync(mountPath, "mounted file");
+    h.deps.catalogRegister!.snapshotsDir = mountPath;
+    const outcome = await connect(h, endpoint, "personal", "UADA");
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.message).toContain("writable extension mount");
+      expect(outcome.message).toContain(mountPath);
+      expect(outcome.message).toContain("read-write");
+    }
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(h.deps.registry.resolve("custom-readonly-example-test-mcp")).toBeUndefined();
+  });
+
+  test("an approved custom static-key endpoint continues through the existing API-key connect flow", async () => {
+    const endpoint = "https://apikey.example.test/mcp";
+    const h = makeCatalogHarness({
+      routes: [{ match: endpoint, status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } }],
+      records: [],
+      wellKnownStatus: 404,
+    });
+    catalogDirs.push(h.dir);
+    const outcome = await connect(h, endpoint, "personal", "UADA", { apiKey: "safe-key", fromUpload: true });
+
+    expect(outcome.ok).toBe(true);
+    expect(h.router.requests).toHaveLength(0);
+    expect(h.broker.calls).toEqual([
+      {
+        provider: "custom-apikey-example-test-mcp",
+        credentialType: "api_key",
+        apiKey: "safe-key",
+      },
+    ]);
+    expect(h.runtimeRegistry.rows).toHaveLength(1);
+    expect(existsSync(join(h.snapshotsDir, "custom-apikey-example-test-mcp.json"))).toBe(true);
+  });
+
+
   test("Exa OAuth authorization host is in approval, persisted domains, and runtime egress but not credential targets", async () => {
     const h = makeCatalogHarness({
       records: [EXA_RECORD],

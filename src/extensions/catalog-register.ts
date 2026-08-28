@@ -42,6 +42,7 @@
  * the result, and the runtime registration still lands (the approved
  * durable change).
  */
+import { mkdirSync } from "node:fs";
 import type { AuditModule } from "../policy/audit";
 import { errorMessage } from "../tools/helpers";
 import { proxyBoundaryControlFromEnv } from "./boundary";
@@ -51,6 +52,7 @@ import {
   DEFAULT_CATALOG_URL,
   fetchCatalogEntry,
   openApiGenerationFor,
+  writeSnapshotDraft,
   type CatalogEntry,
   type FetchCatalogOptions,
   type SnapshotDraft,
@@ -314,6 +316,51 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
       "integrations.sh catalog with catalog_browser to find the right id.",
   );
 }
+function customCatalogEntry(endpoint: string): { entry: CatalogEntry } | { message: string } {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return {
+      message:
+        `custom MCP URL "${endpoint}" is invalid — provide a complete https URL such as ` +
+        "https://mcp.example.com/mcp; nothing was registered.",
+    };
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname === "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.port !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    return {
+      message:
+        `custom MCP URL "${endpoint}" must be an https URL with a hostname, no credentials, port, query, or fragment ` +
+        "(secrets in URLs are never accepted); nothing was registered.",
+    };
+  }
+  const host = url.hostname.toLowerCase();
+  const path = url.pathname === "" ? "/" : url.pathname;
+  const pathPart = path
+    .replace(/[^a-z0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase()
+    .slice(0, 80);
+  const slug = `custom-${host.replace(/[^a-z0-9]+/gi, "-")}-${pathPart || "mcp"}`;
+  return {
+    entry: {
+      id: slug,
+      slug,
+      kind: "mcp",
+      name: host,
+      domain: host,
+      mcpEndpoint: url.toString(),
+    },
+  };
+}
 
 /** The connect capability's optional catalog wiring (issue #232). */
 export interface CatalogRegisterDeps {
@@ -383,6 +430,8 @@ export interface CatalogDraftFacts {
   operations?: OpenApiOperation[];
   credentialSchema: CredentialSchema;
   oauthGated: boolean;
+  /** True when this draft came from a user-supplied hosted MCP URL, not the catalog. */
+  customSource?: boolean;
 }
 
 export type CatalogLookupResult =
@@ -408,16 +457,25 @@ export async function lookupCatalogExtension(
   // 1. LOOKUP — the catalog is the only source of truth; an unknown spec
   // (or an unreachable catalog) fails loudly with the browse path.
   let entry: CatalogEntry;
+  let customSource = false;
   try {
     entry = await fetchCatalogEntry(extensionId, catalogOpts);
   } catch (err) {
-    return {
-      ok: false,
-      message:
-        `unknown extension "${extensionId}" — no extension or catalog entry for it ` +
-        `(${errorMessage(err)}). Browse the integrations.sh catalog with catalog_browser ` +
-        `(or "bun run src/extensions/fetch-catalog.ts") to find the right id, then "connect <id>" again.`,
-    };
+    const custom = customCatalogEntry(extensionId);
+    if ("message" in custom) {
+      if (/^[a-z][a-z\d+.-]*:\/\//i.test(extensionId)) {
+        return { ok: false, message: custom.message };
+      }
+      return {
+        ok: false,
+        message:
+          `unknown extension "${extensionId}" — no extension or catalog entry for it ` +
+          `(${errorMessage(err)}). Browse the integrations.sh catalog with catalog_browser ` +
+          `(or "bun run src/extensions/fetch-catalog.ts") to find the right id, then "connect <id>" again.`,
+      };
+    }
+    entry = custom.entry;
+    customSource = true;
   }
   // The deterministic route registers HOSTED MCP extensions only: the
   // discovery resolves an official hosted MCP endpoint, which a cli/openapi
@@ -459,7 +517,7 @@ export async function lookupCatalogExtension(
       .filter(Boolean);
     if (hosts.length > 0) {
       try {
-        await deps.ensureEgressHosts(hosts, extensionId);
+        await deps.ensureEgressHosts(hosts, customSource ? entry.slug : extensionId);
       } catch (err) {
         // Tolerated (#366): the reconcile is best-effort — the probe then
         // fails loudly with its evidence instead of a swallowed regen error.
@@ -468,21 +526,34 @@ export async function lookupCatalogExtension(
     }
   }
 
-  // 2. DRAFT — the catalog scaffold + the discovered official endpoint +
-  // the auth classification. Fail closed BEFORE anything registers: a
-  // manifest that cannot register must never reach the human's approval.
+  // 2. DRAFT — the catalog scaffold (or a custom hosted endpoint) + the
+  // discovered endpoint + auth classification. Fail closed BEFORE anything
+  // registers: a manifest that cannot register must never reach approval.
   let discovered: DiscoveredCatalogMcp;
   try {
     discovered = await discoverMcp(entry, catalogOpts);
   } catch (err) {
-    // Issue #286: the discovery failure carries the probe evidence and the
-    // reviewed-override instruction (§8) — nothing was registered.
+    // Discovery failure carries probe evidence and the reviewed-override
+    // instruction (§8) — nothing is registered.
     return {
       ok: false,
-      message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
+      message: customSource
+        ? `cannot register custom MCP URL "${extensionId}": ${errorMessage(err)}`
+        : `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
     };
   }
-  const scaffold = buildSnapshotDraft(entry);
+  const baseScaffold = buildSnapshotDraft(entry);
+  const scaffold: SnapshotDraft = customSource
+    ? {
+        ...baseScaffold,
+        source: {
+          catalog: "custom",
+          specId: discovered.serverUrl,
+          vendorOfficial: false,
+          reviewed: true,
+        },
+      }
+    : baseScaffold;
   const manifest = {
     ...scaffold.manifest,
     mcp: {
@@ -509,7 +580,12 @@ export async function lookupCatalogExtension(
   try {
     manifestValidated = validateManifest(JSON.parse(JSON.stringify(manifest)));
   } catch (err) {
-    return { ok: false, message: `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}` };
+    return {
+      ok: false,
+      message: customSource
+        ? `cannot register custom MCP URL "${extensionId}": ${errorMessage(err)}`
+        : `cannot register "${extensionId}" from the catalog: ${errorMessage(err)}`,
+    };
   }
 
   // The approval IS the review (issue #233): the connect's own approval
@@ -518,7 +594,11 @@ export async function lookupCatalogExtension(
   // came from the vendor's own host (vendorOfficial: true).
   const reviewed: SnapshotDraft = {
     ...completed,
-    source: { ...completed.source, reviewed: true, vendorOfficial: true },
+    source: {
+      ...completed.source,
+      reviewed: true,
+      vendorOfficial: !customSource,
+    },
   };
   const snapshot: PinnedSnapshot = {
     schema: reviewed.schema,
@@ -539,6 +619,7 @@ export async function lookupCatalogExtension(
       operations: undefined,
       credentialSchema: discovered.credentialSchema,
       oauthGated: discovered.oauthGated,
+      ...(customSource ? { customSource: true } : undefined),
     },
     snapshot,
   };
@@ -787,8 +868,27 @@ export async function registerExtensionAtRuntime(
   label: string,
   deps: CatalogRegisterRuntimeDeps,
 ): Promise<RegisterFromCatalogResult> {
+  const snapshotsDir = deps.snapshotsDir ?? SNAPSHOTS_DIR;
   const egressPath = deps.egressPath ?? EGRESS_CONFIG_PATH;
   const devEgressPath = deps.devEgressPath ?? DEV_EGRESS_CONFIG_PATH;
+
+  // Custom endpoints are user-owned drafts. Persist the approved snapshot to
+  // the writable extensions mount before the runtime registry or egress work;
+  // a read-only mount therefore fails closed with actionable guidance.
+  if (snapshot.source.catalog === "custom") {
+    try {
+      mkdirSync(snapshotsDir, { recursive: true });
+      writeSnapshotDraft(snapshot, snapshotsDir);
+    } catch (err) {
+      return {
+        ok: false,
+        message:
+          `custom MCP draft "${snapshot.extensionId}" could not be persisted to writable extension mount ` +
+          `"${snapshotsDir}" — ${errorMessage(err)} (EROFS/read-only mount). Mount that path read-write and retry ` +
+          "the approved connect; nothing was registered.",
+      };
+    }
+  }
 
   // 3. REGISTER AT RUNTIME — the durable store write comes FIRST: a failed
   // persistence fails the registration closed (the egress regen reads the

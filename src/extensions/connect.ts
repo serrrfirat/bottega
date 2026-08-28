@@ -287,7 +287,8 @@ export async function connectExtension(
           args: {
             extension: input.extension,
             scope: input.scope,
-            registering_from_catalog: true,
+            registering_from_catalog: !lookup.facts.customSource,
+            ...(lookup.facts.customSource ? { custom_source: true } : undefined),
             vendor: lookup.facts.label,
             domains: lookup.facts.domains,
             credentialTargets: lookup.facts.credentialTargets,

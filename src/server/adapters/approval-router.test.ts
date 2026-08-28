@@ -226,6 +226,29 @@ describe("approval prompt payload preview (issue #160)", () => {
     // Non-secret payload stays visible so the approval is still informed.
     expect(posted[0]!.text).toContain("ls");
   });
+  test("a custom MCP approval shows endpoint, domains, and credential targets", async () => {
+    const { adapter, posted } = fakeAdapter();
+    const router = new SlackApprovalRouter({ adapter, timeoutMs: 60_000 });
+
+    void router.request({
+      tool: "connect_extension",
+      args: {
+        extension: "https://custom.example.test/mcp",
+        scope: "org",
+        custom_source: true,
+        mcpEndpoint: "https://custom.example.test/mcp",
+        domains: ["custom.example.test"],
+        credentialTargets: [{ host: "custom.example.test", pathPrefix: "/mcp" }],
+      },
+      reason: "exec-tier tool requires human approval",
+      spaceId: "slack:C1",
+      actor: "agent",
+    });
+
+    expect(posted[0]!.text).toContain("https://custom.example.test/mcp");
+    expect(posted[0]!.text).toContain("custom.example.test");
+    expect(posted[0]!.text).toContain("Credential targets");
+  });
 });
 
 describe("SlackApprovalRouter resolution", () => {

@@ -503,6 +503,59 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
     expect(existsSync(h.egressPath)).toBe(false);
     expect(h.auditRows).toHaveLength(0);
   });
+  test("a well-formed hosted MCP URL missing from the catalog creates a custom reviewed draft", async () => {
+    const endpoint = "https://custom.example.test/mcp";
+    const h = harness({
+      records: [],
+      wellKnownStatus: 404,
+      routes: [initializeOk(endpoint)],
+    });
+    const result = await lookupCatalogExtension(endpoint, h.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facts).toMatchObject({
+      label: "custom.example.test",
+      kind: "mcp",
+      domains: ["custom.example.test"],
+      credentialTargets: [{ host: "custom.example.test", pathPrefix: "/mcp" }],
+      mcpEndpoint: endpoint,
+      credentialSchema: { type: "api_key" },
+      oauthGated: false,
+    });
+    expect(result.snapshot.source.catalog).toBe("custom");
+    expect(result.snapshot.source.specId).toBe(endpoint);
+    expect(result.snapshot.source.reviewed).toBe(true);
+    expect(result.snapshot.source.vendorOfficial).toBe(false);
+    expect(result.snapshot.manifest.mcp).toEqual({ serverUrl: endpoint, transport: "streamable-http" });
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+  });
+
+  test("an unreachable custom MCP URL fails closed with actionable guidance", async () => {
+    const endpoint = "https://unreachable.example.test/mcp";
+    const h = harness({ records: [], wellKnownStatus: 404 });
+    const result = await lookupCatalogExtension(endpoint, h.deps);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("custom MCP URL");
+      expect(result.message).toContain("nothing was registered");
+      expect(result.message).toContain("catalog_browser");
+    }
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(h.registry.resolve("custom-unreachable-example-test-mcp")).toBeUndefined();
+  });
+
+  test("a malformed custom URL fails closed with guidance and does not probe", async () => {
+    const h = harness({ records: [] });
+    const result = await lookupCatalogExtension("http://custom.example.test/mcp", h.deps);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("custom MCP URL");
+      expect(result.message).toContain("https");
+      expect(result.message).toContain("nothing was registered");
+    }
+    expect(h.runtimeRegistry.rows).toHaveLength(0);
+    expect(h.registry.resolve("http://custom.example.test/mcp")).toBeUndefined();
+  });
 
   test("the candidate hosts are allowlisted BEFORE the validation probe (issue #366)", async () => {
     const h = harness({ records: [NOTION_RECORD] });
