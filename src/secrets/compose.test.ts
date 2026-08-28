@@ -124,22 +124,33 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       const argsFile = join(dir, "omp.args");
       const pidFile = join(dir, "omp.pid");
       const tokenSeenFile = join(dir, "omp.token-seen");
+      const providerFile = join(dir, "omp.provider");
+      const optionsFile = join(dir, "omp.options");
+      const oauthImportPath = resolve(import.meta.dir, "../../node_modules/@oh-my-pi/pi-ai/src/registry/oauth/index.ts");
       mkdirSync(bin, { recursive: true });
       writeFileSync(
         join(bin, "omp"),
         [
-          "#!/bin/sh",
-          `printf '%s\\n' "$@" > "${argsFile}"`,
-          `printf '%s' "$$" > "${pidFile}"`,
-          `printf '%s' "$OMP_AUTH_BROKER_TOKEN" > "${tokenSeenFile}"`,
-          "exit 0",
+          "#!/usr/bin/env bun",
+          `import { getOAuthProvider } from ${JSON.stringify(oauthImportPath)};`,
+          'import { writeFileSync } from "node:fs";',
+          `writeFileSync(${JSON.stringify(argsFile)}, process.argv.slice(2).join("\\n") + "\\n");`,
+          `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+          `writeFileSync(${JSON.stringify(tokenSeenFile)}, process.env.OMP_AUTH_BROKER_TOKEN ?? "");`,
+          `writeFileSync(${JSON.stringify(providerFile)}, getOAuthProvider("notion")?.id ?? "missing");`,
+          `writeFileSync(${JSON.stringify(optionsFile)}, process.env.BUN_OPTIONS ?? "");`,
           "",
         ].join("\n"),
         { mode: 0o700 },
       );
       chmodSync(join(bin, "omp"), 0o700);
       const configDir = join(dir, ".omp");
-      const env = { PATH: `${bin}:${process.env.PATH ?? ""}`, PI_CONFIG_DIR: configDir };
+      const preloadPath = resolve(import.meta.dir, "../server/notion-oauth-broker-preload.ts");
+      const env = {
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PI_CONFIG_DIR: configDir,
+        OMP_AUTH_BROKER_PRELOAD: preloadPath,
+      };
       const tokenFile = join(configDir, "auth-broker.token");
 
       const vaultArgs = ["auth-broker", "serve", "--bind=0.0.0.0:8765"];
@@ -155,12 +166,16 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(vaultArgs);
       expect(readFileSync(pidFile, "utf8")).toBe(String(first.pid));
       expect(readFileSync(tokenSeenFile, "utf8")).toBe("");
+      expect(readFileSync(providerFile, "utf8")).toBe("notion");
+      expect(readFileSync(optionsFile, "utf8")).toBe(`--preload=${preloadPath}`);
 
       // Later boots reuse the token: no regeneration, same vault identity.
       const second = Bun.spawnSync(["sh", script, ...vaultArgs], { env });
       expect(second.success).toBe(true);
       expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
       expect(readFileSync(pidFile, "utf8")).toBe(String(second.pid));
+      expect(readFileSync(providerFile, "utf8")).toBe("notion");
+      expect(readFileSync(optionsFile, "utf8")).toBe(`--preload=${preloadPath}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
