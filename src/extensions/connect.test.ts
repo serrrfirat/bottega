@@ -710,6 +710,16 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     url: "https://acme.example.com/docs/mcp",
     domain: "acme.example.com",
   };
+  const EXA_RECORD = {
+    id: "mcp/exa",
+    slug: "exa",
+    kind: "mcp",
+    name: "Exa",
+    description: "Exa's official MCP server",
+    url: "https://exa.ai/docs/mcp",
+    domain: "exa.ai",
+  };
+
 
   /** A valid MCP initialize result the endpoint doubles serve (issue #286). */
   const INITIALIZE_RESULT = JSON.stringify({
@@ -921,6 +931,39 @@ describe("connectExtension catalog fallback (issue #232/#233) — register at ru
     expect(denied.mcpOAuth.calls).toHaveLength(0);
     expect(denied.deps.registry.resolve("notion")).toBeUndefined();
   });
+  test("Exa OAuth authorization host is in approval, persisted domains, and runtime egress but not credential targets", async () => {
+    const h = makeCatalogHarness({
+      records: [EXA_RECORD],
+      wellKnownStatus: 404,
+      routes: [
+        {
+          match: "https://mcp.exa.ai/.well-known/oauth-protected-resource/mcp",
+          status: 200,
+          body: JSON.stringify({
+            resource: "https://mcp.exa.ai/mcp",
+            authorization_servers: ["https://auth.exa.ai", "https://auth.exa.ai"],
+          }),
+          headers: { "content-type": "application/json" },
+        },
+      ],
+    });
+    catalogDirs.push(h.dir);
+
+    const outcome = await connect(h, "exa", "org", "UADA");
+
+    expect(outcome.ok).toBe(true);
+    expect(h.router.requests).toHaveLength(1);
+    expect(h.router.requests[0]!.args).toMatchObject({
+      domains: ["exa.ai", "mcp.exa.ai", "auth.exa.ai"],
+      credentialTargets: [{ host: "mcp.exa.ai", pathPrefix: "/mcp" }],
+    });
+    expect(h.runtimeRegistry.rows[0]!.manifest.domains).toEqual(["exa.ai", "mcp.exa.ai", "auth.exa.ai"]);
+    expect(h.runtimeRegistry.rows[0]!.manifest.credentialTargets).toEqual([
+      { host: "mcp.exa.ai", pathPrefix: "/mcp" },
+    ]);
+    expect(readFileSync(h.egressPath, "utf8")).toContain('"auth.exa.ai"');
+  });
+
 
   test("an api_key catalog extension registers at runtime then directs the key to the one-time upload link", async () => {
     const h = makeCatalogHarness({ records: [ACME_KEY_RECORD], wellKnownStatus: 404 });

@@ -87,7 +87,15 @@ export interface DiscoveredCatalogMcp {
   credentialSchema: CredentialSchema;
   /** True when OAuth-gated → tools-less manifest (the #231 notion pattern). */
   oauthGated: boolean;
+  /** Validated HTTPS authorization-server hosts from protected-resource metadata. */
+  authorizationServerHosts: string[];
 }
+
+interface OAuthMetadataResult {
+  oauthGated: boolean;
+  authorizationServerHosts: string[];
+}
+
 
 /** The discovery seam; default {@link discoverCatalogMcp} (deterministic). */
 export type CatalogMcpDiscoverer = (entry: CatalogEntry, opts?: FetchCatalogOptions) => Promise<DiscoveredCatalogMcp>;
@@ -123,12 +131,18 @@ function mcpCandidates(entry: CatalogEntry): string[] {
 }
 
 /**
- * The RFC 8414 auth-classification probe (issue #232, unchanged semantics):
+ * The RFC 8414 auth-classification probe (issue #232):
  * an OAuth resource/authorization-server metadata document on the
  * validated MCP origin → OAuth-gated; clean 404s on both paths → api_key;
- * any other status fails loudly (an auth mode is never guessed).
+ * any other status fails loudly (an auth mode is never guessed). Protected
+ * resource metadata may additionally name the HTTPS authorization-server
+ * hosts that the SDK must reach during the OAuth exchange.
  */
-async function classifyOAuthFromMetadata(origin: string, slug: string, fetchImpl: typeof fetch): Promise<boolean> {
+async function classifyOAuthFromMetadata(
+  origin: string,
+  slug: string,
+  fetchImpl: typeof fetch,
+): Promise<OAuthMetadataResult> {
   const metadataPaths = [
     `${origin}/.well-known/oauth-protected-resource/mcp`,
     `${origin}${OAUTH_AS_METADATA_PATH}`,
@@ -143,10 +157,78 @@ async function classifyOAuthFromMetadata(origin: string, slug: string, fetchImpl
       );
     }
     if (res.status === 200) {
+      const authorizationServerHosts: string[] = [];
+      // A status-only metadata double remains a valid OAuth classification
+      // signal for compatibility with vendors that publish no resource
+      // metadata fields. When a document names servers, validate every one.
+      if (metadataUrl.includes("/oauth-protected-resource/")) {
+        let raw: string;
+        try {
+          raw = await res.text();
+        } catch (err) {
+          throw new CatalogError(
+            `official MCP endpoint discovery for "${slug}" failed reading ${metadataUrl}: ${errorMessage(err)}`,
+          );
+        }
+        if (raw.trim() !== "") {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw) as unknown;
+          } catch (err) {
+            throw new CatalogError(
+              `official MCP endpoint discovery for "${slug}" received malformed OAuth metadata at ${metadataUrl}: ` +
+                errorMessage(err),
+            );
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            throw new CatalogError(
+              `official MCP endpoint discovery for "${slug}" received malformed OAuth metadata at ${metadataUrl}`,
+            );
+          }
+          const servers = (parsed as Record<string, unknown>)["authorization_servers"];
+          if (servers !== undefined) {
+            if (!Array.isArray(servers)) {
+              throw new CatalogError(
+                `official MCP endpoint discovery for "${slug}" received malformed authorization_servers at ${metadataUrl}`,
+              );
+            }
+            for (const server of servers) {
+              if (typeof server !== "string" || server.trim() === "") {
+                throw new CatalogError(
+                  `official MCP endpoint discovery for "${slug}" received a malformed authorization server URL at ${metadataUrl}`,
+                );
+              }
+              let parsedServer: URL;
+              try {
+                parsedServer = new URL(server);
+              } catch (err) {
+                throw new CatalogError(
+                  `official MCP endpoint discovery for "${slug}" received a malformed authorization server URL "${server}": ` +
+                    errorMessage(err),
+                );
+              }
+              if (
+                parsedServer.protocol !== "https:" ||
+                parsedServer.hostname === "" ||
+                parsedServer.username !== "" ||
+                parsedServer.password !== "" ||
+                parsedServer.host !== parsedServer.hostname
+              ) {
+                throw new CatalogError(
+                  `official MCP endpoint discovery for "${slug}" authorization server URL must be HTTPS without credentials or a port: "${server}"`,
+                );
+              }
+              if (!authorizationServerHosts.includes(parsedServer.hostname)) {
+                authorizationServerHosts.push(parsedServer.hostname);
+              }
+            }
+          }
+        }
+      }
       // OAuth-gated: tools-less manifest, the #231 notion pattern — the
       // runtime discovers the surface from tools/list at boot, the OAuth
       // flow mints at connect (SDK-owned, issue #284).
-      return true;
+      return { oauthGated: true, authorizationServerHosts };
     }
     if (res.status !== 404) {
       throw new CatalogError(
@@ -159,8 +241,9 @@ async function classifyOAuthFromMetadata(origin: string, slug: string, fetchImpl
   // API key at connect (the #196 upload-link path). A server that omits
   // RFC 8414 metadata is never guessed as OAuth (that would mint an OAuth
   // flow against a server that does not speak it).
-  return false;
+  return { oauthGated: false, authorizationServerHosts: [] };
 }
+
 
 /**
  * Deterministic official MCP endpoint discovery (issue #232 + #286): every
@@ -208,15 +291,17 @@ export async function discoverCatalogMcp(entry: CatalogEntry, opts: FetchCatalog
         transport: "streamable-http",
         credentialSchema: { type: "oauth" },
         oauthGated: true,
+        authorizationServerHosts: [],
       };
     }
-    const oauthGated = await classifyOAuthFromMetadata(`https://${host}`, entry.slug, fetchImpl);
+    const metadata = await classifyOAuthFromMetadata(`https://${host}`, entry.slug, fetchImpl);
     return {
       serverUrl,
       host,
       transport: "streamable-http",
-      credentialSchema: oauthGated ? { type: "oauth" } : { type: "api_key" },
-      oauthGated,
+      credentialSchema: metadata.oauthGated ? { type: "oauth" } : { type: "api_key" },
+      oauthGated: metadata.oauthGated,
+      authorizationServerHosts: metadata.authorizationServerHosts,
     };
   }
   throw new CatalogError(
@@ -405,9 +490,10 @@ export async function lookupCatalogExtension(
       transport: discovered.transport,
     },
     credentialSchema: discovered.credentialSchema,
-    // Egress allowlist: the vendor host + the official MCP host (notion →
-    // ["notion.com", "mcp.notion.com"]).
-    domains: [...new Set<string>([...scaffold.manifest.domains, discovered.host])],
+    // Egress allowlist: the vendor host, the validated MCP host, and any
+    // validated OAuth authorization-server hosts. Authorization hosts are
+    // reachability-only; credentialTargets below remains MCP-only.
+    domains: [...new Set<string>([...scaffold.manifest.domains, discovered.host, ...discovered.authorizationServerHosts])],
     credentialTargets: [
       {
         host: discovered.host,

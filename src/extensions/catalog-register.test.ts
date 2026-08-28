@@ -63,6 +63,16 @@ const OAUTH_ONLY_RECORD = {
   url: "https://oauth-only.example.com/docs/mcp",
   domain: "oauth-only.example.com",
 };
+const EXA_RECORD = {
+  id: "mcp/exa",
+  slug: "exa",
+  kind: "mcp",
+  name: "Exa",
+  description: "Exa's official MCP server",
+  url: "https://exa.ai/docs/mcp",
+  domain: "exa.ai",
+};
+
 
 /** A catalog record with a name/alias that differs from its slug (issue #233 semantic lookup). */
 const DOCS_RECORD = {
@@ -157,6 +167,11 @@ function oauthChallengeAt(url: string): Route {
 function statusAt(url: string, status: number): Route {
   return { match: url, status };
 }
+/** Serves a JSON document at `url` (metadata doubles). */
+function jsonAt(url: string, body: unknown, status = 200): Route {
+  return { match: url, status, body: JSON.stringify(body), headers: { "content-type": "application/json" } };
+}
+
 
 /** The derived candidate endpoints for a catalog record's domain (issue #286 §3). */
 function derivedCandidates(record: CatalogRecordFixture): string[] {
@@ -303,6 +318,59 @@ describe("discoverCatalogMcp (issue #232 + #286) — probed official MCP endpoin
     expect(discovered.oauthGated).toBe(false);
     expect(discovered.credentialSchema).toEqual({ type: "api_key" });
   });
+
+  test("protected-resource metadata returns validated authorization-server hosts", async () => {
+    const discovered = await discoverCatalogMcp(
+      { ...entry, slug: "exa", domain: "exa.ai" },
+      {
+        fetchImpl: stubFetch(
+          [],
+          [
+            initializeOk("https://mcp.exa.ai/mcp"),
+            jsonAt("https://mcp.exa.ai/.well-known/oauth-protected-resource/mcp", {
+              resource: "https://mcp.exa.ai/mcp",
+              authorization_servers: ["https://auth.exa.ai", "https://auth.exa.ai"],
+            }),
+          ],
+          { wellKnownStatus: 404 },
+        ),
+      },
+    );
+    expect(discovered.oauthGated).toBe(true);
+    expect(discovered.authorizationServerHosts).toEqual(["auth.exa.ai"]);
+  });
+
+  test("a malformed or non-HTTPS authorization server URL fails closed", async () => {
+    for (const authorizationServer of ["http://auth.exa.ai", "not a URL"]) {
+      await expect(
+        discoverCatalogMcp(
+          { ...entry, slug: "exa", domain: "exa.ai" },
+          {
+            fetchImpl: stubFetch(
+              [],
+              [
+                initializeOk("https://mcp.exa.ai/mcp"),
+                jsonAt("https://mcp.exa.ai/.well-known/oauth-protected-resource/mcp", {
+                  resource: "https://mcp.exa.ai/mcp",
+                  authorization_servers: [authorizationServer],
+                }),
+              ],
+              { wellKnownStatus: 404 },
+            ),
+          },
+        ),
+      ).rejects.toThrow(/authorization server.*https|authorization server.*URL/i);
+    }
+  });
+
+  test("no OAuth metadata returns api_key with no authorization-server hosts", async () => {
+    const discovered = await discoverCatalogMcp(entry, {
+      fetchImpl: stubFetch([], [initializeOk("https://mcp.linear.app/mcp")], { wellKnownStatus: 404 }),
+    });
+    expect(discovered.credentialSchema).toEqual({ type: "api_key" });
+    expect(discovered.authorizationServerHosts).toEqual([]);
+  });
+
 
   test("an unreachable endpoint probe fails loudly — the endpoint is never guessed", async () => {
     // A throwing fetch (network error) and an HTTP 503 both fail EVERY
@@ -451,6 +519,7 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
         transport: "streamable-http" as const,
         credentialSchema: { type: "oauth" } as const,
         oauthGated: true,
+        authorizationServerHosts: [],
       };
     };
     const result = await lookupCatalogExtension("notion", h.deps);
@@ -527,6 +596,7 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
     // the provider's tools/list with conservative tiers.
     expect(result.snapshot.manifest.tools).toBeUndefined();
     expect(result.snapshot.manifest.domains).toEqual(["notion.com", "mcp.notion.com"]);
+
   });
 
   test("the lookup is READ-ONLY — no store row, no egress, no hot-register, no audit", async () => {
@@ -557,6 +627,44 @@ describe("lookupCatalogExtension (issue #232/#233) — lookup → draft, READ-ON
     }
     expect(h.runtimeRegistry.rows).toHaveLength(0);
   });
+
+  test("OAuth metadata authorization hosts are persisted and approved for egress but never credential targets", async () => {
+    const h = harness({
+      records: [EXA_RECORD],
+      wellKnownStatus: 404,
+      routes: [
+        jsonAt("https://mcp.exa.ai/.well-known/oauth-protected-resource/mcp", {
+          resource: "https://mcp.exa.ai/mcp",
+          authorization_servers: ["https://auth.exa.ai", "https://auth.exa.ai"],
+        }),
+      ],
+    });
+    const result = await lookupCatalogExtension("exa", h.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facts.domains).toEqual(["exa.ai", "mcp.exa.ai", "auth.exa.ai"]);
+    expect(result.facts.credentialTargets).toEqual([{ host: "mcp.exa.ai", pathPrefix: "/mcp" }]);
+    expect(result.snapshot.manifest.domains).toEqual(["exa.ai", "mcp.exa.ai", "auth.exa.ai"]);
+    expect(result.snapshot.manifest.credentialTargets).toEqual([{ host: "mcp.exa.ai", pathPrefix: "/mcp" }]);
+  });
+
+  test("an authorization server equal to the validated MCP host is deduped from Notion domains", async () => {
+    const h = harness({
+      records: [NOTION_RECORD],
+      wellKnownStatus: 404,
+      routes: [
+        jsonAt("https://mcp.notion.com/.well-known/oauth-protected-resource/mcp", {
+          resource: "https://mcp.notion.com/mcp",
+          authorization_servers: ["https://mcp.notion.com"],
+        }),
+      ],
+    });
+    const result = await lookupCatalogExtension("notion", h.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facts.domains).toEqual(["notion.com", "mcp.notion.com"]);
+  });
+
 
   test("every candidate failing the probe fails the lookup closed with the reviewed-override instruction — nothing registers (issue #286)", async () => {
     const h = harness({
@@ -704,11 +812,38 @@ describe("registerExtensionAtRuntime (issue #233) — store write → egress reg
       expect(result.message).toContain("FAILED — nothing was registered");
       expect(result.message).toContain("store write failed");
     }
+
+
     // Fail closed: no egress output, no hot-register, no audit row.
     expect(existsSync(h.egressPath)).toBe(false);
     expect(h.registry.resolve("notion")).toBeUndefined();
     expect(h.auditRows).toHaveLength(0);
   });
+  test("runtime egress includes the validated OAuth authorization host without credential injection", async () => {
+    const h = makeHarness({
+      records: [EXA_RECORD],
+      wellKnownStatus: 404,
+      routes: [
+        jsonAt("https://mcp.exa.ai/.well-known/oauth-protected-resource/mcp", {
+          resource: "https://mcp.exa.ai/mcp",
+          authorization_servers: ["https://auth.exa.ai"],
+        }),
+      ],
+    });
+    tracked.push(h);
+    const draft = await lookupCatalogExtension("exa", h.deps);
+    if (!draft.ok) throw new Error(draft.message);
+    const result = await registerExtensionAtRuntime(draft.snapshot, draft.facts.label, { ...h.deps, actor: "UADA" });
+    expect(result.ok).toBe(true);
+    const egress = readFileSync(h.egressPath, "utf8");
+    expect(egress).toContain('"exa.ai"');
+    expect(egress).toContain('"mcp.exa.ai"');
+    expect(egress).toContain('"auth.exa.ai"');
+    expect(egress).not.toContain("exa-oauth.json");
+    expect(egress).not.toContain("- name: oauth_token");
+    expect(h.runtimeRegistry.rows[0]!.manifest.credentialTargets).toEqual([{ host: "mcp.exa.ai", pathPrefix: "/mcp" }]);
+  });
+
 
   test("without a runtime registry seam the registration is ephemeral but still regenerates egress + hot-registers", async () => {
     const h = makeHarness();
