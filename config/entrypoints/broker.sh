@@ -28,20 +28,13 @@ if [ ! -f "$TOKEN_FILE" ]; then
   fi
 fi
 chmod 600 "$TOKEN_FILE"
-# Load the broker's provider-registration preload into this same Bun process
-# before the packaged CLI starts. Tests may point at a checked-out source
-# tree; the image keeps the /app path.
+# Run OMP's source CLI in the same Bun module graph as the provider preload.
+# The packaged dist CLI bundles a separate OAuth registry, so BUN_OPTIONS
+# cannot register providers into that instance.
 BROKER_PRELOAD="${OMP_AUTH_BROKER_PRELOAD:-/app/src/server/notion-oauth-broker-preload.ts}"
-if [ -n "${BUN_OPTIONS:-}" ]; then
-  BUN_OPTIONS="$BUN_OPTIONS --preload=$BROKER_PRELOAD"
-else
-  BUN_OPTIONS="--preload=$BROKER_PRELOAD"
+BROKER_CLI="${OMP_AUTH_BROKER_CLI:-/app/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts}"
+if [ ! -f "$BROKER_PRELOAD" ] || [ ! -f "$BROKER_CLI" ]; then
+  echo "auth-broker preload or source CLI is missing" >&2
+  exit 1
 fi
-export BUN_OPTIONS
-
-# Run the packaged CLI from the app image. The PATH fallback keeps this
-# entrypoint hermetic in local tests and older development images.
-if [ -x /app/node_modules/.bin/omp ]; then
-  exec /app/node_modules/.bin/omp "$@"
-fi
-exec omp "$@"
+exec bun --preload "$BROKER_PRELOAD" "$BROKER_CLI" "$@"

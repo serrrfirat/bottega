@@ -17,7 +17,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       "--bind=0.0.0.0:8765",
     ]);
     expect(readFileSync(resolve(import.meta.dir, "../../config/entrypoints/broker.sh"), "utf8")).toContain(
-      "exec /app/node_modules/.bin/omp",
+      'exec bun --preload "$BROKER_PRELOAD" "$BROKER_CLI" "$@"',
     );
     // OMP joins PI_CONFIG_DIR under HOME (/home/bun), so deployment paths
     // are HOME-relative; absolute-looking values become /home/bun/data.
@@ -117,15 +117,14 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     expect(statSync(script).mode & 0o111).not.toBe(0);
     const dir = mkdtempSync(join(tmpdir(), "bottega-broker-"));
     try {
-      // Fake omp on PATH: records its args, its PID, and whether the bearer
-      // leaked into its environment. PID equality with the spawned process
-      // proves `exec` semantics (no intermediate shell survives).
+      // Fake source CLI: records args/PID and confirms the preload registered
+      // Notion in the SAME unbundled module graph. PID equality proves exec.
       const bin = join(dir, "bin");
       const argsFile = join(dir, "omp.args");
       const pidFile = join(dir, "omp.pid");
       const tokenSeenFile = join(dir, "omp.token-seen");
       const providerFile = join(dir, "omp.provider");
-      const optionsFile = join(dir, "omp.options");
+
       const oauthImportPath = resolve(import.meta.dir, "../../node_modules/@oh-my-pi/pi-ai/src/registry/oauth/index.ts");
       mkdirSync(bin, { recursive: true });
       writeFileSync(
@@ -138,7 +137,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
           `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
           `writeFileSync(${JSON.stringify(tokenSeenFile)}, process.env.OMP_AUTH_BROKER_TOKEN ?? "");`,
           `writeFileSync(${JSON.stringify(providerFile)}, getOAuthProvider("notion")?.id ?? "missing");`,
-          `writeFileSync(${JSON.stringify(optionsFile)}, process.env.BUN_OPTIONS ?? "");`,
+
           "",
         ].join("\n"),
         { mode: 0o700 },
@@ -147,9 +146,10 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       const configDir = join(dir, ".omp");
       const preloadPath = resolve(import.meta.dir, "../server/notion-oauth-broker-preload.ts");
       const env = {
-        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PATH: process.env.PATH ?? "",
         PI_CONFIG_DIR: configDir,
         OMP_AUTH_BROKER_PRELOAD: preloadPath,
+        OMP_AUTH_BROKER_CLI: join(bin, "omp"),
       };
       const tokenFile = join(configDir, "auth-broker.token");
 
@@ -167,7 +167,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       expect(readFileSync(pidFile, "utf8")).toBe(String(first.pid));
       expect(readFileSync(tokenSeenFile, "utf8")).toBe("");
       expect(readFileSync(providerFile, "utf8")).toBe("notion");
-      expect(readFileSync(optionsFile, "utf8")).toBe(`--preload=${preloadPath}`);
+
 
       // Later boots reuse the token: no regeneration, same vault identity.
       const second = Bun.spawnSync(["sh", script, ...vaultArgs], { env });
@@ -175,7 +175,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
       expect(readFileSync(pidFile, "utf8")).toBe(String(second.pid));
       expect(readFileSync(providerFile, "utf8")).toBe("notion");
-      expect(readFileSync(optionsFile, "utf8")).toBe(`--preload=${preloadPath}`);
+
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
