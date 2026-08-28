@@ -97,7 +97,12 @@ export function renderTurnProgress(
 }
 
 export function renderOutcomeSummary(summary: TurnOutcomeSummary): string | undefined {
-  if (summary.outcome === "complete" && summary.sources.length <= 1 && summary.action === undefined) {
+  const quietComplete =
+    summary.outcome === "complete" &&
+    summary.action === undefined &&
+    (summary.sources.length === 0 ||
+      (summary.sources.length === 1 && summary.sources[0]?.state === "complete"));
+  if (quietComplete) {
     return undefined;
   }
 

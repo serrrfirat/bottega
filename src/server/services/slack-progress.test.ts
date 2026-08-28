@@ -61,6 +61,18 @@ describe("Slack turn progress", () => {
     expect(renderOutcomeSummary(summary)).toBeUndefined();
   });
 
+  test("renders a one-source failure summary", () => {
+    const summary: TurnOutcomeSummary = {
+      outcome: "complete",
+      elapsedMs: 12_000,
+      sources: [{ label: "Notion", state: "failed" }],
+    };
+
+    expect(renderOutcomeSummary(summary)).toBe(
+      ["Completed in 12s", "Notion: failed"].join("\n"),
+    );
+  });
+
   test("renders successful sources before reauthorization", () => {
     const summary: TurnOutcomeSummary = {
       outcome: "partial",
