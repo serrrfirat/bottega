@@ -1025,13 +1025,15 @@ export class SpaceService {
           lower.includes(providerId.toLowerCase()) || lower.includes(label.toLowerCase());
         const alreadyActionable =
           lower.includes(`reconnect ${providerId.toLowerCase()}`) ||
-          lower.includes(`reconnect ${label.toLowerCase()}`);
+          lower.includes(`reconnect ${label.toLowerCase()}`) ||
+          lower.includes(`disconnect ${providerId.toLowerCase()}`) ||
+          lower.includes(`disconnect ${label.toLowerCase()}`);
         return mentioned && !alreadyActionable;
       });
       const notice = failures
         .map(
           ({ providerId, label }) =>
-            `Your ${label} authorization expired or was revoked. Reconnect ${label} by running "connect ${providerId}".`,
+            `Your ${label} authorization expired or was revoked. Disconnect the stale ${label} connection, then run "connect ${providerId}" again.`,
         )
         .join("\n");
       this.#presenterFor(spaceId).onMessage({

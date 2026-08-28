@@ -298,8 +298,11 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     if (failures.length === 0) return "";
     return [
       "Some connected extension providers need reauthorization:",
-      ...failures.map(({ providerId, label }) => `- ${label} (${providerId}): reconnect/reauthorize it by running "connect ${providerId}".`),
-      "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reconnect.",
+      ...failures.map(
+        ({ providerId, label }) =>
+          `- ${label} (${providerId}): disconnect the stale connection, then run "connect ${providerId}" again.`,
+      ),
+      "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reauthorize.",
     ].join("\n");
   };
   return {

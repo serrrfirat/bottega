@@ -2755,8 +2755,8 @@ describe("response mode → session prompt directive (issue #55)", () => {
     const extensionReauthDirective = () =>
       [
         "Some connected extension providers need reauthorization:",
-        '- Notion (notion): reconnect/reauthorize it by running "connect notion".',
-        "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reconnect.",
+        '- Notion (notion): disconnect the stale connection, then run "connect notion" again.',
+        "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reauthorize.",
       ].join("\n");
     const deps = { store, adapter, driver, extensionReauthDirective, extensionAuthFailures };
     const service = makeSpaceService(deps);
@@ -2775,7 +2775,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await Promise.resolve();
     expect(failureReads).toBeGreaterThan(0);
     expect(updates.at(-1)?.text).toStartWith(
-      'Your Notion authorization expired or was revoked. Reconnect Notion by running "connect notion".',
+      'Your Notion authorization expired or was revoked. Disconnect the stale Notion connection, then run "connect notion" again.',
     );
     await service.stop();
   });
