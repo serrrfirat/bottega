@@ -63,6 +63,7 @@ import {
   refreshMissingExtensionSurfaces,
   type ExtensionSurfaces,
 } from "../extensions/surface";
+import { assertWritableExtensionsDir } from "./extensions-writability";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "../extensions/manifest";
 import { extensionToolDefinitions } from "../extensions/tools";
@@ -273,6 +274,10 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // session model from) so the codex auth/mint leg runs only when the
   // default is the openai-codex provider.
   const agentDir = opts.agentDir ?? OMP_AGENT_DIR;
+  // Issue #382: catalog lookup and reviewed pins write under the extension
+  // snapshot mount. Fail before boot side effects when deployment mounted it
+  // read-only, and name the exact container mount in the diagnostic.
+  assertWritableExtensionsDir();
   // Issue #339: the ACTIVE DEFAULT MODEL (the agent-dir config.yml
   // `modelRoles.default`, the same pin the SDK/agent resolves its default
   // session model from) drives BOTH the codex mint leg at boot AND the

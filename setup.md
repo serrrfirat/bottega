@@ -513,6 +513,37 @@ instruction. DCR-capable providers (Notion, Linear, ...) are unaffected —
 they register dynamically exactly as before and never consult a static
 client.
 
+### Writable extension snapshots (issue #382)
+
+The server writes catalog drafts and reviewed extension pins under
+`/app/config/extensions`. Deployment Compose mounts that path from the named
+`extensions` volume, so drafts survive container replacement. The one-shot
+`extensions-config-init` service copies the reviewed seed files from the repo
+(`./config/extensions`) into an empty volume and preserves existing files on
+later starts. The executor mounts the same volume so both boot paths use the
+same snapshot set.
+
+Validate the rendered deployment before the first boot, especially on a new
+droplet:
+
+```bash
+docker compose --profile executor config -q
+```
+
+Do not change the application mount to `:ro`: boot stops with a diagnostic that
+names `/app/config/extensions` when catalog drafts cannot be written. To
+confirm the live mount independently:
+
+```bash
+docker compose run --rm --no-deps --entrypoint sh server \
+  -c 'touch /app/config/extensions/.write-check && rm /app/config/extensions/.write-check'
+```
+
+The repository seed is copied only when the named volume is empty. To
+intentionally replace its contents, stop the stack and remove the `extensions`
+volume, then run the first-boot command again; this discards all saved drafts
+and reviewed pins in that volume.
+
 ### 3. First boot
 
 ```bash
@@ -692,12 +723,12 @@ or escaped targets are refused and remain untouched.
 1. `docker compose logs -f server` — no errors, bot connects via Socket Mode.
 2. Invite the bot into a channel and @mention it — it should reply (the space agent answers in-channel).
 3. Create a test work item (the `create_work_item` tool, passing a `repo` that is on the allowlist — see "Which repo does the executor work in?" above) — the executor claims it, implements it in a workspace, opens a PR, and the server posts `PR ready: <url> — approve to finish` in the channel.
-4. Restart persistence: `docker compose down && up` — spaces, work items, and the audit trail survive (they live on the `data` volume).
+4. Restart persistence: `docker compose down && up` — spaces, work items, the audit trail, and extension drafts survive (they live on the `data` and `extensions` volumes).
 5. Scheduled live-fire (requires `.env` and Slack): create a job due in the next minute, confirm one channel post, then confirm `list_scheduler_jobs` advanced `nextFireAt` and the audit trail contains `scheduler.fire`.
 
 ### Backup & rollback
 
-- **Backup** — everything that matters lives on the `data` volume (SQLite store, sessions, transcripts, git credential file). Snapshot the store DB with `scripts/backup.sh` (uses Bun's `bun:sqlite` `Database.serialize()` to make a consistent, restorable copy of the live DB — safe to run while the server is up):
+- **Backup** — durable runtime state spans the `data` volume (SQLite store, sessions, transcripts, git credential file) and the `extensions` volume (reviewed snapshots and catalog drafts). Snapshot the store DB with `scripts/backup.sh` (uses Bun's `bun:sqlite` `Database.serialize()` to make a consistent, restorable copy of the live DB — safe to run while the server is up):
 
   ```bash
   # One-off snapshot: writes backups/bottega-<timestamp>.db (mode 0600) next
@@ -720,6 +751,14 @@ or escaped targets are refused and remain untouched.
   | `BACKUP_KEEP` | Newest snapshots to keep; `0` disables pruning | `7` |
 
   Backups are stored on the `data` volume by default (`data/backups`). Keep a copy off-host (tar the file to object storage or a remote volume on a schedule) so host loss does not lose the history.
+
+  Snapshot the extension volume separately when backing up a droplet:
+
+  ```bash
+  mkdir -p backups
+  docker run --rm -v extensions:/extensions:ro -v "$PWD/backups:/backup" alpine:3.19 \
+    tar czf /backup/extensions-$(date +%Y%m%d%H%M%S).tar.gz -C /extensions .
+  ```
 
 - **Restore** — `scripts/restore.sh` copies a snapshot back over the store DB atomically (temp file + `mv`), so a crash mid-restore never leaves a half-written DB. It requires an explicit `yes` confirmation (`--yes` skips it, for cron/CI), validates the file is a real SQLite DB, and prints the next step:
 

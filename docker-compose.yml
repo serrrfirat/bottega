@@ -40,6 +40,21 @@ services:
       - data:/data
     networks:
       - egress
+  extensions-config-init:
+    # snapshots. `cp -n` keeps operator-created drafts and runtime pins on
+    # restarts while an empty volume receives every committed seed. The app
+    # runs as uid 1000 (`bun`), so the init fixes ownership before handoff.
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - cp -R -n /seed/. /extensions/ && chown -R 1000:1000 /extensions
+    volumes:
+      - ./config/extensions:/seed:ro
+      - extensions:/extensions
+    networks:
+      - egress
+
 
   iron-proxy:
     # Pinned stable release; published to Docker Hub only (ghcr.io does not
@@ -199,6 +214,8 @@ services:
         condition: service_started
       auth-broker:
         condition: service_healthy
+      extensions-config-init:
+        condition: service_completed_successfully
     dns:
       - 172.30.0.2 # iron-proxy: DNS allowlist enforcement (anti-tunneling)
     environment:
@@ -243,6 +260,9 @@ services:
       # The app resolves its store/sessions/transcripts from the relative
       # path data/ (WORKDIR /app) — the shared volume mounts there.
       - data:/app/data
+      # Catalog drafts and reviewed pins survive app recreation in a named
+      # volume; extensions-config-init seeds it from the repository snapshots.
+      - extensions:/app/config/extensions
       # OMP agent config per deployment: templates from config/omp/ (issue
       # #9), writable so the SDK can persist its placeholder key alongside.
       - ./config/omp:/app/data/omp-agent
@@ -288,6 +308,8 @@ services:
         condition: service_started
       auth-broker:
         condition: service_healthy
+      extensions-config-init:
+        condition: service_completed_successfully
     dns:
       - 172.30.0.2 # iron-proxy: DNS allowlist enforcement (anti-tunneling)
     environment:
@@ -355,6 +377,9 @@ services:
       BOTTEGA_SANDBOX_DOCKER_SOCKET: /var/run/docker.sock
     volumes:
       - data:/app/data
+      # Keep the executor's registry aligned with the server's seeded,
+      # persistent snapshot volume.
+      - extensions:/app/config/extensions
       - data:/workspaces
       # Docker-out-of-Docker: the supervisor drives the host daemon to launch
       # the disposable per-job containers. The job containers never receive
@@ -373,6 +398,10 @@ volumes:
   # (BOTTEGA_SANDBOX_DATA_VOLUME). The job containers never mount the whole root.
   data:
     name: data
+  # Persistent writable extension snapshots and catalog drafts. The init
+  # service seeds this volume from ./config/extensions on first creation.
+  extensions:
+    name: extensions
 
 networks:
   # The only network with a route out of the host: services that need real

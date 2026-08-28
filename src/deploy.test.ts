@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { service, serviceEnv } from "./compose-test-utils";
+import { service, serviceEnv, volumes } from "./compose-test-utils";
 import { parseYamlSubset } from "./yaml-subset";
 import type { YamlNode } from "./yaml-subset";
 
@@ -41,6 +41,27 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
         name === "server" ? "src/server/index.ts" : "src/executor.ts",
       ]);
     }
+  });
+
+  test("seeds a persistent writable extensions volume for server and executor", () => {
+    const init = service("extensions-config-init");
+    expect(asStringArray(init["volumes"])).toEqual([
+      "./config/extensions:/seed:ro",
+      "extensions:/extensions",
+    ]);
+    expect(asStringArray(init["command"])).toContain(
+      "cp -R -n /seed/. /extensions/ && chown -R 1000:1000 /extensions",
+    );
+
+    for (const name of ["server", "executor"]) {
+      const svc = service(name);
+      expect(asStringArray(svc["volumes"])).toContain("extensions:/app/config/extensions");
+      const dependsOn = asRecord(svc["depends_on"]);
+      expect(asRecord(dependsOn["extensions-config-init"])["condition"]).toBe(
+        "service_completed_successfully",
+      );
+    }
+    expect(asRecord(volumes["extensions"])["name"]).toBe("extensions");
   });
 
   test("long-running services restart on failure", () => {
