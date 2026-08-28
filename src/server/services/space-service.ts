@@ -31,7 +31,6 @@ import type { LearningService } from "./learning";
 import { loadPersona } from "../personas";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import {
-  createPhraseRotation,
   SlackTurnPresenter,
   StreamTurnPresenter,
   type SearchResultRow,
@@ -39,11 +38,10 @@ import {
   type TurnPresenterDeps,
 } from "./slack-turn-presenter";
 
-// Turn-rendering constants and helpers moved to the SlackTurnPresenter
-// (issue #153/#168); re-exported here so existing callers (tests, e2e
-// canary) keep importing them from space-service.
+// Turn-rendering constants and helpers moved to SlackTurnPresenter
+// (issue #153/#168); re-exported here so existing callers keep importing
+// them from space-service.
 export {
-  THINKING_PHRASES,
   EMPTY_TURN_LIMIT,
   STREAM_UPDATE_INTERVAL_MS,
   EMPTY_RESPONSE_FALLBACK,
@@ -413,15 +411,9 @@ export class SpaceService {
   }
 
   /**
-   * The space's turn presenter, created lazily. The streaming renderer is
-   * the default for CHANNELS when the adapter supports chat streaming
-   * (issue #168); otherwise (or after the first stream failure flips the
-   * adapter's per-boot cache) the phrase renderer carries the space. DMs
-   * (slack:D*) always use the phrase renderer (issue #180): a DM reads as
-   * one plain message — no thread, no thinking panel. All presenters
-   * share ONE phrase rotation (the pre-#153 single-class counter).
+   * The space's turn presenter, created lazily. Channels use the streaming
+   * renderer when supported; DMs always use the single-message presenter.
    */
-  readonly #phraseRotation = createPhraseRotation();
 
   #presenterFor(spaceId: string): SlackTurnPresenter {
     const existing = this.#presenters.get(spaceId);
@@ -431,7 +423,6 @@ export class SpaceService {
       adapter: this.#adapter,
       store: this.#store,
       onboardingChecks: this.#onboardingChecks,
-      phraseRotation: this.#phraseRotation,
       stopControl: this.#stopControl,
       // The active model provider (issue #342): maps a bare 403 to the
       // Codex mint/grant family only when the active provider is codex.

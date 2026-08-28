@@ -12,8 +12,8 @@
  *   - stream appends respect the STREAM_UPDATE_INTERVAL_MS throttle;
  *   - a failing stream falls back to the phrase + edit path with no
  *     dropped reply;
- *   - the 👀 receipt reaction, the message.reply latency audit, and the
- *     phrase rotation are unchanged by streaming mode.
+ *   - the 👀 receipt reaction and the message.reply latency audit are
+ *     unchanged by streaming mode.
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { Store } from "../../store/db";
@@ -33,10 +33,6 @@ import {
   STREAM_UPDATE_INTERVAL_MS,
   StreamTurnPresenter,
   SlackTurnPresenter,
-  THINKING_PHRASES,
-  THINKING_SNIPPET_MAX,
-  createPhraseRotation,
-  emitToolStep,
   nextToolStepId,
   toolStepTitle,
   renderSearchResultBlocks,
@@ -46,6 +42,7 @@ import {
   type ToolStepEvent,
 } from "./slack-turn-presenter";
 
+const ACCEPTED_PROGRESS = "Accepted — Request received\n0s elapsed";
 // ---------------------------------------------------------------------------
 // Recording doubles: no network, no real store.
 // ---------------------------------------------------------------------------
@@ -191,8 +188,8 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     presenter.onInbound(msg({ ts: "1.1" }));
     await flush();
     expect(rec.streams).toHaveLength(1);
-    expect(rec.streams[0]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "1.1", openingText: THINKING_PHRASES[0] } });
-    const streamTs = `stream-${rec.streams.length}`;
+    expect(rec.streams[0]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "1.1", openingText: ACCEPTED_PROGRESS } });
+    const streamTs = "stream-1";
 
     // N gated tool calls: each opens a card in_progress and checks it off.
     const steps: ToolStepEvent[] = [
@@ -205,17 +202,18 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     presenter.onToolStep({ ...steps[1]!, status: "complete" });
     await flush();
 
-    expect(rec.tasks).toHaveLength(4); // two opens + two completions
-    expect(rec.tasks.map((c) => c.task.id)).toEqual([steps[0]!.taskId, steps[1]!.taskId, steps[0]!.taskId, steps[1]!.taskId]);
-    expect(rec.tasks[0]!.task.status).toBe("in_progress");
-    expect(rec.tasks[2]!.task.status).toBe("complete");
-    expect(rec.tasks.map((c) => c.task.title)).toEqual([
+    const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
+    expect(toolTasks).toHaveLength(4);
+    expect(toolTasks.map((c) => c.task.id)).toEqual([steps[0]!.taskId, steps[1]!.taskId, steps[0]!.taskId, steps[1]!.taskId]);
+    expect(toolTasks[0]!.task.status).toBe("in_progress");
+    expect(toolTasks[2]!.task.status).toBe("complete");
+    expect(toolTasks.map((c) => c.task.title)).toEqual([
       "github.search_issues — allowed (read)",
       "create_work_item — allowed (write)",
       "github.search_issues — allowed (read)",
       "create_work_item — allowed (write)",
     ]);
-    expect(rec.tasks[0]!.task.output).toBe('{"query":"bugs"}');
+    expect(toolTasks[0]!.task.output).toBe('{"query":"bugs"}');
 
     // Interim reply text streams below the panel...
     presenter.onMessage({ spaceId: "slack:C1", text: "Working on it" });
@@ -245,9 +243,9 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     const taskId = nextToolStepId();
     presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("bash", "denied (exec)"), status: "complete", output: '{"command":"rm -rf /"}' });
     await flush();
-
-    expect(rec.tasks).toHaveLength(1);
-    expect(rec.tasks[0]!.task).toMatchObject({ id: taskId, title: "bash — denied (exec)", status: "complete" });
+    const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
+    expect(toolTasks).toHaveLength(1);
+    expect(toolTasks[0]!.task).toMatchObject({ id: taskId, title: "bash — denied (exec)", status: "complete" });
   });
 
   test("an ask-human call shows waiting for approval until it resolves, sharing one card id", async () => {
@@ -269,10 +267,10 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     // Approved: the SAME card checks off as complete.
     presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("create_work_item", "approved (write)"), status: "complete", output: '{"title":"x"}' });
     await flush();
-
-    expect(rec.tasks).toHaveLength(2);
-    expect(rec.tasks[0]!.task).toMatchObject({ id: taskId, status: "in_progress", title: "create_work_item — waiting for approval" });
-    expect(rec.tasks[1]!.task).toMatchObject({ id: taskId, status: "complete", title: "create_work_item — approved (write)" });
+    const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
+    expect(toolTasks).toHaveLength(2);
+    expect(toolTasks[0]!.task).toMatchObject({ id: taskId, status: "in_progress", title: "create_work_item — waiting for approval" });
+    expect(toolTasks[1]!.task).toMatchObject({ id: taskId, status: "complete", title: "create_work_item — approved (write)" });
   });
 
   test("secret-shaped args never reach a step: redacted at the source, rendered as [REDACTED]", () => {
@@ -372,8 +370,7 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     // The stream failed: the phrase landed as a plain post, no stream opened.
     expect(rec.streams).toHaveLength(0);
     expect(rec.posts).toHaveLength(1);
-    expect(rec.posts[0]).toMatchObject({ spaceId: "slack:C1", text: THINKING_PHRASES[0] });
-
+    expect(rec.posts[0]).toMatchObject({ spaceId: "slack:C1", text: ACCEPTED_PROGRESS });
     // The reply edits the phrase in place — never dropped.
     presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
     presenter.onTurnEnd({ spaceId: "slack:C1" });
@@ -397,7 +394,7 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     expect(rec.streams).toHaveLength(1);
     expect(rec.streams[0]).toMatchObject({
       spaceId: "slack:C1",
-      opts: { threadTs: "1.1", openingText: THINKING_PHRASES[0], recipientUserId: "U456" },
+      opts: { threadTs: "1.1", openingText: ACCEPTED_PROGRESS, recipientUserId: "U456" },
     });
   });
 
@@ -419,8 +416,7 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     presenter.onInbound(missingPrincipal);
     await flush();
     expect(rec.streams).toHaveLength(0); // zero startStream calls
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
-
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: ACCEPTED_PROGRESS, opts: { threadTs: "1.1" } }]);
     // The reply still lands phrase+edit — never dropped.
     presenter.onMessage({ spaceId: "slack:C1", text: "final answer" });
     presenter.onTurnEnd({ spaceId: "slack:C1" });
@@ -444,7 +440,7 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     presenter.onInbound(msg({ ts: "1.1" }));
     await flush();
     expect(rec.streams).toHaveLength(0);
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: ACCEPTED_PROGRESS, opts: { threadTs: "1.1" } }]);
     presenter.onMessage({ spaceId: "slack:C1", text: "first answer" });
     presenter.onTurnEnd({ spaceId: "slack:C1" });
     await flush();
@@ -501,14 +497,15 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     expect(rec.stops).toHaveLength(0);
     expect(rec.streams).toHaveLength(1);
 
-    // Turn two keeps the one-message rule (#120): the phrase ROTATES the
-    // stream message in place (no fresh post, no stream re-open) — the
-    // fallback is permanent.
+    // Turn two keeps the one-message rule (#120): the fallback updates the
+    // existing stream message in place (no fresh post, no stream re-open).
     presenter.onInbound(msg({ ts: "2.2" }));
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
     await flush();
     expect(rec.streams).toHaveLength(1);
     expect(rec.posts).toHaveLength(0);
-    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: THINKING_PHRASES[1] });
+    expect(rec.updates.at(-1)?.text).toContain("Accepted — Request received");
   });
 
   test("a stopStream failure never drops the final reply — it lands as an in-place edit", async () => {
@@ -540,23 +537,24 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     expect(rec.stops.length).toBe(STREAM_FINAL_RETRY_LIMIT + 1); // initial + bounded retries
     expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: streamTs, text: "The final answer" });
 
-    // The fallback holds: the next turn opens a plain phrase post.
+    // The fallback holds: the next turn updates the same plain surface.
     presenter.onInbound(msg({ ts: "2.2" }));
     await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
     expect(rec.streams).toHaveLength(1);
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[1], opts: { threadTs: "2.2" } }]);
+    expect(rec.posts).toHaveLength(0);
+    expect(rec.updates.at(-1)?.text).toContain("Accepted — Request received");
   });
 
-  test("receipt reaction, message.reply latency audit, and phrase rotation are unchanged by streaming mode", async () => {
+  test("receipt reaction, message.reply latency audit, and progress opening are unchanged by streaming mode", async () => {
     const rec = recordingAdapter();
     const { store, audit } = recordingStore();
-    const rotation = createPhraseRotation();
     const presenter = new StreamTurnPresenter({
       spaceId: "slack:C1",
       adapter: rec.adapter,
       store,
       onboardingChecks: () => [],
-      phraseRotation: rotation,
     });
 
     presenter.onInbound(msg({ ts: "1.1" }));
@@ -578,12 +576,12 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
     expect(latency.latency_ms).toEqual(expect.any(Number));
     expect(latency.latency_ms).toBeGreaterThanOrEqual(0);
 
-    // Turn two: the stream re-opens under the new inbound ts, rotating the
-    // phrase through the SHARED rotation (one sequence across turns).
+    // Turn two: the stream re-opens under the new inbound ts with its
+    // accepted progress opening.
     presenter.onInbound(msg({ ts: "2.2" }));
     await flush();
     expect(rec.streams).toHaveLength(2);
-    expect(rec.streams[1]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "2.2", openingText: THINKING_PHRASES[1] } });
+    expect(rec.streams[1]).toMatchObject({ spaceId: "slack:C1", opts: { threadTs: "2.2", openingText: ACCEPTED_PROGRESS } });
   });
 
   test("the receipt reaction acks once per unique inbound ts — redeliveries never re-fire (issue #183)", async () => {
@@ -628,312 +626,6 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
 // SlackTurnPresenter (the phrase renderer): no panel, but the rest is shared.
 // ---------------------------------------------------------------------------
 
-describe("SlackTurnPresenter (phrase renderer): live progress, no panel", () => {
-  test("a gated tool step becomes the in-place progress line (throttled); the phrase+edit path still delivers the reply", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    expect(rec.posts).toHaveLength(1);
-    expect(rec.streams).toHaveLength(0);
-    const phraseTs = "post-1";
-
-    // A gated tool call in the phrase renderer (issue #193): the step
-    // becomes the in-place progress line — never a panel card, and
-    // coalesced on the cadence (nothing flushes before the throttle).
-    emitToolStep(
-      (step) => presenter.onToolStep(step),
-      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" },
-    );
-    await flush();
-    expect(rec.tasks).toHaveLength(0);
-    expect(rec.updates).toHaveLength(0);
-
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates).toContainEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
-
-    // The final reply replaces the progress line in place — and no stale
-    // progress update (or elapsed tick) overwrites it afterwards.
-    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the final answer" });
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the final answer" });
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 3);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the final answer" });
-  });
-
-  test("a confirmed-write failure step is a visible ⚙️ line in the DM/phrase path and resolves (issue #277)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    expect(rec.streams).toHaveLength(0); // DM → phrase path, no panel
-    const phraseTs = "post-1";
-
-    // A confirmed write that FAILED (issue #277): the router opens the step
-    // as in_progress (the failing tool is the CURRENT step)…
-    const taskId = nextToolStepId();
-    presenter.onToolStep({
-      spaceId: "slack:C1",
-      taskId,
-      title: toolStepTitle("create_work_item", "confirmed write failed"),
-      status: "in_progress",
-      output: "disk full",
-    });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    // …and the phrase renderer makes the failure VISIBLE as the progress line.
-    expect(rec.updates).toContainEqual({
-      spaceId: "slack:C1",
-      ts: phraseTs,
-      text: "⚙️ create_work_item — confirmed write failed",
-    });
-
-    // …then completes it with the same taskId: valid lifecycle, no orphaned
-    // complete, and the line still resolves onward.
-    presenter.onToolStep({
-      spaceId: "slack:C1",
-      taskId,
-      title: toolStepTitle("create_work_item", "confirmed write failed"),
-      status: "complete",
-      output: "disk full",
-    });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)?.text).not.toContain("confirmed write failed");
-
-    // The final reply replaces the progress line in place.
-    presenter.onMessage({ spaceId: "slack:C1", text: "Here is the answer" });
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Here is the answer" });
-  });
-
-  test("a turn with tool steps + thinking blocks renders progress updates in place, throttled (issue #193)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
-    const phraseTs = "post-1";
-
-    // A burst of steps + thinking inside one turn: coalesced — no
-    // per-event spam before the throttle.
-    const stepId = nextToolStepId();
-    presenter.onToolStep({ spaceId: "slack:C1", taskId: stepId, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress" });
-    presenter.onThinking({ spaceId: "slack:C1", thinking: "Let me check the repo first" });
-    await flush();
-    expect(rec.updates).toHaveLength(0);
-
-    // Priority: the CURRENT STEP beats the thinking snippet.
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ github.search_issues — allowed (read)" });
-
-    // The step completes: the line falls back to the thinking snippet.
-    presenter.onToolStep({ spaceId: "slack:C1", taskId: stepId, title: toolStepTitle("github.search_issues", "allowed (read)"), status: "complete" });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me check the repo first" });
-
-    // The final reply replaces the progress line in place, exactly once.
-    presenter.onMessage({ spaceId: "slack:C1", text: "Done — here is the answer" });
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "Done — here is the answer" });
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 3);
-    await flush();
-    expect(rec.updates.filter((u) => u.ts === phraseTs).at(-1)!.text).toBe("Done — here is the answer");
-  });
-
-  test("without thinking, the progress line shows the step or the elapsed phrase only (issue #193)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    const phraseTs = "post-1";
-
-    // No step, no thinking: the elapsed tick keeps the phrase live.
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s$/);
-
-    // A step supersedes the elapsed line...
-    presenter.onToolStep({ spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
-    // ...and a 🧠 line NEVER appears (no thinking ever arrived).
-    expect(rec.updates.some((u) => u.text?.startsWith("🧠") ?? false)).toBe(false);
-  });
-
-  test("long reasoning truncates to a ~200-char tail snippet (issue #193)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-
-    const head = "The user wants to know why the build failed";
-    const tail = "so I should check the CI logs before answering";
-    const long = `${head} ${"reasoning ".repeat(40)} ${tail}`;
-    expect(long.length).toBeGreaterThan(THINKING_SNIPPET_MAX);
-    presenter.onThinking({ spaceId: "slack:C1", thinking: long });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-
-    const line = rec.updates.at(-1)!.text!;
-    expect(line.startsWith("🧠 …")).toBe(true);
-    // The snippet is capped at THINKING_SNIPPET_MAX characters...
-    expect(line.length).toBe("🧠 ".length + THINKING_SNIPPET_MAX);
-    // ...and it is the TAIL of the reasoning (the part still moving), not
-    // the frozen head.
-    expect(line).toContain(tail);
-    expect(line).not.toContain(head);
-  });
-
-  test("a retry turn_start keeps a live 🧠 reasoning line — no rotating phrase over it (issue #251)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const rotation = { next: vi.fn(() => THINKING_PHRASES[0]) };
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-      phraseRotation: rotation,
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    const phraseTs = "post-1"; // the first postMessage resolves to post-1
-
-    // Reasoning streams in (#193) and flushes to the in-place 🧠 line.
-    presenter.onThinking({ spaceId: "slack:C1", thinking: "Let me trace the failure path" });
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me trace the failure path" });
-
-    // OMP auto-retry (issue #60) re-fires turn_start after thinking has
-    // streamed in. It must NOT rotate the phrase over the live reasoning
-    // (#251): the 🧠 line stays and no new phrase is requested.
-    presenter.onTurnStart();
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "🧠 Let me trace the failure path" });
-    expect(rotation.next).toHaveBeenCalledTimes(1); // the initial post only — no retry phrase
-  });
-
-  test("a retry turn_start keeps a live ⚙️ tool step line — no rotating phrase over it (issue #251)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const rotation = { next: vi.fn(() => THINKING_PHRASES[0]) };
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-      phraseRotation: rotation,
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    const phraseTs = "post-1"; // the first postMessage resolves to post-1
-
-    // A gated tool call is IN FLIGHT (#193): the step becomes the ⚙️ line.
-    emitToolStep(
-      (step) => presenter.onToolStep(step),
-      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("bash", "allowed (exec)"), status: "in_progress" },
-    );
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
-
-    // A retry's turn_start must not clobber the in-flight step (#251).
-    presenter.onTurnStart();
-    await flush();
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: "⚙️ bash — allowed (exec)" });
-    expect(rotation.next).toHaveBeenCalledTimes(1); // the initial post only — no retry phrase
-  });
-
-  test("a turn_start with NO live progress still rotates the phrase (issue #251 keeps rotation)", async () => {
-    vi.useFakeTimers();
-    fakeTimers = true;
-    const rec = recordingAdapter();
-    const { store } = recordingStore();
-    const rotation = createPhraseRotation();
-    const presenter = new SlackTurnPresenter({
-      spaceId: "slack:C1",
-      adapter: rec.adapter,
-      store,
-      onboardingChecks: () => [],
-      phraseRotation: rotation,
-    });
-    presenter.onInbound(msg({ ts: "1.1" }));
-    await flush();
-    const phraseTs = "post-1"; // no step, no thinking yet — only the elapsed line
-
-    // Only the elapsed tick has rendered so far — no real progress content.
-    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
-    await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s$/);
-
-    // With nothing live to protect, turn_start rotates exactly as before.
-    presenter.onTurnStart();
-    await flush();
-    expect(rec.updates.at(-1)).toEqual({ spaceId: "slack:C1", ts: phraseTs, text: THINKING_PHRASES[1] });
-  });
-});
 
 describe("Codex mint-failure surface (issue #218)", () => {
   /** The proxy's actual 502 body (verified from iron-proxy v0.49.0), as the SDK surfaces it. */
@@ -1138,7 +830,7 @@ describe("SlackTurnPresenter: threaded inbound turns (issue #289)", () => {
     const presenter = threadedPresenter(rec);
     presenter.onInbound(msg({ ts: "1.1" }));
     await flush();
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "1.1" } }]);
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: ACCEPTED_PROGRESS, opts: { threadTs: "1.1" } }]);
 
     presenter.onMessage({ spaceId: "slack:C1", text: "plain answer" });
     await flush();
@@ -1222,8 +914,7 @@ describe("SlackTurnPresenter: threaded inbound turns (issue #289)", () => {
     // phrase under the message.
     presenter.activateInbound(m);
     await flush();
-    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: THINKING_PHRASES[0], opts: { threadTs: "5.0" } }]);
-    expect(presenter.latestInboundTs()).toBe("5.0");
+    expect(rec.posts).toEqual([{ spaceId: "slack:C1", text: ACCEPTED_PROGRESS, opts: { threadTs: "5.0" } }]);
   });
 
   test("a threaded drain re-arms the steer safe-window: the delivered flag resets even though no placeholder opens (issue #289 review)", async () => {
@@ -1304,7 +995,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/^Thinking… \d+s · 🛠 2\/3 — Draft the section$/);
+    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Completing the request\n1 of 3 stages complete/);
     expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(false);
 
     // Step 2 completes, step 3 runs: the indicator advances in place.
@@ -1322,7 +1013,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/🛠 3\/3 — Push \+ PR$/);
+    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Completing the request\n2 of 3 stages complete/);
 
     // One phrase message only — the indicator edited it in place.
     expect(rec.posts).toHaveLength(1);
@@ -1524,8 +1215,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // THE regression: a single plain-text post — no attachment, no blocks,
     // no color bar. The body rides the `text` key (owner veto #296-reopened).
     expect(rec.posts).toHaveLength(1);
-    expect(rec.posts[0]).toEqual({ spaceId: "slack:D1", text: THINKING_PHRASES[0], opts: undefined });
-    expect(rec.posts[0]!.opts).not.toHaveProperty("attachments");
+    expect(rec.posts[0]).toEqual({ spaceId: "slack:D1", text: ACCEPTED_PROGRESS, opts: undefined });
     expect(rec.posts[0]!.opts).not.toHaveProperty("blocks");
 
     // A long plan that would qualify for the separate #228 message in a
@@ -1539,7 +1229,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // The todo progress still surfaces on the single status line (folded in), as plain text.
     const lastStatus = rec.updates.at(-1)!;
     expect(lastStatus.opts).toBeUndefined(); // plain-text edit — no attachment/blocks
-    expect(lastStatus.text).toMatch(/🛠 3\/3 — Push \+ PR$/);
+    expect(lastStatus.text).toMatch(/^Working — Completing the request\n2 of 3 stages complete/);
 
     // The request completes by settling the SAME message, never a second post.
     presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
@@ -1559,8 +1249,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // THE regression: the old DM status card was a colored Slack attachment
     // ("show more / show less", bordered container). Now it is ordinary text.
     const post = rec.posts[0]!;
-    expect(post).toEqual({ spaceId: "slack:D1", text: THINKING_PHRASES[0], opts: undefined });
-    expect(post.opts).toBeUndefined(); // no thread, no blocks, no attachments
+    expect(post).toEqual({ spaceId: "slack:D1", text: ACCEPTED_PROGRESS, opts: undefined });
 
     // The final answer lands on the SAME message (chat.update) as plain text
     // with NO count line.
@@ -1601,7 +1290,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     }
     // The message stays alive with a non-content status instead — the
     // elapsed phrase is plain text.
-    expect(rec.updates.at(-1)!.text).toMatch(/^Thinking\u2026 \d+s$/);
+    expect(rec.updates.at(-1)!.text).toContain("Accepted — Request received");
   });
 
   test("THE regression (issue #296): preamble + two grep rounds + final answer own ONE post; all updates target its ts; no preamble/thinking before settlement", async () => {
@@ -1622,8 +1311,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     await flush();
     // Still exactly one post; the preamble never reached Slack.
     expect(rec.posts).toHaveLength(1);
-    expect(rec.posts[0]!.text).toBe(THINKING_PHRASES[0]); // plain-text opening unchanged
-    expect(rec.updates.some((u) => u.text?.includes("Let me search"))).toBe(false);
+    expect(rec.posts[0]!.text).toBe(ACCEPTED_PROGRESS);
 
     // Round 2: another grep tool round, then the FINAL answer — still no
     // second post, still no preamble leak.
@@ -1892,7 +1580,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(final.opts).toBeUndefined(); // plain text — the body rides the text key
     expect(final.text).toBe(answer);
     expect(final.text).not.toContain("actions completed");
-    expect(rec.posts[0]!.text).toBe(THINKING_PHRASES[0]); // opening is plain text too
+    expect(rec.posts[0]!.text).toBe(ACCEPTED_PROGRESS);
   });
 
   test("opening + rotating status are PLAIN TEXT on the single message (owner veto #296-reopened)", async () => {
@@ -1905,8 +1593,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
 
     // Opening post: plain text body, no attachments/blocks.
     const post = rec.posts[0]!;
-    expect(post).toEqual({ spaceId: "slack:D1", text: THINKING_PHRASES[0], opts: undefined });
-    expect(post.opts).toBeUndefined();
+    expect(post).toEqual({ spaceId: "slack:D1", text: ACCEPTED_PROGRESS, opts: undefined });
 
     // A long inline progress line updates the SAME message in place as
     // plain text — nothing duplicated in an attachment.
@@ -1921,7 +1608,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     await flush();
     const update = rec.updates.at(-1)!;
     expect(update.opts).toBeUndefined(); // plain-text edit
-    expect(update.text).toMatch(/🛠 1\/5 \u2014 in-progress item 0/);
+    expect(update.text).toMatch(/^Working — Completing the request\n0 of 5 stages complete/);
 
     vi.useRealTimers();
     fakeTimers = false;
@@ -2085,5 +1772,117 @@ describe("presentSearchResults cited-table dispatch (issue #278)", () => {
     expect(
       parseSearchResultRows('{"results":[{"title":"B","url":"https://b", "snippet":"s"},{"title":"NoUrl"}]}'),
     ).toEqual([{ title: "B", url: "https://b", snippet: "s" }]);
+  });
+});
+
+describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
+  test("opens with an accepted progress state", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    expect(rec.posts[0]?.text).toContain("Accepted — Request received");
+    expect(rec.posts[0]?.text).toContain("elapsed");
+  });
+  test("turn_start advances accepted turns to planning", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onTurnStart();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Planning");
+  });
+
+  test("tool work uses a safe human label and finishing follows completed external work", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onToolStep({ taskId: "tool-1", title: "Search issues", label: "Search issues", status: "in_progress" });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Working — Search issues");
+    presenter.onToolStep({ taskId: "tool-1", title: "Search issues", label: "Search issues", status: "complete", outcome: "succeeded" });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Finishing");
+  });
+
+  test("todo counts and blocked todos render waiting", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onTodoPhases({
+      spaceId: "slack:C1",
+      phases: [
+        {
+          name: "plan",
+          tasks: [
+            { content: "first", status: "completed" },
+            { content: "blocked", status: "blocked", blocker: "needs approval" },
+          ],
+        },
+      ],
+    });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("1 of 2 stages complete");
+    expect(rec.updates.at(-1)?.text).toContain("Waiting");
+  });
+
+  test("raw thinking is never visible on channel or DM surfaces", async () => {
+    const channel = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const channelPresenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: channel.adapter, store, onboardingChecks: () => [] });
+    channelPresenter.onInbound(msg());
+    await flush();
+    channelPresenter.onThinking({ thinking: "SECRET reasoning must not leak" });
+    const dm = recordingAdapter({ streaming: false });
+    const dmPresenter = new SlackTurnPresenter({ spaceId: "slack:D1", adapter: dm.adapter, store, onboardingChecks: () => [] });
+    dmPresenter.onInbound(msg({ spaceId: "slack:D1" }));
+    await flush();
+    dmPresenter.onThinking({ thinking: "SECRET reasoning must not leak" });
+    await flush();
+    expect(channel.posts.concat(channel.updates).some((entry) => entry.text?.includes("SECRET"))).toBe(false);
+    expect(dm.posts.concat(dm.updates).some((entry) => entry.text?.includes("SECRET"))).toBe(false);
+  });
+
+  test("a simple no-tool reply does not render finishing", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onMessage({ text: "answer" });
+    await flush();
+    expect(rec.updates.at(-1)?.text).toBe("answer");
+    expect(rec.updates.some((entry) => entry.text?.includes("Finishing"))).toBe(false);
+  });
+  test("stream progress uses one stable turn-progress task and never markdown appends", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onTurnStart();
+    presenter.onToolStep({ taskId: "tool-1", title: "Search issues", label: "Search issues", status: "in_progress" });
+    await flush();
+    const progressTasks = rec.tasks.filter((entry) => entry.task.id === "turn-progress");
+    expect(progressTasks.length).toBeGreaterThan(0);
+    expect(new Set(progressTasks.map((entry) => entry.ts))).toEqual(new Set(["stream-1"]));
+    expect(rec.texts).toHaveLength(0);
   });
 });

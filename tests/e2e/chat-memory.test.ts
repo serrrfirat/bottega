@@ -12,7 +12,6 @@
  * model, Slack, and the filesystem are emulated.
  */
 import { describe, expect, test } from "bun:test";
-import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import { bootHarness, type StubTurn } from "./harness";
 
 /** Polls `fn` until it returns a truthy value; fails the test on timeout. */
@@ -35,7 +34,9 @@ describe("e2e journey 1: chat + memory", () => {
         // The turn runs inside deliverMessage; poll for the phrase while it
         // is in flight (it lives from turn_start until the reply lands).
         const pending = h.deliverMessage(h.slack.dmChannelId, "hello bot");
-        const phrase = await waitFor(() => h.messages(h.slack.dmChannelId).find((m) => THINKING_PHRASES.includes(m.text)));
+        const phrase = await waitFor(() =>
+          h.messages(h.slack.dmChannelId).find((m) => /^(?:Accepted|Planning|Working|Waiting|Finishing)(?: — [^\n]+)?\n.* elapsed/.test(m.text)),
+        );
         expect(phrase).toBeDefined();
         await pending;
 

@@ -1,34 +1,20 @@
 /**
  * SlackTurnPresenter (issue #153 extraction, #168 streaming renderer).
  *
- * Turn rendering for one Slack space, extracted from SpaceService: the
- * thinking phrase, the 👀 receipt reaction, the streaming (steer) update
- * coalescing, the reply latency audit, the churn guard, and the threading
- * rule all live here. SpaceService keeps session/connect/learning/digest
- * lifecycle and delegates every channel-visible effect to the presenter.
+ * Turn rendering for one Slack space, extracted from SpaceService: explicit
+ * turn progress, the 👀 receipt reaction, stream coalescing, reply latency
+ * audit, churn guard, and threading all live here. SpaceService keeps
+ * session/connect/learning/digest lifecycle and delegates every
+ * channel-visible effect to the presenter.
  *
- * Two implementations:
- *
- *  - {@link SlackTurnPresenter} — the phrase + in-place-edit renderer
- *    (issues #40/#60/#119/#120/#193, extracted verbatim). One thinking
- *    message per space, rotated on receipt/turn_start; during the turn the
- *    phrase is a LIVE PROGRESS line (issue #193) — current tool step,
- *    latest thinking snippet, or the elapsed "Thinking… Ns" — coalesced on
- *    {@link STREAM_UPDATE_INTERVAL_MS} and replaced in place by the final
- *    reply; steered (streaming) turns coalesce edits to at most one per
- *    cadence with a final-delivery guarantee.
- *  - {@link StreamTurnPresenter} — the Slack-native thinking-panel renderer
- *    (issue #168). The thinking phrase becomes the `chat.startStream`
- *    opening; every gated tool call renders a `task_update` thinking-step
- *    card (in_progress → complete / denied / waiting-for-approval); interim
- *    reply text appends as `markdown_text` chunks on the same coalescing
- *    cadence; `turn_end` calls `chat.stopStream` with the final reply as
- *    the closing block. CHANNELS only: DMs (slack:D*) always use the
- *    phrase renderer (issue #180), because the panel is a threaded reply.
- *    Falls back to the phrase renderer — permanently, per boot — the
- *    moment the workspace/app lacks the Agents feature or a stream call
- *    fails (feature-detect once, never per message; a failed stream never
- *    drops the reply).
+ * The base presenter renders one normalized progress snapshot as an
+ * in-place text update. StreamTurnPresenter renders that same snapshot as
+ * one stable `turn-progress` task card and keeps reply chunks on the stream.
+ * StreamTurnPresenter uses `chat.startStream` for channel panels, adds
+ * tool task cards alongside the stable progress card, appends reply chunks
+ * on the existing cadence, and closes with `chat.stopStream`. DMs remain
+ * on the plain one-message path. Capability and request-local failures
+ * retain the existing phrase+edit fallback without dropping replies.
  *
  * Step source (issue #168): every gated tool call — the driver's
  * `withPolicyGate` wrapper and the extension runtime — emits
@@ -39,6 +25,7 @@
  */
 import { z } from "zod";
 import type { TodoPhase, TodoStatus } from "@oh-my-pi/pi-coding-agent";
+import { createTurnProgress, renderTurnProgress as renderProgressSnapshot, todoStageCounts, type TurnProgressSnapshot } from "./slack-progress";
 import type { Store } from "../../store/db";
 import {
   ADMIN_ONBOARDING_NUDGE_EVENT,
@@ -119,64 +106,20 @@ export const TodoPhasesEventSchema = z.object({
 export type TodoPhasesEvent = z.infer<typeof TodoPhasesEventSchema>;
 
 /**
- * Rotating status phrases posted on message receipt (issue #119) and updated
- * in place by the real reply (or error text) when the turn completes (issue
- * #40). Since #60, every posting path is retry-safe: while a phrase is
- * pending for the space, the next rotating phrase UPDATES it in place
- * instead of posting a second message, so an OMP auto-retry loop never
- * stacks phrases. A turn that ends with neither message nor error leaves the
- * phrase as-is. In streaming mode the phrase becomes the stream OPENING.
- * Exported (and re-exported by space-service) so e2e canary tests can
- * assert the in-place replacement.
- */
-export const THINKING_PHRASES = [
-  "Thinking…",
-  "On it — thinking…",
-  "Give me a second…",
-  "Working on it…",
-  "Let me think…",
-];
-
-/**
- * Consecutive empty completions that trip the churn guard (issue #60): beyond
- * this many, one visible churn message replaces the phrase and phrases stay
- * off until a non-empty turn. Root cause: reasoning-only output (content
- * empty when the token budget is consumed by reasoning) or a stale gateway
- * route — either way OMP auto-retries and every retry re-fires turn_start.
+ * Consecutive empty completions that trip the churn guard (issue #60).
  */
 export const EMPTY_TURN_LIMIT = 3;
 
 /**
- * Streaming update cadence (issue #120, kept for #168's stream appends):
- * Slack rate-limits message updates (~50/min tier) and stream appends, so a
- * dense streamed turn coalesces its updates to at most one per 400ms —
- * smooth enough to read as streaming, while a 429 (fail-soft below) merely
- * skips an interim update instead of stalling the turn. The turn's FINAL
- * reply text is always delivered — flushed on turn_end with bounded retries
- * (phrase path) or carried by the stopStream closing block (stream path) —
- * while interim updates may be skipped. Batching applies ONLY to the
- * streaming (steer) path; non-streaming replies update exactly as before.
- * The live-progress phrase (issue #193) coalesces on the SAME cadence.
- * Hardcoded default (no org setting).
+ * Streaming update cadence (issue #120): dense stream updates and progress
+ * edits coalesce to one update per 400ms while final delivery remains
+ * guaranteed by the existing bounded flush/retry paths.
  */
 export const STREAM_UPDATE_INTERVAL_MS = 400;
 
 /**
- * Live-progress line cap (issue #193): the in-place phrase shows the
- * current tool step or the latest reasoning snippet at most this many
- * characters — a progress HINT, never a document. Long reasoning renders
- * as its tail (the most recent reasoning, which keeps moving); long step
- * titles render as their head (the tool name stays visible).
- */
-export const THINKING_SNIPPET_MAX = 200;
-
-/**
- * Bounded retries for the FINAL delivery (issue #120): after this many
- * consecutive final-flush failures (e.g. a hard 429), the update is dropped
- * with a log rather than hammering Slack forever. Interim updates never
- * retry on their own — they wait for the turn-end flush. A stopStream that
- * exhausts this budget flips the presenter to the phrase path so the final
- * reply still lands (issue #181).
+ * Bounded retries for FINAL delivery (issue #120). Interim failures wait
+ * for turn-end; stopStream failures fall back to phrase+edit.
  */
 export const STREAM_FINAL_RETRY_LIMIT = 3;
 
@@ -535,51 +478,14 @@ export function stopControlBlock(spaceId: string): SlackBlockPayload {
 export interface TurnPresenterDeps {
   spaceId: string;
   adapter: SlackAdapter;
-  /** Audit sink for receipt/reply latency rows (issue #119) + nudge audit rows (#116). */
+  /** Audit sink for receipt/reply latency rows + nudge audit rows. */
   store: Store;
-  /** Onboarding-check seam (issue #116); defaults to runWizardChecks(store) at the service. */
+  /** Onboarding-check seam. */
   onboardingChecks: () => WizardCheck[];
-  /**
-   * Shared phrase rotation (issue #153): the pre-extraction SpaceService
-   * advanced ONE rotation index per turn across ALL spaces, so multi-space
-   * test journeys see a global sequence. SpaceService passes one shared
-   * rotation to every presenter; direct constructions default to a fresh
-   * per-presenter rotation.
-   */
-  phraseRotation?: { next(): string };
-  /**
-   * Render the active-turn Stop control (issue #315): when true, the
-   * presenter mounts a {@link stopControlBlock} on turn start and clears it
-   * on turn end. OPT-IN: existing turn-flow fixtures construct presenters
-   * without it and their message-count assertions stay exact. Production
-   * (the index boot) enables it via {@link SpaceServiceDeps.stopControl}.
-   */
+  /** Mount the active-turn Stop control. */
   stopControl?: boolean;
-  /**
-   * The active model PROVIDER for the space's turns (issue #342): the
-   * provider id (e.g. "near", "openai-codex") derived from the active
-   * default model. Lets the error mapper attribute a bare 403 to the Codex
-   * mint/grant family ONLY when the provider is codex; any other provider's
-   * 403 maps to a provider-aware credential remedy. Absent → a bare 403
-   * keeps its original text (fail-closed: never a false "run codex login").
-   */
+  /** Active model provider for provider-aware error recovery. */
   provider?: string;
-}
-
-/**
- * The shared THINKING_PHRASES rotation. One instance per SpaceService (all
- * spaces share the sequence, matching the pre-#153 single-class counter);
- * the streaming presenter consumes it for each turn's stream opening.
- */
-export function createPhraseRotation() {
-  let index = 0;
-  return {
-    next() {
-      const phrase = THINKING_PHRASES[index % THINKING_PHRASES.length];
-      index += 1;
-      return phrase;
-    },
-  };
 }
 
 /** State of one coalesced streaming update (issue #120). */
@@ -676,26 +582,10 @@ export class SlackTurnPresenter {
    * ts: one ack per unique inbound message, cleared on dispose.
    */
   #ackedReactions = new Set<string>();
-  /** Onboarding-nudge dedupe snapshot (issue #116). */
-  #nudged: string | undefined;
-  /** Shared THINKING_PHRASES rotation (one per SpaceService; see deps). */
-  readonly #phraseRotation: { next(): string };
-  /**
-   * True in the streaming renderer: EVERY turn is a streaming turn, so the
-   * message path always coalesces into the open stream instead of taking
-   * the direct replace path.
-   */
-  protected alwaysStream = false;
-  /**
-   * Live progress (issue #193): the CURRENT tool step's title and the
-   * latest thinking snippet drive the in-place progress line — priority
-   * step > thinking > elapsed "Thinking… Ns". The elapsed tick timer
-   * re-renders the line on {@link STREAM_UPDATE_INTERVAL_MS} so a long
-   * silent turn (no step, no thinking) never looks frozen, and
-   * {@link #lastProgressText} skips identical re-renders.
-   */
-  #currentStepTitle: string | undefined;
-  #latestThinking: string | undefined;
+  /** Current normalized progress state for this real turn. */
+  #progress: TurnProgressSnapshot = createTurnProgress(Date.now());
+  /** Whether any external tool work was observed during the turn. */
+  #sawExternalWork = false;
   #lastProgressText: string | undefined;
   #progressTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -708,13 +598,7 @@ export class SlackTurnPresenter {
   protected toolStepInFlight = false;
   /** Messages queued behind the running turn (issue #219); the visible "+N waiting" count. */
   #waitingCount = 0;
-  /**
-   * The session's live todo plan (issue #228): the latest snapshot the
-   * driver pushed (tool_execution_end). Survives turns — the SDK's todo
-   * state is per-session and persists across turns — and is cleared only
-   * on dispose. Drives the phrase's "🛠 N/M" indicator and the in-place
-   * plan message.
-   */
+  /** The session's live todo plan (issue #228): latest driver snapshot. */
   #todoPhases: TodoPhase[] = [];
   /**
    * ts of the in-place "🛠 Agent's plan" message (issue #228): one per
@@ -730,32 +614,19 @@ export class SlackTurnPresenter {
   #planPosting = false;
   /** The last rendered plan body; identical snapshots skip the edit. */
   #lastPlanText: string | undefined;
-  /** Whether the active-turn Stop control (issue #315) is enabled for this space. */
+  /** Whether the active-turn Stop control is enabled for this space. */
   #stopControlEnabled: boolean;
-  /**
-   * ts of the mounted Stop-control message (issue #315); undefined until
-   * mounted on turn start, cleared on turn end. One per space, so a second
-   * turn_start never stacks a duplicate control.
-   */
+  /** ts of the mounted Stop-control message, cleared on turn end. */
   #stopControlTs: string | undefined;
-  /**
-   * Requests are in flight for a TOP-LEVEL DM (issue #296): true from a
-   * top-level DM turn's open (activateInbound / onQueueDrain, which are
-   * never threaded because {@link #dmTopLevel} requires no root) until the
-   * opening `session.prompt` promise settles ({@link onRequestSettled}) or
-   * the presenter is disposed. While true, the SDK's per-round
-   * {@link onTurnEnd} events are internal ROUND boundaries, not the request
-   * end: intermediate {@link onMessage} assistant preambles are buffered
-   * (never posted) and the one Block Kit status card stays up until the
-   * true request end. Channels/threads never set it (their turn_end stays
-   * the request boundary).
-   */
+  /** Onboarding-nudge dedupe snapshot. */
+  #nudged: string | undefined;
+  /** Requests in flight for a top-level DM. */
   #requestActive = false;
-  /** The latest buffered final-assistant message text during a pending top-level DM request (issue #296). */
+  /** Latest buffered final-assistant message text during a pending DM request. */
   #bufferedDMReply: string | undefined;
-  /** The latest buffered session error / empty-fallback during a pending top-level DM request (issue #296). */
+  /** Latest buffered session error/fallback during a pending DM request. */
   #bufferedDMError: string | undefined;
-  /** The active model provider (issue #342): attributes a bare 403 to Codex only when the provider is codex. */
+  /** Active model provider for provider-aware error recovery. */
   readonly #provider: string | undefined;
 
   constructor(deps: TurnPresenterDeps) {
@@ -763,7 +634,6 @@ export class SlackTurnPresenter {
     this.adapter = deps.adapter;
     this.#store = deps.store;
     this.#onboardingChecks = deps.onboardingChecks;
-    this.#phraseRotation = deps.phraseRotation ?? createPhraseRotation();
     this.#stopControlEnabled = deps.stopControl ?? false;
     this.#provider = deps.provider;
   }
@@ -795,53 +665,33 @@ export class SlackTurnPresenter {
   }
 
   /**
-   * Activates the inbound's identity as the CURRENT turn's surface (issue
-   * #289): the threading base ({@link lastInboundTs}), the channel
-   * stream's recipient ({@link lastInboundPrincipal}, issue #287), and
-   * the conversation ROOT when the message is itself a thread reply
-   * ({@link turnThreadTs}). Called ONLY when a fresh or steered turn
-   * actually starts — never for a queued message, whose identity must not
-   * mutate the running turn until its own turn opens (onQueueDrain). A
-   * threaded turn is reaction-only: no thinking placeholder and no stream
-   * open — the final/error reply posts as a NEW message under the root,
-   * so two requests in one thread never reuse or edit a shared
-   * placeholder.
+   * Activates the inbound identity as the current turn's surface.
    */
   activateInbound(msg: SlackMessage): void {
     this.lastInboundTs = msg.ts;
     this.lastInboundPrincipal = msg.principal;
     this.turnThreadTs = msg.threadTs;
-    // A new turn: the previous turn's progress state is stale (#193). The
-    // opening phrase (and the elapsed tick) take over from here.
-    this.#currentStepTitle = undefined;
-    this.#latestThinking = undefined;
-    this.#lastProgressText = undefined;
-    // #296: a fresh top-level turn arms a DM REQUEST — one Block Kit card
-    // owning the whole agent loop until the opening prompt settles. The
-    // prior request's buffered reply/error never leak in.
+    this.#resetTurnProgress();
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
-      // Reaction-only receipt: no placeholder to edit, so drop any stale
-      // pending ts (a leftover phrase from a previous top-level turn must
-      // never become this turn's edit target) and keep the fresh-turn
-      // bookkeeping the steer safe-window depends on (#219).
       this.#turnDelivered = false;
       this.pendingTs = undefined;
     }
   }
 
-  /** The latest inbound message ts (digest marker base, #42); undefined before the first message. */
+  /** The latest inbound message ts (digest marker base, #42). */
   latestInboundTs(): string | undefined {
     return this.lastInboundTs;
   }
 
-  /** turn_start: rotate the phrase in place (or, streaming, keep the stream opening). */
+  /** turn_start advances an accepted turn to planning; evidence states win. */
   onTurnStart(): void {
     this.#mountStopControl();
+    if (this.#progress.state === "accepted") this.#setProgress("planning", "Preparing a plan");
     this.#postThinkingPhrase();
   }
 
@@ -1102,52 +952,25 @@ export class SlackTurnPresenter {
   }
 
   /**
-   * Issue #219 (queue-by-default): SpaceService reports the per-space queue
-   * length; the CURRENT live line carries a visible "+N waiting" suffix
-   * while messages wait, and the suffix drops as the queue drains. The
-   * indicator rides the phrase/progress line only — never the final reply
-   * text (turnDelivered lines are left untouched; the next turn's phrase
-   * re-decorates).
+   * Queue length decorates the active progress state.
    */
   setQueueLength(count: number): void {
     this.#waitingCount = Math.max(0, count);
-    if (this.digesting) return;
-    if (this.#turnDelivered) return; // the final reply owns the line; the next phrase re-decorates
-    this.#renderProgressNow();
+    if (!this.digesting && !this.#turnDelivered) this.#renderProgressNow();
   }
 
-  /**
-   * Issue #219: a queued message's turn starts. The running turn's reply
-   * already landed; this opens the drained turn's OWN visible line (fresh
-   * phrase, threaded under the drained message) and re-arms the live
-   * progress. The receipt reaction and message.in audit already happened
-   * at queue time (onInbound), so neither repeats here. `principal` is the
-   * drained message's sender — the channel stream's recipient (issue #287).
-   * Issue #289: a drained message that is itself a thread reply
-   * (rootThreadTs set) stays reaction-only — its reply targets the
-   * conversation root.
-   */
+  /** A queued message starts a fresh normalized turn. */
   onQueueDrain(msgTs: string, principal: string, rootThreadTs?: string): void {
     this.lastInboundTs = msgTs;
     this.lastInboundPrincipal = principal;
     this.turnThreadTs = rootThreadTs;
-    this.#currentStepTitle = undefined;
-    this.#latestThinking = undefined;
-    this.#lastProgressText = undefined;
-    // #296: a drained turn is a FRESH request — a top-level drain arms a DM
-    // REQUEST (one Block Kit card, buffer intermediate messages) and resets
-    // the prior request's buffered reply/error.
+    this.#resetTurnProgress();
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
     if (this.turnThreadTs === undefined) {
       this.#postThinkingPhrase();
     } else {
-      // Issue #289: a threaded drain is reaction-only — no placeholder —
-      // but it is still a FRESH turn: reset the delivered flag (and drop
-      // any stale pending phrase) so the steer safe-window (#219), the
-      // empty-turn churn guard (#60), and the live progress line all see
-      // a fresh turn instead of the previous turn's delivered state.
       this.#turnDelivered = false;
       this.pendingTs = undefined;
     }
@@ -1186,48 +1009,27 @@ export class SlackTurnPresenter {
       .catch((err) => console.error("[search-results] cited table post failed:", err));
   }
 
-  /**
-  /** A live thinking chunk from the driver (issue #193): the phrase renderer
-   * shows the latest reasoning snippet in place while the turn runs. The
-   * streaming renderer ignores it (the panel renders steps, not phrases).
-   */
-  onThinking(data: ThinkingEvent): void {
-    if (this.digesting) return;
-    this.renderThinking(data);
-  }
+  /** Thinking is intentionally a surface no-op: raw reasoning never renders. */
+  onThinking(_data: ThinkingEvent): void {}
 
-  /**
-   * A live todo snapshot from the driver (issue #228): the phrase renderer
-   * appends the "🛠 N/M — current step" indicator to the progress line and
-   * keeps the in-place plan message current for long turns. Digest turns
-   * skip the rendering (their output is memory, #42).
-   */
+  /** Todo snapshots normalize progress and update the plan surface. */
   onTodoPhases(data: TodoPhasesEvent): void {
     if (this.digesting) return;
     this.renderTodoPhases(data);
   }
 
-  /**
-   * Render seam (issue #228): the base renderer stores the snapshot, then
-   * re-renders the live progress line and the plan message. The streaming
-   * renderer overrides this to keep the plan message but never touch the
-   * panel surface (mirrors renderThinking).
-   */
+  /** Render seam shared by phrase and stream presenters. */
   protected renderTodoPhases(data: TodoPhasesEvent): void {
     this.updateTodoSnapshot(data.phases ?? []);
-    this.#renderProgressNow();
   }
 
-  /**
-   * Stores the snapshot and re-renders the in-place plan message when the
-   * plan qualifies (long turns). Shared by both renderers — the plan
-   * message is a separate posted message, independent of the turn's phrase
-   * or stream surface.
-   */
+  /** Stores todos and derives the visible state from their evidence. */
   protected updateTodoSnapshot(phases: readonly TodoPhase[]): void {
     this.#todoPhases = [...phases];
+    this.#normalizeProgressFromEvidence();
     this.#renderPlanMessage();
   }
+
 
   /**
    * True for a TOP-LEVEL (non-threaded) Slack DM — the single-status-card
@@ -1283,22 +1085,15 @@ export class SlackTurnPresenter {
     this.#ackedReactions.clear();
     this.cancelStreamUpdate();
     this.#cancelProgressTimer();
-    this.#currentStepTitle = undefined;
-    this.#latestThinking = undefined;
-    this.#lastProgressText = undefined;
     this.streamingTurns = false;
     this.toolStepInFlight = false;
     this.#waitingCount = 0;
     this.#nudged = undefined;
-    // Issue #228: the todo snapshot and plan message die with the session —
-    // the next cold start re-hydrates the plan from the transcript (the
-    // SDK's getTodoPhases) and re-posts the plan message on the next
-    // qualifying snapshot.
+    this.#resetTurnProgress();
     this.#todoPhases = [];
     this.#planTs = undefined;
     this.#planPosting = false;
     this.#lastPlanText = undefined;
-    // #296: request-phase state dies with the session.
     this.#requestActive = false;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
@@ -1306,13 +1101,7 @@ export class SlackTurnPresenter {
   }
 
   /**
-   * Mounts the active-turn Stop control (issue #315): posts ONE standalone
-   * block message carrying the {@link stopControlBlock} into the turn's
-   * thread (or plainly for DMs) — the visible "Stop" affordance on the
-   * turn's card/progress surface. Fire-and-forget like {@link postChartBlock}
-   * (Slack latency must never block the turn path). Resolves the control's
-   * ts once posted so {@link #clearStopControl} can edit it away. Deduped:
-   * a second turn_start (SDK auto-retry) never stacks a duplicate control.
+   * Mounts the active-turn Stop control.
    */
   #mountStopControl(): void {
     if (!this.#stopControlEnabled) return;
@@ -1395,104 +1184,85 @@ export class SlackTurnPresenter {
 
   /** Post-turn cleanup; streaming closes the stream here. */
   protected async finishTurn(): Promise<void> {}
+  #resetTurnProgress(): void {
+    this.#progress = createTurnProgress(Date.now());
+    this.#sawExternalWork = false;
+    this.#todoPhases = [];
+    this.#lastProgressText = undefined;
+    this.toolStepInFlight = false;
+  }
 
-  /**
-   * Renders one thinking-step card; the phrase renderer has no panel. The
-   * plain renderer instead shows the CURRENT step as the in-place progress
-   * line (issue #193); the streaming renderer overrides this with the
-   * panel's task_update cards (issue #168).
-   */
+  /** Normalizes tool evidence and renders explicit progress. */
   protected renderToolStep(step: ToolStepEvent): void {
-    // A completion clears the current step: the line falls back to the
-    // latest thinking snippet or the elapsed phrase until the next step.
-    // The in-flight flag (issue #219) gates the steer safe window.
     this.toolStepInFlight = step.status === "in_progress";
-    this.#currentStepTitle = step.status === "in_progress" ? step.title : undefined;
+    if (step.status === "in_progress") {
+      const waitingForApproval = step.title.toLowerCase().includes("waiting for approval");
+      if (!waitingForApproval) this.#sawExternalWork = true;
+      this.#setProgress(waitingForApproval ? "waiting" : "working", step.label ?? "External work");
+      return;
+    }
+    this.#normalizeProgressFromEvidence();
+  }
+
+
+  /** Formats normalized progress with the current queue count. */
+  protected progressText(progress: TurnProgressSnapshot): string {
+    return renderProgressSnapshot(progress, Date.now(), this.#waitingCount);
+  }
+
+  /** Render current state through the surface-specific seam. */
+  protected renderTurnProgress(progress: TurnProgressSnapshot): void {
+    this.#scheduleProgressUpdate(this.progressText(progress));
+  }
+
+  /** Replays progress after an opening surface receives its timestamp. */
+  protected replayTurnProgress(): void {
+    this.#lastProgressText = undefined;
     this.#renderProgressNow();
   }
 
-  /** A thinking chunk (issue #193); the phrase renderer shows it live as the 🧠 snippet. */
-  protected renderThinking(data: ThinkingEvent): void {
-    const thinking = data.thinking?.trim();
-    if (!thinking) return;
-    // #295: a top-level DM's single status card NEVER surfaces raw model
-    // reasoning. The elapsed tick keeps the card alive; the thinking chunk
-    // is a no-op for the surface, so Reasoning text can never reach Slack.
-    if (this.#dmTopLevel) return;
-    this.#latestThinking = this.#tailSnippet(thinking);
+  /** Updates normalized state while preserving turn start and evidence. */
+  #setProgress(state: TurnProgressSnapshot["state"], detail?: string): void {
+    const counts = todoStageCounts(this.#todoPhases);
+    this.#progress = {
+      ...this.#progress,
+      state,
+      ...(detail === undefined ? { detail: undefined } : { detail }),
+      ...(counts === undefined
+        ? { completedStages: undefined, totalStages: undefined }
+        : { completedStages: counts.completed, totalStages: counts.total }),
+      lastMeaningfulProgressAt: Date.now(),
+    };
     this.#renderProgressNow();
   }
 
-  // -------------------------------------------------------------------------
-  // Live progress (issue #193): the in-place phrase becomes a progress line
-  // — current tool step ("⚙️ …") > latest thinking snippet ("🧠 …") >
-  // elapsed "Thinking… Ns" — coalesced on the STREAM_UPDATE_INTERVAL_MS
-  // cadence and replaced by the final reply exactly as before. The elapsed
-  // tick keeps the line moving during a silent turn so the user never stares
-  // at a frozen phrase.
-  // -------------------------------------------------------------------------
-
-  /** The current progress line: step > thinking snippet > elapsed phrase, each carrying the live todo indicator when the plan has >= 2 steps (issue #228). */
-  #progressLine(): string {
-    const step = this.#currentStepTitle;
-    const base =
-      step !== undefined
-        ? `⚙️ ${this.#headSnippet(step)}`
-        : this.#latestThinking !== undefined
-          ? `🧠 ${this.#latestThinking}`
-          : this.#elapsedPhrase();
-    const todo = todoProgressLine(this.#todoPhases);
-    const line = todo === undefined ? base : `${base} · ${todo}`;
-    return this.#decorate(line);
+  /** Derives waiting/working/finishing state from tool and todo evidence. */
+  #normalizeProgressFromEvidence(): void {
+    const tasks = this.#todoPhases.flatMap((phase) => phase.tasks);
+    const blocked = tasks.some((task) => task.status === "blocked");
+    if (this.toolStepInFlight) {
+      this.#setProgress("working", this.#progress.detail);
+    } else if (blocked) {
+      this.#setProgress("waiting", "Blocked on an outstanding task");
+    } else if (
+      this.#sawExternalWork &&
+      tasks.every((task) => task.status === "completed" || task.status === "abandoned")
+    ) {
+      this.#setProgress("finishing", "Preparing the final response");
+    } else if (this.#sawExternalWork || tasks.length > 0) {
+      this.#setProgress("working", "Completing the request");
+    } else {
+      this.#renderProgressNow();
+    }
   }
 
-  /**
-   * Appends the queue indicator (issue #219): every visible phrase or
-   * progress line carries "+N waiting" while messages queue behind the
-   * running turn, so the user knows their message was received and is
-   * next. The final reply text never carries it — {@link #replaceOrPost}
-   * posts/edits raw text, and the next turn's phrase re-decorates with
-   * the remaining count.
-   */
-  #decorate(line: string): string {
-    return this.#waitingCount > 0 ? `${line} — +${this.#waitingCount} waiting` : line;
-  }
-
-  /** "Thinking… Ns" — the fallback while no step or thinking has arrived. */
-  #elapsedPhrase(): string {
-    const base = this.#receivedAt ?? Date.now();
-    const seconds = Math.max(0, Math.floor((Date.now() - base) / 1000));
-    return `Thinking… ${seconds}s`;
-  }
-
-  /** Head-truncates a long value (keeps the tool name of a step title). */
-  #headSnippet(text: string): string {
-    if (text.length <= THINKING_SNIPPET_MAX) return text;
-    return `${text.slice(0, THINKING_SNIPPET_MAX - 1)}…`;
-  }
-
-  /** Tail-truncates a long value (keeps the MOST RECENT reasoning, #193). */
-  #tailSnippet(text: string): string {
-    if (text.length <= THINKING_SNIPPET_MAX) return text;
-    return `…${text.slice(-(THINKING_SNIPPET_MAX - 1))}`;
-  }
-
-  /**
-   * Renders the current progress line in place, coalesced on the cadence.
-   * Skipped while the phrase post is in flight (ts unknown): the elapsed
-   * tick or the next step/thinking event renders once it lands. Yields to
-   * pending real reply text (the streamed answer always wins).
-   */
   #renderProgressNow(): void {
-    this.#scheduleProgressUpdate(this.#progressLine());
+    const text = renderProgressSnapshot(this.#progress, Date.now(), this.#waitingCount);
+    if (text === this.#lastProgressText) return;
+    this.#lastProgressText = text;
+    this.renderTurnProgress(this.#progress);
   }
 
-  /**
-   * Arms the elapsed tick; one timer per space, no-op while armed. The
-   * streaming renderer overrides this to a no-op: the panel owns the
-   * stream surface, so the phrase renderer's progress tick must never
-   * append elapsed lines to it (issue #193 is the plain path).
-   */
   protected armProgressTimer(): void {
     if (this.#progressTimer !== null) return;
     this.#progressTimer = setTimeout(() => {
@@ -1502,25 +1272,18 @@ export class SlackTurnPresenter {
     this.#progressTimer.unref?.();
   }
 
-  /**
-   * One cadence tick: re-render the priority line (a completed step or a
-   * new elapsed second changes it; identical text and pending real reply
-   * text are skipped) and re-arm — the tick lives for the whole turn and
-   * stops via {@link #cancelProgressTimer} when a real text replaces the
-   * phrase.
-   */
   #tickProgress(): void {
     if (!this.digesting) this.#renderProgressNow();
     this.armProgressTimer();
   }
 
-  /** Stops the elapsed tick (the phrase was replaced by a delivered text). */
   #cancelProgressTimer(): void {
     if (this.#progressTimer !== null) {
       clearTimeout(this.#progressTimer);
       this.#progressTimer = null;
     }
   }
+
 
   // -------------------------------------------------------------------------
   // Phrase machinery (issues #40/#60/#119/#120, extracted verbatim).
@@ -1549,33 +1312,19 @@ export class SlackTurnPresenter {
     if (this.turnThreadTs !== undefined) return;
     this.#turnDelivered = false;
     if (this.#churnActive) return;
-    // Live progress (#193): the elapsed tick keeps the phrase live from the
-    // moment the turn opens (armed once; no-op while already running).
-    this.armProgressTimer();
     const pendingTs = this.pendingTs;
     if (pendingTs !== undefined) {
-      // Live progress (#193) beats rotation (#251): a current tool step or
-      // a live reasoning snippet is never replaced by rotating phrase text
-      // (a retry's turn_start re-fires after thinking has streamed in, #60).
-      // Return WITHOUT cancelStreamUpdate() so a not-yet-flushed 🧠/⚙️ line
-      // still lands; the elapsed tick and step/thinking events keep it moving.
-      if (this.#currentStepTitle !== undefined || this.#latestThinking !== undefined) {
-        return;
-      }
-      // A retry (or second turn) while the phrase is up: replace in place.
-      // A stale coalesced streaming text must not overwrite the rotation (#120).
       this.cancelStreamUpdate();
-      void this.rotateTurnOpening(pendingTs).catch((err) => {
-        console.error(`[slack-turn-presenter] failed to update thinking phrase in ${this.spaceId}:`, err);
-      });
+      this.replayTurnProgress();
       return;
     }
     if (this.#phrasePosting) return; // in flight — it becomes the phrase
     this.#phrasePosting = true;
-    void this.openTurn(this.#nextPhrase())
+    void this.openTurn(renderProgressSnapshot(this.#progress, Date.now(), this.#waitingCount))
       .then((ts) => {
-        if (ts !== undefined) {
+        if (ts !== undefined && !this.#turnDelivered) {
           this.pendingTs = ts;
+          this.replayTurnProgress();
           console.log(`presenter: phrase posted ${this.spaceId} ${ts}`);
           const receivedAt = this.#receivedAt;
           if (receivedAt !== undefined) this.#phrasePostedMs = Date.now() - receivedAt;
@@ -1613,7 +1362,7 @@ export class SlackTurnPresenter {
     // or streamed reply can never edit the OLD (invisible) phrase.
     this.cancelStreamUpdate();
     this.pendingTs = undefined;
-    void this.openTurn(this.#nextPhrase())
+    void this.openTurn(renderProgressSnapshot(this.#progress, Date.now(), this.#waitingCount))
       .then((ts) => {
         if (ts !== undefined) {
           this.pendingTs = ts;
@@ -1628,13 +1377,6 @@ export class SlackTurnPresenter {
       });
   }
 
-  /** Rotates an already-pending phrase in place; streaming keeps its opening, so it does nothing. */
-  protected rotateTurnOpening(pendingTs: string): Promise<void> {
-    // Plain text everywhere: a top-level DM's rotating status and a
-    // channel's phrase are the SAME in-place plain-text edit (no attachment
-    // card; owner veto #296-reopened).
-    return this.sendTextChunk(pendingTs, this.#nextPhrase());
-  }
 
   /**
    * The in-place "🛠 Agent's plan" message (issue #228, long turns): posted
@@ -1681,10 +1423,6 @@ export class SlackTurnPresenter {
       });
   }
 
-  /** Next rotating phrase (queue-decorated, issue #219); advances the shared rotation. */
-  #nextPhrase(): string {
-    return this.#decorate(this.#phraseRotation.next());
-  }
 
   /**
    * Receipt ack (issue #119): adds the 👀 reaction to the inbound message
@@ -1830,7 +1568,6 @@ export class SlackTurnPresenter {
    * line was scheduled; identical lines are skipped.
    */
   #scheduleProgressUpdate(line: string): void {
-    if (line === this.#lastProgressText) return;
     const pendingTs = this.pendingTs;
     if (pendingTs === undefined) return; // phrase post still in flight
     const existing = this.#streamUpdate;
@@ -2042,7 +1779,10 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     if (recipientUserId === undefined) return super.openTurn(openingText);
     try {
       const ts = await this.adapter.startStream(this.spaceId, { threadTs, openingText, recipientUserId });
-      if (ts !== undefined) this.#streamTs = ts;
+      if (ts !== undefined) {
+        this.#streamTs = ts;
+        this.replayTurnProgress();
+      }
       return ts;
     } catch (err) {
       const parsedError = slackApiErrorSchema.safeParse(err);
@@ -2084,9 +1824,8 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     try {
       await this.adapter.appendText(this.spaceId, ts, text);
     } catch (err) {
-      // Any stream failure flips to the phrase path for the boot (issue
-      // #181) — and the text still lands: edit the stream message in place.
       this.#streamMode = false;
+      this.pendingTs = ts;
       console.error(
         `[slack-turn-presenter] chat.appendStream failed in ${this.spaceId} — falling back to phrase+edit for the boot:`,
         err,
@@ -2095,14 +1834,6 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     }
   }
 
-  /**
-   * turn_end: the final reply lands as the stopStream closing block (the
-   * pending coalesced append is dropped — it was superseded by the final).
-   * With no open stream the base flush delivers it via chat.update as
-   * before — and a per-turn fallback (missing recipient / request
-   * rejection, issue #287) additionally clears the pending phrase so the
-   * NEXT turn opens a fresh stream instead of rotating the fallback post.
-   */
   protected async finalizeTurn(finalText: string | undefined): Promise<void> {
     if (!(this.#streamMode && this.#streamTs !== undefined)) {
       // Boot-fallback mode (#streamMode false) keeps the pending ts so the
@@ -2127,6 +1858,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     // only carrier — flip to the phrase path and edit the stream message in
     // place so the reply is NEVER dropped (issue #181).
     this.#streamMode = false;
+    this.pendingTs = ts;
     if (finalText !== undefined) {
       await super.sendTextChunk(ts, finalText);
     }
@@ -2143,12 +1875,26 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     }
   }
 
-  /** One thinking-step card per gated tool call (issue #168). */
+  /** Render all normalized states through one stable stream task card. */
+  protected renderTurnProgress(progress: TurnProgressSnapshot): void {
+    if (!this.#streamMode || this.#streamTs === undefined) {
+      super.renderTurnProgress(progress);
+      return;
+    }
+    const title = this.progressText(progress);
+    void this.adapter
+      .appendTask(this.spaceId, this.#streamTs, { id: "turn-progress", title, status: "in_progress" })
+      .catch((err) => {
+        this.#streamMode = false;
+        this.pendingTs = this.#streamTs;
+        console.error(`[slack-turn-presenter] failed to append progress in ${this.spaceId}:`, err);
+      });
+  }
+
+  /** Normalize shared state before adding a stream-specific tool card. */
   protected renderToolStep(step: ToolStepEvent): void {
-    // The in-flight flag (issue #219) mirrors the base: a mid-tool steer
-    // must never interrupt a side-effecting call.
-    this.toolStepInFlight = step.status === "in_progress";
-    if (!this.#streamMode || this.#streamTs === undefined) return; // no panel in fallback mode
+    super.renderToolStep(step);
+    if (!this.#streamMode || this.#streamTs === undefined) return;
     const ts = this.#streamTs;
     void this.adapter
       .appendTask(this.spaceId, ts, {
@@ -2158,7 +1904,6 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
         ...(step.output !== undefined ? { output: step.output } : undefined),
       })
       .catch((err) => {
-        // Any stream failure flips to the phrase path for the boot (issue #181).
         this.#streamMode = false;
         console.error(
           `[slack-turn-presenter] failed to append task step in ${this.spaceId} — falling back to phrase+edit for the boot:`,
@@ -2167,22 +1912,9 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
       });
   }
 
-  /**
-   * Live thinking (issue #193) is the PLAIN path's progress phrase; the
-   * panel renders steps as cards and reply text as stream appends — a
-   * reasoning snippet must not pollute the stream, so it renders nothing.
-   */
-  protected renderThinking(_data: ThinkingEvent): void {}
-
-  /**
-   * Live todo (issue #228): the panel owns the turn's live surface, so the
-   * phrase renderer's "🛠 N/M" progress line must never append to it
-   * (mirrors renderThinking). The in-place plan MESSAGE is a separate
-   * posted message and still renders for long turns via the shared
-   * snapshot update.
-   */
+  /** Todo normalization is shared; stream rendering uses the progress seam. */
   protected renderTodoPhases(data: TodoPhasesEvent): void {
-    this.updateTodoSnapshot(data.phases ?? []);
+    super.renderTodoPhases(data);
   }
 
   /**

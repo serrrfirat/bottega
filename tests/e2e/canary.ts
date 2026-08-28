@@ -63,7 +63,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { bootHarness, type Harness } from "./harness";
-import { THINKING_PHRASES } from "../../src/server/services/space-service";
 import {
   CHURN_MESSAGE,
   EMPTY_RESPONSE_FALLBACK,
@@ -744,7 +743,7 @@ export function noReplyEvidence(h: Harness, after: number, messages: SlackApiMes
   if (rows.length === 0) return "";
   const parts: string[] = [`the bot posted ${rows.length} message(s) after the ask but none reads as a reply`];
   const toolLines = rows
-    .filter((m) => PROGRESS_LINE_RE.test(m.text.trim()) || THINKING_PHRASES.includes(m.text.trim()))
+    .filter((m) => PROGRESS_LINE_RE.test(m.text.trim()))
     .map((m) => snippet(m.text));
   if (toolLines.length > 0) {
     parts.push(`last non-reply line(s): ${toolLines.slice(-3).join(" | ")}`);
@@ -827,13 +826,12 @@ export async function waitForBotReply(
         (m) =>
           isBotMessage(h, m) &&
           m.text.trim().length > 0 &&
-          !THINKING_PHRASES.includes(m.text.trim()) &&
+          !PROGRESS_LINE_RE.test(m.text.trim()) &&
           // Live-progress lines (issue #224) are turn DECORATION, never a
           // reply: a real reply replaces the phrase in place, so a poll
           // that matches "⚙️ …" / "🧠 …" / "Thinking… Ns" false-passes on
           // an empty turn (run msypizpb-qt3: the DM journey "passed" on
           // the elapsed line while the channel turn honestly timed out).
-          !PROGRESS_LINE_RE.test(m.text.trim()) &&
           // Issue #245: an empty-response recovery line is decoration too —
           // the real completion replaces it in place; matching it
           // false-passes a churn turn (empty completions / model gave up)
@@ -2141,7 +2139,7 @@ async function journeyUploadLink(h: Harness, channelId: string, uploadLink: Uplo
  * place. DMs always use the phrase renderer (issue #180), so the journey
  * observes the progress line in history while the turn runs.
  */
-const PROGRESS_LINE_RE = /^(?:⚙️ |🧠 |Thinking… \d+s$)/;
+const PROGRESS_LINE_RE = /^(?:Accepted|Planning|Working|Waiting|Finishing)(?: — [^\n]+)?\n.* elapsed(?: ·.*)?$/;
 /** Exported for the hermetic mechanism tests (issue #193). */
 export { PROGRESS_LINE_RE };
 

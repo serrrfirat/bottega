@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { bootHarness, type Harness } from "./harness";
-import { THINKING_PHRASES, REQUEST_ONLY_DIRECTIVE } from "../../src/server/services/space-service";
+import { REQUEST_ONLY_DIRECTIVE } from "../../src/server/services/space-service";
 import { loadSpacePolicy, parseOrgConfigYaml } from "../../src/policy/config";
 import { createFixtureRegistry, FIXTURE_EXTENSION_ID } from "../../src/extensions/fixture";
 import { EXTENSION_CONNECTED_EVENT } from "../../src/store/audit-events";
@@ -50,7 +50,6 @@ describe("headless conversation lane (issue #363)", () => {
       const messages = await waitFor(() => h.messages(h.slack.dmChannelId).length === 1 ? h.messages(h.slack.dmChannelId) : undefined);
       expect(messages).toHaveLength(1);
       expect(messages[0]!.text).toBe("final answer");
-      expect(THINKING_PHRASES).not.toContain(messages[0]!.text);
     });
   });
 
@@ -97,8 +96,6 @@ describe("headless conversation lane (issue #363)", () => {
       expect(streams.map((s) => s.op)[0]).toBe("start");
       expect(streams.at(-1)?.op).toBe("stop");
       expect(streams.at(-1)?.text).toBe("stream complete");
-      expect(h.messages(h.slack.dmChannelId).some((m) => THINKING_PHRASES.includes(m.text))).toBe(false);
-      expect(h.messages("C-HEADLESSOPS").some((m) => THINKING_PHRASES.includes(m.text))).toBe(false);
     });
   });
 

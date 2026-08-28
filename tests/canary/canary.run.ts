@@ -42,7 +42,8 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createServer } from "@emulators/core";
 import githubPlugin, { seedFromConfig } from "@emulators/github";
-import { CHURN_MESSAGE, THINKING_PHRASES } from "../../src/server/services/space-service";
+import { CHURN_MESSAGE } from "../../src/server/services/space-service";
+const TURN_PROGRESS_RE = /^(?:Accepted|Planning|Working|Waiting|Finishing)(?: —|\n)/;
 import { runExecutor } from "../../src/executor";
 import { resolveMemoryProvider } from "../../src/server/memory-provider";
 import { bootHarness, type Harness } from "../e2e/harness";
@@ -229,7 +230,7 @@ describe("canary journeys with the real model (issue #71)", () => {
             const msgs = h.messages(dm);
             if (msgs.length !== 1) return undefined;
             const text = msgs[0]!.text.trim();
-            return text.length > 0 && !THINKING_PHRASES.includes(text) && text !== CHURN_MESSAGE ? msgs[0] : undefined;
+            return text.length > 0 && !TURN_PROGRESS_RE.test(text) && text !== CHURN_MESSAGE ? msgs[0] : undefined;
           },
           150_000,
           "the real model reply (in place of the thinking phrase)",
