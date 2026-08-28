@@ -8,6 +8,7 @@ certs/
 *.log
 .DS_Store
 .worktrees/
+.superpowers/
 
 # One-off root probe/scratch scripts (issue #341) — not part of the app.
 probe-membership.ts
