@@ -29,16 +29,18 @@
  *     actionable refusal.
  *
  * Accepted verdicts:
- *   - `mcp`             — HTTP 200 + JSON body whose `result` parses the
- *     SDK's exported InitializeResultSchema with a supported protocol
- *     version (the same validation Client.connect runs).
+ *   - `mcp`             — HTTP 200 + JSON body, or a Streamable HTTP SSE
+ *     body, whose initialize result parses the SDK's exported
+ *     InitializeResultSchema with a supported protocol version (the same
+ *     validation Client.connect runs).
  *   - `oauth_challenge` — HTTP 401, or 403 with error="insufficient_scope",
  *     plus a single valid Bearer WWW-Authenticate challenge parsed with
  *     the SDK's extractWWWAuthenticateParams (RFC 6750): the endpoint
  *     exists and is OAuth-gated.
  *   - `rejected`        — everything else: 404/405/other errors, missing/
  *     non-Bearer/malformed/duplicate challenges, HTML/non-JSON bodies,
- *     202/SSE-only, timeout, network error, redirect, non-https.
+ *     malformed or conflicting SSE, 202/unsupported streams, timeout,
+ *     network error, redirect, non-https.
  *
  * The official MCP SDK stays the sole OAuth owner: this probe performs no
  * RFC 8414 discovery, no token-endpoint resolution, and no credential
@@ -161,7 +163,8 @@ export async function probeMcpEndpoint(
   }
 
   // Any other non-200 status is rejected: no initialize response, no
-  // usable OAuth challenge (202/SSE-only included — fail closed).
+  // usable OAuth challenge (202/other streaming statuses included — fail
+  // closed).
   if (res.status !== 200) {
     return {
       ok: false,
@@ -170,53 +173,162 @@ export async function probeMcpEndpoint(
     };
   }
 
-  // HTTP 200: the body must be JSON (never HTML/SSE) and its `result` must
-  // parse the SDK's InitializeResultSchema — the same validation
-  // Client.connect runs.
+  // HTTP 200: JSON responses and Streamable HTTP SSE responses both feed the
+  // same initialize-result validator. Legacy GET-only SSE is not accepted:
+  // this path only sends the POST initialize above.
   const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-  if (contentType.includes("text/event-stream")) {
-    return { ok: false, rejected: true, evidence: "HTTP 200 with text/event-stream content (SSE-only endpoints are not probed)" };
-  }
   if (contentType.includes("text/html")) {
     return { ok: false, rejected: true, evidence: "HTTP 200 with HTML content (landing page, not an MCP endpoint)" };
   }
-  let text: string;
-  try {
-    text = await res.text();
-  } catch (err) {
-    return { ok: false, rejected: true, evidence: `HTTP 200 but the response body could not be read: ${errorMessage(err)}` };
+  const body = await readBoundedResponseText(res);
+  if (!body.ok) return { ok: false, rejected: true, evidence: body.evidence };
+
+  if (contentType.includes("text/event-stream")) {
+    return parseSseInitialize(body.text);
   }
+
   let doc: unknown;
   try {
-    doc = JSON.parse(text);
+    doc = JSON.parse(body.text);
   } catch {
     return { ok: false, rejected: true, evidence: "HTTP 200 with non-JSON content (HTML landing page)" };
   }
+  return validateInitializeDocument(doc, "HTTP 200", false);
+}
+
+const MCP_PROBE_MAX_RESPONSE_BYTES = 256 * 1024;
+
+type BoundedBody =
+  | { ok: true; text: string }
+  | { ok: false; evidence: string };
+
+async function readBoundedResponseText(res: Response): Promise<BoundedBody> {
+  const contentLength = Number(res.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MCP_PROBE_MAX_RESPONSE_BYTES) {
+    return {
+      ok: false,
+      evidence: `HTTP 200 response body exceeds ${MCP_PROBE_MAX_RESPONSE_BYTES}-byte cap`,
+    };
+  }
+
+  if (res.body === null) return { ok: true, text: "" };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > MCP_PROBE_MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        return {
+          ok: false,
+          evidence: `HTTP 200 response body exceeds ${MCP_PROBE_MAX_RESPONSE_BYTES}-byte cap`,
+        };
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    text += decoder.decode();
+    return { ok: true, text };
+  } catch (err) {
+    return { ok: false, evidence: `HTTP 200 but the response body could not be read: ${errorMessage(err)}` };
+  }
+}
+
+interface SseEvent {
+  event?: string;
+  data: string[];
+  hasData: boolean;
+}
+
+function parseSseEvents(text: string): SseEvent[] {
+  const events: SseEvent[] = [];
+  let current: SseEvent = { data: [], hasData: false };
+  const flush = () => {
+    if (current.event !== undefined || current.hasData) events.push(current);
+    current = { data: [], hasData: false };
+  };
+  for (const line of text.split(/\r\n|\n|\r/)) {
+    if (line === "") {
+      flush();
+      continue;
+    }
+    if (line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") current.event = value;
+    if (field === "data") {
+      current.hasData = true;
+      current.data.push(value);
+    }
+  }
+  flush();
+  return events;
+}
+
+function parseSseInitialize(text: string): ProbeVerdict {
+  const events = parseSseEvents(text);
+  if (events.length === 0) {
+    return { ok: false, rejected: true, evidence: "HTTP 200 SSE stream has no message data" };
+  }
+  let initializeResult: string | undefined;
+  for (const event of events) {
+    if (event.event !== undefined && event.event !== "message") {
+      return { ok: false, rejected: true, evidence: `HTTP 200 SSE stream contains a non-message event "${event.event}"` };
+    }
+    if (!event.hasData) {
+      return { ok: false, rejected: true, evidence: "HTTP 200 SSE message is missing data" };
+    }
+    let doc: unknown;
+    try {
+      doc = JSON.parse(event.data.join("\n"));
+    } catch {
+      return { ok: false, rejected: true, evidence: "HTTP 200 SSE message has malformed JSON data" };
+    }
+    const verdict = validateInitializeDocument(doc, "HTTP 200 SSE message", true);
+    if (!verdict.ok) return verdict;
+    const result = JSON.stringify((doc as Record<string, unknown>)["result"]);
+    if (initializeResult !== undefined && initializeResult !== result) {
+      return { ok: false, rejected: true, evidence: "HTTP 200 SSE stream contains conflicting multiple initialize messages" };
+    }
+    initializeResult = result;
+  }
+  return { ok: true, kind: "mcp", evidence: "HTTP 200 SSE with a valid MCP initialize result" };
+}
+
+function validateInitializeDocument(doc: unknown, evidencePrefix: string, requireRequestId: boolean): ProbeVerdict {
   // SAFETY: JSON.parse output is JSON-shaped by construction; the guard
   // below is the authority on the record shape (fail closed otherwise).
   const docValue = doc as JsonValue;
   if (!isRecord(docValue)) {
-    return { ok: false, rejected: true, evidence: "HTTP 200 with a JSON body that is not a JSON-RPC response" };
+    return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON body that is not a JSON-RPC response` };
+  }
+  if (requireRequestId && (docValue["jsonrpc"] !== "2.0" || docValue["id"] !== 1)) {
+    return { ok: false, rejected: true, evidence: `${evidencePrefix} has a JSON-RPC message with the wrong id (expected 1)` };
   }
   if (docValue["error"] !== undefined) {
-    return { ok: false, rejected: true, evidence: "HTTP 200 with a JSON-RPC error response (no initialize result)" };
+    return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON-RPC error response (no initialize result)` };
   }
   const result = docValue["result"];
   if (result === undefined) {
-    return { ok: false, rejected: true, evidence: "HTTP 200 with a JSON body that has no initialize result" };
+    return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON body that has no initialize result` };
   }
   const parsed = InitializeResultSchema.safeParse(result);
   if (!parsed.success) {
-    return { ok: false, rejected: true, evidence: "HTTP 200 but the initialize result is invalid (not an MCP server)" };
+    return { ok: false, rejected: true, evidence: `${evidencePrefix} but the initialize result is invalid (not an MCP server)` };
   }
   if (!SUPPORTED_PROTOCOL_VERSIONS.includes(parsed.data.protocolVersion)) {
     return {
       ok: false,
       rejected: true,
-      evidence: `HTTP 200 but the server's protocol version ${parsed.data.protocolVersion} is not supported`,
+      evidence: `${evidencePrefix} but the server's protocol version ${parsed.data.protocolVersion} is not supported`,
     };
   }
-  return { ok: true, kind: "mcp", evidence: "HTTP 200 with a valid MCP initialize result" };
+  return { ok: true, kind: "mcp", evidence: `${evidencePrefix} with a valid MCP initialize result` };
 }
 
 /** The parsed Bearer challenge, or the rejection reason. */

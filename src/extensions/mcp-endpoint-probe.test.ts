@@ -30,6 +30,11 @@ const INITIALIZE_RESULT = JSON.stringify({
     serverInfo: { name: "stub-mcp", version: "1.0.0" },
   },
 });
+const SSE_INITIALIZE_RESULT = `event: message\ndata: ${INITIALIZE_RESULT}\n\n`;
+
+function sseMessage(data: string, event = "message"): string {
+  return `event: ${event}\ndata: ${data}\n\n`;
+}
 
 /** One URL (or prefix) → a scripted response. */
 interface Route {
@@ -81,6 +86,21 @@ describe("probeMcpEndpoint — accepted verdicts", () => {
   test("HTTP 200 + a valid MCP initialize result → mcp", async () => {
     const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
       fetchImpl: routeFetch([{ match: "https://mcp.linear.app/mcp", status: 200, body: INITIALIZE_RESULT, headers: { "content-type": "application/json" } }]),
+    });
+    expect(verdict).toMatchObject({ ok: true, kind: "mcp" });
+    if (verdict.ok) expect(verdict.evidence).toContain("valid MCP initialize result");
+  });
+
+  test("HTTP 200 Exa-style text/event-stream initialize response → mcp", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.exa.ai/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.exa.ai/mcp",
+          status: 200,
+          body: SSE_INITIALIZE_RESULT,
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
     });
     expect(verdict).toMatchObject({ ok: true, kind: "mcp" });
     if (verdict.ok) expect(verdict.evidence).toContain("valid MCP initialize result");
@@ -198,6 +218,115 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
     });
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.evidence).toContain("SSE");
+  });
+  test("HTTP 200 text/event-stream with a malformed message payload is rejected", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: sseMessage("{"),
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("malformed");
+  });
+
+  test("HTTP 200 text/event-stream message without data is rejected", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: "event: message\n\n",
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("data");
+  });
+
+  test("HTTP 200 text/event-stream JSON-RPC error message is rejected", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: sseMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "method not found" } })),
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("JSON-RPC error response");
+  });
+
+  test("HTTP 200 text/event-stream initialize message with the wrong id is rejected", async () => {
+    const wrongId = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
+    wrongId.id = 2;
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: sseMessage(JSON.stringify(wrongId)),
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("id");
+  });
+
+  test("HTTP 200 text/event-stream body over the response cap is rejected", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: sseMessage("x".repeat(300_000)),
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("exceeds");
+  });
+
+  test("HTTP 200 text/event-stream non-message events are rejected", async () => {
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: sseMessage(INITIALIZE_RESULT, "update"),
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("event");
+  });
+
+  test("conflicting text/event-stream initialize messages are rejected", async () => {
+    const first = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
+    const second = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
+    (second.result as Record<string, unknown>).serverInfo = { name: "other", version: "2" };
+    const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
+      fetchImpl: routeFetch([
+        {
+          match: "https://mcp.linear.app/mcp",
+          status: 200,
+          body: `${sseMessage(JSON.stringify(first))}${sseMessage(JSON.stringify(second))}`,
+          headers: { "content-type": "text/event-stream" },
+        },
+      ]),
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.evidence).toContain("multiple");
   });
 
   test("HTTP 202 is rejected (SSE/streaming accept signal, no initialize result)", async () => {
