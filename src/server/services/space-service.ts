@@ -1033,7 +1033,7 @@ export class SpaceService {
       const notice = failures
         .map(
           ({ providerId, label }) =>
-            `Your ${label} authorization expired or was revoked. Disconnect the stale ${label} connection, then run "connect ${providerId}" again.`,
+            `Your ${label} authorization expired or was revoked. Reconnect ${label} by running "connect ${providerId}".`,
         )
         .join("\n");
       const retained =

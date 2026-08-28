@@ -2755,7 +2755,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
     const extensionReauthDirective = () =>
       [
         "Some connected extension providers need reauthorization:",
-        '- Notion (notion): disconnect the stale connection, then run "connect notion" again.',
+        '- Notion (notion): reauthorize it by running "connect notion".',
         "Do not describe these providers as merely tool-not-found or unavailable; tell the user to reauthorize.",
       ].join("\n");
     const deps = { store, adapter, driver, extensionReauthDirective, extensionAuthFailures };
@@ -2775,7 +2775,7 @@ describe("response mode → session prompt directive (issue #55)", () => {
     await Promise.resolve();
     expect(failureReads).toBeGreaterThan(0);
     expect(updates.at(-1)?.text).toStartWith(
-      'Your Notion authorization expired or was revoked. Disconnect the stale Notion connection, then run "connect notion" again.',
+      'Your Notion authorization expired or was revoked. Reconnect Notion by running "connect notion".',
     );
     expect(updates.at(-1)?.text).not.toContain("tool not found");
     expect(updates.at(-1)?.text).not.toContain("GitHub-only");
