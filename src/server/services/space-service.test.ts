@@ -2777,6 +2777,8 @@ describe("response mode → session prompt directive (issue #55)", () => {
     expect(updates.at(-1)?.text).toStartWith(
       'Your Notion authorization expired or was revoked. Disconnect the stale Notion connection, then run "connect notion" again.',
     );
+    expect(updates.at(-1)?.text).not.toContain("tool not found");
+    expect(updates.at(-1)?.text).not.toContain("GitHub-only");
     await service.stop();
   });
 });

@@ -1036,9 +1036,23 @@ export class SpaceService {
             `Your ${label} authorization expired or was revoked. Disconnect the stale ${label} connection, then run "connect ${providerId}" again.`,
         )
         .join("\n");
+      const retained =
+        notice === ""
+          ? data.text
+          : data.text
+              .split(/\n{2,}/)
+              .filter((paragraph) => {
+                const value = paragraph.toLowerCase();
+                return !failures.some(
+                  ({ providerId, label }) =>
+                    value.includes(providerId.toLowerCase()) || value.includes(label.toLowerCase()),
+                );
+              })
+              .join("\n\n")
+              .trim();
       this.#presenterFor(spaceId).onMessage({
         ...data,
-        text: notice === "" ? data.text : `${notice}\n\n${data.text}`,
+        text: notice === "" ? retained : retained === "" ? notice : `${notice}\n\n${retained}`,
       });
     });
     session.on("error", (data) => this.#presenterFor(spaceId).onError(data));
