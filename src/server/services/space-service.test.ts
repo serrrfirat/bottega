@@ -2699,6 +2699,9 @@ describe("response mode → session prompt directive (issue #55)", () => {
     expect(driver.created[0].opts.appendSystemPrompt).toBe(
       `${SLACK_FORMAT_DIRECTIVE}\n\n${REQUEST_ONLY_DIRECTIVE}`,
     );
+    expect(driver.created[0].opts.appendSystemPrompt).toContain(
+      "Never send artifact:// URIs or internal spill/display-limit notices to Slack users; read artifacts when needed, otherwise omit notices silently.",
+    );
     await service.stop();
   });
 
@@ -2718,6 +2721,9 @@ describe("response mode → session prompt directive (issue #55)", () => {
 
       expect(driver.created).toHaveLength(1);
       expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+      expect(driver.created[0].opts.appendSystemPrompt).toContain(
+        "Never send artifact:// URIs or internal spill/display-limit notices to Slack users; read artifacts when needed, otherwise omit notices silently.",
+      );
       await service.stop();
     }
   });
@@ -2727,10 +2733,12 @@ describe("response mode → session prompt directive (issue #55)", () => {
     const { store } = fakeStore();
     const driver = new FakeDriver();
     const service = makeSpaceService({ store, adapter, driver });
-
     await service.handleInboundMessage(msg());
 
     expect(driver.created[0].opts.appendSystemPrompt).toBe(SLACK_FORMAT_DIRECTIVE);
+    expect(driver.created[0].opts.appendSystemPrompt).toContain(
+      "Never send artifact:// URIs or internal spill/display-limit notices to Slack users; read artifacts when needed, otherwise omit notices silently.",
+    );
     await service.stop();
   });
 });

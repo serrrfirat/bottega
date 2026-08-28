@@ -102,6 +102,9 @@ describe("SpaceService department personas (issue #130)", () => {
     expect(driver.sessions).toHaveLength(1);
     expect(driver.sessions[0]?.appendSystemPrompt).toContain("Prioritize operational monitoring, tickets, and reports.");
     expect(driver.sessions[0]?.appendSystemPrompt).toContain(SLACK_FORMAT_DIRECTIVE);
+    expect(driver.sessions[0]?.appendSystemPrompt).toContain(
+      "Never send artifact:// URIs or internal spill/display-limit notices to Slack users; read artifacts when needed, otherwise omit notices silently.",
+    );
     await service.stop();
   });
 

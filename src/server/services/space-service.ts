@@ -264,7 +264,7 @@ export const REQUEST_ONLY_DIRECTIVE =
  * adapter is the deterministic backstop for whatever still slips through.
  */
 export const SLACK_FORMAT_DIRECTIVE =
-  "Format replies for Slack, not Markdown: *bold*, _italic_, ~strike~, `inline code`, • bullets, <url|label> links; never **, # headings, md tables, or [label](url); keep @mentions and :emoji: as-is.";
+  "Format replies for Slack, not Markdown: *bold*, _italic_, ~strike~, `inline code`, • bullets, <url|label> links; never **, # headings, md tables, or [label](url); keep @mentions and :emoji: as-is. Never send artifact:// URIs or internal spill/display-limit notices to Slack users; read artifacts when needed, otherwise omit notices silently.";
 
 interface LiveSession {
   spaceId: string;
