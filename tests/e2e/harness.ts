@@ -629,13 +629,14 @@ export function createHeadlessAdapter(opts: { streaming?: boolean } = {}): Headl
     async startStream(spaceId, sOpts) {
       if (!streaming) throw new Error("headless adapter: streaming not enabled");
       const ts = nextTs();
-      streams.push({
+      const event: HeadlessStreamEvent = {
         op: "start",
         spaceId,
         ts,
-        ...(sOpts.openingText !== undefined ? { text: sOpts.openingText } : {}),
-        ...(sOpts.recipientUserId !== undefined ? { recipientUserId: sOpts.recipientUserId } : {}),
-      });
+      };
+      if (sOpts.openingText !== undefined) event.text = sOpts.openingText;
+      if (sOpts.recipientUserId !== undefined) event.recipientUserId = sOpts.recipientUserId;
+      streams.push(event);
       return ts;
     },
     async appendText(spaceId, ts, text) {
@@ -645,7 +646,9 @@ export function createHeadlessAdapter(opts: { streaming?: boolean } = {}): Headl
       streams.push({ op: "task", spaceId, ts, text: task.title });
     },
     async stopStream(spaceId, ts, text) {
-      streams.push({ op: "stop", spaceId, ts, ...(text !== undefined ? { text } : {}) });
+      const event: HeadlessStreamEvent = { op: "stop", spaceId, ts };
+      if (text !== undefined) event.text = text;
+      streams.push(event);
     },
     async start() {},
     async stop() {},
@@ -1038,7 +1041,7 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
       request(path, init) {
         return fetch(`${base}${path}`, {
           ...init,
-          headers: { authorization: `Bearer ${token}`, ...(init?.headers ?? {}) },
+          headers: { authorization: `Bearer ${token}`, ...init?.headers },
         });
       },
     };

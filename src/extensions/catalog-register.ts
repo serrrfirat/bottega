@@ -42,8 +42,8 @@
  * the result, and the runtime registration still lands (the approved
  * durable change).
  */
-import { mkdirSync } from "node:fs";
 import type { AuditModule } from "../policy/audit";
+import { z } from "zod";
 import { errorMessage } from "../tools/helpers";
 import { proxyBoundaryControlFromEnv } from "./boundary";
 import {
@@ -57,14 +57,13 @@ import {
   type FetchCatalogOptions,
   type SnapshotDraft,
 } from "./fetch-catalog";
-import {
-  fetchOpenApiSpec,
-  type OpenApiOperation,
-} from "./openapi-tools";
+import { fetchOpenApiSpec, type OpenApiOperation } from "./openapi-tools";
 import {
   validateManifest,
+  isRecord,
   type CredentialSchema,
   type CredentialTarget,
+  type JsonValue,
   type JsonObject,
 } from "./manifest";
 import { probeMcpEndpoint } from "./mcp-endpoint-probe";
@@ -77,6 +76,7 @@ import {
   regenerateEgressConfig,
 } from "../egress/generate";
 import { ADMIN_CATALOG_BROWSER_EVENT } from "../store/audit-events";
+import { mkdirSync } from "node:fs";
 
 /** What the deterministic endpoint discovery resolved for one catalog entry. */
 export interface DiscoveredCatalogMcp {
@@ -173,33 +173,29 @@ async function classifyOAuthFromMetadata(
           );
         }
         if (raw.trim() !== "") {
-          let parsed: unknown;
+          let parsed: JsonValue;
           try {
-            parsed = JSON.parse(raw) as unknown;
+            parsed = JSON.parse(raw);
           } catch (err) {
             throw new CatalogError(
               `official MCP endpoint discovery for "${slug}" received malformed OAuth metadata at ${metadataUrl}: ` +
                 errorMessage(err),
             );
           }
-          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          if (!isRecord(parsed)) {
             throw new CatalogError(
               `official MCP endpoint discovery for "${slug}" received malformed OAuth metadata at ${metadataUrl}`,
             );
           }
-          const servers = (parsed as Record<string, unknown>)["authorization_servers"];
+          const servers = parsed["authorization_servers"];
           if (servers !== undefined) {
-            if (!Array.isArray(servers)) {
+            const parsedServers = z.array(z.string().min(1)).safeParse(servers);
+            if (!parsedServers.success) {
               throw new CatalogError(
                 `official MCP endpoint discovery for "${slug}" received malformed authorization_servers at ${metadataUrl}`,
               );
             }
-            for (const server of servers) {
-              if (typeof server !== "string" || server.trim() === "") {
-                throw new CatalogError(
-                  `official MCP endpoint discovery for "${slug}" received a malformed authorization server URL at ${metadataUrl}`,
-                );
-              }
+            for (const server of parsedServers.data) {
               let parsedServer: URL;
               try {
                 parsedServer = new URL(server);
@@ -223,8 +219,8 @@ async function classifyOAuthFromMetadata(
               if (!authorizationServerHosts.includes(parsedServer.hostname)) {
                 authorizationServerHosts.push(parsedServer.hostname);
               }
-            }
-          }
+        }
+      }
         }
       }
       // OAuth-gated: tools-less manifest, the #231 notion pattern — the

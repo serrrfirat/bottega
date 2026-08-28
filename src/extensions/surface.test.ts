@@ -10,6 +10,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { AuthorizationContext } from "./boundary";
 import { createExtensionRegistry } from "./registry";
 import { validateManifest, type ExtensionManifest, type McpBinding } from "./manifest";
@@ -116,7 +117,7 @@ describe("extensionToolSurface (issue #158 runtime discovery)", () => {
     const manifest = toolsLessManifest({ id: "authorized.me" });
     const transport = (
       _binding: McpBinding,
-      _authProvider: unknown,
+      _authProvider: OAuthClientProvider | undefined,
       authorization?: AuthorizationContext,
     ): Transport => {
       if (authorization === undefined) throw new Error("discovery authorization was not wired");

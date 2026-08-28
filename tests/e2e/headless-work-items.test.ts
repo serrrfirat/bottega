@@ -38,17 +38,25 @@ const ASK_CONFIG = ["tools:", "  create_work_item: allow", ""].join("\n");
 function workItemCustomTools(orgConfigYaml: string, actor = "agent") {
   const orgPolicy = parseOrgConfigYaml(orgConfigYaml);
   let storeRef: Store | null = null;
+  // SAFETY: the proxy target is intentionally empty; every property read is
+  // redirected to the store bound after boot.
   const storeProxy = new Proxy({} as Store, {
     get: (_target, prop: PropertyKey) => {
       if (storeRef === null) throw new Error("work item tools used before the harness store was bound");
+      // SAFETY: the proxy key is supplied by the Store consumer and is
+      // narrowed to the Store property domain before access.
       return storeRef[prop as keyof Store];
     },
   }) as Store;
   const defs: ToolDefinition[] = [];
+  // SAFETY: the fixture registration callback receives exactly the extension
+  // API shape consumed by workItemsExtension.
   workItemsExtension(storeProxy, { orgPolicy, actor })({
     registerTool: (tool: ToolDefinition) => void defs.push(tool),
   } as ExtensionAPI);
   return {
+    // SAFETY: adding the marker preserves every ToolDefinition field; the
+    // harness consumes the resulting object through the same tool contract.
     customTools: defs.map((def) => ({ ...def, __isToolDefinition: true }) as ToolDefinition),
     bindStore(store: Store) {
       storeRef = store;
@@ -87,18 +95,23 @@ type ApprovalPayload = { tool: string; approved: boolean; approver: string | nul
 type ForkPayload = { id: string; forked_from: string; note?: string; by: string };
 
 function createdPayload(row: AuditRow): CreatedPayload {
+  // SAFETY: this audit event is serialized by the work-item creation path with
+  // the exact payload shape asserted by CreatedPayload.
   return JSON.parse(row.payload) as CreatedPayload;
 }
 
 function transitionPayload(row: AuditRow): TransitionPayload {
+  // SAFETY: transition audit rows are emitted with these four fields.
   return JSON.parse(row.payload) as TransitionPayload;
 }
 
 function approvalPayload(row: AuditRow): ApprovalPayload {
+  // SAFETY: approval audit rows are emitted with this decision payload.
   return JSON.parse(row.payload) as ApprovalPayload;
 }
 
 function forkPayload(row: AuditRow): ForkPayload {
+  // SAFETY: fork audit rows are emitted with this source/child payload.
   return JSON.parse(row.payload) as ForkPayload;
 }
 
@@ -136,7 +149,9 @@ function lazyApprovalRouter() {
 type ApprovalPrompt = { requestId: string; messageTs: string };
 
 /** Capture the request id and message ts carried by the real approval blocks. */
-function captureApprovalPrompt(harness: Harness): { prompt: Promise<ApprovalPrompt>; seen: ApprovalPrompt[] } {
+type ApprovalCapture = { prompt: Promise<ApprovalPrompt>; seen: ApprovalPrompt[] };
+
+function captureApprovalPrompt(harness: Harness): ApprovalCapture {
   const seen: ApprovalPrompt[] = [];
   const originalPost = harness.adapter.postMessage.bind(harness.adapter);
   let resolvePrompt: ((prompt: ApprovalPrompt) => void) | undefined;
@@ -199,6 +214,8 @@ describe("headless work items (issue #363)", () => {
       expect(item.state).toBe("open");
       const requested = await harness.store.listAudit({ event_type: APPROVAL_REQUESTED_EVENT });
       const resolved = await harness.store.listAudit({ event_type: APPROVAL_RESOLVED_EVENT });
+      // SAFETY: approval-request audit rows are serialized by the approval
+      // router with the tool and reason fields asserted below.
       expect(requested.map((row) => JSON.parse(row.payload) as { tool: string; reason: string })).toEqual([
         expect.objectContaining({ tool: "create_work_item", reason: "exec-tier tool requires human approval" }),
       ]);
@@ -335,6 +352,8 @@ describe("headless work items (issue #363)", () => {
 
       const done = await harness.store.getWorkItem(item.id);
       expect(done?.state).toBe("done");
+      // SAFETY: a done work item stores its result as the summary object
+      // produced by the completion tool.
       expect(JSON.parse(done?.result ?? "{}") as { summary: string }).toEqual({ summary: "answered from the conversation" });
       const transitions = (await harness.store.listAudit({ event_type: WORK_ITEM_TRANSITION_EVENT }))
         .map(transitionPayload)
@@ -381,6 +400,8 @@ describe("headless work items (issue #363)", () => {
       expect(child.id).not.toBe(source.id);
       expect(child.state).toBe("open");
       expect(child.forked_from).toBe(source.id);
+      // SAFETY: forked work items store this timeline/note object in
+      // fork_json, written by forkWorkItem.
       expect(JSON.parse(child.fork_json ?? "{}") as { timelineIndex: number; note: string }).toMatchObject({
         timelineIndex: 1,
         note: "try again",

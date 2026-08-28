@@ -7,6 +7,8 @@ function reader(snapshotIds: number[], disabledIds: number[], fail = false) {
   const client = {
     fetchSnapshot: async () => {
       if (fail) throw new Error("broker unreachable");
+      // SAFETY: this fixture implements the broker snapshot response shape
+      // consumed by createBrokerCredentialStatusReader.
       return {
         status: 200 as const,
         snapshot: {

@@ -81,20 +81,32 @@ const WIRE_TIERS = {
 } as const;
 
 /** Minimal inputSchema per wire tool — the MCP spec requires one. */
-function wireInputSchema(wire: string) {
-  const schema = {
-    type: "object" as const,
+type WireInputSchema = {
+  type: "object";
+  properties: { query: { type: string }; title: { type: string } };
+  required?: string[];
+};
+
+function wireInputSchema(wire: string): WireInputSchema {
+  const schema: WireInputSchema = {
+    type: "object",
     properties: {
       query: { type: "string" },
       title: { type: "string" },
     },
   };
   if (wire.includes("search")) {
-    return { ...schema, required: ["query"] };
+    schema.required = ["query"];
   }
   return schema;
 }
 
+interface WireTool {
+  name: string;
+  description: string;
+  inputSchema: WireInputSchema;
+  annotations?: { readOnlyHint: boolean; destructiveHint: boolean };
+}
 /**
  * The hermetic transport seam (issue #158): an in-memory MCP server for one
  * provider serving tools/list (discovery) and tools/call (execution) — no
@@ -107,17 +119,20 @@ function stubMcpTransport(provider: (typeof PROVIDERS)[number], seen?: { tool: s
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = new Server({ name: `${provider}-stub`, version: "1.0.0" }, { capabilities: { tools: {} } });
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: WIRE_SURFACE[provider].map((wire) => ({
-        name: wire,
-        description: `${provider} ${wire}`,
-        inputSchema: wireInputSchema(wire),
+      tools: WIRE_SURFACE[provider].map((wire) => {
+        const tool: WireTool = {
+          name: wire,
+          description: `${provider} ${wire}`,
+          inputSchema: wireInputSchema(wire),
+        };
         // Notion's hosted server publishes readOnlyHint on its read tools —
         // and its "notion-" prefix defeats the first-token verb heuristic,
         // so the annotation is what the #157 classifier keys on (#361).
-        ...(wire.startsWith("notion-")
-          ? { annotations: { readOnlyHint: /search|fetch/.test(wire), destructiveHint: false } }
-          : {}),
-      })),
+        if (wire.startsWith("notion-")) {
+          tool.annotations = { readOnlyHint: /search|fetch/.test(wire), destructiveHint: false };
+        }
+        return tool;
+      }),
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       seen?.tool.push(request.params.name);

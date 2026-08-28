@@ -6,6 +6,7 @@
  * unreachable by design in this lane.
  */
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { bootHarness, type Harness } from "./harness";
 import { THINKING_PHRASES, REQUEST_ONLY_DIRECTIVE } from "../../src/server/services/space-service";
 import { loadSpacePolicy, parseOrgConfigYaml } from "../../src/policy/config";
@@ -67,7 +68,12 @@ describe("headless conversation lane (issue #363)", () => {
     await withHarness({ headless: true, orgConfigYaml: "response_mode: request-only\n", modelTurns: [{ type: "text", text: "ok" }] }, async (h) => {
       await h.deliverMessage(h.slack.dmChannelId, "explicit");
       await h.modelStub.waitForRequests(1);
-      expect(h.modelStub.latestMessages().some((m) => typeof m.content === "string" && m.content.includes(REQUEST_ONLY_DIRECTIVE))).toBe(true);
+      expect(
+        h.modelStub.latestMessages().some((m) => {
+          const parsed = z.string().safeParse(m.content);
+          return parsed.success && parsed.data.includes(REQUEST_ONLY_DIRECTIVE);
+        }),
+      ).toBe(true);
       const clamped = await loadSpacePolicy(org, h.store, `slack:${h.slack.dmChannelId}`);
       expect(clamped.responseMode).toBe("request-only");
     });
@@ -83,6 +89,8 @@ describe("headless conversation lane (issue #363)", () => {
       const adapter = h.adapter;
       expect("streams" in adapter).toBe(true);
       const streams = await waitFor(() => {
+        // SAFETY: the adapter's `streams` property is established by the
+        // preceding `"streams" in adapter` assertion.
         const current = (adapter as typeof adapter & { streams: Array<{ op: string; text?: string }> }).streams;
         return current.length > 0 ? current : undefined;
       });

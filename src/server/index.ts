@@ -108,7 +108,7 @@ import { recordTurnUsage } from "../tools/usage-meter";
 import { ADMIN_ONBOARDING_BOOT_EVENT } from "../store/audit-events";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SecretFileBoundaryOpts } from "../extensions/boundary";
-import { createPreProbeEgressEnsure, createReconcileEgress } from "../extensions/egress-reconcile";
+import { createPreProbeEgressEnsure, createReconcileEgress, type ReconcileEgressDeps } from "../extensions/egress-reconcile";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -635,12 +635,12 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   // container's /app/config is the immutable image layer; the proxy-visible
   // config lives on the shared data volume.
   const runtimeEgressPath = process.env.BOTTEGA_PROXY_CONFIG_PATH;
-  const runtimeReconcileEgress = createReconcileEgress({
-    store,
-    ...(runtimeEgressPath !== undefined
-      ? { egressPath: runtimeEgressPath, devEgressPath: `${runtimeEgressPath}.dev` }
-      : {}),
-  });
+  const runtimeReconcileDeps: ReconcileEgressDeps = { store };
+  if (runtimeEgressPath !== undefined) {
+    runtimeReconcileDeps.egressPath = runtimeEgressPath;
+    runtimeReconcileDeps.devEgressPath = `${runtimeEgressPath}.dev`;
+  }
+  const runtimeReconcileEgress = createReconcileEgress(runtimeReconcileDeps);
   const callbackDeps: OAuthCallbackEndpointDeps = {
     store,
     audit,
@@ -706,23 +706,20 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
   const catalogRegisterDeps: CatalogRegisterDeps = {
     snapshotsDir: process.env.BOTTEGA_EXTENSIONS_DIR ?? SNAPSHOTS_DIR,
     runtimeRegistry: storeRuntimeRegistrySeam(store),
-    ...(runtimeEgressPath !== undefined
-      ? {
-          // The post-registration regen must target the SAME shared,
-          // proxy-visible file as the pre-probe ensure (#366). Falling back
-          // to config/egress.yml writes the immutable image layer in a
-          // hardened deployment (EROFS) and would not update the running
-          // proxy even if the root were writable.
-          egressPath: runtimeEgressPath,
-          devEgressPath: `${runtimeEgressPath}.dev`,
-          ensureEgressHosts: createPreProbeEgressEnsure({
-            store,
-            egressPath: runtimeEgressPath,
-            devEgressPath: `${runtimeEgressPath}.dev`,
-          }),
-        }
-      : {}),
   };
+  if (runtimeEgressPath !== undefined) {
+    // The post-registration regen must target the SAME shared, proxy-visible
+    // file as the pre-probe ensure (#366).
+    Object.assign(catalogRegisterDeps, {
+      egressPath: runtimeEgressPath,
+      devEgressPath: `${runtimeEgressPath}.dev`,
+      ensureEgressHosts: createPreProbeEgressEnsure({
+        store,
+        egressPath: runtimeEgressPath,
+        devEgressPath: `${runtimeEgressPath}.dev`,
+      }),
+    });
+  }
   // Extension tool runtime (issue #53): every extension tool call crosses
   // the policy gate → credential ladder → egress boundary → audit — built
   // by bootstrapRuntime above with the router just assigned (the #172

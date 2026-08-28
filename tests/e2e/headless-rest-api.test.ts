@@ -3,6 +3,7 @@
  * exercises every documented route, and verifies durable store/audit effects.
  */
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { bootHarness } from "./harness";
 import { REST_ROUTES, AUTH_THROTTLE_MAX_PER_IP } from "../../src/server/api";
 import {
@@ -13,12 +14,17 @@ import {
   API_WORK_ITEM_TIMELINE_EVENT,
   WORK_ITEM_TRANSITION_EVENT,
 } from "../../src/store/audit-events";
+import type { JsonObject } from "../../src/extensions/manifest";
 
-async function json(response: Response): Promise<Record<string, unknown>> {
-  const value: unknown = await response.json();
-  expect(typeof value).toBe("object");
-  expect(value).not.toBeNull();
-  return value as Record<string, unknown>;
+type RestJson = JsonObject;
+
+async function json(response: Response): Promise<RestJson> {
+  const value = await response.json();
+  const parsed = z.record(z.string(), z.unknown()).safeParse(value);
+  if (!parsed.success) throw new Error("REST response was not a JSON object");
+  // SAFETY: REST endpoint responses are JSON objects; the parser above rejects
+  // null, arrays, and primitive response bodies before this domain projection.
+  return parsed.data as RestJson;
 }
 
 describe("headless REST API (issue #363)", () => {
@@ -49,8 +55,10 @@ describe("headless REST API (issue #363)", () => {
       const spaces = await json(await rest.request("/api/v1/spaces"));
       expect(spaces.count).toBe(1);
       expect(Array.isArray(spaces.spaces)).toBe(true);
-      const space = (spaces.spaces as unknown[])[0] as Record<string, unknown>;
-      expect(typeof space.id).toBe("string");
+      // SAFETY: the REST spaces response declares `spaces` as a JSON array;
+      // this assertion follows the preceding array-shape check.
+      const space = (spaces.spaces as JsonObject[])[0]!;
+      expect(z.string().safeParse(space.id).success).toBe(true);
 
       const created = await rest.request("/api/v1/work-items", {
         method: "POST",
@@ -59,7 +67,7 @@ describe("headless REST API (issue #363)", () => {
       });
       expect(created.status).toBe(201);
       const createdBody = await json(created);
-      expect(typeof createdBody.id).toBe("string");
+      expect(z.string().safeParse(createdBody.id).success).toBe(true);
       expect(createdBody.state).toBe("open");
       const itemId = String(createdBody.id);
       expect((await h.store.getWorkItem(itemId))?.description).toContain("details");
@@ -84,7 +92,7 @@ describe("headless REST API (issue #363)", () => {
       const fork = await rest.request(`/api/v1/work-items/${itemId}/fork`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ atTimelineIndex: 0 }) });
       expect(fork.status).toBe(201);
       const forkBody = await json(fork);
-      expect(typeof forkBody.id).toBe("string");
+      expect(z.string().safeParse(forkBody.id).success).toBe(true);
       expect(forkBody.forked_from).toBe(itemId);
       expect((await h.store.queryAudit({ event_type: API_WORK_ITEM_FORKED_EVENT })).rows.length).toBe(1);
 
@@ -101,7 +109,9 @@ describe("headless REST API (issue #363)", () => {
       const openapiResponse = await rest.request("/openapi.json");
       expect(openapiResponse.status).toBe(200);
       const openapi = await json(openapiResponse);
-      const paths = openapi.paths as Record<string, unknown>;
+      // SAFETY: the OpenAPI response declares `paths` as a JSON object; this
+      // assertion follows the response parser's object-shape validation.
+      const paths = openapi.paths as JsonObject;
       for (const route of REST_ROUTES) if (route.path.startsWith("/api/v1")) expect(paths[route.path]).toBeDefined();
 
       const before404 = (await h.store.queryAudit()).rows.length;

@@ -19,7 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { probeMcpEndpoint } from "./mcp-endpoint-probe";
-
+import type { JsonObject } from "./manifest";
 /** A valid initialize result the stub serves (the SDK's accepted wire shape). */
 const INITIALIZE_RESULT = JSON.stringify({
   jsonrpc: "2.0",
@@ -265,7 +265,9 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
   });
 
   test("HTTP 200 text/event-stream initialize message with the wrong id is rejected", async () => {
-    const wrongId = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
+    // SAFETY: INITIALIZE_RESULT is this suite's own serialized JSON-RPC
+    // object, and the probe validates its shape before accepting it.
+    const wrongId = JSON.parse(INITIALIZE_RESULT) as JsonObject;
     wrongId.id = 2;
     const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
       fetchImpl: routeFetch([
@@ -312,9 +314,13 @@ describe("probeMcpEndpoint — rejected verdicts (fail closed)", () => {
   });
 
   test("conflicting text/event-stream initialize messages are rejected", async () => {
-    const first = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
-    const second = JSON.parse(INITIALIZE_RESULT) as Record<string, unknown>;
-    (second.result as Record<string, unknown>).serverInfo = { name: "other", version: "2" };
+    // SAFETY: the first value is parsed from the suite's valid initialize fixture.
+    const first = JSON.parse(INITIALIZE_RESULT) as JsonObject;
+    // SAFETY: the second value is parsed from the same valid initialize fixture.
+    const second = JSON.parse(INITIALIZE_RESULT) as JsonObject;
+    // SAFETY: the initialize fixture's result is a JSON object whose serverInfo
+    // field is intentionally replaced to create the conflict under test.
+    (second.result as JsonObject).serverInfo = { name: "other", version: "2" };
     const verdict = await probeMcpEndpoint("https://mcp.linear.app/mcp", {
       fetchImpl: routeFetch([
         {

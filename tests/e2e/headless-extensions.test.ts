@@ -15,6 +15,7 @@ import type { JsonObject, McpBinding } from "../../src/extensions/manifest";
 import { EXTENSION_CALL_EVENT, EXTENSION_CREDENTIAL_RESOLVED_EVENT, POLICY_DECISION_EVENT } from "../../src/store/audit-events";
 
 function payload(row: AuditRow): JsonObject {
+  // SAFETY: audit rows are serialized JSON objects by the store's append path.
   return JSON.parse(row.payload) as JsonObject;
 }
 async function seed(store: Store, scope: "org" | "personal", owner: string | null): Promise<ExtensionCredential> {
@@ -30,6 +31,8 @@ function transport(): (binding: McpBinding) => Transport {
   return () => {
     const [client, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = new Server({ name: "fixture", version: "1" }, { capabilities: { tools: {} } });
+    // SAFETY: this fixture always sends a JSON object of tool arguments with
+    // the asserted city field to the MCP server.
     server.setRequestHandler(CallToolRequestSchema, async (request) => ({ content: [{ type: "text", text: `sunny in ${String((request.params.arguments as JsonObject)["city"] ?? "")}` }] }));
     void server.connect(serverTransport);
     return client;

@@ -22,6 +22,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { bootHarness, AutoApproveRouter, type Harness } from "./harness";
 import type { StubTurn } from "./harness";
 import { parseOrgConfigYaml, type PolicyConfig } from "../../src/policy/config";
@@ -45,15 +46,21 @@ const HEADLESS_ACTOR = "U-headless-human";
  * Late-bound store/audit pair for eager gatedTools factories: definitions
  * close over proxies that resolve to the real booted instances after boot.
  */
-function lateBind(): { store: Store; audit: AuditModule; bind(h: Harness): void } {
+type LateBoundTools = { store: Store; audit: AuditModule; bind(h: Harness): void };
+
+function lateBind(): LateBoundTools {
   let real: { store: Store; audit: AuditModule } | null = null;
   const proxied = <T extends object>(pick: () => T): T =>
+    // SAFETY: the proxy target is intentionally empty; every property read is
+    // redirected to the bound dependency in the `get` trap below.
     new Proxy({} as T, {
       get(_t, prop: PropertyKey) {
         if (real === null) throw new Error("late-bound tools used before bootHarness returned");
         const target = pick();
-        const value = Reflect.get(target as object, prop, target);
-        return typeof value === "function" ? value.bind(target) : value;
+        // SAFETY: Proxy `get` receives a key from the target object; keyof T is
+        // the exact property domain exposed by the late-bound dependency.
+        const value = prop in target ? target[prop as keyof T] : undefined;
+        return value instanceof Function ? value.bind(target) : value;
       },
     });
   const store = proxied(() => real!.store);
@@ -66,6 +73,8 @@ type PolicyDecision = { tool?: string; decision?: string };
 async function decisions(h: Harness): Promise<PolicyDecision[]> {
   const rows = await h.store.listAudit({ limit: 300 });
   return rows.filter((row) => row.event_type === POLICY_DECISION_EVENT).map((row) => {
+    // SAFETY: policy decision rows are serialized by the audit writer with
+    // this optional tool/decision payload shape.
     const payload = JSON.parse(row.payload) as { tool?: string; tool_name?: string; decision?: string };
     return { tool: payload.tool ?? payload.tool_name, decision: payload.decision };
   });
@@ -75,7 +84,8 @@ async function decisions(h: Harness): Promise<PolicyDecision[]> {
 function lastToolText(h: Harness): string {
   const messages = h.modelStub.latestMessages();
   const tool = [...messages].reverse().find((m) => m.role === "tool");
-  return typeof tool?.content === "string" ? tool.content : JSON.stringify(tool?.content ?? "");
+  const parsed = z.string().safeParse(tool?.content);
+  return parsed.success ? parsed.data : JSON.stringify(tool?.content ?? "");
 }
 
 const TOOL_ALLOWLIST = [
@@ -238,7 +248,10 @@ describe("headless tool families (issue #363)", () => {
       await h.modelStub.waitForRequests(3);
       const combined = h.modelStub.requests
         .map((r) => [...r.messages].reverse().find((m) => m.role === "tool"))
-        .map((m) => (typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")))
+        .map((m) => {
+          const parsed = z.string().safeParse(m?.content);
+          return parsed.success ? parsed.data : JSON.stringify(m?.content ?? "");
+        })
         .join("\n");
       expect(combined).toContain("do it");
     } finally {
@@ -266,6 +279,8 @@ describe("headless tool families (issue #363)", () => {
       await h.deliverMessage(h.slack.dmChannelId, "refresh knowledge base");
       await h.modelStub.waitForRequests(2);
       const db = h.store.getDb();
+      // SAFETY: this aggregate query always returns one row with its numeric
+      // COUNT(*) value under the `n` alias.
       const queued = db.query("SELECT COUNT(*) AS n FROM worker_jobs WHERE kind = 'kb'").get() as { n: number };
       expect(queued.n).toBeGreaterThanOrEqual(1);
     } finally { await h.cleanup(); }

@@ -1,69 +1,74 @@
 import { registerOAuthProvider } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthProviderInterface } from "@oh-my-pi/pi-ai/oauth";
+import { z } from "zod";
 
 export const NOTION_TOKEN_ENDPOINT = "https://mcp.notion.com/token";
 
-export type NotionOAuthCredentials = OAuthCredentials & Record<string, unknown>;
-type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-
-type TokenResponse = {
-  access_token: string;
-  expires_in: number;
-  refresh_token?: string;
+type NotionClientCredentials = {
+  client_id?: string;
+  client_secret?: string;
+  token_endpoint_auth_method?: "client_secret_basic" | "client_secret_post" | "none";
+  identity_key?: string;
+  client_metadata?: { registration_id?: string };
 };
 
-function parseTokenResponse(value: unknown): TokenResponse | null {
-  if (value === null || typeof value !== "object") return null;
-  const response = value as Record<string, unknown>;
-  if (typeof response.access_token !== "string" || response.access_token.length === 0) return null;
-  if (typeof response.expires_in !== "number" || !Number.isFinite(response.expires_in) || response.expires_in <= 0) return null;
-  if (response.refresh_token !== undefined && (typeof response.refresh_token !== "string" || response.refresh_token.length === 0)) {
-    return null;
-  }
-  return {
-    access_token: response.access_token,
-    expires_in: response.expires_in,
-    ...(response.refresh_token === undefined ? {} : { refresh_token: response.refresh_token }),
-  };
-}
+export type NotionOAuthCredentials = OAuthCredentials & NotionClientCredentials;
+type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-function clientCredentials(credentials: NotionOAuthCredentials): { method: string; clientId: string; clientSecret?: string } {
-  const method = credentials.token_endpoint_auth_method;
-  const clientId = credentials.client_id;
-  if (method !== "client_secret_basic" && method !== "client_secret_post" && method !== "none") {
+const TOKEN_RESPONSE_SCHEMA = z.object({
+  access_token: z.string().min(1),
+  expires_in: z.number().finite().positive(),
+  refresh_token: z.string().min(1).optional(),
+});
+type TokenResponse = z.infer<typeof TOKEN_RESPONSE_SCHEMA>;
+
+const ERROR_RESPONSE_SCHEMA = z.object({ error: z.string().regex(/^[a-z0-9_]{1,64}$/).optional() });
+
+type ClientCredentials =
+  | { method: "client_secret_basic"; clientId: string; clientSecret: string }
+  | { method: "client_secret_post"; clientId: string; clientSecret: string }
+  | { method: "none"; clientId: string };
+
+
+function clientCredentials(credentials: NotionOAuthCredentials): ClientCredentials {
+  const parsedMethod = z
+    .enum(["client_secret_basic", "client_secret_post", "none"])
+    .safeParse(credentials.token_endpoint_auth_method);
+  if (!parsedMethod.success) {
     throw new Error("Notion OAuth credential has an unsupported client authentication method");
   }
-  if (typeof clientId !== "string" || clientId.length === 0) {
+  const method = parsedMethod.data;
+  const clientId = z.string().min(1).safeParse(credentials.client_id);
+  if (!clientId.success) {
     throw new Error("Notion OAuth credential is missing its client id");
   }
   if (method !== "none") {
-    const clientSecret = credentials.client_secret;
-    if (typeof clientSecret !== "string" || clientSecret.length === 0) {
+    const clientSecret = z.string().min(1).safeParse(credentials.client_secret);
+    if (!clientSecret.success) {
       throw new Error("Notion OAuth credential is missing its client secret");
     }
-    return { method, clientId, clientSecret };
+    return { method, clientId: clientId.data, clientSecret: clientSecret.data };
   }
-  return { method, clientId };
+  return { method, clientId: clientId.data };
 }
 
 export async function refreshNotionToken(
   credentials: NotionOAuthCredentials,
   fetchImpl: FetchImpl = fetch,
 ): Promise<NotionOAuthCredentials> {
-  if (typeof credentials.refresh !== "string" || credentials.refresh.length === 0) {
-    throw new Error("Notion OAuth credential is missing its refresh token");
-  }
+  const refresh = z.string().min(1).safeParse(credentials.refresh);
+  if (!refresh.success) throw new Error("Notion OAuth credential is missing its refresh token");
   const client = clientCredentials(credentials);
-  const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: credentials.refresh });
+  const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh.data });
   const headers = new Headers({
     accept: "application/json",
     "content-type": "application/x-www-form-urlencoded",
   });
   if (client.method === "client_secret_basic") {
-    headers.set("authorization", `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret!}`).toString("base64")}`);
+    headers.set("authorization", `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString("base64")}`);
   } else {
     body.set("client_id", client.clientId);
-    if (client.method === "client_secret_post") body.set("client_secret", client.clientSecret!);
+    if (client.method === "client_secret_post") body.set("client_secret", client.clientSecret);
   }
 
   let response: Response;
@@ -75,8 +80,8 @@ export async function refreshNotionToken(
   if (!response.ok) {
     let code: string | undefined;
     try {
-      const value = (await response.json()) as Record<string, unknown>;
-      if (typeof value.error === "string" && /^[a-z0-9_]{1,64}$/.test(value.error)) code = value.error;
+      const parsedError = ERROR_RESPONSE_SCHEMA.safeParse(await response.json());
+      if (parsedError.success) code = parsedError.data.error;
     } catch {
       // Status-only error below: response bodies can contain credential data.
     }
@@ -89,18 +94,20 @@ export async function refreshNotionToken(
 
   let parsed: TokenResponse | null;
   try {
-    parsed = parseTokenResponse(await response.json());
+    const tokenResponse = TOKEN_RESPONSE_SCHEMA.safeParse(await response.json());
+    parsed = tokenResponse.success ? tokenResponse.data : null;
   } catch {
     parsed = null;
   }
   if (!parsed) throw new Error("Notion OAuth token refresh returned a malformed response");
 
-  return {
+  const refreshed: NotionOAuthCredentials = {
     ...credentials,
     access: parsed.access_token,
     expires: Date.now() + parsed.expires_in * 1000,
     refresh: parsed.refresh_token ?? credentials.refresh,
   };
+  return refreshed;
 }
 
 export function createNotionOAuthProvider(fetchImpl: FetchImpl = fetch): OAuthProviderInterface {
@@ -111,6 +118,8 @@ export function createNotionOAuthProvider(fetchImpl: FetchImpl = fetch): OAuthPr
     login: async () => {
       throw new Error("Notion OAuth interactive login is not supported by the auth broker");
     },
+    // SAFETY: the OAuth provider contract supplies its credential object from
+    // AuthStorage; Notion adds the optional client fields used by this broker.
     refreshToken: (credentials) => refreshNotionToken(credentials as NotionOAuthCredentials, fetchImpl),
     getApiKey: (credentials) => credentials.access,
   };

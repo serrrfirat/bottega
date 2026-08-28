@@ -24,9 +24,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { CatalogError, DEFAULT_CATALOG_URL, type CatalogEntry } from "./fetch-catalog";
+import type { JsonValue } from "./manifest";
 import { createExtensionRegistry, parsePinnedSnapshot, type ExtensionRegistry, type PinnedSnapshot } from "./registry";
-import { type CatalogRegisterRuntimeDeps, type RuntimeRegistrySeam } from "./catalog-register";
 import {
+  type CatalogRegisterRuntimeDeps,
+  type RuntimeRegistrySeam,
   discoverCatalogMcp,
   lookupCatalogExtension,
   registerExtensionAtRuntime,
@@ -168,7 +170,7 @@ function statusAt(url: string, status: number): Route {
   return { match: url, status };
 }
 /** Serves a JSON document at `url` (metadata doubles). */
-function jsonAt(url: string, body: unknown, status = 200): Route {
+function jsonAt(url: string, body: JsonValue, status = 200): Route {
   return { match: url, status, body: JSON.stringify(body), headers: { "content-type": "application/json" } };
 }
 

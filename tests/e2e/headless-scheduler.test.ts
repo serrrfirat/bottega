@@ -20,6 +20,7 @@ import { postOutboxRow } from "../../src/store/outbox";
 import { postPendingOutboxRows } from "../../src/server/services/outbox-post-seam";
 import { createMemoryReactiveStorage, startReactiveCore } from "../../src/events/reactive";
 import { bootHarness, type Harness } from "./harness";
+import type { JsonObject } from "../../src/extensions/manifest";
 
 const SPACE_ID = "slack:C-HEADLESSOPS";
 const CHANNEL_ID = "C-HEADLESSOPS";
@@ -71,8 +72,9 @@ function schedulerDeps(
     now,
   };
 }
-
 function context(spaceId: string): ExtensionContext {
+  // SAFETY: the scheduler tool context only reads sessionManager.getSessionFile;
+  // this minimal fixture intentionally implements that dependency.
   return {
     sessionManager: {
       getSessionFile: () => `/tmp/headless-scheduler/${spaceId}.jsonl`,
@@ -126,8 +128,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1500): Promise<void
   await waiter.promise;
 }
 
-function auditPayload(row: { payload: string }): Record<string, unknown> {
-  return jsonObjectSchema.parse(JSON.parse(row.payload));
+function auditPayload(row: { payload: string }): JsonObject {
+  // SAFETY: the scheduler audit payload schema validates the parsed response
+  // as a JSON object before projecting it into the shared JSON domain.
+  return jsonObjectSchema.parse(JSON.parse(row.payload)) as JsonObject;
 }
 
 describe("headless scheduler and outbox (issue #363)", () => {
@@ -322,6 +326,8 @@ describe("headless scheduler and outbox (issue #363)", () => {
       const first = await postPendingOutboxRows(h.store, h.adapter, { now: () => createdAt + 1_000 });
       expect(first).toEqual({ posted: 1, nudged: 0 });
       expect(h.messages(CHANNEL_ID).map((message) => message.text)).toEqual(["scheduled Done: queued scheduled result"]);
+      // SAFETY: this SELECT projects exactly the OutboxStatusRow columns and
+      // aliases them to the fields asserted below.
       const row = h.store.getDb().query("SELECT status, attempts, posted_at FROM outbox WHERE id = ?").get("headless-scheduled-outbox") as OutboxStatusRow;
       expect(row.status).toBe("posted");
 

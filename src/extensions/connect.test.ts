@@ -164,16 +164,19 @@ function makeDeps(overrides: {
   const broker = overrides.broker ?? new RecordingBroker();
   const mcpOAuth = overrides.mcpOAuth ?? new RecordingMcpOAuth();
   const policy = overrides.policy ?? defaultPolicy();
+  const deps: ConnectExtensionDeps = {
+    registry: registry(),
+    store,
+    audit: createAudit(store),
+    broker: broker.connect.bind(broker),
+    mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth), probeCallbackBase: mcpOAuth.probeCallbackBase.bind(mcpOAuth) },
+    gate: { loadPolicy: () => Promise.resolve(policy), router },
+  };
+  if (overrides.brokerCredentialStatus !== undefined) {
+    deps.brokerCredentialStatus = overrides.brokerCredentialStatus;
+  }
   return {
-    deps: {
-      registry: registry(),
-      store,
-      audit: createAudit(store),
-      broker: broker.connect.bind(broker),
-      mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth), probeCallbackBase: mcpOAuth.probeCallbackBase.bind(mcpOAuth) },
-      ...(overrides.brokerCredentialStatus !== undefined ? { brokerCredentialStatus: overrides.brokerCredentialStatus } : {}),
-      gate: { loadPolicy: () => Promise.resolve(policy), router },
-    },
+    deps,
     store,
     router,
     broker,

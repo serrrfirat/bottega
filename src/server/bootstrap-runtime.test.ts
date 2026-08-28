@@ -10,6 +10,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { AuthorizationContext } from "../extensions/boundary";
 import {
   SCOPED_AUTHORIZATIONS_BEGIN,
@@ -23,7 +24,7 @@ import { bootstrapRuntime } from "./bootstrap-runtime";
 
 const SNAPSHOT = resolve(import.meta.dir, "../../config/extensions/github.json");
 
-function toolsTransport(fail = false): (binding: McpBinding, auth?: unknown, authorization?: AuthorizationContext) => Transport {
+function toolsTransport(fail = false): (binding: McpBinding) => Transport {
   return () => {
     if (fail) throw new Error("provider tools/list unavailable");
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -37,9 +38,9 @@ function toolsTransport(fail = false): (binding: McpBinding, auth?: unknown, aut
 }
 
 function authorizedTransport(seen: AuthorizationContext[], fail = false) {
-  return (binding: McpBinding, auth?: unknown, authorization?: AuthorizationContext): Transport => {
+  return (binding: McpBinding, _auth?: OAuthClientProvider, authorization?: AuthorizationContext): Transport => {
     if (authorization !== undefined) seen.push(authorization);
-    return toolsTransport(fail)(binding, auth, authorization);
+    return toolsTransport(fail)(binding);
   };
 }
 

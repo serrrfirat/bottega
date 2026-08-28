@@ -1015,7 +1015,7 @@ export class SpaceService {
       this.#presenterFor(spaceId).onTurnStart();
     });
     session.on("message", (data) => {
-      if (typeof data.text !== "string") {
+      if (data.text === undefined) {
         this.#presenterFor(spaceId).onMessage(data);
         return;
       }

@@ -11,6 +11,7 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     expect(broker["image"]).toBe("bottega:${BOTTEGA_IMAGE_TAG:-local}");
     // SAFETY: hand-authored fixture renders `entrypoint` as a block sequence of scalars.
     expect(broker["entrypoint"] as string[]).toEqual(["/entrypoints/broker.sh"]);
+    // SAFETY: the fixture declares `command` as a block sequence of scalars.
     expect(broker["command"] as string[]).toEqual([
       "auth-broker",
       "serve",
@@ -89,10 +90,12 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
       expect(keys.some((k) => /^(NEAR_API_KEY|SLACK_APP_TOKEN|SLACK_BOT_TOKEN|GITHUB_PAT)$/.test(k))).toBe(false);
     }
   });
-
   test("server and executor wait for a healthy broker before starting", () => {
     for (const name of ["server", "executor"]) {
+      // SAFETY: each service declares depends_on as a mapping with the broker
+      // health condition in the hand-authored compose fixture.
       const depends = service(name)["depends_on"] as Record<string, YamlNode>;
+      // SAFETY: the broker depends_on entry is a mapping carrying condition.
       expect((depends["auth-broker"] as Record<string, YamlNode>)["condition"]).toBe("service_healthy");
     }
   });

@@ -54,8 +54,8 @@ export interface SurfaceFailureObserver {
 
 /** The effective tool surface of every extension, keyed by extension id. */
 export type ExtensionSurfaces = ReadonlyMap<string, readonly ExtensionTool[]>;
-function clearlyAuthRelatedFailure(err: unknown): boolean {
-  const message = errorMessage(err).toLowerCase();
+function clearlyAuthRelatedFailure(err: string): boolean {
+  const message = err.toLowerCase();
   return (
     /\b(expired|revoked|invalid[_ -]?token|invalid[_ -]?grant)\b/.test(message) ||
     /\bre-?auth(orize|entication)?\b/.test(message) ||
@@ -157,7 +157,7 @@ export async function resolveExtensionSurfaces(
             connected = false;
           }
         }
-        if (connected && clearlyAuthRelatedFailure(err)) {
+        if (connected && clearlyAuthRelatedFailure(errorMessage(err))) {
           opts.failureObserver?.onAuthFailure?.({ providerId: manifest.id, label: manifest.label });
         }
         if (connected) {

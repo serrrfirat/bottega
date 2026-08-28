@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { JsonValue } from "../extensions/manifest";
 import {
   createNotionOAuthProvider,
   NOTION_TOKEN_ENDPOINT,
@@ -10,6 +11,8 @@ const CLIENT_SECRET = "notion-client-secret";
 const REFRESH = "notion-refresh-token";
 
 function credential(authMethod: string) {
+  // SAFETY: this fixture includes Notion's optional client metadata fields;
+  // the broker accepts the OAuth provider's credential contract plus those fields.
   return {
     refresh: REFRESH,
     access: "old-access-token",
@@ -24,14 +27,14 @@ function credential(authMethod: string) {
   } as never;
 }
 
-function response(body: unknown, status = 200): Response {
+function response(body: JsonValue, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
   });
 }
 
-function recordingFetch(body: unknown, status = 200) {
+function recordingFetch(body: JsonValue, status = 200) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const fetchImpl = async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), init: init ?? {} });
@@ -48,6 +51,8 @@ describe("Notion auth-broker OAuth provider", () => {
   test("factory registers the expected id and refuses interactive broker login", async () => {
     const provider = createNotionOAuthProvider();
     expect(provider.id).toBe("notion");
+    // SAFETY: the login fixture deliberately passes an empty argument because
+    // this provider always rejects interactive login before reading it.
     await expect(provider.login({} as never)).rejects.toThrow(/interactive login is not supported/i);
   });
 

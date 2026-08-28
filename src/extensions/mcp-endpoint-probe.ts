@@ -187,7 +187,7 @@ export async function probeMcpEndpoint(
     return parseSseInitialize(body.text);
   }
 
-  let doc: unknown;
+  let doc: JsonValue;
   try {
     doc = JSON.parse(body.text);
   } catch {
@@ -283,7 +283,7 @@ function parseSseInitialize(text: string): ProbeVerdict {
     if (!event.hasData) {
       return { ok: false, rejected: true, evidence: "HTTP 200 SSE message is missing data" };
     }
-    let doc: unknown;
+    let doc: JsonValue;
     try {
       doc = JSON.parse(event.data.join("\n"));
     } catch {
@@ -291,7 +291,7 @@ function parseSseInitialize(text: string): ProbeVerdict {
     }
     const verdict = validateInitializeDocument(doc, "HTTP 200 SSE message", true);
     if (!verdict.ok) return verdict;
-    const result = JSON.stringify((doc as Record<string, unknown>)["result"]);
+    const result = JSON.stringify(JSON.parse(event.data.join("\n"))["result"]);
     if (initializeResult !== undefined && initializeResult !== result) {
       return { ok: false, rejected: true, evidence: "HTTP 200 SSE stream contains conflicting multiple initialize messages" };
     }
@@ -300,20 +300,17 @@ function parseSseInitialize(text: string): ProbeVerdict {
   return { ok: true, kind: "mcp", evidence: "HTTP 200 SSE with a valid MCP initialize result" };
 }
 
-function validateInitializeDocument(doc: unknown, evidencePrefix: string, requireRequestId: boolean): ProbeVerdict {
-  // SAFETY: JSON.parse output is JSON-shaped by construction; the guard
-  // below is the authority on the record shape (fail closed otherwise).
-  const docValue = doc as JsonValue;
-  if (!isRecord(docValue)) {
+function validateInitializeDocument(doc: JsonValue, evidencePrefix: string, requireRequestId: boolean): ProbeVerdict {
+  if (!isRecord(doc)) {
     return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON body that is not a JSON-RPC response` };
   }
-  if (requireRequestId && (docValue["jsonrpc"] !== "2.0" || docValue["id"] !== 1)) {
+  if (requireRequestId && (doc["jsonrpc"] !== "2.0" || doc["id"] !== 1)) {
     return { ok: false, rejected: true, evidence: `${evidencePrefix} has a JSON-RPC message with the wrong id (expected 1)` };
   }
-  if (docValue["error"] !== undefined) {
+  if (doc["error"] !== undefined) {
     return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON-RPC error response (no initialize result)` };
   }
-  const result = docValue["result"];
+  const result = doc["result"];
   if (result === undefined) {
     return { ok: false, rejected: true, evidence: `${evidencePrefix} with a JSON body that has no initialize result` };
   }
