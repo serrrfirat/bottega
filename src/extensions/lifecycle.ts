@@ -13,6 +13,7 @@ import type { ConnectionStatus, ExtensionCredential, Store } from "../store/db";
 import { errorMessage, toolError } from "../tools/helpers";
 import { createSecretFileBoundary, type ConnectionBoundary, type CredentialReplacementPreparation } from "./boundary";
 import { connectViaAuthBroker, type BrokerConnector } from "./connect";
+import { createBrokerCredentialStatusReader, type BrokerCredentialStatusReader } from "./broker-status";
 import type { CredentialType } from "./manifest";
 import type { ExtensionRegistry } from "./registry";
 
@@ -22,6 +23,7 @@ export const REPLACE_CONNECTION_TOOL = "replace_connection";
 export const DISCONNECT_CONNECTION_TOOL = "disconnect_connection";
 
 export type { ConnectionBoundary } from "./boundary";
+export type { BrokerCredentialStatus, BrokerCredentialStatusReader } from "./broker-status";
 export type ConnectionReadModel = {
   id: string;
   provider: string;
@@ -96,6 +98,8 @@ export interface ConnectionLifecycleDeps {
     | "transitionExtensionConnection"
   >;
   audit: AuditModule;
+  /** Broker metadata health; no credential payload crosses this seam. */
+  brokerCredentialStatus?: BrokerCredentialStatusReader;
   authority?: ConnectionAuthority;
   boundary?: ConnectionBoundary;
   gate: {
@@ -139,7 +143,28 @@ function identityLabel(identityKey: string): string {
   return "connected account";
 }
 
-function toConnectionReadModel(connection: ExtensionCredential, registry: Pick<ExtensionRegistry, "resolve">): ConnectionReadModel {
+async function connectionNeedsReconnect(
+  connection: ExtensionCredential,
+  brokerCredentialStatus: BrokerCredentialStatusReader,
+): Promise<boolean> {
+  if (connection.status !== "active") return true;
+  try {
+    const health = await brokerCredentialStatus({
+      brokerCredentialId: connection.broker_credential_id,
+      provider: connection.vault_provider,
+    });
+    return health.state === "disabled" || health.state === "missing";
+  } catch {
+    // A status seam outage is unknown, never evidence that the credential is disabled.
+    return false;
+  }
+}
+
+async function toConnectionReadModel(
+  connection: ExtensionCredential,
+  registry: Pick<ExtensionRegistry, "resolve">,
+  brokerCredentialStatus: BrokerCredentialStatusReader,
+): Promise<ConnectionReadModel> {
   return {
     id: connection.id,
     provider: connection.provider,
@@ -149,7 +174,7 @@ function toConnectionReadModel(connection: ExtensionCredential, registry: Pick<E
     owner: connection.scope === "org" ? "organization" : "you",
     status: connection.status,
     revision: connection.revision,
-    reconnect_needed: connection.status !== "active",
+    reconnect_needed: await connectionNeedsReconnect(connection, brokerCredentialStatus),
     created_at: connection.created_at,
     updated_at: connection.updated_at,
   };
@@ -157,7 +182,8 @@ function toConnectionReadModel(connection: ExtensionCredential, registry: Pick<E
 
 function connectionLine(connection: ConnectionReadModel): string {
   const reconnectNeeded = connection.reconnect_needed ? "yes" : "no";
-  return `${connection.id} — ${connection.label}; identity=${connection.identity_label}; scope=${connection.scope}; owner=${connection.owner}; status=${connection.status}; revision=${connection.revision}; reconnect_needed=${reconnectNeeded}`;
+  const action = connection.reconnect_needed ? "; action=reauthorize" : "";
+  return `${connection.id} — ${connection.label}; identity=${connection.identity_label}; scope=${connection.scope}; owner=${connection.owner}; status=${connection.status}; revision=${connection.revision}; reconnect_needed=${reconnectNeeded}${action}`;
 }
 
 async function appendLifecycleAudit(
@@ -219,11 +245,11 @@ async function approveOrgMutation(
 /** Canonical authorization-filtered, redacted connection read model. */
 export async function listConnectionReadModel(
   input: { actor: string },
-  deps: Pick<ConnectionLifecycleDeps, "registry" | "store">,
+  deps: Pick<ConnectionLifecycleDeps, "registry" | "store" | "brokerCredentialStatus">,
 ): Promise<ConnectionReadModel[]> {
-  return (await deps.store.listExtensionConnections())
-    .filter((connection) => visibleConnection(connection, input.actor))
-    .map((connection) => toConnectionReadModel(connection, deps.registry));
+  const brokerCredentialStatus = deps.brokerCredentialStatus ?? createBrokerCredentialStatusReader();
+  const visible = (await deps.store.listExtensionConnections()).filter((connection) => visibleConnection(connection, input.actor));
+  return Promise.all(visible.map((connection) => toConnectionReadModel(connection, deps.registry, brokerCredentialStatus)));
 }
 
 export async function listConnections(
@@ -247,7 +273,8 @@ export async function inspectConnection(
 ): Promise<LifecycleOutcome> {
   const connection = await authorizedConnection(deps, input.connectionId, input.actor);
   if (!connection) return { ok: false, message: `connection "${input.connectionId}" not found` };
-  const model = toConnectionReadModel(connection, deps.registry);
+  const brokerCredentialStatus = deps.brokerCredentialStatus ?? createBrokerCredentialStatusReader();
+  const model = await toConnectionReadModel(connection, deps.registry, brokerCredentialStatus);
   await deps.audit.appendAudit({
     space_id: input.spaceId ?? null,
     actor: input.actor,

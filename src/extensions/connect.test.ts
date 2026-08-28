@@ -24,6 +24,7 @@ import {
   SECRET_PASTE_REDIRECT,
   storeBootSecret,
   type BrokerConnectResult,
+  type BrokerCredentialStatusReader,
   type ConnectExtensionDeps,
   type ConnectScope,
 } from "./connect";
@@ -151,12 +152,12 @@ interface Harness {
   broker: RecordingBroker;
   mcpOAuth: RecordingMcpOAuth;
 }
-
 function makeDeps(overrides: {
   policy?: PolicyConfig;
   router?: RecordingRouter;
   broker?: RecordingBroker;
   mcpOAuth?: RecordingMcpOAuth;
+  brokerCredentialStatus?: BrokerCredentialStatusReader;
 } = {}): Harness {
   const store = freshStore();
   const router = overrides.router ?? new RecordingRouter();
@@ -170,6 +171,7 @@ function makeDeps(overrides: {
       audit: createAudit(store),
       broker: broker.connect.bind(broker),
       mcpOAuth: { start: mcpOAuth.start.bind(mcpOAuth), probeCallbackBase: mcpOAuth.probeCallbackBase.bind(mcpOAuth) },
+      ...(overrides.brokerCredentialStatus !== undefined ? { brokerCredentialStatus: overrides.brokerCredentialStatus } : {}),
       gate: { loadPolicy: () => Promise.resolve(policy), router },
     },
     store,
@@ -420,6 +422,30 @@ describe("connectExtension re-connect", () => {
       expect(second.message).toContain("revision 1");
     }
     expect(h.broker.calls).toHaveLength(1);
+  });
+
+  test("a disabled broker reference instructs deterministic reauthorization instead of treating the row as healthy", async () => {
+    const h = makeDeps();
+    const first = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+    expect(first.ok).toBe(true);
+    const brokerCredentialId = first.ok && first.credential ? first.credential.broker_credential_id : -1;
+    const status: BrokerCredentialStatusReader = async (input) =>
+      input.brokerCredentialId === brokerCredentialId ? { state: "disabled", cause: "invalid_grant" } : { state: "unknown" };
+    h.deps.brokerCredentialStatus = status;
+
+    const second = await connect(h, "com.example.stdio-oauth", "personal", "UADA");
+
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      expect(second.message).toContain("reauthorization");
+      expect(second.message).toContain("disconnect_connection");
+      expect(second.message).toContain("connect_extension");
+      expect(second.message).toContain(first.ok && first.credential ? first.credential.id : "unreachable");
+      expect(second.message).not.toContain("invalid_grant");
+      expect(second.message).not.toContain("replace_connection");
+    }
+    expect(h.broker.calls).toHaveLength(1);
+    expect(await rowsFor(h.store, "com.example.stdio-oauth")).toHaveLength(1);
   });
 
   test("re-connecting org names the approved stable replace target without overwriting it", async () => {

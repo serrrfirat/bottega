@@ -10,6 +10,7 @@ import { createFixtureRegistry, FIXTURE_EXTENSION_ID } from "./fixture";
 import {
   connectionLifecycleToolDefinitions,
   listConnectionReadModel,
+  type BrokerCredentialStatus,
   type ConnectionAuthority,
   type ConnectionBoundary,
 } from "./lifecycle";
@@ -84,7 +85,6 @@ class FakeBoundary implements ConnectionBoundary {
     this.active.delete(credential.id);
   }
 }
-
 async function harness(orgMutation: "allow" | "deny" = "allow") {
   const root = mkdtempSync(join(tmpdir(), "bottega-connection-lifecycle-"));
   roots.push(root);
@@ -95,9 +95,11 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
   const registry = createFixtureRegistry();
   const audit = createAudit(store);
   const currentPolicy = policy(orgMutation);
+  const brokerStatuses = new Map<number, BrokerCredentialStatus>();
 
   async function seed(owner: string | null, scope: "personal" | "org", brokerCredentialId: number) {
     authority.live.add(brokerCredentialId);
+    brokerStatuses.set(brokerCredentialId, { state: "active" });
     return store.upsertExtensionCredential({
       provider: FIXTURE_EXTENSION_ID,
       identityKey: owner === null ? "org-account" : `account:${owner}`,
@@ -107,6 +109,12 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
     });
   }
 
+  function setBrokerStatus(brokerCredentialId: number, status: BrokerCredentialStatus) {
+    brokerStatuses.set(brokerCredentialId, status);
+  }
+  const brokerCredentialStatus = async ({ brokerCredentialId }: { brokerCredentialId: number }) =>
+    brokerStatuses.get(brokerCredentialId) ?? { state: "unknown" as const };
+
   function tools(actor: string) {
     return new Map(
       connectionLifecycleToolDefinitions({
@@ -115,6 +123,7 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
         audit,
         authority,
         boundary,
+        brokerCredentialStatus,
         gate: {
           loadPolicy: async () => currentPolicy,
           router: { request: async () => ({ approved: true, approver: "UADMIN" }) },
@@ -135,7 +144,7 @@ async function harness(orgMutation: "allow" | "deny" = "allow") {
     } as never);
   }
 
-  return { store, authority, boundary, registry, seed, call };
+  return { store, authority, boundary, registry, seed, setBrokerStatus, brokerCredentialStatus, call };
 }
 
 describe("connection lifecycle caller surface (#318)", () => {
@@ -175,6 +184,33 @@ describe("connection lifecycle caller surface (#318)", () => {
     const foreign = await h.call("UA", "inspect_connection", { connection_id: (await h.store.listExtensionConnections()).find((row) => row.owner === "UB")!.id });
     expect(foreign.isError).toBe(true);
     expect(text(foreign)).toContain("not found");
+  });
+
+  test("marks disabled and missing broker references for reauthorization while unknown broker health stays fail-closed", async () => {
+    const h = await harness();
+    const disabled = await h.seed("UA", "personal", 71);
+    const missing = await h.seed(null, "org", 72);
+    const unreachable = await h.seed("UB", "personal", 73);
+
+    h.setBrokerStatus(71, { state: "disabled", cause: "invalid_grant" });
+    h.setBrokerStatus(72, { state: "missing" });
+    h.setBrokerStatus(73, { state: "unknown" });
+    const model = await listConnectionReadModel({ actor: "UA" }, h);
+    const unknownModel = await listConnectionReadModel({ actor: "UB" }, h);
+    expect(model.find((row) => row.id === disabled.id)).toMatchObject({ status: "active", reconnect_needed: true });
+    expect(model.find((row) => row.id === missing.id)).toMatchObject({ status: "active", reconnect_needed: true });
+    expect(unknownModel.find((row) => row.id === unreachable.id)).toMatchObject({ status: "active", reconnect_needed: false });
+    expect(model.map((row) => row.id)).not.toContain(unreachable.id);
+
+    const listed = await h.call("UA", "list_connections", {});
+    expect(text(listed)).toContain(`${disabled.id} —`);
+    expect(text(listed)).toContain("reconnect_needed=yes; action=reauthorize");
+    expect(text(listed)).toContain(`${missing.id} —`);
+    expect(text(listed)).not.toContain("invalid_grant");
+    expect(text(listed)).not.toContain("token");
+
+    const inspected = await h.call("UA", "inspect_connection", { connection_id: disabled.id });
+    expect(text(inspected)).toContain("reconnect_needed=yes; action=reauthorize");
   });
 
   test("replacement rolls back on proxy preparation failure, then switches by expected revision and revokes only the old authority", async () => {

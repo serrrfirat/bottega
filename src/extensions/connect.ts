@@ -70,6 +70,8 @@ import {
 } from "./catalog-register";
 import { createReconcileEgress, type ReconcileEgress } from "./egress-reconcile";
 import { resolveBrokerToken } from "./boundary";
+import type { BrokerCredentialStatusReader } from "./broker-status";
+export type { BrokerCredentialStatusReader } from "./broker-status";
 
 /** The connect capability's tool/policy name (exec tier, issue #52). */
 export const CONNECT_EXTENSION_TOOL = "connect_extension";
@@ -135,9 +137,10 @@ export interface ConnectExtensionDeps {
     | "beginExtensionConnectionDisconnect"
     | "transitionExtensionConnection"
   >;
-  /** Redacting audit wrapper (src/policy/audit.ts). */
   audit: AuditModule;
   broker: BrokerConnector;
+  /** Broker metadata health; no credential payload crosses this seam. */
+  brokerCredentialStatus?: BrokerCredentialStatusReader;
   /**
    * Connect-time egress reconcile (issue #250): after a successful BROKER
    * OAuth connect (notion class), regenerate egress with the superset
@@ -388,11 +391,35 @@ export async function connectExtension(
       : row.scope === "org",
   );
   if (target) {
+    let reauthorizationNeeded = false;
+    if (deps.brokerCredentialStatus) {
+      try {
+        const status = await deps.brokerCredentialStatus({
+          brokerCredentialId: target.broker_credential_id,
+          provider: target.vault_provider,
+        });
+        reauthorizationNeeded = status.state === "disabled" || status.state === "missing";
+      } catch {
+        // Unknown broker health must preserve the active-connect guard.
+      }
+    }
+    const prefix =
+      `${label} is already connected ${input.scope === "org" ? "as an organization" : `for @${input.actor}`} ` +
+      `as ${target.id} revision ${target.revision}`;
+    if (reauthorizationNeeded && manifest.credentialSchema.type === "oauth") {
+      return {
+        ok: false,
+        message:
+          `${prefix} and needs reauthorization — use disconnect_connection with connection_id=${target.id}, ` +
+          `then connect_extension extension=${provider} scope=${input.scope}.`,
+      };
+    }
+    const action = reauthorizationNeeded
+      ? " needs reauthorization — use replace_connection"
+      : " — use replace_connection";
     return {
       ok: false,
-      message:
-        `${label} is already connected ${input.scope === "org" ? "as an organization" : `for @${input.actor}`} ` +
-        `as ${target.id} revision ${target.revision} — use replace_connection with that stable id and expected revision.`,
+      message: `${prefix}${action} with that stable id and expected revision.`,
     };
   }
 

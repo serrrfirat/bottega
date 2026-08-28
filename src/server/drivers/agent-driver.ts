@@ -42,6 +42,7 @@ import {
   createConnectionAuthority,
   type ConnectionAuthority,
 } from "../../extensions/lifecycle";
+import { createBrokerCredentialStatusReader, type BrokerCredentialStatusReader } from "../../extensions/broker-status";
 import type { ConnectionBoundary } from "../../extensions/boundary";
 import type { ExtensionRegistry } from "../../extensions/registry";
 import type { AuditModule } from "../../policy/audit";
@@ -86,7 +87,9 @@ export interface ConnectExtensionDriverOpts {
   router: ApprovalRouter;
   /** Ask-human timeout in ms; defaults to the policy's `approvals.timeout_minutes`. */
   timeoutMs?: number;
-  /** Broker seam; defaults to the production auth-broker connector. */
+  /** Broker metadata health; defaults to the safe production status reader. */
+  brokerCredentialStatus?: BrokerCredentialStatusReader;
+  /** Broker connect/write seam; defaults to the production auth-broker connector. */
   broker?: BrokerConnector;
   /**
    * Catalog registration seam (issue #232): when wired, the per-session
@@ -1313,6 +1316,8 @@ export function createOmpSdkDriver(
       // Shared per-session space mapping: every connect-family tool resolves
       // audit space from the session's file-derived id.
       const sessionSpaceMapping = { spaceIdFromFile: sessionIdFromFilePath };
+      const brokerCredentialStatus =
+        opts.connectExtension?.brokerCredentialStatus ?? createBrokerCredentialStatusReader();
       const sessionCustomTools = opts.connectExtension
         ? [
             ...sessionCustomToolsBase,
@@ -1321,6 +1326,7 @@ export function createOmpSdkDriver(
               store: opts.connectExtension.store,
               audit: opts.connectExtension.audit,
               broker: opts.connectExtension.broker ?? connectViaAuthBroker,
+              brokerCredentialStatus,
               ...(opts.connectExtension.catalogRegister !== undefined
                 ? { catalogRegister: opts.connectExtension.catalogRegister }
                 : undefined),
@@ -1342,6 +1348,7 @@ export function createOmpSdkDriver(
               registry: opts.connectExtension.registry,
               store: opts.connectExtension.store,
               audit: opts.connectExtension.audit,
+              brokerCredentialStatus,
               authority:
                 opts.connectExtension.connectionAuthority ??
                 createConnectionAuthority(opts.connectExtension.broker ?? connectViaAuthBroker),
