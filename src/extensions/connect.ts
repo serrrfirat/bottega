@@ -56,7 +56,11 @@ import type { AuditModule } from "../policy/audit";
 import type { PolicyConfig } from "../policy/config";
 import { evaluatePolicyGate } from "../policy/gate";
 import type { ExtensionCredential, Store } from "../store/db";
-import { EXTENSION_CONNECTED_EVENT, SECRET_PROVISIONED_EVENT } from "../store/audit-events";
+import {
+  EXTENSION_CONNECTED_EVENT,
+  EXTENSION_CONNECTION_PHASE_EVENT,
+  SECRET_PROVISIONED_EVENT,
+} from "../store/audit-events";
 import type { BootSecret } from "../server/boot-secrets";
 import { errorMessage, toolError } from "../tools/helpers";
 import { looksLikeObviousSecret } from "../tools/memory";
@@ -374,6 +378,10 @@ export async function connectExtension(
   const manifest = resolved.manifest;
   const provider = manifest.id;
   const label = manifest.label;
+  const hostedOAuth =
+    manifest.kind === "mcp" &&
+    manifest.mcp.transport === "streamable-http" &&
+    manifest.credentialSchema.type === "oauth";
   // Issue #250: default the connect-time egress reconcile from the store
   // (the runtime half of the egress superset) so a successful BROKER OAuth
   // connect reconciles the proxy plane with zero composition-root wiring.
@@ -403,24 +411,49 @@ export async function connectExtension(
         // Unknown broker health must preserve the active-connect guard.
       }
     }
-    const prefix =
-      `${label} is already connected ${input.scope === "org" ? "as an organization" : `for @${input.actor}`} ` +
-      `as ${target.id} revision ${target.revision}`;
-    if (reauthorizationNeeded && manifest.credentialSchema.type === "oauth") {
+    if (reauthorizationNeeded && hostedOAuth) {
+      try {
+        const disconnected = await deps.store.transitionExtensionConnection({
+          id: target.id,
+          from: "active",
+          to: "disconnected",
+        });
+        await deps.audit.appendAudit({
+          space_id: input.spaceId ?? null,
+          actor: input.actor,
+          event_type: EXTENSION_CONNECTION_PHASE_EVENT,
+          payload: {
+            connection_id: disconnected.id,
+            phase: "reauthorization_requested",
+            revision: disconnected.revision,
+            status: disconnected.status,
+          },
+        });
+      } catch (err) {
+        return { ok: false, message: `connect ${label} failed to prepare reauthorization: ${errorMessage(err)}` };
+      }
+      // Continue into the ordinary hosted-OAuth mint below. Callback upsert
+      // reactivates the same unique provider/owner row at the next revision.
+    } else {
+      const prefix =
+        `${label} is already connected ${input.scope === "org" ? "as an organization" : `for @${input.actor}`} ` +
+        `as ${target.id} revision ${target.revision}`;
+      if (reauthorizationNeeded && manifest.credentialSchema.type === "oauth") {
+        return {
+          ok: false,
+          message:
+            `${prefix} and needs reauthorization — use disconnect_connection with connection_id=${target.id}, ` +
+            `then connect_extension extension=${provider} scope=${input.scope}.`,
+        };
+      }
+      const action = reauthorizationNeeded
+        ? " needs reauthorization — use replace_connection"
+        : " — use replace_connection";
       return {
         ok: false,
-        message:
-          `${prefix} and needs reauthorization — use disconnect_connection with connection_id=${target.id}, ` +
-          `then connect_extension extension=${provider} scope=${input.scope}.`,
+        message: `${prefix}${action} with that stable id and expected revision.`,
       };
     }
-    const action = reauthorizationNeeded
-      ? " needs reauthorization — use replace_connection"
-      : " — use replace_connection";
-    return {
-      ok: false,
-      message: `${prefix}${action} with that stable id and expected revision.`,
-    };
   }
 
   // An api_key chat connect carries no key. Point to the boundary-safe
@@ -438,17 +471,11 @@ export async function connectExtension(
     };
   }
 
-  // Hosted OAuth MCPs (issue #198) connect through the GENERIC MCP OAuth
-  // flow, never the broker's provider-registry login (the broker knows no
-  // `notion` OAuth provider, and per-provider broker work does not scale):
-  // the authorization URL is minted here and shown in Slack (one-time-link
-  // posture), the browser flow completes at the server's callback endpoint,
-  // and the token lands in the vault through the existing upload path.
-  if (
-    manifest.kind === "mcp" &&
-    manifest.mcp.transport === "streamable-http" &&
-    manifest.credentialSchema.type === "oauth"
-  ) {
+  // Hosted OAuth MCPs (issue #198) connect through the generic browser
+  // flow, not broker interactive login: the authorization URL is shown in
+  // Slack, callback stores the token in the broker vault, and the broker's
+  // registered refresh adapter keeps supported grants fresh.
+  if (hostedOAuth) {
     if (!deps.mcpOAuth) {
       return {
         ok: false,

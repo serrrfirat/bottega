@@ -448,6 +448,34 @@ describe("connectExtension re-connect", () => {
     expect(await rowsFor(h.store, "com.example.stdio-oauth")).toHaveLength(1);
   });
 
+
+  test("a disabled hosted OAuth connection mints reauthorization in the same connect call", async () => {
+    const h = makeDeps();
+    const current = await h.store.upsertExtensionCredential({
+      provider: "com.example.oauth",
+      identityKey: "oauth:old",
+      owner: "UADA",
+      scope: "personal",
+      brokerCredentialId: 77,
+    });
+    h.deps.brokerCredentialStatus = async ({ brokerCredentialId }) =>
+      brokerCredentialId === 77 ? { state: "disabled" } : { state: "unknown" };
+
+    const outcome = await connect(h, "com.example.oauth", "personal", "UADA", {
+      spaceId: "slack:C1",
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.message).toBe("Open this link to authorize");
+    expect(h.mcpOAuth.calls).toHaveLength(1);
+    expect(h.broker.calls).toHaveLength(0);
+    const rows = await h.store.listExtensionConnections();
+    expect(rows.find((row) => row.id === current.id)).toMatchObject({
+      id: current.id,
+      status: "disconnected",
+      revision: current.revision,
+    });
+  });
   test("re-connecting org names the approved stable replace target without overwriting it", async () => {
     const h = makeDeps({ policy: allowedPolicy() });
     h.broker.result = { identityKey: "org-a", brokerCredentialId: 1 };
