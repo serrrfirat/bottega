@@ -2,7 +2,7 @@
  * Bootstrap surface authorization (issue #373): tools-less API-key MCP
  * discovery uses the same call-scoped credential boundary as execution.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -23,6 +23,9 @@ import { DenyRouter } from "../policy/approval-router";
 import { bootstrapRuntime } from "./bootstrap-runtime";
 
 const SNAPSHOT = resolve(import.meta.dir, "../../config/extensions/github.json");
+const suiteNodeEnv = process.env.NODE_ENV;
+
+let originalNodeEnv: string | undefined;
 
 function toolsTransport(fail = false): (binding: McpBinding) => Transport {
   return () => {
@@ -78,11 +81,16 @@ function fixture(): Fixture {
 }
 
 beforeEach(() => {
+  originalNodeEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = "test";
   resetToolSurfaceCache();
 });
 afterEach(() => {
-  delete process.env.NODE_ENV;
+  if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = originalNodeEnv;
+});
+afterAll(() => {
+  expect(process.env.NODE_ENV).toBe(suiteNodeEnv);
 });
 
 describe("bootstrapRuntime API-key surface authorization", () => {
