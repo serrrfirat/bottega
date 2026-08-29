@@ -694,6 +694,7 @@ export class SlackTurnPresenter {
   onSourceOutcome(source: SourceOutcome): void {
     const label = source.label.trim();
     if (label === "") return;
+    if (!this.#canRecordSource(label, source.state)) return;
     this.#sourceOutcomes.set(label, { ...source, label });
     if (this.#sourceWaitingLabel === label && source.state !== "needs_reauthorization") {
       this.#sourceWaitingLabel = undefined;
@@ -709,6 +710,7 @@ export class SlackTurnPresenter {
   onSourceWaiting(label: string, action?: string): void {
     const friendly = label.trim();
     if (friendly === "") return;
+    if (!this.#canRecordSource(friendly, "needs_reauthorization")) return;
     this.#sourceOutcomes.set(friendly, {
       label: friendly,
       state: "needs_reauthorization",
@@ -1259,6 +1261,9 @@ export class SlackTurnPresenter {
     this.#stopped = false;
     this.#sourceWaitingLabel = undefined;
     this.#streamedAnswer = undefined;
+  }
+  #canRecordSource(label: string, state: SourceOutcome["state"]): boolean {
+    return !(this.#sourceOutcomes.get(label)?.state === "complete" && state === "needs_reauthorization");
   }
 
   #deriveTerminalOutcome(): TerminalOutcome {

@@ -1500,6 +1500,34 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(blockedRec.updates.at(-1)?.text).toContain("Blocked in");
     expect(blockedRec.updates.at(-1)?.text).toContain("Notion: needs reauthorization");
   });
+  test("verified source completion cannot be downgraded by later auth evidence", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onSourceOutcome({ label: "GitHub", state: "complete" });
+    presenter.onSourceWaiting("GitHub", "Reconnect GitHub.");
+    presenter.onSourceOutcome({ label: "GitHub", state: "needs_reauthorization", action: "Reconnect GitHub." });
+    presenter.onMessage({ text: "Answer" });
+    await flush();
+    expect(rec.updates.at(-1)?.text).toBe("Answer");
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toBe("Answer");
+
+    const freshRec = recordingAdapter({ streaming: false });
+    const { store: freshStore } = recordingStore();
+    const fresh = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: freshRec.adapter, store: freshStore, onboardingChecks: () => [] });
+    fresh.onInbound(msg());
+    await flush();
+    fresh.onSourceWaiting("Notion", "Reconnect Notion.");
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(freshRec.updates.at(-1)?.text).toContain("Waiting — Notion needs reauthorization");
+  });
 
   test("stopped wins over a later answer and explicitly says completed actions may remain", async () => {
     const rec = recordingAdapter({ streaming: false });
