@@ -57,7 +57,7 @@ import { workItemToolDefinitions } from "../../src/tools/work-items";
 import { memoryToolDefinitions } from "../../src/tools/memory";
 import { modelToolsDefinitions } from "../../src/tools/model-settings";
 import type { ExtensionRegistry } from "../../src/extensions/registry";
-import { createExtensionRegistry } from "../../src/extensions/registry";
+import { createFixtureRegistry } from "../../src/extensions/fixture";
 import { createExtensionRuntime } from "../../src/extensions/runtime";
 import { resolveExtensionSurfaces } from "../../src/extensions/surface";
 import { extensionToolDefinitions } from "../../src/extensions/tools";
@@ -793,7 +793,7 @@ export interface HarnessConfig {
   idleTimeoutMs?: number;
   /** Approval router for ask-human tool calls; defaults to auto-approve. */
   approve?: HarnessApprovalRouter;
-  /** Extension registry override (fixture registries); defaults to the pinned snapshots dir. */
+  /** Extension registry override (fixture registries); defaults to the local fixture registry. */
   registry?: ExtensionRegistry;
   /** MCP transport factory injected into the real extension runtime. */
   mcpTransport?: (binding: McpBinding) => Transport;
@@ -1120,10 +1120,10 @@ export async function bootHarness(cfg: HarnessConfig = {}): Promise<Harness> {
   approvalRouter = cfg.approve ?? AutoApproveRouter;
 
   // --- driver: real OMP SDK pointed at the stub ----------------------------
-  const extensionRegistry = cfg.registry ?? createExtensionRegistry("config/extensions");
-  // Effective tool surfaces (issue #158): pinned manifest tools, or the
-  // provider's tools/list discovered surface for tools-less manifests —
-  // resolved once so the agent sees the provider's real surface.
+  // Default E2E boots stay hermetic: the local fixture has a pinned tool
+  // surface, so resolving it never contacts hosted provider endpoints.
+  // Hosted snapshots remain an explicit opt-in through `cfg.registry`.
+  const extensionRegistry = cfg.registry ?? createFixtureRegistry();
   const extensionSurfaces = await resolveExtensionSurfaces(extensionRegistry.list());
   // Connect capability (issue #52/#61): the caller's full deps, or the live
   // canary's convenience wiring (issue #79) — the harness's own
