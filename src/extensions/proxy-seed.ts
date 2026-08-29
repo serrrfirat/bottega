@@ -21,7 +21,7 @@
  * STATIC secret file (openai-codex.secret) that the egress secrets
  * transform injects; the proxy never touches auth.openai.com for codex.
  */
-import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { writeFileAtomic } from "../fs-atomic";
@@ -303,12 +303,11 @@ async function probeCodexMint(input: CodexMintProbeInput): Promise<CodexMintOutc
 /**
  * Writes a (possibly rotated) refresh token back to the Codex CLI auth
  * file (issue #218): patches `tokens.refresh_token` in place, preserving
- * every other field, atomically (write-temp + rename, mode preserved,
- * 0600 default). The seed writes the minted token back so the CLI's auth
- * file and the codex blob never diverge, and a later reload/restart
- * re-reads a LIVE token instead of the stale one. A missing or
- * unparseable file is left untouched (the boundary blob still carries the
- * rotated token). No-op when the token is unchanged.
+ * every other field, atomically with secure mode 0600. The seed writes the
+ * minted token back so the CLI's auth file and the codex blob never diverge,
+ * and a later reload/restart re-reads a LIVE token instead of the stale one.
+ * A missing or unparseable file is left untouched (the boundary blob still
+ * carries the rotated token). No-op when the token is unchanged.
  */
 export function writeCodexAuthTokens(authFilePath: string, refreshToken: string): void {
   let raw: string;
@@ -332,12 +331,8 @@ export function writeCodexAuthTokens(authFilePath: string, refreshToken: string)
   const tokens = (parsed.tokens ??= {}) as Record<string, JsonValue>;
   if (tokens.refresh_token === refreshToken) return;
   tokens.refresh_token = refreshToken;
-  let mode = 0o600;
-  try {
-    mode = statSync(authFilePath).mode & 0o777;
-  } catch {
-    // File vanished between read and write: keep the 0600 default.
-  }
+  const mode = 0o600;
+  // A Codex auth file contains credentials; never preserve a weaker mode.
   // Preserve the file's formatting style (compact vs pretty) so the CLI's
   // own diffs stay clean; JSON parsing is whitespace-insensitive either way.
   const pretty = /\n\s{2}/.test(raw);

@@ -8,7 +8,7 @@
  * the regression below proves the sync never reads/probes/writes them.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -571,7 +571,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
     }
   });
 
-  test("the endpoint's rotated refresh token is written back to the blob AND the auth file (fields + mode preserved)", async () => {
+  test("the endpoint's rotated refresh token is written back to the blob AND the auth file (fields + secure mode 0600)", async () => {
     const s = tempSecretsDir();
     const auth = codexAuthFile({
       tokens: { access_token: "codex-access-1", refresh_token: "codex-refresh-1", id_token: "keep-me" },
@@ -599,7 +599,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
       expect(written.tokens.refresh_token).toBe("codex-refresh-2-rotated");
       expect(written.tokens.access_token).toBe("codex-access-1");
       expect(written.tokens.id_token).toBe("keep-me");
-      expect(statSync(auth.path).mode & 0o777).toBe(0o644); // mode preserved (fixture 0644)
+      expect(statSync(auth.path).mode & 0o777).toBe(0o600); // credential file remains mode 0600
     } finally {
       auth.cleanup();
       s.cleanup();
@@ -633,11 +633,12 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
     }
   });
 
-  test("writeCodexAuthTokens preserves unknown top-level fields and skips unchanged tokens", () => {
+  test("writeCodexAuthTokens preserves unknown top-level fields, enforces mode 0600, and skips unchanged tokens", () => {
     const dir = mkdtempSync(join(tmpdir(), "bottega-codex-writeback-"));
     try {
       const path = join(dir, "auth.json");
       writeFileSync(path, JSON.stringify({ oauth_account: "acct", tokens: { access_token: "at", refresh_token: "rt" } }), { mode: 0o644 });
+      chmodSync(path, 0o644); // exercise hardening from an insecure existing auth file
       writeCodexAuthTokens(path, "rt"); // unchanged → no rewrite
       expect(JSON.parse(readFileSync(path, "utf8")).tokens.refresh_token).toBe("rt");
       writeCodexAuthTokens(path, "rt-rotated");
@@ -645,7 +646,7 @@ describe("codex mint probe + rotation write-back (issue #218)", () => {
       expect(written.tokens.refresh_token).toBe("rt-rotated");
       expect(written.tokens.access_token).toBe("at");
       expect(written.oauth_account).toBe("acct");
-      expect(statSync(path).mode & 0o777).toBe(0o644);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
       // A missing file is a no-op (the blob still carries the rotated token).
       writeCodexAuthTokens(join(dir, "missing.json"), "rt-rotated");
       expect(existsSync(join(dir, "missing.json"))).toBe(false);
