@@ -34,6 +34,19 @@ running the weekly chores on a schedule. Every ask, in any channel, becomes
 a tracked work item — gated by your policies, delivered as whatever the
 task calls for, never silently dropped.
 
+### Progress feedback in Slack
+
+Bottega keeps one active Slack surface per turn. It shows an evidence-based
+state (`Accepted`, `Planning`, `Working`, `Waiting`, or `Finishing`), elapsed
+time, and counts from a real todo plan. Progress detail excludes percentages,
+ETAs, raw reasoning, and tool arguments. Channel replies keep their existing
+threaded renderer, while top-level DMs keep their existing single plain-text
+message.
+
+The final answer replaces progress. Multi-source, partial, blocked, failed, and
+stopped turns add a success-first outcome summary of up to four lines, with a
+safe recovery action when one is available.
+
 ## What you get
 
 - **A colleague for the whole org, not a coding tool.** Work items can be
