@@ -25,7 +25,7 @@
  */
 import { z } from "zod";
 import type { TodoPhase, TodoStatus } from "@oh-my-pi/pi-coding-agent";
-import { createTurnProgress, renderTurnProgress as renderProgressSnapshot, todoStageCounts, type TurnProgressSnapshot } from "./slack-progress";
+import { createTurnProgress, renderTurnProgress as renderProgressSnapshot, renderOutcomeSummary, todoStageCounts, type SourceOutcome, type TerminalOutcome, type TurnOutcomeSummary, type TurnProgressSnapshot } from "./slack-progress";
 import type { Store } from "../../store/db";
 import {
   ADMIN_ONBOARDING_NUDGE_EVENT,
@@ -620,6 +620,18 @@ export class SlackTurnPresenter {
   #bufferedDMReply: string | undefined;
   /** Latest buffered session error/fallback during a pending DM request. */
   #bufferedDMError: string | undefined;
+  /** Source outcomes observed during this turn, keyed by friendly label. */
+  readonly #sourceOutcomes = new Map<string, SourceOutcome>();
+  /** Terminal outcome state, retained until the next accepted turn. */
+  #terminalOutcome: TerminalOutcome | undefined;
+  /** A terminal presenter error remains a problem until a non-empty reply recovers it. */
+  #sawError = false;
+  /** A user stop wins over every later event for this turn. */
+  #stopped = false;
+  /** Current source waiting for reauthorization; elapsed ticks must not clear it. */
+  #sourceWaitingLabel: string | undefined;
+  /** Latest raw streamed answer, retained after interim updates flush. */
+  #streamedAnswer: string | undefined;
   /** Active model provider for provider-aware error recovery. */
   readonly #provider: string | undefined;
 
@@ -666,6 +678,7 @@ export class SlackTurnPresenter {
     this.lastInboundPrincipal = msg.principal;
     this.turnThreadTs = msg.threadTs;
     this.#resetTurnProgress();
+    this.#resetTurnOutcome();
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
@@ -675,6 +688,46 @@ export class SlackTurnPresenter {
       this.#turnDelivered = false;
       this.pendingTs = undefined;
     }
+  }
+
+  /** Records a verified terminal outcome for one friendly source label. */
+  onSourceOutcome(source: SourceOutcome): void {
+    const label = source.label.trim();
+    if (label === "") return;
+    this.#sourceOutcomes.set(label, { ...source, label });
+    if (this.#sourceWaitingLabel === label && source.state !== "needs_reauthorization") {
+      this.#sourceWaitingLabel = undefined;
+      if (this.#progress.state === "waiting" && this.#progress.detail === `${label} needs reauthorization`) {
+        this.#setProgress("finishing", "Preparing the response");
+      } else {
+        this.#normalizeProgressFromEvidence();
+      }
+    }
+  }
+
+  /** Records current sanitized reauthorization evidence and pins waiting progress. */
+  onSourceWaiting(label: string, action?: string): void {
+    const friendly = label.trim();
+    if (friendly === "") return;
+    this.#sourceOutcomes.set(friendly, {
+      label: friendly,
+      state: "needs_reauthorization",
+      ...(action === undefined ? {} : { action }),
+    });
+    this.#sourceWaitingLabel = friendly;
+    this.#setProgress("waiting", `${friendly} needs reauthorization`);
+  }
+
+  /** Marks this turn stopped before aborting the driver session. */
+  onStopped(): void {
+    this.#stopped = true;
+    this.#terminalOutcome = "stopped";
+  }
+
+  /** Clears a provisional stop when the driver abort fails before settlement. */
+  clearStopped(): void {
+    this.#stopped = false;
+    this.#terminalOutcome = undefined;
   }
 
   /** The latest inbound message ts (digest marker base, #42). */
@@ -695,14 +748,15 @@ export class SlackTurnPresenter {
     const text = data.text;
     if (text === undefined) return;
     this.#turnDelivered = true;
+    // A non-empty answer recovers a prior error, but never a user stop.
+    if (text.trim()) {
+      this.#sawError = false;
+      if (!this.#stopped) this.#terminalOutcome = "complete";
+    }
     // Issue #296: a top-level DM REQUEST is pending — the opening prompt
     // has not settled. Intermediate assistant message events (the
     // speculative preamble) and the final answer are BUFFERED, never
-    // posted: the one Block Kit status card stays up until
-    // {@link onRequestSettled} delivers the final reply. The real reply
-    // supersedes any earlier buffered error (an SDK recovery after an
-    // error), and an empty completion buffers the visible fallback/churn
-    // text for settlement. Nothing reaches Slack here.
+    // posted: the one status message stays up until settlement.
     if (this.#dmTopLevel && this.#requestActive) {
       this.cancelStreamUpdate();
       this.#cancelProgressTimer();
@@ -722,17 +776,10 @@ export class SlackTurnPresenter {
     }
     if (!text.trim()) {
       // Empty completion (#60): surface a visible fallback so the retry
-      // loop is never silent, and count it for the churn guard. The pending
-      // ts is deliberately kept: a retry's turn_start then replaces the
-      // phrase in place (or appends to the stream) instead of stacking a
-      // new message. A swallowed provider error (issue #78) rides the event
-      // payload; the fallback carries the cause instead of the generic phrase.
+      // loop is never silent, and count it for the churn guard.
       const cause = data.error?.trim() || undefined;
       this.#countEmptyTurn(cause);
       if (!this.#churnActive) {
-        // A coalesced streaming text must not overwrite the fallback (#120);
-        // neither may the elapsed tick (#193) — the fallback IS the visible
-        // state until the retry's turn_start re-arms the progress.
         this.cancelStreamUpdate();
         this.#cancelProgressTimer();
         const pendingTs = this.pendingTs;
@@ -749,14 +796,13 @@ export class SlackTurnPresenter {
     this.#emptyTurnCount = 0;
     this.#churnActive = false;
     if (this.alwaysStream || this.streamingTurns) {
-      // Streaming turn (#120): coalesce updates on the cadence; the turn's
-      // final text is delivered by turn_end (final-delivery guarantee).
+      this.#streamedAnswer = text;
       this.#scheduleStreamUpdate(text);
       return;
     }
     // The reply landed: the receipt reaction comes off and the reply
     // latency is audited (issue #119).
-    this.#replaceOrPost(text);
+    this.#replaceOrPost(this.#withOutcomeSummary(text));
     this.#clearReactions();
     this.#auditReply();
   }
@@ -766,10 +812,9 @@ export class SlackTurnPresenter {
     console.error(`[slack-turn-presenter] session error (${this.spaceId}):`, data);
     if (this.digesting) return;
     this.#turnDelivered = true;
-    // Issue #296: a pending top-level DM request buffers the error too —
-    // the one card only changes at request settlement. The SDK may recover
-    // from an error with a later answer (onMessage clears the buffered
-    // error), so the error is held, not posted mid-request.
+    if (!this.#stopped) this.#terminalOutcome = "failed";
+    this.#sawError = !this.#stopped;
+    // Issue #296: a pending top-level DM request buffers the error too.
     if (this.#dmTopLevel && this.#requestActive) {
       this.cancelStreamUpdate();
       this.#cancelProgressTimer();
@@ -777,26 +822,15 @@ export class SlackTurnPresenter {
       this.#bufferedDMError = base;
       return;
     }
-    // An error supersedes any coalesced streaming text (#120): cancel the
-    // pending update so its timer can never overwrite the error surface.
     this.cancelStreamUpdate();
     this.streamingTurns = false;
-    // An error is a visible outcome: it breaks the empty streak and re-arms phrases.
     this.#emptyTurnCount = 0;
     this.#churnActive = false;
-    // A Codex mint failure (issue #218) maps to the recovery path — the raw
-    // proxy error string would read as an empty-response rerun, not a fix.
     const base = codexMintFailureText(data.message, this.#provider) ?? data.message ?? "Something went wrong while thinking.";
     console.log(`presenter: turn error ${this.spaceId} ${base.replaceAll("\n", " ")}`);
-    // A setup-blocked failure (provider/session) appends the one-line
-    // onboarding pointer (issue #116) — bounded by the per-space dedupe.
-    this.#replaceOrPost(this.#nudgeText(base));
-    // An error is a visible outcome: the receipt reaction comes off and
-    // the reply latency is audited (issue #119).
+    this.#replaceOrPost(this.#withOutcomeSummary(this.#nudgeText(base)));
     this.#clearReactions();
     this.#auditReply();
-    // Streaming: the error text was appended above; close the stream so no
-    // dangling panel is left behind.
     void this.finishTurn().catch((err) => {
       console.error(`[slack-turn-presenter] error-path turn finalize failed in ${this.spaceId}:`, err);
     });
@@ -811,22 +845,25 @@ export class SlackTurnPresenter {
    */
   onTurnEnd(data: TurnEndEvent): void {
     if (this.digesting) return;
-    // Issue #296: while a top-level DM REQUEST is pending, an SDK
-    // `turn_end` is an internal tool-round boundary (the SDK emits it after
-    // EVERY tool round — the agent-driver documents this). It is NOT the
-    // request end: do not finalize the card, do not open a new surface, do
-    // not count a silent round as churn — the one Block Kit card stays up
-    // and the request finalizes only when the opening prompt settles
-    // ({@link onRequestSettled}).
+    // A top-level DM's per-round turn_end is not terminal.
     if (this.#dmTopLevel && this.#requestActive) {
       return;
     }
     if (!this.#turnDelivered) {
       this.#countEmptyTurn(data.error?.trim() || undefined);
     }
-    const finalText = this.#latestStreamedText();
+    if (data.error?.trim() && !this.#stopped) {
+      this.#sawError = true;
+      this.#terminalOutcome = "failed";
+    }
+    const rawFinalText = this.#latestStreamedText();
+    const finalText = this.#withOutcomeSummary(rawFinalText);
+    const streaming = this.streamingTurns || this.alwaysStream;
+    if (!streaming && this.#stopped && finalText !== undefined) {
+      this.#replaceOrPost(finalText);
+    }
     const finalized = this.finalizeTurn(finalText);
-    if (this.streamingTurns || this.alwaysStream) {
+    if (streaming) {
       this.#clearReactions();
       this.#auditReply();
     }
@@ -915,7 +952,7 @@ export class SlackTurnPresenter {
     // Plain-text final: exactly the answer (or error). No count line, no
     // attachment, no color bar, no Block Kit — top-level DMs render as a
     // normal Slack text message (owner veto #296-reopened, #336).
-    const text = reply ?? error ?? "Done.";
+    const text = this.#withOutcomeSummary(reply ?? error ?? "Done.");
     if (pendingTs !== undefined) {
       // Settle the SAME timestamp: one message per accepted top-level DM
       // request, updated in place across every internal round.
@@ -959,6 +996,7 @@ export class SlackTurnPresenter {
     this.lastInboundPrincipal = principal;
     this.turnThreadTs = rootThreadTs;
     this.#resetTurnProgress();
+    this.#resetTurnOutcome();
     this.#requestActive = this.#dmTopLevel;
     this.#bufferedDMReply = undefined;
     this.#bufferedDMError = undefined;
@@ -982,6 +1020,10 @@ export class SlackTurnPresenter {
   /** A gated tool-call step (issue #168); the phrase renderer shows it as the live progress line. */
   onToolStep(step: ToolStepEvent): void {
     if (this.digesting) return;
+    if (step.status === "complete" && step.sourceLabel !== undefined && step.outcome !== undefined) {
+      const state = step.outcome === "succeeded" ? "complete" : step.outcome === "denied" ? "blocked" : "failed";
+      this.onSourceOutcome({ label: step.sourceLabel, state });
+    }
     this.renderToolStep(step);
   }
 
@@ -1009,6 +1051,9 @@ export class SlackTurnPresenter {
   /** Todo snapshots normalize progress and update the plan surface. */
   onTodoPhases(data: TodoPhasesEvent): void {
     if (this.digesting) return;
+    if ((data.phases?.length ?? 0) > 0 && this.#sourceWaitingLabel !== undefined) {
+      this.#sourceWaitingLabel = undefined;
+    }
     this.renderTodoPhases(data);
   }
 
@@ -1084,6 +1129,7 @@ export class SlackTurnPresenter {
     this.#waitingCount = 0;
     this.#nudged = undefined;
     this.#resetTurnProgress();
+    this.#resetTurnOutcome();
     this.#todoPhases = [];
     this.#planTs = undefined;
     this.#planPosting = false;
@@ -1172,7 +1218,28 @@ export class SlackTurnPresenter {
    * pending append and close with chat.stopStream carrying the final text
    * as the closing block.
    */
-  protected async finalizeTurn(_finalText: string | undefined): Promise<void> {
+  protected async finalizeTurn(finalText: string | undefined): Promise<void> {
+    // A stream request can fall back to the phrase renderer for this turn.
+    // In that mode the final carrier is the pending phrase edit, so the
+    // already-rendered answer and outcome summary must replace any buffered
+    // interim update together.
+    if (finalText !== undefined && this.pendingTs !== undefined) {
+      this.#cancelProgressTimer();
+      const pending = this.#streamUpdate;
+      if (pending !== undefined) {
+        pending.text = finalText;
+        pending.progress = false;
+        pending.final = true;
+        pending.retries = 0;
+        if (pending.timer !== null) {
+          clearTimeout(pending.timer);
+          pending.timer = null;
+        }
+        return this.#flushStreamUpdate();
+      }
+      await this.sendTextChunk(this.pendingTs, finalText);
+      return;
+    }
     return this.#finalizeStreamUpdate();
   }
 
@@ -1184,6 +1251,41 @@ export class SlackTurnPresenter {
     this.#todoPhases = [];
     this.#lastProgressText = undefined;
     this.toolStepInFlight = false;
+  }
+  #resetTurnOutcome(): void {
+    this.#sourceOutcomes.clear();
+    this.#terminalOutcome = undefined;
+    this.#sawError = false;
+    this.#stopped = false;
+    this.#sourceWaitingLabel = undefined;
+    this.#streamedAnswer = undefined;
+  }
+
+  #deriveTerminalOutcome(): TerminalOutcome {
+    if (this.#stopped || this.#terminalOutcome === "stopped") return "stopped";
+    const sources = [...this.#sourceOutcomes.values()];
+    const hasSuccess = sources.some((source) => source.state === "complete");
+    const hasFailed = sources.some((source) => source.state === "failed");
+    const hasBlocked = sources.some(
+      (source) => source.state === "blocked" || source.state === "needs_reauthorization" || source.state === "skipped",
+    );
+    if (hasSuccess && (hasFailed || hasBlocked || this.#sawError)) return "partial";
+    if (hasFailed || this.#sawError) return "failed";
+    if (hasBlocked) return "blocked";
+    return "complete";
+  }
+
+  #withOutcomeSummary(text: string | undefined): string | undefined {
+    const outcome = this.#deriveTerminalOutcome();
+    this.#terminalOutcome = outcome;
+    const summary: TurnOutcomeSummary = {
+      outcome,
+      elapsedMs: Date.now() - this.#progress.startedAt,
+      sources: [...this.#sourceOutcomes.values()],
+    };
+    const rendered = renderOutcomeSummary(summary);
+    if (rendered === undefined) return text;
+    return text === undefined || text === "" ? rendered : `${text}\n\n${rendered}`;
   }
 
   /** Normalizes tool evidence and renders explicit progress. */
@@ -1645,9 +1747,9 @@ export class SlackTurnPresenter {
     return this.#flushStreamUpdate();
   }
 
-  /** The latest coalesced streamed text, if any (the turn's final reply candidate). */
+  /** The latest raw streamed answer, whether or not its coalesced update flushed. */
   #latestStreamedText(): string | undefined {
-    return this.#streamUpdate?.text;
+    return this.#streamUpdate?.text ?? this.#streamedAnswer;
   }
 
   /** Cancels any pending coalesced update (superseded text must not overwrite). */

@@ -514,6 +514,19 @@ describe("StreamTurnPresenter: throttle and fallback", () => {
       opts: { threadTs: "2.2", recipientUserId: "U456" },
     });
   });
+  test("a request-local stream fallback carries the outcome summary on its phrase edit", async () => {
+    const rec = recordingAdapter({ failStartRequest: true });
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg({ ts: "1.1" }));
+    await flush();
+    presenter.onSourceOutcome({ label: "Notion", state: "failed" });
+    presenter.onMessage({ text: "Answer" });
+    presenter.onTurnEnd({});
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Answer\n\nFailed in");
+    expect(rec.updates.at(-1)?.text).toContain("Notion: failed");
+  });
 
   test("a mid-boot appendStream failure flips to the phrase+edit path without dropping the reply", async () => {
     vi.useFakeTimers();
@@ -771,7 +784,7 @@ describe("Codex mint-failure surface (issue #218)", () => {
     presenter.onError({ spaceId: "slack:C1", message: "Request failed with status code 403" });
     await flush();
 
-    expect(rec.updates.at(-1)!.text).toBe("Request failed with status code 403");
+    expect(rec.updates.at(-1)!.text).toStartWith("Request failed with status code 403");
     expect(rec.updates.at(-1)!.text).not.toContain("codex login");
   });
 
@@ -783,7 +796,7 @@ describe("Codex mint-failure surface (issue #218)", () => {
     presenter.onError({ spaceId: "slack:C1", message: "model exploded" });
     await flush();
 
-    expect(rec.updates.at(-1)!.text).toBe("model exploded");
+    expect(rec.updates.at(-1)!.text).toStartWith("model exploded");
   });
 });
 
@@ -1420,34 +1433,159 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(rec.updates.at(-1)!.ts).toBe("post-2");
     expect(rec.updates.at(-1)!.ts).not.toBe(firstTs);
   });
-
-  test("succeeded tool actions never surface a count line: the final is just the bare answer (issue #336)", async () => {
+  test("succeeded tool actions without source labels never surface an action count", async () => {
     const rec = recordingAdapter();
     const presenter = dmPresenter(rec);
     presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
     await flush();
-
-    // Three genuinely-succeeded tool actions across the request.
     for (const name of ["github.search_issues", "create_work_item", "slack_post_message"]) {
       const id = nextToolStepId();
       presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), label: humanizeToolName(name), status: "in_progress" });
       presenter.onToolStep({ spaceId: "slack:D1", taskId: id, title: toolStepTitle(name, "allowed (exec)"), label: humanizeToolName(name), status: "complete", outcome: "succeeded" });
     }
-    await flush();
-
     presenter.onMessage({ spaceId: "slack:D1", text: "Answer" });
     presenter.onRequestSettled();
     await flush();
-
     const final = rec.updates.at(-1)!;
-    expect(final.opts).toBeUndefined(); // plain-text reply — no attachment/blocks
-    // No count line ever — the final is exactly the bare answer (issue #336).
+    expect(final.opts).toBeUndefined();
     expect(final.text).toBe("Answer");
     expect(final.text).not.toContain("actions completed");
     expect(final.text).not.toContain("✅");
-    expect(final.text).not.toContain("Search issues");
-    expect(final.text).not.toContain("create_work_item");
-    expect(final.text).not.toContain("slack_post_message");
+  });
+  test("multiple successful sources render an outcome summary while one success stays quiet", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    for (const label of ["GitHub", "Notion"]) {
+      presenter.onSourceOutcome({ label, state: "complete" });
+    }
+    presenter.onMessage({ spaceId: "slack:D1", text: "Answer" });
+    presenter.onRequestSettled();
+    await flush();
+    expect(rec.updates.at(-1)?.text).toStartWith("Answer\n\nCompleted in");
+    expect(rec.updates.at(-1)?.text).toContain("GitHub: complete · Notion: complete");
+
+    const quiet = recordingAdapter();
+    const quietPresenter = dmPresenter(quiet);
+    quietPresenter.onInbound(msg({ spaceId: "slack:D1", ts: "2.2" }));
+    await flush();
+    quietPresenter.onSourceOutcome({ label: "GitHub", state: "complete" });
+    quietPresenter.onMessage({ spaceId: "slack:D1", text: "Answer" });
+    quietPresenter.onRequestSettled();
+    await flush();
+    expect(quiet.updates.at(-1)?.text).toBe("Answer");
+  });
+
+  test("failed and blocked source-only outcomes use their distinct terminal headings", async () => {
+    const failedRec = recordingAdapter({ streaming: false });
+    const { store: failedStore } = recordingStore();
+    const failed = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: failedRec.adapter, store: failedStore, onboardingChecks: () => [] });
+    failed.onInbound(msg());
+    await flush();
+    failed.onSourceOutcome({ label: "GitHub", state: "failed" });
+    failed.onMessage({ text: "No answer" });
+    await flush();
+    expect(failedRec.updates.at(-1)?.text).toContain("Failed in");
+    expect(failedRec.updates.at(-1)?.text).toContain("GitHub: failed");
+
+    const blockedRec = recordingAdapter({ streaming: false });
+    const { store: blockedStore } = recordingStore();
+    const blocked = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: blockedRec.adapter, store: blockedStore, onboardingChecks: () => [] });
+    blocked.onInbound(msg());
+    await flush();
+    blocked.onSourceOutcome({ label: "Notion", state: "needs_reauthorization", action: "Reconnect Notion." });
+    blocked.onMessage({ text: "Please reconnect Notion." });
+    await flush();
+    expect(blockedRec.updates.at(-1)?.text).toContain("Blocked in");
+    expect(blockedRec.updates.at(-1)?.text).toContain("Notion: needs reauthorization");
+  });
+
+  test("stopped wins over a later answer and explicitly says completed actions may remain", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onStopped();
+    presenter.onMessage({ text: "The answer" });
+    await flush();
+    const text = rec.updates.at(-1)?.text ?? "";
+    expect(text).toContain("Stopped in");
+    expect(text).toContain("Completed actions may remain applied");
+    expect(text).not.toContain("no changes");
+  });
+
+  test("stream turn closes with the outcome summary in stopStream", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onSourceOutcome({ label: "GitHub", state: "complete" });
+    presenter.onSourceOutcome({ label: "Notion", state: "failed" });
+    presenter.onMessage({ text: "Answer" });
+    presenter.onTurnEnd({});
+    await flush();
+    expect(rec.stops.at(-1)?.text).toStartWith("Answer\n\nPartial result in");
+    expect(rec.stops.at(-1)?.text).toContain("GitHub: complete · Notion: failed");
+  });
+
+  test("DM settlement applies a summary exactly once", async () => {
+    const rec = recordingAdapter();
+    const presenter = dmPresenter(rec);
+    presenter.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    presenter.onSourceOutcome({ label: "GitHub", state: "failed" });
+    presenter.onMessage({ spaceId: "slack:D1", text: "Answer" });
+    expect(presenter.onRequestSettled()).toBe(true);
+    expect(presenter.onRequestSettled()).toBe(false);
+    await flush();
+    const finals = rec.updates.filter((entry) => entry.text?.includes("Failed in"));
+    expect(finals).toHaveLength(1);
+    expect(finals[0]?.text).toContain("Answer\n\nFailed in");
+  });
+  test("reauthorization waiting survives turn_start and clears only on verified source progress", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onSourceWaiting("Notion", "Reconnect Notion.");
+    presenter.onTurnStart();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Waiting — Notion needs reauthorization");
+    presenter.onSourceOutcome({ label: "Notion", state: "complete" });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).not.toContain("Notion needs reauthorization");
+  });
+
+  test("a recovered DM error becomes complete, but a stopped DM never recovers", async () => {
+    const recoveredRec = recordingAdapter();
+    const recovered = dmPresenter(recoveredRec);
+    recovered.onInbound(msg({ spaceId: "slack:D1", ts: "1.1" }));
+    await flush();
+    recovered.onError({ message: "provider exploded" });
+    recovered.onMessage({ text: "Recovered answer" });
+    recovered.onRequestSettled();
+    await flush();
+    expect(recoveredRec.updates.at(-1)?.text).toBe("Recovered answer");
+
+    const stoppedRec = recordingAdapter();
+    const stopped = dmPresenter(stoppedRec);
+    stopped.onInbound(msg({ spaceId: "slack:D1", ts: "2.2" }));
+    await flush();
+    stopped.onStopped();
+    stopped.onError({ message: "provider exploded" });
+    stopped.onMessage({ text: "Late answer" });
+    stopped.onRequestSettled();
+    await flush();
+    expect(stoppedRec.updates.at(-1)?.text).toContain("Stopped in");
+    expect(stoppedRec.updates.at(-1)?.text).toContain("Completed actions may remain applied");
   });
 
   test("denied / execution-failed / approval-only events NEVER count; only genuine success does (issue #296)", async () => {
@@ -1532,7 +1670,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(rec.posts).toHaveLength(1);
     expect(rec.updates.at(-1)).toMatchObject({ spaceId: "slack:D1", ts: cardTs });
     expect(rec.updates.at(-1)!.opts).toBeUndefined();
-    expect(rec.updates.at(-1)!.text).toBe("provider exploded");
+    expect(rec.updates.at(-1)!.text).toStartWith("provider exploded");
     expect(rec.updates.at(-1)!.text).not.toContain("actions completed");
   });
 
@@ -1966,5 +2104,23 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     await flush();
     expect(rec.updates.length).toBeGreaterThan(0);
     expect(rec.updates.at(-1)?.text).toContain("Accepted — Request received");
+  });
+  test("answer-first outcome summary names successful and failed sources in order", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onSourceOutcome({ label: "GitHub", state: "complete" });
+    presenter.onSourceWaiting("Notion", 'Reconnect Notion by running "connect notion".');
+    presenter.onSourceOutcome({ label: "Notion", state: "needs_reauthorization", action: 'Reconnect Notion by running "connect notion".' });
+    presenter.onMessage({ text: "GitHub answer\n\nYour Notion authorization expired or was revoked." });
+    await flush();
+    const text = rec.updates.at(-1)?.text ?? "";
+    expect(text).toContain("GitHub answer");
+    expect(text).toContain("Partial result");
+    expect(text).toContain("GitHub: complete");
+    expect(text).toContain("Notion: needs reauthorization");
+    expect(text).toContain('Action: Reconnect Notion by running "connect notion".');
   });
 });

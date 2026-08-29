@@ -1224,7 +1224,7 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     // The rejected request's error settles as plain text on the one message —
     // no attachment, no color bar (owner veto #296-reopened).
     const dmError = updates.filter(
-      (u) => u.spaceId === "slack:D1" && u.text === "provider exploded",
+      (u) => u.spaceId === "slack:D1" && u.text?.startsWith("provider exploded"),
     );
     expect(dmError).toHaveLength(1); // the rejected request finalized the error on its one message
     expect(dmError[0]!.ts).toBe("ts-2"); // the ERROR replaced the SAME message ts, no second post
@@ -1269,7 +1269,7 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     // attachment (owner veto #296-reopened). This is the regression: a
     // rejected drained DM must still settle + drain the NEXT queued message
     // exactly once (issue #296).
-    const carryError = (u: { text?: string }) => u.text === "drained exploded";
+    const carryError = (u: { text?: string }) => u.text?.startsWith("drained exploded") ?? false;
     const explodedUpdates = updates.filter((u) => u.spaceId === "slack:D1" && carryError(u));
     const explodedPosts = posts.filter((p) => p.spaceId === "slack:D1" && carryError(p));
     expect(explodedUpdates.length + explodedPosts.length).toBe(2); // queued A + queued B
@@ -1298,7 +1298,9 @@ describe("SpaceService DM request settlement (issue #296)", () => {
     session.emit("error", { spaceId: "slack:C1", message: "model exploded" });
     await Promise.resolve();
 
-    expect(updates).toEqual([{ spaceId: "slack:C1", ts: "ts-1", text: "model exploded" }]);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.ts).toBe("ts-1");
+    expect(updates[0]?.text).toStartWith("model exploded");
     expect(posts).toHaveLength(1); // phrase only; error replaced it
   });
 
@@ -2758,6 +2760,43 @@ describe("response mode → session prompt directive (issue #55)", () => {
     expect(updates.at(-1)?.text).not.toContain("GitHub-only");
     await service.stop();
   });
+  test("answer-first replies render successful sources before auth failures in a partial summary (#383)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    const failures = [
+      { providerId: "github", label: "GitHub" },
+      { providerId: "notion", label: "Notion" },
+    ];
+    const service = makeSpaceService({
+      store,
+      adapter,
+      driver,
+      extensionAuthFailures: () => failures,
+    });
+    await service.handleInboundMessage(msg({ text: "Use GitHub and Notion" }));
+    service.routeToolStep({
+      spaceId: "slack:C1",
+      taskId: "github-1",
+      title: "GitHub search",
+      label: "GitHub",
+      status: "complete",
+      outcome: "succeeded",
+      sourceLabel: "GitHub",
+    });
+    driver.last().emit("message", {
+      spaceId: "slack:C1",
+      text: "Repository answer\n\nNotion authorization expired or was revoked.",
+    });
+    await Promise.resolve();
+    const final = updates.at(-1)?.text ?? "";
+    expect(final).toStartWith('Your Notion authorization expired or was revoked.');
+    expect(final).toContain("Repository answer");
+    expect(final).toContain("Partial result");
+    expect(final).toContain("GitHub: complete · Notion: needs reauthorization");
+    expect(final).toContain('Action: Reconnect Notion by running "connect notion".');
+    await service.stop();
+  });
 });
 
 describe("work-items auto-pickup → session prompt directive (issue #89)", () => {
@@ -2949,7 +2988,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     await flush();
     session.emit("error", { spaceId: "slack:C1", message: "boom 3" });
     await flush();
-    expect(updates.at(-1)!.text).toBe("boom 3");
+    expect(updates.at(-1)!.text).toStartWith("boom 3");
     const nudged = updates.filter((u) => u.text?.includes("first_run_wizard") ?? false);
     expect(nudged).toHaveLength(2);
   });
@@ -2971,7 +3010,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     expect(updates.filter((u) => u.text?.includes("first_run_wizard") ?? false)).toHaveLength(0);
     // Each error replaces the pending phrase in place (clearing its ts), so
     // Each error replaces the pending progress in place.
-    expect(updates.filter((u) => u.text === "boom")).toHaveLength(3);
+    expect(updates.filter((u) => u.text?.startsWith("boom") ?? false)).toHaveLength(3);
     expect(updates).toHaveLength(3);
   });
 
@@ -2993,7 +3032,7 @@ describe("SpaceService onboarding nudge (issue #116)", () => {
     await flush();
     driver.last().emit("error", { spaceId: "slack:C1", message: "boom" });
     await flush();
-    expect(updates.at(-1)!.text).toBe("boom");
+    expect(updates.at(-1)!.text).toStartWith("boom");
   });
 });
 
@@ -3356,7 +3395,7 @@ describe("SpaceService stopTurn (issue #315, caller-level)", () => {
   }
 
   test("a Stop action routed exactly once aborts an in-flight turn and settles it as stopped (audited)", async () => {
-    const { adapter } = fakeAdapter();
+    const { adapter, updates } = fakeAdapter();
     const { store, audit } = fakeStore();
     const driver = new FakeDriver();
     const service = makeSpaceService({ store, adapter, driver, stopControl: true });
@@ -3382,6 +3421,8 @@ describe("SpaceService stopTurn (issue #315, caller-level)", () => {
     expect(stopAudits).toHaveLength(1);
     expect(stopAudits[0]).toMatchObject({ space_id: "slack:C1", actor: "U-stop" });
     expect(JSON.parse(stopAudits[0]!.payload)).toEqual({ by: "U-stop", stopped: true });
+    expect(updates.some((entry) => entry.text?.includes("Stopped in") ?? false)).toBe(true);
+    expect(updates.some((entry) => entry.text?.includes("Completed actions may remain applied") ?? false)).toBe(true);
 
     await service.stop();
   });

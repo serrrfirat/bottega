@@ -551,26 +551,25 @@ export class SpaceService {
    */
   async stopTurn(spaceId: string, by: string): Promise<boolean> {
     const live = this.#sessions.get(spaceId);
-    // Fail closed: no live session (unknown/foreign/stale/disposing) → reject.
     if (!live || live.disposing) {
       await this.#auditStop(spaceId, by, false);
       return false;
     }
-    // No in-flight turn → nothing to stop; idempotent no-op.
     if (live.stopPending || !live.session.isStreaming()) {
       await this.#auditStop(spaceId, by, false);
       return false;
     }
-    // Exactly one abort per in-flight turn: the flag is set synchronously
-    // before the first await so a racing second Stop cannot double-abort.
     live.stopPending = true;
+    const presenter = this.#presenters.get(spaceId);
+    presenter?.onStopped();
     try {
       await live.session.abort();
       await this.#auditStop(spaceId, by, true);
       return true;
+    } catch (err) {
+      presenter?.clearStopped();
+      throw err;
     } finally {
-      // The turn is done driving this session: a later Stop for the NEXT
-      // turn must be able to abort it, so the flag re-arms here.
       live.stopPending = false;
     }
   }
@@ -622,23 +621,16 @@ export class SpaceService {
       // Issue #219 safe-window snapshot: taken BEFORE the receipt resets
       // turn-rendering state (activation re-arms the phrase and clears the
       // delivered flag), so it reflects the RUNNING turn as this message
-      // arrived — a message landing after the final reply committed or
-      // while a tool call is in flight can never steer. Only consulted on
-      // the streaming branch; fresh turns ignore it.
+      // arrived.
       const steerSafe = presenter.canSteer();
-      // Issue #289: the receipt (👀 reaction + message.in audit) happens
-      // at queue time for EVERY inbound. The message identity — threading
-      // base, conversation root, thinking phrase — activates ONLY when a
-      // turn actually starts (fresh/steer below, or onQueueDrain for a
-      // queued message); a queued message must never retarget the running
-      // turn's reply or open a placeholder for a turn that has not begun.
       presenter.receipt(msg);
-      // A message that will start a FRESH turn activates NOW (issue #119:
-      // the phrase posts before a slow session cold-start). Only a message
-      // landing mid-turn defers: it may queue (never activates) or steer
-      // (activates at the steer decision below).
       const midTurn = existing !== undefined && existing.session.isStreaming();
-      if (!midTurn) presenter.activateInbound(msg);
+      if (!midTurn) {
+        presenter.activateInbound(msg);
+        for (const failure of this.#currentAuthFailures(msg.text)) {
+          presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
+        }
+      }
       // Voice notes (issue #96): an audio/* file becomes the turn's inbound
       // text (a transcribed transcript) instead of a generic object. Any
       // voice-note failure is replied to, audited (VOICE_NOTE_FAILED_EVENT),
@@ -668,6 +660,9 @@ export class SpaceService {
           // activate the steer's identity — deferred at receipt because
           // the turn was mid-flight when the message arrived.
           presenter.activateInbound(msg);
+          for (const failure of this.#currentAuthFailures(msg.text)) {
+            presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
+          }
           presenter.setSteered(true);
           try {
             await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
@@ -937,6 +932,18 @@ export class SpaceService {
     );
     return created;
   }
+  #currentAuthFailures(text: string): ExtensionAuthFailure[] {
+    const lower = text.toLowerCase();
+    return (this.#extensionAuthFailures?.() ?? []).filter(({ providerId, label }) => {
+      const mentioned = lower.includes(providerId.toLowerCase()) || lower.includes(label.toLowerCase());
+      const alreadyActionable =
+        lower.includes(`reconnect ${providerId.toLowerCase()}`) ||
+        lower.includes(`reconnect ${label.toLowerCase()}`) ||
+        lower.includes(`disconnect ${providerId.toLowerCase()}`) ||
+        lower.includes(`disconnect ${label.toLowerCase()}`);
+      return mentioned && !alreadyActionable;
+    });
+  }
 
   async #createLive(spaceId: string): Promise<LiveSession> {
     // SAFETY: the cold-start path only touches store members that exist on
@@ -1006,21 +1013,19 @@ export class SpaceService {
       this.#presenterFor(spaceId).onTurnStart();
     });
     session.on("message", (data) => {
+      const presenter = this.#presenterFor(spaceId);
       if (data.text === undefined) {
-        this.#presenterFor(spaceId).onMessage(data);
+        presenter.onMessage(data);
         return;
       }
-      const lower = data.text.toLowerCase();
-      const failures = (this.#extensionAuthFailures?.() ?? []).filter(({ providerId, label }) => {
-        const mentioned =
-          lower.includes(providerId.toLowerCase()) || lower.includes(label.toLowerCase());
-        const alreadyActionable =
-          lower.includes(`reconnect ${providerId.toLowerCase()}`) ||
-          lower.includes(`reconnect ${label.toLowerCase()}`) ||
-          lower.includes(`disconnect ${providerId.toLowerCase()}`) ||
-          lower.includes(`disconnect ${label.toLowerCase()}`);
-        return mentioned && !alreadyActionable;
-      });
+      const failures = this.#currentAuthFailures(data.text);
+      for (const failure of failures) {
+        presenter.onSourceOutcome({
+          label: failure.label,
+          state: "needs_reauthorization",
+          action: `Reconnect ${failure.label} by running "connect ${failure.providerId}".`,
+        });
+      }
       const notice = failures
         .map(
           ({ providerId, label }) =>
@@ -1041,7 +1046,7 @@ export class SpaceService {
               })
               .join("\n\n")
               .trim();
-      this.#presenterFor(spaceId).onMessage({
+      presenter.onMessage({
         ...data,
         text: notice === "" ? retained : retained === "" ? notice : `${notice}\n\n${retained}`,
       });
@@ -1140,6 +1145,9 @@ export class SpaceService {
     // thread reply) travels with the turn so its reply stays in the same
     // conversation thread the request came from.
     presenter.onQueueDrain(entry.ts, entry.principal, entry.rootThreadTs);
+    for (const failure of this.#currentAuthFailures(entry.text)) {
+      presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
+    }
     try {
       // The drain IS a fresh turn (issue #189): hot-swap the default model
       // role like any other fresh turn, then prompt without a streaming
