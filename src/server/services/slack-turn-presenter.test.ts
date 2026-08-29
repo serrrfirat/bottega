@@ -1515,6 +1515,22 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     expect(text).toContain("Completed actions may remain applied");
     expect(text).not.toContain("no changes");
   });
+  test("stopped error followed by turn_end writes one terminal summary", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onStopped();
+    presenter.onError({ message: "aborted" });
+    presenter.onTurnEnd({});
+    await flush();
+    const terminalWrites = [
+      ...rec.posts.map((entry) => entry.text),
+      ...rec.updates.map((entry) => entry.text),
+    ].filter((text) => text?.includes("Stopped in") ?? false);
+    expect(terminalWrites).toHaveLength(1);
+  });
 
   test("stream turn closes with the outcome summary in stopStream", async () => {
     const rec = recordingAdapter();

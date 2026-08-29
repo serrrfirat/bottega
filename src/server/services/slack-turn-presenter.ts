@@ -859,7 +859,7 @@ export class SlackTurnPresenter {
     const rawFinalText = this.#latestStreamedText();
     const finalText = this.#withOutcomeSummary(rawFinalText);
     const streaming = this.streamingTurns || this.alwaysStream;
-    if (!streaming && this.#stopped && finalText !== undefined) {
+    if (!streaming && this.#stopped && !this.#turnDelivered && finalText !== undefined) {
       this.#replaceOrPost(finalText);
     }
     const finalized = this.finalizeTurn(finalText);
