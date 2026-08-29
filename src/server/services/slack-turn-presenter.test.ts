@@ -995,7 +995,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Completing the request\n1 of 3 stages complete/);
+    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Draft the section\n1 of 3 stages complete/);
     expect(rec.posts.some((p) => p.text?.includes("🛠 Agent's plan") ?? false)).toBe(false);
 
     // Step 2 completes, step 3 runs: the indicator advances in place.
@@ -1013,7 +1013,7 @@ describe("SlackTurnPresenter: live todo tiers (issue #228)", () => {
     await flush();
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS * 2);
     await flush();
-    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Completing the request\n2 of 3 stages complete/);
+    expect(rec.updates.at(-1)?.text).toMatch(/^Working — Push \+ PR\n2 of 3 stages complete/);
 
     // One phrase message only — the indicator edited it in place.
     expect(rec.posts).toHaveLength(1);
@@ -1229,7 +1229,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     // The todo progress still surfaces on the single status line (folded in), as plain text.
     const lastStatus = rec.updates.at(-1)!;
     expect(lastStatus.opts).toBeUndefined(); // plain-text edit — no attachment/blocks
-    expect(lastStatus.text).toMatch(/^Working — Completing the request\n2 of 3 stages complete/);
+    expect(lastStatus.text).toMatch(/^Working — Push \+ PR\n2 of 3 stages complete/);
 
     // The request completes by settling the SAME message, never a second post.
     presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
@@ -1608,7 +1608,7 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     await flush();
     const update = rec.updates.at(-1)!;
     expect(update.opts).toBeUndefined(); // plain-text edit
-    expect(update.text).toMatch(/^Working — Completing the request\n0 of 5 stages complete/);
+    expect(update.text).toMatch(/^Working — in-progress item 0\n0 of 5 stages complete/);
 
     vi.useRealTimers();
     fakeTimers = false;
@@ -1796,7 +1796,7 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     presenter.onTurnStart();
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
     await flush();
-    expect(rec.updates.at(-1)?.text).toContain("Planning");
+    expect(rec.updates.at(-1)?.text).toContain("Planning — Building the work plan");
   });
 
   test("tool work uses a safe human label and finishing follows completed external work", async () => {
@@ -1814,7 +1814,7 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     presenter.onToolStep({ taskId: "tool-1", title: "Search issues", label: "Search issues", status: "complete", outcome: "succeeded" });
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
     await flush();
-    expect(rec.updates.at(-1)?.text).toContain("Finishing");
+    expect(rec.updates.at(-1)?.text).toContain("Finishing — Preparing the response");
   });
 
   test("todo counts and blocked todos render waiting", async () => {
@@ -1840,9 +1840,25 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
     await flush();
     expect(rec.updates.at(-1)?.text).toContain("1 of 2 stages complete");
-    expect(rec.updates.at(-1)?.text).toContain("Waiting");
+    expect(rec.updates.at(-1)?.text).toContain("Waiting — needs approval");
   });
 
+  test("an active todo renders its content as the working detail", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onTodoPhases({
+      spaceId: "slack:C1",
+      phases: [{ name: "plan", tasks: [{ content: "Draft the release notes", status: "in_progress" }] }],
+    });
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS);
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("Working — Draft the release notes");
+  });
   test("raw thinking is never visible on channel or DM surfaces", async () => {
     const channel = recordingAdapter({ streaming: false });
     const { store } = recordingStore();
@@ -1884,5 +1900,18 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     expect(progressTasks.length).toBeGreaterThan(0);
     expect(new Set(progressTasks.map((entry) => entry.ts))).toEqual(new Set(["stream-1"]));
     expect(rec.texts).toHaveLength(0);
+  });
+  test("phrase progress timer advances elapsed without changing the accepted state", async () => {
+    vi.useFakeTimers();
+    fakeTimers = true;
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    vi.advanceTimersByTime(STREAM_UPDATE_INTERVAL_MS + 1000);
+    await flush();
+    expect(rec.updates.length).toBeGreaterThan(0);
+    expect(rec.updates.at(-1)?.text).toContain("Accepted — Request received");
   });
 });

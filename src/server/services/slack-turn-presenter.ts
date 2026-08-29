@@ -691,7 +691,7 @@ export class SlackTurnPresenter {
   /** turn_start advances an accepted turn to planning; evidence states win. */
   onTurnStart(): void {
     this.#mountStopControl();
-    if (this.#progress.state === "accepted") this.#setProgress("planning", "Preparing a plan");
+    if (this.#progress.state === "accepted") this.#setProgress("planning", "Building the work plan");
     this.#postThinkingPhrase();
   }
 
@@ -1239,18 +1239,19 @@ export class SlackTurnPresenter {
   /** Derives waiting/working/finishing state from tool and todo evidence. */
   #normalizeProgressFromEvidence(): void {
     const tasks = this.#todoPhases.flatMap((phase) => phase.tasks);
-    const blocked = tasks.some((task) => task.status === "blocked");
+    const active = tasks.find((task) => task.status === "in_progress") ?? tasks.find((task) => task.status === "pending");
+    const blocked = tasks.find((task) => task.status === "blocked");
     if (this.toolStepInFlight) {
       this.#setProgress("working", this.#progress.detail);
-    } else if (blocked) {
-      this.#setProgress("waiting", "Blocked on an outstanding task");
+    } else if (blocked !== undefined) {
+      this.#setProgress("waiting", blocked.blocker ?? blocked.content);
     } else if (
       this.#sawExternalWork &&
       tasks.every((task) => task.status === "completed" || task.status === "abandoned")
     ) {
-      this.#setProgress("finishing", "Preparing the final response");
+      this.#setProgress("finishing", "Preparing the response");
     } else if (this.#sawExternalWork || tasks.length > 0) {
-      this.#setProgress("working", "Completing the request");
+      this.#setProgress("working", active?.content ?? "Completing the request");
     } else {
       this.#renderProgressNow();
     }
@@ -1324,6 +1325,7 @@ export class SlackTurnPresenter {
       .then((ts) => {
         if (ts !== undefined && !this.#turnDelivered) {
           this.pendingTs = ts;
+          this.armProgressTimer();
           this.replayTurnProgress();
           console.log(`presenter: phrase posted ${this.spaceId} ${ts}`);
           const receivedAt = this.#receivedAt;

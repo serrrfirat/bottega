@@ -520,22 +520,15 @@ describe("channel chat-reply thread polling (issue #212)", () => {
   });
 
   test("a live-progress line is never the reply — the poll keeps waiting for the real text (issue #224)", async () => {
-    // Live finding (run msypizpb-qt3): the live model returned empty
-    // completions for the ping turns. The DM turn's phrase was edited to
-    // the elapsed progress line "Thinking… 0s" (the plain presenter's
-    // progress tick) and the DM journey MATCHED it as the reply — a false
-    // pass that hid the no-reply — while the channel turn (stream
-    // presenter: no progress tick) honestly timed out. A progress line is
-    // turn decoration; a real reply replaces the phrase in place. The stub
-    // posts the progress line first; the poll must skip it and only
-    // resolve on the real reply. Red on the pre-fix code: the poll matched
-    // "Thinking… 0s" immediately and never saw the real reply.
+    // The live model can leave an explicit accepted progress line while a
+    // request is still running. Progress is turn decoration; the poll must
+    // skip it and resolve only on the real reply.
     const pingTs = "1787000000.000100";
     const progressLine: SlackApiMessage = {
       ts: "1787000000.000300",
       channel: "C1",
       bot_id: "B-bot",
-      text: "Thinking… 0s",
+      text: "Accepted — Request received\n0s elapsed",
     };
     const realReply: SlackApiMessage = {
       ts: "1787000000.000900",
@@ -1519,37 +1512,26 @@ describe("MCP OAuth + upload-link journey mechanisms (issues #198/#196)", () => 
 });
 
 describe("live-progress line shapes (issue #193)", () => {
-  test("the journey's regex matches the step / thinking / elapsed shapes, never the static phrase", () => {
-    expect(PROGRESS_LINE_RE.test("⚙️ github.search_issues — allowed (read)")).toBe(true);
-    expect(PROGRESS_LINE_RE.test("🧠 the model is reasoning about the fix")).toBe(true);
-    expect(PROGRESS_LINE_RE.test("Thinking… 3s")).toBe(true);
-    expect(PROGRESS_LINE_RE.test("Thinking…")).toBe(false);
+  test("the journey's regex matches explicit progress states with elapsed metadata", () => {
+    expect(PROGRESS_LINE_RE.test("Accepted — Request received\n0s elapsed")).toBe(true);
+    expect(PROGRESS_LINE_RE.test("Planning — Building the work plan\n1s elapsed")).toBe(true);
+    expect(PROGRESS_LINE_RE.test("Working — Search issues\n1 of 2 stages complete · 2s elapsed")).toBe(true);
+    expect(PROGRESS_LINE_RE.test("Waiting — needs approval\n1 of 2 stages complete · 3s elapsed")).toBe(true);
+    expect(PROGRESS_LINE_RE.test("Finishing — Preparing the response\n2 of 2 stages complete · 4s elapsed")).toBe(true);
+    expect(PROGRESS_LINE_RE.test("Accepted — Request received")).toBe(false);
     expect(PROGRESS_LINE_RE.test("ok")).toBe(false);
   });
 });
 
 describe("no-reply timeout diagnosis (issue #245)", () => {
-  test("a bot turn that never replies times out WITH what it posted — turn opened, tool lines, and the empty-response churn guard", async () => {
-    // Live finding (run mt01tgvw-48n): a no-reply wait reported only
-    // "no bot reply to ... within Nms" while the bot had visibly opened a
-    // turn — the bare message hid the failure mode. The stub returns ONLY
-    // bot-authored non-reply rows after the inbound: a ⚙️ progress line, a
-    // 🧠 thinking line, the adapter's EMPTY_RESPONSE_FALLBACK, and the
-    // CHURN_MESSAGE guard. Red on the pre-fix code TWICE over: the
-    // fallback row matched the reply filter, so waitForBotReply
-    // false-PASSED on the churn turn (resolved with the fallback instead
-    // of timing out) — and a true timeout carried no diagnosis. Post-fix
-    // the wait times out and the error names the cause.
+  test("a bot turn that never replies times out with explicit progress diagnostics", async () => {
     const pingTs = "1787000000.000100";
     const botRows: SlackApiMessage[] = [
-      { ts: "1787000000.000110", channel: "C1", bot_id: "B-bot", text: "⚙️ github.search_issues — allowed (read)" },
-      { ts: "1787000000.000120", channel: "C1", bot_id: "B-bot", text: "🧠 the model is reasoning about the fix" },
+      { ts: "1787000000.000110", channel: "C1", bot_id: "B-bot", text: "Working — Search issues\n0 of 2 stages complete · 1s elapsed" },
+      { ts: "1787000000.000120", channel: "C1", bot_id: "B-bot", text: "Waiting — needs approval\n1 of 2 stages complete · 2s elapsed" },
       { ts: "1787000000.000130", channel: "C1", bot_id: "B-bot", text: "Hmm — I got an empty response, retrying…" },
       { ts: "1787000000.000140", channel: "C1", bot_id: "B-bot", text: "I keep getting empty responses — check the model key?" },
     ];
-    // SAFETY: the stub only exposes the sync members waitForBotReply reads
-    // (history for the poll, botUserId/qaUserId for isBotMessage); the
-    // rest of the Harness surface is unused in this mechanism test.
     const h = {
       liveSlack: {
         botUserId: "B-bot",
@@ -1563,25 +1545,15 @@ describe("no-reply timeout diagnosis (issue #245)", () => {
     } as Harness;
     let error: Error | undefined;
     try {
-      await waitForBotReply(h, "C1", {
-        afterTs: pingTs,
-        label: "churn diagnostics ping",
-        timeoutMs: 300,
-      });
+      await waitForBotReply(h, "C1", { afterTs: pingTs, label: "churn diagnostics ping", timeoutMs: 300 });
     } catch (caught) {
       error = caught instanceof Error ? caught : new Error(String(caught));
     }
-    // Pre-fix this resolved (the fallback false-passed as a "reply") and
-    // then the message assertions below failed; post-fix it rejects.
     expect(error).toBeDefined();
     const message = error?.message ?? "";
-    // Turn opened: the diagnosis counts the bot rows and calls out that
-    // none reads as a reply.
     expect(message).toMatch(/the bot posted \d+ message\(s\) after the ask but none reads as a reply/);
-    // Tool / progress lines surface verbatim (issue #245).
-    expect(message).toContain("⚙️ github.search_issues — allowed (read)");
-    expect(message).toContain("🧠 the model is reasoning about the fix");
-    // The empty-response churn guard names the recovery (issue #245).
+    expect(message).toContain("Working — Search issues");
+    expect(message).toContain("Waiting — needs approval");
     expect(message).toMatch(/empty-response churn hit the recovery guard — check the model key/);
   });
 });
