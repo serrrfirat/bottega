@@ -2077,6 +2077,17 @@ describe("TurnProgressSnapshot presenter integration (issue #383)", () => {
     expect(rec.updates.at(-1)?.text).toContain("1 of 2 stages complete");
     expect(rec.updates.at(-1)?.text).toContain("Waiting — needs approval");
   });
+  test("a turn_end error without a message preserves the empty-response text before its failed summary", async () => {
+    const rec = recordingAdapter({ streaming: false });
+    const { store } = recordingStore();
+    const presenter = new SlackTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onTurnEnd({ error: "provider exploded" });
+    await flush();
+    expect(rec.updates.at(-1)?.text).toContain("empty response");
+    expect(rec.updates.at(-1)?.text).toContain("Failed in");
+  });
 
   test("an active todo renders its content as the working detail", async () => {
     vi.useFakeTimers();

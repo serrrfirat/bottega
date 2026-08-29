@@ -555,6 +555,7 @@ export class SlackTurnPresenter {
    * turn_end/error/dispose and when a non-streaming turn starts.
    */
   protected streamingTurns = false;
+  protected alwaysStream = false;
   /** Pending coalesced streaming update (issue #120). */
   #streamUpdate: PendingStreamUpdate | undefined;
   /** In-flight progress flush (#365): the settle edit queues behind it —
@@ -632,6 +633,8 @@ export class SlackTurnPresenter {
   #sourceWaitingLabel: string | undefined;
   /** Latest raw streamed answer, retained after interim updates flush. */
   #streamedAnswer: string | undefined;
+  /** Latest visible empty-response fallback retained for turn-end delivery. */
+  #emptyResponseText: string | undefined;
   /** Active model provider for provider-aware error recovery. */
   readonly #provider: string | undefined;
 
@@ -780,13 +783,14 @@ export class SlackTurnPresenter {
       // Empty completion (#60): surface a visible fallback so the retry
       // loop is never silent, and count it for the churn guard.
       const cause = data.error?.trim() || undefined;
+      const fallback = emptyResponseFallback(cause, this.#provider);
+      this.#emptyResponseText = fallback;
       this.#countEmptyTurn(cause);
       if (!this.#churnActive) {
         this.cancelStreamUpdate();
         this.#cancelProgressTimer();
         const pendingTs = this.pendingTs;
         if (pendingTs !== undefined) {
-          const fallback = emptyResponseFallback(cause, this.#provider);
           void this.sendTextChunk(pendingTs, fallback).catch((err) => {
             console.error(`[slack-turn-presenter] failed to update empty-response phrase in ${this.spaceId}:`, err);
           });
@@ -858,7 +862,10 @@ export class SlackTurnPresenter {
       this.#sawError = true;
       this.#terminalOutcome = "failed";
     }
-    const rawFinalText = this.#latestStreamedText();
+    const rawFinalText =
+      this.#streamedAnswer ??
+      this.#emptyResponseText ??
+      (!this.#turnDelivered && data.error?.trim() ? emptyResponseFallback(data.error.trim(), this.#provider) : this.#latestStreamedText());
     const finalText = this.#withOutcomeSummary(rawFinalText);
     const streaming = this.streamingTurns || this.alwaysStream;
     if (!streaming && this.#stopped && !this.#turnDelivered && finalText !== undefined) {
@@ -1261,6 +1268,7 @@ export class SlackTurnPresenter {
     this.#stopped = false;
     this.#sourceWaitingLabel = undefined;
     this.#streamedAnswer = undefined;
+    this.#emptyResponseText = undefined;
   }
   #canRecordSource(label: string, state: SourceOutcome["state"]): boolean {
     return !(this.#sourceOutcomes.get(label)?.state === "complete" && state === "needs_reauthorization");
@@ -1280,6 +1288,8 @@ export class SlackTurnPresenter {
     return "complete";
   }
 
+  #withOutcomeSummary(text: string): string;
+  #withOutcomeSummary(text: string | undefined): string | undefined;
   #withOutcomeSummary(text: string | undefined): string | undefined {
     const outcome = this.#deriveTerminalOutcome();
     this.#terminalOutcome = outcome;

@@ -17,7 +17,7 @@ import type { SlackAction, SlackAdapter, SlackMessage } from "../adapters/slack"
 import { STOP_ACTION_ID } from "../adapters/slack";
 import { VOICE_MAX_BYTES, NEAR_TRANSCRIBE_MODEL } from "../../voice/transcriber";
 import { createAudit } from "../../policy/audit";
-import { EXTENSION_CONNECTED_EVENT, ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT, VOICE_NOTE_FAILED_EVENT } from "../../store/audit-events";
+import { ADMIN_ONBOARDING_NUDGE_EVENT, MESSAGE_RECEIVED_EVENT, MESSAGE_REPLIED_EVENT, DIGEST_FAILED_EVENT, OBJECT_ATTACHED_EVENT, TURN_STOP_EVENT, VOICE_NOTE_FAILED_EVENT } from "../../store/audit-events";
 import type { WizardCheck } from "../../tools/admin";
 import { buildAutoPickupDirective } from "../../tools/work-item-pickup";
 import { objectToolDefinitions } from "../../tools/objects";
