@@ -461,8 +461,17 @@ export class SlackApprovalRouter implements ApprovalRouter {
     const taskId = nextToolStepId();
     const output = redact(text);
     const label = humanizeToolName(tool);
-    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, label, status: "in_progress", output });
-    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, label, status: "complete", output, outcome: "failed" });
+    emitToolStep(this.onToolStep, {
+      spaceId: space,
+      taskId,
+      title,
+      label,
+      progressState: "waiting",
+      progressDetail: "Write failed; review required",
+      status: "in_progress",
+      output,
+    });
+    emitToolStep(this.onToolStep, { spaceId: space, taskId, title, label, status: "complete", outcome: "failed", output });
     this.log(`[approvals] confirmed write failed for ${tool}: ${text}`);
   }
 

@@ -319,6 +319,9 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
                     taskId,
                     label,
                     title: toolStepTitle(tool.name, "waiting for approval"),
+                    progressState: "waiting",
+                    progressDetail: "Waiting for approval",
+                    sourceLabel: manifest.label,
                     status: "in_progress",
                     output: stepArgs,
                   });
@@ -336,33 +339,24 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
           taskId,
           label,
           title: toolStepTitle(tool.name, `denied (${tier})`),
+          sourceLabel: manifest.label,
           status: "complete",
           outcome: "denied",
           output: stepArgs,
         });
         return { ok: false, error: outcome.blockReason };
       }
-      if (outcome.decision === "ask-human") {
-        // The waiting card (onAskHuman above) resolves as "approved".
-        emitToolStep(sink, {
-          spaceId,
-          taskId,
-          label,
-          title: toolStepTitle(tool.name, `approved (${tier})`),
-          status: "complete",
-          outcome: "approved",
-          output: stepArgs,
-        });
-      } else {
-        emitToolStep(sink, {
-          spaceId,
-          taskId,
-          label,
-          title: toolStepTitle(tool.name, `allowed (${tier})`),
-          status: "in_progress",
-          output: stepArgs,
-        });
-      }
+      emitToolStep(sink, {
+        spaceId,
+        taskId,
+        label,
+        title: toolStepTitle(tool.name, outcome.decision === "ask-human" ? "approved" : `allowed (${tier})`),
+        progressState: "working",
+        progressDetail: label,
+        sourceLabel: manifest.label,
+        status: "in_progress",
+        output: stepArgs,
+      });
 
       // 2. Credential ladder over the store's registry rows. Personal
       // lookups are filtered to the caller — the ladder never sees other
@@ -386,17 +380,16 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         // The card documents the attempt: check it off so the thinking
         // panel never shows a stuck spinner (the error rides the reply).
         // The tool never ran — this is a FAILED outcome, never success.
-        if (outcome.decision !== "ask-human") {
-          emitToolStep(sink, {
-            spaceId,
-            taskId,
-            label,
-            title: toolStepTitle(tool.name, `allowed (${tier})`),
-            status: "complete",
-            outcome: "failed",
-            output: stepArgs,
-          });
-        }
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          label,
+          title: toolStepTitle(tool.name, `allowed (${tier})`),
+          sourceLabel: manifest.label,
+          status: "complete",
+          outcome: "failed",
+          output: stepArgs,
+        });
         return { ok: false, error: resolution.kind === "ask" ? resolution.reason : resolution.message };
       }
       const credential = resolution.credential;
@@ -442,17 +435,16 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
                       egress: deps.openapiEgress ?? FAIL_CLOSED_OPENAPI_EGRESS,
                     })
                   : await callCliTool(manifest.cli, wireName, args, authorization);
-            if (outcome.decision !== "ask-human") {
-              emitToolStep(sink, {
-                spaceId,
-                taskId,
-                label,
-                title: toolStepTitle(tool.name, `allowed (${tier})`),
-                status: "complete",
-                outcome: "succeeded",
-                output: stepArgs,
-              });
-            }
+            emitToolStep(sink, {
+              spaceId,
+              taskId,
+              label,
+              title: toolStepTitle(tool.name, `allowed (${tier})`),
+              sourceLabel: manifest.label,
+              status: "complete",
+              outcome: result.ok ? "succeeded" : "failed",
+              output: stepArgs,
+            });
             return result;
           },
         );
@@ -466,17 +458,16 @@ export function createExtensionRuntime(deps: ExtensionRuntimeDeps): ExtensionRun
         if (outcome.decision === "ask-human") {
           deps.router.recordConfirmedWriteFailure?.(spaceId ?? "", tool.name, errorMessage(err));
         }
-        if (outcome.decision !== "ask-human") {
-          emitToolStep(sink, {
-            spaceId,
-            taskId,
-            label,
-            title: toolStepTitle(tool.name, `allowed (${tier})`),
-            status: "complete",
-            outcome: "failed",
-            output: stepArgs,
-          });
-        }
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          label,
+          title: toolStepTitle(tool.name, `allowed (${tier})`),
+          sourceLabel: manifest.label,
+          status: "complete",
+          outcome: "failed",
+          output: stepArgs,
+        });
         return { ok: false, error: `extension tool "${tool.name}" failed: ${errorMessage(err)}` };
       }
     },

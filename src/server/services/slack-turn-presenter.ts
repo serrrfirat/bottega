@@ -172,29 +172,23 @@ export interface ToolStepEvent {
   title: string;
   /** in_progress opens a card; complete checks it off (a deny resolves as complete). */
   status: "in_progress" | "complete";
-  /**
-   * Truthful EXECUTION outcome on a terminal (complete) step, set at the
-   * source (issue #295). `complete` alone is NOT success: denied calls,
-   * ask-human approvals (emitted BEFORE the tool runs), and allowed calls
-   * that errored all resolve as complete. Only `"succeeded"` means the
-   * tool actually ran and returned — the completed-action footer claims
-   * only genuinely successful executions. Undefined for in_progress steps.
-   */
+  /** Truthful execution outcome on a terminal step. */
   outcome?: ToolStepOutcome;
-  /**
-   * Human-readable tool label derived from the tool NAME at the source
-   * (issue #295), e.g. "Search issues" for `github.search_issues`. The DM
-   * footer renders this, never the raw internal identifier. Absent when no
-   * trustworthy label exists — the footer then omits that action rather
-   * than leak an identifier.
-   */
+  /** Human-readable tool label derived from the tool name at the source. */
   label?: string;
+  /** Presentation-safe active progress state. */
+  progressState?: "working" | "waiting";
+  /** Presentation-safe active progress detail; never raw args or provider errors. */
+  progressDetail?: string;
+  /** Presentation-safe source label (for example an extension manifest label). */
+  sourceLabel?: string;
   /** Redacted args summary (the card's code block); capped by the adapter. */
   output?: string;
 }
 
 /** How a gated tool call's TERMINAL card resolved (issue #295). */
-export type ToolStepOutcome = "succeeded" | "denied" | "approved" | "failed";
+export type ToolStepOutcome = "succeeded" | "denied" | "failed";
+
 
 /** The step-source → presenter bridge; must never throw into the turn path. */
 export type ToolStepSink = (step: ToolStepEvent) => void;
@@ -1196,14 +1190,17 @@ export class SlackTurnPresenter {
   protected renderToolStep(step: ToolStepEvent): void {
     this.toolStepInFlight = step.status === "in_progress";
     if (step.status === "in_progress") {
-      const waitingForApproval = step.title.toLowerCase().includes("waiting for approval");
+      const waitingForApproval =
+        step.progressState === "waiting" || (step.progressState === undefined && step.title.toLowerCase().includes("waiting for approval"));
       if (!waitingForApproval) this.#sawExternalWork = true;
-      this.#setProgress(waitingForApproval ? "waiting" : "working", step.label ?? "External work");
+      this.#setProgress(
+        step.progressState ?? (waitingForApproval ? "waiting" : "working"),
+        step.progressDetail ?? (waitingForApproval ? "Waiting for approval" : step.label ?? "External work"),
+      );
       return;
     }
     this.#normalizeProgressFromEvidence();
   }
-
 
   /** Formats normalized progress with the current queue count. */
   protected progressText(progress: TurnProgressSnapshot): string {
@@ -1901,7 +1898,7 @@ export class StreamTurnPresenter extends SlackTurnPresenter {
     void this.adapter
       .appendTask(this.spaceId, ts, {
         id: step.taskId,
-        title: step.title,
+        title: step.label ?? "External action",
         status: step.status,
         ...(step.output !== undefined ? { output: step.output } : undefined),
       })

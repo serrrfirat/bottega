@@ -225,7 +225,7 @@ describe("extension runtime: gate first (denied calls never resolve a credential
 describe("extension runtime: thinking-step emission (issue #168)", () => {
   /** Collects the steps the sink received for one call. */
   function stepHarness(opts: Parameters<typeof makeHarness>[0] = {}) {
-    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string }> = [];
+    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string; progressState?: "working" | "waiting"; progressDetail?: string; sourceLabel?: string; outcome?: string }> = [];
     const h = makeHarness({ ...opts, onToolStep: (step) => steps.push(step) });
     return { h, steps };
   }
@@ -243,14 +243,23 @@ describe("extension runtime: thinking-step emission (issue #168)", () => {
     });
     expect(result.ok).toBe(true);
 
-    expect(steps).toHaveLength(2);
     expect(steps[0]).toMatchObject({
       spaceId: "slack:C1",
       status: "in_progress",
       title: `${FIXTURE_EXTENSION_TOOL} — allowed (read)`,
+      sourceLabel: "Fixture Weather",
+      progressState: "working",
+      progressDetail: "Current",
     });
-    expect(steps[1]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: `${FIXTURE_EXTENSION_TOOL} — allowed (read)` });
-    expect(steps[0]!.taskId).toBe(steps[1]!.taskId); // one card, checked off
+    expect(steps[1]).toMatchObject({
+      spaceId: "slack:C1",
+      status: "complete",
+      title: `${FIXTURE_EXTENSION_TOOL} — allowed (read)`,
+      sourceLabel: "Fixture Weather",
+      outcome: "succeeded",
+    });
+
+    expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
   });
 
   test("a denied call emits a single terminal deny step", async () => {
@@ -290,7 +299,7 @@ describe("extension runtime: thinking-step emission (issue #168)", () => {
     expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
   });
 
-  test("an ask-human call emits waiting for approval, then approved, on one shared card", async () => {
+  test("an ask-human call emits waiting, then working, then succeeded on one shared card", async () => {
     const { h, steps } = stepHarness({
       policy: parseOrgConfigYaml("tools:\n  weather.current: prompt\n"),
       router: { request: async () => ({ approved: true, approver: "U1" }) },
@@ -306,12 +315,55 @@ describe("extension runtime: thinking-step emission (issue #168)", () => {
     });
     expect(result.ok).toBe(true);
 
-    // waiting-for-approval (in_progress, via the gate's onAskHuman hook)
-    // then approved (complete) — the SAME card, one id.
-    expect(steps).toHaveLength(2);
-    expect(steps[0]).toMatchObject({ spaceId: "slack:C1", status: "in_progress", title: `${FIXTURE_EXTENSION_TOOL} — waiting for approval` });
-    expect(steps[1]).toMatchObject({ spaceId: "slack:C1", status: "complete", title: `${FIXTURE_EXTENSION_TOOL} — approved (read)` });
-    expect(steps[0]!.taskId).toBe(steps[1]!.taskId);
+    expect(steps).toHaveLength(3);
+    expect(steps[0]).toMatchObject({
+      spaceId: "slack:C1",
+      status: "in_progress",
+      progressState: "waiting",
+      progressDetail: "Waiting for approval",
+      sourceLabel: "Fixture Weather",
+    });
+    expect(steps[1]).toMatchObject({
+      spaceId: "slack:C1",
+      status: "in_progress",
+      progressState: "working",
+      progressDetail: "Current",
+      sourceLabel: "Fixture Weather",
+    });
+    expect(steps[2]).toMatchObject({
+      spaceId: "slack:C1",
+      status: "complete",
+      outcome: "succeeded",
+      sourceLabel: "Fixture Weather",
+    });
+    expect(steps.every((step) => step.taskId === steps[0]!.taskId)).toBe(true);
+  });
+
+  test("an approved extension execution failure emits working then failed complete", async () => {
+    const failingBoundary: CredentialBoundary = {
+      async runWithAuthorization() {
+        throw new Error("provider-internal secret failure");
+      },
+    };
+    const { h, steps } = stepHarness({
+      policy: parseOrgConfigYaml("tools:\n  weather.current: prompt\n"),
+      router: { request: async () => ({ approved: true, approver: "U1" }) },
+      boundary: failingBoundary,
+    });
+    await seedOrgCredential(h.store);
+    const result = await h.runtime.execute({
+      extensionId: FIXTURE_EXTENSION_ID,
+      toolName: FIXTURE_EXTENSION_TOOL,
+      args: { city: "Lisbon" },
+      caller: "UADA",
+      spaceId: "slack:C1",
+    });
+    expect(result.ok).toBe(false);
+    expect(steps[1]!.progressDetail).toBe("Current");
+    expect(steps.map((step) => step.progressState)).toEqual(["waiting", "working", undefined]);
+    expect(steps.at(-1)).toMatchObject({ outcome: "failed", sourceLabel: "Fixture Weather" });
+    expect(steps.every((step) => !step.progressDetail?.includes("secret failure"))).toBe(true);
+    expect(steps.every((step) => step.taskId === steps[0]!.taskId)).toBe(true);
   });
 
   test("secret-shaped args are redacted in the step output, never raw", async () => {

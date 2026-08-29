@@ -17,7 +17,7 @@ import { extensionToolDefinitions } from "../../extensions/tools";
 import type { ExtensionRuntime } from "../../extensions/runtime";
 import type { MemoryProvider } from "../../memory/types";
 import { createAudit } from "../../policy/audit";
-import { DenyRouter } from "../../policy/approval-router";
+import { DenyRouter, type ApprovalRouter } from "../../policy/approval-router";
 import { parseOrgConfigYaml } from "../../policy/config";
 import { createStore, type ExtensionCredential, type SpaceModelSettings, type Store } from "../../store/db";
 import type { OrgSettings } from "../../store/org-settings";
@@ -1493,7 +1493,7 @@ describe("empty completions surface at the presenter (issue #226)", () => {
     // the SDK's turn events. The model completes with EMPTY content.
     presenter.onInbound({ spaceId: "slack:C1", principal: "U1", text: "hello", ts: "1.1" });
     await flush();
-    expect(posts.map((p) => p.text)).toEqual(["Thinking…"]);
+    expect(posts.map((p) => p.text)).toEqual(["Accepted — Request received\n0s elapsed"]);
 
     const CAUSE = "400 No tool output found for tool call call_repro_1";
     emit({ type: "turn_start" });
@@ -2213,11 +2213,16 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
     title: string;
     status: "in_progress" | "complete";
     output?: string;
+    progressState?: "working" | "waiting";
+    progressDetail?: string;
+    sourceLabel?: string;
+    outcome?: string;
   }
 
   function gatedReadTool(opts: {
     orgYaml?: string;
     sink?: (step: StepSinkCall) => void;
+    router?: ApprovalRouter;
   } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "gate-steps-"));
     const store = createStore(join(dir, "test.db"));
@@ -2238,7 +2243,7 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
       {
         orgPolicy,
         audit,
-        router: DenyRouter,
+        router: opts.router ?? DenyRouter,
         store,
         onToolStep: sink,
       },
@@ -2266,6 +2271,24 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
       cleanup();
     }
   });
+  test("an approved call emits waiting, working, then succeeded on one shared card", async () => {
+    const { tool, steps, ctx, cleanup } = gatedReadTool({
+      orgYaml: "tools:\n  read: prompt\n",
+      router: { request: async () => ({ approved: true, approver: "U1" }) },
+    });
+    try {
+      await tool.execute("c1", { path: "/x" }, undefined, undefined, ctx);
+      expect(steps).toHaveLength(3);
+      expect(steps.map((step) => step.status)).toEqual(["in_progress", "in_progress", "complete"]);
+      expect(steps.map((step) => step.progressState)).toEqual(["waiting", "working", undefined]);
+      expect(steps.map((step) => step.progressDetail)).toEqual(["Waiting for approval", "Read", undefined]);
+      expect(steps.at(-1)).toMatchObject({ outcome: "succeeded" });
+      expect(steps.every((step) => step.taskId === steps[0]!.taskId)).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
 
   test("a denied call emits a single terminal deny step", async () => {
     const { tool, steps, ctx, cleanup } = gatedReadTool({ orgYaml: "tools:\n  read: deny\n" });

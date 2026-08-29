@@ -818,6 +818,8 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
                       taskId,
                       label,
                       title: toolStepTitle(def.name, "waiting for approval"),
+                      progressState: "waiting",
+                      progressDetail: "Waiting for approval",
                       status: "in_progress",
                       output: stepArgs,
                     });
@@ -858,43 +860,29 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
         console.log(`[tool] ${def.name} → denied (${tier})`);
         throw new Error(outcome.blockReason);
       }
-      if (outcome.decision === "ask-human") {
-        // The waiting card (onAskHuman above) resolves as "approved".
-        emitToolStep(sink, {
-          spaceId,
-          taskId,
-          label,
-          title: toolStepTitle(def.name, `approved (${tier})`),
-          status: "complete",
-          outcome: "approved",
-          output: stepArgs,
-        });
-      } else {
+      emitToolStep(sink, {
+        spaceId,
+        taskId,
+        label,
+        title: toolStepTitle(def.name, outcome.decision === "ask-human" ? "approved" : `allowed (${tier})`),
+        progressState: "working",
+        progressDetail: label,
+        status: "in_progress",
+        output: stepArgs,
+      });
+      try {
+        const result = await execute.call(def, toolCallId, params, signal, onUpdate, ctx);
+        // A returned result means the tool executed; provider-marked errors
+        // are terminal failures rather than false successes.
         emitToolStep(sink, {
           spaceId,
           taskId,
           label,
           title: toolStepTitle(def.name, `allowed (${tier})`),
-          status: "in_progress",
+          status: "complete",
+          outcome: result.isError ? "failed" : "succeeded",
           output: stepArgs,
         });
-      }
-      try {
-        const result = await execute.call(def, toolCallId, params, signal, onUpdate, ctx);
-        // The call RAN AND RETURNED: check the card off as SUCCEEDED — the
-        // only #295-footer-eligible outcome. (A call that later throws is
-        // the failed path below, never succeeded.)
-        if (outcome.decision !== "ask-human") {
-          emitToolStep(sink, {
-            spaceId,
-            taskId,
-            label,
-            title: toolStepTitle(def.name, `allowed (${tier})`),
-            status: "complete",
-            outcome: "succeeded",
-            output: stepArgs,
-          });
-        }
         // Tool-outcome INFO (issue #224): the canary's tool-event seam —
         // log the tool name + outcome so a live run attributes a store
         // effect that never landed (tool failure vs stall vs model
@@ -932,17 +920,15 @@ export function withPolicyGate<TDef extends ToolDefinition>(def: TDef, deps: Pol
             err instanceof Error ? err.message : String(err),
           );
         }
-        if (outcome.decision !== "ask-human") {
-          emitToolStep(sink, {
-            spaceId,
-            taskId,
-            label,
-            title: toolStepTitle(def.name, `allowed (${tier})`),
-            status: "complete",
-            outcome: "failed",
-            output: stepArgs,
-          });
-        }
+        emitToolStep(sink, {
+          spaceId,
+          taskId,
+          label,
+          title: toolStepTitle(def.name, `allowed (${tier})`),
+          status: "complete",
+          outcome: "failed",
+          output: stepArgs,
+        });
         console.log(`[tool] ${def.name} → error: ${err instanceof Error ? err.message : String(err)}`);
         throw err;
       }

@@ -689,7 +689,7 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
 
   test("a confirmed write that fails posts the failure to the thread and a later card surfaces it (issue #277)", async () => {
     const postedSignal = Promise.withResolvers<void>();
-    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string }> = [];
+    const steps: Array<{ spaceId?: string; taskId: string; title: string; status: string; output?: string; progressState?: "working" | "waiting"; progressDetail?: string; sourceLabel?: string; outcome?: string }> = [];
     const { adapter, posted } = fakeAdapter({ onPosted: () => postedSignal.resolve() });
     const router = new SlackApprovalRouter({
       adapter,
@@ -717,6 +717,10 @@ describe("policy gate end to end with the Slack router (issue #44)", () => {
     const failureSteps = steps.filter((s) => s.title.includes("confirmed write failed"));
     expect(failureSteps).toHaveLength(2);
     expect(failureSteps.map((s) => s.status)).toEqual(["in_progress", "complete"]);
+    expect(failureSteps[0]!.progressState).toBe("waiting");
+    expect(failureSteps[1]!.outcome).toBe("failed");
+    expect(failureSteps[0]!.progressDetail).toBe("Write failed; review required");
+    expect(failureSteps[1]!.progressDetail).toBeUndefined();
     // Shared taskId: the complete checks off the card the in_progress opened.
     expect(failureSteps[0].taskId).toBe(failureSteps[1].taskId);
     expect(failureSteps[0].spaceId).toBe("slack:C1");

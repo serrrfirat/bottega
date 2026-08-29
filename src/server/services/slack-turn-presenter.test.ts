@@ -193,13 +193,13 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
 
     // N gated tool calls: each opens a card in_progress and checks it off.
     const steps: ToolStepEvent[] = [
-      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("github.search_issues", "allowed (read)"), status: "in_progress", output: '{"query":"bugs"}' },
-      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("create_work_item", "allowed (write)"), status: "in_progress", output: '{"title":"fix bug"}' },
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("github.search_issues", "allowed (read)"), label: "Search issues", status: "in_progress", output: '{"query":"bugs"}' },
+      { spaceId: "slack:C1", taskId: nextToolStepId(), title: toolStepTitle("create_work_item", "allowed (write)"), label: "Create work item", status: "in_progress", output: '{"title":"fix bug"}' },
     ];
     for (const step of steps) presenter.onToolStep(step);
     await flush();
-    presenter.onToolStep({ ...steps[0]!, status: "complete" });
-    presenter.onToolStep({ ...steps[1]!, status: "complete" });
+    presenter.onToolStep({ ...steps[0]!, status: "complete", outcome: "succeeded" });
+    presenter.onToolStep({ ...steps[1]!, status: "complete", outcome: "succeeded" });
     await flush();
 
     const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
@@ -207,13 +207,7 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     expect(toolTasks.map((c) => c.task.id)).toEqual([steps[0]!.taskId, steps[1]!.taskId, steps[0]!.taskId, steps[1]!.taskId]);
     expect(toolTasks[0]!.task.status).toBe("in_progress");
     expect(toolTasks[2]!.task.status).toBe("complete");
-    expect(toolTasks.map((c) => c.task.title)).toEqual([
-      "github.search_issues — allowed (read)",
-      "create_work_item — allowed (write)",
-      "github.search_issues — allowed (read)",
-      "create_work_item — allowed (write)",
-    ]);
-    expect(toolTasks[0]!.task.output).toBe('{"query":"bugs"}');
+    expect(toolTasks.map((c) => c.task.title)).toEqual(["Search issues", "Create work item", "Search issues", "Create work item"]);
 
     // Interim reply text streams below the panel...
     presenter.onMessage({ spaceId: "slack:C1", text: "Working on it" });
@@ -226,6 +220,39 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     expect(rec.stops[0]).toMatchObject({ spaceId: "slack:C1", ts: streamTs, text: "Done — here is the answer" });
     // The coalesced interim append never landed: the final block superseded it.
     expect(rec.texts).toHaveLength(0);
+  });
+
+  test("stream tool cards use the friendly label, never the internal title", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId: nextToolStepId(),
+      title: "internal.secret_tool — allowed (exec)",
+      label: "Friendly action",
+      status: "in_progress",
+    });
+    await flush();
+    expect(rec.tasks.filter((entry) => entry.task.id !== "turn-progress").at(-1)?.task.title).toBe("Friendly action");
+  });
+
+  test("stream tool cards fall back to External action without a friendly label", async () => {
+    const rec = recordingAdapter();
+    const { store } = recordingStore();
+    const presenter = new StreamTurnPresenter({ spaceId: "slack:C1", adapter: rec.adapter, store, onboardingChecks: () => [] });
+    presenter.onInbound(msg());
+    await flush();
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId: nextToolStepId(),
+      title: "internal.secret_tool — allowed (exec)",
+      status: "in_progress",
+    });
+    await flush();
+    expect(rec.tasks.filter((entry) => entry.task.id !== "turn-progress").at(-1)?.task.title).toBe("External action");
   });
 
   test("a denied call renders one step stating the deny", async () => {
@@ -245,7 +272,7 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     await flush();
     const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
     expect(toolTasks).toHaveLength(1);
-    expect(toolTasks[0]!.task).toMatchObject({ id: taskId, title: "bash — denied (exec)", status: "complete" });
+    expect(toolTasks[0]!.task).toMatchObject({ id: taskId, title: "External action", status: "complete" });
   });
 
   test("an ask-human call shows waiting for approval until it resolves, sharing one card id", async () => {
@@ -259,18 +286,46 @@ describe("StreamTurnPresenter: thinking panel (issue #168)", () => {
     });
     presenter.onInbound(msg());
     await flush();
-
     const taskId = nextToolStepId();
-    // While the approval router waits: in_progress "waiting for approval".
-    presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("create_work_item", "waiting for approval"), status: "in_progress", output: '{"title":"x"}' });
+    // While approval is pending, the card is waiting; approval transitions it
+    // to working and a real execution result resolves the same task.
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId,
+      title: toolStepTitle("create_work_item", "waiting for approval"),
+      label: "Create work item",
+      progressState: "waiting",
+      progressDetail: "Waiting for approval",
+      status: "in_progress",
+      output: '{"title":"x"}',
+    });
     await flush();
-    // Approved: the SAME card checks off as complete.
-    presenter.onToolStep({ spaceId: "slack:C1", taskId, title: toolStepTitle("create_work_item", "approved (write)"), status: "complete", output: '{"title":"x"}' });
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId,
+      title: toolStepTitle("create_work_item", "allowed (write)"),
+      label: "Create work item",
+      progressState: "working",
+      progressDetail: "Create work item",
+      status: "in_progress",
+      output: '{"title":"x"}',
+    });
+    await flush();
+    presenter.onToolStep({
+      spaceId: "slack:C1",
+      taskId,
+      title: toolStepTitle("create_work_item", "allowed (write)"),
+      label: "Create work item",
+      status: "complete",
+      outcome: "succeeded",
+      output: '{"title":"x"}',
+    });
     await flush();
     const toolTasks = rec.tasks.filter((entry) => entry.task.id !== "turn-progress");
-    expect(toolTasks).toHaveLength(2);
-    expect(toolTasks[0]!.task).toMatchObject({ id: taskId, status: "in_progress", title: "create_work_item — waiting for approval" });
-    expect(toolTasks[1]!.task).toMatchObject({ id: taskId, status: "complete", title: "create_work_item — approved (write)" });
+    expect(toolTasks).toHaveLength(3);
+    expect(toolTasks.map((entry) => entry.task.id)).toEqual([taskId, taskId, taskId]);
+    expect(toolTasks.map((entry) => entry.task.status)).toEqual(["in_progress", "in_progress", "complete"]);
+    expect(toolTasks.map((entry) => entry.task.title)).toEqual(["Create work item", "Create work item", "Create work item"]);
   });
 
   test("secret-shaped args never reach a step: redacted at the source, rendered as [REDACTED]", () => {
@@ -1405,8 +1460,6 @@ describe("SlackTurnPresenter: top-level DM plain-text lifecycle (issue #296)", (
     presenter.onToolStep({ spaceId: "slack:D1", taskId: denied, title: toolStepTitle("bash", "denied (exec)"), label: humanizeToolName("bash"), status: "complete", outcome: "denied" });
     const failed = nextToolStepId();
     presenter.onToolStep({ spaceId: "slack:D1", taskId: failed, title: toolStepTitle("create_work_item", "allowed (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "failed" });
-    const approved = nextToolStepId();
-    presenter.onToolStep({ spaceId: "slack:D1", taskId: approved, title: toolStepTitle("create_work_item", "approved (write)"), label: humanizeToolName("create_work_item"), status: "complete", outcome: "approved" });
     await flush();
 
     presenter.onMessage({ spaceId: "slack:D1", text: "Done" });
