@@ -13,7 +13,7 @@
  * skip-gated by BOTTEGA_RUN_INTEGRATION (see src/memory/mnesis-integration.test.ts).
  */
 import type { Server } from "bun";
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { z } from "zod";
 import type { MemoryProvider } from "./types";
 import { createMnesisMemoryProvider, mnesisSessionId } from "./mnesis";
@@ -259,6 +259,10 @@ describe("mnesis provider (stub-backed, issue #348)", () => {
       principalId: "space-alpha",
       token: "mnesis-token",
     });
+  });
+
+  afterEach(async () => {
+    await stub.stop();
   });
 
   test("save maps content/scope/kind/metadata onto memory_add_learning structured fields", async () => {

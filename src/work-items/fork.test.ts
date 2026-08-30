@@ -15,6 +15,7 @@ import { buildForkContext, buildForkPreamble, forkWorkItem, resolveForkPoint } f
 const dirs: string[] = [];
 const stores: Store[] = [];
 afterAll(() => {
+  vi.useRealTimers();
   for (const store of stores) store.close();
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });

@@ -15,7 +15,7 @@
  * - Still needs a real workspace: Socket Mode delivery, app_mention/message
  *   routing, and Slack-side delivery guarantees.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createServer } from "@emulators/core";
 import slackPlugin, { getSlackStore, seedFromConfig } from "@emulators/slack";
 import { createSlackAdapter, spaceIdFromChannel } from "./slack";
@@ -53,6 +53,10 @@ function bootSlackEmulator() {
 
 describe("slack adapter against @emulators/slack", () => {
   const emu = bootSlackEmulator();
+
+  afterAll(() => {
+    emu.stop();
+  });
   const slack = getSlackStore(emu.store);
   // Channel ids are random per emulator run; derive the seeded id from the
   // store rather than hardcoding it.
