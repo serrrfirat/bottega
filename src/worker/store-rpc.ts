@@ -67,9 +67,11 @@ import { postOutboxRow, type OutboxWrite } from "../store/outbox";
 import {
   DELIVERY_COMPLETED_EVENT,
   DELIVERY_PENDING_EVENT,
+  EXTENSION_CALL_EVENT,
   JOB_COMPLETED_EVENT,
   JOB_FAILED_EVENT,
   MEMORY_WRITE_EVENT,
+  POLICY_DECISION_EVENT,
   USAGE_TURN_EVENT,
   WORK_ITEM_FAILED_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
@@ -229,6 +231,7 @@ const AUDIT_POLICY = {
     { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
     { eventType: DELIVERY_PENDING_EVENT, actors: ["executor"], space: "own" },
     { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: POLICY_DECISION_EVENT, actors: ["agent"], space: "own" },
     { eventType: USAGE_TURN_EVENT, actors: ["agent"], space: "own" },
   ],
   extension: [
@@ -236,6 +239,8 @@ const AUDIT_POLICY = {
     { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
     { eventType: DELIVERY_COMPLETED_EVENT, actors: ["executor"], space: "own" },
     { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: EXTENSION_CALL_EVENT, actors: ["executor"], space: "own" },
+    { eventType: POLICY_DECISION_EVENT, actors: ["agent"], space: "own" },
     { eventType: USAGE_TURN_EVENT, actors: ["agent"], space: "own" },
   ],
   kb: [
