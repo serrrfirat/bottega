@@ -96,6 +96,7 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     expect(env["WORKSPACES_DIR"]).toBeUndefined();
     const volumes = asStringArray(service("executor")["volumes"]);
     expect(volumes).toContain("data:/workspaces");
+    expect(asStringArray(service("executor")["group_add"])).toEqual(["${DOCKER_SOCKET_GID:-988}"]);
   });
 
   test("executor container keeps the reachable #105 hardening profile mandatory", () => {

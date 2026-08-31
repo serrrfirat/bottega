@@ -364,6 +364,10 @@ services:
     mem_limit: 1g
     cap_drop:
       - ALL
+    # The mounted Docker socket is owned by root and its host docker group.
+    # Match that supplementary group without running the executor as root.
+    group_add:
+      - "${DOCKER_SOCKET_GID:-988}"
     security_opt:
       - no-new-privileges:true
     tmpfs:
