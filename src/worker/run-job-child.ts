@@ -13,6 +13,7 @@ import type { ConsolidationModelCall, ConsolidationResult } from "../memory/cons
 import type { MemoryProvider } from "../memory/types";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import type { Store } from "../store/db";
+import type { WorkerJob } from "./envelope";
 import { runIsolatedJobBody, FORBIDDEN_CHILD_ENV_NAMES, type SandboxResult, type SandboxStore } from "./run-job";
 import { connectStoreRpc } from "./store-rpc";
 import {
@@ -120,27 +121,30 @@ function buildJobDeps(boot: ExecutorBoot, config: ExecutorConfig, lane: JobDepsL
   return { deps, consolidationModelCall };
 }
 
+function loadExtensionBrokerToken(job: WorkerJob): void {
+  if (job.kind !== "extension") return;
+  const tokenFile = process.env.OMP_AUTH_BROKER_TOKEN_FILE;
+  if (tokenFile === undefined || tokenFile === "") {
+    throw new Error("extension sandbox requires the mounted auth-broker token file");
+  }
+  const stat = statSync(tokenFile);
+  if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
+    throw new Error("extension sandbox auth-broker token mount must be a mode-0600 file");
+  }
+  const token = readFileSync(tokenFile, "utf8").trim();
+  if (token === "") throw new Error("extension sandbox auth-broker token mount is empty");
+  process.env.OMP_AUTH_BROKER_TOKEN = token;
+  delete process.env.OMP_AUTH_BROKER_TOKEN_FILE;
+}
+
 async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
   const forbidden = forbiddenEnvironment();
   if (forbidden.length > 0) {
     throw new Error(`sandbox received forbidden credential environment: ${forbidden.join(", ")}`);
   }
+  loadExtensionBrokerToken(request.job);
   if (DOCKER_LANE) {
     return await executeViaRpc(request);
-  }
-  if (request.job.kind === "extension") {
-    const tokenFile = process.env.OMP_AUTH_BROKER_TOKEN_FILE;
-    if (tokenFile === undefined || tokenFile === "") {
-      throw new Error("extension sandbox requires the mounted auth-broker token file");
-    }
-    const stat = statSync(tokenFile);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-      throw new Error("extension sandbox auth-broker token mount must be a mode-0600 file");
-    }
-    const token = readFileSync(tokenFile, "utf8").trim();
-    if (token === "") throw new Error("extension sandbox auth-broker token mount is empty");
-    process.env.OMP_AUTH_BROKER_TOKEN = token;
-    delete process.env.OMP_AUTH_BROKER_TOKEN_FILE;
   }
   const boot = await bootExecutorRuntime({
     dbPath: request.dbPath,
