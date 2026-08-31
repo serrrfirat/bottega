@@ -129,7 +129,7 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     expect(env["REQUESTS_CA_BUNDLE"]).toBe("/etc/iron-proxy/certs/ca.crt");
     expect(env["SSL_CERT_FILE"]).toBe("/etc/iron-proxy/certs/ca.crt");
     const volumes = asStringArray(service("searxng")["volumes"]);
-    expect(volumes).toContain("./config/searxng/settings.yml:/etc/searxng/settings.yml:ro");
+    expect(volumes).toContain("searxng-config:/etc/searxng:ro");
     expect(volumes).toContain("./certs:/etc/iron-proxy/certs:ro");
   });
 

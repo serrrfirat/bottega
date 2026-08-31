@@ -115,13 +115,42 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     expect(executorVolumes).not.toContain("./config/omp:/app/data/omp-agent");
   });
 
-  test("searxng receives a required deployment secret and keeps the committed sentinel", () => {
-    expect(serviceEnv("searxng")["SEARXNG_SECRET"]).toBe("${SEARXNG_SECRET:?SEARXNG_SECRET must be set}");
-    const settings = parseYamlSubset(
-      readFileSync(resolve(import.meta.dir, "../../config/searxng/settings.yml"), "utf8"),
-    );
-    const server = settings["server"] as Record<string, YamlNode>;
-    expect(server["secret_key"]).toBe("ultrasecretkey");
+  test("searxng config init renders the required secret into a read-only runtime volume", () => {
+    const init = service("searxng-config-init");
+    expect(init["image"]).toBe("alpine:3.19");
+    expect(init["environment"] as Record<string, YamlNode>).toEqual({
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?SEARXNG_SECRET must be set}",
+    });
+    expect(init["volumes"] as string[]).toEqual([
+      "./config/searxng/settings.yml:/seed/settings.yml:ro",
+      "searxng-config:/config",
+    ]);
+    const command = (init["command"] as string[])[2];
+    expect(command).toContain("__SEARXNG_SECRET__");
+    expect(command).toContain("at least 64 hexadecimal characters");
+
+    const secret = "0123456789abcdef".repeat(4);
+    const dir = mkdtempSync(join(tmpdir(), "bottega-searxng-config-"));
+    try {
+      const seedPath = join(dir, "settings.yml");
+      const outputPath = join(dir, "rendered.yml");
+      const source = readFileSync(resolve(import.meta.dir, "../../config/searxng/settings.yml"), "utf8");
+      writeFileSync(seedPath, source);
+      const renderedCommand = command
+        .replaceAll("/seed/settings.yml", seedPath)
+        .replaceAll("/config/settings.yml", outputPath)
+        .replaceAll("$$", "$");
+      const result = Bun.spawnSync(["sh", "-c", renderedCommand], {
+        env: { PATH: process.env.PATH ?? "", SEARXNG_SECRET: secret },
+      });
+      expect(result.success).toBe(true);
+      const rendered = readFileSync(outputPath, "utf8");
+      expect(rendered).toContain(`secret_key: "${secret}"`);
+      expect(rendered).not.toContain("__SEARXNG_SECRET__");
+      expect(statSync(outputPath).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("broker bootstrap generates the 0600 token once and execs packaged omp without exporting it", async () => {

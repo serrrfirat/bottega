@@ -197,6 +197,21 @@ services:
       # proxy allowlist); the server keeps reaching it on egress.
       - sandbox
 
+  searxng-config-init:
+    # Render the deployment secret into a private runtime config volume.
+    # Compose expands $$ to a literal $ before this shell runs.
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - set -eu; secret="$${SEARXNG_SECRET:-}"; case "$$secret" in ''|*[!0-9A-Fa-f]*) echo 'SEARXNG_SECRET must be at least 64 hexadecimal characters' >&2; exit 1;; esac; [ "$${#secret}" -ge 64 ] || { echo 'SEARXNG_SECRET must be at least 64 hexadecimal characters' >&2; exit 1; }; sed "s/__SEARXNG_SECRET__/$$secret/g" /seed/settings.yml > /config/settings.yml; chmod 600 /config/settings.yml
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET must be set}
+    volumes:
+      - ./config/searxng/settings.yml:/seed/settings.yml:ro
+      - searxng-config:/config
+    network_mode: none
+
   searxng:
     # Internal web search backend (issue #388). The digest pins the reviewed
     # SearXNG build; no host port is published.
@@ -205,6 +220,8 @@ services:
     depends_on:
       iron-proxy:
         condition: service_started
+      searxng-config-init:
+        condition: service_completed_successfully
     dns:
       - 172.30.0.2
     environment:
@@ -213,11 +230,8 @@ services:
       NO_PROXY: localhost,127.0.0.1,iron-proxy,searxng
       REQUESTS_CA_BUNDLE: /etc/iron-proxy/certs/ca.crt
       SSL_CERT_FILE: /etc/iron-proxy/certs/ca.crt
-      # The official image replaces the committed ultrasecretkey sentinel
-      # from settings.yml with this deployment-only value.
-      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET must be set}
     volumes:
-      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-config:/etc/searxng:ro
       - ./certs:/etc/iron-proxy/certs:ro
     read_only: true
     init: true
@@ -442,6 +456,8 @@ services:
       - egress
 
 volumes:
+  searxng-config:
+    name: searxng-config
   # The shared `data` volume: single-writer SQLite store + secrets + transcripts
   # + workspaces. Named `data` (not the compose-default `<project>_data`) so the
   # executor's sibling per-job containers (Docker-out-of-Docker) can mount exact
