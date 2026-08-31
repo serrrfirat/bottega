@@ -1,4 +1,4 @@
-import { readFileSync, readSync, statSync, writeSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
 import {
   bootExecutorRuntime,
   createDefaultConsolidationModelCall,
@@ -137,6 +137,14 @@ function loadExtensionBrokerToken(job: WorkerJob): void {
   delete process.env.OMP_AUTH_BROKER_TOKEN_FILE;
 }
 
+/** Docker jobs receive the deployment's model catalog in an ephemeral agent dir. */
+function prepareDockerAgentDir(): string {
+  const agentDir = "/tmp/omp-agent";
+  mkdirSync(agentDir, { recursive: true });
+  copyFileSync("config/omp/models.yml", `${agentDir}/models.yml`);
+  return agentDir;
+}
+
 async function execute(request: Extract<SandboxRequest, { mode: "execute" }>): Promise<SandboxResult> {
   const forbidden = forbiddenEnvironment();
   if (forbidden.length > 0) {
@@ -190,6 +198,7 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
     await rpc.ready();
     const relayedOrgSettings = orgSettingsWireSchema.safeParse(request.orgSettings);
     boot = await bootExecutorRuntime({
+      agentDir: prepareDockerAgentDir(),
       // SAFETY: bootStore is the explicit allowlisted RPC store facade,
       // widened to the full Store at the boot boundary; the runtime only
       // invokes facade methods, and non-allowlisted access fails closed at
