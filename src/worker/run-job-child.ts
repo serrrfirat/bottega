@@ -199,6 +199,8 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
     const relayedOrgSettings = orgSettingsWireSchema.safeParse(request.orgSettings);
     boot = await bootExecutorRuntime({
       agentDir: prepareDockerAgentDir(),
+      surfaceOverrides:
+        request.extensionSurfaces === undefined ? undefined : new Map(Object.entries(request.extensionSurfaces)),
       // SAFETY: bootStore is the explicit allowlisted RPC store facade,
       // widened to the full Store at the boot boundary; the runtime only
       // invokes facade methods, and non-allowlisted access fails closed at

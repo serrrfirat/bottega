@@ -48,6 +48,7 @@ import {
 } from "./job-bodies";
 import type { Store } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
+import type { ExtensionTool } from "../extensions/manifest";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
 import { JOB_FAILED_EVENT } from "../store/audit-events";
 import { ingestPollJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
@@ -245,6 +246,8 @@ export interface DockerSandboxOptions {
    * is denied outright (fail closed).
    */
   extensionProviderIds?: Iterable<string>;
+  /** Supervisor-resolved tool metadata; credentials never cross this boundary. */
+  extensionSurfaces?: ReadonlyMap<string, readonly ExtensionTool[]>;
   /** The supervisor's parsed org settings, serialized into the job request so the child boot needs no sync store read. */
   orgSettings?: OrgSettings | null;
   /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
@@ -388,6 +391,10 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       config: containerConfig(ctx.cfg, options),
       caps: ctx.caps,
       orgSettings: options.orgSettings ?? undefined,
+      extensionSurfaces:
+        options.extensionSurfaces === undefined
+          ? undefined
+          : Object.fromEntries([...options.extensionSurfaces].map(([id, tools]) => [id, [...tools]])),
     };
     const containerName = `${namePrefix}-${sanitizeContainerName(job.id)}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const response = await launchDockerContainer(docker, request, {
@@ -399,12 +406,13 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       hostStore: options.hostStore,
       memoryProvider: options.memoryProvider,
       extensionProviderIds: options.extensionProviderIds,
-      askpassScript: options.askpassScript ?? ctx.cfg.askpassScript,
+      extensionSurfaces: request.extensionSurfaces,
       image,
       network,
       dns: options.dns,
       proxyUrl: options.proxyUrl,
       caCertHostPath: options.caCertHostPath,
+      askpassScript: options.askpassScript ?? ctx.cfg.askpassScript,
       gitTokenFile: options.gitTokenFile ?? ctx.cfg.tokenFile,
       brokerTokenFile: options.brokerTokenFile,
       job: job,
@@ -469,6 +477,7 @@ interface DockerLaunchOptions {
   hostStore?: import("../store/db").Store;
   memoryProvider?: ResolvedMemoryProvider;
   extensionProviderIds?: Iterable<string>;
+  extensionSurfaces?: Record<string, readonly ExtensionTool[]>;
   job?: WorkerJob;
   jobId: string;
   caps: JobResourceCaps;

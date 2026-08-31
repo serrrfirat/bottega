@@ -125,8 +125,14 @@ export interface BootstrapRuntimeDeps {
    * process already holds the merged registry. Only compiled/pinned
    * extensions remain visible in the child (no runtime-registered ones).
    * Defaults false (existing roots keep merging).
-   */
+  */
   skipRuntimeRegistryMerge?: boolean;
+  /**
+   * Pre-resolved extension tool surfaces from the supervisor. Sandbox jobs
+   * use this metadata-only snapshot so discovery never needs child proxy
+   * credentials or a shared proxy config write.
+   */
+  surfaceOverrides?: ExtensionSurfaces;
   /** MCP transport seam for tools-less manifest discovery (test seam; also threaded into the runtime). */
   mcpTransport?: (
     binding: McpBinding,
@@ -258,7 +264,9 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     failureObserver,
   };
   if (deps.mcpTransport !== undefined) surfaceOptions.mcpTransport = deps.mcpTransport;
-  const surfaces = await resolveExtensionSurfaces(registry.list(), surfaceOptions);
+  const surfaces =
+    deps.surfaceOverrides ??
+    (await resolveExtensionSurfaces(registry.list(), surfaceOptions));
   // construction when a plain object was given, otherwise forward per call
   // so the server's mid-boot router assignment is observed live.
   const resolveRouter = (): ApprovalRouter =>

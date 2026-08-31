@@ -2,6 +2,36 @@ import { z } from "zod";
 import type { OrgSettings } from "../store/org-settings";
 import { WORKER_JOB_KINDS, WORKER_JOB_STATUSES } from "./envelope";
 
+const extensionToolParamSchema = z
+  .object({
+    name: z.string().min(1).max(256),
+    type: z.enum(["string", "number", "boolean"]),
+    jsonType: z.enum(["array", "object"]).optional(),
+    description: z.string().max(4_096).optional(),
+    required: z.boolean().optional(),
+    location: z.enum(["path", "query", "body"]).optional(),
+  })
+  .strict();
+const extensionToolSchema = z
+  .object({
+    name: z.string().min(1).max(256),
+    providerName: z.string().min(1).max(256).optional(),
+    tier: z.enum(["read", "write", "exec"]),
+    description: z.string().max(4_096),
+    params: z.array(extensionToolParamSchema).max(512),
+    openapi: z
+      .object({
+        method: z.enum(["get", "post", "put", "delete", "patch", "options", "head", "trace"]),
+        path: z.string().min(1).max(4_096),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+const extensionSurfacesSchema = z
+  .record(z.string().min(1).max(256), z.array(extensionToolSchema).max(2_000))
+  .optional();
+
 export const SANDBOX_PROTOCOL_VERSION = 1 as const;
 export const MAX_SANDBOX_REQUEST_BYTES = 64 * 1024;
 export const MAX_SANDBOX_RESPONSE_BYTES = 16 * 1024;
@@ -80,6 +110,10 @@ export const sandboxExecuteRequestSchema = z
     // dir pin) never needs a synchronous store read over the async RPC socket.
     // Present in the Docker lane (and any lane that boots over RPC).
     orgSettings: z.unknown().optional(),
+    // The supervisor's successfully resolved extension tool surfaces. This
+    // metadata contains no credentials and lets a sandbox reuse the same
+    // reviewed tools without discovering through its isolated proxy config.
+    extensionSurfaces: extensionSurfacesSchema,
   })
   .strict();
 

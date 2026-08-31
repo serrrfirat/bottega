@@ -86,6 +86,7 @@ import { bootstrapRuntime, type BootstrapRuntime } from "./server/bootstrap-runt
 import { seedBootSecretsFromVault } from "./server/boot-secrets";
 import { agentDirModelDefault, syncProxyCredentialsFromEnv } from "./extensions/proxy-seed";
 import type { SecretFileBoundaryOpts } from "./extensions/boundary";
+import type { ExtensionSurfaces } from "./extensions/surface";
 import { extensionToolDefinitions } from "./extensions/tools";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpBinding } from "./extensions/manifest";
@@ -181,6 +182,8 @@ export async function bootExecutorRuntime(opts: {
    * settings into the job request.
    */
   orgSettings?: OrgSettings | null;
+  /** Supervisor-resolved extension tool metadata reused by isolated jobs. */
+  surfaceOverrides?: ExtensionSurfaces;
   /** Skip the global extension-registry merge (denied by the sandbox store RPC allowlist). */
   skipRuntimeRegistryMerge?: boolean;
   /** Secret env names a sandbox child must never seed into its process. */
@@ -227,6 +230,7 @@ export async function bootExecutorRuntime(opts: {
     ...(opts.memoryProvider !== undefined ? { memoryProvider: opts.memoryProvider } : undefined),
     ...(opts.orgSettings !== undefined ? { orgSettings: opts.orgSettings } : undefined),
     ...(opts.skipRuntimeRegistryMerge === true ? { skipRuntimeRegistryMerge: true } : undefined),
+    ...(opts.surfaceOverrides !== undefined ? { surfaceOverrides: opts.surfaceOverrides } : undefined),
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
     ...(opts.boundary !== undefined ? { boundary: opts.boundary } : undefined),
   });
@@ -684,6 +688,7 @@ if (import.meta.main) {
     hostStore: store,
     memoryProvider,
     extensionProviderIds: sandboxExtensionProviderIds,
+    extensionSurfaces: boot.runtime.surfaces,
     orgSettings: store.getOrgSettings(),
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
