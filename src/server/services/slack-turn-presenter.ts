@@ -714,11 +714,12 @@ export class SlackTurnPresenter {
     const friendly = label.trim();
     if (friendly === "") return;
     if (!this.#canRecordSource(friendly, "needs_reauthorization")) return;
-    this.#sourceOutcomes.set(friendly, {
+    const outcome: SourceOutcome = {
       label: friendly,
       state: "needs_reauthorization",
-      ...(action === undefined ? {} : { action }),
-    });
+    };
+    if (action !== undefined) outcome.action = action;
+    this.#sourceOutcomes.set(friendly, outcome);
     this.#sourceWaitingLabel = friendly;
     this.#setProgress("waiting", `${friendly} needs reauthorization`);
   }

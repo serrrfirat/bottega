@@ -1532,6 +1532,9 @@ describe("no-reply timeout diagnosis (issue #245)", () => {
       { ts: "1787000000.000130", channel: "C1", bot_id: "B-bot", text: "Hmm — I got an empty response, retrying…" },
       { ts: "1787000000.000140", channel: "C1", bot_id: "B-bot", text: "I keep getting empty responses — check the model key?" },
     ];
+    // SAFETY: the stub only exposes the live-Slack members waitForBotReply
+    // reads (botUserId, qaUserId, history, replies) for the empty-response
+    // churn journey; no other Harness member is touched on this path.
     const h = {
       liveSlack: {
         botUserId: "B-bot",

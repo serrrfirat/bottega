@@ -38,21 +38,21 @@ export interface TurnOutcomeSummary {
   action?: string;
 }
 
-const LABEL_BY_STATE: Record<TurnProgressState, string> = {
+const LABEL_BY_STATE = {
   accepted: "Accepted",
   planning: "Planning",
   working: "Working",
   waiting: "Waiting",
   finishing: "Finishing",
-};
+} satisfies Record<TurnProgressState, string>;
 
-const LABEL_BY_SOURCE_STATE: Record<SourceOutcomeState, string> = {
+const LABEL_BY_SOURCE_STATE = {
   complete: "complete",
   skipped: "skipped",
   blocked: "blocked",
   failed: "failed",
   needs_reauthorization: "needs reauthorization",
-};
+} satisfies Record<SourceOutcomeState, string>;
 
 export function createTurnProgress(now: number): TurnProgressSnapshot {
   return {
@@ -106,13 +106,13 @@ export function renderOutcomeSummary(summary: TurnOutcomeSummary): string | unde
     return undefined;
   }
 
-  const heading: Record<TerminalOutcome, string> = {
+  const heading = {
     complete: "Completed",
     partial: "Partial result",
     blocked: "Blocked",
     failed: "Failed",
     stopped: "Stopped",
-  };
+  } satisfies Record<TerminalOutcome, string>;
   const lines = [`${heading[summary.outcome]} in ${duration(summary.elapsedMs)}`];
   if (summary.sources.length > 0) {
     const ordered = [...summary.sources].sort(
