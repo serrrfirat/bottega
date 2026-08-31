@@ -484,7 +484,9 @@ ${domainLines}
 ${judgeRuleLines}
       provider:
         type: "openai" # NEAR.ai OpenAI-compatible Chat Completions API
-        base_url: "https://cloud-api.near.ai/v1"
+        # iron-proxy's OpenAI adapter appends /v1/chat/completions; keep this
+        # base URL pathless so requests do not become /v1/v1/chat/completions.
+        base_url: "https://cloud-api.near.ai"
         model: "deepseek-ai/DeepSeek-V4-Flash"
         # Non-reasoning model REQUIRED (#364): a reasoning model burns the
         # whole token budget on reasoning_content and content stays null ->

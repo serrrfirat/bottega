@@ -154,7 +154,7 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
     expect(provider["type"]).toBe("openai");
     // cloud-api.near.ai serves the deployed non-reasoning judge model (#389):
     // a reasoning model starves content and fallback-deny fires on every call.
-    expect(asString(provider["base_url"])).toMatch(/^https:\/\/[a-z0-9.-]+\.near\.ai\/v1$/);
+    expect(asString(provider["base_url"])).toBe("https://cloud-api.near.ai");
     expect(asString(provider["model"])).toBe("deepseek-ai/DeepSeek-V4-Flash");
     expect(provider["api_key_env"]).toBe("NEARAI_JUDGE_API_KEY");
     expect(Number(provider["max_tokens"])).toBeGreaterThan(0);

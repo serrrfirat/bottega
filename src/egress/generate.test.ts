@@ -110,6 +110,11 @@ describe("egress config generation", () => {
     expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).toContain(expectedModel);
     expect(COMMITTED_EGRESS).toContain(expectedModel);
   });
+  test("uses the iron-proxy OpenAI adapter base URL without a duplicate API path", () => {
+    const rendered = renderEgressConfig(BASE_EGRESS_DOMAINS);
+    expect(rendered).toContain('base_url: "https://cloud-api.near.ai"');
+    expect(rendered).not.toContain('base_url: "https://cloud-api.near.ai/v1"');
+  });
 
   test("egress permits the reviewed SearXNG search hosts", () => {
     for (const host of ["html.duckduckgo.com", "search.brave.com"]) {
