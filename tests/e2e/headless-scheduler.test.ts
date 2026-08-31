@@ -8,14 +8,21 @@ import { z } from "zod";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ReactiveCore } from "../../src/events/reactive";
 import { buildRegistry } from "../../src/scheduler/actions";
+import { recurringWorkAction } from "../../src/scheduler/recurring-work";
 import { tickScheduler, type SchedulerTickDeps } from "../../src/scheduler/runner";
 import { sendMessageAction } from "../../src/scheduler/send-message";
+import {
+  createSchedulerRunNowFeedback,
+  resolveSchedulerAction,
+  schedulerActionValue,
+} from "../../src/server/adapters/scheduler-router";
 import { schedulerToolDefinitions } from "../../src/scheduler/scheduler-tools";
 import type { SchedulerAction, SchedulerActionRegistry } from "../../src/scheduler/types";
 import {
   SCHEDULER_ERROR_EVENT,
   SCHEDULER_FIRE_EVENT,
 } from "../../src/store/audit-events";
+import { SCHEDULER_RUN_NOW_ACTION_ID } from "../../src/server/adapters/slack";
 import { postOutboxRow } from "../../src/store/outbox";
 import { postPendingOutboxRows } from "../../src/server/services/outbox-post-seam";
 import { createMemoryReactiveStorage, startReactiveCore } from "../../src/events/reactive";
@@ -60,6 +67,7 @@ function schedulerDeps(
   h: Harness,
   registry: SchedulerActionRegistry,
   now: () => number,
+  overrides: Partial<Pick<SchedulerTickDeps, "onInvocationComplete">> = {},
 ): SchedulerTickDeps {
   return {
     store: h.store,
@@ -70,6 +78,7 @@ function schedulerDeps(
     loadPolicy: async () => h.orgPolicy,
     log: () => {},
     now,
+    ...overrides,
   };
 }
 function context(spaceId: string): ExtensionContext {
@@ -303,6 +312,82 @@ describe("headless scheduler and outbox (issue #363)", () => {
       );
       expect(deleted.isError).not.toBe(true);
       expect(await h.store.getSchedulerJob(created.id)).toBeNull();
+    } finally {
+      await h.cleanup();
+    }
+  });
+  test("keeps recurring agent Run now queued until the worker outbox posts one payload", async () => {
+    const h = await bootHarness({ headless: true });
+    await h.store.getOrCreateSpace({ platform: "slack", channel_id: CHANNEL_ID });
+    try {
+      const registry = buildRegistry([recurringWorkAction]);
+      const job = await h.store.createSchedulerJob({
+        action: "recurring_work",
+        cron: "0 9 * * *",
+        params: {
+          content: "Compose and post a compact daily digest",
+          description: "Daily digest",
+          space: SPACE_ID,
+        },
+        spaceId: SPACE_ID,
+        createdBy: "U-headless-human",
+        createdAt: BASE_TIME,
+      });
+      const feedback = createSchedulerRunNowFeedback(h.adapter);
+      await resolveSchedulerAction(
+        {
+          store: h.store,
+          audit: h.audit,
+          adapter: h.adapter,
+          now: () => BASE_TIME,
+          onRunNowRequested: (request) => feedback.register(request),
+        },
+        {
+          actionId: SCHEDULER_RUN_NOW_ACTION_ID,
+          value: schedulerActionValue(job),
+          spaceId: SPACE_ID,
+          principal: "U-headless-human",
+          messageTs: "control-1",
+        },
+      );
+
+      await tickScheduler(
+        schedulerDeps(h, registry, () => BASE_TIME, {
+          onInvocationComplete: (invocation) => feedback.onInvocationComplete(invocation),
+        }),
+      );
+
+      const invocations = await h.store.listSchedulerInvocations({ jobId: job.id });
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]).toMatchObject({ action: "recurring_work", source: "manual", result: "ok" });
+      const item = (await h.store.listWorkItems({ space_id: SPACE_ID }))[0];
+      expect(item).toMatchObject({
+        delivery: "extension",
+        state: "open",
+        description: "Daily digest",
+      });
+      expect(await h.store.getJob(item!.id)).toMatchObject({ kind: "extension", status: "queued", attempts: 0 });
+
+      const statusText = h.messages(CHANNEL_ID).map((message) => message.text);
+      expect(statusText.filter((text) => text.includes("Run now queued — agent work continues and will post here when finished"))).toHaveLength(1);
+      expect(statusText.some((text) => text.includes("Run now completed"))).toBe(false);
+
+      postOutboxRow(
+        h.store,
+        {
+          id: item!.id,
+          kind: "extension",
+          payload: { state: "done", result: { summary: "Digest payload", url: "https://example.test/digest" } },
+          space: SPACE_ID,
+        },
+        { now: () => BASE_TIME + 1_000 },
+      );
+      const first = await postPendingOutboxRows(h.store, h.adapter, { now: () => BASE_TIME + 2_000 });
+      expect(first).toEqual({ posted: 1, nudged: 0 });
+      expect(h.messages(CHANNEL_ID).map((message) => message.text)).toContain("Done: Digest payload — https://example.test/digest");
+      const second = await postPendingOutboxRows(h.store, h.adapter, { now: () => BASE_TIME + 3_000 });
+      expect(second).toEqual({ posted: 0, nudged: 0 });
+      expect(h.messages(CHANNEL_ID).filter((message) => message.text === "Done: Digest payload — https://example.test/digest")).toHaveLength(1);
     } finally {
       await h.cleanup();
     }

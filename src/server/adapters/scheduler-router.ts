@@ -101,6 +101,7 @@ export function buildSchedulerBlocks(jobs: readonly SchedulerJob[]): SlackBlockP
 
 export interface SchedulerRunNowRequest {
   invocationId: string;
+  action: SchedulerInvocation["action"];
   spaceId: string;
   statusMessageTs: string;
 }
@@ -117,6 +118,7 @@ export interface SchedulerActionDeps {
 const SCHEDULER_FEEDBACK_CACHE_LIMIT = 256;
 
 interface SchedulerRunNowCompletion {
+  action: SchedulerInvocation["action"];
   result: "ok" | "error";
   error?: string;
 }
@@ -140,9 +142,11 @@ export function createSchedulerRunNowFeedback(
 
   const update = async (request: SchedulerRunNowRequest, completion: SchedulerRunNowCompletion): Promise<void> => {
     const text =
-      completion.result === "ok"
-        ? `Run now completed — ${request.invocationId}`
-        : `Run now failed — ${escapeMrkdwn(completion.error?.trim() || "scheduler action failed")} (${request.invocationId})`;
+      completion.result === "error"
+        ? `Run now failed — ${escapeMrkdwn(completion.error?.trim() || "scheduler action failed")} (${request.invocationId})`
+        : request.action === "recurring_work"
+          ? `Run now queued — agent work continues and will post here when finished (${request.invocationId})`
+          : `Run now completed — ${request.invocationId}`;
     try {
       await adapter.updateMessage(request.spaceId, request.statusMessageTs, text);
     } catch (error) {
@@ -163,6 +167,7 @@ export function createSchedulerRunNowFeedback(
     },
     async onInvocationComplete(invocation) {
       const completion: SchedulerRunNowCompletion = {
+        action: invocation.action,
         result: invocation.result === "error" ? "error" : "ok",
         ...(invocation.error === undefined ? {} : { error: invocation.error }),
       };
@@ -271,7 +276,7 @@ export async function resolveSchedulerAction(deps: SchedulerActionDeps, action: 
                 `Run now working — ${description}`,
               );
               if (statusMessageTs !== undefined) {
-                await deps.onRunNowRequested?.({ invocationId, spaceId: a.spaceId, statusMessageTs });
+                await deps.onRunNowRequested?.({ invocationId, action: job.action, spaceId: a.spaceId, statusMessageTs });
               }
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
