@@ -105,6 +105,11 @@ describe("egress config generation", () => {
     expect(domains).toContain("chatgpt.com");
     expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("api.anthropic.com");
   });
+  test("pins the deployed non-reasoning judge model", () => {
+    const expectedModel = 'model: "deepseek-ai/DeepSeek-V4-Flash"';
+    expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).toContain(expectedModel);
+    expect(COMMITTED_EGRESS).toContain(expectedModel);
+  });
 
   test("egress permits the reviewed SearXNG search hosts", () => {
     for (const host of ["html.duckduckgo.com", "search.brave.com"]) {

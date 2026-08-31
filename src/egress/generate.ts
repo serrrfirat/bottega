@@ -485,13 +485,13 @@ ${judgeRuleLines}
       provider:
         type: "openai" # NEAR.ai OpenAI-compatible Chat Completions API
         base_url: "https://cloud-api.near.ai/v1"
-        model: "google/gemini-2.5-flash-lite"
+        model: "deepseek-ai/DeepSeek-V4-Flash"
         # Non-reasoning model REQUIRED (#364): a reasoning model burns the
         # whole token budget on reasoning_content and content stays null ->
         # fallback deny on every request.
         # Judge key is separate from the agents' key (issue #8: "separate key
-        # if preferred"). Model id is org-chosen; this example is from
-        # https://docs.near.ai/cloud/models.
+        # if preferred"). This deployed model is documented by NEAR.ai as
+        # non-reasoning and is required for the judge response contract.
         api_key_env: "NEARAI_JUDGE_API_KEY"
         max_tokens: 256
       prompt: |

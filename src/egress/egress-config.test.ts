@@ -152,10 +152,10 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
   test("judge LLM backend points at a NEAR.ai OpenAI-compatible endpoint", () => {
     const provider = asRecord(judgeCfg["provider"]);
     expect(provider["type"]).toBe("openai");
-    // cloud-api.near.ai serves the non-reasoning judge model (#364): a
-    // reasoning model starves content and fallback-deny fires on every call.
+    // cloud-api.near.ai serves the deployed non-reasoning judge model (#389):
+    // a reasoning model starves content and fallback-deny fires on every call.
     expect(asString(provider["base_url"])).toMatch(/^https:\/\/[a-z0-9.-]+\.near\.ai\/v1$/);
-    expect(asString(provider["model"])).toBe("google/gemini-2.5-flash-lite");
+    expect(asString(provider["model"])).toBe("deepseek-ai/DeepSeek-V4-Flash");
     expect(provider["api_key_env"]).toBe("NEARAI_JUDGE_API_KEY");
     expect(Number(provider["max_tokens"])).toBeGreaterThan(0);
   });
