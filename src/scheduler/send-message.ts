@@ -3,7 +3,8 @@
  * message directly to the bound space through the scheduler context's
  * postMessage seam — no executor round-trip. This is the mechanism behind
  * "remind me at 3pm" requests. The runner audits the fire itself; this
- * handler audits its own failures and never throws past the runner.
+ * handler audits its own failures before throwing so the runner records an
+ * error completion and can surface it to a waiting Slack user.
  */
 import { SCHEDULER_ERROR_EVENT } from "../store/audit-events";
 import type { SchedulerAction, SchedulerActionContext } from "./types";
@@ -38,17 +39,19 @@ export const sendMessageAction: SchedulerAction = {
 
     if (!text) {
       await auditError(ctx, space || null, "text is required");
-      return;
+      throw new Error("text is required");
     }
     if (!space) {
       await auditError(ctx, null, "space is required");
-      return;
+      throw new Error("space is required");
     }
     try {
       await ctx.postMessage(space, text);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      await auditError(ctx, space, `failed to post scheduled message: ${detail}`);
+      const reason = `failed to post scheduled message: ${detail}`;
+      await auditError(ctx, space, reason);
+      throw new Error(reason, { cause: error });
     }
   },
 };

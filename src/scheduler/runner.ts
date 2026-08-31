@@ -40,6 +40,8 @@ export interface SchedulerTickDeps {
   /** True only for the first successful pass after process boot. */
   firstTick?: boolean;
   fireTimeoutMs?: number;
+  /** Notifies observers after durable completion, without changing execution semantics. */
+  onInvocationComplete?: (invocation: SchedulerInvocation) => Promise<void> | void;
 }
 
 export interface SchedulerDeps extends Omit<SchedulerTickDeps, "now" | "firstTick"> {
@@ -128,12 +130,14 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
   while ((invocation = await deps.store.claimNextSchedulerInvocation(fireTime)) !== null) {
     const action = deps.registry.get(invocation.action);
     let fireResult: "ok" | "error" = "ok";
+    let fireError: string | undefined;
     if (!action) {
       fireResult = "error";
+      fireError = `unknown scheduler action: ${invocation.action}`;
       await auditError(
         deps,
         { id: invocation.jobId, action: invocation.action, spaceId: invocation.spaceId },
-        `unknown scheduler action: ${invocation.action}`,
+        fireError,
         invocation.id,
       );
     } else {
@@ -150,10 +154,11 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
         );
       } catch (error) {
         fireResult = "error";
+        fireError = errorMessage(error);
         await auditError(
           deps,
           { id: invocation.jobId, action: invocation.action, spaceId: invocation.spaceId },
-          errorMessage(error),
+          fireError,
           invocation.id,
         );
       }
@@ -173,6 +178,17 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
       },
     });
     await deps.store.completeSchedulerInvocation(invocation.id, fireResult, fireTime);
+    try {
+      await deps.onInvocationComplete?.({
+        ...invocation,
+        status: "completed",
+        completedAt: fireTime,
+        result: fireResult,
+        ...(fireError === undefined ? {} : { error: fireError }),
+      });
+    } catch (error) {
+      deps.log(`scheduler: completion feedback failed: ${errorMessage(error)}`);
+    }
   }
 }
 

@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAudit } from "../../policy/audit";
+import type { SchedulerInvocation } from "../../scheduler/types";
 import { SCHEDULER_JOB_PAUSED_EVENT, SCHEDULER_RUN_REQUESTED_EVENT } from "../../store/audit-events";
 import { createStore, type Store } from "../../store/db";
 import {
   buildSchedulerBlocks,
+  createSchedulerRunNowFeedback,
   resolveSchedulerAction,
   schedulerActionValue,
 } from "./scheduler-router";
@@ -36,8 +38,12 @@ function store(): Store {
 
 function adapter() {
   const updates: Array<{ spaceId: string; ts: string; text: string; blocks: unknown[] }> = [];
+  const posts: Array<{ spaceId: string; text: string }> = [];
   const value = {
-    postMessage: async () => undefined,
+    postMessage: async (spaceId: string, text: string) => {
+      posts.push({ spaceId, text });
+      return `status-${posts.length}`;
+    },
     updateMessage: async (spaceId, ts, text, options) => {
       updates.push({ spaceId, ts, text, blocks: options?.blocks ?? [] });
     },
@@ -55,7 +61,7 @@ function adapter() {
     start: async () => {},
     stop: async () => {},
   } satisfies SlackAdapter;
-  return { value, updates };
+  return { value, updates, posts };
 }
 
 function click(actionId: string, value: string): SlackAction {
@@ -69,6 +75,103 @@ function click(actionId: string, value: string): SlackAction {
 }
 
 describe("Slack scheduler controls (issue #308)", () => {
+  test("posts visible working feedback for a run-now click", async () => {
+    const db = store();
+    const audit = createAudit(db);
+    const slack = adapter();
+    const job = await db.createSchedulerJob({
+      action: "send_message",
+      cron: "0 9 * * *",
+      params: { text: "Reminder" },
+      spaceId: "slack:C1",
+      createdBy: "U1",
+    });
+    let request: { invocationId: string; spaceId: string; statusMessageTs: string } | undefined;
+
+    await resolveSchedulerAction(
+      {
+        store: db,
+        audit,
+        adapter: slack.value,
+        now: () => 1_800_000_000_000,
+        onRunNowRequested: (value) => {
+          request = value;
+        },
+      },
+      click(SCHEDULER_RUN_NOW_ACTION_ID, schedulerActionValue(job)),
+    );
+
+    expect(slack.posts).toEqual([{ spaceId: "slack:C1", text: expect.stringMatching(/working/i) }]);
+    expect(request).toEqual({
+      invocationId: `slack:1700.0001:${SCHEDULER_RUN_NOW_ACTION_ID}:${job.id}:1`,
+      spaceId: "slack:C1",
+      statusMessageTs: "status-1",
+    });
+  });
+
+  test("updates the same working message with one terminal outcome even if completion races registration", async () => {
+    const slack = adapter();
+    const feedback = createSchedulerRunNowFeedback(slack.value);
+    const invocation: SchedulerInvocation = {
+      id: "slack:1700.0001:bottega_scheduler_run_now:sj_1:1",
+      jobId: "sj_1",
+      action: "send_message",
+      params: { content: "Daily digest" },
+      spaceId: "slack:C1",
+      source: "manual",
+      scheduledFor: null,
+      requestedAt: 1_800_000_000_000,
+      jobRevision: 1,
+      status: "completed",
+      claimedAt: 1_800_000_000_001,
+      completedAt: 1_800_000_000_002,
+      result: "error",
+      error: "text is required",
+    };
+
+    await feedback.onInvocationComplete(invocation);
+    await feedback.register({ invocationId: invocation.id, spaceId: "slack:C1", statusMessageTs: "status-1" });
+    expect(slack.updates).toEqual([
+      {
+        spaceId: "slack:C1",
+        ts: "status-1",
+        text: expect.stringContaining("text is required"),
+        blocks: [],
+      },
+    ]);
+  });
+
+  test("updates a registered working message on successful completion", async () => {
+    const slack = adapter();
+    const feedback = createSchedulerRunNowFeedback(slack.value);
+    const invocation: SchedulerInvocation = {
+      id: "slack:1700.0001:bottega_scheduler_run_now:sj_2:1",
+      jobId: "sj_2",
+      action: "send_message",
+      params: { text: "Daily digest" },
+      spaceId: "slack:C1",
+      source: "manual",
+      scheduledFor: null,
+      requestedAt: 1_800_000_000_000,
+      jobRevision: 1,
+      status: "completed",
+      claimedAt: 1_800_000_000_001,
+      completedAt: 1_800_000_000_002,
+      result: "ok",
+    };
+
+    await feedback.register({ invocationId: invocation.id, spaceId: "slack:C1", statusMessageTs: "status-2" });
+    await feedback.onInvocationComplete(invocation);
+    expect(slack.updates).toEqual([
+      {
+        spaceId: "slack:C1",
+        ts: "status-2",
+        text: expect.stringContaining("completed"),
+        blocks: [],
+      },
+    ]);
+  });
+
   test("renders deterministic enabled/paused state with only valid controls", async () => {
     const db = store();
     const enabled = await db.createSchedulerJob({
@@ -103,6 +206,7 @@ describe("Slack scheduler controls (issue #308)", () => {
     expect(JSON.stringify(blocks)).toContain("paused");
   });
 
+
   test("same-space pause and repeated run clicks settle once and rerender current state", async () => {
     const db = store();
     const audit = createAudit(db);
@@ -132,6 +236,7 @@ describe("Slack scheduler controls (issue #308)", () => {
     expect([first, second]).toEqual([true, true]);
     expect(await db.listSchedulerInvocations({ jobId: job.id })).toHaveLength(1);
     expect(await audit.listAudit({ event_type: SCHEDULER_RUN_REQUESTED_EVENT })).toHaveLength(1);
+    expect(slack.posts).toHaveLength(1);
     expect(slack.updates.length).toBeGreaterThanOrEqual(2);
   });
 

@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { AuditModule } from "../../policy/audit";
 import { describeCron } from "../../scheduler/scheduler-tools";
 import { schedulerJobMetadata } from "../../scheduler/store";
-import type { SchedulerJob } from "../../scheduler/types";
+import type { SchedulerInvocation, SchedulerJob } from "../../scheduler/types";
 import {
   SCHEDULER_JOB_PAUSED_EVENT,
   SCHEDULER_JOB_RESUMED_EVENT,
@@ -99,12 +99,90 @@ export function buildSchedulerBlocks(jobs: readonly SchedulerJob[]): SlackBlockP
   return blocks;
 }
 
+export interface SchedulerRunNowRequest {
+  invocationId: string;
+  spaceId: string;
+  statusMessageTs: string;
+}
+
 export interface SchedulerActionDeps {
   store: Store;
   audit: AuditModule;
   adapter: SlackAdapter;
   now?: () => number;
   log?: (line: string) => void;
+  onRunNowRequested?: (request: SchedulerRunNowRequest) => Promise<void> | void;
+}
+
+const SCHEDULER_FEEDBACK_CACHE_LIMIT = 256;
+
+interface SchedulerRunNowCompletion {
+  result: "ok" | "error";
+  error?: string;
+}
+
+export interface SchedulerRunNowFeedback {
+  register(request: SchedulerRunNowRequest): Promise<void>;
+  onInvocationComplete(invocation: SchedulerInvocation): Promise<void>;
+}
+
+/**
+ * Correlates a Slack run-now status message with the runner's durable
+ * completion callback. Completion can race the Slack post, so a just-finished
+ * Slack-originated invocation is held until its status message is registered.
+ */
+export function createSchedulerRunNowFeedback(
+  adapter: Pick<SlackAdapter, "updateMessage">,
+  log: (line: string) => void = console.error,
+): SchedulerRunNowFeedback {
+  const pending = new Map<string, SchedulerRunNowRequest>();
+  const completedBeforeRegistration = new Map<string, SchedulerRunNowCompletion>();
+
+  const update = async (request: SchedulerRunNowRequest, completion: SchedulerRunNowCompletion): Promise<void> => {
+    const text =
+      completion.result === "ok"
+        ? `Run now completed — ${request.invocationId}`
+        : `Run now failed — ${escapeMrkdwn(completion.error?.trim() || "scheduler action failed")} (${request.invocationId})`;
+    try {
+      await adapter.updateMessage(request.spaceId, request.statusMessageTs, text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`scheduler controls: terminal feedback failed: ${message}`);
+    }
+  };
+
+  return {
+    async register(request) {
+      const completion = completedBeforeRegistration.get(request.invocationId);
+      if (completion !== undefined) {
+        completedBeforeRegistration.delete(request.invocationId);
+        await update(request, completion);
+        return;
+      }
+      pending.set(request.invocationId, request);
+    },
+    async onInvocationComplete(invocation) {
+      const completion: SchedulerRunNowCompletion = {
+        result: invocation.result === "error" ? "error" : "ok",
+        ...(invocation.error === undefined ? {} : { error: invocation.error }),
+      };
+      const request = pending.get(invocation.id);
+      if (request !== undefined) {
+        pending.delete(invocation.id);
+        await update(request, completion);
+        return;
+      }
+      // Only Slack-originated manual runs can later register a status message;
+      // scheduled runs and tool-originated manual runs need no in-memory hold.
+      if (invocation.source !== "manual" || !invocation.id.startsWith("slack:")) return;
+      completedBeforeRegistration.set(invocation.id, completion);
+      while (completedBeforeRegistration.size > SCHEDULER_FEEDBACK_CACHE_LIMIT) {
+        const oldest = completedBeforeRegistration.keys().next().value;
+        if (oldest === undefined) break;
+        completedBeforeRegistration.delete(oldest);
+      }
+    },
+  };
 }
 
 /**
@@ -186,6 +264,19 @@ export async function resolveSchedulerAction(deps: SchedulerActionDeps, action: 
                 after: { ...schedulerJobMetadata(job), pending_invocation_id: invocationId },
               },
             });
+            const description = escapeMrkdwn(job.params.description?.trim() || job.action);
+            try {
+              const statusMessageTs = await deps.adapter.postMessage(
+                a.spaceId,
+                `Run now working — ${description}`,
+              );
+              if (statusMessageTs !== undefined) {
+                await deps.onRunNowRequested?.({ invocationId, spaceId: a.spaceId, statusMessageTs });
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              (deps.log ?? console.error)(`scheduler controls: working feedback failed: ${message}`);
+            }
           }
           changed = enqueued.created;
         }

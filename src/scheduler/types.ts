@@ -96,6 +96,8 @@ export interface SchedulerInvocation {
   claimedAt: number | null;
   completedAt: number | null;
   result: "ok" | "error" | null;
+  /** Failure detail delivered to completion observers; not persisted in the invocation row. */
+  error?: string;
 }
 
 /**

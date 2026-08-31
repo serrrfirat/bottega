@@ -5,7 +5,11 @@ import { SCHEDULER_ERROR_EVENT } from "../store/audit-events";
 import { createStore, type Store } from "../store/db";
 import { buildRegistry, KNOWN_ACTIONS } from "./actions";
 import { tickScheduler, type SchedulerTickDeps } from "./runner";
-import { createSchedulerJobArgsSchema } from "./scheduler-tools";
+import {
+  createSchedulerJobArgsSchema,
+  schedulerToolDefinitions,
+  updateSchedulerJobArgsSchema,
+} from "./scheduler-tools";
 import { sendMessageAction } from "./send-message";
 import type { SchedulerActionContext } from "./types";
 
@@ -83,6 +87,37 @@ describe("sendMessageAction (issue #220)", () => {
     ).toBe("send_message");
   });
 
+  test("exposes the canonical text parameter in the model-visible scheduler directive", () => {
+    const store = freshStore();
+    const create = schedulerToolDefinitions(store, createAudit(store), buildRegistry([])).find(
+      (definition) => definition.name === "create_scheduler_job",
+    );
+
+    expect(create?.description).toContain("params.text");
+    expect(create?.description).toContain("never params.content");
+  });
+  test("rejects the production digest's wrong content parameter at job creation", () => {
+    const parsed = createSchedulerJobArgsSchema.safeParse({
+      action: "send_message",
+      cron: "0 7 * * *",
+      params: { content: "Daily digest" },
+      space: "slack:C1",
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  test("rejects content in the update schema when changing to send_message", () => {
+    expect(
+      updateSchedulerJobArgsSchema.safeParse({
+        id: "sj_1",
+        expected_revision: 1,
+        action: "send_message",
+        params: { content: "Daily digest" },
+      }).success,
+    ).toBe(false);
+  });
+
   test("posts the message text directly to the bound space (no executor round-trip)", async () => {
     const { ctx, postCalls } = context();
 
@@ -147,8 +182,8 @@ describe("sendMessageAction (issue #220)", () => {
   test("fails closed for missing text or space without posting", async () => {
     const { ctx, postCalls, audits } = context();
 
-    await sendMessageAction.run({ space: "slack:C1" }, ctx);
-    await sendMessageAction.run({ text: "Lonely message" }, ctx);
+    await expect(sendMessageAction.run({ space: "slack:C1" }, ctx)).rejects.toThrow("text is required");
+    await expect(sendMessageAction.run({ text: "Lonely message" }, ctx)).rejects.toThrow("space is required");
 
     expect(postCalls).toEqual([]);
     expect(audits).toHaveLength(2);
@@ -164,10 +199,12 @@ describe("sendMessageAction (issue #220)", () => {
     });
   });
 
-  test("audits a posting failure and never throws it past the runner", async () => {
+  test("audits a posting failure and propagates it to the runner", async () => {
     const { ctx, postCalls, audits } = context({ postError: new Error("slack unavailable") });
 
-    await expect(sendMessageAction.run({ text: "Hello", space: "slack:C1" }, ctx)).resolves.toBeUndefined();
+    await expect(sendMessageAction.run({ text: "Hello", space: "slack:C1" }, ctx)).rejects.toThrow(
+      "failed to post scheduled message: slack unavailable",
+    );
 
     expect(postCalls).toEqual([]);
     expect(audits).toEqual([

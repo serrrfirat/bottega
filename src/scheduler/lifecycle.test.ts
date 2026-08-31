@@ -201,6 +201,26 @@ describe("scheduler lifecycle caller surface (issue #308)", () => {
     });
   });
 
+  test("rejects content when updating a send_message job instead of creating a stale digest payload", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const registry = buildRegistry([{ name: "send_message", run: async () => {} }]);
+    const definitions = schedulerToolDefinitions(store, audit, registry);
+    const created = await createJob(store);
+
+    const result = await call(
+      definitions,
+      "update_scheduler_job",
+      { id: created.id, expected_revision: created.revision, params: { content: "Daily digest" } },
+      "slack:C1",
+      "update-content",
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content.find((part) => part.type === "text")?.text).toMatch(/params\.text is required/i);
+    expect((await store.getSchedulerJob(created.id))?.params).toEqual({ text: "before" });
+  });
+
   test("pauses scheduled claims and resumes from the supplied clock", async () => {
     const store = freshStore();
     const audit = createAudit(store);

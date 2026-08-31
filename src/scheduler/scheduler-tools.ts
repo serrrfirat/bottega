@@ -32,16 +32,26 @@ import {
  */
 const schedulerActionSchema = z.enum(DURABLE_ACTION_NAMES);
 
-export const createSchedulerJobArgsSchema = z.object({
-  action: schedulerActionSchema,
-  /** The job's identity in the user's own words ("daily repository digest"). */
-  description: z.string().optional(),
-  /** Natural-language schedule for the user-facing reply ("every day at 10:00"). */
-  schedule: z.string().optional(),
-  cron: z.string(),
-  params: z.record(z.string(), z.string()).optional(),
-  space: z.string().optional(),
-});
+export const createSchedulerJobArgsSchema = z
+  .object({
+    action: schedulerActionSchema,
+    /** The job's identity in the user's own words ("daily repository digest"). */
+    description: z.string().optional(),
+    /** Natural-language schedule for the user-facing reply ("every day at 10:00"). */
+    schedule: z.string().optional(),
+    cron: z.string(),
+    /**
+     * Action-specific string parameters. For `send_message`, the message body
+     * is `text` (not `content`); the scheduler runner passes this unchanged to
+     * the registered action.
+     */
+    params: z.record(z.string(), z.string()).optional(),
+    space: z.string().optional(),
+  })
+  .refine(
+    (value) => value.action !== "send_message" || Boolean(value.params?.text?.trim()),
+    "send_message params.text is required",
+  );
 export const listSchedulerJobsArgsSchema = z.object({});
 export const updateSchedulerJobArgsSchema = z
   .object({
@@ -53,7 +63,11 @@ export const updateSchedulerJobArgsSchema = z
   })
   .refine((value) => value.action !== undefined || value.cron !== undefined || value.params !== undefined, {
     message: "update requires at least one supplied field",
-  });
+  })
+  .refine(
+    (value) => value.action !== "send_message" || value.params === undefined || Boolean(value.params.text?.trim()),
+    "send_message params.text is required",
+  );
 const schedulerJobRevisionArgs = {
   id: z.string().min(1),
   expected_revision: z.number().int().positive(),
@@ -228,7 +242,8 @@ export function schedulerToolDefinitions(
     label: "Create scheduler job",
     description:
       "Creates a durable recurring UTC cron job. Space-scoped actions default to this conversation. " +
-      "An explicit foreign space or org-wide action requires org authority. Requires human approval.",
+      "An explicit foreign space or org-wide action requires org authority. " +
+      "For send_message, params.text is the message body (never params.content). Requires human approval.",
     parameters: createSchedulerJobArgsSchema,
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
@@ -315,7 +330,9 @@ export function schedulerToolDefinitions(
   const update: ToolDefinition<typeof updateSchedulerJobArgsSchema> = {
     name: "update_scheduler_job",
     label: "Update scheduler job",
-    description: "Changes only supplied action, cron, or parameter fields. Requires the current revision.",
+    description:
+      "Changes only supplied action, cron, or parameter fields. Requires the current revision. " +
+      "For send_message, params.text is the message body (never params.content).",
     parameters: updateSchedulerJobArgsSchema,
     approval: "exec",
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult> {
@@ -323,6 +340,11 @@ export function schedulerToolDefinitions(
         const before = await resolveAuthorizedJob(store, options, update.name, toolCallId, sessionSpaceId(ctx), params.id);
         if (params.action !== undefined && !registry.has(params.action)) {
           return toolError(`scheduler action is not registered: ${params.action}`);
+        }
+        const resultingAction = params.action ?? before.action;
+        const resultingParams = params.params ?? before.params;
+        if (resultingAction === "send_message" && !resultingParams.text?.trim()) {
+          return toolError("send_message params.text is required");
         }
         if (
           params.action !== undefined &&

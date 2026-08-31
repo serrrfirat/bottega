@@ -85,7 +85,7 @@ import { resolveRetryAction } from "./adapters/retry-router";
 import { resolveOpenReviewAction } from "./adapters/work-review-router";
 import { RETRY_WITH_CONTEXT_ACTION_ID } from "./adapters/blocks";
 import { mountWorkReviewRoutes } from "./work-review/routes";
-import { buildSchedulerBlocks, resolveSchedulerAction } from "./adapters/scheduler-router";
+import { buildSchedulerBlocks, createSchedulerRunNowFeedback, resolveSchedulerAction, type SchedulerRunNowFeedback } from "./adapters/scheduler-router";
 import {
   channelFromSpaceId,
   createSlackAdapter,
@@ -423,6 +423,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       return { provider, available: true };
     },
   });
+  let schedulerFeedback: SchedulerRunNowFeedback;
   let spaceService: SpaceService;
   // Issue #358: the executor's per-item transcript dir — the read-only
   // source for the work-item timeline projection and fork prior-context.
@@ -453,7 +454,15 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
         a.actionId === SCHEDULER_RESUME_ACTION_ID ||
         a.actionId === SCHEDULER_RUN_NOW_ACTION_ID
       ) {
-        return resolveSchedulerAction({ store, audit, adapter }, a).then(() => undefined);
+        return resolveSchedulerAction(
+          {
+            store,
+            audit,
+            adapter,
+            onRunNowRequested: (request) => schedulerFeedback.register(request),
+          },
+          a,
+        ).then(() => undefined);
       }
       // Stop control (issue #315): a user clicking Stop on a live turn is a
       // first-class, audited control — resolved by the space service's
@@ -468,6 +477,7 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     onHomeOpened: (viewer) => operatorHome.render(viewer),
     onHomePublished: (viewer, revision) => operatorHome.recordRead(viewer, revision),
   });
+  schedulerFeedback = createSchedulerRunNowFeedback(adapter, (line) => console.log(line));
   // Boot-time onboarding guide (issue #116): proactive Slack-side setup.
   // When any first-run check fails AND an onboarding space is configured
   // (org settings onboarding.space_id), post ONE guided message naming the
@@ -1126,8 +1136,8 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
     postMessage: (spaceId, text, opts) => adapter.postMessage(spaceId, text, opts),
     loadPolicy: (spaceId) => loadSpacePolicy(orgPolicy, store, spaceId),
     log: (line) => console.log(line),
+    onInvocationComplete: (invocation) => schedulerFeedback.onInvocationComplete(invocation),
   });
-
   return {
     async start() {
       await adapter.start();

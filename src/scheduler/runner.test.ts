@@ -57,7 +57,7 @@ function deps(
   audit: AuditModule,
   registry: SchedulerActionRegistry,
   now: number,
-  overrides: Partial<Pick<SchedulerTickDeps, "firstTick" | "fireTimeoutMs">> = {},
+  overrides: Partial<Pick<SchedulerTickDeps, "firstTick" | "fireTimeoutMs" | "onInvocationComplete">> = {},
 ): SchedulerTickDeps {
   return {
     store,
@@ -254,6 +254,70 @@ describe("scheduler runner (issue #86)", () => {
     });
     expect((await store.getSchedulerJob(job.id))?.lastResult).toBe("ok");
     expect(await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT })).toEqual([]);
+  });
+  test("notifies the visible feedback seam after a durable invocation completes", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const fireTime = Date.UTC(2026, 7, 21, 12);
+    const registry = buildRegistry([
+      {
+        name: "send_message",
+        run: async () => {},
+      },
+    ]);
+    const job = await store.createSchedulerJob({
+      action: "send_message",
+      cron: "* * * * *",
+      params: { text: "Reminder" },
+      spaceId: "slack:C1",
+      createdBy: "U1",
+    });
+    await store.updateSchedulerNextFire(job.id, fireTime);
+    const completions: Array<{ id: string; result: string | null }> = [];
+
+    await tickScheduler(
+      deps(store, audit, registry, fireTime, {
+        onInvocationComplete: async (invocation) => {
+          completions.push({ id: invocation.id, result: invocation.result });
+        },
+      }),
+    );
+
+    expect(completions).toEqual([{ id: `scheduled:${job.id}:${fireTime}`, result: "ok" }]);
+  });
+
+  test("passes the terminal failure reason to visible feedback", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const fireTime = Date.UTC(2026, 7, 21, 12);
+    const registry = buildRegistry([
+      {
+        name: "send_message",
+        run: async () => {
+          throw new Error("text is required");
+        },
+      },
+    ]);
+    const job = await store.createSchedulerJob({
+      action: "send_message",
+      cron: "* * * * *",
+      params: { content: "Daily digest" },
+      spaceId: "slack:C1",
+      createdBy: "U1",
+    });
+    await store.updateSchedulerNextFire(job.id, fireTime);
+    const completions: Array<{ result: string | null; error?: string }> = [];
+
+    await tickScheduler(
+      deps(store, audit, registry, fireTime, {
+        onInvocationComplete: async (invocation) => {
+          completions.push({ result: invocation.result, error: invocation.error });
+        },
+      }),
+    );
+
+    expect(completions).toEqual([{ result: "error", error: "text is required" }]);
+    expect((await store.getSchedulerJob(job.id))?.lastResult).toBe("error");
   });
 
   test("start and stop run the immediate pass without leaving a timer", async () => {
