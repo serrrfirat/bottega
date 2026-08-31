@@ -85,6 +85,11 @@ safe recovery action when one is available.
   lands in an append-only audit trail that can't be edited or deleted.
 - **Pick your model per task.** Fast model for quick things, reasoning
   model for hard ones — switched from chat, per space, no restarts.
+- **Cited public-web research without a vendor account.** `search_web` uses the
+  internal SearXNG service, configured with DuckDuckGo and Brave, and returns
+  title, URL, and snippet citations. It is best-effort because public engines
+  may throttle the droplet IP; use it for current external facts, not
+  repository-local facts.
 
 ## How the executor delivers approved work
 

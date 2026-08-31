@@ -161,9 +161,11 @@ everything through the strict config/egress.yml, unchanged.
 ### Proxy credential sync: vault → env → Keychain → fail closed (issues #208/#201/#343)
 
 `src/extensions/proxy-seed.ts` is the boot adapter that seeds iron-proxy with
-model-gateway keys (`near`, `opencode`, `openai`, `anthropic`, plus the
-`tavily` web-search key) and the codex static credential, then removes the
-provider keys from the app environment. The vault stays the source of truth.
+model-gateway keys (`near`, `opencode`, `openai`, and `anthropic`) and the codex
+static credential, then removes the provider keys from the app environment.
+The vault stays the source of truth. Search does not add a provider key: its
+internal SearXNG service uses public search engines through the proxy.
+
 For each model-gateway key the sync resolves a single value with precedence
 **vault → env → Keychain (local dev, opt-in) → fail closed**, writes it
 atomically to the provider's mode-0600 `<provider>.secret` boundary file,
@@ -204,6 +206,22 @@ provider-aware: the error mapper attributes a bare `403` (or the `502` mint
 marker) to the codex mint/grant family ONLY when the active provider is
 codex; any other provider's 403 names that failing provider and its env var
 or vault row via `providerCredentialRemedy`, never codex.
+
+### Internal web search (#388)
+
+`search_web` is a read-tier agent tool backed by the internal
+`http://searxng:8080/search` JSON endpoint. The Compose service has no published
+host port and is configured to keep only DuckDuckGo and Brave. SearXNG sends
+those upstream requests through iron-proxy; it has no direct egress and needs
+no search account or API key. The reviewed proxy allowlist and judge rules
+cover `html.duckduckgo.com` and `search.brave.com`.
+
+The tool sends a safe-search JSON GET and returns bounded structured results
+(title, URL, and snippet) for citation rendering. It is intended for current
+external, research, news, comparison, or source-verifiable questions, not
+repository-local facts. Search is best-effort: public engines may throttle the
+droplet IP, and unavailable or malformed responses fail closed rather than
+producing uncited claims.
 
 ### Local development topology (#123/#143/#311)
 
