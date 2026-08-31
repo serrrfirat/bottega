@@ -1,7 +1,7 @@
 # bottega tools image (issues #58, #63, #391): the executor base (oven/bun:1 + git +
 # ca-certificates, same as the app image) plus the curated CLI set v1.1:
 #   - GitHub/ops:   gh, jq, curl, git, glab, yq (v4), ripgrep
-#   - Docker:       docker.io CLI (the executor drives its mounted host socket;
+#   - Docker:       docker-cli (the executor drives its mounted host socket;
 #                   no daemon runs in this image)
 #   - Node:         nodejs, npm, pnpm, yarn — the base image ships only a bun
 #                   `node` shim (no npm), so the real toolchain is installed
@@ -35,7 +35,7 @@ ARG YQ_VERSION=v4.53.3
 # toolchains (pnpm, yarn) are installed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates curl jq gh docker.io \
+        git ca-certificates curl jq gh docker-cli \
         nodejs npm \
         build-essential golang-go \
         python3 python3-pip \
