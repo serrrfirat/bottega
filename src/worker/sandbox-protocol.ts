@@ -108,8 +108,10 @@ export const sandboxExecuteRequestSchema = z
     // The supervisor's parsed org settings blob (JSON-safe), injected so the
     // child's shared composition chain (loadOrgPolicy, secret resolver, agent
     // dir pin) never needs a synchronous store read over the async RPC socket.
-    // Present in the Docker lane (and any lane that boots over RPC).
     orgSettings: z.unknown().optional(),
+    // The supervisor's typed org policy floor, including tools and extension
+    // allowlists, so the child applies the same policy as the live space.
+    orgPolicy: z.unknown().optional(),
     // The supervisor's successfully resolved extension tool surfaces. This
     // metadata contains no credentials and lets a sandbox reuse the same
     // reviewed tools without discovering through its isolated proxy config.

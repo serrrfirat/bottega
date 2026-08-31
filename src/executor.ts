@@ -95,6 +95,7 @@ import { z } from "zod";
 import { parseYamlSubset, type YamlNode } from "./yaml-subset";
 import type { ResolvedMemoryProvider } from "./server/memory-provider";
 import type { OrgSettings } from "./store/org-settings";
+import type { PolicyConfig } from "./policy/config";
 import { defaultWorkspaceRoot } from "./worker/workspace-lifecycle";
 
 // Re-export the moved executor JOB BODIES + their shared types from the leaf so
@@ -182,6 +183,8 @@ export async function bootExecutorRuntime(opts: {
    * settings into the job request.
    */
   orgSettings?: OrgSettings | null;
+  /** Supervisor-resolved org policy floor reused by sandbox children. */
+  orgPolicyOverride?: PolicyConfig;
   /** Supervisor-resolved extension tool metadata reused by isolated jobs. */
   surfaceOverrides?: ExtensionSurfaces;
   /** Skip the global extension-registry merge (denied by the sandbox store RPC allowlist). */
@@ -229,6 +232,7 @@ export async function bootExecutorRuntime(opts: {
     ...(opts.store !== undefined ? { store: opts.store } : undefined),
     ...(opts.memoryProvider !== undefined ? { memoryProvider: opts.memoryProvider } : undefined),
     ...(opts.orgSettings !== undefined ? { orgSettings: opts.orgSettings } : undefined),
+    ...(opts.orgPolicyOverride !== undefined ? { orgPolicyOverride: opts.orgPolicyOverride } : undefined),
     ...(opts.skipRuntimeRegistryMerge === true ? { skipRuntimeRegistryMerge: true } : undefined),
     ...(opts.surfaceOverrides !== undefined ? { surfaceOverrides: opts.surfaceOverrides } : undefined),
     ...(opts.mcpTransport !== undefined ? { mcpTransport: opts.mcpTransport } : undefined),
@@ -689,7 +693,7 @@ if (import.meta.main) {
     memoryProvider,
     extensionProviderIds: sandboxExtensionProviderIds,
     extensionSurfaces: boot.runtime.surfaces,
-    orgSettings: store.getOrgSettings(),
+    orgPolicy: boot.runtime.orgPolicy,
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
     network: process.env.BOTTEGA_SANDBOX_NETWORK,

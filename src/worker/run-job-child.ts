@@ -13,6 +13,7 @@ import type { ConsolidationModelCall, ConsolidationResult } from "../memory/cons
 import type { MemoryProvider } from "../memory/types";
 import { createJobScopedStore, jobScopeFromEnvelope } from "./scoped-store";
 import type { Store } from "../store/db";
+import type { PolicyConfig } from "../policy/config";
 import type { WorkerJob } from "./envelope";
 import { runIsolatedJobBody, FORBIDDEN_CHILD_ENV_NAMES, type SandboxResult, type SandboxStore } from "./run-job";
 import { connectStoreRpc } from "./store-rpc";
@@ -201,7 +202,7 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
       agentDir: prepareDockerAgentDir(),
       surfaceOverrides:
         request.extensionSurfaces === undefined ? undefined : new Map(Object.entries(request.extensionSurfaces)),
-      // SAFETY: bootStore is the explicit allowlisted RPC store facade,
+      orgPolicyOverride: request.orgPolicy as PolicyConfig | undefined,
       // widened to the full Store at the boot boundary; the runtime only
       // invokes facade methods, and non-allowlisted access fails closed at
       // the socket (issue #101).

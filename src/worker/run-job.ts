@@ -49,6 +49,7 @@ import {
 import type { Store } from "../store/db";
 import type { OrgSettings } from "../store/org-settings";
 import type { ExtensionTool } from "../extensions/manifest";
+import type { PolicyConfig } from "../policy/config";
 import type { ResolvedMemoryProvider } from "../server/memory-provider";
 import { JOB_FAILED_EVENT } from "../store/audit-events";
 import { ingestPollJobPayloadSchema, workItemJobPayloadSchema, type WorkerJob } from "./envelope";
@@ -248,6 +249,8 @@ export interface DockerSandboxOptions {
   extensionProviderIds?: Iterable<string>;
   /** Supervisor-resolved tool metadata; credentials never cross this boundary. */
   extensionSurfaces?: ReadonlyMap<string, readonly ExtensionTool[]>;
+  /** Supervisor-resolved org policy floor, applied before space overlays. */
+  orgPolicy?: PolicyConfig;
   /** The supervisor's parsed org settings, serialized into the job request so the child boot needs no sync store read. */
   orgSettings?: OrgSettings | null;
   /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
@@ -391,6 +394,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       config: containerConfig(ctx.cfg, options),
       caps: ctx.caps,
       orgSettings: options.orgSettings ?? undefined,
+      orgPolicy: options.orgPolicy ?? undefined,
       extensionSurfaces:
         options.extensionSurfaces === undefined
           ? undefined
@@ -406,6 +410,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       hostStore: options.hostStore,
       memoryProvider: options.memoryProvider,
       extensionProviderIds: options.extensionProviderIds,
+      orgPolicy: options.orgPolicy,
       extensionSurfaces: request.extensionSurfaces,
       image,
       network,
@@ -477,6 +482,7 @@ interface DockerLaunchOptions {
   hostStore?: import("../store/db").Store;
   memoryProvider?: ResolvedMemoryProvider;
   extensionProviderIds?: Iterable<string>;
+  orgPolicy?: PolicyConfig;
   extensionSurfaces?: Record<string, readonly ExtensionTool[]>;
   job?: WorkerJob;
   jobId: string;

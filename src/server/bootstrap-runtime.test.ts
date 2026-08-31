@@ -196,4 +196,36 @@ describe("bootstrapRuntime API-key surface authorization", () => {
       f.cleanup();
     }
   });
+
+  test("reuses supervisor-resolved surfaces without child discovery", async () => {
+    const f = fixture();
+    const store = createStore(f.dbPath);
+    let discoveryCalls = 0;
+    try {
+      const runtime = await bootstrapRuntime({
+        router: DenyRouter,
+        dbPath: f.dbPath,
+        extensionsDir: f.extensionsDir,
+        skipRuntimeRegistryMerge: true,
+        surfaceOverrides: new Map([
+          [
+            "github",
+            [{ name: "search_issues", tier: "read", description: "Search issues", params: [] }],
+          ],
+        ]),
+        mcpTransport: () => {
+          discoveryCalls += 1;
+          throw new Error("child discovery must not run");
+        },
+      });
+
+      expect(runtime.surfaces.get("github")).toEqual([
+        { name: "search_issues", tier: "read", description: "Search issues", params: [] },
+      ]);
+      expect(discoveryCalls).toBe(0);
+    } finally {
+      store.close();
+      f.cleanup();
+    }
+  });
 });

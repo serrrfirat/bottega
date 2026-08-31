@@ -114,6 +114,8 @@ export interface BootstrapRuntimeDeps {
    * (sync reads work there).
    */
   orgSettings?: OrgSettings | null;
+  /** Supervisor-resolved org policy floor reused by sandbox children. */
+  orgPolicyOverride?: PolicyConfig;
   /** Injected, already-scoped memory provider for the sandbox child (no
    * shared-db memory handle); mutually exclusive with opening the store. */
   memoryProvider?: ResolvedMemoryProvider;
@@ -199,7 +201,7 @@ export async function bootstrapRuntime(deps: BootstrapRuntimeDeps): Promise<Boot
     onResolved: (providerId: string) => extensionAuthFailures.delete(providerId),
   };
   const audit = createAudit(store);
-  const orgPolicy = loadOrgPolicy(store, deps.configDir, deps.orgSettings);
+  const orgPolicy = deps.orgPolicyOverride ?? loadOrgPolicy(store, deps.configDir, deps.orgSettings);
   const registry = createExtensionRegistry(
     deps.extensionsDir ?? process.env.BOTTEGA_EXTENSIONS_DIR ?? "config/extensions",
   );
