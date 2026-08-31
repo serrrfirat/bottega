@@ -118,13 +118,16 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("searxng config init renders the required secret into a read-only runtime volume", () => {
     const init = service("searxng-config-init");
     expect(init["image"]).toBe("alpine:3.19");
+    // SAFETY: hand-authored fixture renders `environment` as a mapping of scalars.
     expect(init["environment"] as Record<string, YamlNode>).toEqual({
       SEARXNG_SECRET: "${SEARXNG_SECRET:?SEARXNG_SECRET must be set}",
     });
+    // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     expect(init["volumes"] as string[]).toEqual([
       "./config/searxng/settings.yml:/seed/settings.yml:ro",
       "searxng-config:/config",
     ]);
+    // SAFETY: hand-authored fixture renders `command` as a block sequence of scalars.
     const command = (init["command"] as string[])[2];
     expect(command).toContain("__SEARXNG_SECRET__");
     expect(command).toContain("at least 64 hexadecimal characters");

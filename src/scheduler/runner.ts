@@ -179,13 +179,16 @@ export async function tickScheduler(deps: SchedulerTickDeps): Promise<void> {
     });
     await deps.store.completeSchedulerInvocation(invocation.id, fireResult, fireTime);
     try {
-      await deps.onInvocationComplete?.({
+      const completion: SchedulerInvocation = {
         ...invocation,
         status: "completed",
         completedAt: fireTime,
         result: fireResult,
-        ...(fireError === undefined ? {} : { error: fireError }),
-      });
+      };
+      if (fireError !== undefined) {
+        completion.error = fireError;
+      }
+      await deps.onInvocationComplete?.(completion);
     } catch (error) {
       deps.log(`scheduler: completion feedback failed: ${errorMessage(error)}`);
     }

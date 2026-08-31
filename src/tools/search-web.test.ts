@@ -1,8 +1,11 @@
 import { describe, expect, test, vi } from "bun:test";
 import { type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Server } from "bun";
+import type { JsonValue } from "../memory/mem0";
 import { searchWebArgsSchema, searchWebToolDefinition, type SearchFetch } from "./search-web";
 
+// SAFETY: search_web's execute never reads extension context fields, so an empty
+// object satisfies the ExtensionContext interface for these hermetic tool tests.
 const NONE_CTX = {} as ExtensionContext;
 
 function resultText(result: AgentToolResult): string {
@@ -41,7 +44,7 @@ function stubSearchProvider(responder: (request: Request) => Response | Promise<
   };
 }
 
-function jsonProvider(body: unknown, status = 200): SearchStubHarness {
+function jsonProvider(body: JsonValue, status = 200): SearchStubHarness {
   return stubSearchProvider(() => Response.json(body, { status }));
 }
 
@@ -160,6 +163,8 @@ describe("search_web SearXNG client", () => {
     try {
       const result = await toolHarness(h).execute("tc1", { query: "many", max_results: 3 }, undefined, undefined, NONE_CTX);
       expect(result.isError).not.toBe(true);
+      // SAFETY: the prior line asserted the call succeeded, and resultText verified
+      // the text tool result exists; the tool serializes { query, count, results }.
       const body = JSON.parse(resultText(result)) as { count: number; results: unknown[] };
       expect(body.count).toBe(3);
       expect(body.results).toHaveLength(3);
@@ -192,7 +197,8 @@ describe("search_web SearXNG client", () => {
   });
 
   test("fails closed on malformed result envelopes", async () => {
-    for (const body of [{}, { results: "not an array" }]) {
+    const bodies: JsonValue[] = [{}, { results: "not an array" }];
+    for (const body of bodies) {
       const h = jsonProvider(body);
       try {
         const result = await toolHarness(h).execute("tc1", { query: "bad envelope" }, undefined, undefined, NONE_CTX);

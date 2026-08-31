@@ -169,8 +169,10 @@ export function createSchedulerRunNowFeedback(
       const completion: SchedulerRunNowCompletion = {
         action: invocation.action,
         result: invocation.result === "error" ? "error" : "ok",
-        ...(invocation.error === undefined ? {} : { error: invocation.error }),
       };
+      if (invocation.error !== undefined) {
+        completion.error = invocation.error;
+      }
       const request = pending.get(invocation.id);
       if (request !== undefined) {
         pending.delete(invocation.id);

@@ -195,7 +195,12 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       const deps = {
         store,
         sandboxRunner: inProcessSandboxRunner(),
+        // SAFETY: with no PAT configured, prepareExecutor takes the extension
+        // executor path without touching memoryProvider or driver, so both may
+        // be absent; `as never` keeps the object assignable to ExecutorDeps.
         memoryProvider: undefined as never,
+        // SAFETY: same absent-delegate rationale as memoryProvider; the extension
+        // executor path never dereferences driver.
         driver: undefined as never,
         orgConfigDir: join(env.dir, "config"),
       } satisfies ExecutorDeps;

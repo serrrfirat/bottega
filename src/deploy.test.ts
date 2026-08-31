@@ -158,6 +158,8 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
   test("server waits for healthy searxng and bypasses its internal name", () => {
     const dependsOn = asRecord(service("server")["depends_on"]);
     expect(asRecord(dependsOn["searxng"])["condition"]).toBe("service_healthy");
+    // SAFETY: the server service's NO_PROXY line in the hand-authored fixture is
+    // a comma-separated string of proxy-bypassed hostnames.
     expect((serviceEnv("server")["NO_PROXY"] as string).split(",")).toContain("searxng");
   });
 
