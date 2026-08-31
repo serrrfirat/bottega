@@ -47,6 +47,12 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    # CI-only: docker-compose.yml requires ${SEARXNG_SECRET:?...} so the
+    # compose validation / docker-run steps resolve it. This is a dummy
+    # validation-only value (a recognizable 64-hex pattern), never a real
+    # secret — production substitutes the actual deployment secret.
+    env:
+      SEARXNG_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     steps:
       - uses: actions/checkout@v4
       # The real-container lane below drives `bun test` HOST-side against the
