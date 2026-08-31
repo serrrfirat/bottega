@@ -186,6 +186,8 @@ export interface ExecutorDeps {
   jobUnclaimedTtlMs?: number;
   /** How often the claim loop sweeps for unclaimed jobs. Default 60 s. */
   jobSweepIntervalMs?: number;
+  /** Optional reauthorization directive surfaced to headless extension workers. */
+  extensionReauthDirective?: () => string;
   /**
    * Nudge hook for unclaimed jobs (epic #170). The worker holds no Slack
    * tokens (credential boundary), so the default surfaces the audit row +
@@ -436,7 +438,7 @@ async function extensionWorkerPath(
   // issues #234/#235, Tier 3: the task-level skills ride the driver seam so
   // `skill://<name>` resolves inside the extension worker session too.
   const skills = await resolveItemSkills(item);
-  if (skills.length > 0) console.log(`[${item.id}] injected skills: ${skills.map((s) => s.name).join(", ")}`);
+  const reauthDirective = deps.extensionReauthDirective?.() ?? "";
   const session = await (await deps.driver).createSession({
     spaceId: item.space_id,
     transcriptDir: join(cfg.transcriptDir, item.id),
@@ -465,6 +467,7 @@ async function extensionWorkerPath(
       session,
       [
         ...(forkPrefix !== "" ? [forkPrefix, ""] : []),
+        ...(reauthDirective === "" ? [] : [reauthDirective, ""]),
         `You are the bottega extension worker for work item ${item.id} in space ${item.space_id}.`,
         "Complete the task using the available tools. The task may require creating or updating an",
         "external object through the connected extensions.",

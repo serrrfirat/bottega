@@ -113,11 +113,11 @@ function buildJobDeps(boot: ExecutorBoot, config: ExecutorConfig, lane: JobDepsL
       return (driver ??= boot.getDriver());
     },
     getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
+    extensionReauthDirective: boot.runtime.extensionReauthDirective,
     orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
     transcriptDir: config.transcriptDir,
     scheduledActions: buildRegistry([memoryConsolidationAction()]),
     consolidationModelCall,
-    ...(lane.runMemoryConsolidation !== undefined ? { runMemoryConsolidation: lane.runMemoryConsolidation } : undefined),
   };
   return { deps, consolidationModelCall };
 }
