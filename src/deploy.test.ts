@@ -160,8 +160,11 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     expect((serviceEnv("server")["NO_PROXY"] as string).split(",")).toContain("searxng");
   });
 
-  test("committed SearXNG settings keep only reviewed JSON web search engines", () => {
-    const settings = parseYamlSubset(readRoot("config/searxng/settings.yml"));
+  test("committed SearXNG settings keep only reviewed JSON web search engines and no startup plugins", () => {
+    const raw = readRoot("config/searxng/settings.yml");
+    expect(raw).toContain("plugins: {}");
+    expect(raw).not.toContain("tracker_url_remover.SXNGPlugin");
+    const settings = parseYamlSubset(raw.replace("plugins: {}", "plugins:\n"));
     const useDefaults = asRecord(settings["use_default_settings"]);
     const engines = asRecord(useDefaults["engines"]);
     expect(asStringArray(engines["keep_only"])).toEqual(["duckduckgo", "brave"]);
@@ -170,10 +173,6 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     const search = asRecord(settings["search"]);
     expect(search["safe_search"]).toBe("1");
     expect(asStringArray(search["formats"])).toEqual(["html", "json"]);
-    const plugins = asRecord(settings["plugins"]);
-    expect(
-      asRecord(plugins["searx.plugins.tracker_url_remover.SXNGPlugin"])["active"],
-    ).toBe("false");
   });
 });
 
