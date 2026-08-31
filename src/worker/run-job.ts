@@ -330,6 +330,8 @@ export async function probeDockerSandbox(options: {
   workspacesDir: string;
   transcriptDir: string;
   volume?: string;
+  volumeWorkspacesRoot?: string;
+  volumeStateRoot?: string;
   image?: string;
   network?: string;
   gitTokenFile?: string;
@@ -342,6 +344,8 @@ export async function probeDockerSandbox(options: {
     workspacesDir: options.workspacesDir,
     transcriptDir: options.transcriptDir,
     volume: options.volume,
+    volumeWorkspacesRoot: options.volumeWorkspacesRoot,
+    volumeStateRoot: options.volumeStateRoot,
     image: options.image ?? DEFAULT_SANDBOX_IMAGE,
     network: options.network ?? process.env.BOTTEGA_SANDBOX_NETWORK ?? "none",
     gitTokenFile: options.gitTokenFile,

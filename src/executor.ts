@@ -713,6 +713,8 @@ if (import.meta.main) {
         workspacesDir: sandboxWorkspaces,
         transcriptDir: sandboxTranscripts,
         volume: sandboxVolume,
+        volumeWorkspacesRoot: process.env.BOTTEGA_SANDBOX_WORKSPACES_VOLUME_ROOT,
+        volumeStateRoot: process.env.BOTTEGA_SANDBOX_STATE_VOLUME_ROOT,
         requireDocker: true,
       }).then(() => undefined),
   };
