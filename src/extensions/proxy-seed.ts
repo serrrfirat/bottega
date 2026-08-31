@@ -50,7 +50,7 @@ export interface ModelProxyKey {
   envName: string;
 }
 
-/** The model-gateway + web-search keys (opencode-go's key-only decl + the three custom gateways + tavily). */
+/** The model-gateway keys, including opencode-go's key-only declaration. */
 export const MODEL_PROXY_KEYS: readonly ModelProxyKey[] = [
   { provider: "near", envName: "NEAR_API_KEY" },
   { provider: "opencode", envName: "OPENCODE_API_KEY" },

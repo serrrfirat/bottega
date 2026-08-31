@@ -90,7 +90,7 @@ describe("forbidden child env denylist (issue #346)", () => {
     expect(env.BOTTEGA_CONFIG_DIR).toBe("/cfg");
   });
 
-  test("the new 346 names (BOTTEGA_API_TOKEN, NEAR_API_KEY, OPENCODE/TAVILY keys) are on the denylist", () => {
+  test("the credential names are on the denylist", () => {
     for (const name of [
       "BOTTEGA_API_TOKEN",
       "NEAR_API_KEY",
