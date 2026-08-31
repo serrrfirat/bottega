@@ -694,6 +694,7 @@ if (import.meta.main) {
     extensionProviderIds: sandboxExtensionProviderIds,
     extensionSurfaces: boot.runtime.surfaces,
     orgPolicy: boot.runtime.orgPolicy,
+    extensionReauthDirective: boot.runtime.extensionReauthDirective(),
     gitTokenFile: process.env.EXECUTOR_GIT_TOKEN_FILE,
     brokerTokenFile: process.env.OMP_AUTH_BROKER_TOKEN_FILE,
     network: process.env.BOTTEGA_SANDBOX_NETWORK,

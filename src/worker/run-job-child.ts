@@ -84,6 +84,8 @@ interface JobDepsLane {
   dbPath?: string;
   /** The org memory provider (child: boot runtime; Docker: RPC provider). */
   memoryProvider: MemoryProvider;
+  /** Sanitized supervisor reauthorization guidance, when present. */
+  extensionReauthDirective?: string;
   /** Docker-lane only: routes the memory-consolidation DB leg supervisor-side (issue #272). */
   runMemoryConsolidation?: () => Promise<ConsolidationResult[]>;
 }
@@ -113,7 +115,10 @@ function buildJobDeps(boot: ExecutorBoot, config: ExecutorConfig, lane: JobDepsL
       return (driver ??= boot.getDriver());
     },
     getExtensionWorkerToolset: boot.getExtensionWorkerToolset,
-    extensionReauthDirective: boot.runtime.extensionReauthDirective,
+    extensionReauthDirective:
+      lane.extensionReauthDirective === undefined
+        ? boot.runtime.extensionReauthDirective
+        : () => lane.extensionReauthDirective!,
     orgConfigDir: process.env.BOTTEGA_CONFIG_DIR ?? "config",
     transcriptDir: config.transcriptDir,
     scheduledActions: buildRegistry([memoryConsolidationAction()]),
@@ -221,6 +226,7 @@ async function executeViaRpc(request: Extract<SandboxRequest, { mode: "execute" 
       // closed at the socket.
       store: bootStore as SandboxStore,
       memoryProvider: rpc.memoryProvider,
+      extensionReauthDirective: request.extensionReauthDirective,
       runMemoryConsolidation: () => rpc.maintainMemory(),
     });
     // The scheduled consolidation DB leg is routed supervisor-side; the LLM

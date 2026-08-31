@@ -112,6 +112,9 @@ export const sandboxExecuteRequestSchema = z
     // The supervisor's typed org policy floor, including tools and extension
     // allowlists, so the child applies the same policy as the live space.
     orgPolicy: z.unknown().optional(),
+    // Connected providers whose supervisor discovery failed are relayed as a
+    // sanitized reauthorization directive, never as credentials.
+    extensionReauthDirective: z.string().max(8_192).optional(),
     // The supervisor's successfully resolved extension tool surfaces. This
     // metadata contains no credentials and lets a sandbox reuse the same
     // reviewed tools without discovering through its isolated proxy config.

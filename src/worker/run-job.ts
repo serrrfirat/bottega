@@ -251,6 +251,8 @@ export interface DockerSandboxOptions {
   extensionSurfaces?: ReadonlyMap<string, readonly ExtensionTool[]>;
   /** Supervisor-resolved org policy floor, applied before space overlays. */
   orgPolicy?: PolicyConfig;
+  /** Sanitized supervisor reauthorization guidance; contains no credentials. */
+  extensionReauthDirective?: string;
   /** The supervisor's parsed org settings, serialized into the job request so the child boot needs no sync store read. */
   orgSettings?: OrgSettings | null;
   /** Inject a docker CLI seam (tests). Production uses the real docker CLI. */
@@ -395,6 +397,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       caps: ctx.caps,
       orgSettings: options.orgSettings ?? undefined,
       orgPolicy: options.orgPolicy ?? undefined,
+      extensionReauthDirective: options.extensionReauthDirective,
       extensionSurfaces:
         options.extensionSurfaces === undefined
           ? undefined
@@ -411,6 +414,7 @@ export function createDockerSandboxRunner(options: DockerSandboxOptions): Sandbo
       memoryProvider: options.memoryProvider,
       extensionProviderIds: options.extensionProviderIds,
       orgPolicy: options.orgPolicy,
+      extensionReauthDirective: options.extensionReauthDirective,
       extensionSurfaces: request.extensionSurfaces,
       image,
       network,
@@ -478,11 +482,11 @@ interface DockerLaunchOptions {
   caCertHostPath?: string;
   gitTokenFile?: string;
   brokerTokenFile?: string;
-  /** The supervisor's real store, host-side (job-scoped RPC host). */
-  hostStore?: import("../store/db").Store;
+  hostStore?: Store;
   memoryProvider?: ResolvedMemoryProvider;
   extensionProviderIds?: Iterable<string>;
   orgPolicy?: PolicyConfig;
+  extensionReauthDirective?: string;
   extensionSurfaces?: Record<string, readonly ExtensionTool[]>;
   job?: WorkerJob;
   jobId: string;
