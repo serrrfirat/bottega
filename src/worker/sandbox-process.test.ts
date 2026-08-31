@@ -583,7 +583,9 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     // as the immutable container-internal path, never passed through from the
     // host (which has no container path and no reason to set it).
     const originalHostRpcSocket = process.env.BOTTEGA_SANDBOX_RPC_SOCKET;
+    const originalProxyConfigPath = process.env.BOTTEGA_PROXY_CONFIG_PATH;
     process.env.BOTTEGA_SANDBOX_RPC_SOCKET = "host-must-not-leak.sock";
+    process.env.BOTTEGA_PROXY_CONFIG_PATH = "/app/data/proxy-config/egress.yml";
     const runner = createDockerSandboxRunner({
       hostStore: store,
       memoryProvider: memoryDenyProvider,
@@ -599,9 +601,12 @@ describe("production docker sandbox boundary (#101/#338)", () => {
       expect(runArgs).toContain("--env");
       const rpcSocketEnv = runArgs.find((a) => a.startsWith("BOTTEGA_SANDBOX_RPC_SOCKET="));
       expect(rpcSocketEnv).toBe("BOTTEGA_SANDBOX_RPC_SOCKET=/rpc/store.sock");
+      expect(runArgs).toContain("BOTTEGA_PROXY_CONFIG_PATH=/app/data/proxy-config/egress.yml");
     } finally {
       if (originalHostRpcSocket === undefined) delete process.env.BOTTEGA_SANDBOX_RPC_SOCKET;
       else process.env.BOTTEGA_SANDBOX_RPC_SOCKET = originalHostRpcSocket;
+      if (originalProxyConfigPath === undefined) delete process.env.BOTTEGA_PROXY_CONFIG_PATH;
+      else process.env.BOTTEGA_PROXY_CONFIG_PATH = originalProxyConfigPath;
     }
   });
 

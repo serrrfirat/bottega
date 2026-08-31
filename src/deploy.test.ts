@@ -90,6 +90,9 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     const env = serviceEnv("executor");
     expect(env["EXECUTOR_GIT_TOKEN_FILE"]).toBe("/app/data/secrets/github-pat");
     expect(env["OMP_AUTH_BROKER_TOKEN_FILE"]).toBe("/app/data/.omp/auth-broker.token");
+    expect(env["BOTTEGA_PROXY_CONFIG_PATH"]).toBe("/app/data/egress.yml");
+    expect(env["BOTTEGA_PROXY_CONTROL_URL"]).toBe("http://iron-proxy:9092");
+    expect(env["BOTTEGA_PROXY_CONTROL_TOKEN"]).toBe("${IRON_MANAGEMENT_API_KEY:-}");
     // Issue #67: the workspaces dir is an org SETTING (settings.workspaces_dir),
     // not an env var — unset, the executor resolves the container default
     // /workspaces (the data volume mounted below).
