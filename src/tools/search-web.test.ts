@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Server } from "bun";
 import { searchWebArgsSchema, searchWebToolDefinition } from "./search-web";
@@ -15,16 +15,19 @@ interface SearchStubHarness {
   server: Server<undefined>;
   baseUrl: string;
   requests: URL[];
+  requestReceived: Promise<void>;
   cleanup: () => void;
 }
 
 function stubSearchProvider(responder: (request: Request) => Response | Promise<Response>): SearchStubHarness {
   const requests: URL[] = [];
+  const requestReceived = Promise.withResolvers<void>();
   const server = Bun.serve({
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
       requests.push(url);
+      requestReceived.resolve();
       if (url.pathname !== "/search") return Response.json({ error: "not found" }, { status: 404 });
       return responder(request);
     },
@@ -33,6 +36,7 @@ function stubSearchProvider(responder: (request: Request) => Response | Promise<
     server,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
+    requestReceived: requestReceived.promise,
     cleanup: () => server.stop(true),
   };
 }
@@ -210,5 +214,44 @@ describe("search_web SearXNG client", () => {
     const result = await tool.execute("tc1", { query: "unreachable" }, undefined, undefined, NONE_CTX);
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("connection refused");
+  });
+  test("propagates cancellation while the local SearXNG service is pending", async () => {
+    vi.useFakeTimers();
+    const h = stubSearchProvider(() => new Promise<Response>(() => {}));
+    const controller = new AbortController();
+    const pendingFetch: typeof fetch = async (input, init) => {
+      void fetch(input, init).catch(() => {});
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+      throw new Error("unreachable");
+    };
+    const pending = searchWebToolDefinition({ baseUrl: h.baseUrl, fetch: pendingFetch }).execute(
+      "tc1",
+      { query: "cancel" },
+      controller.signal,
+      undefined,
+      NONE_CTX,
+    );
+    try {
+      await h.requestReceived;
+      expect(h.requests).toHaveLength(1);
+      controller.abort();
+      const resultPromise = Promise.race([
+        pending,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 250)),
+      ]);
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(250);
+      const result = await resultPromise;
+      expect(result).not.toBeNull();
+      if (result === null) throw new Error("search_web cancellation timed out");
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain("search_web failed");
+    } finally {
+      vi.useRealTimers();
+      h.cleanup();
+    }
   });
 });

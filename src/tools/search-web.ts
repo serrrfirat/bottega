@@ -68,7 +68,7 @@ export function searchWebToolDefinition(opts: SearchWebToolOpts = {}): ToolDefin
       "Search the public web for current, external, research, news, comparison, or source-verifiable information; use the cited URLs in the answer, and do not use this tool for repository-local facts.",
     parameters: searchWebArgsSchema,
     approval: "read",
-    async execute(_toolCallId, params, _signal, _onUpdate): Promise<AgentToolResult> {
+    async execute(_toolCallId, params, signal, _onUpdate): Promise<AgentToolResult> {
       const query = params.query.trim();
       const max = params.max_results ?? 5;
       if (!query) return toolError("search_web requires a non-empty query");
@@ -78,7 +78,7 @@ export function searchWebToolDefinition(opts: SearchWebToolOpts = {}): ToolDefin
         url.searchParams.set("format", "json");
         url.searchParams.set("categories", "general");
         url.searchParams.set("safesearch", "1");
-        const response = await doFetch(url, { method: "GET" });
+        const response = await doFetch(url, { method: "GET", signal });
         if (!response.ok) {
           const detail = (await response.text().catch(() => "")).slice(0, 200);
           return toolError(
