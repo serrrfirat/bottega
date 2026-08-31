@@ -33,42 +33,46 @@ async function seedFailedItem(store: Store, transcriptDir: string, channel = "C3
   // gives deterministic separation between the transcript stamps (derived
   // from created_at) and the later audit rows.
   vi.useFakeTimers();
-  const space = await store.getOrCreateSpace({ platform: "slack", channel_id: channel });
-  const item = await store.createWorkItem({
-    space_id: space.id,
-    requester: "U1",
-    description: "ship the thing",
-    repo: "acme/repo",
-    delivery: "git",
-  });
-  await store.claimWorkItemById(item.id);
-  await store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
-  mkdirSync(transcriptDir, { recursive: true });
-  writeFileSync(
-    join(transcriptDir, `${item.id}.jsonl`),
-    [
-      '{"type":"title","title":"session"}',
-      `{"type":"message","message":{"content":"explore the repo"},"timestamp":"${new Date(item.created_at + 10).toISOString()}"}`,
-      `{"type":"message","message":{"content":[{"type":"tool_use","name":"bash","input":{"command":"ls"}},{"type":"text","text":"listing files"}]},"timestamp":"${new Date(item.created_at + 20).toISOString()}"}`,
-      `{"type":"message","message":{"content":"the fix touches src/a.ts"},"timestamp":"${new Date(item.created_at + 30).toISOString()}"}`,
-      "",
-    ].join("\n"),
-  );
-  // Deterministic clock advance: audit rows must land strictly after the
-  // transcript stamps above (the transcript is written while working; the
-  // failure comes later). Fake timers — no real wall-clock latency.
-  vi.advanceTimersByTime(1000);
-  await store.transitionWorkItem(item.id, "working", "blocked", {
-    evidence: "sandbox crashed",
-    by: "executor",
-  });
-  await store.appendAudit({
-    space_id: space.id,
-    actor: "executor",
-    event_type: "work_item.failed",
-    payload: JSON.stringify({ id: item.id, error: "sandbox crashed" }),
-  });
-  return { item, space };
+  try {
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: channel });
+    const item = await store.createWorkItem({
+      space_id: space.id,
+      requester: "U1",
+      description: "ship the thing",
+      repo: "acme/repo",
+      delivery: "git",
+    });
+    await store.claimWorkItemById(item.id);
+    await store.transitionWorkItem(item.id, "claimed", "working", { by: "executor" });
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(
+      join(transcriptDir, `${item.id}.jsonl`),
+      [
+        '{"type":"title","title":"session"}',
+        `{"type":"message","message":{"content":"explore the repo"},"timestamp":"${new Date(item.created_at + 10).toISOString()}"}`,
+        `{"type":"message","message":{"content":[{"type":"tool_use","name":"bash","input":{"command":"ls"}},{"type":"text","text":"listing files"}]},"timestamp":"${new Date(item.created_at + 20).toISOString()}"}`,
+        `{"type":"message","message":{"content":"the fix touches src/a.ts"},"timestamp":"${new Date(item.created_at + 30).toISOString()}"}`,
+        "",
+      ].join("\n"),
+    );
+    // Deterministic clock advance: audit rows must land strictly after the
+    // transcript stamps above (the transcript is written while working; the
+    // failure comes later). Fake timers — no real wall-clock latency.
+    vi.advanceTimersByTime(1000);
+    await store.transitionWorkItem(item.id, "working", "blocked", {
+      evidence: "sandbox crashed",
+      by: "executor",
+    });
+    await store.appendAudit({
+      space_id: space.id,
+      actor: "executor",
+      event_type: "work_item.failed",
+      payload: JSON.stringify({ id: item.id, error: "sandbox crashed" }),
+    });
+    return { item, space };
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 describe("fork point resolution (issue #358)", () => {
@@ -184,10 +188,15 @@ describe("fork service (issue #358)", () => {
     const { item } = await seedFailedItem(store, transcriptDir);
     const first = await forkWorkItem({ ...store, transcriptDir }, { sourceId: item.id, afterKind: "failed", requester: "U2" });
     // Fail the first fork too, then fork again — attempt 3.
-    await store.claimWorkItemById(first.id);
-    await store.transitionWorkItem(first.id, "claimed", "working", { by: "executor" });
-    vi.advanceTimersByTime(1000);
-    await store.transitionWorkItem(first.id, "working", "blocked", { evidence: "again", by: "executor" });
+    vi.useFakeTimers();
+    try {
+      await store.claimWorkItemById(first.id);
+      await store.transitionWorkItem(first.id, "claimed", "working", { by: "executor" });
+      vi.advanceTimersByTime(1000);
+      await store.transitionWorkItem(first.id, "working", "blocked", { evidence: "again", by: "executor" });
+    } finally {
+      vi.useRealTimers();
+    }
     const second = await forkWorkItem({ ...store, transcriptDir }, { sourceId: first.id, afterKind: "failed", requester: "U3" });
     const preamble = await buildForkPreamble(store, transcriptDir, second);
     expect(preamble).toContain("attempt 3 of");
