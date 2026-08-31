@@ -13,6 +13,9 @@ search:
   formats:
     - html
     - json
+outgoing:
+  request_timeout: 12.0
+
 
 plugins: {}
 

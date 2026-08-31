@@ -173,6 +173,8 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     const search = asRecord(settings["search"]);
     expect(search["safe_search"]).toBe("1");
     expect(asStringArray(search["formats"])).toEqual(["html", "json"]);
+    const outgoing = asRecord(settings["outgoing"]);
+    expect(outgoing["request_timeout"]).toBe("12.0");
   });
 });
 
