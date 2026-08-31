@@ -667,6 +667,11 @@ describe("production docker sandbox boundary (#101/#338)", () => {
     const tmpfsIndex = runArgs.indexOf("--tmpfs");
     expect(tmpfsIndex).toBeGreaterThan(-1);
     expect(runArgs[tmpfsIndex + 1]).toBe("/tmp:rw,nosuid,nodev,noexec,size=64m");
+    // The job-scoped OMP agent config needs a writable noexec tmpfs because
+    // the container root is read-only and the SDK pins its model role at boot.
+    expect(runArgs).toContain("--tmpfs");
+    expect(runArgs.filter((arg) => arg === "--tmpfs")).toHaveLength(2);
+    expect(runArgs[runArgs.lastIndexOf("--tmpfs") + 1]).toBe("/app/data/omp-agent:rw,nosuid,nodev,noexec,size=16m");
     // The job container joins the internal sandbox network only, with the
     // iron-proxy sandbox IP as DNS — never egress, so no direct route out.
     expect(runArgs[runArgs.indexOf("--network") + 1]).toBe("bottega_sandbox");

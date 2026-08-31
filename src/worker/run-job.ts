@@ -678,6 +678,10 @@ function dockerRunArgs(request: SandboxRequest, opts: DockerLaunchOptions, rpcDi
     // privilege-escalation or execution surface; the size cap bounds disk use.
     "--tmpfs",
     "/tmp:rw,nosuid,nodev,noexec,size=64m",
+    // The SDK writes its per-job agent config/cache during boot. Keep that
+    // state ephemeral and bounded while leaving the image root immutable.
+    "--tmpfs",
+    "/app/data/omp-agent:rw,nosuid,nodev,noexec,size=16m",
   ];
   if (opts.dns !== undefined && opts.dns.length > 0) {
     for (const dns of opts.dns) args.push("--dns", dns);
