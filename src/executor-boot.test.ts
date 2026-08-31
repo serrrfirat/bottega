@@ -32,6 +32,7 @@ import { inProcessSandboxRunner } from "./worker/run-job-test-fabric";
 import type { McpBinding } from "./extensions/manifest";
 import { resetToolSurfaceCache } from "./extensions/surface";
 import { bootExecutorRuntime, prepareExecutor, type ExecutorDeps } from "./executor";
+import { createStore } from "./store/db";
 import { assertAgentDirModelAvailable } from "./server/drivers/agent-driver";
 
 const EXTENSIONS_DIR = resolve(import.meta.dir, "../config/extensions");
@@ -181,6 +182,29 @@ describe("executor boot wiring (issue #172 — caller-level, boot-wiring.test.ts
       const resolvedDriver = await deps.driver;
       expect(resolvedDriver.createSession).toEqual(expect.any(Function));
     } finally {
+      env.cleanup();
+    }
+  });
+
+  test("allows extension executor boot when no git PAT is configured", async () => {
+    const env = tempEnv();
+    const store = createStore(join(env.dir, "state.db"));
+    try {
+      rmSync(join(env.dir, "data", "secrets", "github-pat"));
+      store.setOrgSettings({ repos: [], git_base_url: "https://github.com" });
+      const deps = {
+        store,
+        sandboxRunner: inProcessSandboxRunner(),
+        memoryProvider: undefined as never,
+        driver: undefined as never,
+        orgConfigDir: join(env.dir, "config"),
+      } satisfies ExecutorDeps;
+
+      await expect(prepareExecutor(deps)).resolves.toMatchObject({
+        tokenFile: "data/secrets/github-pat",
+      });
+    } finally {
+      store.close();
       env.cleanup();
     }
   });

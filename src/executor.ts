@@ -302,7 +302,10 @@ export async function prepareExecutor(deps: ExecutorDeps): Promise<ExecutorConfi
   // becomes a visible job.unclaimed audit + nudge — a scheduled job
   // silently never posting is the worst failure mode of the worker design.
   await sweepUnclaimedJobs(deps, cfg);
-  writeAskpassScript(cfg);
+  // Git is the only job kind that needs the PAT/askpass boundary. Extension,
+  // scheduled, and KB jobs use their own credential or no credential and must
+  // be able to boot without an unrelated Git secret.
+  if (existsSync(cfg.tokenFile)) writeAskpassScript(cfg);
   return cfg;
 }
 
@@ -429,6 +432,12 @@ async function processJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJo
 
 /** Every durable job kind crosses the mandatory per-job sandbox boundary. */
 async function runJob(deps: ExecutorDeps, cfg: ExecutorConfig, job: WorkerJob): Promise<JobRunOutcome> {
+  if (job.kind === "git") {
+    if (!existsSync(cfg.tokenFile)) {
+      throw new Error(`git job requires a git token file: ${cfg.tokenFile}`);
+    }
+    writeAskpassScript(cfg);
+  }
   const runner = deps.sandboxRunner;
   if (runner === undefined) {
     throw new Error("sandbox runner unavailable: refusing in-process job execution");
@@ -591,19 +600,18 @@ export function resolveConfig(deps: ExecutorDeps): ExecutorConfig {
   const apiBaseUrl = (settings?.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
   const workspacesDir = settings?.workspacesDir ?? defaultWorkspaceRoot();
   const allowLoosePat = settings?.allowLoosePat ?? false;
-  const tokenFile = process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
-  if (!existsSync(tokenFile)) {
-    throw new Error(`git token file not found: ${tokenFile} (install the PAT there, mode 0600 — never env/image)`);
-  }
-  const tokenMode = statSync(tokenFile).mode & 0o777;
-  if (tokenMode !== 0o600) {
-    if (!allowLoosePat) {
-      throw new Error(
-        `git token file ${tokenFile} must be mode 0600 (found ${tokenMode.toString(8)}); ` +
-          "set org settings allow_loose_pat to override for local dev only",
-      );
+  const tokenFile = deps.gitTokenFile ?? process.env.EXECUTOR_GIT_TOKEN_FILE ?? "data/secrets/github-pat";
+  if (existsSync(tokenFile)) {
+    const tokenMode = statSync(tokenFile).mode & 0o777;
+    if (tokenMode !== 0o600) {
+      if (!allowLoosePat) {
+        throw new Error(
+          `git token file ${tokenFile} must be mode 0600 (found ${tokenMode.toString(8)}); ` +
+            "set org settings allow_loose_pat to override for local dev only",
+        );
+      }
+      console.log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — allow_loose_pat set, continuing`);
     }
-    console.log(`warning: ${tokenFile} mode is ${tokenMode.toString(8)} — allow_loose_pat set, continuing`);
   }
   return {
     repoAllowlist: repos,

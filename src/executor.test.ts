@@ -388,11 +388,17 @@ async function executeExtensionTool(tool: ToolDefinition, params: { city: string
 }
 
 /** Runs the executor loop and aborts it once the item settles. */
-async function runUntil(fx: Fixture, itemId: string, state: WorkItemState, deps: ExecutorDeps): Promise<WorkItem> {
+async function runUntil(
+  fx: Fixture,
+  itemId: string,
+  state: WorkItemState,
+  deps: ExecutorDeps,
+  timeoutMs = 10_000,
+): Promise<WorkItem> {
   const ac = new AbortController();
   const run = runExecutor(deps, ac.signal);
   try {
-    return await waitForState(fx.store, itemId, state);
+    return await waitForState(fx.store, itemId, state, timeoutMs);
   } finally {
     ac.abort();
     await run;
@@ -523,8 +529,85 @@ describe("claim loop", () => {
       expect(session.opts.transcriptDir).toBe(fx.transcriptsDir);
       expect(session.opts.allowTools).toEqual([...EXECUTOR_TOOLS]);
       expect(session.prompts[0]).toContain(item.description);
+
       // Success cleanup: the workspace is removed, the transcript stays.
       expect(existsSync(join(fx.workspacesDir, item.id))).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+  test("runs extension delivery without a git PAT", async () => {
+    const fx = makeFixture();
+    try {
+      fx.driver.messageText = '{"url":"https://linear.example/issue/OPS-44","summary":"Created the report"}';
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "create the operations report",
+        delivery: "extension",
+      });
+
+      const done = await runUntil(
+        fx,
+        item.id,
+        "done",
+        makeDeps(fx, {
+          gitTokenFile: join(fx.dir, "secrets", "missing-github-pat"),
+          getExtensionWorkerToolset: () => makeExtensionToolset(fx),
+          extensionSessionTimeoutMs: 1_000,
+        }),
+        2_000,
+      );
+      expect(JSON.parse(done.result!)).toEqual({
+        url: "https://linear.example/issue/OPS-44",
+        summary: "Created the report",
+      });
+      await waitForJobStatus(fx.store, item.id, "completed");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("fails a git job without a PAT before invoking the sandbox", async () => {
+    const fx = makeFixture();
+    try {
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C1" });
+      const item = await fx.store.createWorkItem({
+        space_id: space.id,
+        requester: "U1",
+        description: "update the repository",
+        repo: "acme/sandbox",
+        delivery: "git",
+      });
+      let sandboxRuns = 0;
+      const deps = makeDeps(fx, {
+        gitTokenFile: join(fx.dir, "secrets", "missing-github-pat"),
+        maxJobAttempts: 1,
+        pollIntervalMs: 1,
+        sandboxRunner: async () => {
+          sandboxRuns += 1;
+          throw new Error("sandbox must not run");
+        },
+      });
+      const ac = new AbortController();
+      const run = runExecutor(deps, ac.signal);
+      try {
+        await waitForJobStatus(fx.store, item.id, "failed", 2_000);
+      } finally {
+        ac.abort();
+        await run;
+      }
+
+      expect(sandboxRuns).toBe(0);
+      const failures = await fx.store.listAudit({ event_type: JOB_FAILED_EVENT });
+      expect(failures.map((row) => JSON.parse(row.payload))).toContainEqual(
+        expect.objectContaining({
+          id: item.id,
+          kind: "git",
+          error: expect.stringContaining("git job requires a git token file"),
+        }),
+      );
     } finally {
       fx.cleanup();
     }

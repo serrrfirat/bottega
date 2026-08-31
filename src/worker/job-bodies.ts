@@ -131,7 +131,8 @@ export interface ExecutorDeps {
    * #158) — so it may be async. Consumers await it.
    */
   driver: AgentDriver | Promise<AgentDriver>;
-  /** Directory holding org.yml (repos + git base). Default "config". */
+  /** Optional git PAT path. Extension, scheduled, and KB jobs do not require it. */
+  gitTokenFile?: string;
   orgConfigDir?: string;
   /** Claim-loop poll interval. Default 2000 ms. */
   pollIntervalMs?: number;
