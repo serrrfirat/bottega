@@ -50,6 +50,9 @@ import {
 import { WORKSPACE_MARKER_FILE } from "./worker/workspace-lifecycle";
 import { resolveDeliveryAction } from "./server/adapters/delivery-router";
 import { pollPendingDeliveries } from "./server/services/delivery-poller";
+import { buildRegistry } from "./scheduler/actions";
+import { recurringWorkAction } from "./scheduler/recurring-work";
+import { tickScheduler } from "./scheduler/runner";
 import { postPendingOutboxRows } from "./server/services/outbox-post-seam";
 import {
   DELIVERY_APPROVE_ACTION_ID,
@@ -1964,6 +1967,63 @@ describe("worker job envelope (epic #170)", () => {
       expect((await fx.store.getWorkItem(item.id))?.state).toBe("blocked");
       expect((await fx.store.getJob(item.id))?.attempts).toBe(1);
     } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("a recurring-work fire reaches the executor and posts its digest through the outbox (#392)", async () => {
+    const fx = makeFixture();
+    const ac = new AbortController();
+    const executor = runExecutor(makeExtensionDeps(fx), ac.signal);
+    try {
+      fx.driver.messageText = 'Digest ready.\n{"url":"","summary":"Daily digest posted"}';
+      const audit = createAudit(fx.store);
+      const space = await fx.store.getOrCreateSpace({ platform: "slack", channel_id: "C392" });
+      const fireTime = Date.UTC(2026, 7, 31, 9, 0);
+      const schedulerJob = await fx.store.createSchedulerJob({
+        action: "recurring_work",
+        cron: "* * * * *",
+        params: { description: "Compose the daily digest" },
+        spaceId: space.id,
+        createdBy: "U_SCHEDULER",
+      });
+      await fx.store.updateSchedulerNextFire(schedulerJob.id, fireTime);
+
+      // The scheduler and executor are separate processes in production. The
+      // shared store is the only hand-off: fire creates the item and its
+      // extension job, then the running executor claims that job.
+      await tickScheduler({
+        store: fx.store,
+        audit,
+        registry: buildRegistry([recurringWorkAction]),
+        memoryProvider: resolveMemoryProvider(fx.store.getOrgSettings(), fx.store.getDb()),
+        postMessage: async () => undefined,
+        loadPolicy: async () => defaultPolicy(),
+        log: () => {},
+        now: () => fireTime,
+      });
+
+      const created = await audit.listAudit({ event_type: "work_item.created" });
+      expect(created).toHaveLength(1);
+      // SAFETY: the created audit payload is written by createWorkItem with
+      // an id string, and the preceding length assertion proves the row exists.
+      const itemId = JSON.parse(created[0]!.payload).id as string;
+      await waitForState(fx.store, itemId, "done");
+      await waitForJobStatus(fx.store, itemId, "completed");
+
+      const posts: Array<{ spaceId: string; text: string }> = [];
+      const pass = await postPendingOutboxRows(fx.store, {
+        postMessage: async (spaceId, text) => {
+          posts.push({ spaceId, text });
+          return "1.000392";
+        },
+      });
+      expect(pass.posted).toBe(1);
+      expect(posts).toEqual([{ spaceId: space.id, text: "Done: Daily digest posted" }]);
+      expect((await fx.store.getSchedulerJob(schedulerJob.id))?.lastResult).toBe("ok");
+    } finally {
+      ac.abort();
+      await executor;
       fx.cleanup();
     }
   });

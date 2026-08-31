@@ -723,6 +723,7 @@ function assertLegalTransition(
   from: WorkItemState,
   to: WorkItemState,
   delivery: WorkItemDelivery,
+  requester: string,
   opts?: TransitionOpts,
 ): void {
   // Extension pickup (#128) and an in-channel chat answer (#202) authorize
@@ -733,7 +734,7 @@ function assertLegalTransition(
   if (!ALLOWED_TRANSITIONS[from].includes(to) && !isDirectNonGitCompletion) {
     throw new Error(`illegal work item transition ${from} -> ${to}`);
   }
-  if (to === "done") assertDoneResult(delivery, opts?.result);
+  if (to === "done") assertDoneResult(delivery, requester, opts?.result);
   if (to === "blocked" && !opts?.evidence?.trim()) {
     throw new Error("work item cannot transition to blocked without evidence");
   }
@@ -752,9 +753,8 @@ const DONE_RESULT_SCHEMA = z.object({
   url: z.string().optional(),
   summary: z.string().optional(),
 });
-
 /** Fails closed unless result JSON satisfies the selected delivery contract (issue #128). */
-function assertDoneResult(delivery: WorkItemDelivery, result: string | undefined): void {
+function assertDoneResult(delivery: WorkItemDelivery, requester: string, result: string | undefined): void {
   let record: z.infer<typeof DONE_RESULT_SCHEMA> = {};
   try {
     record = DONE_RESULT_SCHEMA.parse(result ? JSON.parse(result) : null);
@@ -765,7 +765,10 @@ function assertDoneResult(delivery: WorkItemDelivery, result: string | undefined
   if (delivery === "git" && !isNonEmptyString(record.pr_url)) {
     throw new Error("git work item cannot transition to done without result.pr_url");
   }
-  if (delivery === "extension" && !isNonEmptyString(record.url)) {
+  // A recurring scheduler digest is an extension worker task whose deliverable
+  // is the summary posted through the outbox; it has no external object URL.
+  // User-requested extension work still requires its external URL.
+  if (delivery === "extension" && requester !== "scheduler" && !isNonEmptyString(record.url)) {
     throw new Error("extension work item cannot transition to done without result.url");
   }
   if (!isNonEmptyString(record.summary)) {
@@ -1119,7 +1122,10 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // have no worker (the space agent handles them in-session) and never
     // enqueue.
     if (delivery === "git" || delivery === "extension") {
-      enqueueJob({ id, kind: delivery, payload: { workItemId: id }, spaceId: input.space_id });
+      // Await the durable queue write. Returning before this promise settles
+      // lets scheduler fires report success while the work item has no job for
+      // an executor to claim.
+      await enqueueJob({ id, kind: delivery, payload: { workItemId: id }, spaceId: input.space_id });
     }
     return item;
   }
@@ -1354,7 +1360,7 @@ export function createStore(dbPath: string = DEFAULT_DB_PATH): Store {
     // SAFETY: get() yields undefined when the id is absent; the not-found branch throws before any use.
     const current = getWorkItemStmt.get(id) as WorkItem | null;
     if (!current) throw new Error(`work item not found: ${id}`);
-    assertLegalTransition(from, to, current.delivery, opts);
+    assertLegalTransition(from, to, current.delivery, current.requester, opts);
     const t = Date.now();
     const appendJson = (column: string): string => `json_set(${column}, '$[#]', json(?))`;
     const sets: string[] = ["state = ?", "updated_at = ?"];

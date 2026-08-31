@@ -190,6 +190,31 @@ describe("recurringWorkAction", () => {
       },
     ]);
   });
+  test("surfaces worker enqueue failure instead of reporting a successful fire", async () => {
+    const store = freshStore();
+    const audit = createAudit(store);
+    const space = await store.getOrCreateSpace({ platform: "slack", channel_id: "C_ENQUEUE_FAILURE" });
+    // Simulate the queue being unavailable after the work-item row is written.
+    // Before the enqueue was awaited, createWorkItem resolved successfully and
+    // left an open item with no executor-visible job.
+    store.getDb().exec("DROP TABLE worker_jobs");
+
+    await recurringWorkAction.run(
+      { space: space.id, description: "Compose the daily digest" },
+      context(store, audit),
+    );
+    const errors = await audit.listAudit({ event_type: SCHEDULER_ERROR_EVENT });
+
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.actor).toBe("scheduler:recurring_work");
+    expect(errors[0]?.event_type).toBe(SCHEDULER_ERROR_EVENT);
+    expect(JSON.parse(errors[0]!.payload)).toEqual({
+      action: "recurring_work",
+      error: expect.stringContaining("failed to create recurring work item"),
+    });
+  });
+
 
   test("creates one item per manual fire; scheduler skip policy prevents accidental replay", async () => {
     const store = freshStore();
