@@ -33,7 +33,7 @@ const extensionSurfacesSchema = z
   .optional();
 
 export const SANDBOX_PROTOCOL_VERSION = 1 as const;
-export const MAX_SANDBOX_REQUEST_BYTES = 64 * 1024;
+export const MAX_SANDBOX_REQUEST_BYTES = 256 * 1024;
 export const MAX_SANDBOX_RESPONSE_BYTES = 16 * 1024;
 
 const workerJobSchema = z
