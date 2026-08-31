@@ -65,7 +65,7 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
   });
 
   test("long-running services restart on failure", () => {
-    for (const name of ["iron-proxy", "auth-broker", "auth-gateway", "mem0", "server", "executor"]) {
+    for (const name of ["iron-proxy", "auth-broker", "auth-gateway", "mem0", "searxng", "server", "executor"]) {
       expect(service(name)["restart"]).toBe("on-failure");
     }
   });
@@ -108,6 +108,68 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     const volumes = asStringArray(executor["volumes"]);
     expect(volumes).not.toContain("./config/omp:/app/data/omp-agent");
     expect(volumes).toContain("./certs:/etc/iron-proxy/certs:ro");
+  });
+
+  test("searxng uses the pinned internal image and fixed egress topology", () => {
+    const searxng = service("searxng");
+    expect(searxng["image"]).toBe(
+      "searxng/searxng:2026.8.29-d226b78bc@sha256:b36af7984b87191b595bc5301418ed6432c047668a4547ab531a7439b816fac3",
+    );
+    expect(searxng["ports"]).toBeUndefined();
+    const networks = asRecord(searxng["networks"]);
+    expect(Object.keys(networks)).toEqual(["egress"]);
+    expect(asRecord(networks["egress"])["ipv4_address"]).toBe("172.30.0.6");
+    expect(asStringArray(searxng["dns"])).toEqual(["172.30.0.2"]);
+  });
+
+  test("searxng routes outbound requests through the iron-proxy tunnel", () => {
+    const env = serviceEnv("searxng");
+    expect(env["HTTP_PROXY"]).toBe("http://iron-proxy:8080");
+    expect(env["HTTPS_PROXY"]).toBe("http://iron-proxy:8080");
+    expect(env["REQUESTS_CA_BUNDLE"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/iron-proxy/certs/ca.crt");
+    const volumes = asStringArray(service("searxng")["volumes"]);
+    expect(volumes).toContain("./config/searxng/settings.yml:/etc/searxng/settings.yml:ro");
+    expect(volumes).toContain("./certs:/etc/iron-proxy/certs:ro");
+  });
+
+  test("searxng has a local-only healthcheck and hardened filesystem", () => {
+    const searxng = service("searxng");
+    expect(searxng["read_only"]).toBe("true");
+    expect(searxng["pids_limit"]).toBe("256");
+    expect(searxng["mem_limit"]).toBe("512m");
+    expect(asStringArray(searxng["cap_drop"])).toEqual(["ALL"]);
+    expect(asStringArray(searxng["security_opt"])).toEqual(["no-new-privileges:true"]);
+    expect(asStringArray(searxng["tmpfs"])).toEqual([
+      "/tmp:rw,noexec,nosuid,size=64m",
+      "/var/cache/searxng:rw,noexec,nosuid,size=64m",
+    ]);
+    const healthcheck = asRecord(searxng["healthcheck"]);
+    expect(asStringArray(healthcheck["test"])).toEqual([
+      "CMD",
+      "wget",
+      "--spider",
+      "--timeout=2",
+      "http://127.0.0.1:8080/",
+    ]);
+  });
+
+  test("server waits for healthy searxng and bypasses its internal name", () => {
+    const dependsOn = asRecord(service("server")["depends_on"]);
+    expect(asRecord(dependsOn["searxng"])["condition"]).toBe("service_healthy");
+    expect((serviceEnv("server")["NO_PROXY"] as string).split(",")).toContain("searxng");
+  });
+
+  test("committed SearXNG settings keep only reviewed JSON web search engines", () => {
+    const settings = parseYamlSubset(readRoot("config/searxng/settings.yml"));
+    const useDefaults = asRecord(settings["use_default_settings"]);
+    const engines = asRecord(useDefaults["engines"]);
+    expect(asStringArray(engines["keep_only"])).toEqual(["duckduckgo", "brave"]);
+    expect(asRecord(settings["general"])["debug"]).toBe("false");
+    expect(asRecord(settings["general"])["instance_name"]).toBe("bottega-search");
+    const search = asRecord(settings["search"]);
+    expect(search["safe_search"]).toBe("1");
+    expect(asStringArray(search["formats"])).toEqual(["html", "json"]);
   });
 });
 

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { service, serviceEnv } from "../compose-test-utils";
-import type { YamlNode } from "../yaml-subset";
+import { parseYamlSubset, type YamlNode } from "../yaml-subset";
 
 describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("auth-broker runs the packaged OMP CLI on the internal network with a token bootstrap", () => {
@@ -113,6 +113,15 @@ describe("docker-compose.yml (issue #9 credential boundary)", () => {
     // SAFETY: hand-authored fixture renders `volumes` as a block sequence of scalars.
     const executorVolumes = service("executor")["volumes"] as string[];
     expect(executorVolumes).not.toContain("./config/omp:/app/data/omp-agent");
+  });
+
+  test("searxng receives a required deployment secret and keeps the committed sentinel", () => {
+    expect(serviceEnv("searxng")["SEARXNG_SECRET"]).toBe("${SEARXNG_SECRET:?SEARXNG_SECRET must be set}");
+    const settings = parseYamlSubset(
+      readFileSync(resolve(import.meta.dir, "../../config/searxng/settings.yml"), "utf8"),
+    );
+    const server = settings["server"] as Record<string, YamlNode>;
+    expect(server["secret_key"]).toBe("ultrasecretkey");
   });
 
   test("broker bootstrap generates the 0600 token once and execs packaged omp without exporting it", async () => {

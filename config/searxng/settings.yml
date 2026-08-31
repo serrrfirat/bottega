@@ -1,0 +1,22 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - duckduckgo
+      - brave
+
+general:
+  debug: false
+  instance_name: bottega-search
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "ultrasecretkey"
+  limiter: false
+  image_proxy: false

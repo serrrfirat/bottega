@@ -15,6 +15,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       "iron-proxy",
       "mem0",
       "server",
+      "searxng",
     ]) {
       expect(names).toContain(name);
     }
@@ -116,7 +117,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
     }
   });
 
-  test("NO_PROXY covers internal names (localhost, loopback, data, auth services, mem0)", () => {
+  test("NO_PROXY covers internal names (localhost, loopback, data, auth services, mem0, searxng)", () => {
     // auth-broker/auth-gateway joined in issue #9: broker-mode traffic is
     // internal and must bypass the proxy (the allowlist would 403 it).
     // mem0 joined in issue #43: the memory backend is internal too, so the
@@ -134,6 +135,7 @@ describe("docker-compose.yml (issue #8 egress topology)", () => {
       "auth-gateway",
       "mem0",
       "iron-proxy",
+      "searxng",
     ]);
     // SAFETY: the fixture declares NO_PROXY as a comma-joined string on the executor.
     const executorNoProxy = serviceEnv("executor")["NO_PROXY"] as string;

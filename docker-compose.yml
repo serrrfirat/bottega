@@ -197,6 +197,55 @@ services:
       # proxy allowlist); the server keeps reaching it on egress.
       - sandbox
 
+  searxng:
+    # Internal web search backend (issue #388). The digest pins the reviewed
+    # SearXNG build; no host port is published.
+    image: searxng/searxng:2026.8.29-d226b78bc@sha256:b36af7984b87191b595bc5301418ed6432c047668a4547ab531a7439b816fac3
+    restart: on-failure
+    depends_on:
+      iron-proxy:
+        condition: service_started
+    dns:
+      - 172.30.0.2
+    environment:
+      HTTP_PROXY: http://iron-proxy:8080
+      HTTPS_PROXY: http://iron-proxy:8080
+      NO_PROXY: localhost,127.0.0.1,iron-proxy,searxng
+      REQUESTS_CA_BUNDLE: /etc/iron-proxy/certs/ca.crt
+      SSL_CERT_FILE: /etc/iron-proxy/certs/ca.crt
+      # The official image replaces the committed ultrasecretkey sentinel
+      # from settings.yml with this deployment-only value.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET must be set}
+    volumes:
+      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./certs:/etc/iron-proxy/certs:ro
+    read_only: true
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /var/cache/searxng:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --spider
+        - --timeout=2
+        - http://127.0.0.1:8080/
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      egress:
+        ipv4_address: 172.30.0.6
+
+
   server:
     # App image built from the repo root (Dockerfile): the server and the
     # executor share it and differ only in entrypoint. BOTTEGA_IMAGE_TAG
@@ -212,6 +261,8 @@ services:
     depends_on:
       iron-proxy:
         condition: service_started
+      searxng:
+        condition: service_healthy
       auth-broker:
         condition: service_healthy
       extensions-config-init:
@@ -232,7 +283,7 @@ services:
       # (the allowlist would 403 them). iron-proxy too (#361): Bun.fetch
       # proxies the management reload (POST :9092/v1/reload) through the
       # tunnel listener, where the allowlist rejects it with a bare 403.
-      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,iron-proxy
+      NO_PROXY: localhost,127.0.0.1,data,auth-broker,auth-gateway,mem0,iron-proxy,searxng
       # Credential boundary (issue #123): the extension runtime reloads the
       # proxy (POST /v1/reload) after writing each secret file, so rotation
       # applies immediately. Both the URL and the token must be set — the
