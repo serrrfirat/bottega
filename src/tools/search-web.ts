@@ -41,11 +41,12 @@ const providerSearchResponseSchema = z.object({
   results: z.array(providerResultSchema),
 });
 
+export type SearchFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 export interface SearchWebToolOpts {
   /** SearXNG's base URL; hermetic tests point this at a local stub endpoint. */
   baseUrl?: string;
   /** Outbound fetch seam; defaults to global fetch. */
-  fetch?: typeof fetch;
+  fetch?: SearchFetch;
 }
 
 /** The SearXNG base URL for a given opts set. */

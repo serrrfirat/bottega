@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { service, serviceEnv } from "../compose-test-utils";
-import { parseYamlSubset, type YamlNode } from "../yaml-subset";
+import { type YamlNode } from "../yaml-subset";
 
 describe("docker-compose.yml (issue #9 credential boundary)", () => {
   test("auth-broker runs the packaged OMP CLI on the internal network with a token bootstrap", () => {

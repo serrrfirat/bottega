@@ -286,8 +286,7 @@ describe("headless tool families (issue #363)", () => {
     } finally { await h.cleanup(); }
   });
 
-  test("search_web fails closed without a seeded provider key", async () => {
-    const emptyDir = mkdtempSync(join(tmpdir(), "headless-secrets-"));
+  test("search_web fails closed when the SearXNG service is unavailable", async () => {
     const turns: StubTurn[] = [
       { type: "tool_calls", calls: [{ name: "search_web", args: { query: "bottega" } }] },
       { type: "text", text: "search unavailable" },
@@ -296,15 +295,20 @@ describe("headless tool families (issue #363)", () => {
       headless: true,
       orgConfigYaml: ORG_YAML,
       modelTurns: turns,
-      gatedTools: () => [searchWebToolDefinition({ secretsDir: emptyDir })],
+      gatedTools: () => [
+        searchWebToolDefinition({
+          fetch: async () => {
+            throw new Error("SearXNG unavailable");
+          },
+        }),
+      ],
     });
     try {
       await h.deliverMessage(h.slack.dmChannelId, "search the web please");
       await h.modelStub.waitForRequests(2);
-      expect(lastToolText(h)).toMatch(/key|secret|configur|not/i);
+      expect(lastToolText(h)).toMatch(/unreachable|connect|unavailable|failed/i);
     } finally {
       await h.cleanup();
-      rmSync(emptyDir, { recursive: true, force: true });
     }
   });
 

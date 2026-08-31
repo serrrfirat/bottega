@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "bun:test";
 import { type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Server } from "bun";
-import { searchWebArgsSchema, searchWebToolDefinition } from "./search-web";
+import { searchWebArgsSchema, searchWebToolDefinition, type SearchFetch } from "./search-web";
 
 const NONE_CTX = {} as ExtensionContext;
 
@@ -219,7 +219,7 @@ describe("search_web SearXNG client", () => {
     vi.useFakeTimers();
     const h = stubSearchProvider(() => new Promise<Response>(() => {}));
     const controller = new AbortController();
-    const pendingFetch: typeof fetch = async (input, init) => {
+    const pendingFetch: SearchFetch = async (input, init) => {
       void fetch(input, init).catch(() => {});
       await new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });

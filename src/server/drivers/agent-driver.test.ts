@@ -36,7 +36,7 @@ import {
   spaceAgentToolNames,
   withPolicyGate,
 } from "./agent-driver";
-import { searchWebToolDefinition } from "../../tools/search-web";
+import { searchWebToolDefinition, type SearchFetch } from "../../tools/search-web";
 import type { SearchResultRow } from "../services/slack-turn-presenter";
 
 /**
@@ -2325,7 +2325,7 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
 describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
   function searchToolHarness(opts: {
     sink?: (spaceId: string, results: readonly SearchResultRow[]) => void;
-    fetch?: typeof fetch;
+    fetch?: SearchFetch;
   } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "search-dispatch-"));
     const store = createStore(join(dir, "test.db"));
