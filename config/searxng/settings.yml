@@ -14,6 +14,10 @@ search:
     - html
     - json
 
+plugins:
+  searx.plugins.tracker_url_remover.SXNGPlugin:
+    active: false
+
 server:
   bind_address: "0.0.0.0"
   secret_key: "__SEARXNG_SECRET__"

@@ -170,6 +170,10 @@ describe("docker-compose.yml deploy wiring (issue #12)", () => {
     const search = asRecord(settings["search"]);
     expect(search["safe_search"]).toBe("1");
     expect(asStringArray(search["formats"])).toEqual(["html", "json"]);
+    const plugins = asRecord(settings["plugins"]);
+    expect(
+      asRecord(plugins["searx.plugins.tracker_url_remover.SXNGPlugin"])["active"],
+    ).toBe("false");
   });
 });
 
