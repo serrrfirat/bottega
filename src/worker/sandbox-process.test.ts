@@ -17,7 +17,7 @@ import {
   runJobInSandbox,
   type SandboxRunnerContext,
 } from "./run-job";
-import { JOB_FAILED_EVENT } from "../store/audit-events";
+import { JOB_FAILED_EVENT, USAGE_TURN_EVENT } from "../store/audit-events";
 import { memoryDenyProvider, MAX_RPC_FRAME_BYTES, connectStoreRpc, JobStoreRpcServer } from "./store-rpc";
 import { resolveMemoryProvider, type ResolvedMemoryProvider } from "../server/memory-provider";
 
@@ -1131,6 +1131,14 @@ describe("job-scoped store RPC boundary (#101/#338)", () => {
       ).resolves.toBeGreaterThan(0);
       await expect(
         gitSession.store.appendAudit({ space_id: "slack:C1", actor: "executor", event_type: "work_item.delivery_pending", payload: "{}" }),
+      ).resolves.toBeGreaterThan(0);
+      await expect(
+        gitSession.store.appendAudit({
+          space_id: "slack:C1",
+          actor: "agent",
+          event_type: USAGE_TURN_EVENT,
+          payload: JSON.stringify({ model: "near/model", tokensIn: 1, tokensOut: 1 }),
+        }),
       ).resolves.toBeGreaterThan(0);
       // Forged actor (not executor) on a git event denies.
       await expect(

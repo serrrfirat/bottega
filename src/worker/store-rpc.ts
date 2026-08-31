@@ -70,6 +70,7 @@ import {
   JOB_COMPLETED_EVENT,
   JOB_FAILED_EVENT,
   MEMORY_WRITE_EVENT,
+  USAGE_TURN_EVENT,
   WORK_ITEM_FAILED_EVENT,
   WORK_ITEM_PIN_APPLIED_EVENT,
 } from "../store/audit-events";
@@ -228,12 +229,14 @@ const AUDIT_POLICY = {
     { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
     { eventType: DELIVERY_PENDING_EVENT, actors: ["executor"], space: "own" },
     { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: USAGE_TURN_EVENT, actors: ["agent"], space: "own" },
   ],
   extension: [
     ...JOB_LIFECYCLE_RULES,
     { eventType: WORK_ITEM_FAILED_EVENT, actors: ["executor"], space: "own" },
     { eventType: DELIVERY_COMPLETED_EVENT, actors: ["executor"], space: "own" },
     { eventType: WORK_ITEM_PIN_APPLIED_EVENT, actors: ["executor"], space: "own" },
+    { eventType: USAGE_TURN_EVENT, actors: ["agent"], space: "own" },
   ],
   kb: [
     ...JOB_LIFECYCLE_RULES,
@@ -242,7 +245,7 @@ const AUDIT_POLICY = {
     { eventType: MEMORY_WRITE_EVENT, actors: ["kb_ingest"], space: "null" },
   ],
   ingest_poll: [...JOB_LIFECYCLE_RULES],
-  scheduled: [...JOB_LIFECYCLE_RULES],
+  scheduled: [...JOB_LIFECYCLE_RULES, { eventType: USAGE_TURN_EVENT, actors: ["agent"], space: "own" }],
 } satisfies Record<WorkerJob["kind"], readonly AuditPolicyRule[]>;
 
 /** The audit policy rule matching an event/actor, or null when not legitimately writable by this kind. */
