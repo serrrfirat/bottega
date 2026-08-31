@@ -1,35 +1,9 @@
-/**
- * search_web tests (issue #278): the read-tier cited-search tool. Hermetic:
- * the search provider is a LOCAL double served on a temp-dir-backed HTTP
- * stub (Bun.serve), and the boot-seeded provider key is a stub secret file
- * written into a temp proxy-secrets dir — no real network, no live key.
- * The tool fails closed when no key is seeded (never a fabricated result
- * set) and posts the structured result shape the agent renders as a table.
- */
 import { describe, expect, test } from "bun:test";
-import { z, type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { type AgentToolResult, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Server } from "bun";
-import { searchWebArgsSchema, searchWebToolDefinition, SEARCH_PROVIDER, searchKeySeeded } from "./search-web";
+import { searchWebArgsSchema, searchWebToolDefinition } from "./search-web";
 
-const SearchRequestSchema = z.object({
-  query: z.string(),
-  max_results: z.number(),
-});
-type SearchRequest = z.infer<typeof SearchRequestSchema>;
-
-const SearchToolResponseSchema = z.object({
-  query: z.string(),
-  count: z.number(),
-  results: z.array(z.object({
-    title: z.string(),
-    url: z.string(),
-    snippet: z.string(),
-  })),
-});
-type SearchToolResponse = z.infer<typeof SearchToolResponseSchema>;
+const NONE_CTX = {} as ExtensionContext;
 
 function resultText(result: AgentToolResult): string {
   const content = result.content[0];
@@ -38,92 +12,50 @@ function resultText(result: AgentToolResult): string {
 }
 
 interface SearchStubHarness {
-  dir: string;
   server: Server<undefined>;
   baseUrl: string;
-  requests: Array<{ path: string; auth: string | null; body: SearchRequest | null }>;
+  requests: URL[];
   cleanup: () => void;
 }
 
-/** Spins up a local double of the search provider + a temp secrets dir. */
-function stubSearchProvider(): SearchStubHarness {
-  const dir = mkdtempSync(join(tmpdir(), "bottega-search-web-"));
-  const requests: SearchStubHarness["requests"] = [];
+function stubSearchProvider(responder: (request: Request) => Response | Promise<Response>): SearchStubHarness {
+  const requests: URL[] = [];
   const server = Bun.serve({
     port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      const parsedBody = SearchRequestSchema.safeParse(await req.json().catch(() => null));
-      const body = parsedBody.success ? parsedBody.data : null;
-      requests.push({
-        path: url.pathname,
-        auth: req.headers.get("authorization"),
-        body,
-      });
-      if (url.pathname !== "/search") {
-        return Response.json({ error: "not found" }, { status: 404 });
-      }
-      // A generic search JSON shape the tool accepts (title/url/snippet or
-      // title/url/content), independent of the live provider.
-      return Response.json({
-        results: [
-          {
-            title: "Bottega — the agent harness",
-            url: "https://example.com/bottega",
-            content: "Bottega is the Oh My Pi coding harness.",
-          },
-          {
-            title: "Proxy seam docs",
-            url: "https://example.com/proxy-seam",
-            snippet: "Static provider secrets ride the proxy key seam.",
-          },
-          { title: "Third result", url: "https://example.com/third", content: "A third sited claim." },
-        ],
-      });
+    async fetch(request) {
+      const url = new URL(request.url);
+      requests.push(url);
+      if (url.pathname !== "/search") return Response.json({ error: "not found" }, { status: 404 });
+      return responder(request);
     },
   });
   return {
-    dir,
     server,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
-    cleanup: () => {
-      server.stop(true);
-      rmSync(dir, { recursive: true, force: true });
-    },
+    cleanup: () => server.stop(true),
   };
 }
 
-/** Writes the boot-seeded provider key file into the temp secrets dir. */
-function seedKey(dir: string): void {
-  mkdirSync(join(dir, "secrets"), { recursive: true });
-  writeFileSync(join(dir, "secrets", `${SEARCH_PROVIDER}.secret`), "tvly-stub-key", { mode: 0o600 });
+function jsonProvider(body: unknown, status = 200): SearchStubHarness {
+  return stubSearchProvider(() => Response.json(body, { status }));
 }
 
 function toolHarness(h: SearchStubHarness) {
-  return searchWebToolDefinition({
-    baseUrl: h.baseUrl,
-    secretsDir: join(h.dir, "secrets"),
-  });
+  return searchWebToolDefinition({ baseUrl: h.baseUrl });
 }
 
-// SAFETY: search_web is stateless and never reads ExtensionContext; the empty fixture cannot hide an accessed dependency.
-const NONE_CTX = {} as ExtensionContext;
-
 describe("search_web registration", () => {
-  test("registers as a read-tier tool named search_web (NOT the reserved web_search)", () => {
-    const h = stubSearchProvider();
-    try {
-      seedKey(h.dir);
-      const tool = toolHarness(h);
-      expect(tool.name).toBe("search_web");
-      expect(tool.approval).toBe("read");
-      expect(tool.label.length).toBeGreaterThan(0);
-      expect(tool.description).toContain("source");
-      expect(tool.description).toContain("each claim");
-    } finally {
-      h.cleanup();
-    }
+  test("registers as a read-tier tool with search-selection guidance", () => {
+    const tool = searchWebToolDefinition({ fetch: async () => new Response() });
+    expect(tool.name).toBe("search_web");
+    expect(tool.approval).toBe("read");
+    expect(tool.description).toContain("current");
+    expect(tool.description).toContain("external");
+    expect(tool.description).toContain("research");
+    expect(tool.description).toContain("news");
+    expect(tool.description).toContain("comparison");
+    expect(tool.description).toContain("repository-local");
   });
 
   test("the args schema accepts a query and an optional capped max_results", () => {
@@ -135,97 +67,148 @@ describe("search_web registration", () => {
   });
 });
 
-describe("search_web execution (hermetic, local double)", () => {
-  test("returns structured cited results through the real tool path from a stubbed provider", async () => {
-    const h = stubSearchProvider();
-    try {
-      seedKey(h.dir);
-      const tool = toolHarness(h);
-      const res = await tool.execute("tc1", { query: "bottega", max_results: 5 }, undefined, undefined, NONE_CTX);
-      expect(res.isError).toBeFalsy();
-      const parsed: SearchToolResponse = SearchToolResponseSchema.parse(JSON.parse(resultText(res)));
-      expect(parsed.query).toBe("bottega");
-      expect(parsed.count).toBe(3);
-      expect(parsed.results).toHaveLength(3);
-      // Every row carries its source URL — the shape the agent renders as a table.
-      for (const row of parsed.results) {
-        expect(row.title.length).toBeGreaterThan(0);
-        expect(row.url).toMatch(/^https:\/\//);
-        expect(row.snippet.length).toBeGreaterThan(0);
-      }
-      // The wire request reached the provider double and carried the proxy
-      // placeholder bearer (the proxy swaps the real key at egress).
-      expect(h.requests).toHaveLength(1);
-      expect(h.requests[0].path).toBe("/search");
-      expect(h.requests[0].auth).toBe("Bearer bottega-proxy-placeholder");
-      expect(h.requests[0].body?.query).toBe("bottega");
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("capes results to max_results", async () => {
-    const h = stubSearchProvider();
-    try {
-      seedKey(h.dir);
-      const tool = toolHarness(h);
-      const res = await tool.execute("tc1", { query: "bottega", max_results: 2 }, undefined, undefined, NONE_CTX);
-      expect(res.isError).toBeFalsy();
-      const parsed = SearchToolResponseSchema.parse(JSON.parse(resultText(res)));
-      expect(parsed.count).toBe(2);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("a missing/unseeded key FAILS CLOSED: a clear unavailable error, never a result set", async () => {
-    const h = stubSearchProvider();
-    try {
-      // NOTE: do not seedKey — the secrets dir stays empty.
-      const tool = toolHarness(h);
-      const res = await tool.execute("tc1", { query: "bottega" }, undefined, undefined, NONE_CTX);
-      expect(res.isError).toBe(true);
-      expect(resultText(res)).toMatch(/unavailable/);
-      expect(resultText(res)).toContain("tavily");
-      // Fail closed: NO network call happened.
-      expect(h.requests).toHaveLength(0);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("searchKeySeeded reflects the boundary file presence", () => {
-    const dir = mkdtempSync(join(tmpdir(), "bottega-search-seeded-"));
-    try {
-      expect(searchKeySeeded(dir)).toBe(false);
-      mkdirSync(join(dir, "secrets"), { recursive: true });
-      expect(searchKeySeeded(join(dir, "secrets"))).toBe(false);
-      writeFileSync(join(dir, "secrets", "tavily.secret"), "kv", { mode: 0o600 });
-      expect(searchKeySeeded(join(dir, "secrets"))).toBe(true);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("a provider non-2xx surfaces a clear error", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "bottega-search-err-"));
-    const server = Bun.serve({
-      port: 0,
-      fetch: () => Response.json({ error: "rate limited" }, { status: 429 }),
+describe("search_web SearXNG client", () => {
+  test("uses a keyless GET request and preserves the cited result shape", async () => {
+    const h = jsonProvider({
+      results: [
+        {
+          title: "SearXNG documentation",
+          url: "https://docs.searxng.org/",
+          content: "A self-hosted metasearch engine",
+        },
+      ],
     });
     try {
-      mkdirSync(join(dir, "secrets"), { recursive: true });
-      writeFileSync(join(dir, "secrets", "tavily.secret"), "kv", { mode: 0o600 });
-      const tool = searchWebToolDefinition({
-        baseUrl: `http://127.0.0.1:${server.port}`,
-        secretsDir: join(dir, "secrets"),
+      const result = await toolHarness(h).execute(
+        "tc1",
+        { query: "bottega search" },
+        undefined,
+        undefined,
+        NONE_CTX,
+      );
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(resultText(result))).toEqual({
+        query: "bottega search",
+        count: 1,
+        results: [
+          {
+            title: "SearXNG documentation",
+            url: "https://docs.searxng.org/",
+            snippet: "A self-hosted metasearch engine",
+          },
+        ],
       });
-      const res = await tool.execute("tc1", { query: "bottega" }, undefined, undefined, NONE_CTX);
-      expect(res.isError).toBe(true);
-      expect(resultText(res)).toContain("429");
+      expect(h.requests).toHaveLength(1);
+      const request = h.requests[0]!;
+      expect(request.pathname).toBe("/search");
+      expect(request.searchParams.get("q")).toBe("bottega search");
+      expect(request.searchParams.get("format")).toBe("json");
+      expect(request.searchParams.get("categories")).toBe("general");
+      expect(request.searchParams.get("safesearch")).toBe("1");
     } finally {
-      server.stop(true);
-      rmSync(dir, { recursive: true, force: true });
+      h.cleanup();
     }
+  });
+
+  test("returns a valid empty result set", async () => {
+    const h = jsonProvider({ results: [] });
+    try {
+      const result = await toolHarness(h).execute("tc1", { query: "nothing" }, undefined, undefined, NONE_CTX);
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(resultText(result))).toEqual({ query: "nothing", count: 0, results: [] });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("filters rows with empty URLs before mapping", async () => {
+    const h = jsonProvider({
+      results: [
+        { title: "valid", url: "https://example.com/valid", content: "first" },
+        { title: "missing", url: "   ", content: "discarded" },
+        { title: "also valid", url: "https://example.com/also", content: "second" },
+      ],
+    });
+    try {
+      const result = await toolHarness(h).execute("tc1", { query: "urls" }, undefined, undefined, NONE_CTX);
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(resultText(result))).toEqual({
+        query: "urls",
+        count: 2,
+        results: [
+          { title: "valid", url: "https://example.com/valid", snippet: "first" },
+          { title: "also valid", url: "https://example.com/also", snippet: "second" },
+        ],
+      });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("caps mapped results at max_results", async () => {
+    const h = jsonProvider({
+      results: Array.from({ length: 6 }, (_, index) => ({
+        title: `result ${index}`,
+        url: `https://example.com/${index}`,
+        content: `content ${index}`,
+      })),
+    });
+    try {
+      const result = await toolHarness(h).execute("tc1", { query: "many", max_results: 3 }, undefined, undefined, NONE_CTX);
+      expect(result.isError).not.toBe(true);
+      const body = JSON.parse(resultText(result)) as { count: number; results: unknown[] };
+      expect(body.count).toBe(3);
+      expect(body.results).toHaveLength(3);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("returns a bounded error for a non-2xx response", async () => {
+    const h = jsonProvider({ error: "x".repeat(1_000) }, 503);
+    try {
+      const result = await toolHarness(h).execute("tc1", { query: "failure" }, undefined, undefined, NONE_CTX);
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain("503");
+      expect(resultText(result).length).toBeLessThan(280);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("fails closed on malformed JSON", async () => {
+    const h = stubSearchProvider(() => new Response("not json", { headers: { "content-type": "application/json" } }));
+    try {
+      const result = await toolHarness(h).execute("tc1", { query: "bad json" }, undefined, undefined, NONE_CTX);
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain("unparseable");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("fails closed on malformed result envelopes", async () => {
+    for (const body of [{}, { results: "not an array" }]) {
+      const h = jsonProvider(body);
+      try {
+        const result = await toolHarness(h).execute("tc1", { query: "bad envelope" }, undefined, undefined, NONE_CTX);
+        expect(result.isError).toBe(true);
+        expect(resultText(result)).toContain("unparseable");
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  test("returns an error when the local SearXNG service is unreachable", async () => {
+    const tool = searchWebToolDefinition({
+      baseUrl: "http://127.0.0.1:1",
+      fetch: async () => {
+        throw new Error("connection refused");
+      },
+    });
+    const result = await tool.execute("tc1", { query: "unreachable" }, undefined, undefined, NONE_CTX);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain("connection refused");
   });
 });

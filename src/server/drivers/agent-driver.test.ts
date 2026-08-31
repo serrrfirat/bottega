@@ -36,7 +36,7 @@ import {
   spaceAgentToolNames,
   withPolicyGate,
 } from "./agent-driver";
-import { searchWebToolDefinition, SEARCH_PROVIDER } from "../../tools/search-web";
+import { searchWebToolDefinition } from "../../tools/search-web";
 import type { SearchResultRow } from "../services/slack-turn-presenter";
 
 /**
@@ -2323,14 +2323,14 @@ describe("withPolicyGate thinking-step emission (issue #168)", () => {
 // ---------------------------------------------------------------------------
 
 describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
-  function searchToolHarness(opts: { sink?: (spaceId: string, results: readonly SearchResultRow[]) => void } = {}) {
+  function searchToolHarness(opts: {
+    sink?: (spaceId: string, results: readonly SearchResultRow[]) => void;
+    fetch?: typeof fetch;
+  } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "search-dispatch-"));
     const store = createStore(join(dir, "test.db"));
     const audit = createAudit(store);
     const orgPolicy = parseOrgConfigYaml("tools:\n  search_web: allow\n");
-    const secretDir = join(dir, "secrets");
-    mkdirSync(secretDir, { recursive: true });
-    writeFileSync(join(secretDir, `${SEARCH_PROVIDER}.secret`), "tvly-stub", { mode: 0o600 });
     const calls: Array<{ spaceId: string; results: readonly SearchResultRow[] }> = [];
     const sink = opts.sink ?? ((spaceId, results) => void calls.push({ spaceId, results }));
     const server = Bun.serve({
@@ -2344,7 +2344,7 @@ describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
         }),
     });
     const tool = withPolicyGate(
-      searchWebToolDefinition({ baseUrl: `http://127.0.0.1:${server.port}`, secretsDir: secretDir }),
+      searchWebToolDefinition({ baseUrl: `http://127.0.0.1:${server.port}`, fetch: opts.fetch }),
       {
         orgPolicy,
         audit,
@@ -2361,7 +2361,7 @@ describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
     // SAFETY: execute() reads only ctx.sessionManager.getSessionFile(); the
     // stub provides exactly that and the rest is never touched.
     const ctx = { sessionManager: { getSessionFile: () => join(dir, "sessions", "slack:C1.jsonl") } } as never;
-    return { tool, calls, ctx, cleanup, secretDir };
+    return { tool, calls, ctx, cleanup };
   }
 
   test("a successful search_web call dispatches its parsed cited rows to the sink", async () => {
@@ -2381,17 +2381,18 @@ describe("withPolicyGate search_web cited-result dispatch (issue #278)", () => {
     }
   });
 
-  test("an unseeded key fails closed AND never dispatches (fail closed end-to-end)", async () => {
-    const { tool, calls, ctx, cleanup, secretDir } = searchToolHarness();
+  test("an unreachable service fails closed AND never dispatches (fail closed end-to-end)", async () => {
+    const { tool, calls, ctx, cleanup } = searchToolHarness({
+      fetch: async () => {
+        throw new Error("connection refused");
+      },
+    });
     try {
-      // Remove the seeded key: the tool must report unavailable and the
-      // sink must NOT fire (a fabricated/empty result must never post).
-      rmSync(join(secretDir, `${SEARCH_PROVIDER}.secret`));
       const res = await tool.execute("c1", { query: "bottega" }, undefined, undefined, ctx);
       expect(res.isError).toBe(true);
       const content = res.content[0];
       if (content?.type !== "text") throw new Error("expected a text tool result");
-      expect(content.text).toContain("unavailable");
+      expect(content.text).toContain("connection refused");
       expect(calls).toHaveLength(0);
     } finally {
       cleanup();
