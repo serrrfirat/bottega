@@ -223,6 +223,7 @@ describe("Dockerfile + .dockerignore (issue #12)", () => {
     expect(tools).toContain("apt-get install -y --no-install-recommends");
     for (const pkg of [
       "git", "ca-certificates", "gh", "jq", "curl",
+      "docker.io",
       "nodejs", "npm", "build-essential", "golang-go",
       "python3", "python3-pip", "sqlite3", "postgresql-client",
       "ripgrep", "glab", "unzip",

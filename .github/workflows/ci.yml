@@ -83,6 +83,7 @@ jobs:
         run: |
           docker run --rm bottega-tools:ci sh -c '
             gh --version >/dev/null && jq --version >/dev/null && curl --version >/dev/null && git --version >/dev/null &&
+            docker --version >/dev/null &&
             node --version >/dev/null && npm --version >/dev/null && pnpm --version >/dev/null && yarn --version >/dev/null &&
             python3 --version >/dev/null && pip3 --version >/dev/null && uv --version >/dev/null &&
             gcc --version >/dev/null && make --version >/dev/null && go version >/dev/null &&
