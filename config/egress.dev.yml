@@ -121,16 +121,6 @@ transforms:
             require: true
           rules:
             - host: "chatgpt.com"
-        - source:
-            type: file
-            path: "/data/proxy-secrets/tavily.secret"
-            ttl: "30s"
-          inject:
-            header: "Authorization"
-            formatter: "Bearer {{ .Value }}"
-            require: true
-          rules:
-            - host: "api.tavily.com"
 
 log:
   level: "info"

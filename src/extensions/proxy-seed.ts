@@ -56,10 +56,6 @@ export const MODEL_PROXY_KEYS: readonly ModelProxyKey[] = [
   { provider: "opencode", envName: "OPENCODE_API_KEY" },
   { provider: "openai", envName: "OPENAI_API_KEY" },
   { provider: "anthropic", envName: "ANTHROPIC_API_KEY" },
-  // The Tavily web-search provider key (issue #278): the search_web tool's
-  // static secret, seeded like the model gateways and injected by the
-  // proxy for api.tavily.com at egress.
-  { provider: "tavily", envName: "TAVILY_API_KEY" },
 ] as const;
 
 /** The proxy-side secret file for a model gateway key. */

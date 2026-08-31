@@ -113,7 +113,6 @@ describe("boot secret identity table (issue #201, shrunk #208)", () => {
       "near",
       "openai",
       "anthropic",
-      "tavily",
       "mnesis",
     ]);
     for (const provider of providers) {

@@ -83,12 +83,6 @@ export const MODEL_GATEWAY_KEYS: readonly ModelGatewayKey[] = [
   // — the seed owns the refresh and writes the minted access token; the
   // proxy injects it as the bearer for chatgpt.com, require: true).
   { provider: "openai-codex", host: "chatgpt.com" },
-  // The Tavily web-search gateway (issue #278): the search_web tool's
-  // outbound call to api.tavily.com/search sends the placeholder bearer;
-  // the proxy injects the real key from data/proxy-secrets/tavily.secret
-  // (seeded at boot — require: true, so a missing key rejects the request
-  // closed instead of reaching the provider unauthenticated).
-  { provider: "tavily", host: "api.tavily.com" },
 ] as const;
 
 /** The gateway host for a provider, from {@link MODEL_GATEWAY_KEYS} — the
@@ -109,8 +103,7 @@ export function gatewayHost(provider: string): string {
  * at slack.com/api/* and api.slack.com, the Socket Mode websocket on
  * *.slack.com, and file downloads on files.slack.com, issue #124), and
  * the GitHub API for the ingest poller (issue #57, mentions search), and
- * the Tavily web-search gateway (issue #278 — the search_web tool's
- * provider host, api.tavily.com). */
+ * the reviewed SearXNG search-engine hosts. */
 /**
  * Hosts the judge transform evaluates (#364): direct content-bearing
  * traffic where an LLM verdict adds signal. Infrastructure and reviewed MCP
@@ -119,7 +112,8 @@ export function gatewayHost(provider: string): string {
  * a URL-only LLM verdict on protocol traffic denies 100% of it.
  */
 export const JUDGED_HOSTS = [
-  "api.tavily.com",
+  "html.duckduckgo.com",
+  "search.brave.com",
   "raw.githubusercontent.com",
 ] as const;
 
@@ -130,7 +124,8 @@ export const BASE_EGRESS_DOMAINS = [
   gatewayHost("openai-codex"),
   gatewayHost("openai"),
   gatewayHost("anthropic"),
-  gatewayHost("tavily"),
+  "html.duckduckgo.com",
+  "search.brave.com",
   "raw.githubusercontent.com",
   "files.slack.com",
   "integrations.sh", // extension catalog browse (issue #54; egress gap found #361)

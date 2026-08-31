@@ -69,7 +69,6 @@ describe("model gateway keys (issue #208)", () => {
         OPENCODE_API_KEY: "opencode-env",
         OPENAI_API_KEY: "openai-env",
         ANTHROPIC_API_KEY: "anthropic-env",
-        TAVILY_API_KEY: "tavily-env",
       };
       await syncProxyCredentialsFromEnv({
         env,
@@ -84,7 +83,6 @@ describe("model gateway keys (issue #208)", () => {
         ["opencode", "opencode-env"],
         ["openai", "openai-env"],
         ["anthropic", "anthropic-env"],
-        ["tavily", "tavily-env"],
       ]);
       for (const key of MODEL_PROXY_KEYS) {
         const path = join(s.dir, proxyKeyFileName(key.provider));

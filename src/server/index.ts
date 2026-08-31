@@ -853,9 +853,6 @@ export async function main(opts: BottegaServerOpts = {}): Promise<BottegaServer>
       },
     }),
     // Web search (issue #278): read-tier tool that returns cited results
-    // via a search provider; the key rides the proxy seam (boot-seeded
-    // data/proxy-secrets/tavily.secret, injected at egress). Fail-closed
-    // on a missing key — no fabricated result set.
     searchWebToolDefinition(),
     // Owned-space Slack read (issue #340): the agent hydrates its own
     // channel's thread/history on demand (no automatic per-turn injection

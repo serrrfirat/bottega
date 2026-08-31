@@ -106,17 +106,13 @@ describe("egress config generation", () => {
     expect(allowlistDomains(renderEgressConfig(BASE_EGRESS_DOMAINS))).toContain("api.anthropic.com");
   });
 
-  test("egress permits the search_web provider and pins its proxy-key entry (issue #278)", () => {
-    // The search_web tool (issue #278) calls the search provider at
-    // api.tavily.com/search; the static key rides the proxy-secret seam —
-    // the app never holds the key, the proxy injects it at egress
-    // (config/egress.yml's require:true entry 502s if unseeded).
-    expect(BASE_EGRESS_DOMAINS).toContain("api.tavily.com");
-    const domains = allowlistDomains(COMMITTED_EGRESS);
-    expect(domains).toContain("api.tavily.com");
-    const yaml = renderEgressConfig(BASE_EGRESS_DOMAINS);
-    expect(yaml).toContain('path: "/data/proxy-secrets/tavily.secret"');
-    expect(COMMITTED_EGRESS).toContain('path: "/data/proxy-secrets/tavily.secret"');
+  test("egress permits the reviewed SearXNG search hosts", () => {
+    for (const host of ["html.duckduckgo.com", "search.brave.com"]) {
+      expect(BASE_EGRESS_DOMAINS).toContain(host);
+      expect(allowlistDomains(COMMITTED_EGRESS)).toContain(host);
+      expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).toContain(host);
+    }
+    expect(renderEgressConfig(BASE_EGRESS_DOMAINS)).not.toContain("tavily");
   });
 
   test("reviewed MCP transport hosts remain allowlisted but are not judge-scoped", () => {
@@ -134,7 +130,8 @@ describe("egress config generation", () => {
       expect(allowlistDomains(rendered)).toContain(host);
       expect(rules).not.toContain(host);
     }
-    expect(rules).toContain("api.tavily.com");
+    expect(rules).toContain("html.duckduckgo.com");
+    expect(rules).toContain("search.brave.com");
     expect(rules).toContain("raw.githubusercontent.com");
   });
 
@@ -174,7 +171,7 @@ describe("egress config generation", () => {
     expect(yaml).not.toContain("- name: oauth_token");
     expect(yaml).not.toContain("openai-codex-oauth.json");
     expect(yaml).not.toContain("https://auth.openai.com/oauth/token");
-    expect(secretsEntries(yaml)?.length).toBe(6); // near/opencode/openai/anthropic/openai-codex/tavily
+    expect(secretsEntries(yaml)?.length).toBe(5); // near/opencode/openai/anthropic/openai-codex
   });
 
   test("rendered config enables the management API for boundary reloads (issue #123)", () => {
@@ -195,13 +192,13 @@ describe("egress config generation", () => {
       },
     ]);
     const entries = secretsEntries(`transforms:\n${yaml}`) ?? [];
-    expect(entries).toHaveLength(6);
+    expect(entries).toHaveLength(5);
     expect(yaml).toContain("bottega:scoped-authorizations begin");
     expect(yaml).toContain("bottega:scoped-authorizations end");
     expect(yaml).not.toContain(`${FIXTURE_EXTENSION_ID}.secret`);
     expect(yaml).not.toContain('host: "api.example.com"');
     // The gateway entries are REQUIRED (fail closed — issue #208).
-    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex", "tavily"]) {
+    for (const provider of ["near", "opencode", "openai", "anthropic", "openai-codex"]) {
       // SAFETY: each gateway entry's `source` is a block mapping with a `path` scalar.
       const entry = entries.find((e) => String((e["source"] as Record<string, YamlNode>)["path"]).includes(`${provider}.secret`));
       expect(entry, `${provider} gateway entry`).toBeDefined();
@@ -218,7 +215,8 @@ describe("egress config generation", () => {
       "chatgpt.com",
       "api.openai.com",
       "api.anthropic.com",
-      "api.tavily.com",
+      "html.duckduckgo.com",
+      "search.brave.com",
       "raw.githubusercontent.com",
       "files.slack.com",
     "integrations.sh",
@@ -290,7 +288,8 @@ describe("egress config generation", () => {
         "chatgpt.com",
         "api.openai.com",
         "api.anthropic.com",
-        "api.tavily.com",
+        "html.duckduckgo.com",
+      "search.brave.com",
         "raw.githubusercontent.com",
         "files.slack.com",
     "integrations.sh",
@@ -360,7 +359,7 @@ describe("dev-permissive egress config (issue #126)", () => {
   test("rendering the dev config without extensions still allow-alls, keeps management + the gateway entries", () => {
     const yaml = renderDevEgressConfig();
     expect(allowlistDomains(yaml)).toEqual(["*"]);
-    expect(secretsEntries(yaml)?.length).toBe(6); // the model-gateway keys + tavily (issue #208 + #278)
+    expect(secretsEntries(yaml)?.length).toBe(5); // the model-gateway keys (issue #208 + #278)
     expect(yaml).toContain('api_key_env: "IRON_MANAGEMENT_API_KEY"');
     expect(yaml).not.toContain("- name: judge");
   });
@@ -505,7 +504,7 @@ describe("OAuth extension egress contract (issue #284)", () => {
     // The OAuth extensions get NO secrets-file entry either (nothing for
     // the proxy to inject) — only the api_key extension (github) + the six
     // model-gateway keys appear.
-    expect(secretsEntries(yaml)?.length).toBe(6);
+    expect(secretsEntries(yaml)?.length).toBe(5);
     // A runtime regen of the same set emits the same contract.
     const dir = mkdtempSync(join(tmpdir(), "egress-oauth-allowlist-"));
     try {
@@ -535,8 +534,8 @@ describe("Gmail reviewed override egress contract (issue #286 §7)", () => {
     expect(domains).toContain("gmailmcp.googleapis.com");
     const entries = secretsEntries(COMMITTED_EGRESS);
     expect(entries).not.toBeNull();
-    // github (api_key) + the six model-gateway keys — gmail adds nothing.
-    expect(entries!.length).toBe(6);
+    // github (api_key) + the five model-gateway keys — gmail adds nothing.
+    expect(entries!.length).toBe(5);
     for (const entry of entries!) {
       // SAFETY: each committed secrets entry is generated with a `source`
       // mapping; this assertion checks its path remains unrelated to Gmail.

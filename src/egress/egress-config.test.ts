@@ -144,7 +144,8 @@ describe("config/egress.yml (iron-proxy v0.49.0 schema)", () => {
       expect(domains).toContain(host);
       expect(rules).not.toContain(host);
     }
-    expect(rules).toContain("api.tavily.com");
+    expect(rules).toContain("html.duckduckgo.com");
+    expect(rules).toContain("search.brave.com");
     expect(rules).toContain("raw.githubusercontent.com");
   });
 

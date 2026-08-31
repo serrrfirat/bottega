@@ -78,7 +78,6 @@ describe("forbidden child env denylist (issue #346)", () => {
       OPENAI_API_KEY: "sk-proj-secret",
       ANTHROPIC_API_KEY: "sk-ant-secret",
       OPENCODE_API_KEY: "oc_api_key",
-      TAVILY_API_KEY: "tvly-abc123",
       OMP_AUTH_BROKER_TOKEN: "broker-token",
     } satisfies Record<string, string>;
     sanitizeSandboxEnv(env);
@@ -96,7 +95,6 @@ describe("forbidden child env denylist (issue #346)", () => {
       "BOTTEGA_API_TOKEN",
       "NEAR_API_KEY",
       "OPENCODE_API_KEY",
-      "TAVILY_API_KEY",
       "OPENAI_API_KEY",
       "ANTHROPIC_API_KEY",
     ] as const) {
