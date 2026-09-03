@@ -196,9 +196,12 @@ class FakeDriver implements AgentDriver {
   deferCreate = false;
   /** Set while createSession is parked on the defer gate (issue #119). */
   createGate?: { promise: Promise<void>; resolve: () => void };
+  /** Model reply emitted during prompt() so caller-level postprocessing is exercised. */
+  autoReply?: string;
 
   async createSession(opts: CreateSessionOpts): Promise<AgentSessionDriver> {
     const session = new FakeSession(opts.spaceId);
+    session.autoReply = this.autoReply;
     this.created.push({ opts, session });
     if (this.deferCreate) {
       const gate = Promise.withResolvers<void>();
@@ -2760,6 +2763,23 @@ describe("response mode → session prompt directive (issue #55)", () => {
     expect(updates.at(-1)?.text).not.toContain("GitHub-only");
     await service.stop();
   });
+  test("explicit connect notion preserves the authorization URL despite a stale auth failure (#395)", async () => {
+    const { adapter, updates } = fakeAdapter();
+    const { store } = fakeStore();
+    const driver = new FakeDriver();
+    driver.autoReply = "Open this link to authorize Notion: https://mcp.notion.com/authorize?state=single-use";
+    const failures = [{ providerId: "notion", label: "Notion" }];
+    const extensionAuthFailures = () => failures;
+    const service = makeSpaceService({ store, adapter, driver, extensionAuthFailures });
+    await service.handleInboundMessage(msg({ text: "connect notion" }));
+
+    await Promise.resolve();
+    const final = updates.at(-1)?.text ?? "";
+    expect(final).toContain("https://mcp.notion.com/authorize?state=single-use");
+    expect(final).not.toContain("authorization expired or was revoked");
+    await service.stop();
+  });
+
   test("answer-first replies render successful sources before auth failures in a partial summary (#383)", async () => {
     const { adapter, updates } = fakeAdapter();
     const { store } = fakeStore();

@@ -387,6 +387,9 @@ export class SpaceService {
    * stream panel opens a threaded reply, which DMs must never see.
    */
   readonly #presenters = new Map<string, SlackTurnPresenter>();
+  /** Providers named by the active explicit connect command; auth guidance must not rewrite its URL. */
+  readonly #explicitConnectProviders = new Map<string, ReadonlySet<string>>();
+
 
   constructor(deps: SpaceServiceDeps) {
     this.#store = deps.store;
@@ -627,7 +630,8 @@ export class SpaceService {
       const midTurn = existing !== undefined && existing.session.isStreaming();
       if (!midTurn) {
         presenter.activateInbound(msg);
-        for (const failure of this.#currentAuthFailures(msg.text)) {
+        const explicitConnectProviders = this.#explicitConnectProvidersFor(msg.text);
+        for (const failure of this.#currentAuthFailures(msg.text, explicitConnectProviders)) {
           presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
         }
       }
@@ -660,19 +664,28 @@ export class SpaceService {
           // activate the steer's identity — deferred at receipt because
           // the turn was mid-flight when the message arrived.
           presenter.activateInbound(msg);
-          for (const failure of this.#currentAuthFailures(msg.text)) {
+          const explicitConnectProviders = this.#explicitConnectProvidersFor(msg.text);
+          for (const failure of this.#currentAuthFailures(msg.text, explicitConnectProviders)) {
             presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
           }
+
           presenter.setSteered(true);
+          const turnExplicitConnectProviders = this.#explicitConnectProvidersFor(turnText);
+          if (turnExplicitConnectProviders.size > 0) {
+            this.#explicitConnectProviders.set(msg.spaceId, turnExplicitConnectProviders);
+          }
+
           try {
             await live.session.prompt(turnText, { streamingBehavior: "steer", principal: msg.principal });
           } finally {
+            this.#explicitConnectProviders.delete(msg.spaceId);
             // Issue #296: settle the steered DM request on resolve OR reject
             // (a rejected steer must still release the wedged request).
             await this.#settleAndDrain(msg.spaceId);
           }
           return;
         }
+
         // Queued: the receipt (👀 reaction, message.in audit) already
         // happened above; identity activation happens at DRAIN time via
         // onQueueDrain — never here. The "+N waiting" indicator makes
@@ -719,11 +732,16 @@ export class SpaceService {
         // turn instead of opening a second one. Best-effort: never blocks
         // the turn on a model misconfiguration.
         await live.session.reapplyDefaultModelRole?.();
+        const explicitConnectProviders = this.#explicitConnectProvidersFor(turnText);
+        if (explicitConnectProviders.size > 0) {
+          this.#explicitConnectProviders.set(msg.spaceId, explicitConnectProviders);
+        }
         try {
           await live.session.prompt(turnText, { principal: msg.principal });
           // Issue #296: the opening prompt's resolution is the true request
           // end — NOT the SDK's per-round turn_end events.
         } finally {
+          this.#explicitConnectProviders.delete(msg.spaceId);
           // A REJECTED prompt (after onError buffered the failure) must also
           // finalize the DM card and drain the queue; finally runs on resolve
           // AND reject. #settleAndDrain never throws, so it cannot mask the
@@ -932,9 +950,26 @@ export class SpaceService {
     );
     return created;
   }
-  #currentAuthFailures(text: string): ExtensionAuthFailure[] {
+  #explicitConnectProvidersFor(text: string): ReadonlySet<string> {
+    const target = text.trim().toLowerCase().replace(/\s+/g, " ");
+    if (!target.startsWith("connect ")) return new Set();
+    const providerTarget = target.slice("connect ".length);
+    const providers = this.#extensionAuthFailures?.() ?? [];
+    return new Set(
+      providers
+        .filter(({ providerId, label }) => {
+          const provider = providerId.toLowerCase();
+          const friendly = label.toLowerCase();
+          return providerTarget === provider || providerTarget === friendly || providerTarget === `my ${provider}` || providerTarget === `my ${friendly}`;
+        })
+        .map(({ providerId }) => providerId.toLowerCase()),
+    );
+  }
+
+  #currentAuthFailures(text: string, suppressProviderIds?: ReadonlySet<string>): ExtensionAuthFailure[] {
     const lower = text.toLowerCase();
     return (this.#extensionAuthFailures?.() ?? []).filter(({ providerId, label }) => {
+      if (suppressProviderIds?.has(providerId.toLowerCase())) return false;
       const mentioned = lower.includes(providerId.toLowerCase()) || lower.includes(label.toLowerCase());
       const alreadyActionable =
         lower.includes(`reconnect ${providerId.toLowerCase()}`) ||
@@ -1018,7 +1053,7 @@ export class SpaceService {
         presenter.onMessage(data);
         return;
       }
-      const failures = this.#currentAuthFailures(data.text);
+      const failures = this.#currentAuthFailures(data.text, this.#explicitConnectProviders.get(spaceId));
       for (const failure of failures) {
         presenter.onSourceOutcome({
           label: failure.label,
@@ -1145,17 +1180,24 @@ export class SpaceService {
     // thread reply) travels with the turn so its reply stays in the same
     // conversation thread the request came from.
     presenter.onQueueDrain(entry.ts, entry.principal, entry.rootThreadTs);
-    for (const failure of this.#currentAuthFailures(entry.text)) {
+    const explicitConnectProviders = this.#explicitConnectProvidersFor(entry.text);
+    for (const failure of this.#currentAuthFailures(entry.text, explicitConnectProviders)) {
       presenter.onSourceWaiting(failure.label, `Reconnect ${failure.label} by running "connect ${failure.providerId}".`);
     }
+
     try {
       // The drain IS a fresh turn (issue #189): hot-swap the default model
       // role like any other fresh turn, then prompt without a streaming
       // behavior — own phrase, own reply, own principal (issue #152).
       await live.session.reapplyDefaultModelRole?.();
+      if (explicitConnectProviders.size > 0) {
+        this.#explicitConnectProviders.set(spaceId, explicitConnectProviders);
+      }
+
       try {
         await live.session.prompt(entry.text, { principal: entry.principal });
       } finally {
+        this.#explicitConnectProviders.delete(spaceId);
         // Issue #296: a DRAINED top-level DM request also settles on resolve
         // OR reject — a rejection after onError buffered the failure must
         // still finalize the drained card and drain the NEXT queued message.
